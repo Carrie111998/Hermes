@@ -18062,11 +18062,14 @@ def main():
                     role_counts[sid] = {}
                 role_counts[sid][role] = cnt
 
-            # Detect terminal width for dynamic title sizing
-            import shutil as _shutil
-            term_w = _shutil.get_terminal_size((80, 24)).columns
-            fixed_w = 3 + 10 + 10 + 10 + 8 + 20 + 12 + 14
-            title_w = max(16, term_w - fixed_w)
+            # Title column width = longest title in results (capped at 50)
+            max_title = 0
+            for sid in seen:
+                meta = db.get_session(sid) or {}
+                t = meta.get("title") or ""
+                if len(t) > max_title:
+                    max_title = len(t)
+            title_w = max(16, min(max_title, 50))
             def _fmt_tok(n):
                 if n is None:
                     return "—"

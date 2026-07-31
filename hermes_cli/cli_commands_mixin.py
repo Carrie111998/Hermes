@@ -1214,12 +1214,17 @@ class CLICommandsMixin:
                     role_counts[sid] = {}
                 role_counts[sid][role] = cnt
 
-            # Detect terminal width for dynamic title sizing
-            import shutil as _shutil
-            term_w = _shutil.get_terminal_size((80, 24)).columns
-            # Fixed: #(3) + Model(10) + Tok(10) + Created(10) + Last Active(8) + Preview(20) + ID(12) + separators(7×2=14)
-            fixed_w = 3 + 10 + 10 + 10 + 8 + 20 + 12 + 14
-            title_w = max(16, term_w - fixed_w)
+            # Title column width = longest title in results (capped at 50)
+            max_title = 0
+            for sid in seen:
+                meta = self._session_db.get_session(sid) or {}
+                t = meta.get("title") or ""
+                if len(t) > max_title:
+                    max_title = len(t)
+            title_w = max(16, min(max_title, 50))
+
+            _cprint(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<20} {'ID'}")
+            _cprint(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*20} {'─'*12}")
             # Format tokens as human-readable (e.g. "221k/17k")
             def _fmt_tok(n):
                 if n is None:
