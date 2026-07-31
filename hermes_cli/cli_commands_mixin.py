@@ -1102,9 +1102,6 @@ class CLICommandsMixin:
                 # Use FTS5 content search — searches message text, not just
                 # session titles/IDs. Returns ranked results with match
                 # snippets, grouped by session.
-                import time as _time
-                from datetime import datetime as _dt
-
                 raw = self._session_db.search_messages(
                     query=search_query,
                     role_filter=["user", "assistant"],
@@ -1189,56 +1186,18 @@ class CLICommandsMixin:
                 row = cur.fetchone()
                 root_preview_cache[sid] = row[0] if row else ""
 
-            # Title column width = longest title in results (capped at 50)
-            max_title = 0
-            for sid in seen:
+            # Build canonical row dicts and render with the shared table
+            # renderer (same format as /sessions and hermes sessions list).
+            from hermes_cli.session_listing import render_sessions_table
+            table_rows = []
+            for sid in sids_sorted:
                 meta = self._session_db.get_session(sid) or {}
-                t = meta.get("title") or ""
-                if len(t) > max_title:
-                    max_title = len(t)
-            title_w = max(16, min(max_title, 50))
-
-            _cprint(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
-            _cprint(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
-            # Format tokens as human-readable (e.g. "221k/17k")
-            def _fmt_tok(n):
-                if n is None:
-                    return "—"
-                if n >= 1_000_000:
-                    return f"{n/1_000_000:.1f}M"
-                if n >= 1_000:
-                    return f"{n//1000}k"
-                return str(n)
-
-            for idx, (sid, r) in enumerate(seen.items(), 1):
-                meta = self._session_db.get_session(sid) or {}
-                title = (meta.get("title") or "—")[:title_w]
-                model_raw = (r.get("model") or "—")
-                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-                if len(model) > 10:
-                    model = model[:9] + "…"
-                inp = meta.get("input_tokens")
-                out = meta.get("output_tokens")
-                tok_str = f"{_fmt_tok(inp)}/{_fmt_tok(out)}"
-                started = meta.get("started_at")
-                created = _dt.fromtimestamp(started).strftime("%Y-%m-%d") if started else "?"
-                last_active = sid_latest.get(sid)
-                if last_active:
-                    age = int(_time.time() - last_active)
-                    if age < 60:
-                        when = f"{age}s"
-                    elif age < 3600:
-                        when = f"{age // 60}m"
-                    elif age < 86400:
-                        when = f"{age // 3600}h"
-                    else:
-                        when = f"{age // 86400}d"
-                else:
-                    when = "?"
-                pv = (root_preview_cache.get(sid) or "")[:38]
-                if len(root_preview_cache.get(sid) or "") >= 38:
-                    pv = pv[:37] + "…"
-                _cprint(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
+                row = dict(seen[sid])
+                row.update(meta)
+                row["id"] = sid
+                row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
+                table_rows.append(row)
+            render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
             _cprint("")
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")

@@ -119,3 +119,108 @@ def format_gateway_session_listing(
     lines.append("Resume: `/resume <session id>` or `/resume <number>` from `/resume`.")
     lines.append("More: `/sessions all`, `/sessions full`, `/sessions search <query>`.")
     return "\n".join(lines)
+
+
+def render_sessions_table(
+    sessions: list[dict[str, Any]],
+    *,
+    out=print,
+    db: Any = None,
+    preview_lookup: dict[str, str] | None = None,
+) -> None:
+    """Render the canonical sessions table shared by /sessions, /sessions
+    search, `hermes sessions list` and `hermes sessions search`.
+
+    Columns: #, Title, Model, Tok (in/out), Created, Last, Preview, ID.
+    Title width sizes to the longest title in the result set (min 16, max 50).
+
+    Preview resolution order:
+      1. ``preview_lookup[sid]`` — FTS5 search precomputes root-ancestor
+         previews and passes them here.
+      2. If ``db`` is given and the row has a ``parent_session_id``, walk up
+         the compression chain to the root ancestor and use its first user
+         message (so compressed children show the original conversation
+         opener, not the compaction banner).
+      3. The row's own ``preview`` field.
+    """
+    import time as _time
+    from datetime import datetime as _dt
+
+    def _fmt_tok(n: Any) -> str:
+        if n is None:
+            return "—"
+        if n >= 1_000_000:
+            return f"{n/1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n//1000}k"
+        return str(n)
+
+    def _fmt_age(ts: Any) -> str:
+        if not ts:
+            return "?"
+        age = int(_time.time() - float(ts))
+        if age < 60:
+            return f"{age}s"
+        if age < 3600:
+            return f"{age // 60}m"
+        if age < 86400:
+            return f"{age // 3600}h"
+        return f"{age // 86400}d"
+
+    max_title = 0
+    for s in sessions:
+        t = s.get("title") or ""
+        if len(t) > max_title:
+            max_title = len(t)
+    title_w = max(16, min(max_title, 50))
+
+    # Resolve previews once per session id.
+    previews: dict[str, str] = dict(preview_lookup or {})
+    for s in sessions:
+        sid = s.get("id")
+        if not sid or sid in previews:
+            continue
+        root_id = sid
+        if db is not None and s.get("parent_session_id"):
+            current = sid
+            hops = 0
+            while current and hops < 20:
+                m = db.get_session(current) or {}
+                parent = m.get("parent_session_id")
+                if not parent:
+                    break
+                current = parent
+                hops += 1
+            root_id = current
+        if root_id == sid and s.get("preview"):
+            previews[sid] = s["preview"]
+        elif db is not None:
+            try:
+                cur = db._conn.execute(
+                    "SELECT substr(content, 1, 60) FROM messages "
+                    "WHERE session_id = ? AND role = 'user' "
+                    "ORDER BY id ASC LIMIT 1",
+                    (root_id,),
+                )
+                row = cur.fetchone()
+                previews[sid] = row[0] if row else ""
+            except Exception:
+                previews[sid] = s.get("preview") or ""
+
+    out(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
+    out(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
+    for idx, s in enumerate(sessions, 1):
+        sid = s.get("id") or "—"
+        title = (s.get("title") or "—")[:title_w]
+        model_raw = s.get("model") or "—"
+        model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+        if len(model) > 10:
+            model = model[:9] + "…"
+        tok_str = f"{_fmt_tok(s.get('input_tokens'))}/{_fmt_tok(s.get('output_tokens'))}"
+        started = s.get("started_at")
+        created = _dt.fromtimestamp(started).strftime("%Y-%m-%d") if started else "?"
+        when = _fmt_age(s.get("last_active"))
+        pv = (previews.get(sid) or "")[:38]
+        if len(previews.get(sid) or "") >= 38:
+            pv = pv[:37] + "…"
+        out(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")

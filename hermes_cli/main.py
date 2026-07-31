@@ -17092,10 +17092,9 @@ def main():
                 key = _ws_key(s)
                 return (os.path.basename(key.rstrip("/\\")) or key) if key else "—"
 
-            has_ws = bool(_ws_filter) or any(_ws_key(s) for s in sessions)
-            has_titles = any(s.get("title") for s in sessions)
-
-            if has_ws:
+            # Workspace column only when the user explicitly filtered by it.
+            if _ws_filter:
+                has_titles = any(s.get("title") for s in sessions)
                 if has_titles:
                     print(f"{'Title':<24} {'Workspace':<18} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'ID'}")
                     print("─" * 100)
@@ -17119,32 +17118,9 @@ def main():
                         print(f"{preview:<30} {ws:<18} {model:<12} {msgs_str:>4}  {last_active:<13} {s['source']:<6} {s['id']}")
                 return
 
-            if has_titles:
-                print(f"{'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<28} {'Last Active':<13} {'ID'}")
-                print("─" * 100)
-            else:
-                print(f"{'Preview':<40} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'Src':<6} {'ID'}")
-                print("─" * 90)
-            for s in sessions:
-                last_active = _relative_time(s.get("last_active"))
-                model_raw = (s.get("model") or "—")
-                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-                if len(model) > 12:
-                    model = model[:11] + "…"
-                msgs = s.get("message_count")
-                msgs_str = str(msgs) if msgs is not None else "—"
-                preview = (
-                    s.get("preview", "")[:26]
-                    if has_titles
-                    else s.get("preview", "")[:38]
-                )
-                if has_titles:
-                    title = (s.get("title") or "—")[:26]
-                    sid = s["id"]
-                    print(f"{title:<28} {model:<12} {msgs_str:>4}  {preview:<28} {last_active:<13} {sid}")
-                else:
-                    sid = s["id"]
-                    print(f"{preview:<40} {model:<12} {msgs_str:>4}  {last_active:<13} {s['source']:<6} {sid}")
+            # Canonical table (same format as /sessions and /sessions search).
+            from hermes_cli.session_listing import render_sessions_table
+            render_sessions_table(sessions, out=print, db=db)
 
         elif action == "export":
             from hermes_cli.session_filters import (
@@ -18009,9 +17985,6 @@ def main():
             for sid in ancestors:
                 seen.pop(sid, None)
 
-            import time as _time
-            from datetime import datetime as _dt
-
             # Sort by last_active descending (most recent first)
             sids_sorted = list(seen.keys())
             conn = db._conn
@@ -18043,66 +18016,21 @@ def main():
                 row = cur.fetchone()
                 root_preview_cache[sid] = row[0] if row else ""
 
-            # Batch-fetch user/assistant message counts
-            cur = conn.execute(
-                f"SELECT session_id, role, COUNT(*) FROM messages WHERE session_id IN ({ph_sorted}) GROUP BY session_id, role",
-                sids_sorted,
-            )
-            role_counts = {}
-            for sid, role, cnt in cur.fetchall():
-                if sid not in role_counts:
-                    role_counts[sid] = {}
-                role_counts[sid][role] = cnt
-
-            # Title column width = longest title in results (capped at 50)
-            max_title = 0
-            for sid in seen:
+            # Build canonical row dicts and render with the shared table
+            # renderer (same format as /sessions, /sessions search, and
+            # `hermes sessions list`).
+            from hermes_cli.session_listing import render_sessions_table
+            table_rows = []
+            for sid in sids_sorted:
                 meta = db.get_session(sid) or {}
-                t = meta.get("title") or ""
-                if len(t) > max_title:
-                    max_title = len(t)
-            title_w = max(16, min(max_title, 50))
-            def _fmt_tok(n):
-                if n is None:
-                    return "—"
-                if n >= 1_000_000:
-                    return f"{n/1_000_000:.1f}M"
-                if n >= 1_000:
-                    return f"{n//1000}k"
-                return str(n)
+                row = dict(seen[sid])
+                row.update(meta)
+                row["id"] = sid
+                row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
+                table_rows.append(row)
 
             print(f"⚙️  sessions search {query}\n")
-            print(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
-            print(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
-            for idx, (sid, r) in enumerate(seen.items(), 1):
-                meta = db.get_session(sid) or {}
-                title = (meta.get("title") or "—")[:title_w]
-                model_raw = (r.get("model") or "—")
-                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-                if len(model) > 10:
-                    model = model[:9] + "…"
-                inp = meta.get("input_tokens")
-                out = meta.get("output_tokens")
-                tok_str = f"{_fmt_tok(inp)}/{_fmt_tok(out)}"
-                started = meta.get("started_at")
-                created = _dt.fromtimestamp(started).strftime("%Y-%m-%d") if started else "?"
-                last_active = sid_latest.get(sid)
-                if last_active:
-                    age = int(_time.time() - last_active)
-                    if age < 60:
-                        when = f"{age}s"
-                    elif age < 3600:
-                        when = f"{age // 60}m"
-                    elif age < 86400:
-                        when = f"{age // 3600}h"
-                    else:
-                        when = f"{age // 86400}d"
-                else:
-                    when = "?"
-                pv = (root_preview_cache.get(sid) or "")[:38]
-                if len(root_preview_cache.get(sid) or "") >= 38:
-                    pv = pv[:37] + "…"
-                print(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
+            render_sessions_table(table_rows, out=print, preview_lookup=root_preview_cache)
             print()
             print("  Use /resume <id> from an interactive Hermes session to continue.")
 

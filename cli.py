@@ -7627,8 +7627,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not sessions:
             return False
 
-        from hermes_cli.main import _relative_time
-        from datetime import datetime as _dt
+        from hermes_cli.session_listing import render_sessions_table
 
         _cli_visible_print()
         if reason == "history":
@@ -7638,20 +7637,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             _cli_visible_print("  Recent sessions:")
         _cli_visible_print()
-        _cli_visible_print(f"  {'#':<3} {'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<28} {'Last Active':<13} {'ID'}")
-        _cli_visible_print(f"  {'─' * 3} {'─' * 28} {'─' * 12} {'─' * 4}  {'─' * 28} {'─' * 13} {'─' * 24}")
-        for idx, session in enumerate(sessions, start=1):
-            title = session.get("title") or "—"
-            # Abbreviate model: strip provider prefix, max 12 chars
-            model_raw = (session.get("model") or "—")
-            model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-            if len(model) > 12:
-                model = model[:11] + "…"
-            msgs = session.get("message_count")
-            msgs_str = str(msgs) if msgs is not None else "—"
-            preview = (session.get("preview") or "")[:26]
-            last_active = _relative_time(session.get("last_active"))
-            _cli_visible_print(f"  {idx:<3} {title:<28} {model:<12} {msgs_str:>4}  {preview:<28} {last_active:<13} {session['id']}")
+        render_sessions_table(sessions, out=_cli_visible_print, db=self._session_db)
         _cli_visible_print()
         _cli_visible_print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
         _cli_visible_print("  Example: /resume 2")
