@@ -39,6 +39,25 @@ Don't use for:
   those are normal turns.
 - Planning work — use the `plan` skill instead.
 
+## How This Differs from /plan
+
+`/plan` and `/nocode` are sibling mode skills that both restrain the agent
+from running off and doing things, but they produce different deliverables:
+
+| | `/plan` | `/nocode` |
+|---|---|---|
+| Deliverable | A markdown plan document saved under `.hermes/plans/` | A direct answer in the conversation |
+| Purpose | Prepare a task for later implementation | Answer a question now, without side effects |
+| File writes | Writes exactly one file — the plan | Writes nothing, ever |
+| Typical trigger | "Plan how to build X" | "Just answer, don't do anything" |
+| After the turn | The plan is meant to be executed later | The answer is the end state; nothing remains |
+
+Choose `/plan` when the user wants a roadmap for work that will happen later.
+Choose `/nocode` when the user wants information and explicitly does not want
+anything done. `/nocode` is the stricter mode: it permits only read-only
+research, while `/plan` may inspect the repo and writes the plan file as its
+deliverable.
+
 ## Core Behavior
 
 1. **Answer directly in the same turn.** No preamble, no plan, no
