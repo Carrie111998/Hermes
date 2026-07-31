@@ -633,8 +633,16 @@ def test_expired_approval_refresh_preserves_request_instance(
 
     values["HERMES_SESSION_MESSAGE_ID"] = "msg-expired-approval"
     values["HERMES_SESSION_MESSAGE_TEXT"] = ""
+    values["HERMES_SESSION_ID"] = "grace-session-2"
     refresh_args = dict(args)
     refresh_args["_approval_refresh_token"] = old_token
+    values["HERMES_SESSION_THREAD_ID"] = "1"
+    values["HERMES_SESSION_KEY"] = "agent:main:telegram:group:chat-1:1"
+    wrong_lane = json.loads(handle_clawops_delegate(refresh_args))
+    assert wrong_lane["status"] == "rejected"
+    assert "bound to another conversation lane" in wrong_lane["reason"]
+    values["HERMES_SESSION_THREAD_ID"] = "2"
+    values["HERMES_SESSION_KEY"] = "agent:main:telegram:group:chat-1:2"
     refreshed = json.loads(handle_clawops_delegate(refresh_args))
 
     assert refreshed["status"] == "approval_required"
@@ -646,6 +654,7 @@ def test_expired_approval_refresh_preserves_request_instance(
         )
     assert replacement["request_instance_id"] == original["request_instance_id"]
     assert replacement["requested_message_id"] == "msg-expired-approval"
+    assert replacement["session_id"] == "grace-session-2"
 
 
 def test_token_shaped_message_cannot_omit_approval_token_argument(
@@ -1398,6 +1407,220 @@ def test_fresh_approval_continuation_preserves_nondefault_board(
     assert delegation["origin_event_id"] == callback["event_id"]
     assert delegation["state"] == "queued"
     assert len(tasks) == 4
+
+
+def test_execution_blocker_can_create_durable_approval_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "",
+        "HERMES_SESSION_MESSAGE_TEXT": "[SYSTEM: callback]",
+        "HERMES_SESSION_INTERNAL": "true",
+        "HERMES_GRACE_CALLBACK_BOARD": "default",
+        "HERMES_GRACE_CALLBACK_LEASE_OWNER": "execution-blocker-lease",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook read-only verification",
+            assignee="clawops-content",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_callback_delegation(
+            conn,
+            execution_id=execution_id,
+            review_id=review_id,
+            contract_fingerprint="d" * 64,
+            suffix="execution-approval-blocker",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="d" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="Facebook navigation requires a fresh read-only approval",
+            kind="needs_input",
+        )
+        callback = kb.list_due_grace_loop_callbacks(conn)[0]
+        assert callback["event_stage"] == "execution"
+        assert kb.claim_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner=values["HERMES_GRACE_CALLBACK_LEASE_OWNER"],
+        )
+
+    from plugins.openclaw_bridge.clawops_delegate import (
+        handle_clawops_delegate,
+        handle_grace_callback_outcome,
+    )
+
+    args = _external_listing_args()
+    args["task_type"] = "browser_readonly"
+    args["risk_level"] = "low"
+    args.update({
+        "origin_callback_review_id": review_id,
+        "origin_callback_event_id": callback["event_id"],
+        "origin_callback_board": "default",
+    })
+    missing_targets = json.loads(json.dumps(args))
+    missing_targets.pop("external_targets")
+    missing_target_result = json.loads(
+        handle_clawops_delegate(missing_targets),
+    )
+    assert missing_target_result["status"] == "rejected"
+    assert "requires explicit external_targets" in missing_target_result["reason"]
+    challenge = json.loads(handle_clawops_delegate(args))
+
+    assert challenge["status"] == "approval_required"
+    narrowed_args = json.loads(json.dumps(args))
+    narrowed_args["external_targets"] = ["Facebook Marketplace"]
+    narrowed_args["goal"]["objective"] = (
+        "僅驗證 Facebook Marketplace 賣家刊登介面的唯讀可達性"
+    )
+    narrowed_args["scope"]["allowed"] = [
+        "僅在 Facebook Marketplace 既有登入工作階段唯讀導覽",
+        "產出證據報告",
+    ]
+    narrowed_challenge = json.loads(handle_clawops_delegate(narrowed_args))
+    assert narrowed_challenge["status"] == "approval_required"
+    assert narrowed_challenge["approval_token"] != challenge["approval_token"]
+    assert narrowed_challenge["platform"] == "Facebook Marketplace"
+    assert all(
+        "蝦皮" not in item
+        for item in narrowed_challenge["scope"]
+    )
+    args = narrowed_args
+    challenge = narrowed_challenge
+    with kb.connect_closing() as conn:
+        challenge_row = kb.get_grace_approval_challenge(
+            conn, challenge["approval_token"],
+        )
+    persisted_args = json.loads(challenge_row["delegation_args"])
+    assert persisted_args["approved"] is False
+    assert persisted_args["external_targets"] == ["Facebook Marketplace"]
+    assert (
+        persisted_args["origin_callback_review_id"]
+        == review_id
+    )
+    assert persisted_args["origin_callback_event_id"] == callback["event_id"]
+    from plugins.openclaw_bridge.clawops_delegate import (
+        recover_clawops_approval_args,
+    )
+
+    assert (
+        recover_clawops_approval_args(challenge["approval_token"])
+        == persisted_args
+    )
+    outcome = json.loads(handle_grace_callback_outcome({
+        "review_task_id": review_id,
+        "event_id": callback["event_id"],
+        "outcome_kind": "approval_blocked",
+        "payload": {
+            "action": args["goal"]["objective"],
+            "platform": challenge["platform"],
+            "scope": challenge["scope"],
+            "exact_question": challenge["exact_reply"],
+        },
+    }))
+    assert outcome["status"] == "recorded"
+
+    with kb.connect_closing() as conn:
+        assert kb.finish_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            event_id=callback["event_id"],
+            lease_owner=values["HERMES_GRACE_CALLBACK_LEASE_OWNER"],
+        )
+        recorded = kb.get_grace_loop_callback(conn, review_id)
+        assert recorded["outcome_kind"] == "approval_blocked"
+        assert len(kb.list_tasks(conn)) == 2
+
+    values.update({
+        "HERMES_SESSION_MESSAGE_ID": "fresh-generic-approval",
+        "HERMES_SESSION_MESSAGE_TEXT": "同意",
+        "HERMES_SESSION_INTERNAL": "false",
+        "HERMES_GRACE_CALLBACK_BOARD": "",
+        "HERMES_GRACE_CALLBACK_LEASE_OWNER": "",
+    })
+    replay = json.loads(handle_clawops_delegate(args))
+
+    assert replay["status"] == "approval_required"
+    assert replay["approval_token"] == challenge["approval_token"]
+    assert replay["exact_reply"] == challenge["exact_reply"]
+    with kb.connect_closing() as conn:
+        assert len(kb.list_tasks(conn)) == 2
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE grace_approval_challenges SET expires_at = 0 "
+                "WHERE token = ?",
+                (challenge["approval_token"],),
+            )
+
+    values.update({
+        "HERMES_SESSION_ID": "grace-session-2",
+        "HERMES_SESSION_MESSAGE_ID": "fresh-expired-refresh",
+        "HERMES_SESSION_MESSAGE_TEXT": "",
+    })
+    refresh_args = json.loads(json.dumps(args))
+    refresh_args["_approval_refresh_token"] = challenge["approval_token"]
+    refreshed = json.loads(handle_clawops_delegate(refresh_args))
+
+    assert refreshed["status"] == "approval_required"
+    assert refreshed["approval_token"] != challenge["approval_token"]
+    with kb.connect_closing() as conn:
+        refreshed_row = kb.get_grace_approval_challenge(
+            conn, refreshed["approval_token"],
+        )
+        assert refreshed_row["session_id"] == "grace-session-2"
+        assert len(kb.list_tasks(conn)) == 2
+
+    values.update({
+        "HERMES_SESSION_MESSAGE_ID": "fresh-rotated-session-approval",
+        "HERMES_SESSION_MESSAGE_TEXT": (
+            f"核准 {refreshed['approval_token']}"
+        ),
+    })
+    approval_args = json.loads(json.dumps(args))
+    approval_args["approval_token"] = refreshed["approval_token"]
+    queued = json.loads(handle_clawops_delegate(approval_args))
+
+    assert queued["status"] == "queued"
+    with kb.connect_closing() as conn:
+        approved_delegation = kb.get_grace_delegation(
+            conn, delegation_id=queued["delegation_id"],
+        )
+        assert approved_delegation["approval_required"] == 1
+        assert approved_delegation["state"] == "queued"
+        assert len(kb.list_tasks(conn)) == 4
 
 
 def test_delegate_rejects_unknown_topic_without_creating_task(tmp_path, monkeypatch):

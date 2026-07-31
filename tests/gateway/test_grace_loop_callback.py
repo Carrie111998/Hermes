@@ -99,6 +99,55 @@ class DroppedCallbackAdapter(CallbackAdapter):
         return None
 
 
+class PendingApprovalWithoutOutcomeAdapter(CallbackAdapter):
+    def __init__(self, *, expire_challenge=False, raise_after_create=False):
+        super().__init__()
+        self.expire_challenge = expire_challenge
+        self.raise_after_create = raise_after_create
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+        fields = {}
+        for line in event.text.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                fields[key] = value
+        with kb.connect_closing() as conn:
+            callback = kb.get_grace_loop_callback(
+                conn, fields["grace_review_task_id"],
+            )
+            challenge = kb.create_grace_approval_challenge(
+                conn,
+                contract_fingerprint="e" * 64,
+                request_instance_id="execution-blocker-approval",
+                platform="telegram",
+                chat_id="chat-1",
+                thread_id="2",
+                session_key="agent:main:telegram:group:chat-1:2",
+                session_id=callback["session_id"],
+                user_id_sha256="owner-hash",
+                requested_message_id="42",
+                action_summary="navigate Facebook Marketplace read-only",
+                approval_platform="Facebook Marketplace",
+                approval_scope='{"allowed":["navigate","click"],"forbidden":["write"]}',
+                origin_review_task_id=fields["grace_review_task_id"],
+                origin_event_id=int(fields["callback_event_id"]),
+                callback_lease_owner=callback["lease_owner"],
+            )
+            if self.expire_challenge:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        """
+                        UPDATE grace_approval_challenges
+                           SET expires_at = 0
+                         WHERE token = ?
+                        """,
+                        (challenge["token"],),
+                    )
+        if self.raise_after_create:
+            raise RuntimeError("synthetic failure after durable challenge")
+
+
 def _runner(
     adapter,
     *,
@@ -608,6 +657,208 @@ def test_blocked_execution_wakes_grace_once_without_claiming_review(tmp_path, mo
     review_event = adapter.handled[1]
     assert "callback_stage=grace_review" in review_event.text
     assert "validated_outcome=accepted" in review_event.text
+
+
+def test_execution_approval_challenge_requires_structured_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "execution-approval-outcome.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook read-only verification",
+            assignee="clawops-content",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="execution-approval-outcome",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="e" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="Facebook navigation needs read-only approval",
+            kind="needs_input",
+        )
+
+    adapter = PendingApprovalWithoutOutcomeAdapter()
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+        challenge_count = conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM grace_approval_challenges
+             WHERE origin_review_task_id = ?
+               AND origin_event_id = ?
+               AND state = 'pending'
+            """,
+            (review_id, adapter.handled[0].text.split(
+                "callback_event_id=", 1,
+            )[1].splitlines()[0]),
+        ).fetchone()[0]
+    assert len(adapter.handled) == 1
+    assert callback["state"] == "pending"
+    assert callback["last_event_id"] == 0
+    assert "durable checkpoint" in callback["last_error"]
+    assert challenge_count == 1
+
+
+def test_expired_execution_approval_challenge_still_requires_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "expired-execution-approval-outcome.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook read-only verification",
+            assignee="clawops-content",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="expired-execution-approval-outcome",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="e" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="Facebook navigation needs read-only approval",
+            kind="needs_input",
+        )
+
+    adapter = PendingApprovalWithoutOutcomeAdapter(expire_challenge=True)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "pending"
+    assert callback["last_event_id"] == 0
+    assert "durable checkpoint" in callback["last_error"]
+
+
+def test_exception_after_execution_challenge_preserves_checkpoint_requirement(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "failed-execution-approval-outcome.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect_closing(db_path) as conn:
+        execution_id = kb.create_task(
+            conn,
+            title="Facebook read-only verification",
+            assignee="clawops-content",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+        )
+        review_id = kb.create_task(
+            conn,
+            title="Grace review",
+            assignee="default",
+            body="GRACE_LOOP_CONTRACT_STAGE: grace_review",
+            parents=(execution_id,),
+        )
+        _bind_delegation(
+            conn,
+            execution_id,
+            review_id,
+            suffix="failed-execution-approval-outcome",
+        )
+        kb.add_grace_loop_callback(
+            conn,
+            review_task_id=review_id,
+            execution_task_id=execution_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="2",
+            user_id="kj",
+            session_key="agent:main:telegram:group:chat-1:2",
+            session_id="grace-session-1",
+            message_id="42",
+            contract_fingerprint="e" * 64,
+        )
+        assert kb.block_task(
+            conn,
+            execution_id,
+            reason="Facebook navigation needs read-only approval",
+            kind="needs_input",
+        )
+
+    adapter = PendingApprovalWithoutOutcomeAdapter(raise_after_create=True)
+    runner = _runner(
+        adapter,
+        session_key="agent:main:telegram:group:chat-1:2",
+        session_id="grace-session-1",
+    )
+    for _ in range(3):
+        asyncio.run(runner._deliver_due_grace_loop_callbacks(kb))
+
+    with kb.connect_closing(db_path) as conn:
+        callback = kb.get_grace_loop_callback(conn, review_id)
+    assert callback["state"] == "attention"
+    assert callback["last_event_id"] == 0
+    assert callback["delivered_at"] is None
+    assert "synthetic failure after durable challenge" in callback["last_error"]
 
 
 def test_callback_bounds_worker_authored_trigger_payload(tmp_path, monkeypatch):

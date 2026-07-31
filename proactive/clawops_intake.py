@@ -219,7 +219,14 @@ def create_clawops_task(
             bound_route = fresh_route
 
     approval_required = bool(
-        hubops_envelope and route_requires_owner_approval(hubops_envelope)
+        (
+            isinstance(contract, Mapping)
+            and list(contract.get("external_targets") or [])
+        )
+        or (
+            hubops_envelope
+            and route_requires_owner_approval(hubops_envelope)
+        )
     )
     delegation: Optional[dict[str, Any]] = None
     if contract is None or not contract_fingerprint or not delegation_id.strip():

@@ -1613,6 +1613,7 @@ CREATE TABLE IF NOT EXISTS grace_approval_challenges (
     action_summary       TEXT NOT NULL,
     approval_platform    TEXT NOT NULL,
     approval_scope       TEXT NOT NULL,
+    delegation_args      TEXT NOT NULL,
     origin_review_task_id TEXT,
     origin_event_id      INTEGER,
     state                TEXT NOT NULL DEFAULT 'pending',
@@ -2672,6 +2673,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             ("origin_event_id", "origin_event_id INTEGER"),
             ("approval_platform", "approval_platform TEXT"),
             ("approval_scope", "approval_scope TEXT"),
+            ("delegation_args", "delegation_args TEXT"),
         ):
             if column not in challenge_cols:
                 _add_column_if_missing(
@@ -11009,6 +11011,7 @@ def create_grace_approval_challenge(
     action_summary: str,
     approval_platform: str,
     approval_scope: str,
+    delegation_args: str = "",
     origin_review_task_id: str = "",
     origin_event_id: Optional[int] = None,
     callback_lease_owner: str = "",
@@ -11052,7 +11055,7 @@ def create_grace_approval_challenge(
                 raise ValueError(
                     "Callback lease owner requires a callback origin."
                 )
-            validate_accepted_grace_callback_origin(
+            validate_grace_callback_approval_origin(
                 conn,
                 review_task_id=clean_origin_review_id,
                 event_id=clean_origin_event_id,
@@ -11093,21 +11096,6 @@ def create_grace_approval_challenge(
                     or origin_row.get("approval_scope")
                     == approval_scope.strip()
                 )
-                if not (
-                    fingerprint_matches
-                    and request_matches
-                    and platform_matches
-                    and scope_matches
-                ):
-                    raise ValueError(
-                        "This Grace callback event already created another "
-                        "approval challenge."
-                    )
-                if (
-                    origin_row.get("state") == "pending"
-                    and int(origin_row.get("expires_at") or 0) > now
-                ):
-                    return origin_row
                 authorized = conn.execute(
                     """
                     SELECT 1
@@ -11118,6 +11106,100 @@ def create_grace_approval_challenge(
                     """,
                     (clean_origin_review_id, clean_origin_event_id),
                 ).fetchone()
+                if not (
+                    fingerprint_matches
+                    and request_matches
+                    and platform_matches
+                    and scope_matches
+                ):
+                    if (
+                        callback_lease_owner
+                        and origin_row.get("state") == "pending"
+                        and not origin_row.get("consumed_at")
+                        and authorized is None
+                        and is_grace_callback_execution_blocker_origin(
+                            conn,
+                            review_task_id=clean_origin_review_id,
+                            event_id=clean_origin_event_id,
+                            platform=platform,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            session_id=session_id,
+                            lease_owner=callback_lease_owner,
+                        )
+                    ):
+                        replacement_token = secrets.token_hex(8)
+                        conn.execute(
+                            """
+                            UPDATE grace_approval_challenges
+                               SET token = ?, contract_fingerprint = ?,
+                                   request_instance_id = ?, platform = ?,
+                                   chat_id = ?, thread_id = ?, session_key = ?,
+                                   session_id = ?, user_id_sha256 = ?,
+                                   requested_message_id = ?, action_summary = ?,
+                                   approval_platform = ?, approval_scope = ?,
+                                   delegation_args = ?,
+                                   state = 'pending', created_at = ?, expires_at = ?,
+                                   consumed_at = NULL, approved_message_id = NULL
+                             WHERE origin_review_task_id = ?
+                               AND origin_event_id = ?
+                               AND state = 'pending'
+                               AND consumed_at IS NULL
+                            """,
+                            (
+                                replacement_token,
+                                contract_fingerprint,
+                                request_instance_id.strip(),
+                                platform.strip().lower(),
+                                chat_id.strip(),
+                                (thread_id or "").strip(),
+                                session_key.strip(),
+                                session_id.strip(),
+                                user_id_sha256.strip(),
+                                requested_message_id.strip(),
+                                action_summary.strip(),
+                                approval_platform.strip(),
+                                approval_scope.strip(),
+                                delegation_args.strip(),
+                                now,
+                                expires_at,
+                                clean_origin_review_id,
+                                clean_origin_event_id,
+                            ),
+                        )
+                        replaced = conn.execute(
+                            "SELECT * FROM grace_approval_challenges "
+                            "WHERE token = ?",
+                            (replacement_token,),
+                        ).fetchone()
+                        if replaced is not None:
+                            return dict(replaced)
+                    raise ValueError(
+                        "This Grace callback event already created another "
+                        "approval challenge."
+                    )
+                if (
+                    origin_row.get("state") == "pending"
+                    and int(origin_row.get("expires_at") or 0) > now
+                ):
+                    if delegation_args.strip() and not str(
+                        origin_row.get("delegation_args") or ""
+                    ).strip():
+                        conn.execute(
+                            """
+                            UPDATE grace_approval_challenges
+                               SET delegation_args = ?
+                             WHERE token = ? AND state = 'pending'
+                            """,
+                            (delegation_args.strip(), origin_row["token"]),
+                        )
+                        refreshed = conn.execute(
+                            "SELECT * FROM grace_approval_challenges "
+                            "WHERE token = ?",
+                            (origin_row["token"],),
+                        ).fetchone()
+                        return dict(refreshed)
+                    return origin_row
                 if authorized is not None:
                     raise ValueError(
                         "This Grace callback event already authorized a "
@@ -11133,6 +11215,7 @@ def create_grace_approval_challenge(
                            session_id = ?, user_id_sha256 = ?,
                            requested_message_id = ?, action_summary = ?,
                            approval_platform = ?, approval_scope = ?,
+                           delegation_args = ?,
                            state = 'pending', created_at = ?, expires_at = ?,
                            consumed_at = NULL, approved_message_id = NULL
                      WHERE origin_review_task_id = ?
@@ -11152,6 +11235,7 @@ def create_grace_approval_challenge(
                         action_summary.strip(),
                         approval_platform.strip(),
                         approval_scope.strip(),
+                        delegation_args.strip(),
                         now,
                         expires_at,
                         clean_origin_review_id,
@@ -11197,6 +11281,22 @@ def create_grace_approval_challenge(
             ),
         ).fetchone()
         if existing is not None:
+            if delegation_args.strip() and not str(
+                existing["delegation_args"] or ""
+            ).strip():
+                conn.execute(
+                    """
+                    UPDATE grace_approval_challenges
+                       SET delegation_args = ?
+                     WHERE token = ? AND state = 'pending'
+                    """,
+                    (delegation_args.strip(), existing["token"]),
+                )
+                refreshed = conn.execute(
+                    "SELECT * FROM grace_approval_challenges WHERE token = ?",
+                    (existing["token"],),
+                ).fetchone()
+                return dict(refreshed)
             return dict(existing)
         token = secrets.token_hex(8)
         conn.execute(
@@ -11206,9 +11306,10 @@ def create_grace_approval_challenge(
                 platform, chat_id, thread_id,
                 session_key, session_id, user_id_sha256, requested_message_id,
                 action_summary, approval_platform, approval_scope,
+                delegation_args,
                 origin_review_task_id, origin_event_id,
                 created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 token,
@@ -11224,6 +11325,7 @@ def create_grace_approval_challenge(
                 action_summary.strip(),
                 approval_platform.strip(),
                 approval_scope.strip(),
+                delegation_args.strip(),
                 clean_origin_review_id or None,
                 clean_origin_event_id,
                 now,
@@ -11664,14 +11766,9 @@ def mark_grace_delegation_queued(
                     lease_owner=callback_lease_owner,
                 )
             elif int(existing.get("approval_required") or 0) == 1:
-                validate_completed_approval_blocker(
+                validate_consumed_grace_approval_origin(
                     conn,
-                    review_task_id=origin_review_id,
-                    event_id=int(origin_event_raw),
-                    platform=str(existing.get("platform") or ""),
-                    chat_id=str(existing.get("chat_id") or ""),
-                    thread_id=str(existing.get("thread_id") or ""),
-                    session_id=str(existing.get("session_id") or ""),
+                    delegation_id=delegation_id,
                 )
             else:
                 raise ValueError(
@@ -12073,6 +12170,95 @@ def validate_accepted_grace_callback_origin(
     return callback
 
 
+def validate_grace_callback_approval_origin(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+) -> dict:
+    """Require an active callback that may create an approval checkpoint.
+
+    A checkpoint may follow either an accepted Grace review or an execution
+    blocker. The latter is intentionally limited to an exact blocked or
+    loop-blocked execution event already fenced by the active callback lease;
+    crashes, timeouts, and gave-up events cannot mint approval checkpoints.
+    """
+    callback = validate_active_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+    if callback.get("lease_owner") != lease_owner.strip():
+        raise ValueError(
+            "Internal approval checkpoint is not owned by this callback lease."
+        )
+    trigger = conn.execute(
+        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    if (
+        trigger is not None
+        and trigger["task_id"] == callback.get("execution_task_id")
+        and trigger["kind"] in {"blocked", "block_loop_detected"}
+    ):
+        return callback
+    return validate_accepted_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+        lease_owner=lease_owner,
+    )
+
+
+def is_grace_callback_execution_blocker_origin(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    session_id: str,
+    lease_owner: str,
+) -> bool:
+    """Return whether the exact active callback was raised by execution."""
+    callback = validate_active_grace_callback_origin(
+        conn,
+        review_task_id=review_task_id,
+        event_id=event_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+    if callback.get("lease_owner") != lease_owner.strip():
+        raise ValueError(
+            "Internal callback classification is not owned by this lease."
+        )
+    trigger = conn.execute(
+        "SELECT task_id, kind FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    return bool(
+        trigger is not None
+        and trigger["task_id"] == callback.get("execution_task_id")
+        and trigger["kind"] in {"blocked", "block_loop_detected"}
+    )
+
+
 def validate_completed_approval_blocker(
     conn: sqlite3.Connection,
     *,
@@ -12116,6 +12302,60 @@ def validate_completed_approval_blocker(
     return dict(row)
 
 
+def validate_consumed_grace_approval_origin(
+    conn: sqlite3.Connection,
+    *,
+    delegation_id: str,
+) -> dict:
+    """Validate an approved saga against its consumed challenge and callback.
+
+    The authenticated approval session may be newer than the session that
+    delivered the original callback.  The consumed challenge is the durable
+    bridge between them, so every contract, route, identity, message, and
+    callback-origin field must agree while callback ``session_id`` may differ.
+    """
+    row = conn.execute(
+        """
+        SELECT c.*
+          FROM grace_delegations AS d
+          JOIN grace_approval_challenges AS a
+            ON a.token = d.challenge_token
+          JOIN grace_loop_callbacks AS c
+            ON c.review_task_id = d.origin_review_task_id
+         WHERE d.delegation_id = ?
+           AND d.approval_required = 1
+           AND d.contract_fingerprint = a.contract_fingerprint
+           AND d.request_instance_id = a.request_instance_id
+           AND d.platform = a.platform
+           AND d.chat_id = a.chat_id
+           AND d.thread_id = a.thread_id
+           AND d.session_key = a.session_key
+           AND d.session_id = a.session_id
+           AND d.user_id_sha256 = a.user_id_sha256
+           AND d.approved_message_id = a.approved_message_id
+           AND d.origin_review_task_id = a.origin_review_task_id
+           AND d.origin_event_id = a.origin_event_id
+           AND a.state = 'consumed'
+           AND a.consumed_at IS NOT NULL
+           AND c.execution_task_id IS NOT NULL
+           AND c.platform = d.platform
+           AND c.chat_id = d.chat_id
+           AND c.thread_id = d.thread_id
+           AND c.state = 'delivered'
+           AND c.last_event_id = d.origin_event_id
+           AND c.outcome_event_id = d.origin_event_id
+           AND c.outcome_kind = 'approval_blocked'
+        """,
+        (delegation_id.strip(),),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            "Approved Grace delegation is not bound to one exact consumed "
+            "challenge and delivered approval checkpoint."
+        )
+    return dict(row)
+
+
 def record_grace_loop_callback_outcome(
     conn: sqlite3.Connection,
     *,
@@ -12130,55 +12370,32 @@ def record_grace_loop_callback_outcome(
     payload: Mapping[str, Any],
 ) -> dict:
     """Persist the structured postcondition for one callback delivery."""
-    callback = validate_active_grace_callback_origin(
-        conn,
-        review_task_id=review_task_id,
-        event_id=event_id,
-        platform=platform,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        session_id=session_id,
-    )
-    if callback.get("lease_owner") != lease_owner.strip():
-        raise ValueError(
-            "Structured callback outcome is not owned by this callback lease."
-        )
-    trigger = conn.execute(
-        "SELECT task_id, kind FROM task_events WHERE id = ?",
-        (int(event_id),),
-    ).fetchone()
-    review_run = conn.execute(
-        """
-        SELECT metadata
-          FROM task_runs
-         WHERE task_id = ? AND outcome = 'completed'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (review_task_id.strip(),),
-    ).fetchone()
-    try:
-        review_metadata = (
-            json.loads(review_run["metadata"])
-            if review_run is not None and review_run["metadata"]
-            else {}
-        )
-    except (TypeError, ValueError):
-        review_metadata = {}
-    if (
-        trigger is None
-        or trigger["task_id"] != review_task_id.strip()
-        or trigger["kind"] != "completed"
-        or review_metadata.get("review_outcome") != "accepted"
-    ):
-        raise ValueError(
-            "Structured callback outcomes are allowed only for an accepted "
-            "Grace-review completion event."
-        )
     kind = str(outcome_kind or "").strip()
     if kind not in {"closed", "continued", "approval_blocked"}:
         raise ValueError(
             "Callback outcome must be closed, continued, or approval_blocked."
+        )
+    if kind == "approval_blocked":
+        callback = validate_grace_callback_approval_origin(
+            conn,
+            review_task_id=review_task_id,
+            event_id=event_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_id=session_id,
+            lease_owner=lease_owner,
+        )
+    else:
+        callback = validate_accepted_grace_callback_origin(
+            conn,
+            review_task_id=review_task_id,
+            event_id=event_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_id=session_id,
+            lease_owner=lease_owner,
         )
     clean_payload = dict(payload or {})
     payload_json = json.dumps(
@@ -12400,6 +12617,38 @@ def grace_loop_callback_has_outcome(
             int(event_id),
             lease_owner,
             int(event_id),
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def grace_loop_callback_has_approval_challenge(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    lease_owner: str,
+) -> bool:
+    """Return whether this active callback created an approval challenge."""
+    now = int(time.time())
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM grace_loop_callbacks AS c
+          JOIN grace_approval_challenges AS a
+            ON a.origin_review_task_id = c.review_task_id
+           AND a.origin_event_id = c.lease_event_id
+         WHERE c.review_task_id = ?
+           AND c.state = 'delivering'
+           AND c.lease_event_id = ?
+           AND c.lease_owner = ?
+           AND c.lease_expires > ?
+        """,
+        (
+            review_task_id.strip(),
+            int(event_id),
+            lease_owner,
+            now,
         ),
     ).fetchone()
     return row is not None

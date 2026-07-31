@@ -1096,6 +1096,24 @@ def _find_bound_clawops_approval_args(
     return None
 
 
+def _recover_bound_clawops_approval_args(
+    messages: List[Dict[str, Any]],
+    approval_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Recover approval args from history, then the authoritative durable row."""
+    recovered = _find_bound_clawops_approval_args(messages, approval_token)
+    if recovered is not None:
+        return recovered
+    try:
+        from plugins.openclaw_bridge.clawops_delegate import (
+            recover_clawops_approval_args,
+        )
+
+        return recover_clawops_approval_args(approval_token)
+    except (OSError, ValueError):
+        return None
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -10557,7 +10575,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _approval_token = approval_token_candidate(str(event.text or ""))
         if _approval_token:
-            recovered_args = _find_bound_clawops_approval_args(
+            recovered_args = _recover_bound_clawops_approval_args(
                 history, _approval_token,
             )
             _approval_records: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
