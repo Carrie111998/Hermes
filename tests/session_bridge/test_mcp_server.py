@@ -2384,6 +2384,26 @@ def test_sidebar_status_shapes_placement_without_secret_identity_fields() -> Non
         assert secret not in encoded
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    ("C:\\unsafe\x00path", "C:\\unsafe\x85path", "C:\\unsafe\u2028path", "C:\\unsafe\u2029path"),
+)
+def test_sidebar_status_omits_placement_with_unsafe_inbox_path(unsafe: str) -> None:
+    status = _sidebar_status({
+        "counts": {},
+        "placement": {
+            "inbox_cwd": unsafe,
+            "generation": 1,
+            "verified_visible": 1,
+            "mismatch_count": 0,
+            "canary": {"status": "passed", "verified_at": 1234.0},
+        },
+    })
+
+    assert "placement" not in status
+    assert unsafe not in json.dumps(status)
+
+
 def test_sidebar_status_preserves_only_broker_thresholds_and_identity() -> None:
     status = _sidebar_status({
         "counts": {"pending": 1},

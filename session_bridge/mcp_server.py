@@ -1673,13 +1673,7 @@ def _sidebar_placement_status(value: object) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
     inbox_cwd = value.get("inbox_cwd")
-    if (
-        type(inbox_cwd) is not str
-        or not inbox_cwd
-        or inbox_cwd != inbox_cwd.strip()
-        or "\n" in inbox_cwd
-        or "\r" in inbox_cwd
-    ):
+    if not is_canonical_sidebar_string(inbox_cwd):
         return None
     generation = _nonnegative_status_int(value.get("generation"), 0)
     if generation < 1:
