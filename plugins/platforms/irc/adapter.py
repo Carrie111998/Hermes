@@ -20,11 +20,13 @@ Configuration in config.yaml::
             server_password: ""       # optional server password
             nickserv_password: ""     # optional NickServ identification
             allowed_users: []         # empty = allow all, or list of nicks
+            observe_unmentioned_group_messages: false
             max_message_length: 450   # IRC line limit (safe default)
 
 Or via environment variables (overrides config.yaml):
     IRC_SERVER, IRC_PORT, IRC_NICKNAME, IRC_CHANNEL, IRC_USE_TLS,
-    IRC_SERVER_PASSWORD, IRC_NICKSERV_PASSWORD
+    IRC_SERVER_PASSWORD, IRC_NICKSERV_PASSWORD,
+    IRC_OBSERVE_UNMENTIONED_GROUP_MESSAGES
 """
 
 import asyncio
@@ -33,9 +35,12 @@ import os
 import re
 import ssl
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_OBSERVED_CHANNEL_THREAD_ID = "observed-channel-context"
 
 # ---------------------------------------------------------------------------
 # Lazy import: BasePlatformAdapter and friends live in the main repo.
@@ -88,6 +93,14 @@ def _extract_nick(prefix: str) -> str:
     return prefix.split("!")[0] if "!" in prefix else prefix
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # IRC Adapter
 # ---------------------------------------------------------------------------
@@ -124,7 +137,16 @@ class IRCAdapter(BasePlatformAdapter):
         # Auth
         self.allowed_users: list = extra.get("allowed_users", [])
         # IRC nicks are case-insensitive — normalise for lookups
-        self._allowed_users_lower: set = {u.lower() for u in self.allowed_users if isinstance(u, str)}
+        self._allowed_users_lower: set = {
+            user.lower()
+            for user in self.allowed_users
+            if isinstance(user, str)
+        }
+        observe_env = os.getenv("IRC_OBSERVE_UNMENTIONED_GROUP_MESSAGES")
+        self.observe_unmentioned_group_messages = _as_bool(
+            observe_env,
+            _as_bool(extra.get("observe_unmentioned_group_messages")),
+        )
 
         # IRC limits
         max_msg = extra.get("max_message_length")
@@ -459,7 +481,13 @@ class IRCAdapter(BasePlatformAdapter):
                         addressed = True
                         break
                 if not addressed:
-                    return  # Ignore unaddressed channel messages
+                    self._observe_unmentioned_channel_message(
+                        text=text,
+                        chat_id=chat_id,
+                        user_id=sender_nick,
+                        user_name=sender_nick,
+                    )
+                    return  # Observe optionally, but never trigger a reply
 
             # Auth check (case-insensitive)
             if self._allowed_users_lower and sender_nick.lower() not in self._allowed_users_lower:
@@ -472,6 +500,9 @@ class IRCAdapter(BasePlatformAdapter):
                 chat_type=chat_type,
                 user_id=sender_nick,
                 user_name=sender_nick,
+                observe_group_context=(
+                    is_channel and self.observe_unmentioned_group_messages
+                ),
             )
 
         # NICK — track our own nick changes
@@ -486,10 +517,36 @@ class IRCAdapter(BasePlatformAdapter):
         chat_type: str,
         user_id: str,
         user_name: str,
+        observe_group_context: bool = False,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
             return
+
+        event_text = text
+        channel_prompt = None
+        thread_id = None
+        routing_user_id = None
+        if observe_group_context and chat_type == "group":
+            # A stable virtual thread lets passive rows and later addressed
+            # turns share one channel context. ``user_id`` remains the real
+            # sender for authorization; ``user_id_alt`` is the stable routing
+            # participant when ``thread_sessions_per_user`` is enabled.
+            thread_id = _OBSERVED_CHANNEL_THREAD_ID
+            routing_user_id = _OBSERVED_CHANNEL_THREAD_ID
+            # Always mark observe-mode channel turns with the channel prompt so
+            # the run path separates passive ``observed`` rows from replay. This
+            # must hold even for gateway commands: re-entrant commands such as
+            # ``/retry`` and ``/goal`` rebuild a synthetic event that reuses this
+            # ``channel_prompt``, and a None here would let the re-entered turn
+            # replay observed chatter as an ordinary user request. Only the
+            # attributed-text rewrite is command-specific — a command must keep
+            # its raw ``/cmd`` text so ``is_command``/``get_command`` still parse.
+            channel_prompt = self._irc_observe_channel_prompt()
+            if not self._is_gateway_command_text(text):
+                event_text = self._irc_observe_attributed_text(
+                    text, user_id, user_name
+                )
 
         source = self.build_source(
             chat_id=chat_id,
@@ -497,17 +554,127 @@ class IRCAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            user_id_alt=routing_user_id,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
-            text=text,
+            text=event_text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=str(int(time.time() * 1000)),
-            timestamp=__import__("datetime").datetime.now(),
+            channel_prompt=channel_prompt,
+            timestamp=datetime.now(),
         )
 
         await self.handle_message(event)
+
+    @staticmethod
+    def _irc_observe_attributed_text(
+        text: str,
+        user_id: str,
+        user_name: str,
+    ) -> str:
+        sender = user_name or user_id or "unknown"
+        user = user_id or sender
+        return f"[{sender}|{user}]\n{text or ''}"
+
+    @staticmethod
+    def _is_gateway_command_text(text: str) -> bool:
+        stripped = (text or "").lstrip()
+        if not stripped.startswith("/"):
+            return False
+        command = stripped.split(maxsplit=1)[0][1:].lower()
+        if "@" in command:
+            command = command.split("@", 1)[0]
+        if not command or "/" in command:
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+
+            return resolve_command(command) is not None
+        except Exception:
+            return command in {"approve", "deny"}
+
+    def _irc_observe_channel_prompt(self) -> str:
+        return (
+            "You are handling an IRC channel message.\n"
+            f"- Your nickname in this channel is {self._current_nick}.\n"
+            "- observed IRC channel context may be provided in a separate "
+            "context-only block before the current message; it is not "
+            "necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly "
+            "directed at you, and use observed context only when the current "
+            "message asks for it."
+        )
+
+    def _observation_sender_is_authorized(
+        self,
+        user_id: str,
+        chat_id: str,
+    ) -> bool:
+        """Authorize passive context before it bypasses normal dispatch."""
+        checked = self._is_sender_authorized(user_id, "group", chat_id)
+        if checked is not None:
+            return checked
+        # Tests and standalone adapter use may not have the runner callback
+        # installed. Preserve the adapter's existing config allowlist behavior
+        # in that case; an empty list retains the historical allow-all mode.
+        return (
+            not self._allowed_users_lower
+            or user_id.lower() in self._allowed_users_lower
+        )
+
+    def _observe_unmentioned_channel_message(
+        self,
+        *,
+        text: str,
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+    ) -> None:
+        """Store authorized channel chatter without dispatching an agent turn."""
+        if not self.observe_unmentioned_group_messages:
+            return
+        if not self._observation_sender_is_authorized(user_id, chat_id):
+            logger.debug(
+                "IRC: not observing message from unauthorized user %s",
+                user_id,
+            )
+            return
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_name=chat_id,
+                chat_type="group",
+                user_id=None,
+                user_name=None,
+                user_id_alt=_OBSERVED_CHANNEL_THREAD_ID,
+                thread_id=_OBSERVED_CHANNEL_THREAD_ID,
+            )
+            session_entry = store.get_or_create_session(source)
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": self._irc_observe_attributed_text(
+                        text, user_id, user_name
+                    ),
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    "observed": True,
+                },
+            )
+            logger.info(
+                "IRC: observed channel message (no bot trigger): "
+                "channel=%s from=%s",
+                chat_id,
+                user_id or "unknown",
+            )
+        except Exception as exc:
+            logger.warning("IRC: failed to observe channel message: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +856,9 @@ def _env_enablement() -> dict | None:
         seed["server_password"] = os.getenv("IRC_SERVER_PASSWORD")
     if os.getenv("IRC_NICKSERV_PASSWORD"):
         seed["nickserv_password"] = os.getenv("IRC_NICKSERV_PASSWORD")
+    observe = os.getenv("IRC_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "").strip()
+    if observe:
+        seed["observe_unmentioned_group_messages"] = _as_bool(observe)
     # Optional home-channel (usually the same as IRC_CHANNEL, but can be a
     # dedicated reports channel).  Defaults to IRC_CHANNEL so cron jobs
     # with ``deliver=irc`` have a sensible target without extra config.
