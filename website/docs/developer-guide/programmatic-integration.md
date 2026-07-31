@@ -58,7 +58,7 @@ terminal.resize         clipboard.paste         image.attach
 
 ### Events streamed back
 
-`message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. Expiry events carry the original `{ request_id }`; external hosts should clear only the matching pending prompt.
+`message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `approval.responded`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. Approval events carry an opaque `approval_id`; external hosts must return it with the decision and clear only the matching prompt. Polling exposes the complete FIFO `pending_approvals` list as well as its first item in `pending_approval`. Expiry events carry the original `{ request_id }` for the same reason.
 
 ### Pi-style RPC mapping
 
@@ -92,7 +92,7 @@ POST /v1/responses               OpenAI Responses API (stateful)
 POST /v1/runs                    Start a run, returns run_id (202)
 GET  /v1/runs/{id}               Run status
 GET  /v1/runs/{id}/events        SSE stream of lifecycle events
-POST /v1/runs/{id}/approval      Resolve a pending approval
+POST /v1/runs/{id}/approval      Resolve one approval by approval_id
 POST /v1/runs/{id}/stop          Interrupt the run
 GET  /v1/capabilities            Machine-readable feature flags
 GET  /v1/models                  Lists hermes-agent

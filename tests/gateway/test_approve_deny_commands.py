@@ -156,6 +156,36 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_by_id_never_falls_back_to_fifo(self):
+        """An unknown request ID must leave every queued approval untouched."""
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, resolve_gateway_approval,
+        )
+
+        session_key = "test-exact-id"
+        first = _ApprovalEntry({"command": "first"})
+        second = _ApprovalEntry({"command": "second"})
+        _gateway_queues[session_key] = [first, second]
+
+        assert resolve_gateway_approval(
+            session_key,
+            "once",
+            approval_id="approval-expired",
+        ) == 0
+        assert _gateway_queues[session_key] == [first, second]
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+
+        assert resolve_gateway_approval(
+            session_key,
+            "deny",
+            approval_id=second.approval_id,
+        ) == 1
+        assert _gateway_queues[session_key] == [first]
+        assert not first.event.is_set()
+        assert second.event.is_set()
+        assert second.result == "deny"
+
 
 # ------------------------------------------------------------------
 # /approve command
