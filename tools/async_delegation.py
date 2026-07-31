@@ -571,6 +571,64 @@ def active_task_count() -> int:
         return total
 
 
+def active_ids() -> List[str]:
+    """Delegation ids currently running, for drain diagnostics."""
+    with _records_lock:
+        return [
+            did for did, r in _records.items()
+            if r.get("status") in {"running", "finalizing"}
+        ]
+
+
+def drain_active(
+    timeout: Optional[float],
+    *,
+    poll_interval: float = 2.0,
+    on_wait: Optional[Callable[[int, float], None]] = None,
+) -> int:
+    """Block until every in-flight async delegation finishes, or ``timeout``.
+
+    Background delegations run on a DAEMON executor (see ``_get_executor``),
+    so they are killed the instant the owning process exits. That is the
+    right trade for an interactive session — the user can quit — but a
+    one-shot ``hermes chat -q`` run (notably a kanban worker) reaches
+    ``sys.exit`` the moment its final turn returns and silently destroys
+    every child mid-flight. The gateway already refuses to scale to zero
+    while ``active_count() > 0``; this is the equivalent guard for the
+    short-lived process.
+
+    ``timeout=None`` waits indefinitely; ``timeout<=0`` returns immediately.
+    ``on_wait(remaining_count, elapsed)`` is invoked once per poll so the
+    caller can log progress.
+
+    Returns the number of delegations STILL running when we stopped waiting
+    (0 = fully drained). A non-zero return means the caller is about to
+    abandon them: on process exit they are picked up by
+    ``recover_abandoned_delegations`` and recorded as ``unknown`` rather
+    than vanishing without trace.
+    """
+    if timeout is not None and timeout <= 0:
+        return active_count()
+
+    started = time.monotonic()
+    while True:
+        remaining = active_count()
+        if remaining == 0:
+            return 0
+        elapsed = time.monotonic() - started
+        if timeout is not None and elapsed >= timeout:
+            return remaining
+        if on_wait is not None:
+            try:
+                on_wait(remaining, elapsed)
+            except Exception:  # noqa: BLE001 - never let logging break the drain
+                logger.debug("drain_active on_wait callback failed", exc_info=True)
+        sleep_for = poll_interval
+        if timeout is not None:
+            sleep_for = min(sleep_for, max(0.0, timeout - elapsed))
+        time.sleep(sleep_for)
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 

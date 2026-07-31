@@ -17484,6 +17484,89 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _drain_background_delegations() -> None:
+    """Wait for in-flight background subagents before a ``-q`` process exits.
+
+    ``delegate_task(background=true)`` children run on a daemon executor and
+    die the instant the owning process exits, so a one-shot run that reaches
+    ``sys.exit`` while a child is working destroys that work with no record
+    of what it had done.
+
+    The wait is bounded by the task's OWN deadline: kanban workers are
+    spawned with ``HERMES_KANBAN_DEADLINE_TS`` (epoch seconds), and the
+    dispatcher reclaims the task after it passes, so draining beyond it
+    would just get the worker killed anyway. A non-kanban ``-q`` run has no
+    deadline and waits indefinitely — it has no supervisor to answer to.
+
+    On timeout we exit anyway and let the survivors be classified by
+    ``recover_abandoned_delegations`` (owner PID gone → state ``unknown``),
+    which is strictly better than the current silent loss.
+
+    While draining we keep the kanban heartbeat fresh: a drain can outlast
+    the claim TTL, and a worker that is deliberately waiting must not look
+    like a hung one to ``release_stale_claims``.
+    """
+    try:
+        from tools.async_delegation import active_count, active_ids, drain_active
+    except Exception:
+        return
+
+    try:
+        if active_count() <= 0:
+            return
+    except Exception:
+        return
+
+    timeout: Optional[float] = None
+    deadline_raw = (os.environ.get("HERMES_KANBAN_DEADLINE_TS") or "").strip()
+    if deadline_raw:
+        try:
+            timeout = max(0.0, float(deadline_raw) - time.time())
+        except ValueError:
+            timeout = None
+
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+
+    def _on_wait(remaining: int, elapsed: float) -> None:
+        logger.info(
+            "waiting on %d background delegation(s) before exit "
+            "(%.0fs elapsed, ids=%s)",
+            remaining, elapsed, ",".join(active_ids()[:5]) or "?",
+        )
+        if not task_id:
+            return
+        # Keep the claim alive so a long drain isn't reaped as a stall.
+        try:
+            from hermes_cli import kanban_db as _kb
+            c = _kb.connect()
+            try:
+                _kb.heartbeat_claim(c, task_id)
+            finally:
+                c.close()
+        except Exception:
+            logger.debug("kanban heartbeat during delegation drain failed", exc_info=True)
+
+    try:
+        stranded = drain_active(timeout, on_wait=_on_wait)
+    except Exception:
+        logger.debug("background delegation drain failed", exc_info=True)
+        return
+
+    if stranded:
+        logger.warning(
+            "exiting with %d background delegation(s) still running after "
+            "%s; they will be recorded as 'unknown' by "
+            "recover_abandoned_delegations",
+            stranded,
+            f"{timeout:.0f}s" if timeout is not None else "the drain window",
+        )
+        print(
+            f"warning: {stranded} background delegation(s) still running at exit; "
+            "results will be marked unknown",
+            file=sys.stderr,
+        )
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -17943,6 +18026,19 @@ def main(
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+
+                        # Wait for background subagents before tearing down.
+                        #
+                        # delegate_task(background=true) children run on a
+                        # DAEMON executor, so sys.exit() below kills them
+                        # mid-flight. In an interactive session that's the
+                        # right trade (the user chose to quit); for a
+                        # one-shot -q run it silently destroys work the
+                        # model was told would finish. The gateway already
+                        # refuses to scale to zero while delegations are in
+                        # flight; this is the same guard for the short-lived
+                        # process.
+                        _drain_background_delegations()
 
                         # Ensure proper exit code for automation wrappers.
                         #
