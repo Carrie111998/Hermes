@@ -18035,7 +18035,11 @@ def main():
             # Build canonical row dicts and render with the shared table
             # renderer (same format as /sessions, /sessions search, and
             # `hermes sessions list`).
-            from hermes_cli.session_listing import render_sessions_table
+            from hermes_cli.session_listing import (
+                render_sessions_table,
+                session_rank_lookup,
+            )
+            rank_of = session_rank_lookup(db)
             table_rows = []
             for sid in sids_sorted:
                 meta = db.get_session(sid) or {}
@@ -18043,6 +18047,10 @@ def main():
                 row.update(meta)
                 row["id"] = sid
                 row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
+                # The # column shows the session's position in the canonical
+                # `hermes sessions list`, so the number on screen is the
+                # number /resume <N> accepts.
+                row["rank"] = rank_of.get(sid)
                 table_rows.append(row)
 
             print(f"⚙️  sessions search {query}\n")

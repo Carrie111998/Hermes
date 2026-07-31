@@ -911,10 +911,7 @@ class CLICommandsMixin:
             return
 
         # Any explicit /resume <target> supersedes a previously-armed bare
-        # numbered prompt, but the armed list stays the preferred resolution
-        # source for numbers — it matches what was just displayed (recent
-        # list, or search results), avoiding drift if sessions changed since.
-        armed = self._pending_resume_sessions
+        # numbered prompt.
         self._pending_resume_sessions = None
 
         if not self._session_db:
@@ -924,20 +921,19 @@ class CLICommandsMixin:
 
         # Resolve numbered selection, title, or ID
         if target.isdigit():
+            # The # column everywhere (search results included) is the
+            # session's position in the canonical sessions list, so resolve
+            # against that same list. The stored limit from a prior --limit
+            # keeps the bare-number flow consistent with what was displayed.
+            digit_limit = getattr(self, '_pending_resume_limit', 20)
+            sessions = self._list_recent_sessions(limit=digit_limit)
             index = int(target)
-            # Prefer the just-displayed list (search results or /resume list).
-            if armed and 1 <= index <= len(armed):
-                selected = armed[index - 1]
-                target_id = selected["id"]
-            else:
-                digit_limit = getattr(self, '_pending_resume_limit', 20)
-                sessions = self._list_recent_sessions(limit=digit_limit)
-                if index < 1 or index > len(sessions):
-                    _cprint(f"  Resume index {index} is out of range.")
-                    _cprint("  Use /resume with no arguments to see available sessions.")
-                    return
-                selected = sessions[index - 1]
-                target_id = selected["id"]
+            if index < 1 or index > len(sessions):
+                _cprint(f"  Resume index {index} is out of range.")
+                _cprint("  Use /resume with no arguments to see available sessions.")
+                return
+            selected = sessions[index - 1]
+            target_id = selected["id"]
         else:
             from hermes_cli.main import _resolve_session_by_name_or_id
             resolved = _resolve_session_by_name_or_id(target)
@@ -1225,7 +1221,11 @@ class CLICommandsMixin:
 
             # Build canonical row dicts and render with the shared table
             # renderer (same format as /sessions and hermes sessions list).
-            from hermes_cli.session_listing import render_sessions_table
+            from hermes_cli.session_listing import (
+                render_sessions_table,
+                session_rank_lookup,
+            )
+            rank_of = session_rank_lookup(self._session_db)
             table_rows = []
             for sid in sids_sorted:
                 meta = self._session_db.get_session(sid) or {}
@@ -1233,18 +1233,16 @@ class CLICommandsMixin:
                 row.update(meta)
                 row["id"] = sid
                 row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
+                # The # column shows the session's position in the canonical
+                # `hermes sessions list`, so the number on screen is the
+                # number /resume <N> accepts.
+                row["rank"] = rank_of.get(sid)
                 table_rows.append(row)
             render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
-            # Arm a one-shot numbered-resume selection against THESE results,
-            # so `/resume 2` (or just typing `2`) right after a search resumes
-            # search match #2 — the numbers on screen are the numbers that work.
-            self._pending_resume_sessions = table_rows
-            self._pending_resume_limit = search_limit
-
             _cprint("")
             _cprint("  Use /resume <number> (the # column above), /resume <session id>, or /resume <session title> to continue.")
-            _cprint("  Example: /resume 2")
+            _cprint("  Example: /resume 13")
             _cprint("")
             _cprint("  More: /sessions search <query>, /sessions -l <N>")
             _cprint("")

@@ -381,7 +381,10 @@ class TestHistoryDisplay:
         assert "Checking Running Hermes Agent" in output
         assert "20260401_201329_d85961" in output
         assert "/resume" in output
-        assert "Current preview" not in output
+        # One canonical list everywhere (same as `hermes sessions list`):
+        # the current session is included so the # column matches across
+        # surfaces and /resume <N> resolves the number on screen.
+        assert "Current preview" in output
 
     def test_resume_without_target_lists_recent_sessions(self, capsys):
         cli = _make_cli()

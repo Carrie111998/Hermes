@@ -7594,10 +7594,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         try:
             from hermes_cli.session_listing import query_session_listing
 
+            # Same query as `hermes sessions list` (all sources except tool,
+            # unnamed included, ordered by original start time) so the #
+            # column everywhere — /sessions, /resume, search results — is a
+            # position in one canonical list and /resume <N> resolves the
+            # number the user sees on screen.
             return query_session_listing(
                 self._session_db,
-                source="cli",
-                current_session_id=self.session_id,
+                source=None,
+                current_session_id=None,
                 include_all_sources=False,
                 include_unnamed=True,
                 limit=limit,

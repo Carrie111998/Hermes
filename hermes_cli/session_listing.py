@@ -121,6 +121,22 @@ def format_gateway_session_listing(
     return "\n".join(lines)
 
 
+def session_rank_lookup(
+    session_db: Any, *, limit: int = 500
+) -> dict[str, int]:
+    """Map session id -> position in the canonical `hermes sessions list`.
+
+    Uses the same query as ``hermes sessions list`` (all sources except
+    ``tool``, unnamed included, ordered by original start time with
+    compression chains projected to their live tip) so the ``#`` column in
+    search results shows the same numbers the user sees in the listing.
+    """
+    rows = session_db.list_sessions_rich(
+        source=None, exclude_sources=["tool"], limit=limit
+    )
+    return {r["id"]: i + 1 for i, r in enumerate(rows)}
+
+
 def render_sessions_table(
     sessions: list[dict[str, Any]],
     *,
@@ -168,11 +184,16 @@ def render_sessions_table(
         return f"{age // 86400}d"
 
     max_title = 0
+    max_num = 0
     for s in sessions:
         t = s.get("title") or ""
         if len(t) > max_title:
             max_title = len(t)
+        num = s.get("rank") or 0
+        if num > max_num:
+            max_num = num
     title_w = max(16, min(max_title, 50))
+    num_w = max(2, len(str(max_num)))
 
     # Resolve previews once per session id.
     previews: dict[str, str] = dict(preview_lookup or {})
@@ -207,10 +228,11 @@ def render_sessions_table(
             except Exception:
                 previews[sid] = s.get("preview") or ""
 
-    out(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
-    out(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
+    out(f"  {'#':>{num_w}}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
+    out(f"  {'─'*num_w}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
     for idx, s in enumerate(sessions, 1):
         sid = s.get("id") or "—"
+        num = s.get("rank") or idx
         title = (s.get("title") or "—")[:title_w]
         model_raw = s.get("model") or "—"
         model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
@@ -223,4 +245,4 @@ def render_sessions_table(
         pv = (previews.get(sid) or "")[:38]
         if len(previews.get(sid) or "") >= 38:
             pv = pv[:37] + "…"
-        out(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
+        out(f"  {num:>{num_w}}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
