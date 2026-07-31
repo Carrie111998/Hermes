@@ -38,7 +38,7 @@ import { $voicePlayback } from '@/store/voice-playback'
 // Stable empty identity for the settled-parts selector — a fresh [] per render
 // would re-derive the changed-files card on every message re-render.
 const EMPTY_PARTS: readonly unknown[] = []
-const MESSAGE_AGE_TICK_MS = 30_000
+const MESSAGE_AGE_TICK_MS = 1_000
 
 const messageAgeClockListeners = new Set<(nowMs: number) => void>()
 let messageAgeClockTimer: ReturnType<typeof setInterval> | null = null

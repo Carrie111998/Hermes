@@ -80,7 +80,23 @@ function Harness({
 }
 
 describe('MessageAge', () => {
-  it('advances relative age on the shared clock without an unrelated render', async () => {
+  it('advances second-level relative ages on the shared clock without an unrelated render', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-01T00:00:05.000Z'))
+
+    render(<Harness assistantCreatedAt={new Date('2026-05-01T00:00:00.000Z')} />)
+    await act(async () => {})
+
+    expect(screen.getByText('5s ago')).toBeTruthy()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+
+    expect(screen.getByText('6s ago')).toBeTruthy()
+  })
+
+  it('advances minute and hour relative ages on the shared clock without an unrelated render', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-05-01T00:08:00.000Z'))
 
