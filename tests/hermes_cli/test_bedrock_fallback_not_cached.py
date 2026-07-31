@@ -4,10 +4,13 @@
 When live discovery fails (expired AWS SSO, throttle, no creds yet),
 ``provider_model_ids("bedrock")`` returns the curated emergency stub. The old
 cache layer could not tell that stub from a live result, so it wrote the stub
-to disk with the full 1h TTL — and because the credential fingerprint is derived
-from ``AWS_PROFILE``/env (not token validity), a subsequent SSO refresh did not
-bust the entry. Result: ``/model`` showed only the ~10 offline entries for an
-hour, with current-generation models absent.
+to disk with the full 1h TTL — and because Bedrock declares no API-key env vars
+(``api_key_env_vars=()`` in ``PROVIDER_REGISTRY``) and AWS SSO tokens live
+outside ``$HERMES_HOME``, the cache fingerprint (built from a provider's API-key
+env vars, base URL, and the mtimes of ``$HERMES_HOME`` auth files) is unchanged
+by an SSO refresh, so re-auth did not bust the persisted stub. Result:
+``/model`` showed only the ~10 offline entries for an hour, with
+current-generation models absent.
 
 The fix threads a ``_provenance`` flag from the Bedrock branch so the cache
 layer serves the fallback in-memory only, letting the next picker open retry.
