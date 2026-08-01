@@ -9,7 +9,7 @@ import type {
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Streamdown } from 'streamdown'
 
-import { requestComposerFocus, requestComposerInsertRefs } from '@/app/chat/composer/focus'
+import { requestComposerInsertRefs } from '@/app/chat/composer/focus'
 import { HERMES_PATHS_MIME } from '@/app/chat/hooks/use-composer-actions'
 import { isAddSelectionShortcut } from '@/app/right-sidebar/terminal/selection'
 import { RichCodeBlock } from '@/components/assistant-ui/embeds'
@@ -40,8 +40,7 @@ import { notifyWorkspaceChanged } from '@/store/workspace-events'
 
 import {
   type LineSelection,
-  lineSelectionFromSelectedText,
-  preferOffsetFromRange,
+  lineSelectionFromHostRange,
   readHostTextSelection,
   retainPreviewAddShortcutClaim,
   sourceLineSelectionRef
@@ -505,15 +504,25 @@ function PreviewAddToChatFrame({
     if (live) {
       const rect = live.range.getBoundingClientRect()
 
-      placeChipAtClient(rect.right, rect.bottom)
+      if (rect.width > 0 || rect.height > 0) {
+        placeChipAtClient(rect.right, rect.bottom)
 
-      return
+        return
+      }
     }
 
     const pointer = lastPointerRef.current
 
     if (pointer) {
       placeChipAtClient(pointer.x, pointer.y)
+
+      return
+    }
+
+    if (frame) {
+      const frameRect = frame.getBoundingClientRect()
+
+      placeChipAtClient(frameRect.left + 12, frameRect.top + 12)
     }
   }, [placeChipAtClient])
 
@@ -540,8 +549,7 @@ function PreviewAddToChatFrame({
       }
 
       const source = getSourceText?.() ?? ''
-      const preferOffset = source ? preferOffsetFromRange(source, frame, live.range) : undefined
-      const resolved = source ? lineSelectionFromSelectedText(source, live.text, preferOffset) : null
+      const resolved = source ? lineSelectionFromHostRange(source, frame, live.range, live.text) : null
 
       if (!resolved) {
         clearTextLineSelection()
@@ -550,6 +558,9 @@ function PreviewAddToChatFrame({
       }
 
       if (opts?.fromKeyboard) {
+        placeChipForKeyboardSelection()
+      } else if (!lastPointerRef.current) {
+        // mouseup usually pins the chip; keep a geometry fallback if it didn't.
         placeChipForKeyboardSelection()
       }
 
@@ -622,7 +633,10 @@ function PreviewAddToChatFrame({
       // line/text node after a drag that started in the preview.
       lastPointerRef.current = { x: event.clientX, y: event.clientY }
       placeChipAtClient(event.clientX, event.clientY)
+      // Publish now and once more after paint — double-click / some drag
+      // releases settle the Selection after mouseup.
       publishTextLineSelection()
+      requestAnimationFrame(() => publishTextLineSelection())
     }
 
     const onKeyUp = (event: KeyboardEvent) => {
@@ -661,8 +675,9 @@ function PreviewAddToChatFrame({
         return false
       }
 
+      // insertInlineRefs already focuses the composer — a second
+      // requestComposerFocus stacks rAF/timeout focus and flashes the dock.
       requestComposerInsertRefs([ref])
-      requestComposerFocus('active')
       triggerHaptic('selection')
 
       return true
@@ -671,32 +686,38 @@ function PreviewAddToChatFrame({
   )
 
   const addLineSelectionToChat = useCallback(() => {
-    if (!lineSelection || !insertLineRef(lineSelection)) {
+    if (!lineSelection) {
       return false
     }
 
-    onConsumeLineSelection?.()
+    const selection = lineSelection
 
-    return true
-  }, [insertLineRef, lineSelection, onConsumeLineSelection])
+    // Clear preview chrome before the composer paints so unmount + insert
+    // don't share a frame (and so insert won't see the preview selection).
+    onConsumeLineSelection?.()
+    window.getSelection()?.removeAllRanges()
+    clearTextLineSelection()
+
+    return insertLineRef(selection)
+  }, [clearTextLineSelection, insertLineRef, lineSelection, onConsumeLineSelection])
 
   const addTextSelectionToChat = useCallback(() => {
     const frame = frameRef.current
     const live = frame ? readHostTextSelection(frame) : null
     const source = getSourceText?.() ?? ''
-    const preferOffset = frame && live && source ? preferOffsetFromRange(source, frame, live.range) : undefined
+
     const resolved =
       textLineSelection ||
-      (live && source ? lineSelectionFromSelectedText(source, live.text, preferOffset) : null)
+      (frame && live && source ? lineSelectionFromHostRange(source, frame, live.range, live.text) : null)
 
-    if (!resolved || !insertLineRef(resolved)) {
+    if (!resolved) {
       return false
     }
 
     window.getSelection()?.removeAllRanges()
     clearTextLineSelection()
 
-    return true
+    return insertLineRef(resolved)
   }, [clearTextLineSelection, getSourceText, insertLineRef, textLineSelection])
 
   const addSelectionToChat = useCallback(() => {

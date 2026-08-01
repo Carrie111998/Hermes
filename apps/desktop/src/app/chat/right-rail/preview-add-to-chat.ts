@@ -97,7 +97,53 @@ export function lineSelectionFromSelectedText(
 /** Marks the preview Add-to-Chat frame so the terminal can defer ⌘/Ctrl+L. */
 export const PREVIEW_ADD_TO_CHAT_ATTR = 'data-preview-add-to-chat'
 
-/** Live window selection that belongs to `host` (collapsed / outside → null). */
+function nodeInsideHost(host: HTMLElement, node: Node): boolean {
+  return node === host || host.contains(node)
+}
+
+/** Clip `range` to `host` contents when a drag ends outside the frame. */
+function clipRangeToHost(host: HTMLElement, range: Range): Range | null {
+  const startIn = nodeInsideHost(host, range.startContainer)
+  const endIn = nodeInsideHost(host, range.endContainer)
+
+  if (startIn && endIn) {
+    return range
+  }
+
+  if (!startIn && !endIn) {
+    try {
+      if (!range.intersectsNode(host)) {
+        return null
+      }
+    } catch {
+      return null
+    }
+
+    const wrapped = document.createRange()
+
+    wrapped.selectNodeContents(host)
+
+    return wrapped.collapsed ? null : wrapped
+  }
+
+  const hostRange = document.createRange()
+
+  hostRange.selectNodeContents(host)
+
+  const clipped = range.cloneRange()
+
+  if (!startIn) {
+    clipped.setStart(hostRange.startContainer, hostRange.startOffset)
+  }
+
+  if (!endIn) {
+    clipped.setEnd(hostRange.endContainer, hostRange.endOffset)
+  }
+
+  return clipped.collapsed ? null : clipped
+}
+
+/** Live window selection that intersects `host` (collapsed / outside → null). */
 export function readHostTextSelection(host: HTMLElement): { range: Range; text: string } | null {
   const selection = window.getSelection()
 
@@ -105,35 +151,76 @@ export function readHostTextSelection(host: HTMLElement): { range: Range; text: 
     return null
   }
 
-  const range = selection.getRangeAt(0)
-  const anchor = range.commonAncestorContainer
-  const node = anchor.nodeType === Node.TEXT_NODE ? anchor.parentNode : anchor
+  const clipped = clipRangeToHost(host, selection.getRangeAt(0))
 
-  if (!(node instanceof Node) || !host.contains(node)) {
+  if (!clipped) {
     return null
   }
 
-  const text = selection.toString()
+  const text = clipped.toString()
 
   if (!text.trim()) {
     return null
   }
 
-  return { range, text }
+  return { range: clipped, text }
 }
 
-/** True when the live window selection is inside a preview Add-to-Chat frame. */
+/** True when the live window selection intersects a preview Add-to-Chat frame. */
 export function selectionBelongsToPreviewAddToChat(): boolean {
   const selection = window.getSelection()
 
-  if (!selection || selection.isCollapsed || selection.rangeCount === 0 || !selection.toString().trim()) {
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
     return false
   }
 
-  const anchor = selection.getRangeAt(0).commonAncestorContainer
-  const node = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor
+  for (const frame of document.querySelectorAll<HTMLElement>(`[${PREVIEW_ADD_TO_CHAT_ATTR}]`)) {
+    if (readHostTextSelection(frame)) {
+      return true
+    }
+  }
 
-  return node instanceof Element && Boolean(node.closest(`[${PREVIEW_ADD_TO_CHAT_ATTR}]`))
+  return false
+}
+
+/**
+ * Resolve a DOM range to source lines. Prefers exact selected-text match; when
+ * the rendered DOM diverges (virtualized chunks, highlighting, drag past the
+ * frame), falls back to gutter / prefix offsets from the range geometry.
+ */
+export function lineSelectionFromHostRange(
+  fullText: string,
+  host: HTMLElement,
+  range: Range,
+  selectedText?: string
+): LineSelection | null {
+  const text = selectedText ?? range.toString()
+  const preferOffset = preferOffsetFromRange(fullText, host, range)
+  const fromText = lineSelectionFromSelectedText(fullText, text, preferOffset)
+
+  if (fromText) {
+    return fromText
+  }
+
+  const startRange = range.cloneRange()
+
+  startRange.collapse(true)
+
+  const endRange = range.cloneRange()
+
+  endRange.collapse(false)
+
+  const startOffset = preferOffsetFromRange(fullText, host, startRange) ?? preferOffset
+  const endOffset = preferOffsetFromRange(fullText, host, endRange) ?? preferOffset
+
+  if (startOffset == null && endOffset == null) {
+    return null
+  }
+
+  const start = startOffset ?? endOffset ?? 0
+  const end = Math.max((endOffset ?? start) + 1, start + 1)
+
+  return lineSelectionFromOffsets(fullText, start, end)
 }
 
 /** Char offset of the start of a 1-based line in newline-normalized text. */

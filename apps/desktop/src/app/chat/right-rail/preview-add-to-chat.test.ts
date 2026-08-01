@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  lineSelectionFromHostRange,
   lineSelectionFromOffsets,
   lineSelectionFromSelectedText,
   offsetOfLineStart,
@@ -170,5 +171,56 @@ describe('readHostTextSelection', () => {
     selection.addRange(range)
 
     expect(readHostTextSelection(host)).toBeNull()
+  })
+
+  it('keeps a drag that starts in the host but ends outside (commonAncestor leaves the frame)', () => {
+    const host = document.createElement('div')
+    const span = document.createElement('span')
+    span.textContent = 'inside selection'
+    host.appendChild(span)
+    const outsider = document.createElement('span')
+    outsider.textContent = ' and outside'
+    document.body.append(host, outsider)
+
+    const range = document.createRange()
+    range.setStart(span.firstChild!, 0)
+    range.setEnd(outsider.firstChild!, outsider.textContent!.length)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    // commonAncestor is body — the old contains(commonAncestor) check dropped these.
+    expect(host.contains(range.commonAncestorContainer)).toBe(false)
+    expect(readHostTextSelection(host)?.text).toBe('inside selection')
+    expect(selectionBelongsToPreviewAddToChat()).toBe(false)
+
+    host.setAttribute(PREVIEW_ADD_TO_CHAT_ATTR, '')
+    expect(selectionBelongsToPreviewAddToChat()).toBe(true)
+  })
+})
+
+describe('lineSelectionFromHostRange', () => {
+  it('falls back to gutter markers when DOM text does not match source', () => {
+    const source = 'alpha\nbeta\ngamma\n'
+    const host = document.createElement('div')
+    const gutter = document.createElement('div')
+    gutter.dataset.previewLine = '2'
+    Object.defineProperty(gutter, 'getBoundingClientRect', {
+      value: () => ({ top: 20, bottom: 30, height: 10, left: 0, right: 10, width: 10, x: 0, y: 20, toJSON: () => ({}) })
+    })
+    // Simulated virtualized / highlighted DOM that dropped the newline between lines.
+    const span = document.createElement('span')
+    span.textContent = 'alphabeta'
+    host.append(gutter, span)
+    document.body.appendChild(host)
+
+    const range = document.createRange()
+    range.selectNodeContents(span)
+    Object.defineProperty(range, 'getBoundingClientRect', {
+      value: () => ({ top: 22, bottom: 28, height: 6, left: 20, right: 80, width: 60, x: 20, y: 22, toJSON: () => ({}) })
+    })
+
+    expect(lineSelectionFromSelectedText(source, range.toString())).toBeNull()
+    expect(lineSelectionFromHostRange(source, host, range)).toEqual({ end: 2, start: 2 })
   })
 })
