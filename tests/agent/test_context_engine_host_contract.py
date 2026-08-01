@@ -90,6 +90,7 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     db.create_session("new-sid", source="cli")
     db.record_compression_failure_cooldown("old-sid", 4_000_000_000.0, "old-timeout")
     db.set_compression_fallback_streak("old-sid", 2)
+    db.set_compression_count("old-sid", 3)
 
     monkeypatch.setattr(
         "agent.context_compressor.get_model_context_length",
@@ -112,15 +113,104 @@ def test_reset_session_state_rebinds_builtin_compressor_after_session_switch(tmp
     agent.reset_session_state()
 
     assert compressor._session_id == "new-sid"
+    assert compressor.compression_count == 0
     assert compressor.get_active_compression_failure_cooldown() is None
     assert compressor._fallback_compression_streak == 0
     assert db.get_compression_failure_cooldown("old-sid") is not None
     assert db.get_compression_fallback_streak("old-sid") == 2
+    assert db.get_compression_count("old-sid") == 3
 
     compressor._record_compression_failure_cooldown(30.0, "new-timeout")
 
     assert db.get_compression_failure_cooldown("new-sid") is not None
     assert db.get_compression_failure_cooldown("old-sid")["error"] == "old-timeout"
+
+
+def test_builtin_compressor_restores_and_persists_compression_count(tmp_path, monkeypatch):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("sid", source="acp")
+    db.set_compression_count("sid", 2)
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_a, **_k: 100_000,
+    )
+    compressor = ContextCompressor(
+        model="fake-model",
+        threshold_percent=0.85,
+        protect_first_n=2,
+        protect_last_n=2,
+        quiet_mode=True,
+    )
+
+    compressor.bind_session_state(db, "sid")
+    assert compressor.compression_count == 2
+
+    compressor.compression_count += 1
+    compressor.record_completed_compaction()
+    assert db.get_compression_count("sid") == 3
+
+
+def test_builtin_compressor_carries_newest_count_across_rotation(tmp_path, monkeypatch):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent", source="acp")
+    db.set_compression_count("parent", 1)
+    db.create_session("child", source="acp", parent_session_id="parent")
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_a, **_k: 100_000,
+    )
+    compressor = ContextCompressor(
+        model="fake-model",
+        threshold_percent=0.85,
+        protect_first_n=2,
+        protect_last_n=2,
+        quiet_mode=True,
+    )
+    compressor.bind_session_state(db, "parent")
+    compressor.compression_count += 1
+
+    compressor.on_session_start(
+        "child",
+        session_db=db,
+        boundary_reason="compression",
+        old_session_id="parent",
+    )
+
+    assert compressor.compression_count == 2
+    assert db.get_compression_count("child") == 2
+
+
+def test_builtin_compressor_does_not_downgrade_newer_child_count_on_rotation(
+    tmp_path, monkeypatch,
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent", source="acp")
+    db.set_compression_count("parent", 1)
+    db.create_session("child", source="acp", parent_session_id="parent")
+    db.set_compression_count("child", 4)
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_a, **_k: 100_000,
+    )
+    compressor = ContextCompressor(
+        model="fake-model",
+        threshold_percent=0.85,
+        protect_first_n=2,
+        protect_last_n=2,
+        quiet_mode=True,
+    )
+    compressor.bind_session_state(db, "parent")
+    compressor.compression_count = 2
+
+    compressor.on_session_start(
+        "child",
+        session_db=db,
+        boundary_reason="compression",
+        old_session_id="parent",
+    )
+
+    assert compressor.compression_count == 4
+    assert db.get_compression_count("child") == 4
 
 
 def test_update_from_response_forwards_canonical_cache_buckets():
