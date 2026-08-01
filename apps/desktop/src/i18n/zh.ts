@@ -2580,6 +2580,7 @@ export const zh: Translations = {
     folder: '文件夹…',
     images: '图片…',
     pasteImage: '粘贴图片',
+    pasteAsFile: 'Paste clipboard as file',
     url: 'URL…',
     promptSnippets: '提示词片段…',
     tipPre: '提示：输入 ',
@@ -3550,6 +3551,7 @@ export const zh: Translations = {
     attachImages: '附加图片',
     clipboard: '剪贴板',
     noClipboardImage: '剪贴板中没有图片',
+    noClipboardText: 'No text in clipboard',
     clipboardPasteFailed: '粘贴剪贴板失败',
     dropFiles: '拖放文件',
     handoff: {

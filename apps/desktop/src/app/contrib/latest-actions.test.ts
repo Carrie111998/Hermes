@@ -17,6 +17,7 @@ function makeChatActions(): ChatActions {
     onDismissError: vi.fn(),
     onEdit: vi.fn(),
     onPasteClipboardImage: vi.fn(),
+    onPasteClipboardText: vi.fn(),
     onPickFiles: vi.fn(),
     onPickFolders: vi.fn(),
     onPickImages: vi.fn(),

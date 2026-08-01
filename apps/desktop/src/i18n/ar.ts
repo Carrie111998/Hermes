@@ -1893,6 +1893,7 @@ export const ar = defineLocale({
     folder: 'مجلد',
     images: 'صور',
     pasteImage: 'لصق صورة',
+    pasteAsFile: 'Paste clipboard as file',
     url: 'رابط',
     promptSnippets: 'مقتطفات جاهزة',
     tipPre: 'نصيحة: اكتب ',
@@ -2803,6 +2804,7 @@ export const ar = defineLocale({
     attachImages: 'إرفاق الصور',
     clipboard: 'الحافظة',
     noClipboardImage: 'لا توجد صورة في الحافظة',
+    noClipboardText: 'No text in clipboard',
     clipboardPasteFailed: 'فشل اللصق من الحافظة',
     dropFiles: 'أفلت الملفات هنا',
     handoff: {

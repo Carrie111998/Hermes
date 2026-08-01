@@ -5737,6 +5737,24 @@ async function writeComposerImage(buffer, ext = '.png') {
   return filePath
 }
 
+async function writeComposerText(text) {
+  const preview = String(text || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, 30)
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
+    .trim()
+  const safePreview = preview.replace(/[. ]+$/, '') || 'clipboard'
+  const dir = path.join(app.getPath('userData'), 'composer-files')
+  await fs.promises.mkdir(dir, { recursive: true })
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
+  const random = crypto.randomBytes(3).toString('hex')
+  const filePath = path.join(dir, `${safePreview}_${stamp}_${random}.txt`)
+  await fs.promises.writeFile(filePath, text, 'utf8')
+
+  return filePath
+}
+
 function previewLabelForUrl(url) {
   return `${url.host}${url.pathname === '/' ? '' : url.pathname}`
 }
@@ -14527,6 +14545,12 @@ ipcMain.handle('hermes:saveClipboardImage', async () => {
   }
 
   return ''
+})
+
+ipcMain.handle('hermes:saveClipboardText', async () => {
+  const text = clipboard.readText()
+
+  return text.trim() ? writeComposerText(text) : ''
 })
 
 ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>

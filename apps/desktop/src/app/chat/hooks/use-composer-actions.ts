@@ -588,6 +588,28 @@ export function useComposerActions({
     [attachImagePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardImage]
   )
 
+  const pasteClipboardText = useCallback(async () => {
+    try {
+      const path = await window.hermesDesktop?.saveClipboardText()
+
+      if (!path) {
+        notify({
+          kind: 'warning',
+          title: copy.clipboard,
+          message: copy.noClipboardText
+        })
+
+        return false
+      }
+
+      return attachContextFilePath(path)
+    } catch (err) {
+      notifyError(err, copy.clipboardPasteFailed)
+
+      return false
+    }
+  }, [attachContextFilePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardText])
+
   const attachContextFolderPath = useCallback(
     (folderPath: string) => {
       if (!folderPath) {
@@ -734,6 +756,7 @@ export function useComposerActions({
     attachPrCommentUrl,
     insertContextPathInlineRef,
     pasteClipboardImage,
+    pasteClipboardText,
     pickContextPaths,
     pickImages,
     removeAttachment

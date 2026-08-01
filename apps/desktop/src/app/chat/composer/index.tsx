@@ -98,6 +98,7 @@ export function ChatBar({
   onAttachImageBlob,
   onAttachPrCommentUrl,
   onPasteClipboardImage,
+  onPasteClipboardText,
   onPickFiles,
   onPickFolders,
   onPickImages,
@@ -965,6 +966,7 @@ export function ChatBar({
       onInsertText={insertText}
       onOpenUrlDialog={openUrlDialog}
       onPasteClipboardImage={onPasteClipboardImage}
+      onPasteClipboardText={onPasteClipboardText}
       onPickFiles={onPickFiles}
       onPickFolders={onPickFolders}
       onPickImages={onPickImages}

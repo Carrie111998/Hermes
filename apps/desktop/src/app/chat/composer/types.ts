@@ -50,6 +50,7 @@ export interface ChatBarProps {
    *  Returns true when the paste was consumed as an attachment. */
   onAttachPrCommentUrl?: (url: string) => boolean
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void
+  onPasteClipboardText?: () => Promise<boolean> | void
   onPickFiles?: () => void
   onPickFolders?: () => void
   onPickImages?: () => void

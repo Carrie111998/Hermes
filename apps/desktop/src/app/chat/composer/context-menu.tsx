@@ -29,6 +29,7 @@ export function ContextMenu({
   onInsertText,
   onOpenUrlDialog,
   onPasteClipboardImage,
+  onPasteClipboardText,
   onPickFiles,
   onPickFolders,
   onPickImages
@@ -83,6 +84,13 @@ export function ContextMenu({
             onSelect={onPasteClipboardImage ? () => void onPasteClipboardImage() : undefined}
           >
             {c.pasteImage}
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={!onPasteClipboardText}
+            icon={FileText}
+            onSelect={onPasteClipboardText ? () => void onPasteClipboardText() : undefined}
+          >
+            {c.pasteAsFile}
           </ContextMenuItem>
           <ContextMenuItem icon={Link} onSelect={onOpenUrlDialog}>
             {c.url}
@@ -188,6 +196,7 @@ interface ContextMenuProps {
   onInsertText: (text: string) => void
   onOpenUrlDialog: () => void
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void
+  onPasteClipboardText?: () => Promise<boolean> | void
   onPickFiles?: () => void
   onPickFolders?: () => void
   onPickImages?: () => void

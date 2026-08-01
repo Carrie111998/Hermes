@@ -2100,6 +2100,7 @@ export const ja = defineLocale({
     folder: 'フォルダー…',
     images: '画像…',
     pasteImage: '画像を貼り付け',
+    pasteAsFile: 'Paste clipboard as file',
     url: 'URL…',
     promptSnippets: 'プロンプトスニペット…',
     tipPre: 'ヒント: ',
@@ -3055,6 +3056,7 @@ export const ja = defineLocale({
     attachImages: '画像を添付',
     clipboard: 'クリップボード',
     noClipboardImage: 'クリップボードに画像が見つかりません',
+    noClipboardText: 'No text in clipboard',
     clipboardPasteFailed: 'クリップボードからの貼り付けに失敗しました',
     dropFiles: 'ファイルをドロップ',
     handoff: {

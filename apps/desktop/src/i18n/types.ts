@@ -2031,6 +2031,7 @@ export interface Translations {
     folder: string
     images: string
     pasteImage: string
+    pasteAsFile: string
     url: string
     promptSnippets: string
     tipPre: string
@@ -2927,6 +2928,7 @@ export interface Translations {
     attachImages: string
     clipboard: string
     noClipboardImage: string
+    noClipboardText: string
     clipboardPasteFailed: string
     dropFiles: string
     handoff: {

@@ -2400,6 +2400,7 @@ export const en: Translations = {
     folder: 'Folder…',
     images: 'Images…',
     pasteImage: 'Paste image',
+    pasteAsFile: 'Paste clipboard as file',
     url: 'URL…',
     promptSnippets: 'Prompt snippets…',
     tipPre: 'Tip: type ',
@@ -3406,6 +3407,7 @@ export const en: Translations = {
     attachImages: 'Attach images',
     clipboard: 'Clipboard',
     noClipboardImage: 'No image found in clipboard',
+    noClipboardText: 'No text in clipboard',
     clipboardPasteFailed: 'Clipboard paste failed',
     dropFiles: 'Drop files',
     handoff: {
