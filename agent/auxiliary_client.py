@@ -3028,6 +3028,21 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     return CodexAuxiliaryClient(real_client, model), model
 
 
+def _normalize_aux_api_mode(value: Any) -> Optional[str]:
+    """Canonicalize auxiliary api_mode values through the runtime parser."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        from hermes_cli.runtime_provider import _parse_api_mode
+
+        return _parse_api_mode(raw) or raw.lower()
+    except Exception:
+        return raw.lower()
+
+
 def _try_azure_foundry(
     *,
     model: Optional[str] = None,
@@ -3089,7 +3104,11 @@ def _try_azure_foundry(
 
     api_key = runtime.get("api_key")
     base_url = str(runtime.get("base_url", "") or "")
-    runtime_api_mode = api_mode or runtime.get("api_mode") or "chat_completions"
+    runtime_api_mode = (
+        _normalize_aux_api_mode(api_mode)
+        or _normalize_aux_api_mode(runtime.get("api_mode"))
+        or "chat_completions"
+    )
 
     # Empty-string check on api_key here would be wrong for callable
     # token providers (callables are truthy and non-empty by definition).
@@ -3946,6 +3965,7 @@ def _retry_same_provider_sync(
             model=final_model,
             base_url=resolved_base_url,
             api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
             async_mode=False,
         )
     else:
@@ -4018,6 +4038,7 @@ async def _retry_same_provider_async(
             model=final_model,
             base_url=resolved_base_url,
             api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
             async_mode=True,
         )
     else:
@@ -5379,8 +5400,9 @@ def resolve_provider_client(
     # which aliases to "kimi-coding") is still reachable via the named-custom
     # branch below.
     original_provider = (provider or "").strip().lower()
-    # Normalise aliases
+    # Normalise aliases and user-facing api_mode spellings.
     provider = _normalize_aux_provider(provider)
+    api_mode = _normalize_aux_api_mode(api_mode)
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -6287,6 +6309,7 @@ def resolve_vision_provider_client(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
     async_mode: bool = False,
     main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
@@ -6301,6 +6324,8 @@ def resolve_vision_provider_client(
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
     )
+    if api_mode is not None:
+        resolved_api_mode = _normalize_aux_api_mode(api_mode)
     requested = _normalize_vision_provider(requested)
 
     def _finalize(resolved_provider: str, sync_client: Any, default_model: Optional[str]):
@@ -7005,7 +7030,7 @@ def _resolve_task_provider_model(
             ).strip()
             if cfg_key_env:
                 cfg_api_key = os.getenv(cfg_key_env, "").strip() or None
-        cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
+        cfg_api_mode = _normalize_aux_api_mode(task_config.get("api_mode"))
 
     # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not
     # a literal model id. Without this, a config of `auxiliary.<task>.model: auto`
@@ -8179,7 +8204,7 @@ def call_llm(
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
-        resolved_api_mode = api_mode
+        resolved_api_mode = _normalize_aux_api_mode(api_mode)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -8189,6 +8214,7 @@ def call_llm(
             model=resolved_model or model,
             base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key,
+            api_mode=resolved_api_mode,
             async_mode=False,
             main_runtime=main_runtime,
         )
@@ -8914,6 +8940,7 @@ async def async_call_llm(
             model=resolved_model or model,
             base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key,
+            api_mode=resolved_api_mode,
             async_mode=True,
             main_runtime=main_runtime,
         )

@@ -104,6 +104,82 @@ class TestAuxAzureFoundryApiKey:
         assert client.api_key == "sk-azure-static-key"
 
 
+    def test_responses_alias_wraps_in_codex_aux_client(self, monkeypatch, patch_load_config):
+        from agent.auxiliary_client import _try_azure_foundry, CodexAuxiliaryClient
+
+        monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "sk-azure-static-key")
+        patch_load_config({
+            "provider": "azure-foundry",
+            "base_url": "https://r.openai.azure.com/openai/v1",
+            "api_mode": "chat_completions",
+            "default": "gpt-4o",
+        })
+
+        client, resolved = _try_azure_foundry(model="gpt-4o", api_mode="responses")
+
+        assert resolved == "gpt-4o"
+        assert isinstance(client, CodexAuxiliaryClient)
+
+    def test_config_responses_alias_wraps_without_explicit_override(
+        self, monkeypatch, patch_load_config,
+    ):
+        """Regression for #39750's literal config: a top-level
+        ``api_mode: responses`` (no explicit call-arg override) must route a
+        Responses-capable Azure Foundry deployment through the Codex adapter.
+
+        ``gpt-4o`` is chosen deliberately: its model family does *not*
+        auto-upgrade (``azure_foundry_model_api_mode('gpt-4o')`` is ``None``),
+        so the Codex wrapping can only come from canonicalizing the
+        user-facing ``responses`` spelling to ``codex_responses`` in
+        ``_parse_api_mode``. Before that fix, ``responses`` failed validation,
+        fell back to ``chat_completions``, and Azure returned the misleading
+        401 from the plain chat path described in the issue.
+        """
+        from agent.auxiliary_client import _try_azure_foundry, CodexAuxiliaryClient
+
+        monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "sk-azure-static-key")
+        patch_load_config({
+            "provider": "azure-foundry",
+            "base_url": "https://r.openai.azure.com/openai/v1",
+            "api_mode": "responses",
+            "default": "gpt-4o",
+        })
+
+        # No api_mode= override — the mode is resolved purely from config.
+        client, resolved = _try_azure_foundry(model="gpt-4o")
+
+        assert resolved == "gpt-4o"
+        assert isinstance(client, CodexAuxiliaryClient)
+
+    def test_task_level_responses_alias_reaches_vision_resolver(
+        self, monkeypatch, patch_load_config,
+    ):
+        from agent import auxiliary_client as _aux
+
+        monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "sk-azure-static-key")
+        patch_load_config({
+            "provider": "azure-foundry",
+            "base_url": "https://r.openai.azure.com/openai/v1",
+            "api_mode": "chat_completions",
+            "default": "gpt-4o",
+        })
+        monkeypatch.setattr(
+            _aux,
+            "_get_auxiliary_task_config",
+            lambda task: {
+                "provider": "azure-foundry",
+                "model": "gpt-4o",
+                "base_url": "https://r.openai.azure.com/openai/v1",
+                "api_mode": "responses",
+            } if task == "vision" else {},
+        )
+
+        provider, client, resolved = _aux.resolve_vision_provider_client()
+
+        assert provider == "azure-foundry"
+        assert resolved == "gpt-4o"
+        assert isinstance(client, _aux.CodexAuxiliaryClient)
+
     def test_no_key_returns_none(self, monkeypatch, patch_load_config):
         from agent.auxiliary_client import _try_azure_foundry
 
@@ -321,3 +397,69 @@ class TestResolveProviderClientAzureFoundry:
             "azure-foundry" in rec.message and "hermes doctor" in rec.message
             for rec in caplog.records
         )
+
+
+class TestAuxVisionRetryPreservesApiMode:
+    """The same-provider recovery retry must re-route vision through the
+    resolved api_mode.
+
+    Regression for #39750: after a Responses-only Azure Foundry vision call
+    hits a transient connection error, ``_retry_same_provider_{sync,async}``
+    rebuild the client via ``resolve_vision_provider_client``. If the resolved
+    ``codex_responses`` mode is dropped there, the rebuilt client falls back to
+    plain chat/completions and the retry re-triggers the misleading 401 the fix
+    exists to prevent. Each test records the kwargs the retry forwards and short
+    -circuits by returning a ``None`` client (so the helper raises before any
+    network call) — the assertion is purely that api_mode was threaded.
+    """
+
+    _COMMON = dict(
+        task="vision",
+        resolved_provider="azure-foundry",
+        resolved_model="gpt-4o",
+        resolved_base_url="https://r.openai.azure.com/openai/v1",
+        resolved_api_key="sk-azure-static-key",
+        resolved_api_mode="codex_responses",
+        final_model="gpt-4o",
+        messages=[{"role": "user", "content": "x"}],
+        temperature=None,
+        max_tokens=None,
+        tools=None,
+        effective_timeout=30.0,
+        effective_extra_body={},
+        reasoning_config=None,
+    )
+
+    def test_sync_retry_threads_resolved_api_mode(self, monkeypatch):
+        from agent import auxiliary_client as aux
+
+        captured = {}
+
+        def _fake_resolve(**kwargs):
+            captured.update(kwargs)
+            return ("azure-foundry", None, None)
+
+        monkeypatch.setattr(aux, "resolve_vision_provider_client", _fake_resolve)
+
+        with pytest.raises(RuntimeError):
+            aux._retry_same_provider_sync(main_runtime=None, **self._COMMON)
+
+        assert captured.get("api_mode") == "codex_responses"
+
+    def test_async_retry_threads_resolved_api_mode(self, monkeypatch):
+        import asyncio
+
+        from agent import auxiliary_client as aux
+
+        captured = {}
+
+        def _fake_resolve(**kwargs):
+            captured.update(kwargs)
+            return ("azure-foundry", None, None)
+
+        monkeypatch.setattr(aux, "resolve_vision_provider_client", _fake_resolve)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(aux._retry_same_provider_async(**self._COMMON))
+
+        assert captured.get("api_mode") == "codex_responses"

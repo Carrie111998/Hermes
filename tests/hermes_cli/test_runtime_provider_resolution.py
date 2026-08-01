@@ -770,6 +770,10 @@ def test_explicit_openrouter_skips_openai_base_url(monkeypatch):
 # ── api_mode config override tests ──────────────────────────────────────
 
 
+def test_responses_alias_normalizes_to_codex_responses():
+    assert rp._parse_api_mode(" responses ") == "codex_responses"
+
+
 
 
 def test_minimax_config_base_url_overrides_hardcoded_default(monkeypatch):
