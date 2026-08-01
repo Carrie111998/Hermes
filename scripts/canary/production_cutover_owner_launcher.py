@@ -910,7 +910,9 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 command,
                 account=account,
                 timeout_seconds=2_400,
-                maximum_output_bytes=MAX_JSON,
+                maximum_output_bytes=(
+                    canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+                ),
             )
         self._owner_identity.require_stable()
         stdout = completed.stdout
