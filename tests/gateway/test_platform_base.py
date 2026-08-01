@@ -730,6 +730,51 @@ class TestMediaDeliveryDefaultMode:
             notes.resolve()
         )
 
+    def test_sibling_credential_denied_when_profiles_enumeration_fails(
+        self, tmp_path, monkeypatch,
+    ):
+        """Fail closed on known sibling credentials when profiles/ can't be listed.
+
+        POSIX execute-only (0111) profiles/ lets open(bob/.env) succeed while
+        iterdir() raises. Denial must be structural under profiles/<name>/,
+        not derived from enumeration (which returns [] on OSError).
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        alice = profiles_dir / "alice"
+        bob = profiles_dir / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        notes = bob / "notes.md"
+        notes.write_text("# ok\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        # Simulate execute-only / unreadable profiles/: listing fails, but
+        # the known child paths remain openable (already created above).
+        real_iterdir = type(profiles_dir).iterdir
+
+        def _iterdir_raises(self):
+            if self.resolve() == profiles_dir.resolve():
+                raise PermissionError("profiles dir not readable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(type(profiles_dir), "iterdir", _iterdir_raises)
+
+        import gateway.platforms.base as base
+
+        assert base._iter_hermes_profile_dirs() == []
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(notes)) == str(
+            notes.resolve()
+        )
+
     def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):
         """Integration credentials at the HERMES_HOME root (google_token.json)
         must never be deliverable, even though they aren't the historically

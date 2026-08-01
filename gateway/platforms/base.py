@@ -1229,19 +1229,102 @@ _MEDIA_DELIVERY_CACHE_SUBDIRS = (
     "screenshots",
 )
 
+# Per-file credential / secret stores that live at a Hermes home root.
+# Mirrored from agent/file_safety.py (get_read_block_error / build_write_denied_*)
+# so delivery (read/exfil) can't trail the write side. Enumerated per-file
+# rather than denying the whole tree, so skills/, logs/, and ad-hoc agent
+# files under a Hermes home stay deliverable (see #32090, #34425).
+_MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES = (
+    ".env",
+    "auth.json",
+    "auth.lock",
+    "credentials",
+    "config.yaml",
+    # Anthropic PKCE / OAuth refresh credential store.
+    ".anthropic_oauth.json",
+    # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
+    # every turn, which defeated the strict-mode recency window) plus the
+    # pending-exchange session/verifier file.
+    "google_token.json",
+    "google_oauth_pending.json",
+    os.path.join("auth", "google_oauth.json"),
+    # Webhook subscription HMAC secrets.
+    "webhook_subscriptions.json",
+    # Bitwarden Secrets Manager plaintext and encrypted disk caches.
+    os.path.join("cache", "bws_cache.json"),
+    os.path.join("cache", "bws_cache.enc.json"),
+)
+
+# Directory trees whose every child is credential material.
+#
+# mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
+# dynamically-registered client credentials (<server>.client.json); see
+# tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
+# The write side already denies it (file_tools _check_sensitive_path);
+# this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
+# tag can't deliver a live bearer token as a native attachment.
+# (session/kanban SQLite stores are handled by #41071 — kept out here.)
+_MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS = (
+    "pairing",
+    "mcp-tokens",
+)
+
 
 def _iter_hermes_profile_dirs() -> List[Path]:
     """Return ``<root>/profiles/<name>/`` directories that currently exist.
 
-    Shared by cache allowlisting and credential denylisting so both sides
-    see the same live profile set (including profiles created after process
-    start). Missing or unreadable ``profiles/`` yields an empty list.
+    Used by cache allowlisting so profiles created after process start are
+    covered. Missing or unreadable ``profiles/`` yields an empty list —
+    credential denial must NOT depend on this helper (see
+    ``_path_is_profile_tree_credential``).
     """
     profiles_dir = _HERMES_ROOT / "profiles"
     try:
         return [p for p in profiles_dir.iterdir() if p.is_dir()]
     except OSError:
         return []
+
+
+def _rel_matches_hermes_root_credential(rel: Path) -> bool:
+    """Return True if ``rel`` (relative to a Hermes home) is a credential path."""
+    if not rel.parts:
+        return False
+    for denied_rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES:
+        denied = Path(denied_rel)
+        if rel == denied or _path_is_within(rel, denied):
+            return True
+    for denied_rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS:
+        denied = Path(denied_rel)
+        if rel == denied or _path_is_within(rel, denied):
+            return True
+    return False
+
+
+def _path_is_profile_tree_credential(resolved: Path) -> bool:
+    """Deny credentials under ``<root>/profiles/<name>/`` without listing profiles.
+
+    ``profiles/`` enumeration can fail while a known child path remains
+    openable (POSIX execute-only directory). Structural matching keeps the
+    credential policy intact under that error condition — denial must not
+    depend on ``_iter_hermes_profile_dirs()``.
+    """
+    profiles_root = _HERMES_ROOT / "profiles"
+    try:
+        profiles_root = profiles_root.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        # Fail closed: still match against the unresolved profiles path
+        # rather than skipping sibling credential denial entirely.
+        profiles_root = _HERMES_ROOT / "profiles"
+    try:
+        rel = resolved.relative_to(profiles_root)
+    except ValueError:
+        return False
+    # Need at least <profile_name>/<credential...> — a bare profiles/<name>
+    # path is not a deliverable file anyway (validate requires is_file).
+    parts = rel.parts
+    if len(parts) < 2:
+        return False
+    return _rel_matches_hermes_root_credential(Path(*parts[1:]))
 
 
 def _profile_cache_roots() -> List[Path]:
@@ -1342,73 +1425,32 @@ def _media_delivery_denied_paths() -> List[Path]:
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
-    # The active Hermes profile, the shared Hermes root, and every sibling
-    # profile under <root>/profiles/<name>/ contain control files and
-    # credentials. Only cache subdirectories under them are explicitly
+    # The active Hermes home and the shared Hermes root contain control files
+    # and credentials. Only cache subdirectories under them are explicitly
     # allowlisted above (matched BEFORE this denylist in
     # validate_media_delivery_path, so generated media still delivers).
     #
-    # These are the per-file credential / secret stores that live at each
-    # Hermes home root. The set mirrors the canonical read guard in
-    # agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
-    # delivery (read/exfil) side can't trail the write side: a credential the
-    # agent is forbidden to write or read must also never be auto-attached to a
-    # chat reply. Enumerated explicitly per-file rather than denying the whole
-    # tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
-    # stay deliverable (see #32090, #34425).
-    #
-    # Sibling/inactive profiles must use the same policy: default mode would
-    # otherwise accept MEDIA:<root>/profiles/<other>/.env (and the rest of
-    # this list) because only (_HERMES_HOME, _HERMES_ROOT) were denied.
-    # Enumeration mirrors _profile_cache_roots() so profiles created after
-    # process start are covered.
-    _ROOT_CREDENTIAL_FILES = (
-        ".env",
-        "auth.json",
-        "auth.lock",
-        "credentials",
-        "config.yaml",
-        # Anthropic PKCE / OAuth refresh credential store.
-        ".anthropic_oauth.json",
-        # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
-        # every turn, which defeated the strict-mode recency window) plus the
-        # pending-exchange session/verifier file.
-        "google_token.json",
-        "google_oauth_pending.json",
-        os.path.join("auth", "google_oauth.json"),
-        # Webhook subscription HMAC secrets.
-        "webhook_subscriptions.json",
-        # Bitwarden Secrets Manager plaintext and encrypted disk caches.
-        os.path.join("cache", "bws_cache.json"),
-        os.path.join("cache", "bws_cache.enc.json"),
-    )
-    # Directory trees whose every child is credential material.
-    #
-    # mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
-    # dynamically-registered client credentials (<server>.client.json); see
-    # tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
-    # The write side already denies it (file_tools _check_sensitive_path);
-    # this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
-    # tag can't deliver a live bearer token as a native attachment.
-    # (session/kanban SQLite stores are handled by #41071 — kept out here.)
-    _ROOT_CREDENTIAL_DIRS = (
-        "pairing",
-        "mcp-tokens",
-    )
+    # Sibling/inactive profiles under <root>/profiles/<name>/ use the same
+    # credential file/dir policy, but denial is applied structurally in
+    # ``_path_is_profile_tree_credential`` — not by listing ``profiles/``.
+    # Directory enumeration can fail while a known child path remains
+    # openable (POSIX execute-only), so building this list from
+    # ``_iter_hermes_profile_dirs()`` would fail open at the exact boundary
+    # sibling denial is meant to close.
     hermes_dirs: List[Path] = []
-    for base in (_HERMES_HOME, _HERMES_ROOT, *_iter_hermes_profile_dirs()):
+    for base in (_HERMES_HOME, _HERMES_ROOT):
         try:
             real = base.expanduser().resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
             # Fail closed: still deny under the unresolved path rather than
-            # skipping the home/profile entirely.
+            # skipping the home entirely.
             real = base
         if real not in hermes_dirs:
             hermes_dirs.append(real)
     for hermes_root in hermes_dirs:
-        for rel in _ROOT_CREDENTIAL_FILES:
+        for rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
-        for rel in _ROOT_CREDENTIAL_DIRS:
+        for rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS:
             denied.append(hermes_root / rel)
     return denied
 
@@ -1427,6 +1469,10 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
     """
+    # Structural sibling-profile credential check first — independent of
+    # whether ``profiles/`` can be listed.
+    if _path_is_profile_tree_credential(resolved):
+        return True
     try:
         home = Path(os.path.expanduser("~")).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
