@@ -1,12 +1,9 @@
 import { atom } from 'nanostores'
 
-import { persistBoolean, storedBoolean } from '@/lib/storage'
-
-const TAKEOVER_KEY = 'hermes.desktop.terminalTakeover'
-
-export const $terminalTakeover = atom(storedBoolean(TAKEOVER_KEY, false))
-
-$terminalTakeover.subscribe(active => persistBoolean(TAKEOVER_KEY, active))
+// Terminal visibility is deliberately session-scoped. Persisting this flag
+// made a terminal opened once become the first screen after every relaunch,
+// and a stale true value could leave the terminal overlay over the app chrome.
+export const $terminalTakeover = atom(false)
 
 export const setTerminalTakeover = (active: boolean) => $terminalTakeover.set(active)
 

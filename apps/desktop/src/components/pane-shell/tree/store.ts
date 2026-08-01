@@ -53,7 +53,29 @@ function loadPersisted(): LayoutNode | null {
 
   // Canonicalize on load: strips stale attributes older code persisted
   // (e.g. explicit headerHidden on lone-pane zones) and re-flattens.
-  return isLayoutNode(parsed) ? normalize(parsed) : null
+  if (!isLayoutNode(parsed)) {
+    return null
+  }
+
+  const normalized = normalize(parsed)
+
+  return normalized ? normalizeStartupTree(normalized) : null
+}
+
+/**
+ * Recover the launch view without discarding the user's layout. The workspace
+ * is the app's navigation surface; if a persisted custom layout left another
+ * pane (most notably the terminal) active in that group, booting into it made
+ * the app look and behave like a terminal-only screen until a layout edit.
+ */
+function normalizeStartupTree(tree: LayoutNode): LayoutNode {
+  const workspaceGroup = findGroupOfPane(tree, 'workspace')
+
+  if (!workspaceGroup || workspaceGroup.active === 'workspace') {
+    return tree
+  }
+
+  return setActivePaneOp(tree, workspaceGroup.id, 'workspace')
 }
 
 function persist(tree: LayoutNode | null) {

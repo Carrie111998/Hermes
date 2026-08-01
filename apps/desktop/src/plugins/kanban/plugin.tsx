@@ -5,8 +5,8 @@
  * through `ctx.rest` (namespace-scoped to `/api/plugins/kanban`). No new
  * backend, no core edits.
  *
- * Ships OFF by default (`defaultEnabled: false`): it inventories in
- * Settings ▸ Plugins and registers nothing until the user flips the switch.
+ * Ships enabled by default so the official Desktop Kanban page is available
+ * immediately after launch. It remains live-toggleable in Settings ▸ Plugins.
  */
 
 import './kanban.css'
@@ -80,7 +80,7 @@ function KanbanCount() {
 const plugin: HermesPlugin = {
   id: 'kanban',
   name: 'Kanban',
-  defaultEnabled: false,
+  defaultEnabled: true,
   register(ctx) {
     ctx.i18n.register(KANBAN_LOCALES)
     ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket))
