@@ -1481,32 +1481,28 @@ def _reset_tool_definition_caches():
     the poisoned verdict. 116 test files touch tool definitions or the
     registry, so per-file fixtures could not cover the exposure.
 
-    Clearing is cheap (two ``dict.clear()`` calls); the TTL still applies
-    normally *within* a test, which is the only scope where its performance
-    benefit is meaningful.
+    Cost, measured on ``tests/run_agent/`` + ``tests/tools/test_registry.py``
+    (1271 passing tests): 515 s -> 602 s, about +17% on a deliberately
+    tool-heavy subset; the full suite is diluted well below that. A variant
+    that dropped only the ``False`` verdicts — on the theory that re-probing
+    available tools was the expense — was measured at 602 s, i.e. no
+    improvement, so the simpler blanket clear is kept. The cost is dominated
+    by rebuilding ``_tool_defs_cache``, which cannot be preserved: its key
+    does not cover the verdicts underneath it, so an entry computed from a
+    poisoned ``False`` would survive and keep serving the short list.
     """
 
     def _clear():
         try:
             from tools import registry
 
-            # Drop only the ``False`` verdicts. A cached ``False`` is what makes
-            # a tool silently vanish from a computed toolset; a cached ``True``
-            # cannot produce that failure mode. Keeping the ``True`` entries
-            # avoids re-probing every available tool's ``check_fn`` on the next
-            # use, which is where the real cost of a blanket clear lives.
             with registry._check_fn_cache_lock:
-                for fn, entry in list(registry._check_fn_cache.items()):
-                    if not entry[1]:
-                        registry._check_fn_cache.pop(fn, None)
+                registry._check_fn_cache.clear()
         except Exception:
             pass
         try:
             import model_tools
 
-            # Must still go entirely: its key does not cover the verdicts
-            # above, so an entry computed from a poisoned ``False`` would
-            # survive and keep serving the short list.
             model_tools._tool_defs_cache.clear()
         except Exception:
             pass
