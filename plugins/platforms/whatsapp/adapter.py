@@ -27,7 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, windows_hide_flags
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
@@ -225,6 +225,9 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
                 timeout=10,
+                # Windowless pythonw parent: without CREATE_NO_WINDOW each
+                # taskkill allocates a visible console flash (#75628).
+                creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
             )
         except FileNotFoundError:
             if force:
@@ -350,7 +353,9 @@ def check_whatsapp_requirements() -> bool:
             [_node, "--version"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=5
+            timeout=5,
+            # Probe fires on every bridge start/reconnect (#75628).
+            creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
         return result.returncode == 0
     except Exception:
@@ -558,6 +563,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         text=True, encoding='utf-8', errors='replace',
                         timeout=npm_install_timeout,
                         env=with_hermes_node_path(),
+                        # npm is a console-subsystem process; hide the flash
+                        # when deps reinstall during reconnect (#75628).
+                        creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
