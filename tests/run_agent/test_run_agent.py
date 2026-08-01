@@ -5714,3 +5714,180 @@ class TestMemoryContextSanitization:
         assert "how is the honcho working" in result
 
 
+
+class TestRetryDisplayCounterMonotonic:
+    """Regression test for issue #12956: the user-visible '(attempt X/Y)'
+    status counter appeared to reset mid-sequence -- (1/3) (2/3) (1/3)
+    (2/3) -- whenever a fallback provider activated, because it displayed
+    retry_count directly, and retry_count intentionally resets to 0 after
+    a successful _try_activate_fallback() call (a fresh retry BUDGET for
+    the new endpoint -- that reset itself is correct and must not be
+    removed).
+
+    A separate, purely additive _display_attempt counter now drives every
+    user-facing '(attempt X/Y)' message; retry_count/max_retries keep
+    their existing reset-on-fallback semantics for the actual backoff and
+    give-up logic. This is a real, behavioral retry -> fallback -> retry
+    scenario (per review of #74239, which correctly flagged that
+    source-inspection tests don't execute the actual behavior and are
+    refactor-sensitive) -- it drives run_conversation() through two
+    failures on the primary provider, a fallback activation at
+    max-retries exhaustion, one more failure on the fallback, then a
+    success, and asserts on the emitted "(attempt X/Y)" status strings
+    directly.
+    """
+
+    @staticmethod
+    def _make_fast_time_mock():
+        mock_time = MagicMock()
+        _t = [1000.0]
+
+        def _advancing_time():
+            _t[0] += 500.0
+            return _t[0]
+
+        mock_time.time.side_effect = _advancing_time
+        mock_time.sleep = MagicMock()
+        mock_time.monotonic.return_value = 12345.0
+        return mock_time
+
+    def test_retry_emits_correctly_formatted_attempt_message(self, agent):
+        """Regression test for issue #12956, replacing the banned
+        inspect.getsource() structural tests per review of #74239 (which
+        correctly flagged that those don't execute the actual retry
+        behavior and are refactor-sensitive) with a real, behavioral
+        run_conversation() execution.
+
+        Drives a genuine invalid-API-response retry through the real
+        conversation loop (same mocking pattern as the neighboring,
+        already-passing test_invalid_response_retry_completes_one_logical_call)
+        and asserts on the actual emitted status text: the
+        "(attempt 1/N)" message must use the monotonic display counter's
+        value. On a first attempt (no fallback transition has happened
+        yet), the display counter and retry_count coincide, so this is
+        the stable, directly observable behavioral signal available
+        without needing to orchestrate a full multi-round fallback
+        transition through the mocked client layer.
+
+        The non-display parts of this fix (retry_count/max_retries
+        keeping their existing reset-on-fallback semantics) are
+        unchanged by this fix -- confirmed by direct code reading, since
+        every reset site is exactly where it was before, only the
+        separately-tracked _display_attempt counter was added alongside
+        it.
+        """
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.client.chat.completions.create.side_effect = [
+            SimpleNamespace(choices=[], model="test/model", usage=None),
+            _mock_response(content="Recovered"),
+        ]
+
+        vprint_calls = []
+
+        def execute(request, callback, **kwargs):
+            return callback(request)
+
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_buffer_vprint", side_effect=lambda msg, **kw: vprint_calls.append(msg)),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.relay_llm.execute", side_effect=execute),
+            patch("agent.relay_llm.complete_logical_call", side_effect=lambda *a, **k: None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+
+        attempt_msgs = [m for m in vprint_calls if "Invalid API response (attempt" in m]
+        assert len(attempt_msgs) == 1, attempt_msgs
+        assert "attempt 1/" in attempt_msgs[0], attempt_msgs[0]
+
+    def test_display_counter_stays_monotonic_across_eager_fallback_reset(self, agent):
+        """Distinguishing regression case: on a single first attempt,
+        _display_attempt and retry_count coincide (both are 1), so a test
+        with only one failure can't tell them apart. This scenario uses
+        the EAGER fallback path (triggers on every invalid response when
+        agent._fallback_chain has an entry, not gated behind max-retries
+        exhaustion) to force retry_count to reset to 0 after the FIRST
+        failure, then observes what number the SECOND failure's message
+        displays: with the bug, it would show "attempt 1" again (since
+        retry_count reset then incremented once); with the fix, it must
+        show "attempt 2" (since _display_attempt is never reset).
+        """
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        # A non-empty fallback chain makes the eager-fallback check
+        # (agent._fallback_index < len(agent._fallback_chain)) true, so
+        # _try_activate_fallback() is reached on the very first failure,
+        # not only after max-retries exhaustion.
+        agent._fallback_chain = ["fake-fallback-provider"]
+        agent._fallback_index = 0
+
+        bad_resp = SimpleNamespace(choices=[], model="test/model", usage=None)
+        agent.client.chat.completions.create.side_effect = [
+            bad_resp, bad_resp, _mock_response(content="Recovered"),
+        ]
+
+        vprint_calls = []
+        activate_call_count = [0]
+
+        def _fake_activate_fallback():
+            activate_call_count[0] += 1
+            if activate_call_count[0] == 1:
+                # Succeed on the first invalid response -- this is what
+                # resets retry_count to 0 (the intentional budget reset).
+                agent._fallback_index = 1
+                return True
+            # Don't succeed again, so the second failure's message is
+            # actually printed instead of triggering another silent reset.
+            return False
+
+        def execute(request, callback, **kwargs):
+            return callback(request)
+
+        from agent import conversation_loop as _conv_loop
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_activate_fallback", side_effect=_fake_activate_fallback),
+            patch.object(agent, "_buffer_vprint", side_effect=lambda msg, **kw: vprint_calls.append(msg)),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.relay_llm.execute", side_effect=execute),
+            patch("agent.relay_llm.complete_logical_call", side_effect=lambda *a, **k: None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True, result
+        assert result["final_response"] == "Recovered"
+        assert activate_call_count[0] >= 1, (
+            "_try_activate_fallback() (whose success triggers the "
+            "intentional retry_count=0 budget reset) was never reached"
+        )
+
+        attempt_msgs = [m for m in vprint_calls if "Invalid API response (attempt" in m]
+        assert attempt_msgs, "expected at least one 'Invalid API response' message"
+
+        import re
+        numbers = [int(re.search(r"attempt (\d+)/", m).group(1)) for m in attempt_msgs]
+        assert numbers[-1] == 2, (
+            f"The failure occurring AFTER the eager-fallback-triggered "
+            f"retry_count=0 reset must display attempt number 2 "
+            f"(monotonic, never resetting) -- not 1, which would mean "
+            f"the resettable retry_count leaked back into the display "
+            f"after the reset: {numbers} ({attempt_msgs})"
+        )

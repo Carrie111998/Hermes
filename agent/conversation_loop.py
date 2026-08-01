@@ -1994,6 +1994,19 @@ def run_conversation(
         api_start_time = time.time()
         retry_count = 0
         max_retries = agent._api_max_retries
+        # Separate, monotonic counter for user-facing "(attempt X/Y)" status
+        # messages. retry_count itself resets to 0 whenever a fallback
+        # provider activates (see _try_activate_fallback() call sites below)
+        # -- that reset is intentional: it's a fresh retry BUDGET for the
+        # new endpoint, and touching it would break the backoff/give-up
+        # logic that depends on it. But the same reset made the visible
+        # counter look like it jumped backward mid-sequence (e.g. "attempt
+        # 2/3" followed by "attempt 1/3" after a silent provider switch),
+        # which read as a bug even though the underlying retry accounting
+        # was correct (issue #12956). _display_attempt increments in
+        # lockstep with every retry_count += 1 but is never reset, so the
+        # number shown to the user only ever goes up.
+        _display_attempt = 0
         _retry = TurnRetryState()
 
         finish_reason = "stop"
@@ -2451,6 +2464,7 @@ def run_conversation(
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
+                    _display_attempt += 1
                     
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
@@ -2520,7 +2534,7 @@ def run_conversation(
                     else:
                         _failure_hint = f"response time {api_duration:.1f}s"
 
-                    agent._buffer_vprint(f"⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}")
+                    agent._buffer_vprint(f"⚠️  Invalid API response (attempt {_display_attempt}/{max_retries}): {', '.join(error_details)}")
                     agent._buffer_vprint(f"   🏢 Provider: {provider_name}")
                     cleaned_provider_error = agent._clean_error_message(error_msg)
                     agent._buffer_vprint(f"   📝 Provider message: {cleaned_provider_error}")
@@ -2555,7 +2569,7 @@ def run_conversation(
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
-                    logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
+                    logger.warning(f"Invalid API response (retry {_display_attempt}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                     
                     # Sleep in small increments to stay responsive to interrupts
                     sleep_end = time.time() + wait_time
@@ -2574,7 +2588,7 @@ def run_conversation(
                                 _retry.restart_with_redirected_messages = True
                                 break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
-                            _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
+                            _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {_display_attempt}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
@@ -2591,7 +2605,7 @@ def run_conversation(
                         _backoff_touch_counter += 1
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                             agent._touch_activity(
-                                f"retry backoff ({retry_count}/{max_retries}), "
+                                f"retry backoff ({_display_attempt}/{max_retries}), "
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
                     if _retry.restart_with_redirected_messages:
@@ -4043,9 +4057,10 @@ def run_conversation(
                     )
 
                 retry_count += 1
+                _display_attempt += 1
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
-                    f"API error recovery (attempt {retry_count}/{max_retries})"
+                    f"API error recovery (attempt {_display_attempt}/{max_retries})"
                 )
                 
                 error_type = type(api_error).__name__
@@ -4053,7 +4068,7 @@ def run_conversation(
                 _error_summary = agent._summarize_api_error(api_error)
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
-                    retry_count,
+                    _display_attempt,
                     max_retries,
                     error_type,
                     agent._client_log_context(),
@@ -4064,7 +4079,7 @@ def run_conversation(
                 _base = getattr(agent, "base_url", "unknown")
                 _model = getattr(agent, "model", "unknown")
                 _status_code_str = f" [HTTP {status_code}]" if status_code else ""
-                agent._buffer_vprint(f"⚠️  API call failed (attempt {retry_count}/{max_retries}): {error_type}{_status_code_str}")
+                agent._buffer_vprint(f"⚠️  API call failed (attempt {_display_attempt}/{max_retries}): {error_type}{_status_code_str}")
                 agent._buffer_vprint(f"   🔌 Provider: {_provider}  Model: {_model}")
                 agent._buffer_vprint(f"   🌐 Endpoint: {_base}")
                 agent._buffer_vprint(f"   📝 Error: {_error_summary}")
@@ -5316,7 +5331,7 @@ def run_conversation(
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
                     _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
-                    _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
+                    _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {_display_attempt + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
                     # Z.AI Coding waits are different: they can last minutes, so surface
                     # progress immediately instead of making the TUI look frozen.
@@ -5325,11 +5340,11 @@ def run_conversation(
                     else:
                         agent._buffer_status(_rate_limit_status)
                 else:
-                    agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                    agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {_display_attempt}/{max_retries})...")
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,
-                    retry_count,
+                    _display_attempt,
                     max_retries,
                     agent._client_log_context(),
                     _backoff_policy or "default",
@@ -5348,7 +5363,7 @@ def run_conversation(
                             _retry.restart_with_redirected_messages = True
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
-                        _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
+                        _interrupt_text = f"Operation interrupted: retrying API call after error (retry {_display_attempt}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
@@ -5365,7 +5380,7 @@ def run_conversation(
                     _backoff_touch_counter += 1
                     if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                         agent._touch_activity(
-                            f"error retry backoff ({retry_count}/{max_retries}), "
+                            f"error retry backoff ({_display_attempt}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
                 if _retry.restart_with_redirected_messages:
@@ -5395,6 +5410,7 @@ def run_conversation(
             # infinite loops when compression reduces messages but not enough
             # to fit the context window.
             retry_count += 1
+            _display_attempt += 1
             _retry.restart_with_compressed_messages = False
             # In-loop compression rebuilt `messages` with fresh compaction
             # copies, so the pre-compression current-turn index is stale.
