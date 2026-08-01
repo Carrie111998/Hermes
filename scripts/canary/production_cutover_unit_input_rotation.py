@@ -1158,6 +1158,51 @@ def _validate_approval_without_lease(
         raise UnitInputRotationError("unit_input_rotation_authority_invalid") from exc
 
 
+def _validate_v3_authority_triplet(
+    plan_value: Mapping[str, Any],
+    approval_value: Mapping[str, Any],
+    fixed_raw: bytes,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Validate current v3 or the one frozen pre-edge-expansion v3 shape.
+
+    V3 authority files predate the backup and SEO operational edges.  Their
+    self-hashes and owner signatures remain authoritative, so historical
+    validation must use the exact nine-domain vocabulary that was active when
+    they were signed.  Successor publications still use the current catalog;
+    this compatibility path is read-only and cannot author a legacy shape.
+    """
+
+    for operational_edge_domains in (
+        None,
+        package.LEGACY_V3_OPERATIONAL_EDGE_DOMAINS,
+    ):
+        try:
+            plan = package.validate_unit_input_plan(
+                plan_value,
+                operational_edge_domains=operational_edge_domains,
+            )
+            approval = _validate_approval_without_lease(
+                approval_value,
+                plan=plan,
+            )
+            fixed = package._unit_inputs_from_authority(
+                plan,
+                approval,
+                operational_edge_domains=operational_edge_domains,
+            )
+        except (
+            PermissionError,
+            TypeError,
+            ValueError,
+            package.PackagingError,
+            UnitInputRotationError,
+        ):
+            continue
+        if fixed_raw == _canonical(fixed) + b"\n":
+            return plan, approval, fixed
+    raise UnitInputRotationError("unit_input_rotation_authority_invalid")
+
+
 def _successor(
     value: Mapping[str, Any],
     *,
@@ -1236,21 +1281,13 @@ def _triplet(
         mode=package.FIXED_UNIT_INPUTS_MODE,
     )
     try:
-        plan = package.validate_unit_input_plan(_decode(plan_raw))
-        approval = _validate_approval_without_lease(
+        plan, approval, fixed_inputs = _validate_v3_authority_triplet(
+            _decode(plan_raw),
             _decode(approval_raw),
-            plan=plan,
+            fixed_raw,
         )
-        fixed_inputs = package._unit_inputs_from_authority(plan, approval)
-    except (
-        PermissionError,
-        TypeError,
-        ValueError,
-        package.PackagingError,
-    ) as exc:
+    except UnitInputRotationError as exc:
         raise UnitInputRotationError("unit_input_rotation_predecessor_invalid") from exc
-    if fixed_raw != _canonical(fixed_inputs) + b"\n":
-        raise UnitInputRotationError("unit_input_rotation_predecessor_invalid")
     return _AuthorityTriplet(
         revision=str(plan["release_revision"]),
         plan=plan,
@@ -1460,25 +1497,18 @@ def _archived_triplet(
         mode=package.FIXED_UNIT_INPUTS_MODE,
     )
     try:
-        plan = package.validate_unit_input_plan(_decode(plan_raw))
-        approval = _validate_approval_without_lease(
+        plan, approval, fixed_inputs = _validate_v3_authority_triplet(
+            _decode(plan_raw),
             _decode(approval_raw),
-            plan=plan,
+            fixed_raw,
         )
-        fixed_inputs = package._unit_inputs_from_authority(plan, approval)
-    except (
-        PermissionError,
-        TypeError,
-        ValueError,
-        package.PackagingError,
-    ) as exc:
+    except UnitInputRotationError as exc:
         raise UnitInputRotationError("unit_input_rotation_audit_invalid") from exc
     if (
         transaction["predecessor_revision"] != plan["release_revision"]
         or transaction["predecessor_plan_sha256"] != plan["plan_sha256"]
         or transaction["predecessor_approval_sha256"] != approval["approval_sha256"]
         or transaction["predecessor_fixed_inputs_sha256"] != _sha(fixed_raw)
-        or fixed_raw != _canonical(fixed_inputs) + b"\n"
     ):
         raise UnitInputRotationError("unit_input_rotation_audit_invalid")
     return _AuthorityTriplet(
@@ -3292,16 +3322,11 @@ def _release_triplet(
                 raise UnitInputRotationError(
                     "unit_input_rotation_predecessor_invalid"
                 )
-            plan = package.validate_unit_input_plan(plan_value)
-            approval = _validate_approval_without_lease(
+            plan, approval, fixed = _validate_v3_authority_triplet(
+                plan_value,
                 approval_value,
-                plan=plan,
+                fixed_raw,
             )
-            fixed = package._unit_inputs_from_authority(plan, approval)
-            if fixed_raw != _canonical(fixed) + b"\n":
-                raise UnitInputRotationError(
-                    "unit_input_rotation_predecessor_invalid"
-                )
             authority_version = "v3"
             fixed_inputs_sha256 = _sha(fixed_raw)
         elif plan_schema == release_inputs_v4.PLAN_SCHEMA:
