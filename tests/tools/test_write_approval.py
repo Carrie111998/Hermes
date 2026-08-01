@@ -7,10 +7,11 @@ split, pending store CRUD, and the list/approve/reject/diff/approval
 subcommand dispatch.
 """
 
+import asyncio
 import json
 import os
-import tempfile
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -546,3 +547,51 @@ def test_skill_pending_stage_list_get_and_count_share_snapshot(hermes_home, monk
     assert wa.get_pending(wa.SKILLS, "expired") is None
     assert wa.get_pending(wa.SKILLS, "older")["id"] == "older"
     assert wa.get_pending(wa.SKILLS, stage["id"])["id"] == stage["id"]
+
+
+def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home):
+    from gateway.platforms.base import MessageEvent
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+    from tools import write_approval as wa
+
+    _write_pending_record(
+        hermes_home,
+        wa.SKILLS,
+        "expired",
+        created_at=time.time() - (31 * 86400),
+    )
+    runner = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+    runner._session_key_for_source = lambda source: "test-session"
+
+    out = asyncio.run(runner._handle_skills_command(MessageEvent(text="/skills pending")))
+
+    assert "Cleanup removed 1 expired pending skill write(s)." in out
+
+
+def test_skill_pending_legacy_record_uses_filename_as_id(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    _create_skill(hermes_home, "test-skill")
+    path = _write_pending_record(
+        hermes_home,
+        wa.SKILLS,
+        "legacy",
+        created_at=_MISSING,
+        payload={
+            "action": "write_file",
+            "name": "test-skill",
+            "file_path": "references/legacy.txt",
+            "file_content": "approved",
+        },
+    )
+    record = json.loads(path.read_text(encoding="utf-8"))
+    del record["id"]
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    pending = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    approved = handle_pending_subcommand(wa.SKILLS, ["approve", "legacy"])
+
+    assert "legacy" in pending
+    assert "Approved 1 skills write(s)." in approved
+    assert not path.exists()

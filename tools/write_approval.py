@@ -173,7 +173,7 @@ def _safe_mtime(path: Path) -> float:
 
 def _effective_pending_id(path: Path, record: Dict[str, Any]) -> str:
     raw = record.get("id")
-    return raw if isinstance(raw, str) and raw else path.stem
+    return path.stem if not isinstance(raw, str) or raw != path.stem else raw
 
 
 def _load_pending_entries(subsystem: str) -> List[Dict[str, Any]]:
@@ -192,11 +192,15 @@ def _load_pending_entries(subsystem: str) -> List[Dict[str, Any]]:
             logger.warning("Skipping unreadable pending record: %s", path)
             continue
 
+        pending_id = _effective_pending_id(path, record)
+        if subsystem == SKILLS and record.get("id") != pending_id:
+            record = {**record, "id": pending_id}
+
         entries.append(
             {
                 "record": record,
                 "path": path,
-                "pending_id": _effective_pending_id(path, record),
+                "pending_id": pending_id,
                 "created_at": _coerce_created_at(record.get("created_at")),
                 "mtime": _safe_mtime(path),
             }
