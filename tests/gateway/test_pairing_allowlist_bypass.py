@@ -188,3 +188,92 @@ def test_revoke_whatsapp_preserves_wildcard_allowlist_entry(store, monkeypatch):
 
     assert store.revoke("whatsapp", "15551234567:47@s.whatsapp.net") is True
     assert saved.get("WHATSAPP_ALLOWED_USERS") == "*"
+
+
+def test_revoke_whatsapp_sole_entry_denies_live_adapter_without_restart(
+    store, monkeypatch,
+):
+    """Sole allowlist entry revoke must deny immediately on a live gateway.
+
+    Persistence alone is not enough: WhatsAppAdapter snapshots ``_allow_from``
+    at construction, and authz trusts ``dm_policy=allowlist`` when the env
+    allowlist is gone. After revoke, intake and ``_is_user_authorized`` must
+    both deny the device-suffix JID without restarting the gateway.
+    """
+    from types import SimpleNamespace
+
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+    import hermes_cli.config as cfg
+
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr(
+        cfg,
+        "save_env_value",
+        lambda k, v: os.environ.__setitem__(k, v),
+    )
+    monkeypatch.setattr(
+        cfg,
+        "remove_env_value",
+        lambda k: (os.environ.pop(k, None), True)[1],
+    )
+
+    class LiveWhatsAppAdapter(WhatsAppBehaviorMixin):
+        def __init__(self):
+            self.config = SimpleNamespace(
+                extra={
+                    "dm_policy": "allowlist",
+                    "allow_from": ["15551234567"],
+                }
+            )
+            self.platform = Platform.WHATSAPP
+            self._dm_policy = "allowlist"
+            self._allow_from = {"15551234567"}
+            self._group_policy = "pairing"
+            self._group_allow_from = set()
+
+    adapter = LiveWhatsAppAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(
+                enabled=True,
+                extra={"dm_policy": "allowlist", "allow_from": ["15551234567"]},
+            )
+        }
+    )
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.pairing_store = store
+    runner.pairing_stores = {}
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+
+    store._approve_user("whatsapp", "15551234567@s.whatsapp.net", "")
+    sender = "15551234567:47@s.whatsapp.net"
+    assert adapter._is_dm_intake_allowed(sender) is True
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.WHATSAPP,
+            user_id=sender,
+            chat_id=sender,
+            user_name="revoked",
+            chat_type="dm",
+        )
+    ) is True
+
+    assert store.revoke("whatsapp", sender) is True
+    assert store.is_approved("whatsapp", "15551234567@s.whatsapp.net") is False
+    assert os.environ.get("WHATSAPP_ALLOWED_USERS") in (None, "")
+    assert "15551234567" not in (adapter._allow_from or set())
+    assert adapter._is_dm_intake_allowed(sender) is False
+    assert adapter._is_dm_allowed(sender) is False
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.WHATSAPP,
+            user_id=sender,
+            chat_id=sender,
+            user_name="revoked",
+            chat_type="dm",
+        )
+    ) is False

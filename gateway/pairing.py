@@ -170,6 +170,94 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
         pass
 
 
+def _iter_live_gateway_adapters():
+    """Yield adapters from the in-process GatewayRunner, if one is running."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+    except Exception:
+        return
+    if runner is None:
+        return
+    adapters = getattr(runner, "adapters", None) or {}
+    for adapter in adapters.values():
+        if adapter is not None:
+            yield adapter
+    profile_adapters = getattr(runner, "_profile_adapters", None) or {}
+    for mapping in profile_adapters.values():
+        for adapter in (mapping or {}).values():
+            if adapter is not None:
+                yield adapter
+
+
+def _adapter_platform_name(adapter) -> str:
+    platform = getattr(adapter, "platform", None)
+    if platform is not None:
+        value = getattr(platform, "value", None)
+        if value:
+            return str(value).strip().lower()
+    name = getattr(adapter, "name", None)
+    return str(name or "").strip().lower()
+
+
+def _purge_allowlist_entries(entries, platform: str, user_id: str):
+    """Drop alias-equivalent allowlist entries while preserving ``*``."""
+    if entries is None:
+        return entries
+    if isinstance(entries, str):
+        parts = _split_allowlist(entries)
+        remaining = [
+            part for part in parts
+            if part == "*" or not _user_ids_match(platform, part, str(user_id))
+        ]
+        return ",".join(remaining)
+    if isinstance(entries, (set, frozenset)):
+        return {
+            entry for entry in entries
+            if str(entry).strip() == "*"
+            or not _user_ids_match(platform, str(entry), str(user_id))
+        }
+    if isinstance(entries, (list, tuple)):
+        return [
+            entry for entry in entries
+            if str(entry).strip() == "*"
+            or not _user_ids_match(platform, str(entry), str(user_id))
+        ]
+    return entries
+
+
+def _sync_live_adapter_allowlist_remove(platform: str, user_id: str) -> None:
+    """Clear revoked principals from in-process adapter allowlist snapshots.
+
+    ``WhatsAppAdapter`` (and Cloud) snapshot ``_allow_from`` at construction.
+    Pairing revoke updates ``WHATSAPP_ALLOWED_USERS`` / cloud env, but when the
+    revoked principal was the sole entry the env key is removed entirely.
+    Intake must not keep authorizing from the stale snapshot until restart.
+    """
+    platform_name = (platform or "").strip().lower()
+    if not platform_name or not str(user_id or "").strip():
+        return
+    for adapter in _iter_live_gateway_adapters():
+        if _adapter_platform_name(adapter) != platform_name:
+            continue
+        if hasattr(adapter, "_allow_from"):
+            try:
+                adapter._allow_from = _purge_allowlist_entries(
+                    set(adapter._allow_from or ()), platform_name, user_id
+                )
+            except Exception:
+                pass
+        extra = getattr(getattr(adapter, "config", None), "extra", None)
+        if isinstance(extra, dict) and "allow_from" in extra:
+            try:
+                extra["allow_from"] = _purge_allowlist_entries(
+                    extra.get("allow_from"), platform_name, user_id
+                )
+            except Exception:
+                pass
+
+
 def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     """Remove ``user_id`` (and WhatsApp alias equivalents) from the allowlist.
 
@@ -177,13 +265,17 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     mirrors a normalized phone into ``WHATSAPP_ALLOWED_USERS``, while revoke
     is often invoked with a JID or device-suffix form. Exact-string delete
     would leave the allowlist entry and keep the sender authorized.
+
+    Also clears matching entries from any in-process platform adapter
+    ``_allow_from`` snapshot so sole-entry revocation is effective without a
+    gateway restart.
     """
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
     current = os.getenv(env_var, "").strip()
     if not current:
-        return
+        return  # No allowlist configured — do not touch config-only snapshots.
     ids = _split_allowlist(current)
     # Never strip a wildcard grant; drop every entry that aliases-matches.
     remaining = [
@@ -201,6 +293,7 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
             remove_env_value(env_var)
     except Exception:
         pass
+    _sync_live_adapter_allowlist_remove(platform, user_id)
 
 
 def _load_json_file(path: Path) -> dict:
