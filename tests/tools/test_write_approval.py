@@ -350,10 +350,11 @@ class TestSkillGist:
         assert wa.skill_gist("unknown", "demo") == "unknown 'demo'"
 
 
-def test_issue_75130_backlog_is_bounded_and_observable(hermes_home):
+def test_issue_75130_backlog_is_bounded_and_observable(hermes_home, caplog):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa
 
+    caplog.set_level("INFO", logger="tools.write_approval")
     now = time.time()
     for i in range(357):
         created_at = now - ((356 - i) * 2034)
@@ -376,6 +377,9 @@ def test_issue_75130_backlog_is_bounded_and_observable(hermes_home):
     assert len(_skill_pending_ids(hermes_home)) == 100
     assert _skill_pending_ids(hermes_home)[0] == "s257"
     assert _skill_pending_ids(hermes_home)[-1] == "s356"
+    assert "retained=100" in caplog.text
+    assert "s000" in caplog.text
+    assert "s256" in caplog.text
 
 
 def test_skill_pending_ttl_boundary(hermes_home, monkeypatch):
@@ -410,7 +414,7 @@ def test_skill_pending_policy_defaults_overrides_and_invalid_values(hermes_home,
     )
     assert wa._resolve_skill_pending_policy() == (7, 9.0)
 
-    for bad_max in (0, -1, False, "bad"):
+    for bad_max in (0, -1, False, "bad", 10**1000):
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
             lambda bad_max=bad_max: {
@@ -419,7 +423,7 @@ def test_skill_pending_policy_defaults_overrides_and_invalid_values(hermes_home,
         )
         assert wa._resolve_skill_pending_policy() == (100, 9.0)
 
-    for bad_ttl in (0, -2, False, "bad"):
+    for bad_ttl in (0, -2, False, "bad", 10**1000):
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
             lambda bad_ttl=bad_ttl: {
@@ -505,6 +509,8 @@ def test_skill_pending_legacy_timestamp_and_unreadable_record_are_conservative(h
 
     unreadable = _pending_path(hermes_home, wa.SKILLS, "broken")
     unreadable.write_text("{not json", encoding="utf-8")
+    wrong_shape = _pending_path(hermes_home, wa.SKILLS, "wrong-shape")
+    wrong_shape.write_text("[]", encoding="utf-8")
 
     out = handle_pending_subcommand(wa.SKILLS, ["pending"])
 
@@ -513,6 +519,7 @@ def test_skill_pending_legacy_timestamp_and_unreadable_record_are_conservative(h
     assert wa.get_pending(wa.SKILLS, "legacy") is None
     assert wa.get_pending(wa.SKILLS, "invalid")["id"] == "invalid"
     assert unreadable.exists()
+    assert wrong_shape.exists()
     assert "Skipping unreadable pending record" in caplog.text
 
 

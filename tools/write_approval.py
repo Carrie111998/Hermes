@@ -136,7 +136,7 @@ def _resolve_skill_pending_policy() -> tuple[int, float]:
 def _normalize_positive_int(value: Any, default: int) -> int:
     if isinstance(value, bool):
         return default
-    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+    if isinstance(value, (int, float)) and _is_finite_number(value) and value > 0:
         return max(1, int(value))
     return default
 
@@ -144,15 +144,22 @@ def _normalize_positive_int(value: Any, default: int) -> int:
 def _normalize_positive_number(value: Any, default: float) -> float:
     if isinstance(value, bool):
         return default
-    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+    if isinstance(value, (int, float)) and _is_finite_number(value) and value > 0:
         return float(value)
     return default
+
+
+def _is_finite_number(value: int | float) -> bool:
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
 
 
 def _coerce_created_at(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)) and math.isfinite(value):
+    if isinstance(value, (int, float)) and _is_finite_number(value):
         return float(value)
     return None
 
@@ -179,6 +186,9 @@ def _load_pending_entries(subsystem: str) -> List[Dict[str, Any]]:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
+            logger.warning("Skipping unreadable pending record: %s", path)
+            continue
+        if not isinstance(record, dict):
             logger.warning("Skipping unreadable pending record: %s", path)
             continue
 
@@ -263,11 +273,14 @@ def _skill_pending_snapshot() -> Dict[str, Any]:
             active_entries = [entry for entry in active_entries if entry["path"] not in removed_paths]
 
     if expired_ids or overflow_ids:
+        affected_ids = expired_ids + overflow_ids
         logger.info(
-            "Cleaned pending %s writes, expired=%d overflow=%d",
+            "Cleaned pending %s writes, expired=%d overflow=%d retained=%d affected_ids=%s",
             SKILLS,
             len(expired_ids),
             len(overflow_ids),
+            len(active_entries),
+            affected_ids,
         )
 
     return {
