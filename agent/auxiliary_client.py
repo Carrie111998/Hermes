@@ -5531,11 +5531,36 @@ def resolve_provider_client(
         if custom_entry is None:
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
-            custom_base = (custom_entry.get("base_url") or "").strip()
-            custom_key = (custom_entry.get("api_key") or "").strip()
+            custom_base = (
+                (explicit_base_url or "").strip()
+                or (custom_entry.get("base_url") or "").strip()
+            )
+            # API key resolution mirrors runtime_provider._resolve_named_custom_runtime:
+            #   1. explicit_api_key (forwarded by call_llm from _slot_runtime)
+            #   2. custom_entry.api_key (inline key in config.yaml)
+            #   3. key_env / api_key_env env var
+            #   4. _host_derived_api_key (e.g. integrate.api.nvidia.com → NVIDIA_API_KEY)
+            # Without step 4, a providers: entry that has `api` + `name` + `models`
+            # but no `api_key` / `key_env` field silently resolves to the
+            # ``no-key-required`` placeholder and 401s on auth-required endpoints —
+            # even though resolve_runtime_provider (used by the main agent loop)
+            # finds the same key via _host_derived_api_key just fine. This mismatch
+            # was invisible in direct mode (main agent uses runtime_provider directly)
+            # but broke every MoA reference / auxiliary call (title generation,
+            # compression, vision, etc.) for providers configured this way.
+            custom_key = (
+                (explicit_api_key or "").strip()
+                or (custom_entry.get("api_key") or "").strip()
+            )
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = os.getenv(custom_key_env, "").strip()
+            if not custom_key:
+                try:
+                    from hermes_cli.runtime_provider import _host_derived_api_key
+                    custom_key = _host_derived_api_key(custom_base or "").strip()
+                except Exception:
+                    pass
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(

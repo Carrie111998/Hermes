@@ -4051,3 +4051,305 @@ class TestCustomEndpointApiKeyInheritance:
 
         assert captured.get("api_key") == "no-key-required"
 
+
+
+class TestNamedCustomProviderHostDerivedKey:
+    """Issue: named custom providers (``providers:`` dict in config.yaml) with
+    ``api`` + ``name`` + ``models`` but no ``api_key`` / ``key_env`` field
+    silently resolved to ``no-key-required`` in the auxiliary client, causing
+    401 on auth-required endpoints — even though ``resolve_runtime_provider``
+    (used by the main agent loop) found the same key via
+    ``_host_derived_api_key`` just fine.
+
+    The fix makes the named-custom-provider branch in
+    ``resolve_provider_client`` mirror ``runtime_provider``'s resolution chain:
+    explicit_api_key → entry.api_key → key_env env var → _host_derived_api_key.
+    """
+
+    def test_host_derived_key_found_when_no_api_key_or_key_env(self, monkeypatch):
+        """A providers: entry with only `api` + `name` + `models` (no api_key,
+        no key_env) must resolve the API key from the host-derived env var
+        (e.g. ``integrate.api.nvidia.com`` → ``NVIDIA_API_KEY``)."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key-12345")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_key": "",
+            "model": "z-ai/glm-5.2",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+            )
+
+        assert captured.get("api_key") == "nvapi-test-key-12345", (
+            "Named custom provider with no api_key/key_env should derive key "
+            "from host (NVIDIA_API_KEY), got: "
+            + repr(captured.get("api_key"))
+        )
+        assert captured.get("base_url") == "https://integrate.api.nvidia.com/v1"
+
+    def test_explicit_api_key_takes_precedence_over_host_derived(self, monkeypatch):
+        """When call_llm forwards an explicit_api_key (e.g. from
+        _slot_runtime), it must take precedence over _host_derived_api_key."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-host-derived")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_key": "",
+            "model": "z-ai/glm-5.2",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+                explicit_api_key="nvapi-explicit-forwarded",
+            )
+
+        assert captured.get("api_key") == "nvapi-explicit-forwarded"
+
+    def test_explicit_base_url_honored_when_entry_has_no_base_url(self, monkeypatch):
+        """explicit_base_url (forwarded from _slot_runtime) must be used when
+        the custom_entry has no base_url of its own."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.setenv("META_API_KEY", "meta-test-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "Meta Model API",
+            "base_url": "",
+            "api_key": "",
+            "model": "muse-spark-1.1",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "meta",
+                model="muse-spark-1.1",
+                explicit_base_url="https://api.meta.ai/v1",
+            )
+
+        assert captured.get("api_key") == "meta-test-key"
+        assert "api.meta.ai" in captured.get("base_url", "")
+
+    def test_key_env_takes_precedence_over_host_derived(self, monkeypatch):
+        """key_env must be checked before _host_derived_api_key, matching
+        runtime_provider's resolution order."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-host-derived")
+        monkeypatch.setenv("MY_CUSTOM_KEY", "custom-key-via-key-env")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_key": "",
+            "key_env": "MY_CUSTOM_KEY",
+            "model": "z-ai/glm-5.2",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+            )
+
+        assert captured.get("api_key") == "custom-key-via-key-env"
+
+    def test_inline_api_key_takes_precedence_over_host_derived(self, monkeypatch):
+        """An inline api_key in the config entry wins over _host_derived."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-host-derived")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_key": "inline-key-from-config",
+            "model": "z-ai/glm-5.2",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+            )
+
+        assert captured.get("api_key") == "inline-key-from-config"
+
+    def test_local_server_still_gets_no_key_required(self, monkeypatch):
+        """A local server (localhost) with no key anywhere must still fall
+        to ``no-key-required`` — _host_derived_api_key rejects loopback."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "Ollama",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key": "",
+            "model": "llama3",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "ollama-launch",
+                model="llama3",
+            )
+
+        assert captured.get("api_key") == "no-key-required"
+
+    def test_no_key_anywhere_still_gets_no_key_required(self, monkeypatch):
+        """When no key is resolvable from any source (explicit, entry, key_env,
+        host-derived), the placeholder is used — same behavior as before the
+        fix, just with one more fallback tried."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+        fake_entry = {
+            "name": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_key": "",
+            "model": "z-ai/glm-5.2",
+        }
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            return_value=fake_entry,
+        ), patch.object(ac, "_create_openai_client", side_effect=_capture_create), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+            )
+
+        assert captured.get("api_key") == "no-key-required"
+
+    def test_integration_providers_api_shape_uses_host_derived_key(
+        self, tmp_path, monkeypatch
+    ):
+        """Integration: ``providers:`` yaml uses ``api`` field (not ``base_url``)\n        and relies on _host_derived_api_key via NVIDIA_API_KEY.
+
+        Writes a real config.yaml into a temp HERMES_HOME so that
+        ``_get_named_custom_provider`` scans the actual user-facing path:
+        ``providers.nvidia-nim.api → base_url`` inside
+        ``hermes_cli/runtime_provider.py:700``.
+
+        The existing unit tests above mock that entry — this test exercises
+        the end-to-end yaml → parse → resolve_provider_client chain referenced
+        in the PR description.
+        """
+        import agent.auxiliary_client as ac
+
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir(parents=True)
+        # config.yaml for new-style ``providers:`` map using the ``api`` field
+        # reported in the issue (api + name + models, no explicit key_env).
+        cfg_text = (
+            "providers:\n"
+            "  nvidia-nim:\n"
+            "    api: https://integrate.api.nvidia.com/v1\n"
+            "    name: NVIDIA NIM\n"
+            "    models: [z-ai/glm-5.2]\n"
+        )
+        (hermes_home / "config.yaml").write_text(cfg_text, encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key-from-host-derived")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        # Also ensure raw NVIDIA env does not leak through leftover env trials
+        # except via the host-derived branch.
+        monkeypatch.setenv("OPENAI_ENV_FILE", "/dev/null")
+
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch.object(ac, "_create_openai_client", side_effect=_capture_create):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+            )
+
+        assert captured.get("api_key") == "nvapi-test-key-from-host-derived"
+        # Base URL should be the reported api field, not placeholder.
+        assert captured.get("base_url", "").startswith(
+            "https://integrate.api.nvidia.com"
+        )
