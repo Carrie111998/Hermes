@@ -1458,6 +1458,7 @@ class ProductionBackend:
                 "codex_thread_conflict",
                 "native_create_ambiguous",
                 "marker_conflict",
+                "bridge_temporarily_unavailable",
             }
             or confirmation != "PRESERVE_EXACT_BOUND_TASK"
         ):
@@ -3447,6 +3448,7 @@ def build_parser() -> argparse.ArgumentParser:
             "codex_thread_conflict",
             "native_create_ambiguous",
             "marker_conflict",
+            "bridge_temporarily_unavailable",
         ),
         required=True,
     )
@@ -4807,6 +4809,7 @@ def _public_sidebar_bound_retry_result(
             "codex_thread_conflict",
             "native_create_ambiguous",
             "marker_conflict",
+            "bridge_temporarily_unavailable",
         }
         or raw.get("error_code") != expected_error_code
         or not isinstance(job_id, str)

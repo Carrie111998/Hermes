@@ -8002,6 +8002,7 @@ class SessionBridgeStore:
                 "codex_thread_conflict",
                 "native_create_ambiguous",
                 "marker_conflict",
+                "bridge_temporarily_unavailable",
             }
             or authority != "PRESERVE_EXACT_BOUND_TASK"
         ):

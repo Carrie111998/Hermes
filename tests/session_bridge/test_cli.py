@@ -1605,6 +1605,60 @@ def test_sidebar_retry_bound_accepts_exact_idempotent_marker_replay(
     }
 
 
+def test_sidebar_retry_bound_parser_accepts_exact_transient_bridge_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "d" * 64
+    source_session_id = "claude:transient-bridge-failure"
+    thread_id = "019f-transient-bridge-failure"
+    backend = FakeBackend(
+        sidebar_bound_retry_payload={
+            "status": "requeued",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "error_code": "bridge_temporarily_unavailable",
+            "state": "sidebar_retry",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-retry-bound",
+                "--job-id",
+                job_id,
+                "--source-session-id",
+                source_session_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "bridge_temporarily_unavailable",
+                "--confirm",
+                "PRESERVE_EXACT_BOUND_TASK",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert backend.calls == [
+        (
+            "sidebar_retry_bound",
+            job_id,
+            source_session_id,
+            thread_id,
+            "bridge_temporarily_unavailable",
+            "PRESERVE_EXACT_BOUND_TASK",
+        ),
+        ("close",),
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "requeued",
+        "job_id": job_id,
+        "codex_thread_id": thread_id,
+        "state": "sidebar_retry",
+    }
+
+
 @pytest.mark.parametrize(
     "argv",
     (
@@ -2293,6 +2347,39 @@ def test_production_sidebar_retry_bound_accepts_exact_idempotent_marker_replay(
             "job_id": failed["id"],
             "codex_thread_id": thread_id,
             "error_code": "marker_conflict",
+            "state": SidebarJobState.RETRY.value,
+        }
+        assert store.get_sidebar_create_reservation(source_session_id) == reservation
+    finally:
+        backend.close()
+
+
+def test_production_sidebar_retry_bound_accepts_exact_transient_bridge_failure(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation = _production_bound_retry_backend(tmp_path)
+    source_session_id = failed["source_session_id"]
+    thread_id = failed["codex_thread_id"]
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("bridge_temporarily_unavailable", failed["id"]),
+        )
+    )
+    try:
+        result = backend.sidebar_retry_bound(
+            job_id=failed["id"],
+            source_session_id=source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="bridge_temporarily_unavailable",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+        )
+
+        assert result == {
+            "status": "requeued",
+            "job_id": failed["id"],
+            "codex_thread_id": thread_id,
+            "error_code": "bridge_temporarily_unavailable",
             "state": SidebarJobState.RETRY.value,
         }
         assert store.get_sidebar_create_reservation(source_session_id) == reservation

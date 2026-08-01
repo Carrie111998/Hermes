@@ -11495,6 +11495,42 @@ def test_bound_sidebar_operator_retry_accepts_exact_idempotent_marker_replay(
     assert claimed["codex_thread_id"] == thread_id
 
 
+def test_bound_sidebar_operator_retry_accepts_exact_transient_bridge_failure(
+    db,
+) -> None:
+    thread_id = "019f-bound-transient-bridge-failure"
+    store, candidate, failed, reservation = _failed_bound_not_indexed_sidebar(
+        db,
+        native_id="bound-transient-bridge-failure",
+        thread_id=thread_id,
+    )
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("bridge_temporarily_unavailable", failed["id"]),
+        )
+    )
+
+    retried = store.retry_failed_bound_sidebar_job(
+        job_id=failed["id"],
+        source_session_id=candidate.source_session_id,
+        codex_thread_id=thread_id,
+        expected_error_code="bridge_temporarily_unavailable",
+        confirmation="PRESERVE_EXACT_BOUND_TASK",
+        now=1_000.0,
+    )
+
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["attempts"] == 0
+    assert retried["error_code"] is None
+    assert retried["codex_thread_id"] == thread_id
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
+    claimed = store.claim_sidebar_jobs(now=1_000.0, limit=1)[0]
+    assert claimed["codex_thread_id"] == thread_id
+
+
 @pytest.mark.parametrize(
     ("argument", "replacement"),
     (
