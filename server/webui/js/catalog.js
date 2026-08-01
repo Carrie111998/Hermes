@@ -27,7 +27,8 @@ export const BUYER_INDUSTRIES = [
 
 export const SCAN_DATA_SOURCES = [
   { value: 'web_search', label: 'Web directories' },
-  { value: 'trade_data', label: 'Trade databases' },
+  // ponytail: database-backed sources (trade_data) stay out of the UI until a
+  // licensed data deal exists; re-add this row when one lands.
   { value: 'exhibitor_lists', label: 'Trade fair exhibitors' },
   { value: 'linkedin_reference', label: 'LinkedIn references' },
   { value: 'company_registries', label: 'Company registries' },

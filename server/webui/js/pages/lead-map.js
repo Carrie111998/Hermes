@@ -283,10 +283,10 @@ export async function mount(root, ctx) {
     const nameInput = input({ value: `Scan — ${selected.map(c => COUNTRY_NAMES[c] || c).join(', ')}` });
     const depthCards = radioCards([
       { value: 'quick', title: 'Quick', desc: 'Top directories only. Fast market taste-test.', meta: '~5 leads / country · ~1 min' },
-      { value: 'standard', title: 'Standard', desc: 'Directories + trade data + exhibitor lists.', meta: '~8 leads / country · ~2 min' },
+      { value: 'standard', title: 'Standard', desc: 'Directories + exhibitor lists.', meta: '~8 leads / country · ~2 min' },
       { value: 'deep', title: 'Deep', desc: 'All sources, wider net, more research per lead.', meta: '~12 leads / country · ~4 min' },
     ], 'standard');
-    const sourceChips = chipSelect(SCAN_DATA_SOURCES, ['web_search', 'trade_data', 'exhibitor_lists']);
+    const sourceChips = chipSelect(SCAN_DATA_SOURCES, ['web_search', 'exhibitor_lists']);
     const productChips = chipSelect(db.products.map(p => ({ value: p.id, label: p.name })), db.products.slice(0, 3).map(p => p.id));
     const industryChips = chipSelect(BUYER_INDUSTRIES, BUYER_INDUSTRIES.slice(0, 3));
     const leadCount = leadCountStepper(8);

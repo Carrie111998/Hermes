@@ -131,7 +131,6 @@ function marketView(market, ctx) {
 function sourcesView(market) {
   const dataSources = [
     { type: 'web_search', label: 'Web directories', status: 'enabled' },
-    { type: 'trade_data', label: 'Trade databases', status: 'enabled' },
     { type: 'exhibitor_lists', label: 'Trade fair exhibitors', status: 'enabled' },
     { type: 'company_registries', label: 'Company registries', status: 'enabled' },
     { type: 'linkedin_reference', label: 'LinkedIn references', status: 'manual' },
