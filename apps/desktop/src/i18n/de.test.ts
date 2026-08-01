@@ -109,4 +109,48 @@ describe('de locale content', () => {
     expect(de.settings.appearance.importedBadge).not.toBe(de.settings.appearance.removeTheme)
     expect(de.settings.appearance.importedBadge).toBe('Importiert')
   })
+
+  it('translates profile delete dialog fragments to German', () => {
+    // Review fix: deleteDescPrefix/Mid/Suffix were left in English.
+    // DeleteProfileDialog concatenates: prefix + name + mid + path + suffix
+    expect(de.profiles.deleteDescPrefix).not.toBe(en.profiles.deleteDescPrefix)
+    expect(de.profiles.deleteDescMid).not.toBe(en.profiles.deleteDescMid)
+    expect(de.profiles.deleteDescSuffix).not.toBe(en.profiles.deleteDescSuffix)
+    // Assembled description must read as a coherent German sentence
+    const assembled = `${de.profiles.deleteDescPrefix}MeinProfil${de.profiles.deleteDescMid}/pfad${de.profiles.deleteDescSuffix}`
+    expect(assembled).toBe(
+      'Dies löscht MeinProfil und entfernt sein /pfad Verzeichnis. Dies kann nicht rückgängig gemacht werden.'
+    )
+  })
+
+  it('translates profile rename dialog prefix to German', () => {
+    // Review fix: renameDescPrefix was left in English.
+    // RenameProfileDialog renders: prefix + path + suffix
+    expect(de.profiles.renameDescPrefix).not.toBe(en.profiles.renameDescPrefix)
+    const assembled = `${de.profiles.renameDescPrefix}~/.local/bin${de.profiles.renameDescSuffix}`
+    expect(assembled).toBe(
+      'Das Umbenennen aktualisiert das Profilverzeichnis und alle Wrapper-Skripte in ~/.local/bin.'
+    )
+  })
+
+  it('translates cron delete dialog fragments to German', () => {
+    // Review fix: cron deleteDescPrefix/Suffix were left in English.
+    // Cron delete dialog concatenates: prefix + title + suffix
+    expect(de.cron.deleteDescPrefix).not.toBe(en.cron.deleteDescPrefix)
+    expect(de.cron.deleteDescSuffix).not.toBe(en.cron.deleteDescSuffix)
+    const assembled = `${de.cron.deleteDescPrefix}Morgen-Briefing${de.cron.deleteDescSuffix}`
+    expect(assembled).toBe(
+      'Dies entfernt Morgen-Briefing dauerhaft. Die Ausführung wird sofort gestoppt.'
+    )
+  })
+
+  it('translates install.currentStage to German', () => {
+    // Review fix: currentStage() returned English '-- now: …'.
+    // The generic leaf walker does not execute function-valued translations,
+    // so this needs a direct assertion.
+    expect(de.install.currentStage('Python wird installiert')).not.toBe(
+      en.install.currentStage('Python wird installiert')
+    )
+    expect(de.install.currentStage('Abhängigkeiten')).toBe(' -- jetzt: Abhängigkeiten')
+  })
 })
