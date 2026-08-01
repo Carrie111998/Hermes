@@ -294,6 +294,10 @@ class TestTurnTraceIsolation:
             def create_trace_id(self, seed=None):
                 return f"trace::{seed}"
 
+            def start_observation(self, **kw):
+                started.append(kw.get("trace_context", {}).get("trace_id"))
+                return _Span()
+
             def start_as_current_observation(self, **kw):
                 started.append(kw.get("trace_context", {}).get("trace_id"))
                 return _RootCM()
@@ -647,26 +651,28 @@ class TestPlaceholderKeyDetection:
                     and r.name == self.LOGGER_NAME]
         assert warnings == []
 
-    def test_sdk_not_installed_still_skips_silently(self, monkeypatch, caplog):
-        """If the langfuse SDK isn't installed at all, the placeholder
-        check should never run — there's nothing the operator can do
-        about a credential mismatch when the package is missing, and
-        re-warning here would dilute the actually-actionable SDK-missing
-        signal upstream.  The ``Langfuse is None`` guard at the top of
-        ``_get_langfuse`` already handles this; this test pins that
-        behaviour."""
+    def test_sdk_not_installed_warns_once_and_stays_fail_open(
+        self, monkeypatch, caplog
+    ):
+        """A missing SDK must be visible without breaking gateway startup."""
         self._clear_env(monkeypatch)
         monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "placeholder")
         monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "placeholder")
-        # NO monkeypatch on Langfuse here — falls back to whatever the
-        # plugin imported at module load (None if SDK absent).
         plugin = self._fresh_plugin()
         monkeypatch.setattr(plugin, "Langfuse", None, raising=False)
+
         with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            assert plugin._get_langfuse() is None
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"
-                    and r.name == self.LOGGER_NAME]
-        assert warnings == []
+            for _ in range(5):
+                assert plugin._get_langfuse() is None
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING" and record.name == self.LOGGER_NAME
+        ]
+        assert len(warnings) == 1
+        assert "SDK is not installed" in warnings[0].getMessage()
+        assert "placeholder" not in warnings[0].getMessage().lower()
 
     def test_valid_prefixes_do_not_trigger_placeholder_warning(self, monkeypatch, caplog):
         """Real Langfuse keys (``pk-lf-…`` / ``sk-lf-…``) must pass the

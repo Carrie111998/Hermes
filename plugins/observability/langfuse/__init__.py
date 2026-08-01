@@ -164,6 +164,10 @@ def _get_langfuse() -> Optional[Langfuse]:
         return _LANGFUSE_CLIENT
 
     if Langfuse is None:
+        logger.warning(
+            "Langfuse SDK is not installed; observability traces are disabled. "
+            "Reinstall the Hermes runtime dependencies."
+        )
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
 
@@ -1200,8 +1204,6 @@ def register(ctx) -> None:
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
     ctx.register_hook("pre_api_request", on_pre_llm_request)
     ctx.register_hook("post_api_request", on_post_llm_call)
-    ctx.register_hook("pre_llm_request", on_pre_llm_request)
-    ctx.register_hook("post_llm_request", on_post_llm_call)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)

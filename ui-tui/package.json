@@ -30,7 +30,7 @@
     "nanostores": "^1.2.0",
     "postcss": "8.5.23",
     "react": "^19.2.4",
-    "react-router": "^8.3.0",
+    "react-router": "^7.11.0",
     "react-router-dom": "^7.11.0",
     "undici": "^6.25.0",
     "unicode-animations": "^1.0.3"
@@ -42,7 +42,7 @@
     "@typescript-eslint/eslint-plugin": "^8",
     "@typescript-eslint/parser": "^8",
     "esbuild": "^0.28.1",
-    "eslint": "^10.8.0",
+    "eslint": "^9.39.4",
     "eslint-plugin-perfectionist": "^5",
     "eslint-plugin-react": "^7",
     "eslint-plugin-react-hooks": "^7",

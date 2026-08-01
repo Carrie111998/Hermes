@@ -184,6 +184,7 @@ def test_gui_skip_build_launches_existing_packaged_app_without_npm(tmp_path, mon
     desktop_dir = root / "apps" / "desktop"
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     packaged_exe = _make_packaged_executable(root, monkeypatch)
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
 
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
@@ -197,6 +198,7 @@ def test_gui_skip_build_launches_existing_packaged_app_without_npm(tmp_path, mon
     mock_install.assert_not_called()
     mock_run.assert_called_once()
     assert mock_run.call_args.args[0] == [str(packaged_exe)]
+    assert "ELECTRON_RUN_AS_NODE" not in mock_run.call_args.kwargs["env"]
 
 
 def test_gui_linux_configures_sandbox_before_launch(tmp_path, monkeypatch):
