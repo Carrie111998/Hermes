@@ -178,7 +178,9 @@ def test_changed_uv_accepts_fixed_same_version_artifact(tmp_path, monkeypatch):
     assert not (root / ".hermes-runtime" / "python" / "unavailable-artifact.json").exists()
 
 
-@pytest.mark.parametrize("failure", ["install", "lookup", "probe", "catalog"])
+@pytest.mark.parametrize(
+    "failure", ["install", "lookup", "probe", "probe_exception", "catalog"]
+)
 def test_uncertain_candidate_failure_is_not_cached(tmp_path, monkeypatch, failure):
     import hermes_cli.managed_uv as managed_uv
 
@@ -211,14 +213,16 @@ def test_uncertain_candidate_failure_is_not_cached(tmp_path, monkeypatch, failur
     monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
     live_python = root / "venv" / "Scripts" / "python.exe"
     current = _runtime_info(live_python)
-    if failure == "catalog":
-        monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", lambda *_: current)
-    else:
-        monkeypatch.setattr(
-            managed_uv,
-            "probe_sqlite_runtime",
-            lambda executable: current if Path(executable) == live_python else None,
-        )
+    def fake_probe(executable):
+        if Path(executable) == live_python:
+            return current
+        if failure == "probe_exception":
+            raise RuntimeError("probe interrupted")
+        if failure == "catalog":
+            return current
+        return None
+
+    monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe)
     monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", Mock())
 
     first = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
