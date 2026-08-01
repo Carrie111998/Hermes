@@ -372,6 +372,7 @@ class TestInstall:
         backfilled = backfill_profile_envs(quiet=True)
 
         assert "telem" not in backfilled
+        assert not backfilled
         content = (plan.target_dir / ".env").read_text(encoding="utf-8")
         assert "sk-SECRET-DEFAULT" not in content
         assert "tok-SECRET" not in content
@@ -418,6 +419,8 @@ class TestInstall:
         backfilled = backfill_profile_envs(quiet=True)
 
         assert "legacy-dist" in backfilled
+        assert backfilled.placeholder == ("legacy-dist",)
+        assert backfilled.copied == ()
         content = (plan.target_dir / ".env").read_text(encoding="utf-8")
         assert "sk-SECRET-DEFAULT" not in content
         assert all(
