@@ -2771,6 +2771,26 @@ async function releaseBackendLock(updateRoot, tag) {
     forceKillProcessTree(pid)
   }
 
+  // Stop the separately-running messaging gateway if one is active.
+  // The gateway is launched by the gateway-launcher desktop plugin via
+  // /api/gateway/start and is NOT in backendConnectionState or backendPool,
+  // so the kills above never see it. On Windows it keeps venv\Scripts\python
+  // mandatory-locked, causing uv pip install to fail with access-denied
+  // during the update. (#70337)
+  if (IS_WINDOWS) {
+    try {
+      const gwPidPath = path.join(HERMES_HOME, 'gateway.pid')
+      const gwPidRaw = fs.readFileSync(gwPidPath, 'utf8')
+      const gwPidParsed = JSON.parse(gwPidRaw)
+
+      if (Number.isInteger(gwPidParsed?.pid) && gwPidParsed.pid > 0) {
+        forceKillProcessTree(gwPidParsed.pid)
+      }
+    } catch {
+      // gateway.pid missing or unparseable — no gateway to stop.
+    }
+  }
+
   const shim = venvHermesShimPath(updateRoot)
   const deadlineMs = Date.now() + 15000
 
