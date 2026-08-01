@@ -2422,6 +2422,19 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     return ""
 
 
+def _load_cursor_rules_enabled() -> bool:
+    """Hermes-only override (Patrick 2026-08-01): `.cursor/rules/*.mdc` pertencem
+    ao Cursor e NÃO devem ser auto-carregados no Hermes. Reabilite com
+    `agent.context_cursor_rules: true` no config.yaml."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        return False
+    raw = ((cfg or {}).get("agent", {}) or {}).get("context_cursor_rules", False)
+    return str(raw).strip().lower() in ("true", "yes", "1", "on")
+
+
 def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
@@ -2436,7 +2449,7 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
             logger.debug("Could not read .cursorrules: %s", e)
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
-    if cursor_rules_dir.exists() and cursor_rules_dir.is_dir():
+    if cursor_rules_dir.exists() and cursor_rules_dir.is_dir() and _load_cursor_rules_enabled():
         mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
         for mdc_file in mdc_files:
             try:
