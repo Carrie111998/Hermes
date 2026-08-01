@@ -8905,6 +8905,32 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_retagged_workspace_roots: set[str] = set()
+
+
+def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
+    """Reclaim pre-tag worker rows in state.db so they leave the session lists.
+
+    Best-effort and gated — the durable ``state_meta`` gate lives in
+    ``retag_kanban_worker_sessions``; the in-process set keeps a busy
+    dispatcher from reopening state.db on every spawn just to read it. A
+    dispatcher tick must never fail because a session DB was busy or missing.
+    """
+    if workspaces_root_path in _retagged_workspace_roots:
+        return
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.retag_kanban_worker_sessions(workspaces_root_path)
+        finally:
+            db.close()
+        _retagged_workspace_roots.add(workspaces_root_path)
+    except Exception as exc:
+        _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8962,6 +8988,14 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Tag the worker's session so it lands in state.db as `kanban`, not as an
+    # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
+    # read on the board and in `hermes kanban log` — it is not a conversation
+    # the user started, so every session-browsing surface (desktop sidebar, TUI
+    # resume picker, session_search) filters it out by source. Without this the
+    # sidebar renders one row per attempt, labeled with the worker's own prompt
+    # ("work kanban task t_…").
+    env["HERMES_SESSION_SOURCE"] = "kanban"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -9009,6 +9043,7 @@ def _default_spawn(
     # but unusual symlink / Docker layouts are caught here too.
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
@@ -9627,15 +9662,65 @@ def add_notify_sub(
             )
 
 
+def _notify_profile_filter(
+    notifier_profiles: Optional[Iterable[str]],
+    *,
+    include_unowned: bool,
+) -> tuple[str, list[str]]:
+    """Build an optional SQL predicate for notification profile ownership."""
+    if notifier_profiles is None:
+        return "", []
+
+    profiles = sorted(
+        {
+            str(profile).strip()
+            for profile in notifier_profiles
+            if str(profile).strip()
+        }
+    )
+    clauses: list[str] = []
+    params: list[str] = []
+    if profiles:
+        clauses.append(
+            "notifier_profile IN (" + ",".join("?" for _ in profiles) + ")"
+        )
+        params.extend(profiles)
+    if include_unowned:
+        clauses.append("notifier_profile IS NULL OR notifier_profile = ''")
+    if not clauses:
+        return "0", []
+    return "(" + ") OR (".join(clauses) + ")", params
+
+
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
+    *,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
 ) -> list[dict]:
+    """List subscriptions, optionally restricted to notifier profile owners.
+
+    Passing no ``notifier_profiles`` preserves the historical all-subscriptions
+    result. Gateway notifier processes pass the profiles whose adapters they
+    own so they cannot claim another gateway's events. ``include_unowned`` is
+    used by the dispatch owner for legacy rows created before profile stamping.
+    """
+    owner_where, owner_params = _notify_profile_filter(
+        notifier_profiles, include_unowned=include_unowned,
+    )
+    where: list[str] = []
+    params: list[Any] = []
     if task_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
+        where.append("task_id = ?")
+        params.append(task_id)
+    if owner_where:
+        where.append(owner_where)
+        params.extend(owner_params)
+    sql = "SELECT * FROM kanban_notify_subs"
+    if where:
+        sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
+    rows = conn.execute(sql, params).fetchall()
     out: list[dict] = []
     for row in rows:
         item = dict(row)
@@ -9651,6 +9736,8 @@ def count_notify_subs(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
 ) -> int:
     """Count ``kanban_notify_subs`` rows via a read-only connection.
 
@@ -9662,8 +9749,10 @@ def count_notify_subs(
     write table content). Rows in a not-yet-checkpointed WAL are
     visible, so a freshly added subscription is never missed. A missing
     DB, or a legacy DB that predates the subscriptions table, counts as
-    zero. Path resolution matches :func:`connect` (explicit ``db_path``,
-    else ``board`` via :func:`kanban_db_path`). Raises
+    zero. When ``notifier_profiles`` is supplied, only subscriptions owned
+    by those profiles are counted; ``include_unowned`` also includes legacy
+    rows without an owner stamp. Path resolution matches :func:`connect`
+    (explicit ``db_path``, else ``board`` via :func:`kanban_db_path`). Raises
     :class:`sqlite3.Error` when the DB exists but cannot be read
     (locked, corrupt); callers choose their own fallback.
     """
@@ -9673,9 +9762,13 @@ def count_notify_subs(
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM kanban_notify_subs"
-            ).fetchone()
+            owner_where, owner_params = _notify_profile_filter(
+                notifier_profiles, include_unowned=include_unowned,
+            )
+            sql = "SELECT COUNT(*) FROM kanban_notify_subs"
+            if owner_where:
+                sql += " WHERE " + owner_where
+            row = conn.execute(sql, owner_params).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return 0
