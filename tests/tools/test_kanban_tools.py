@@ -1023,3 +1023,477 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Verified-completion gate (#70806)
+# ---------------------------------------------------------------------------
+
+def _make_verify_worker_env(monkeypatch, tmp_path, **task_kwargs):
+    """Isolated HERMES_HOME with one claimed task carrying verify config,
+    matching the goal-mode gate test setup. Returns ``(task_id, run_id)``."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="verify-gate-test", assignee="test-worker",
+            **task_kwargs,
+        )
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid, run_id
+
+
+def _fake_verify(ok, *, gate="verify_cmd", command="pytest -q",
+                 exit_code=None, detail="", evidence=None):
+    from hermes_cli import kanban_verify as kv
+
+    outcome = kv.VerifyOutcome(
+        ok=ok, gate=gate, command=command,
+        exit_code=(0 if ok and exit_code is None else exit_code),
+        detail=detail, evidence=evidence,
+    )
+
+    def fake(task, **kw):
+        return outcome
+
+    return fake
+
+
+def test_complete_verify_green_completes_and_stamps_metadata(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.setattr(kv, "evaluate_task_verification", _fake_verify(True))
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert out.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+        run = kb.latest_run(conn, tid)
+        assert run.metadata["verification"] == {
+            "gate": "verify_cmd", "command": "pytest -q", "exit_code": 0,
+        }
+    finally:
+        conn.close()
+
+
+def test_complete_verify_green_overrides_forged_metadata(monkeypatch, tmp_path):
+    """A worker-supplied metadata['verification'] must never masquerade as
+    the gate's audit record — it is moved aside, not merged."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.setattr(kv, "evaluate_task_verification", _fake_verify(True))
+
+    out = json.loads(kt._handle_complete({
+        "summary": "done",
+        "metadata": {"verification": {"forged": True, "exit_code": 0}},
+    }))
+    assert out.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, tid)
+        assert run.metadata["verification"] == {
+            "gate": "verify_cmd", "command": "pytest -q", "exit_code": 0,
+        }
+        assert run.metadata["worker_verification"] == {
+            "forged": True, "exit_code": 0,
+        }
+    finally:
+        conn.close()
+
+
+def test_complete_verify_red_rejects_in_flight_then_green_completes(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q", max_retries=5,
+    )
+    attempts = {"n": 0}
+    red = _fake_verify(False, exit_code=1, detail="1 failed, 3 passed")
+    green = _fake_verify(True)
+
+    def fake(task, **kw):
+        attempts["n"] += 1
+        return (red if attempts["n"] == 1 else green)(task, **kw)
+
+    monkeypatch.setattr(kv, "evaluate_task_verification", fake)
+
+    first = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in first
+    assert "still in-flight" in first["error"]
+    assert "failure 1 of limit 5" in first["error"]
+    assert "1 failed, 3 passed" in first["error"]
+
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running"
+        assert t.consecutive_failures == 1
+    finally:
+        conn.close()
+
+    second = json.loads(kt._handle_complete({"summary": "done"}))
+    assert second.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        assert t.status == "done"
+        assert t.consecutive_failures == 0
+    finally:
+        conn.close()
+
+
+def test_complete_verify_red_exhaustion_blocks_with_evidence(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q", max_retries=1,
+    )
+    monkeypatch.setattr(
+        kv, "evaluate_task_verification",
+        _fake_verify(False, exit_code=1, detail="everything failed"),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in out
+    assert "blocked" in out["error"]
+    assert "Do NOT retry" in out["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+        comments = [c for c in kb.list_comments(conn, tid)
+                    if c.author == "verify-gate"]
+        assert comments and "everything failed" in comments[-1].body
+        evidence = [e for e in kb.list_events(conn, tid)
+                    if e.kind == "completion_blocked_evidence"]
+        assert evidence and evidence[-1].payload["exhausted"] is True
+    finally:
+        conn.close()
+
+
+def test_complete_verify_red_stale_run_uncounted(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 999))
+    monkeypatch.setattr(
+        kv, "evaluate_task_verification",
+        _fake_verify(False, exit_code=1, detail="late red"),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in out
+    assert "no longer current" in out["error"]
+
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running"
+        assert t.consecutive_failures == 0
+        evidence = [e for e in kb.list_events(conn, tid)
+                    if e.kind == "completion_blocked_evidence"]
+        assert evidence and evidence[-1].payload["stale_run"] is True
+        assert evidence[-1].payload["counted"] is False
+    finally:
+        conn.close()
+
+
+def test_complete_verify_nonworker_caller_rejected_uncounted(
+    monkeypatch, tmp_path
+):
+    """Orchestrator/CLI-context tool callers can't run the gate meaningfully
+    (wrong process, wrong ledger bucket) — reject without counting."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    def fail_eval(task, **kw):
+        raise AssertionError("gate must not evaluate for non-worker callers")
+
+    monkeypatch.setattr(kv, "evaluate_task_verification", fail_eval)
+
+    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done"}))
+    assert "error" in out
+    assert "verified-completion gate" in out["error"]
+    assert "human" in out["error"]
+    # The rejection must never hand an LLM caller the literal bypass
+    # incantation — any profile with a terminal tool could just run it.
+    assert "hermes kanban complete" not in out["error"]
+
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running"
+        assert t.consecutive_failures == 0
+        assert not [e for e in kb.list_events(conn, tid)
+                    if e.kind == "completion_blocked_evidence"]
+    finally:
+        conn.close()
+
+
+def test_complete_verify_auto_rejects_prior_incarnation_evidence(
+    monkeypatch, tmp_path
+):
+    """Wire test for the run-freshness bound: green full-scope ledger
+    evidence recorded BEFORE the active run started (a previous
+    incarnation's leftovers under the shared task-id bucket) must not
+    complete the task — while evidence recorded during the run does."""
+    from datetime import datetime, timezone
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_mode="auto",
+        workspace_path=str(ws), max_retries=5,
+    )
+
+    def status_created_at(created_at):
+        return lambda *, session_id, cwd: {
+            "status": "passed",
+            "evidence": {"scope": "full", "canonical_command": "pytest -q",
+                         "exit_code": 0, "created_at": created_at},
+        }
+
+    monkeypatch.setattr(
+        kv, "verification_status",
+        status_created_at("2020-01-01T00:00:00+00:00"),
+    )
+    # The registry-injected task_id kwarg feeds the candidate chain — the
+    # task-id ledger bucket is exactly the shared key a previous
+    # incarnation's evidence survives under.
+    out = json.loads(
+        kt._handle_complete({"summary": "done"}, task_id=tid)
+    )
+    assert "error" in out
+    assert "predates" in out["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        kv, "verification_status",
+        status_created_at(datetime.now(timezone.utc).isoformat()),
+    )
+    out2 = json.loads(
+        kt._handle_complete({"summary": "done"}, task_id=tid)
+    )
+    assert out2.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_without_verify_config_never_calls_gate(monkeypatch, worker_env):
+    """The zero-behavior-change contract: plain tasks never touch the gate."""
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    def fail_eval(task, **kw):
+        raise AssertionError("gate must not run for tasks without verify config")
+
+    monkeypatch.setattr(kv, "evaluate_task_verification", fail_eval)
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert out.get("ok") is True
+
+
+def test_complete_verify_gate_runs_before_goal_judge(monkeypatch, tmp_path):
+    """A red suite makes the judge call moot — the deterministic gate wins."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q", goal_mode=True,
+        max_retries=5,
+    )
+    called = {"judge": False}
+
+    def spy_judge(*args, **kw):
+        called["judge"] = True
+        return "done", "", False, None, False
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", spy_judge)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    monkeypatch.setattr(
+        kv, "evaluate_task_verification",
+        _fake_verify(False, exit_code=1, detail="red"),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in out
+    assert "verification failed" in out["error"]
+    assert called["judge"] is False
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_verify_green_stale_run_not_done(monkeypatch, tmp_path):
+    """Green verify + a superseded run must NOT complete — complete_task's
+    own run CAS carries the same identity guard as the red path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_verify as kv
+    from tools import kanban_tools as kt
+
+    tid, run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 999))
+    monkeypatch.setattr(kv, "evaluate_task_verification", _fake_verify(True))
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in out
+    assert "could not complete" in out["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_verify_cmd_end_to_end_green(monkeypatch, tmp_path):
+    """One un-mocked pass through the real /bin/sh runner."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="exit 0",
+        workspace_kind="dir", workspace_path=str(ws),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert out.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+        run = kb.latest_run(conn, tid)
+        assert run.metadata["verification"]["exit_code"] == 0
+    finally:
+        conn.close()
+
+
+def test_complete_verify_red_output_redacted_in_events(monkeypatch, tmp_path):
+    """Secrets in verify OUTPUT must be redacted at capture, before any
+    persistence (events, comments) or tool_error surfaces them. (The command
+    string itself is operator-authored config, already stored verbatim on
+    the task row — the threat model is leaked output: env dumps, tracebacks,
+    tokens echoed by a failing test.)"""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    secret = "ghp_" + "Abc123XyZ0" * 3
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "leaky.txt").write_text(secret + "\n")
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path,
+        verify_cmd="cat leaky.txt; exit 1",
+        workspace_kind="dir", workspace_path=str(ws),
+        max_retries=5,
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "error" in out
+    assert secret not in out["error"]
+
+    conn = kb.connect()
+    try:
+        for e in kb.list_events(conn, tid):
+            assert secret not in json.dumps(e.payload or {})
+        for c in kb.list_comments(conn, tid):
+            assert secret not in c.body
+    finally:
+        conn.close()
+
+
+def test_complete_verify_unsupported_platform_rejects_without_counting(
+    monkeypatch, tmp_path
+):
+    """A verify-mode task reaching a non-POSIX worker must reject the
+    completion WITHOUT consuming retry budget: the failure is the host's,
+    not the work's — the task must not march toward 'blocked'."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_verify as kv
+    from hermes_cli import kanban_db as kb
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.setattr(kv, "platform_supported", lambda: False)
+    out = kt._handle_complete({"task_id": tid, "result": "did it"})
+    assert "posix" in out.lower()
+    assert "no failure was counted" in out.lower()
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running"          # still in flight
+        assert t.consecutive_failures == 0    # nothing counted
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "completion_blocked_evidence" not in kinds
+    finally:
+        conn.close()

@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from agent.redact import redact_sensitive_text
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -123,6 +124,13 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+
+# Opt-in verified completion (#70806). 'cmd' runs the task's verify_cmd in
+# its workspace when the worker calls kanban_complete; 'auto' accepts fresh
+# full-scope green evidence from the verification ledger instead of
+# executing anything. NULL/None = no gate — the behaviour every task had
+# before the columns existed.
+VALID_VERIFY_MODES = {"cmd", "auto"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -963,6 +971,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Opt-in verified completion (#70806). 'cmd' = run ``verify_cmd`` in the
+    # task workspace at kanban_complete; 'auto' = accept fresh full-scope
+    # green ledger evidence. None (the common case) = no gate. Names match
+    # the ``--verify-cmd`` / ``--verify auto`` CLI flags on ``kanban create``.
+    verify_mode: Optional[str] = None
+    verify_cmd: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1051,6 +1065,12 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            verify_mode=(
+                row["verify_mode"] if "verify_mode" in keys else None
+            ),
+            verify_cmd=(
+                row["verify_cmd"] if "verify_cmd" in keys else None
             ),
         )
 
@@ -1234,7 +1254,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Opt-in verified completion (#70806). NULL = no gate (the behaviour
+    -- every existing row had). 'cmd' runs verify_cmd in the task workspace
+    -- at kanban_complete; 'auto' accepts fresh full-scope green evidence
+    -- from the verification ledger (read-only — the ledger stays passive).
+    verify_mode          TEXT,
+    -- Shell command for verify_mode='cmd' (run via /bin/sh -c in the task
+    -- workspace). NULL otherwise.
+    verify_cmd           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2427,6 +2455,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "verify_mode" not in cols:
+        # Opt-in verified completion (#70806). Existing rows get NULL,
+        # which is the correct default: no gate, identical completion
+        # behaviour to before the column existed.
+        _add_column_if_missing(conn, "tasks", "verify_mode", "verify_mode TEXT")
+    if "verify_cmd" not in cols:
+        _add_column_if_missing(conn, "tasks", "verify_cmd", "verify_cmd TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2853,6 +2889,8 @@ def create_task(
     provider_override: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    verify_mode: Optional[str] = None,
+    verify_cmd: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -2897,6 +2935,21 @@ def create_task(
     provider_override = (provider_override or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    # Verified completion (#70806) — validate the opt-in config up front so
+    # a half-configured gate can never land on a row.
+    if verify_cmd is not None and not str(verify_cmd).strip():
+        verify_cmd = None
+    if verify_cmd and verify_mode is None:
+        verify_mode = "cmd"          # passing a command implies cmd mode
+    if verify_mode is not None:
+        if verify_mode not in VALID_VERIFY_MODES:
+            raise ValueError(
+                f"verify_mode must be one of {sorted(VALID_VERIFY_MODES)} or None"
+            )
+        if verify_mode == "cmd" and not verify_cmd:
+            raise ValueError("verify_mode='cmd' requires verify_cmd")
+        if verify_mode == "auto" and verify_cmd:
+            raise ValueError("verify_mode='auto' does not take verify_cmd")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3162,8 +3215,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        verify_mode, verify_cmd
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3188,6 +3242,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        verify_mode,
+                        verify_cmd,
                     ),
                 )
                 for pid in parents:
@@ -4739,6 +4795,30 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class VerifyGateRequiredError(ValueError):
+    """Raised by ``complete_task`` when a verify-mode task is completed
+    without a ``verify_gate`` declaration.
+
+    ``complete_task`` is the sole writer of ``status='done'``, so this is
+    the fail-closed floor under every completion surface — tool layer,
+    CLI, dashboard, and any caller added later. Surfaces that ran the
+    gate pass ``verify_gate='passed'``; audited human waivers pass
+    ``verify_gate='waived'`` (the caller owns emitting its
+    ``verify_bypassed`` audit trail). Kept a ``ValueError`` subclass so
+    existing tool-error handlers treat it as recoverable.
+    """
+
+    def __init__(self, task_id: str, verify_mode: str):
+        self.task_id = task_id
+        self.verify_mode = verify_mode
+        super().__init__(
+            f"completion refused: task {task_id} has a verified-completion "
+            f"gate ({verify_mode}); complete_task requires "
+            f"verify_gate='passed' (gate ran green) or 'waived' (audited "
+            f"human override)."
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4748,8 +4828,18 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    verify_gate: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
+
+    ``verify_gate`` declares how a verify-mode task's gate was satisfied:
+    ``'passed'`` (the caller ran the gate and it was green) or
+    ``'waived'`` (an audited human override; the caller owns the
+    ``verify_bypassed`` audit trail). For tasks with ``verify_mode`` set,
+    omitting it raises :class:`VerifyGateRequiredError` and emits a
+    ``completion_refused_unverified`` event — fail-closed for every
+    completion surface by default. Tasks without ``verify_mode`` ignore
+    the argument entirely.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -4778,6 +4868,30 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    if verify_gate not in (None, "passed", "waived"):
+        raise ValueError(
+            f"verify_gate must be 'passed' or 'waived', got {verify_gate!r}"
+        )
+
+    # Verified-completion floor (#70806): status='done' is written only by
+    # this function, so enforcing here makes every completion surface —
+    # tool layer, CLI, dashboard, and callers added later — fail closed
+    # unless it declares how the gate was satisfied. Refusals are audited
+    # in their own tiny txn (mirroring the hallucination gate below) and
+    # never mutate task state or the retry budget: an ungated call is an
+    # API-misuse/bypass signal, not a red verification.
+    if verify_gate is None:
+        row = conn.execute(
+            "SELECT verify_mode FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is not None and row["verify_mode"]:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_refused_unverified",
+                    {"mode": row["verify_mode"]},
+                )
+            raise VerifyGateRequiredError(task_id, row["verify_mode"])
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -7702,6 +7816,9 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    escalate_on_trip: bool = False,
+    details_out: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -7745,16 +7862,45 @@ def _record_task_failure(
     ``detect_crashed_workers``, which resolves the per-task
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
+
+    ``expected_run_id`` is a run-identity CAS mirroring ``complete_task``'s:
+    ``None`` (all pre-existing callers) skips the guard; an int is compared
+    against ``current_run_id`` inside this function's own write txn, and on
+    a mismatch NOTHING is mutated — the caller's attempt belonged to a
+    reclaimed/superseded run and must not charge the new incarnation's
+    budget, block it, or close its run. ``details_out["stale_run"]`` reports
+    the rejection.
+
+    ``escalate_on_trip=True`` is the verified-completion gate's mode
+    (#70806): below the limit it behaves as ``(release_claim=False,
+    end_run=False)`` — a counter bump only, claim and open run intact so the
+    still-live worker can fix and retry in-session — while the trip behaves
+    as ``(True, True)`` — blocked, claim cleared, run closed ``gave_up``.
+    The choice is made HERE, on the same ``failures >= effective_limit``
+    comparison the breaker already computes, so there is no pre-read for a
+    caller to get wrong and no TOCTOU window between prediction and write.
+
+    ``details_out``, when provided, is populated with ``failures`` /
+    ``effective_limit`` / ``limit_source`` / ``blocked`` / ``stale_run`` so
+    callers never re-implement the task > caller > default resolution order.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            if details_out is not None:
+                details_out.update({
+                    "failures": 0,
+                    "effective_limit": int(failure_limit),
+                    "limit_source": "dispatcher",
+                    "blocked": False,
+                    "stale_run": False,
+                })
             return False
         failures = int(row["consecutive_failures"]) + 1
 
@@ -7770,9 +7916,28 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
+        # Run-identity CAS — atomic with the mutations below because the
+        # whole body runs inside one BEGIN IMMEDIATE txn (single writer).
+        if expected_run_id is not None:
+            current_run = row["current_run_id"]
+            if current_run is None or int(current_run) != int(expected_run_id):
+                if details_out is not None:
+                    details_out.update({
+                        "failures": failures - 1,   # nothing was charged
+                        "effective_limit": effective_limit,
+                        "limit_source": limit_source,
+                        "blocked": False,
+                        "stale_run": True,
+                    })
+                return False
+
+        # ``escalate_on_trip`` resolves release/end per-branch (see the
+        # docstring); classic callers keep their literal kwargs.
         if force_trip or failures >= effective_limit:
+            trip_release = True if escalate_on_trip else release_claim
+            trip_end = True if escalate_on_trip else end_run
             # Trip the breaker.
-            if release_claim:
+            if trip_release:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
@@ -7792,7 +7957,7 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             run_id = None
-            if end_run:
+            if trip_end:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
                     conn, task_id,
@@ -7819,8 +7984,12 @@ def _record_task_failure(
             )
             blocked = True
         else:
-            # Below threshold.
-            if release_claim:
+            # Below threshold. In escalate mode this is deliberately the
+            # counter-only shape: the still-live worker keeps its claim
+            # and open run so it can fix the failure and retry in-session.
+            below_release = False if escalate_on_trip else release_claim
+            below_end = False if escalate_on_trip else end_run
+            if below_release:
                 # Spawn path: transition running → ready + clear claim.
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -7837,7 +8006,7 @@ def _record_task_failure(
                     "last_failure_error = ? WHERE id = ?",
                     (failures, error[:500], task_id),
                 )
-            if end_run:
+            if below_end:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
                     conn, task_id,
@@ -7851,6 +8020,14 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    if details_out is not None:
+        details_out.update({
+            "failures": failures,
+            "effective_limit": effective_limit,
+            "limit_source": limit_source,
+            "blocked": blocked,
+            "stale_run": False,
+        })
     return blocked
 
 
@@ -7870,6 +8047,134 @@ def _record_spawn_failure(
         release_claim=True,
         end_run=True,
     )
+
+
+def record_verify_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    gate: str,
+    command: Optional[str],
+    exit_code: Optional[int],
+    output_excerpt: str,
+    expected_run_id: Optional[int],
+    failure_limit: Optional[int] = None,
+    summary_preview: Optional[str] = None,
+) -> dict:
+    """Record one rejected verified-completion attempt (#70806).
+
+    Thin orchestrator over ``_record_task_failure``: the funnel does the
+    counter bump, the trip decision, and — via ``escalate_on_trip`` — the
+    release/end escalation atomically, guarded by the ``expected_run_id``
+    run-identity CAS. This function adds the evidence trail on top:
+
+    * a ``completion_blocked_evidence`` event on EVERY counted rejection
+      (``exhausted`` marks the attempt that tripped the breaker),
+    * an audit-only ``completion_blocked_evidence`` event with
+      ``counted: false`` when the attempt belonged to a stale run (a
+      ghost never touches the new incarnation's budget),
+    * a human-readable evidence comment on exhaustion.
+
+    ``output_excerpt`` must arrive already redacted + capped (the runner in
+    ``hermes_cli.kanban_verify`` guarantees this) so it can be persisted
+    verbatim into events and comments. ``write_txn`` is not reentrant, so
+    each step owns its txn; nothing here wraps the funnel.
+
+    Returns ``{"blocked", "stale_run", "failures", "effective_limit",
+    "limit_source"}``.
+    """
+    # Defense in depth: the kanban_verify runner already reports a redacted
+    # command, but this is a public API — a raw secret-bearing command
+    # (``TOKEN=... ./check.sh``) must never reach last_failure_error,
+    # events, or comments through any caller.
+    if command:
+        command = redact_sensitive_text(command, force=True)
+    error = f"verification failed ({gate}, exit {exit_code}): {command or ''}"
+    info: dict = {}
+    blocked = _record_task_failure(
+        conn, task_id, error,
+        outcome="verify_failed",
+        failure_limit=failure_limit,
+        escalate_on_trip=True,
+        expected_run_id=expected_run_id,
+        event_payload_extra={
+            "gate": gate,
+            "command": command,
+            "exit_code": exit_code,
+            "output_excerpt": output_excerpt,
+        },
+        details_out=info,
+    )
+
+    if info.get("stale_run"):
+        # The claim/run this attempt belonged to is gone (mid-verify TTL
+        # reclaim on a non-host-local board, or a requeue). Mutate nothing
+        # further — audit the ghost and stand down.
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_evidence",
+                {
+                    "gate": gate,
+                    "command": command,
+                    "exit_code": exit_code,
+                    "output_excerpt": output_excerpt,
+                    "stale_run": True,
+                    "counted": False,
+                    "summary_preview": summary_preview,
+                },
+                run_id=expected_run_id,
+            )
+        return {
+            "blocked": False,
+            "stale_run": True,
+            "failures": info.get("failures", 0),
+            "effective_limit": info.get("effective_limit"),
+            "limit_source": info.get("limit_source"),
+        }
+
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_evidence",
+            {
+                "gate": gate,
+                "command": command,
+                "exit_code": exit_code,
+                "output_excerpt": output_excerpt,
+                "failures": info["failures"],
+                "effective_limit": info["effective_limit"],
+                "limit_source": info["limit_source"],
+                "exhausted": blocked,
+                "counted": True,
+                "summary_preview": summary_preview,
+            },
+            run_id=expected_run_id,
+        )
+
+    if blocked:
+        add_comment(
+            conn, task_id, "verify-gate",
+            (
+                f"Verified completion failed and the retry budget is "
+                f"exhausted ({info['failures']} of {info['effective_limit']} "
+                f"consecutive failures — the budget is shared with "
+                f"crash/timeout failures).\n"
+                f"Gate: {gate}\n"
+                f"Command: {command}\n"
+                f"Exit code: {exit_code}\n"
+                f"Output (redacted, capped):\n"
+                f"```\n{output_excerpt}\n```\n"
+                f"Unblock this task to grant a fresh retry budget (unblock "
+                f"resets the failure counter)."
+            ),
+        )
+
+    return {
+        "blocked": blocked,
+        "stale_run": False,
+        "failures": info["failures"],
+        "effective_limit": info["effective_limit"],
+        "limit_source": info["limit_source"],
+    }
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
@@ -9267,6 +9572,54 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 except Exception:
                     pass
             lines.append("")
+
+    # Verified-completion gate (#70806): announce the contract up front and
+    # surface the latest red evidence so a re-dispatched worker starts from
+    # the failure, not from scratch. Payloads are redacted + capped at write
+    # time; only the LATEST evidence event is rendered, so prompt growth
+    # stays bounded even on retry-heavy verify tasks.
+    if getattr(task, "verify_mode", None):
+        lines.append("## Verified completion gate")
+        if task.verify_mode == "cmd":
+            lines.append(
+                "kanban_complete will only succeed after this command exits 0 "
+                "in your workspace (run it yourself before completing):"
+            )
+            # Redacted + capped: the prompt is broadcast into transcripts
+            # and logs, and an inline-credential command must not ride
+            # along raw (the gate still executes the stored original).
+            lines.append(
+                f"    {_cap(redact_sensitive_text(task.verify_cmd, force=True))}"
+            )
+        else:
+            lines.append(
+                "kanban_complete requires fresh, full-scope green verification "
+                "evidence from this session: run the project's verify command "
+                "to completion in the terminal (yourself, not via a delegated "
+                "subagent) before completing."
+            )
+        ev_row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND "
+            "kind = 'completion_blocked_evidence' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        ev_payload = None
+        if ev_row and ev_row["payload"]:
+            try:
+                ev_payload = json.loads(ev_row["payload"])
+            except Exception:
+                ev_payload = None
+        if isinstance(ev_payload, dict):
+            lines.append("")
+            lines.append("### Latest failed verification")
+            if ev_payload.get("command"):
+                lines.append(f"Command: {_cap(str(ev_payload['command']))}")
+            if ev_payload.get("exit_code") is not None:
+                lines.append(f"Exit code: {ev_payload['exit_code']}")
+            if ev_payload.get("output_excerpt"):
+                lines.append("Output excerpt:")
+                lines.append(_cap(str(ev_payload["output_excerpt"])))
+        lines.append("")
 
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,

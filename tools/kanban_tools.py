@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli import kanban_verify
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -163,6 +164,42 @@ def _stamp_worker_session_metadata(
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
     return stamped
+
+
+def _verify_session_ids(kw: dict) -> list[str]:
+    """Ordered ledger-key candidates for the verified-completion auto gate.
+
+    Mirrors the recorder's own keying chain (``session_id or task_id or … or
+    "default"`` in tools/terminal_tool.py): the registry-dispatch session id,
+    the env session id (they coincide on the happy path; the env var is the
+    same trusted identity ``_stamp_worker_session_metadata`` uses), then the
+    dispatch task-id kwarg. Sanitizing (falsy dropped, the shared
+    ``"default"`` bucket dropped, deduped) is delegated to
+    ``kanban_verify.normalize_session_candidates`` — the single home for
+    that rule.
+    """
+    return kanban_verify.normalize_session_candidates((
+        kw.get("session_id"),
+        os.environ.get("HERMES_SESSION_ID"),
+        kw.get("task_id"),
+    ))
+
+
+def _config_failure_limit() -> Optional[int]:
+    """Re-read ``kanban.failure_limit`` for the verify gate's funnel call.
+
+    The worker process runs outside the dispatcher, so the config value must
+    be resolved here to preserve the exact task > config > default resolution
+    order the breaker uses everywhere else. ``None`` falls through to
+    ``DEFAULT_FAILURE_LIMIT`` inside the DB layer. Mirrors ``_cmd_show``'s
+    defensive pattern.
+    """
+    try:
+        cfg = load_config()
+        val = (cfg.get("kanban", {}) or {}).get("failure_limit")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -709,12 +746,150 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+
+            # Verified-completion gate (#70806) — opt-in per task, enforced
+            # only for the dispatched worker completing its own task. Runs
+            # the verify command / consults the ledger OUTSIDE any write
+            # txn (the subprocess may take minutes; the board's write slot
+            # must stay free). Rejections keep the task in-flight below
+            # the retry limit and block it with evidence at the limit — an
+            # LLM's say-so alone can never turn a verify task 'done'.
+            # Ordered before the goal judge: deterministic, no LLM cost,
+            # and a red suite makes the judge call moot.
+            verify_gate_arg = None
+            if task and task.verify_mode:
+                if os.environ.get("HERMES_KANBAN_TASK") != tid:
+                    # Orchestrator / CLI-context tool caller (blessed by
+                    # _enforce_worker_task_ownership for plain tasks). The
+                    # gate cannot run meaningfully here: cmd mode would
+                    # execute a multi-minute subprocess inside this chat
+                    # turn, and auto mode would consult THIS session's
+                    # ledger bucket, which never saw the worker's runs.
+                    # Reject without counting — no DB write; the live
+                    # worker's budget is untouched. Deliberately does NOT
+                    # spell out the CLI override incantation: any caller
+                    # with a terminal tool could simply run it (the same
+                    # bypass class the goal-judge gate closes in
+                    # hermes_cli/kanban.py), so the message names the
+                    # legitimate paths without handing over the keys.
+                    return tool_error(
+                        f"kanban_complete blocked: task {tid} has a "
+                        f"verified-completion gate ({task.verify_mode}) and "
+                        f"can only be completed by its dispatched worker, "
+                        f"whose workspace and session the gate checks. "
+                        f"Either let the worker finish, or ask a human "
+                        f"operator to override from the CLI. No failure "
+                        f"was counted."
+                    )
+                # Auto mode: bound acceptance to evidence created after the
+                # active run started. Edit-staleness is tracked per ledger
+                # bucket, so a previous incarnation's green evidence in the
+                # shared task-id bucket can never be staled by THIS run's
+                # edits — the freshness bound is what rejects it.
+                evidence_not_before = None
+                if task.verify_mode == "auto":
+                    try:
+                        if task.current_run_id:
+                            _run = kb.get_run(conn, task.current_run_id)
+                            if _run is not None:
+                                evidence_not_before = _run.started_at
+                    except Exception:
+                        evidence_not_before = None
+                v = kanban_verify.evaluate_task_verification(
+                    task, session_ids=_verify_session_ids(kw),
+                    evidence_not_before=evidence_not_before,
+                )
+                if v is not None and not v.ok and (
+                    v.gate == "verify_unsupported_platform"
+                ):
+                    # Non-counting rejection (#70806 review): the host
+                    # cannot run cmd-mode verification at all, so the
+                    # red result is the platform's fault, not the
+                    # work's. Recording it would march the task toward
+                    # 'blocked' on every attempt from this worker.
+                    return tool_error(
+                        f"kanban_complete blocked: {v.detail} No failure "
+                        f"was counted against the task's retry budget."
+                    )
+                if v is not None and not v.ok:
+                    _preview = (summary or result or "").strip()
+                    info = kb.record_verify_failure(
+                        conn, tid,
+                        gate=v.gate,
+                        command=v.command,
+                        exit_code=v.exit_code,
+                        output_excerpt=v.detail,
+                        expected_run_id=_worker_run_id(tid),
+                        failure_limit=_config_failure_limit(),
+                        summary_preview=(
+                            _preview.splitlines()[0][:200] if _preview else None
+                        ),
+                    )
+                    if info.get("stale_run"):
+                        return tool_error(
+                            f"kanban_complete blocked: verification failed, "
+                            f"but your claim on this task is no longer "
+                            f"current (it was reclaimed while the verify "
+                            f"ran — likely a timeout or requeue). Nothing "
+                            f"was recorded against the task's retry budget. "
+                            f"Do NOT retry kanban_complete — end your turn; "
+                            f"the task has been handed to a new run."
+                        )
+                    if info.get("blocked"):
+                        return tool_error(
+                            f"kanban_complete blocked: verification failed "
+                            f"(failure {info['failures']} of limit "
+                            f"{info['effective_limit']}) and the retry "
+                            f"budget is exhausted. The task is now "
+                            f"'blocked' for human review with the failure "
+                            f"evidence attached as a comment. Do NOT retry "
+                            f"kanban_complete and do not call kanban_block "
+                            f"— end your turn with a short note of what "
+                            f"you tried."
+                        )
+                    return tool_error(
+                        f"kanban_complete blocked: verification failed "
+                        f"(failure {info['failures']} of limit "
+                        f"{info['effective_limit']} — the limit is shared "
+                        f"with crash/timeout failures).\n"
+                        f"Gate: {v.gate}\n"
+                        f"Command: {v.command}\n"
+                        f"Exit code: {v.exit_code}\n"
+                        f"Output excerpt:\n{v.detail}\n\n"
+                        f"Your task is still in-flight (no state change to "
+                        f"your claim). Fix the failures in your workspace, "
+                        f"re-run the command yourself to confirm it passes, "
+                        f"then retry kanban_complete with the same "
+                        f"summary/metadata."
+                    )
+                verify_gate_arg = "passed"
+                if v is not None:
+                    metadata = dict(metadata or {})
+                    if "verification" in metadata:
+                        # Never let the worker pre-forge the gate's audit
+                        # record (setdefault would); preserve their content
+                        # under another key instead.
+                        metadata["worker_verification"] = metadata.pop(
+                            "verification"
+                        )
+                    stamped = {
+                        "gate": v.gate,
+                        "command": v.command,
+                        "exit_code": v.exit_code,
+                    }
+                    if v.evidence:
+                        # Auto mode: copy the ledger row's facts (the
+                        # ledger prunes at 30 days / 100 events, so a
+                        # reference-only stamp would rot).
+                        stamped.update(v.evidence)
+                    metadata["verification"] = stamped
+
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
-            task = kb.get_task(conn, tid)
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -751,6 +926,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    verify_gate=verify_gate_arg,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

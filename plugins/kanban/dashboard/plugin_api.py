@@ -161,6 +161,12 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    # Verified completion (#70806): the verify command is a legitimate
+    # place for inline credentials, so the board never receives it
+    # verbatim. Benign commands pass through unchanged.
+    if d.get("verify_cmd"):
+        from agent.redact import redact_sensitive_text
+        d["verify_cmd"] = redact_sensitive_text(d["verify_cmd"], force=True)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -839,6 +845,14 @@ class UpdateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # Verified completion (#70806): transitioning a verify-mode task to
+    # 'done' from the dashboard requires an explicit human waiver. The
+    # dashboard is a human surface, so an explicit control+reason is an
+    # acceptable boundary — unlike the CLI, which any worker terminal
+    # can reach. The waiver is audited (verify_bypassed event + comment),
+    # never silent.
+    waive_verification: bool = False
+    waiver_reason: Optional[str] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -866,12 +880,54 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
+                # Verified completion (#70806): fail closed unless the
+                # human explicitly waives, and audit the waiver.
+                verify_gate = None
+                if task.verify_mode:
+                    if not payload.waive_verification:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"task {task_id} has a verified-completion "
+                                f"gate ({task.verify_mode}); completing it "
+                                f"from the dashboard requires an explicit "
+                                f"waiver (waive_verification) with a reason."
+                            ),
+                        )
+                    verify_gate = "waived"
                 ok = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    verify_gate=verify_gate,
                 )
+                if ok and verify_gate == "waived":
+                    from agent.redact import redact_sensitive_text
+                    shown_cmd = (
+                        redact_sensitive_text(task.verify_cmd, force=True)
+                        if task.verify_cmd else None
+                    )
+                    reason = (payload.waiver_reason or "").strip() or None
+                    with kanban_db.write_txn(conn):
+                        kanban_db._append_event(
+                            conn, task_id, "verify_bypassed",
+                            {
+                                "mode": task.verify_mode,
+                                "command": shown_cmd,
+                                "actor": "dashboard",
+                                "reason": reason,
+                            },
+                        )
+                    kanban_db.add_comment(
+                        conn, task_id, "verify-gate",
+                        (
+                            f"Human override: completed from the dashboard "
+                            f"with an explicit waiver, bypassing the "
+                            f"{task.verify_mode} verification gate."
+                            + (f" Reason: {reason}" if reason else "")
+                        ),
+                    )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1229,6 +1285,21 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
+                        # Verified completion (#70806): bulk operations
+                        # carry no per-task waiver, so verify-mode tasks
+                        # refuse individually — a bulk drag must never
+                        # silently waive a gate. Waive from the task view.
+                        if task.verify_mode:
+                            entry.update(
+                                ok=False,
+                                error=(
+                                    f"verification gate "
+                                    f"({task.verify_mode}); bulk complete "
+                                    f"cannot waive it — use the task view"
+                                ),
+                            )
+                            results.append(entry)
+                            continue
                         ok = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
