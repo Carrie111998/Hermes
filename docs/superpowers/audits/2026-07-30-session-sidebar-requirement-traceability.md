@@ -1,15 +1,100 @@
 # Session Sidebar Requirement Traceability Audit
 
-Date: 2026-07-30
-Scope: approved visibility-first implementation baseline
+Date: 2026-07-30; final rollout evidence updated 2026-08-01
+Scope: visibility-first implementation, authoritative reconciliation, and production rollout
 
 This ledger accounts for the requirements relevant to Claude-to-Codex sidebar
-visibility. `Missing` means the approved behavior is not yet implemented in
-this repository. `Preserved` means the approved visibility-first design keeps
-the existing contract; it is not a claim that the contract was re-verified by
-this documentation-only change. Every supersession and upstream deferral names
-the approving section and records the evidence that makes the disposition
-auditable.
+visibility. In the frozen July 30 baseline table, `Missing` means the approved
+behavior was not yet implemented at that audit point. `Preserved` means the
+approved visibility-first design kept the existing contract. The August 1
+closure section records the current implementation and live-verification
+overrides. Every supersession and upstream deferral names the approving section
+and records the evidence that makes the disposition auditable.
+
+## Final implementation and rollout closure (2026-08-01)
+
+The baseline ledger below records the original July 30 dispositions. The
+following closure record is authoritative where it supersedes a baseline
+`missing` or `not run` result.
+
+### Current disposition overrides
+
+| Requirements | Final disposition | Evidence |
+|---|---|---|
+| CH-002, CNV-007, SLR-001, VIS-004, VIS-012 | implemented and enabled | Incremental Claude discovery, changed-source priority, continuous enqueueing, all-history recovery, and cursor preservation are implemented in `session_bridge/coordinator.py`, `session_bridge/sidebar.py`, and `session_bridge/cli.py`. Continuous source enqueueing is enabled in production. |
+| SLR-005, SIR-007, VIS-013, VIS-016, VIS-022 | implemented and enabled | Sanitized queue/scanner/reconciliation health, exact broker identity, one lease per wake, and one exact one-minute automation are implemented in the store, CLI/MCP surfaces, and installed `session-sidebar-sync` skill. Production automation targets broker task `019f9b71-7109-7ed0-943a-d7291190245c`. |
+| SIR-001, CDT-006, VIS-001, VIS-005, VIS-007-VIS-009, VIS-015 | implemented and live-canary verified | Native tasks are created only in saved local `.hermes` project `local-e59c279a6cdda9313cf111e46a80b027`; preflight authenticates broker/project/cwd before lease; returned IDs are bound before read/rename/commit; marker, readable preview, source metadata, placement, and quiescence are verified. Ordinary user tasks are not used as delivery workers. |
+| VIS-002 | implemented and live-canary verified | New mirrors open with `## Continuation Brief` followed by `## Last 5 Messages`; all listed production tasks were read back and verified. |
+| SIR-004, VIS-003 | implemented, production hydration intentionally disabled | Exact authenticated in-place hydration and ambiguity-safe no-resend behavior are covered by store, executor, and end-to-end tests. The production `legacy_hydration_enabled` toggle remains false; no legacy task is deleted, archived, replaced, or heuristically rebound. |
+| VIS-006, VIS-011, BAR-001-BAR-005 | implemented and live-canary verified | Commits `bf1aa7759` through `346cf3e59` add immutable reconciliation proofs, complete authenticated Codex inventory, proof-gated leases, transactional reserve revalidation, query-free broker execution, and no-replacement recovery. Lost-response canary recovered the exact created task without a second create. |
+| CH-001, CH-003-CH-005, CH-007-CH-008, CNV-001-CNV-006, SIR-002-SIR-003, SIR-006, VIS-010, VIS-018 | preserved and reverified | Provider transcripts remain read-only; canonical IDs, signed markers, immutable context packs, reverse-loop prevention, provider isolation, source identity, and continuation safety remain covered by the final full suite. |
+| CH-006, CNV-005, SLR-002-SLR-004, SLR-006, SIR-005, CDT-007, VIS-019-VIS-020 | superseded as recorded | The approved visibility-first design continues to govern these supersessions. |
+| SIR-008, CDT-001-CDT-005, VIS-014, VIS-021 | deferred to upstream as recorded | Unsupported runtime-root, caller-idempotency, fork/rebind, typed-error, and trigger-now contracts remain outside the installed Codex API and are not emulated. |
+
+### Production delivery evidence
+
+The rollout recovered or created the following exact project-scoped tasks. Each
+was verified in `.hermes` with the signed source marker, readable continuation
+brief, latest five messages, `[Claude]` title, exact source ID, and terminal
+`REGISTERED` acknowledgement. Ambiguous dispatches preserved and recovered the
+same exact task; they never authorized replacement creation.
+
+| Source session | Codex task | Disposition/title |
+|---|---|---|
+| recorded recovered source (prefix `claude:5d96`) | recorded existing task (prefix `019fbae8`) | recovered pre-existing rollout canary; no create |
+| `claude:61b7fce8-86d7-41c5-80c7-1b9de98cbb29` | `019fbb11-a237-7ea2-b4f0-0467d779c3e9` | genuinely missing-session canary |
+| `claude:439889d5-deca-4136-898c-1b0df61c847e` | `019fbb20-1f34-7381-b066-e9a05aee9481` | newest-five canary |
+| `claude:f3ad059d-611c-4bb3-ad26-edbe20b6817d` | `019fbb22-9607-7e21-aa6c-3882888e28cc` | newest-five canary |
+| `claude:743c7e9b-d036-4c04-8567-69b82dc5553a` | `019fbb26-5827-7842-9c55-32e83b76a9cb` | newest-five canary |
+| `claude:3f9890eb-22df-483a-9c7e-8086dc5b4951` | `019fbb27-82eb-7f40-b6cb-5f511938e764` | newest-five canary |
+| `claude:c2ee3e1c-a41e-4b90-8f17-578da51ee747` | `019fbb28-d0ef-73c2-8de1-c38eefe1ad12` | newest-five canary |
+| `claude:98537c06-8039-436f-81b5-de58edba798e` | `019fbb37-cb53-7dd3-a3ff-d4f2c0063012` | `[Claude] Quick C: drive cleanup` |
+| `claude:683bc7c2-9e86-4f8f-83c2-e28641f4517e` | `019fbb3b-6e7e-77f0-bf2a-8942c454c4f7` | `[Claude] update the /bye skill to make` |
+| `claude:7a725dc0-cc43-4598-8e16-51b75905a104` | `019fbb39-0368-7680-b315-ddeffa9f5560` | recovered ambiguous response; `[Claude] Commit Runbook 03 documentation` |
+| `claude:c88d7152-6f09-4eef-9442-bbf2514b71d7` | `019fbb3d-236b-7010-a192-0086634db6aa` | `[Claude] Resolve backup sidecar ownership` |
+| `claude:2ee5ad7e-192d-4cfd-9862-f111fed2f52e` | `019fbb3e-2591-7c92-bc43-8885818ed9d5` | `[Claude] Run isolated restore drills` |
+| `claude:9a462bf7-264f-45e1-af29-495c389c6cf8` | `019fbb3f-10ec-7890-a0a8-f06d083ecde1` | `[Claude] Reconcile Runbook 03 with ADR-0035` |
+| `claude:1fac384f-8bb8-419b-a139-a0caff2da4c5` | `019fbb40-0d09-7451-8b0c-e787cda007c6` | `[Claude] Cryptic Docker containers` |
+| `claude:30325ca3-7328-4175-8e67-e2460e4eba95` | `019fbb41-59f3-7791-ba66-9b9ff411b7cd` | commit-race recovery; `[Claude] Verify complete Docker CI gate` |
+| `claude:736a6b6d-99e9-4cd7-bb7c-dc94630a278e` | `019fbb42-a5d0-7f12-a51d-3e3a98e5c554` | `[Claude] A lot of of work was` |
+| `claude:130e7671-1821-45b6-b6ae-5509b1e4a599` | `019fbb44-2d83-77d2-a104-78732f0645e2` | commit-race recovery; `[Claude] C drive disk cleanup` |
+| `claude:4597b627-0e9a-4d56-8aab-cf096d853b5a` | `019fbb45-3a3f-79e1-9fde-cc402b7e0727` | `[Claude] Reply with exactly OK` |
+| `claude:f7abeb7b-65b7-4b79-af7d-a78f407675ba` | `019fbb47-175d-7443-8b27-cfb68f930e19` | `[Claude] Track PR 3667 to merge` |
+| `claude:23bcc427-099e-4dbb-b438-44cf6f37d85f` | `019fbb48-1d22-7532-9c34-f035fd6304aa` | `[Claude] when this will be fully wrapped up?` |
+| `claude:4214e295-9cb8-4c30-8fec-18a9541c57a3` | `019fbb67-1a59-7f20-9730-4bf10d6f8f8c` | post-soak delivery; `[Claude] Implement SR-582 execution gates` |
+
+### Scanner repair and soak
+
+The rollout initially exposed 36 persistent Claude scan failures. Valid Claude
+Desktop transcripts can switch from `claude-desktop` to `claude-desktop-3p`
+within one native session. The adapter incorrectly treated that mode transition
+as an identity change. Commit `a0d3b5ab6` now preserves the first nonempty
+launch entrypoint as provenance for cold and incremental parsing. The live
+corpus then parsed all 36 pending sessions with zero failures (33
+`claude-desktop`, 3 `claude-desktop-3p`), and the source backlog drained to
+zero.
+
+Three consecutive production observations passed at
+`2026-08-01T03:05:44.013Z`, `2026-08-01T03:06:56.156Z`, and
+`2026-08-01T03:08:14.733Z`. Each reported running watchers, no provider
+degradation, zero pending/leased/retry jobs, zero execution blockers, no
+overdue oldest job, zero reconciliation blocked codes, and zero hydration or
+registration jobs. Final observed provider lag was 0.219 seconds for Claude
+and 0.153 seconds for Codex. Historical terminal failure/ambiguity counters
+remain visible as preserved audit state; they are not active blockers.
+
+### Final verification
+
+- Production Session Bridge restarted cleanly from final main; health, MCP,
+  and executor smoke checks passed. The active service process was PID 42892.
+- Automation is active on the single pinned one-minute broker; continuous
+  source enqueueing is enabled; legacy hydration remains intentionally off.
+- Commit `f3cf2b7ed` hardens the Windows subprocess readiness test after an
+  observed scheduler-contention retry. The exact crash-release test passed
+  eight consecutive repetitions and the affected file passed 61/61 without a
+  retry.
+- Final production-main gate: 39 files, 2,932 tests passed, 0 failed, no flaky
+  retry, in 382.3 seconds using 24 workers.
 
 | Requirement ID | Source | Requirement | Disposition | Code path | Named test/canary | Result |
 |---|---|---|---|---|---|---|
@@ -116,10 +201,14 @@ the `Result` cell of every linked ledger row when it runs.
 | CANARY-SIDEBAR-ROLLOUT-001 | Operational artifact: visibility-first §Production canaries, steps 1–6. | Dry inventory, fresh mirror, legacy enrichment, uniqueness, and restart observations all pass. | CDT-007, VIS-017 |
 | CANARY-TRIGGER-NOW-001 | External artifact: future Codex trigger-now API contract test. | The API wakes only the exact pinned broker on a queue transition. | VIS-014 |
 
-## Baseline inventory conclusion
+## Final conclusion
 
-The approved visibility-first behavior is intentionally recorded as missing
-until its named test or production canary is run. The preserved, superseded,
-and upstream-deferred rows above retain their evidence and approving design
-sections so later implementation work can update this ledger without silently
-discarding prior safety requirements.
+The approved visibility-first and bridge-authoritative behavior is implemented,
+merged to production `main`, deployed, and verified by focused tests, the
+complete bridge/schema suite, exact-task recovery, missing-task creation, the
+newest-five inspection, ambiguity/restart recovery, backlog delivery, and a
+three-observation production soak. Continuous source enqueueing and the single
+pinned one-minute broker are active. Legacy in-place hydration remains
+implemented but intentionally disabled, preserving existing placeholder tasks
+without mutation until that separate rollout is explicitly enabled. Upstream
+Codex API deferrals remain deferrals and are not emulated locally.
