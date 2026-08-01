@@ -1288,6 +1288,7 @@ def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
     assert len(model_entries) == 1
     assert model_entries[0].access_token == "sk-model-key"
 
+
 def test_get_custom_provider_pool_key_distinguishes_query_trailing_slash(
     tmp_path, monkeypatch,
 ):

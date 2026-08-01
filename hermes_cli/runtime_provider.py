@@ -1033,7 +1033,9 @@ def _resolve_named_custom_runtime(
         except Exception:
             pass
     if requested_norm == "custom" and explicit_base_url:
-        base_url = explicit_base_url.strip().rstrip("/")
+        # Preserve raw URL for credential-scope comparison / pool lookup.
+        # Full-string rstrip("/") mutates query values (?tenant=a/).
+        base_url = explicit_base_url.strip()
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1072,8 +1074,11 @@ def _resolve_named_custom_runtime(
     if not custom_provider:
         return None
 
-    configured_base_url = str(custom_provider.get("base_url", "") or "").strip().rstrip("/")
-    explicit_clean = (explicit_base_url or "").strip().rstrip("/")
+    # Preserve raw URLs for credential-scope comparison. Full-string
+    # rstrip("/") mutates query values (?tenant=a/ vs ?tenant=a); path
+    # trailing-slash equivalence is handled by _normalize_base_url_for_match.
+    configured_base_url = str(custom_provider.get("base_url", "") or "").strip()
+    explicit_clean = (explicit_base_url or "").strip()
 
     # When an alias/runtime override supplies a different endpoint, do not
     # resolve under this named provider identity — its api_key/key_env (and
@@ -1091,7 +1096,7 @@ def _resolve_named_custom_runtime(
             explicit_base_url=explicit_clean,
         )
 
-    base_url = (explicit_clean or configured_base_url).rstrip("/")
+    base_url = explicit_clean or configured_base_url
     if not base_url:
         return None
 
