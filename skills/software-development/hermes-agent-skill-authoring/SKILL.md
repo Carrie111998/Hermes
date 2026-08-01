@@ -90,6 +90,29 @@ Common quality failures:
 - **Sprawl** — too much always-visible material; push branch-specific reference behind pointers.
 - **No-op prose** — generic advice the agent would already follow without the skill.
 
+## Skill Classification
+
+Before creating or renaming a skill, classify the knowledge. The classification decides what belongs in the file, what belongs in memory, and how the description should route future tasks.
+
+| Type | Use for | Name by | Do not include |
+| --- | --- | --- | --- |
+| **Behavior library** | Reusable workflows, procedures, pitfalls, debugging techniques, verification loops | Problem class or workflow trigger (`service-unreachable-diagnostics`, `token-refresh-debugging`) | Project names unless the process is genuinely project-specific; PR numbers; one-time run logs |
+| **Environment info library** | Durable facts about one user-owned environment, server, app instance, or deployment | The environment users will name (`thinkvault`, `notion-workspace`) | Generic how-to steps that should be a behavior library; stale deployment timestamps |
+| **Public/topic info library** | Large reference facts that are public/topic-scoped and too bulky for always-injected memory | Topic or protocol (`matrix-e2ee`, `openrouter-model-catalog`) | Private environment facts; temporary issue/branch state |
+
+**Flow logs are not skills.** PR numbers, issue numbers, commit SHAs, deployment timestamps, backup-chain filenames, temporary worktree paths, and "we fixed X today" notes are session history. Leave them in the transcript or a task-specific note, not in a reusable skill. Preserve the reusable lesson (procedure, invariant, pitfall, command shape), then delete the run-specific residue.
+
+**Memory vs skill:** memory is small, always-injected, durable context. Skills are larger, trigger-loaded procedures or references. If a fact should not load on every turn but should be available when a topic recurs, put it in an info-library skill. If a workflow has steps, pitfalls, and verification, put it in a behavior-library skill.
+
+**Trigger naming decides reuse.** The description's first 57 chars are the routing signal. Behavior libraries and public/topic info libraries should start with the reusable class (`Use when diagnosing callback failures...`), not a project where it happened. Only environment info libraries should lead with an environment name.
+
+Classification check before saving:
+
+1. If every specific project name were removed, would the skill still be useful? If yes, name it by the problem class.
+2. If the content expires in a week, remove it. Session history owns it.
+3. If the content is one environment's durable fact sheet, keep it environment-scoped and do not generalize it into a workflow.
+4. If the content teaches a method and also records where it was learned, keep the method and cut the provenance unless the provenance changes behavior.
+
 ## Peer-Matched Structure
 
 Every in-repo skill follows roughly:
@@ -187,7 +210,11 @@ Pick the closest existing category. Don't invent new top-level categories casual
 
 8. **Writing no-op prose.** "Be careful," "be thorough," and "use best practices" rarely change model behavior. Replace with a checkable completion criterion or a stronger leading word.
 
-9. **Linking to skills that don't exist in-repo.** `related_skills: [some-user-local-skill]` works for you but breaks for other clones. Prefer only in-repo links.
+9. **Using a project name for a reusable behavior.** A skill named after the project where a workflow was learned will not load for the next project with the same problem class. Rename behavior libraries around the trigger class; reserve environment names for environment info libraries.
+
+10. **Storing flow logs in skills.** PR numbers, issue numbers, commit SHAs, timestamps, temp paths, and one-time rollout state go stale quickly. Keep the reusable lesson and discard the run log.
+
+11. **Linking to skills that don't exist in-repo.** `related_skills: [some-user-local-skill]` works for you but breaks for other clones. Prefer only in-repo links.
 
 ## Verification Checklist
 
@@ -201,6 +228,9 @@ Pick the closest existing category. Don't invent new top-level categories casual
 - [ ] Structure: `# Title` → `## Overview` → `## When to Use` → body → `## Common Pitfalls` → `## Verification Checklist`
 - [ ] Each ordered step has a checkable completion criterion
 - [ ] Description is trigger-focused and avoids duplicated body content
+- [ ] Skill type is classified (behavior library, environment info library, or public/topic info library)
+- [ ] Behavior/public info skills are named by reusable problem class or topic; only environment info skills lead with an environment name
+- [ ] Flow-log residue removed: no PR numbers, issue numbers, commit SHAs, temp paths, timestamps, or one-time rollout state unless they are essential durable reference data
 - [ ] Bulky or branch-specific reference is progressively disclosed in linked files
 - [ ] No-op prose and duplicated rules removed
 - [ ] `related_skills` references resolve in-repo (or are explicitly OK to be user-local)
