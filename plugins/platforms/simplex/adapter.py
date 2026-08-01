@@ -869,6 +869,7 @@ class SimplexAdapter(BasePlatformAdapter):
         """
         import subprocess
         import tempfile
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
         p = Path(file_path)
         png_path = file_path
@@ -900,6 +901,7 @@ class SimplexAdapter(BasePlatformAdapter):
                         check=True,
                         capture_output=True,
                         timeout=30,
+                        creationflags=windows_hide_flags(),
                     )
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                     tmp_path = tmp.name
@@ -916,6 +918,7 @@ class SimplexAdapter(BasePlatformAdapter):
                     check=True,
                     capture_output=True,
                     timeout=30,
+                    creationflags=windows_hide_flags(),
                 )
                 with open(tmp_path, "rb") as f:
                     thumb_uri = (

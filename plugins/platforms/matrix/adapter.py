@@ -151,6 +151,8 @@ def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
     extraction is deliberately best-effort: media delivery must still work on
     systems without ffprobe/ffmpeg.
     """
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
     metadata: Dict[str, Any] = {}
 
     ffprobe = shutil.which("ffprobe")
@@ -171,6 +173,7 @@ def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
                 text=True,
                 timeout=10,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if result.returncode == 0:
                 duration = float((result.stdout or "").strip() or 0)
@@ -200,6 +203,7 @@ def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
                 capture_output=True,
                 timeout=15,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if result.returncode == 0 and result.stdout:
                 samples = array.array("h")
@@ -228,6 +232,8 @@ def _matrix_transcode_voice_to_ogg(path: str) -> Optional[str]:
     original file, matching the adapter's previous behaviour. Runs blocking
     subprocess work; call via ``asyncio.to_thread`` from async code.
     """
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
@@ -261,6 +267,7 @@ def _matrix_transcode_voice_to_ogg(path: str) -> Optional[str]:
             capture_output=True,
             timeout=30,
             stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
         if result.returncode == 0 and os.path.getsize(ogg_path) > 0:
             return ogg_path

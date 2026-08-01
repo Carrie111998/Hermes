@@ -3814,6 +3814,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _probe_audio_duration_seconds(self, audio_path: str) -> Optional[float]:
         """Best-effort audio duration probe used to size playback timeouts."""
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         try:
             import importlib
             mutagen = importlib.import_module("mutagen")
@@ -3838,6 +3840,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 text=True,
                 timeout=5,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if proc.returncode == 0:
                 raw = (proc.stdout or "").strip()
