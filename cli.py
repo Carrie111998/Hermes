@@ -9473,6 +9473,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             return False
 
+    def _should_handle_readonly_dispatch_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when a read-only dispatch-policy command should run immediately.
+
+        Commands like /status, /agents, /context, and /egress have
+        ``busy_policy="dispatch"`` in their CommandDef, meaning the gateway
+        runs them without queuing behind the active turn. The classic CLI
+        ignores this policy and queues them through ``_pending_input`` --
+        ``process_loop`` is blocked inside ``self.chat()``, so the command
+        silently waits until the turn finishes. Dispatching inline on the
+        UI thread shows output immediately. These commands are safe to run
+        concurrently with an active agent -- they only read state.
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip("/")
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name in {"status", "agents", "context", "egress"})
+        except Exception:
+            return False
+
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
         if getattr(self, "_app", None):
@@ -15015,6 +15037,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # app, so without this the submitted "/steer <text>" can
                     # linger in the input area (looking unsent) and invite an
                     # accidental re-submit. See issue #34569.
+                    event.app.invalidate()
+                    return
+
+                # Handle read-only dispatch-policy commands (/status, /agents,
+                # /context, /egress) immediately on the UI thread. Same queue
+                # problem as /steer: ``process_loop`` is blocked inside
+                # ``self.chat()``, so queuing through ``_pending_input`` would
+                # silently delay these commands until after the turn finishes.
+                # They are safe to run concurrently with an agent — read-only.
+                if self._should_handle_readonly_dispatch_inline(text, has_images=has_images):
+                    self.process_command(text)
+                    event.app.current_buffer.reset(append_to_history=True)
                     event.app.invalidate()
                     return
 
