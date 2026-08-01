@@ -44,7 +44,6 @@ class TestConfigParsing:
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(None)
         assert cfg.enabled == "auto"
-        assert cfg.threshold_pct == 5.0
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -179,17 +178,26 @@ class TestRetrieval:
 
 
 class TestAssembly:
-    def test_no_deferrable_returns_unchanged(self):
-        """Pure-core toolset: pass-through, no bridge tools added."""
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+    @pytest.mark.parametrize("enabled", ["auto", "on"])
+    def test_enabled_mode_keeps_static_bridge_with_no_deferrable_tools(self, enabled):
+        """The bridge stays present across an MCP 1 -> 0 transition."""
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
         defs = [_td("terminal", "Run shell"), _td("read_file", "Read a file")]
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            config=ToolSearchConfig.from_raw({"enabled": enabled}),
         )
-        assert not result.activated
-        assert {t["function"]["name"] for t in result.tool_defs} == {"terminal", "read_file"}
+        assert result.activated
+        assert {t["function"]["name"] for t in result.tool_defs} == {
+            "terminal",
+            "read_file",
+            *BRIDGE_TOOL_NAMES,
+        }
 
     @staticmethod
     def _register_mcp(name):
@@ -218,6 +226,40 @@ class TestAssembly:
         # The pre-existing tool_search was stripped (it would be re-injected if
         # activation happened; here it didn't).
         assert "tool_search" not in names
+
+    def test_bridge_definitions_do_not_depend_on_live_catalog(self):
+        """Catalog mutations stay behind one byte-stable model-facing bridge."""
+        from tools.registry import registry
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        alpha = "mcp_pr72578_alpha"
+        beta = "mcp_pr72578_beta"
+        config = ToolSearchConfig.from_raw({"enabled": "on"})
+        try:
+            self._register_mcp(alpha)
+            first = assemble_tool_defs(
+                [_td(alpha, "First capability")],
+                context_length=200_000,
+                config=config,
+            )
+
+            registry.deregister(alpha)
+            self._register_mcp(beta)
+            second = assemble_tool_defs(
+                [_td(beta, "Replacement capability")],
+                context_length=200_000,
+                config=config,
+            )
+
+            registry.deregister(beta)
+            empty = assemble_tool_defs([], context_length=200_000, config=config)
+
+            assert first.tool_defs == second.tool_defs == empty.tool_defs
+            assert alpha not in str(first.tool_defs)
+            assert beta not in str(second.tool_defs)
+        finally:
+            registry.deregister(alpha)
+            registry.deregister(beta)
 
 
 # ---------------------------------------------------------------------------
@@ -300,16 +342,16 @@ class TestRegression_OpenClawCron84141:
             for td in visible
         ), "Core tool 'terminal' was wrongly classified as deferrable"
 
-        # Now force activation and check the resulting tool-defs list.
+        # Enabled mode always keeps the static bridge, even for a core-only
+        # snapshot, so later MCP catalog edits cannot rewrite this prefix.
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
             config=ToolSearchConfig.from_raw({"enabled": "on"}),
         )
         names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
-        # terminal must be present; bridges are only added if there are
-        # deferrable tools to put behind them.
         assert "terminal" in names
+        assert BRIDGE_TOOL_NAMES <= names
 
     def test_unwrap_rejects_core_tool_attempt(self):
         """Even if the model tries to invoke a core tool through tool_call,
@@ -391,60 +433,6 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
-
-# ---------------------------------------------------------------------------
-# Catalog listing (skills-style progressive disclosure)
-# ---------------------------------------------------------------------------
-
-
-class TestCatalogListing:
-    def test_config_defaults(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.listing == "auto"
-        assert cfg.listing_max_tokens == 20000
-        # legacy bool shapes keep defaults too
-        assert ToolSearchConfig.from_raw(True).listing == "auto"
-
-
-    def test_short_desc_first_sentence_and_clip(self):
-        from tools.tool_search import _short_desc
-        assert _short_desc("Open an issue. Second sentence dropped.") == "Open an issue."
-        long = "word " * 40
-        s = _short_desc(long)
-        assert len(s) <= 61  # 60 + ellipsis char
-        assert s.endswith("…")
-        assert _short_desc("") == ""
-
-
-    @staticmethod
-    def _register(name):
-        from tools.registry import registry
-
-        def _handler(args, task_id=None, **kw):
-            return json.dumps({"ok": True})
-
-        registry.register(
-            name=name,
-            handler=_handler,
-            schema=_td(name, "Deferred capability description.")["function"],
-            toolset="mcp-listingtest",
-        )
-
-
-    def test_assembly_listing_off_keeps_legacy_description(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
-        for i in range(30):
-            self._register(f"mcp_x_{i}")
-        defs = [_td(f"mcp_x_{i}", "Deferred.") for i in range(30)]
-        result = assemble_tool_defs(
-            defs, context_length=1000,
-            config=ToolSearchConfig.from_raw({"enabled": "on", "listing": "off"}),
-        )
-        assert result.activated
-        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
-        assert "mcp_x_0" not in search["function"]["description"]
 
 
 class TestDeferredCallSchemaProbe:

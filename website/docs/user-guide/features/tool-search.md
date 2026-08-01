@@ -26,8 +26,8 @@ non-core plugin tools are eligible for deferral.
 
 ## How it works
 
-When Tool Search activates for a turn, the model sees three new tools in
-place of the deferred ones:
+While Tool Search is enabled, the model sees three bridge tools in place of
+the deferred ones:
 
 ```
 tool_search(query, limit?)     — search the deferred-tool catalog
@@ -53,22 +53,16 @@ post-tool-call hooks all run against the real tool name — not against
 `tool_call`. The activity feed in the CLI and gateway also unwraps so you
 see the underlying tool, not the bridge.
 
-## When does it activate?
+## Stable bridge behavior
 
-Tool Search uses **tiered disclosure**: the presence of *any* deferrable
-(MCP/plugin) tool activates the bridge; what scales with catalog size is
-how much of the catalog stays visible, not whether schemas defer.
+The bridge schemas do not contain tool names, counts, descriptions, or server
+summaries. They remain byte-for-byte identical when an MCP server connects,
+changes its schema, disconnects, or leaves the catalog empty. This preserves
+the per-conversation prompt-cache prefix.
 
-| Tier | Condition | What the model sees |
-| --- | --- | --- |
-| **0** | No MCP/plugin tools | Every tool eager, no bridge. Pass-through. |
-| **1** | Deferred catalog's listing fits the budget | Bridge + a skills-style manifest of every deferred tool (name + short description, degrading to names-only when over budget). Degradation is **per server**: when one oversized server (Cloudflare) is attached alongside small ones (Linear), the small servers keep their per-tool listings and only the oversized server collapses to a summary line. |
-| **2** | Per-tool listing exceeds the budget even names-only for every server (e.g. Cloudflare's flat API surface alone: ~3,300 tools whose names are ~32K tokens) | Bare bridge + a one-line-per-server summary (server name + tool count), so the model knows which domains are reachable; individual tools are discoverable only through `tool_search`. |
-
-The listing budget is `min(threshold_pct% of context, listing_max_tokens)`.
-The decision is re-evaluated every time the tools array is built, so
-adding or removing MCP servers mid-session moves the session between
-tiers on the next assembly.
+`tool_search` and `tool_describe` read the live registry when invoked, scoped
+to the session's enabled and disabled toolsets. Catalog changes are therefore
+available immediately without republishing the model-facing bridge.
 
 ## Configuration
 
@@ -76,32 +70,15 @@ tiers on the next assembly.
 tools:
   tool_search:
     enabled: auto       # auto (default), on, or off
-    threshold_pct: 5    # listing budget as a percentage of context
     search_default_limit: 5
     max_search_limit: 20
-    listing: auto       # embed a grouped name+description catalog manifest
-    listing_max_tokens: 20000
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto`/`on` activate whenever at least one deferrable tool exists; `off` disables entirely (everything stays eager). |
-| `threshold_pct` | `5` | Listing budget as a percentage of the active model's context length. Range 0–100. |
+| `enabled` | `auto` | `auto`/`on` keep the static bridge enabled; `off` disables it entirely and keeps tools eager. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
-| `listing` | `auto` | Embed a skills-style manifest of every deferred tool (name + first sentence of its description, ≤60 chars, grouped by MCP server) in the `tool_search` bridge description. `auto` includes it when it fits the budget (falling back to names-only, then to the tier-2 server summary); `on`/`off` force either way. |
-| `listing_max_tokens` | `20000` | Absolute cap on the embedded listing, regardless of context size. Range 200–60000. |
-
-### Why the listing exists
-
-Without it, deferred capabilities are *invisible* — live benchmarking showed
-models substituting visible core tools (running `gh` in the terminal instead
-of searching for the deferred GitHub tool) or declaring a capability
-nonexistent instead of calling `tool_search`. The listing applies the skills
-pattern to tools: every capability stays discoverable by name at all times,
-while full parameter schemas remain deferred. If the model sees the exact
-tool name in the listing, it can skip `tool_search` and go straight to
-`tool_describe`, saving a round trip.
 
 You can also flip the legacy boolean shape:
 
@@ -113,12 +90,8 @@ tools:
 ## When NOT to use it
 
 Tool Search trades a fixed per-turn token cost (the three bridge tool
-schemas plus the catalog listing) and at least one extra round trip on
-cold tools (describe → call) for the savings on the deferred schemas.
-At tier 1 the listing keeps every capability visible, so the discovery
-round trip usually disappears — the model goes straight to
-`tool_describe`. Live benchmarking showed the listing mode matching
-eager loading's task success while costing less than the bare bridge.
+schemas) and one or two extra round trips on cold tools (search, describe,
+then call) for the savings on deferred schemas.
 
 If you want the old always-eager behavior for a small toolset, set
 `enabled: off`.
@@ -141,10 +114,9 @@ to any progressive-disclosure design, not specific to this implementation:
   less well; the published Anthropic numbers (49% → 74% on Opus 4 with
   vs. without tool search) show the upside but also that ~26 points of
   accuracy is still retrieval failure.
-- **Toolset edits invalidate cache.** Adding or removing a tool mid-
-  session changes the bridge tools' descriptions (which include the
-  count of deferred tools) and the catalog, so the prompt cache is
-  invalidated. This is the same trade-off as any toolset edit.
+- **Capabilities are not enumerated in the bridge.** The model must search
+  before deciding that an unlisted capability is unavailable. The static
+  bridge description explicitly requires that behavior.
 
 ## Implementation details
 
@@ -153,10 +125,10 @@ to any progressive-disclosure design, not specific to this implementation:
   BM25 returns no positive-score hits, which protects against
   zero-IDF degenerate cases (e.g. searching `"github"` against a
   catalog where every tool name contains "github").
-- **Catalog is stateless across turns.** It rebuilds from the current
-  tool-defs list every assembly — no session-keyed `Map`. This avoids
-  the class of bug where a stored catalog drifts out of sync with the
-  live tool registry.
+- **Catalog is stateless across turns.** It rebuilds from the current scoped
+  registry at bridge invocation time, with no session-keyed copy. This avoids
+  the class of bug where a stored catalog drifts out of sync with the live
+  tool registry.
 - **The catalog is scoped to the session's toolsets.** `tool_search`,
   `tool_describe`, and `tool_call` only ever see and invoke tools the
   session was actually granted. A subagent, kanban worker, or gateway

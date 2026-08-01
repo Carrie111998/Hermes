@@ -17,7 +17,7 @@ Differences from tool_search_livetest_ue.py (which had a ceiling effect):
      - wrong_calls:   # of calls to distractor tools
      - success = final_correct AND wrong_calls == 0 (clean solve)
 
-Env: TS_UE_MODEL, TS_BENCH_REPS, TS_UE_MODES (eager,bridge,listing),
+Env: TS_UE_MODEL, TS_BENCH_REPS, TS_UE_MODES (eager,bridge),
      TS_UE_SUMMARY. Scale is always "full" (830 tools).
 """
 from __future__ import annotations
@@ -188,12 +188,9 @@ SCENARIOS: List[Dict[str, Any]] = [
 
 
 def run_one(scenario, mode, rep, out_dir: Path):
-    enabled = mode in ("bridge", "listing")
+    enabled = mode == "bridge"
     model = os.environ.get("TS_UE_MODEL", "anthropic/claude-opus-4.8")
-    lmax = int(os.environ.get("TS_UE_LISTING_MAX", "30000"))
-    hermes_home = base.setup_isolated_home(
-        enabled, listing=("auto" if mode == "listing" else "off"),
-        listing_max_tokens=lmax, model=model)
+    hermes_home = base.setup_isolated_home(enabled, model=model)
     os.environ["HERMES_HOME"] = str(hermes_home)
     base.reset_module_state()
     n_registered = register_epic_tools_adversarial()
@@ -288,7 +285,7 @@ def run_one(scenario, mode, rep, out_dir: Path):
 def main():
     out_dir = _THIS_DIR / "out_ue_hard"
     out_dir.mkdir(exist_ok=True)
-    modes = [m for m in os.environ.get("TS_UE_MODES", "listing,bridge").split(",") if m]
+    modes = [m for m in os.environ.get("TS_UE_MODES", "bridge,eager").split(",") if m]
     rows = []
     for scenario in SCENARIOS:
         for mode in modes:

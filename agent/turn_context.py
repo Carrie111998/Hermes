@@ -402,10 +402,9 @@ def build_turn_context(
     # snapshot.  This is cache-safe by construction: it runs in the per-turn
     # prologue, before this turn's first API call assembles ``tools=``, so it
     # only ever extends a fresh request prefix — it never mutates the cached
-    # prefix of an in-flight turn.  No-op when no MCP servers are registered
-    # (the common case, gated by the cheap ``has_registered_mcp_tools`` check)
-    # or when the tool set is unchanged (``refresh_agent_mcp_tools`` diffs by
-    # name and leaves the snapshot untouched on no-change).
+    # prefix of an in-flight turn. No-op when no MCP servers are registered
+    # and the MCP generation still matches the agent snapshot (the common
+    # case), or when the model-facing tool names are unchanged.
     try:
         if not getattr(agent, "_skip_mcp_refresh", False):
             # Import-cost gate: ``tools.mcp_tool`` pulls in the whole ``mcp``
@@ -418,8 +417,23 @@ def build_turn_context(
             # without changing behavior for MCP users.
             import sys as _sys
             if "tools.mcp_tool" in _sys.modules:
-                from tools.mcp_tool import has_registered_mcp_tools, refresh_agent_mcp_tools
-                if has_registered_mcp_tools():
+                from tools.mcp_tool import (
+                    get_mcp_tool_generation,
+                    has_registered_mcp_tools,
+                    refresh_agent_mcp_tools,
+                )
+
+                snapshot_generation = getattr(
+                    agent, "_mcp_tool_snapshot_generation", None
+                )
+                mcp_advanced = (
+                    isinstance(snapshot_generation, int)
+                    and snapshot_generation < get_mcp_tool_generation()
+                )
+                # The live-MCP gate catches additions and ordinary changes. The
+                # generation check also catches removal of the final MCP tool,
+                # after the live map has become empty.
+                if has_registered_mcp_tools() or mcp_advanced:
                     refresh_agent_mcp_tools(agent, quiet_mode=True)
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)

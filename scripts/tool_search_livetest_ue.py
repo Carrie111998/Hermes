@@ -4,11 +4,10 @@
 Registers the actual tool schemas captured live from Epic's UE 5.8
 ModelContextProtocol + AllToolsets plugins (probe_raw_5.8.0_alltoolsets.json,
 probe date 2026-07-02) into the Hermes tool registry with mock handlers,
-then runs UE-realistic scenarios in three modes:
+then runs UE-realistic scenarios in two modes:
 
   eager    — all schemas in the tools array (at 830 tools: ~165K tokens)
-  bridge   — tool_search bridge, no listing (old behavior)
-  listing  — bridge + skills-style catalog listing (PR #67034)
+  bridge   — byte-stable tool_search bridge with live registry lookup
 
 Catalog scale is controlled by TS_UE_SCALE:
   "editor"  — EditorApp + Scene + Primitive + Actor toolsets (~65 tools)
@@ -157,14 +156,9 @@ SCENARIOS: List[Dict[str, Any]] = [
 
 
 def run_one(scenario, mode, scale, rep, out_dir: Path):
-    enabled = mode in ("bridge", "listing")
+    enabled = mode == "bridge"
     model = os.environ.get("TS_UE_MODEL", "anthropic/claude-opus-4.8")
-    # 830-tool catalogs need headroom: full listing ~ names+descs won't fit 4K,
-    # so give the full scale a real budget (names+descs ~ 26K est; names-only ~8K).
-    lmax = int(os.environ.get("TS_UE_LISTING_MAX", "30000" if scale == "full" else "4000"))
-    hermes_home = base.setup_isolated_home(
-        enabled, listing=("auto" if mode == "listing" else "off"),
-        listing_max_tokens=lmax, model=model)
+    hermes_home = base.setup_isolated_home(enabled, model=model)
     os.environ["HERMES_HOME"] = str(hermes_home)
     base.reset_module_state()
     n_registered = register_epic_tools(scale)
@@ -273,7 +267,7 @@ def main():
     out_dir = _THIS_DIR / "out_ue"
     out_dir.mkdir(exist_ok=True)
     scale = os.environ.get("TS_UE_SCALE", "full")
-    modes = [m for m in os.environ.get("TS_UE_MODES", "listing,bridge,eager").split(",") if m]
+    modes = [m for m in os.environ.get("TS_UE_MODES", "bridge,eager").split(",") if m]
     rows = []
     for scenario in SCENARIOS:
         if scenario.get("full_only") and scale != "full":

@@ -57,9 +57,9 @@ SCENARIOS: List[Dict[str, Any]] = base.SCENARIOS + [
 
 
 def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) -> Dict[str, Any]:
-    """mode: 'enabled' (bare bridge) | 'listing' (bridge + catalog listing) | 'disabled' (eager)."""
-    enabled = mode in ("enabled", "listing")
-    hermes_home = base.setup_isolated_home(enabled, listing=("auto" if mode == "listing" else "off"))
+    """mode: 'enabled' (static bridge) | 'disabled' (eager)."""
+    enabled = mode == "enabled"
+    hermes_home = base.setup_isolated_home(enabled)
     os.environ["HERMES_HOME"] = str(hermes_home)
     base.reset_module_state()
     n_registered = base.register_fake_tools()
@@ -195,7 +195,7 @@ def run_one(scenario: Dict[str, Any], mode: str, rep: int, out_dir: Path) -> Dic
 def main():
     out_dir = _THIS_DIR / "out2"
     out_dir.mkdir(exist_ok=True)
-    modes = [m for m in os.environ.get("TS_BENCH_MODES", "enabled,listing,disabled").split(",") if m]
+    modes = [m for m in os.environ.get("TS_BENCH_MODES", "enabled,disabled").split(",") if m]
     rows = []
     for scenario in SCENARIOS:
         for mode in modes:
