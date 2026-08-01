@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -2860,6 +2861,329 @@ def test_resolver_show_is_bounded_and_returns_resolve_snapshot(
 
     stale = json.loads(kt._handle_resolve(request))
     assert "kanban_resolve conflict" in stale["error"]
+
+
+def test_resolver_show_adversarial_whole_response_stays_below_safety_ceiling(
+    monkeypatch, tmp_path
+):
+    """A busy card must fit the bound as one serialized response, not only
+    through independent field and row caps."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-stress-model")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-whole-response-bound"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+
+    title = "标题🙂é" * 6000
+    body = "正文🙂é" * 10000
+    result = "结果🙂é" * 10000
+    reason = "原始原因🙂é" * 6000
+    attempts = ["尝试🙂é" * 1500 for _ in range(20)]
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=body,
+            assignee="developer",
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "workspace"),
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason=reason,
+            kind="needs_input",
+            attempted_resolutions=attempts,
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
+
+        parent_ids = []
+        for index in range(1000):
+            parent_id = kb.create_task(
+                conn,
+                title=f"parent {index}",
+                assignee="developer",
+                workspace_kind="scratch",
+                workflow_template_id="product",
+                current_step_key="development",
+                board=board,
+                initial_status="running",
+            )
+            parent_ids.append(parent_id)
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.executemany(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                [(int(time.time()), parent_id) for parent_id in parent_ids],
+            )
+            conn.executemany(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                [(parent_id, task_id) for parent_id in parent_ids],
+            )
+
+        preflight_row = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'human_input_preflight' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert preflight_row is not None
+        preflight_payload = json.loads(preflight_row["payload"])
+        preflight_payload["metadata"] = {
+            "diagnostic": "元数据🙂é" * 6000,
+            "attempt_index": 17,
+        }
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (
+                json.dumps(preflight_payload, ensure_ascii=False),
+                preflight_row["id"],
+            ),
+        )
+
+        for index in range(50):
+            conn.execute(
+                """INSERT INTO task_runs
+                   (task_id, profile, step_key, status, started_at, ended_at,
+                    outcome, summary, metadata, error)
+                   VALUES (?, ?, ?, 'completed', ?, ?, 'failed', ?, ?, ?)""",
+                (
+                    task_id,
+                    "developer",
+                    "development",
+                    10_000 + index,
+                    10_001 + index,
+                    "retry summary🙂é" * 3000,
+                    json.dumps(
+                        {"run_metadata": "运行元数据🙂é" * 3000},
+                        ensure_ascii=False,
+                    ),
+                    "retry error🙂é" * 3000,
+                ),
+            )
+        for index in range(40):
+            conn.execute(
+                """INSERT INTO task_comments (task_id, author, body, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    task_id,
+                    "developer",
+                    f"comment {index} " + ("评论🙂é" * 3000),
+                    20_000 + index,
+                ),
+            )
+        for index in range(80):
+            conn.execute(
+                """INSERT INTO task_events
+                   (task_id, run_id, kind, payload, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    resolver.current_run_id,
+                    "heartbeat",
+                    json.dumps(
+                        {"noise": "事件噪声🙂é" * 3000, "index": index},
+                        ensure_ascii=False,
+                    ),
+                    30_000 + index,
+                ),
+            )
+        expected_event_id = int(preflight_row["id"])
+        conn.commit()
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    raw_show = kt._handle_show({})
+    shown = json.loads(raw_show)
+    serialized = json.dumps(shown, ensure_ascii=False)
+    assert len(raw_show.encode("utf-8")) == len(serialized.encode("utf-8"))
+    assert len(serialized.encode("utf-8")) < 96_000
+    assert set(shown["expected"]) == set(kb._RESOLVER_EXPECTED_KEYS)
+    assert shown["expected"] == expected
+    task_view = shown["task"]
+    for task_field, expected_field in (
+        ("assignee", "assignee"),
+        ("status", "status"),
+        ("project_id", "project_id"),
+        ("workflow_template_id", "workflow_template_id"),
+        ("workspace_kind", "workspace_kind"),
+        ("workspace_path", "workspace_path"),
+        ("branch_name", "branch_name"),
+        ("current_run_id", "run_id"),
+        ("current_step_key", "phase"),
+        ("running", "running"),
+        ("blocked", "blocked"),
+    ):
+        assert task_view[task_field] == expected[expected_field]
+    assert task_view["id"] == task_id
+    assert shown["unresolved_preflight"]["event_id"] == expected_event_id
+    payload = shown["unresolved_preflight"]["payload"]
+    assert payload["hermes_assignee"] == "resolver"
+    assert payload["step_key"] == "development"
+    assert payload["metadata"]["attempt_index"] == 17
+
+    reason_envelope = payload["reason"]
+    assert reason_envelope["truncated"] is True
+    assert reason_envelope["original_chars"] == len(reason)
+    assert reason_envelope["original_bytes"] == len(reason.encode("utf-8"))
+    assert isinstance(reason_envelope["preview"], str)
+
+    attempts_json = json.dumps(attempts, ensure_ascii=False)
+    attempts_envelope = payload["attempted_resolutions"]
+    assert attempts_envelope["truncated"] is True
+    assert attempts_envelope["original_chars"] == len(attempts_json)
+    assert attempts_envelope["original_bytes"] == len(attempts_json.encode("utf-8"))
+    assert isinstance(attempts_envelope["preview"], str)
+
+    diagnostic = payload["metadata"]["diagnostic"]
+    assert diagnostic["truncated"] is True
+    assert diagnostic["original_chars"] == len("元数据🙂é" * 6000)
+    assert diagnostic["original_bytes"] == len(("元数据🙂é" * 6000).encode("utf-8"))
+    assert isinstance(diagnostic["preview"], str)
+
+    assert shown["comments_total"] >= 40
+    assert shown["runs_total"] >= 51
+    assert shown["events_total"] >= 80
+    assert shown["comments_omitted"] > 0
+    assert shown["runs_omitted"] > 0
+    assert shown["events_omitted"] > 0
+    assert shown["history_truncated"] is True
+
+    request = {
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "Adversarial descriptive fields are bounded.",
+        "reason": "Resume with the exact Resolver snapshot.",
+        "expected": shown["expected"],
+    }
+    resolved = json.loads(kt._handle_resolve(request))
+    assert resolved["ok"] is True, resolved
+    stale = json.loads(kt._handle_resolve(request))
+    assert "kanban_resolve conflict" in stale["error"]
+
+
+def test_bounded_preflight_keeps_normal_values_exact_with_oversized_metadata():
+    from tools import kanban_tools as kt
+
+    reason = "normal reason🙂é" * 100
+    attempts = ["checked the documented path"]
+    payload = {
+        "kind": "needs_input",
+        "original_assignee": "developer",
+        "hermes_assignee": "resolver",
+        "step_key": "development",
+        "resume_status": "ready",
+        "memory_capture_id": "capture-1",
+        "reason": reason,
+        "attempted_resolutions": attempts,
+        "metadata": {
+            "diagnostic": "元数据🙂é" * 6000,
+            "attempt_index": 17,
+        },
+    }
+
+    shown = kt._show_bounded_preflight(payload, 12_288)
+
+    assert shown["reason"] == reason
+    assert shown["attempted_resolutions"] == attempts
+    assert shown["metadata"]["attempt_index"] == 17
+    assert shown["metadata"]["diagnostic"]["truncated"] is True
+
+
+
+def test_resolver_show_bounds_single_oversized_mandatory_task_field(
+    monkeypatch, tmp_path
+):
+    """A mandatory task field cannot defeat the whole-response ceiling."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-title-bound"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="标题🙂é" * 40_000,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a bounded answer",
+            kind="needs_input",
+            attempted_resolutions=["checked the documented path"],
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show.encode("utf-8")) < 96_000
+    shown = json.loads(raw_show)
+    assert shown["task"]["title"]["truncated"] is True
+    assert shown["task"]["title"]["original_chars"] == 160_000
+    assert shown["task"]["title"]["original_bytes"] == len(("标题🙂é" * 40_000).encode("utf-8"))
 
 
 def test_resolver_tool_resumes_release_preflight(
