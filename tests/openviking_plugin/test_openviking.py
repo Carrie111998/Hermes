@@ -127,6 +127,42 @@ def wait_prefetch(provider, query="What should we recall?", session_id="session-
     return provider.prefetch(query, session_id=session_id)
 
 
+class _FailClosedClient:
+    """Client stub whose session API always fails; ensure must fail closed."""
+
+    def __init__(self, *args, **kwargs):
+        self.posts = []
+
+    def get(self, path, params=None, **kwargs):
+        raise RuntimeError("session lookup unsupported")
+
+    def post(self, path, payload=None, **kwargs):
+        self.posts.append(path)
+        raise RuntimeError("session create unsupported")
+
+
+class TestPeerOnlySessionGuard:
+    def test_sync_turn_fail_closed_when_session_cannot_be_ensured(self, monkeypatch):
+        client = _FailClosedClient()
+        monkeypatch.setattr(openviking_plugin, "_VikingClient", lambda *a, **k: client)
+        provider = OpenVikingMemoryProvider()
+        provider._client = cast(Any, client)
+        provider._endpoint = "http://openviking.test"
+        provider._api_key = ""
+        provider._account = "default"
+        provider._user = "default"
+        provider._agent = "hermes"
+        provider._session_id = "session-x"
+
+        provider.sync_turn("hello", "hi")
+        assert provider._drain_writers("session-x", timeout=5.0)
+
+        # The write must be skipped entirely: nothing may land in a
+        # default-policy session.
+        assert "session-x" not in provider._ensured_peer_sessions
+        assert not any("messages/batch" in p for p in client.posts)
+
+
 class TestOpenVikingSummaryUriNormalization:
     def test_normalize_summary_uri_maps_pseudo_files_to_parent_directory(self):
         assert OpenVikingMemoryProvider._normalize_summary_uri("viking://user/hermes/.overview.md") == "viking://user/hermes"
