@@ -1449,3 +1449,68 @@ def _isolate_computer_use_approval_state():
             _cu_tool._session_auto_approve.clear()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_tool_definition_caches():
+    """Clear the process-global tool-definition caches around every test.
+
+    Two module-level caches outlive any single test and silently change what
+    ``model_tools.get_tool_definitions()`` returns:
+
+    * ``tools.registry._check_fn_cache`` — per-``check_fn`` verdicts, TTL 30 s,
+      keyed by function object. A test that probes a tool's ``check_fn`` while
+      that feature looks unavailable stamps ``False`` in for the next 30 s.
+    * ``model_tools._tool_defs_cache`` — memoized definition lists. Its cache
+      key covers ``registry._generation`` and the config fingerprint, but NOT
+      the ``check_fn`` verdicts resolved underneath it, so a poisoned TTL entry
+      is invisible to the key.
+
+    Net effect: any test computing a toolset after an unlucky neighbour gets a
+    silently short list. Verified concretely — poisoning the TTL cache drops
+    ``memory``, ``skill_view`` and ``skills_list`` from
+    ``get_tool_definitions(enabled_toolsets=["memory", "skills"])``, which is
+    what made
+    ``test_background_review_installs_thread_local_whitelist`` fail with
+    ``assert 'memory' in {'skill_manage'}`` in one CI slice while passing in
+    isolation, in its own file, and on rerun.
+
+    ``tests/test_get_tool_definitions_cache_isolation.py`` already established
+    this pattern per-file for ``_tool_defs_cache``; this lifts it suite-wide
+    and adds the ``check_fn`` cache, which is the one that actually carries
+    the poisoned verdict. 116 test files touch tool definitions or the
+    registry, so per-file fixtures could not cover the exposure.
+
+    Clearing is cheap (two ``dict.clear()`` calls); the TTL still applies
+    normally *within* a test, which is the only scope where its performance
+    benefit is meaningful.
+    """
+
+    def _clear():
+        try:
+            from tools import registry
+
+            # Drop only the ``False`` verdicts. A cached ``False`` is what makes
+            # a tool silently vanish from a computed toolset; a cached ``True``
+            # cannot produce that failure mode. Keeping the ``True`` entries
+            # avoids re-probing every available tool's ``check_fn`` on the next
+            # use, which is where the real cost of a blanket clear lives.
+            with registry._check_fn_cache_lock:
+                for fn, entry in list(registry._check_fn_cache.items()):
+                    if not entry[1]:
+                        registry._check_fn_cache.pop(fn, None)
+        except Exception:
+            pass
+        try:
+            import model_tools
+
+            # Must still go entirely: its key does not cover the verdicts
+            # above, so an entry computed from a poisoned ``False`` would
+            # survive and keep serving the short list.
+            model_tools._tool_defs_cache.clear()
+        except Exception:
+            pass
+
+    _clear()
+    yield
+    _clear()
