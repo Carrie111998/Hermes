@@ -537,3 +537,166 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         eb = kw.get("extra_body")
         assert eb and "tags" in eb
 
+
+# Wire-boundary guard: a turn that carried payload when the pre-call sanitizer
+# vetted it can become wire-EMPTY after convert_messages strips Responses-only
+# fields. Reachable case: a codex commentary turn (content:"" by design, text
+# in ``codex_message_items``) replayed on an OpenAI-compatible provider after a
+# model switch — the provider then 400s every request ("message at position N
+# must not be empty") until it scrolls out — the same failure class
+# ``repair_empty_non_final_messages`` already repairs for every other shape.
+# ---------------------------------------------------------------------------
+
+
+def _wire_empty_assistants(msgs):
+    out = []
+    for i, m in enumerate(msgs):
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        has_text = (isinstance(content, str) and content.strip()) or (
+            isinstance(content, list) and len(content) > 0
+        )
+        if not (has_text or m.get("tool_calls") or m.get("reasoning_content")):
+            out.append(i)
+    return out
+
+
+def _codex_carrier_history():
+    return [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "codex_message_items": [{"type": "message"}]},
+        {"role": "user", "content": "go on"},
+    ]
+
+
+def test_codex_carrier_turn_is_not_wire_empty_after_stripping():
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    out = ChatCompletionsTransport().convert_messages(
+        _codex_carrier_history(), model="moonshotai/kimi-k3"
+    )
+    assert _wire_empty_assistants(out) == []
+    assert out[1]["content"].strip()
+    assert "codex_message_items" not in out[1]
+
+
+def test_wire_guard_uses_the_shared_interrupted_placeholder():
+    from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    out = ChatCompletionsTransport().convert_messages(
+        _codex_carrier_history(), model="moonshotai/kimi-k3"
+    )
+    assert out[1]["content"] == _INTERRUPTED_PLACEHOLDER
+
+
+def test_wire_guard_does_not_mutate_caller_history():
+    import copy
+
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    history = _codex_carrier_history()
+    snapshot = copy.deepcopy(history)
+    ChatCompletionsTransport().convert_messages(history, model="moonshotai/kimi-k3")
+    assert history == snapshot
+
+
+def test_wire_guard_preserves_reasoning_only_and_tool_call_only_turns():
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "reasoning_content": "thinking"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "res"},
+        {"role": "user", "content": "go on"},
+    ]
+    out = ChatCompletionsTransport().convert_messages(history, model="moonshotai/kimi-k3")
+    assert out[1]["reasoning_content"] == "thinking"
+    assert out[1]["content"] == ""  # reasoning is the payload; untouched
+    assert out[2]["tool_calls"][0]["function"]["name"] == "f"
+    assert out[2]["content"] == ""  # tool_calls are the payload; untouched
+
+
+def test_wire_guard_leaves_valid_content_and_ordering_alone():
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "real answer"},
+        {"role": "user", "content": "go on"},
+    ]
+    out = ChatCompletionsTransport().convert_messages(history, model="moonshotai/kimi-k3")
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    assert out[1]["content"] == "real answer"
+
+
+def test_wire_guard_leaves_empty_final_assistant_prefill_untouched():
+    """An empty FINAL assistant turn is a legal prefill — the guard must not
+    touch it (mirrors repair_empty_non_final_messages' final-message rule)."""
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "codex_message_items": [{"type": "message"}]},
+    ]
+    out = ChatCompletionsTransport().convert_messages(history, model="moonshotai/kimi-k3")
+    assert out[-1]["content"] == ""
+
+
+def test_wire_guard_regression_chain_survives_a_repeated_request():
+    """The wedge was persistent: every retry replayed the shell. Converting the
+    same history twice must produce a valid payload both times."""
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    transport = ChatCompletionsTransport()
+    history = _codex_carrier_history()
+    first = transport.convert_messages(history, model="moonshotai/kimi-k3")
+    second = transport.convert_messages(history, model="moonshotai/kimi-k3")
+    assert _wire_empty_assistants(first) == []
+    assert _wire_empty_assistants(second) == []
+    assert first == second
+
+
+def test_converted_payload_satisfies_strict_provider_contract():
+    """End-to-end contract check with an offline provider stub applying the
+    documented rule ("a non-final assistant message must carry content, tool
+    calls, or reasoning"). Without the guard the middle turn is rejected on
+    every attempt — the persistent-wedge condition; with it the same history
+    is accepted repeatedly."""
+    import copy
+
+    from agent.agent_runtime_helpers import sanitize_api_messages
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    def provider_reject_index(messages):
+        last = len(messages) - 1
+        for idx, msg in enumerate(messages):
+            if msg.get("role") != "assistant" or idx == last:
+                continue
+            content = msg.get("content")
+            valid = (
+                (isinstance(content, str) and content.strip())
+                or (isinstance(content, list) and content)
+                or msg.get("tool_calls")
+                or msg.get("reasoning_content")
+            )
+            if not valid:
+                return idx
+        return None
+
+    transport = ChatCompletionsTransport()
+    history = _codex_carrier_history()
+    for _attempt in range(2):
+        sanitized = sanitize_api_messages(copy.deepcopy(history))
+        kwargs = transport.build_kwargs(
+            model="moonshotai/kimi-k3", messages=sanitized, tools=None
+        )
+        assert provider_reject_index(kwargs["messages"]) is None
