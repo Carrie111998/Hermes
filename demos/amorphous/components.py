@@ -134,7 +134,7 @@ def seed_layout(user_id: str, persona: str = "sre") -> dict:
                       cid="notes-briefing"),
     ]
     return {
-        "title": f"Mission Control — {user_id}",
+        "title": f"Hermes Station — {user_id}",
         "user_id": user_id,
         "persona": persona,
         "grid": {"columns": 12},

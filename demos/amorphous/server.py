@@ -34,7 +34,7 @@ from store import Store
 HERE = Path(__file__).parent
 DEFAULT_USER = "demo"
 
-app = FastAPI(title="Amorphous Applications", version="0.1.0")
+app = FastAPI(title="Hermes Station (Amorphous Applications)", version="0.2.0")
 store: Store = None  # type: ignore  # set in create_app/main
 _curator_state = {"last_run": time.time(), "interval_s": 6 * 3600, "runs": 0}
 _chat_histories: dict[str, list[dict]] = {}
@@ -358,7 +358,7 @@ def main() -> None:
     args = ap.parse_args()
     create_app(args.db, curator_interval_s=int(args.curator_minutes * 60))
     threading.Thread(target=_curator_loop, daemon=True).start()
-    print(f"Amorphous Applications → http://{args.host}:{args.port}  "
+    print(f"Hermes Station → http://{args.host}:{args.port}  "
           f"(agent: {BRIDGE.describe()['model']})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
