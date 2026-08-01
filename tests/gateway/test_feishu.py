@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.base import ProcessingOutcome
 
 try:
@@ -20,6 +22,11 @@ try:
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
 
 class _FakeRequestContent:
