@@ -254,6 +254,10 @@ HYDRATION_FATAL_ERRORS = frozenset({
     "preview_digest_mismatch",
 })
 SIDEBAR_EXCLUSION_REASONS = frozenset({"source_cwd_missing"})
+SIDEBAR_BOUND_RETRY_CONFIRMATION = "PRESERVE_EXACT_BOUND_TASK"
+SIDEBAR_SOURCE_CWD_REPAIR_CONFIRMATION = (
+    "PRESERVE_EXACT_BOUND_TASK_AFTER_SOURCE_CWD_REPAIR"
+)
 SIDEBAR_TERMINAL_RESOLUTION_CODE = "native_thread_unrecoverable"
 SIDEBAR_TERMINAL_EVIDENCE_KIND = "codex_app_server_read_not_loaded_resume_no_rollout"
 SIDEBAR_TERMINAL_EVIDENCE_VERSION = 1
@@ -272,6 +276,26 @@ class SidebarNativeTaskNotIndexed(ValueError):
 
     def __init__(self) -> None:
         super().__init__("native_task_not_indexed")
+
+
+def sidebar_bound_retry_authority_matches(
+    error_code: str,
+    confirmation: str,
+) -> bool:
+    standard_errors = {
+        "native_task_not_indexed",
+        "codex_thread_conflict",
+        "native_create_ambiguous",
+        "marker_conflict",
+        "bridge_temporarily_unavailable",
+    }
+    return (
+        error_code in standard_errors
+        and confirmation == SIDEBAR_BOUND_RETRY_CONFIRMATION
+    ) or (
+        error_code == "source_identity_mismatch"
+        and confirmation == SIDEBAR_SOURCE_CWD_REPAIR_CONFIRMATION
+    )
 
 
 _SIDEBAR_TERMINAL_LEDGER_COLUMNS = (
@@ -7995,17 +8019,7 @@ class SessionBridgeStore:
             confirmation,
             "bound sidebar retry confirmation",
         )
-        if (
-            error_code
-            not in {
-                "native_task_not_indexed",
-                "codex_thread_conflict",
-                "native_create_ambiguous",
-                "marker_conflict",
-                "bridge_temporarily_unavailable",
-            }
-            or authority != "PRESERVE_EXACT_BOUND_TASK"
-        ):
+        if not sidebar_bound_retry_authority_matches(error_code, authority):
             raise ValueError("expected bound sidebar failure does not match")
         retry_time = _finite_number(now, "now")
         idempotency_key = sidebar_idempotency_key(source_id)

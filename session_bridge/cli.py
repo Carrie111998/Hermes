@@ -114,14 +114,17 @@ from .store import (
     HYDRATION_FATAL_ERRORS,
     HYDRATION_RETRYABLE_ERRORS,
     SIDEBAR_FATAL_ERRORS,
+    SIDEBAR_BOUND_RETRY_CONFIRMATION,
     SIDEBAR_PRECREATE_RESOLUTION_CODE,
     SIDEBAR_RETRYABLE_ERRORS,
+    SIDEBAR_SOURCE_CWD_REPAIR_CONFIRMATION,
     SIDEBAR_TERMINAL_RESOLUTION_CODE,
     SIDEBAR_UNBOUND_RESOLUTION_CODE,
     SessionBridgeStore,
     SidebarSource,
     redact_codex_thread_id,
     sidebar_precreate_terminal_evidence_digest,
+    sidebar_bound_retry_authority_matches,
     sidebar_terminal_evidence_digest,
     sidebar_unbound_terminal_evidence_digest,
 )
@@ -1452,15 +1455,10 @@ class ProductionBackend:
             re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", codex_thread_id)
             is None
-            or expected_error_code
-            not in {
-                "native_task_not_indexed",
-                "codex_thread_conflict",
-                "native_create_ambiguous",
-                "marker_conflict",
-                "bridge_temporarily_unavailable",
-            }
-            or confirmation != "PRESERVE_EXACT_BOUND_TASK"
+            or not sidebar_bound_retry_authority_matches(
+                expected_error_code,
+                confirmation,
+            )
         ):
             raise RolloutGateBlocked("sidebar_bound_retry_snapshot_mismatch")
         try:
@@ -3449,12 +3447,16 @@ def build_parser() -> argparse.ArgumentParser:
             "native_create_ambiguous",
             "marker_conflict",
             "bridge_temporarily_unavailable",
+            "source_identity_mismatch",
         ),
         required=True,
     )
     sidebar_retry_bound.add_argument(
         "--confirm",
-        choices=("PRESERVE_EXACT_BOUND_TASK",),
+        choices=(
+            SIDEBAR_BOUND_RETRY_CONFIRMATION,
+            SIDEBAR_SOURCE_CWD_REPAIR_CONFIRMATION,
+        ),
         required=True,
     )
 
@@ -4810,6 +4812,7 @@ def _public_sidebar_bound_retry_result(
             "native_create_ambiguous",
             "marker_conflict",
             "bridge_temporarily_unavailable",
+            "source_identity_mismatch",
         }
         or raw.get("error_code") != expected_error_code
         or not isinstance(job_id, str)

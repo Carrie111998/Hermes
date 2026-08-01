@@ -11531,6 +11531,49 @@ def test_bound_sidebar_operator_retry_accepts_exact_transient_bridge_failure(
     assert claimed["codex_thread_id"] == thread_id
 
 
+def test_bound_sidebar_operator_retry_accepts_repaired_source_identity_only_with_narrow_authority(
+    db,
+) -> None:
+    thread_id = "019f-bound-repaired-source-identity"
+    store, candidate, failed, reservation = _failed_bound_not_indexed_sidebar(
+        db,
+        native_id="bound-repaired-source-identity",
+        thread_id=thread_id,
+    )
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("source_identity_mismatch", failed["id"]),
+        )
+    )
+    arguments = {
+        "job_id": failed["id"],
+        "source_session_id": candidate.source_session_id,
+        "codex_thread_id": thread_id,
+        "expected_error_code": "source_identity_mismatch",
+        "now": 1_000.0,
+    }
+
+    with pytest.raises(ValueError):
+        store.retry_failed_bound_sidebar_job(
+            **arguments,
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+        )
+
+    retried = store.retry_failed_bound_sidebar_job(
+        **arguments,
+        confirmation="PRESERVE_EXACT_BOUND_TASK_AFTER_SOURCE_CWD_REPAIR",
+    )
+
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["attempts"] == 0
+    assert retried["error_code"] is None
+    assert retried["codex_thread_id"] == thread_id
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) == (
+        reservation
+    )
+
+
 @pytest.mark.parametrize(
     ("argument", "replacement"),
     (

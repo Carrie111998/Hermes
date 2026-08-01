@@ -1659,6 +1659,61 @@ def test_sidebar_retry_bound_parser_accepts_exact_transient_bridge_failure(
     }
 
 
+def test_sidebar_retry_bound_parser_accepts_repaired_source_identity_with_narrow_authority(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "e" * 64
+    source_session_id = "claude:repaired-source-identity"
+    thread_id = "019f-repaired-source-identity"
+    confirmation = "PRESERVE_EXACT_BOUND_TASK_AFTER_SOURCE_CWD_REPAIR"
+    backend = FakeBackend(
+        sidebar_bound_retry_payload={
+            "status": "requeued",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "error_code": "source_identity_mismatch",
+            "state": "sidebar_retry",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-retry-bound",
+                "--job-id",
+                job_id,
+                "--source-session-id",
+                source_session_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "source_identity_mismatch",
+                "--confirm",
+                confirmation,
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert backend.calls == [
+        (
+            "sidebar_retry_bound",
+            job_id,
+            source_session_id,
+            thread_id,
+            "source_identity_mismatch",
+            confirmation,
+        ),
+        ("close",),
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "requeued",
+        "job_id": job_id,
+        "codex_thread_id": thread_id,
+        "state": "sidebar_retry",
+    }
+
+
 @pytest.mark.parametrize(
     "argv",
     (
@@ -1695,7 +1750,7 @@ def test_sidebar_retry_bound_parser_accepts_exact_transient_bridge_failure(
             "--codex-thread-id",
             "019f-bound-thread",
             "--expected-error-code",
-            "source_identity_mismatch",
+            "source_cwd_missing",
             "--confirm",
             "PRESERVE_EXACT_BOUND_TASK",
         ],
@@ -2380,6 +2435,51 @@ def test_production_sidebar_retry_bound_accepts_exact_transient_bridge_failure(
             "job_id": failed["id"],
             "codex_thread_id": thread_id,
             "error_code": "bridge_temporarily_unavailable",
+            "state": SidebarJobState.RETRY.value,
+        }
+        assert store.get_sidebar_create_reservation(source_session_id) == reservation
+    finally:
+        backend.close()
+
+
+def test_production_sidebar_retry_bound_accepts_repaired_source_identity_only_with_narrow_authority(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation = _production_bound_retry_backend(tmp_path)
+    source_session_id = failed["source_session_id"]
+    thread_id = failed["codex_thread_id"]
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE id = ?",
+            ("source_identity_mismatch", failed["id"]),
+        )
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_bound_retry_snapshot_mismatch",
+        ):
+            backend.sidebar_retry_bound(
+                job_id=failed["id"],
+                source_session_id=source_session_id,
+                codex_thread_id=thread_id,
+                expected_error_code="source_identity_mismatch",
+                confirmation="PRESERVE_EXACT_BOUND_TASK",
+            )
+
+        result = backend.sidebar_retry_bound(
+            job_id=failed["id"],
+            source_session_id=source_session_id,
+            codex_thread_id=thread_id,
+            expected_error_code="source_identity_mismatch",
+            confirmation="PRESERVE_EXACT_BOUND_TASK_AFTER_SOURCE_CWD_REPAIR",
+        )
+
+        assert result == {
+            "status": "requeued",
+            "job_id": failed["id"],
+            "codex_thread_id": thread_id,
+            "error_code": "source_identity_mismatch",
             "state": SidebarJobState.RETRY.value,
         }
         assert store.get_sidebar_create_reservation(source_session_id) == reservation
