@@ -34,6 +34,7 @@ only fail (silently) when it fires.
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -65,12 +66,275 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
 
+_COMMAND_SEPARATOR_CHARS = frozenset(";&|()\n")
+_SHELLS = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
+_SHELL_COMMAND_PREFIXES = frozenset({
+    "!",
+    "{",
+    "do",
+    "elif",
+    "else",
+    "if",
+    "then",
+    "until",
+    "while",
+})
+_ASSIGNMENT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_QUOTED_ASSIGNMENT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=([\"']).*")
+_REDIRECTION_PATTERN = re.compile(r"\d*(?:<|>).*")
+_ENV_OPTIONS_WITH_VALUES = frozenset({
+    "-C",
+    "-S",
+    "-u",
+    "--chdir",
+    "--split-string",
+    "--unset",
+})
+_COMMAND_WRAPPERS = frozenset({
+    "arch",
+    "caffeinate",
+    "command",
+    "doas",
+    "env",
+    "exec",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "sudo",
+    "time",
+    "timeout",
+})
+_SUDO_OPTIONS_WITH_VALUES = frozenset({
+    "-C",
+    "-D",
+    "-g",
+    "-h",
+    "-p",
+    "-R",
+    "-T",
+    "-u",
+    "--chdir",
+    "--chroot",
+    "--close-from",
+    "--command-timeout",
+    "--group",
+    "--host",
+    "--prompt",
+    "--role",
+    "--type",
+    "--user",
+})
+_SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "-o", "--init-file", "--rcfile"})
+_OPTION_WRAPPERS = frozenset({
+    "arch",
+    "caffeinate",
+    "doas",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "timeout",
+})
+_WRAPPER_OPTIONS_WITH_VALUES = {
+    "caffeinate": frozenset({"-t", "-w"}),
+    "doas": frozenset({"-C", "-u"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-e", "-i", "-o"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+}
+
 
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(text))
+
+
+def _is_command_separator(token: str) -> bool:
+    return bool(token) and not (set(token) - _COMMAND_SEPARATOR_CHARS)
+
+
+def _skip_assignments(tokens: list[str], index: int) -> int:
+    while index < len(tokens):
+        token = tokens[index]
+        quoted = _QUOTED_ASSIGNMENT_PATTERN.fullmatch(token)
+        if quoted:
+            quote = quoted.group(1)
+            value = token.split("=", 1)[1]
+            if len(value) >= 2 and value.endswith(quote):
+                index += 1
+                continue
+            index += 1
+            while index < len(tokens) and not tokens[index].endswith(quote):
+                index += 1
+            index += index < len(tokens)
+            continue
+        if _ASSIGNMENT_PATTERN.fullmatch(token):
+            index += 1
+            continue
+        break
+    return index
+
+
+def _skip_redirections(tokens: list[str], index: int) -> int:
+    while index < len(tokens) and _REDIRECTION_PATTERN.fullmatch(tokens[index]):
+        token = tokens[index]
+        if token.endswith(("<", ">")):
+            if index + 2 < len(tokens) and tokens[index + 1] == "&":
+                index += 3
+            else:
+                index += 2
+        else:
+            index += 1
+        index = _skip_assignments(tokens, index)
+    return index
+
+
+def _shell_tokens(command: str) -> Optional[list[str]]:
+    """Return a small, comment-aware shell token stream or ``None``."""
+    if len(command) > 16_384:
+        return None
+    try:
+        lexer = shlex.shlex(
+            command.replace("\\\n", ""),
+            posix=False,
+            punctuation_chars=";&|()\n",
+        )
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens: list[str] = []
+        in_comment = False
+        for token in lexer:
+            if in_comment:
+                if "\n" in token:
+                    tokens.append("\n")
+                    in_comment = False
+                continue
+            if token.startswith("#"):
+                in_comment = True
+                continue
+            tokens.append(token)
+        return tokens
+    except ValueError:
+        # Fail open on malformed shell text. Known cases are unbalanced quotes,
+        # which the target shell also rejects rather than executing.
+        return None
+
+
+def _unquote(token: str) -> str:
+    try:
+        return shlex.split(token)[0]
+    except (IndexError, ValueError):
+        return token
+
+
+def _contains_launchctl_submit_tokens(tokens: list[str], depth: int) -> bool:
+    index = 0
+    while index < len(tokens):
+        if index and not _is_command_separator(tokens[index - 1]):
+            index += 1
+            continue
+        index = _skip_assignments(tokens, index)
+        while (
+            index < len(tokens) and _unquote(tokens[index]) in _SHELL_COMMAND_PREFIXES
+        ):
+            index += 1
+            index = _skip_assignments(tokens, index)
+        index = _skip_redirections(tokens, index)
+        while (
+            index < len(tokens)
+            and _unquote(tokens[index]).rsplit("/", 1)[-1] in _COMMAND_WRAPPERS
+        ):
+            wrapper = _unquote(tokens[index]).rsplit("/", 1)[-1]
+            index += 1
+            if wrapper == "command" and index < len(tokens) and tokens[index] == "-p":
+                index += 1
+            if wrapper == "env":
+                while index < len(tokens):
+                    assignment_end = _skip_assignments(tokens, index)
+                    if assignment_end != index:
+                        index = assignment_end
+                        continue
+                    if tokens[index] in _ENV_OPTIONS_WITH_VALUES:
+                        index += 2
+                        continue
+                    if tokens[index].startswith("-") and tokens[index] != "--":
+                        index += 1
+                        continue
+                    break
+            if wrapper == "sudo":
+                while index < len(tokens) and tokens[index].startswith("-"):
+                    index += 2 if tokens[index] in _SUDO_OPTIONS_WITH_VALUES else 1
+                index = _skip_assignments(tokens, index)
+            if wrapper == "time" and index < len(tokens) and tokens[index] == "-p":
+                index += 1
+            if wrapper in _OPTION_WRAPPERS:
+                options_with_values = _WRAPPER_OPTIONS_WITH_VALUES.get(
+                    wrapper, frozenset()
+                )
+                while (
+                    index < len(tokens)
+                    and tokens[index].startswith("-")
+                    and tokens[index] != "--"
+                ):
+                    index += 2 if tokens[index] in options_with_values else 1
+                if wrapper == "timeout":
+                    if index < len(tokens) and tokens[index] == "--":
+                        index += 1
+                    index += index < len(tokens)
+            if index < len(tokens) and tokens[index] == "--":
+                index += 1
+        if index >= len(tokens) or _is_command_separator(tokens[index]):
+            index += 1
+            continue
+        name = _unquote(tokens[index]).rsplit("/", 1)[-1]
+        if (
+            name == "launchctl"
+            and index + 1 < len(tokens)
+            and _unquote(tokens[index + 1]) == "submit"
+        ):
+            return True
+        if name not in _SHELLS or depth >= 3:
+            index += 1
+            continue
+        option_index = index + 1
+        while option_index < len(tokens) - 1:
+            option = _unquote(tokens[option_index])
+            if _is_command_separator(option) or not option.startswith("-"):
+                break
+            if (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "c" in option[1:]
+            ):
+                payload_index = option_index + 1
+                if (
+                    payload_index < len(tokens)
+                    and _unquote(tokens[payload_index]) == "--"
+                ):
+                    payload_index += 1
+                if payload_index >= len(tokens):
+                    break
+                payload = _shell_tokens(_unquote(tokens[payload_index]))
+                if payload and _contains_launchctl_submit_tokens(payload, depth + 1):
+                    return True
+                break
+            option_index += 2 if option in _SHELL_OPTIONS_WITH_VALUES else 1
+        index += 1
+    return False
+
+
+def contains_launchctl_submit_command(command: str) -> bool:
+    """Detect an actual ``launchctl submit`` invocation in bounded shell text."""
+    if len(command) > 16_384:
+        return bool(
+            re.search(r"(?i)\blaunchctl\s+submit\b", command.replace("\\\n", ""))
+        )
+    tokens = _shell_tokens(command)
+    return bool(tokens and _contains_launchctl_submit_tokens(tokens, 0))
 
 
 def _resolve_script_path(script_path: str) -> Path:

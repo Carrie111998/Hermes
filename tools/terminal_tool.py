@@ -2444,6 +2444,7 @@ def terminal_tool(
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
         if os.environ.get("_HERMES_GATEWAY") == "1":
+            from cron.lifecycle_guard import contains_launchctl_submit_command
             from hermes_cli.cron import _contains_gateway_lifecycle_command
             if _contains_gateway_lifecycle_command(command):
                 return json.dumps({
@@ -2455,6 +2456,17 @@ def terminal_tool(
                         "it could complete (SIGTERM propagates to child processes). "
                         "Run `hermes gateway restart` from a separate shell outside "
                         "the running gateway."
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+            if env_type == "local" and contains_launchctl_submit_command(command):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: submitted launchd jobs can outlive or relaunch the "
+                        "gateway. Run `launchctl submit` from an external shell "
+                        "instead of the gateway-hosted terminal tool."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
