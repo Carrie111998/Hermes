@@ -62,6 +62,9 @@ type KanbanMessages = {
   titlePlaceholder: string
   descPlaceholder: string
   priority: string
+  classOfService: string
+  unclassified: string
+  classesOfService: Record<'expedite' | 'fixed_date' | 'intangible' | 'standard', string>
   workspace: string
   boardDefaultSuffix: string
   workspaceOverride: string
@@ -115,6 +118,7 @@ type KanbanMessages = {
   someone: string
   // drawer — meta + sections
   metaPriority: string
+  metaClassOfService: string
   metaTenant: string
   metaCreatedBy: string
   metaCreated: string
@@ -247,6 +251,14 @@ const en: KanbanMessages = {
   titlePlaceholder: 'Title',
   descPlaceholder: 'Description (optional)',
   priority: 'Priority',
+  classOfService: 'Class of Service',
+  unclassified: 'Unclassified',
+  classesOfService: {
+    expedite: 'Expedite',
+    fixed_date: 'Fixed date',
+    intangible: 'Intangible',
+    standard: 'Standard'
+  },
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
   workspaceOverride: 'Workspace path (optional override)',
@@ -300,6 +312,7 @@ const en: KanbanMessages = {
   evtReprioritized: priority => `priority set to ${priority}`,
   someone: 'someone',
   metaPriority: 'Priority',
+  metaClassOfService: 'Class of Service',
   metaTenant: 'Tenant',
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
@@ -435,6 +448,14 @@ const ja: KanbanMessages = {
   titlePlaceholder: 'タイトル',
   descPlaceholder: '説明（任意）',
   priority: '優先度',
+  classOfService: 'サービスクラス',
+  unclassified: '未分類',
+  classesOfService: {
+    expedite: '緊急',
+    fixed_date: '期限固定',
+    intangible: '無形',
+    standard: '標準'
+  },
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
   workspaceOverride: 'ワークスペースパス（任意の上書き）',
@@ -487,6 +508,7 @@ const ja: KanbanMessages = {
   evtReprioritized: priority => `優先度を ${priority} に設定`,
   someone: '誰か',
   metaPriority: '優先度',
+  metaClassOfService: 'サービスクラス',
   metaTenant: 'テナント',
   metaCreatedBy: '作成者',
   metaCreated: '作成',
@@ -621,6 +643,14 @@ const zh: KanbanMessages = {
   titlePlaceholder: '标题',
   descPlaceholder: '描述（可选）',
   priority: '优先级',
+  classOfService: '服务类别',
+  unclassified: '未分类',
+  classesOfService: {
+    expedite: '加急',
+    fixed_date: '固定日期',
+    intangible: '无形',
+    standard: '标准'
+  },
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
   workspaceOverride: '工作区路径（可选覆盖）',
@@ -673,6 +703,7 @@ const zh: KanbanMessages = {
   evtReprioritized: priority => `优先级设为 ${priority}`,
   someone: '某人',
   metaPriority: '优先级',
+  metaClassOfService: '服务类别',
   metaTenant: '租户',
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
@@ -805,6 +836,14 @@ const zhHant: KanbanMessages = {
   titlePlaceholder: '標題',
   descPlaceholder: '描述（選填）',
   priority: '優先順序',
+  classOfService: '服務類別',
+  unclassified: '未分類',
+  classesOfService: {
+    expedite: '加急',
+    fixed_date: '固定日期',
+    intangible: '無形',
+    standard: '標準'
+  },
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',
   workspaceOverride: '工作區路徑（選填覆寫）',
@@ -857,6 +896,7 @@ const zhHant: KanbanMessages = {
   evtReprioritized: priority => `優先順序設為 ${priority}`,
   someone: '某人',
   metaPriority: '優先順序',
+  metaClassOfService: '服務類別',
   metaTenant: '租戶',
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
@@ -967,5 +1007,7 @@ export function useKanban(): KanbanText {
 
 // Column labels/help live in i18n; unknown backend statuses fall back to the id.
 export const columnLabel = (k: KanbanText, name: string) => k.col[name as keyof KanbanText['col']]?.label ?? name
+export const classOfServiceLabel = (k: KanbanText, value: string) =>
+  k.classesOfService[value as keyof KanbanText['classesOfService']] ?? value
 export const columnHelp = (k: KanbanText, name: string) => k.col[name as keyof KanbanText['col']]?.help ?? ''
 export const lockedReason = (k: KanbanText, name: string) => k.locked[name as keyof KanbanText['locked']] ?? ''

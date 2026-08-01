@@ -53,7 +53,8 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    class_of_service = f" [{t.class_of_service}]" if t.class_of_service else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{class_of_service}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -78,6 +79,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "class_of_service": t.class_of_service,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -344,6 +346,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_create.add_argument(
+        "--class-of-service",
+        choices=kb.VALID_CLASSES_OF_SERVICE,
+        default=None,
+        help="Optional descriptive Class of Service",
+    )
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
@@ -494,6 +502,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+
+    p_set_class_of_service = sub.add_parser(
+        "set-class-of-service",
+        help="Set or clear a task's descriptive Class of Service",
+    )
+    p_set_class_of_service.add_argument("task_id")
+    p_set_class_of_service.add_argument(
+        "class_of_service",
+        nargs="?",
+        default=None,
+        help="One of " + ", ".join(kb.VALID_CLASSES_OF_SERVICE) + ", or 'none' to clear",
+    )
+    p_set_class_of_service.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -1050,6 +1071,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-class-of-service": _cmd_set_class_of_service,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1516,6 +1538,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            class_of_service=getattr(args, "class_of_service", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
@@ -1524,7 +1547,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        suffix = f", class-of-service={task.class_of_service}" if task.class_of_service else ""
+        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'}{suffix})")
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
@@ -1692,6 +1716,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    if task.class_of_service:
+        print(f"  class-of-service: {task.class_of_service}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -1820,6 +1846,29 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_class_of_service(args: argparse.Namespace) -> int:
+    value = args.class_of_service
+    if value is not None and value.lower() in {"none", "-", "null", ""}:
+        value = None
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_class_of_service(conn, args.task_id, value)
+            task = kb.get_task(conn, args.task_id) if ok else None
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    elif value:
+        print(f"Set Class of Service on {args.task_id}: {value}")
+    else:
+        print(f"Cleared Class of Service on {args.task_id}")
     return 0
 
 

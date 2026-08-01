@@ -101,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_CLASSES_OF_SERVICE = ("expedite", "fixed_date", "intangible", "standard")
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -133,6 +134,18 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def validate_class_of_service(value: Optional[str]) -> Optional[str]:
+    """Return a supported class of service, or raise before a write occurs."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in VALID_CLASSES_OF_SERVICE:
+        raise ValueError(
+            "class_of_service must be one of "
+            f"{list(VALID_CLASSES_OF_SERVICE)} or None"
+        )
+    return value
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -929,6 +942,8 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Descriptive task metadata. NULL means the task is unclassified.
+    class_of_service: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1030,6 +1045,11 @@ class Task:
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
+            class_of_service=(
+                row["class_of_service"]
+                if "class_of_service" in keys and row["class_of_service"]
                 else None
             ),
             max_retries=(
@@ -1200,6 +1220,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Optional descriptive classification. The dispatcher never reads it.
+    class_of_service     TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2388,6 +2410,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "class_of_service" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "class_of_service", "class_of_service TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2851,6 +2878,7 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    class_of_service: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -2895,6 +2923,7 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
+    class_of_service = validate_class_of_service(class_of_service)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3162,8 +3191,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
+                        class_of_service,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3185,6 +3215,7 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
+                        class_of_service,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -3212,6 +3243,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "class_of_service": class_of_service,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3423,6 +3455,37 @@ def set_model_override(
         _append_event(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
+        )
+        return True
+
+
+def set_class_of_service(
+    conn: sqlite3.Connection,
+    task_id: str,
+    value: Optional[str],
+) -> bool:
+    """Set or clear descriptive Class-of-Service metadata for one task."""
+    value = validate_class_of_service(value)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT class_of_service FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        previous = row["class_of_service"]
+        if previous == value:
+            return True
+        conn.execute(
+            "UPDATE tasks SET class_of_service = ? WHERE id = ?", (value, task_id)
+        )
+        _append_event(
+            conn,
+            task_id,
+            "class_of_service_set",
+            {
+                "class_of_service": value,
+                "previous_class_of_service": previous,
+            },
         )
         return True
 
