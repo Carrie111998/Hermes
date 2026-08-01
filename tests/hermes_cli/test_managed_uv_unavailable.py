@@ -287,7 +287,7 @@ def test_uncertain_candidate_failure_is_not_cached(tmp_path, monkeypatch, failur
         return None
 
     monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe)
-    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", Mock())
+    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", Mock(return_value=False))
 
     first = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
     second = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
@@ -296,6 +296,32 @@ def test_uncertain_candidate_failure_is_not_cached(tmp_path, monkeypatch, failur
     assert second.status == "failed"
     assert not marker.exists()
     assert len([call for call in calls if "install" in call]) == 2
+
+
+def test_structured_provisioning_failure_refreshes_and_retries(tmp_path, monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+
+    _windows_hermetic(monkeypatch)
+    root, live_python = _runtime_install(tmp_path)
+    current = _runtime_info(live_python)
+    monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", lambda path: current)
+    monkeypatch.setattr(managed_uv, "_uv_version_string", lambda _path: "0.8.4")
+    provision = Mock(
+        side_effect=[
+            managed_uv._ProvisioningResult.failed("probe failed"),
+            managed_uv._ProvisioningResult.failed("probe failed again"),
+        ]
+    )
+    refresh = Mock(return_value=True)
+    monkeypatch.setattr(managed_uv, "_install_safe_python_generation", provision)
+    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", refresh)
+
+    result = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
+
+    assert result.status == "failed"
+    assert provision.call_count == 2
+    refresh.assert_called_once_with("uv.exe")
+    assert not (root / ".hermes-runtime" / "python" / "unavailable-artifact.json").exists()
 
 
 def test_malformed_unavailable_marker_fails_open(tmp_path, monkeypatch):
@@ -349,7 +375,7 @@ def test_malformed_catalog_is_not_cached(tmp_path, monkeypatch):
         return original_run(command, **kwargs)
 
     monkeypatch.setattr(managed_uv.subprocess, "run", malformed_catalog)
-    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", Mock())
+    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", Mock(return_value=False))
 
     first = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
     second = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)

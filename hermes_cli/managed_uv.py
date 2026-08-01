@@ -1454,7 +1454,7 @@ def repair_vulnerable_runtime(
             provisioned = _ProvisioningResult.ready(generation, python, candidate_info)
             provisioning_status = "ready"
 
-        if provisioning_status == "unavailable" or legacy_provisioning_failure:
+        if provisioning_status in {"failed", "unavailable"} or legacy_provisioning_failure:
             # A stale managed-uv catalog can re-release the same patch with
             # fixed SQLite. Keep the existing refresh path, but retry only
             # after a conclusive vulnerable-candidate result.
