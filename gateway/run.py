@@ -8647,8 +8647,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
+                setattr(event, "_gateway_busy_disposition", "queued")
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
+                setattr(event, "_gateway_busy_disposition", "delivered")
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
             await adapter._send_with_retry(
@@ -8873,6 +8875,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # merge semantics for media.
         if not steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
+            setattr(event, "_gateway_busy_disposition", "queued")
+        else:
+            # Steer/redirect becomes part of the currently running turn; its
+            # marker is cleared only when that turn's final delivery succeeds.
+            setattr(event, "_gateway_busy_disposition", "active_turn")
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -17399,27 +17406,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # Stop persistent typing indicator now that the agent is done.
-            # Slack AI status is scoped to a thread/workspace, so preserve the
-            # same routing metadata used by the response delivery path.
-            try:
-                _typing_adapter = self._adapter_for_source(source)
-                _stop_with_metadata = getattr(
-                    type(_typing_adapter), "_stop_typing_with_metadata", None
-                )
-                _stop_typing = getattr(type(_typing_adapter), "stop_typing", None)
-                if _typing_adapter and callable(_stop_with_metadata):
-                    await _typing_adapter._stop_typing_with_metadata(
-                        source.chat_id,
-                        self._thread_metadata_for_source(
-                            source, self._reply_anchor_for_event(event)
-                        ),
-                    )
-                elif _typing_adapter and callable(_stop_typing):
-                    await _typing_adapter.stop_typing(source.chat_id)
-            except Exception:
-                pass
-
             if not self._is_session_run_current(_quick_key, run_generation):
                 logger.info(
                     "Discarding stale agent result for %s — generation %d is no longer current",
@@ -18013,25 +17999,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
-            # Stop typing indicator on error too, retaining Slack thread/workspace
-            # routing so a failed turn cannot leave its status visible.
-            try:
-                _err_adapter = self._adapter_for_source(source)
-                _stop_with_metadata = getattr(
-                    type(_err_adapter), "_stop_typing_with_metadata", None
-                )
-                _stop_typing = getattr(type(_err_adapter), "stop_typing", None)
-                if _err_adapter and callable(_stop_with_metadata):
-                    await _err_adapter._stop_typing_with_metadata(
-                        source.chat_id,
-                        self._thread_metadata_for_source(
-                            source, self._reply_anchor_for_event(event)
-                        ),
-                    )
-                elif _err_adapter and callable(_stop_typing):
-                    await _err_adapter.stop_typing(source.chat_id)
-            except Exception:
-                pass
+            # Keep the adapter-owned typing refresh alive: this safe error
+            # response is delivered by the outer platform pipeline.
             logger.exception("Agent error in session %s", session_key)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
@@ -23507,8 +23476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         on_missing_cursor: str,
     ) -> "tuple[Any, Optional[Callable[[], None]]]":
-        """Build the shared ``StreamConsumerConfig`` and the optional
-        Telegram pause-typing closure used by both agent-run paths.
+        """Build the shared ``StreamConsumerConfig``.
 
         ``on_missing_cursor`` controls how platforms whose adapter sets
         ``SUPPORTS_MESSAGE_EDITING = False`` are handled — both semantics
@@ -23518,17 +23486,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         - ``"raise"`` (in-process agent path): raise ``RuntimeError`` so
           the caller's ``except`` skips streaming entirely.
 
-        Returns ``(consumer_cfg, pause_typing_before_finalize)``.
+        The second tuple item is retained for call-site compatibility, but is
+        always ``None``. The outer platform lifecycle owns typing cleanup and
+        stops it only after the final send/edit has completed.
         """
         from gateway.stream_consumer import StreamConsumerConfig
 
         _pause_typing_before_finalize = None
-        if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
-            def _pause_typing_before_finalize(
-                _adapter=adapter,
-                _chat_id=source.chat_id,
-            ) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
         # Platforms that don't support editing sent messages
         # (e.g. QQ, WeChat) should skip streaming entirely —
         # without edit support, the consumer sends a partial

@@ -175,6 +175,7 @@ class TestBusySessionAck:
         result = await runner._handle_active_session_busy_message(event, sk)
 
         assert result is True  # handled
+        assert getattr(event, "_gateway_busy_disposition", None) == "queued"
         # Verify ack was sent
         adapter._send_with_retry.assert_called_once()
         call_kwargs = adapter._send_with_retry.call_args
@@ -217,6 +218,7 @@ class TestBusySessionAck:
 
         # VERIFY: No queueing — successful steer must NOT replay as next turn
         mock_merge.assert_not_called()
+        assert getattr(event, "_gateway_busy_disposition", None) == "active_turn"
 
         # VERIFY: Ack mentions steer wording
         adapter._send_with_retry.assert_called_once()

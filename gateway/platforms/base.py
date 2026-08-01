@@ -47,6 +47,26 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
+def _processing_error_content(config, error: Exception) -> str:
+    """Build a user-visible blocker without exposing exception text."""
+    error_type = type(error).__name__
+    extra = getattr(config, "extra", {}) or {}
+    template = extra.get("processing_error_message") if isinstance(extra, dict) else None
+    if isinstance(template, str) and template.strip():
+        try:
+            return template.format(
+                error_type=error_type,
+                error_detail="details available in gateway logs",
+            )
+        except (KeyError, ValueError, IndexError):
+            logger.warning("Invalid processing_error_message template; using default")
+    return (
+        f"Sorry, I encountered an error ({error_type}).\n"
+        "The technical details are available in the gateway logs.\n"
+        "Try again or use /reset to start a fresh session."
+    )
+
+
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
@@ -2455,6 +2475,7 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        _merge_event_inflight_tokens(existing, event)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2497,6 +2518,17 @@ def merge_pending_message_event(
             return
 
     pending_messages[session_key] = event
+
+
+def _merge_event_inflight_tokens(target: MessageEvent, incoming: MessageEvent) -> None:
+    """Carry every accepted-message recovery marker into a merged turn."""
+    combined: list[str] = []
+    for source in (target, incoming):
+        for token in getattr(source, "_gateway_inflight_tokens", []) or []:
+            if token and token not in combined:
+                combined.append(str(token))
+    if combined:
+        setattr(target, "_gateway_inflight_tokens", combined)
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -3919,18 +3951,7 @@ class BasePlatformAdapter(ABC):
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
     ) -> None:
-        """Send a batch of images.
-
-        Accepts ``http(s)://``, ``file://`` URIs in the first tuple
-        element.
-
-        Default implementation sends each item individually,
-        routing animated GIFs through ``send_animation`` and local
-        files through ``send_image_file``.
-
-        Override in subclasses to bundle into a single native API call
-        (e.g. Signal's multi-attachment RPC)
-        """
+        """Send multiple images sequentially; adapters may override batching."""
         from urllib.parse import unquote as _unquote
 
         for image_url, alt_text in images:
@@ -3968,6 +3989,22 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+
+    async def send_multiple_images_tracked(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> Optional[SendResult]:
+        """Optional aggregate result without changing the legacy adapter API.
+
+        Platforms that can report per-batch outcomes should override this.
+        Legacy adapters retain their existing ``send_multiple_images`` contract
+        and return ``None``, which leaves global processing accounting unchanged.
+        """
+        await self.send_multiple_images(chat_id, images, metadata, human_delay)
+        return None
 
     async def send_image(
         self,
@@ -5232,6 +5269,7 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
+            _merge_event_inflight_tokens(state.event, event)
             if event.text:
                 state.event.text = (
                     f"{state.event.text}\n{event.text}"
@@ -5405,6 +5443,15 @@ class BasePlatformAdapter(ABC):
             task.add_done_callback(self._expected_cancelled_tasks.discard)
         return True
 
+    async def enrich_message_context(self, event: MessageEvent) -> MessageEvent:
+        """Optional per-platform context enrichment before the agent handler.
+
+        The default is a no-op.  It is deliberately awaited inside the
+        background processing task, after typing has started, so slow external
+        context sources cannot delay the user's activity signal.
+        """
+        return event
+
     async def cancel_session_processing(
         self,
         session_key: str,
@@ -5551,6 +5598,71 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def _claim_event_inflight(self, event: MessageEvent) -> None:
+        """Persist one accepted non-command event before queue/debounce routing."""
+        if not self.config.extra.get("inflight_recovery_enabled"):
+            return
+        if event.get_command():
+            return
+        if getattr(event, "_gateway_inflight_tokens", None):
+            return
+        try:
+            from gateway.inflight_journal import claim_inflight
+            setattr(event, "_gateway_inflight_tokens", [claim_inflight(event)])
+        except Exception:
+            logger.warning(
+                "[%s] Could not persist inbound in-flight marker",
+                self.name,
+                exc_info=True,
+            )
+
+    def _transfer_event_inflight_to_active_turn(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        turn_generation: object,
+    ) -> None:
+        """Make a successfully steered event part of the active turn obligation."""
+        tokens = list(getattr(event, "_gateway_inflight_tokens", []) or [])
+        if not tokens:
+            return
+        active = getattr(self, "_gateway_active_inflight_tokens", None)
+        if active is None:
+            active = {}
+            setattr(self, "_gateway_active_inflight_tokens", active)
+        active.setdefault((session_key, turn_generation), set()).update(tokens)
+        setattr(event, "_gateway_inflight_tokens", [])
+
+    def _clear_event_inflight(
+        self,
+        event: MessageEvent,
+        session_key: Optional[str] = None,
+        turn_generation: Optional[object] = None,
+    ) -> bool:
+        """Clear all markers merged into a completed turn, retaining failures."""
+        tokens = list(getattr(event, "_gateway_inflight_tokens", []) or [])
+        if session_key and turn_generation is not None:
+            active = getattr(self, "_gateway_active_inflight_tokens", {})
+            tokens.extend(active.pop((session_key, turn_generation), set()))
+        if not tokens:
+            return True
+        retained: list[str] = []
+        try:
+            from gateway.inflight_journal import clear_inflight
+            for token in tokens:
+                if not clear_inflight(token):
+                    retained.append(token)
+        except Exception:
+            retained = tokens
+        setattr(event, "_gateway_inflight_tokens", retained)
+        if retained:
+            logger.warning(
+                "[%s] Could not clear %d inbound in-flight marker(s)",
+                self.name,
+                len(retained),
+            )
+        return not retained
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -5580,6 +5692,7 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        self._claim_event_inflight(event)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -5688,6 +5801,7 @@ class BasePlatformAdapter(ABC):
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        _r = None
                         if _text:
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
@@ -5701,6 +5815,8 @@ class BasePlatformAdapter(ABC):
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        if not _text or getattr(_r, "success", False):
+                            self._clear_event_inflight(event)
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
@@ -5710,7 +5826,30 @@ class BasePlatformAdapter(ABC):
 
             if self._busy_session_handler is not None:
                 try:
+                    generation_map = getattr(
+                        self, "_gateway_inflight_turn_generations", {}
+                    )
+                    busy_generation = generation_map.get(session_key)
                     if await self._busy_session_handler(event, session_key):
+                        disposition = getattr(
+                            event, "_gateway_busy_disposition", "delivered"
+                        )
+                        if disposition == "active_turn":
+                            # No await occurs between this generation check and
+                            # transfer, so a completed/replaced turn cannot
+                            # receive the marker after its final clear.
+                            if (
+                                busy_generation is not None
+                                and generation_map.get(session_key)
+                                is busy_generation
+                            ):
+                                self._transfer_event_inflight_to_active_turn(
+                                    event,
+                                    session_key,
+                                    busy_generation,
+                                )
+                        elif disposition != "queued":
+                            self._clear_event_inflight(event)
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
@@ -5785,17 +5924,28 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        turn_generation = object()
+        generation_map = getattr(
+            self, "_gateway_inflight_turn_generations", None
+        )
+        if generation_map is None:
+            generation_map = {}
+            setattr(self, "_gateway_inflight_turn_generations", generation_map)
+        generation_map[session_key] = turn_generation
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_failed = False
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            else:
+                delivery_failed = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5830,8 +5980,18 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
+
+        # Direct unit/integration callers may enter here without handle_message();
+        # claim idempotently so the production and test paths share semantics.
+        self._claim_event_inflight(event)
+
+        def _clear_inflight_marker() -> None:
+            self._clear_event_inflight(
+                event, session_key, turn_generation
+            )
         
         try:
+            event = await self.enrich_message_context(event)
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
@@ -6017,6 +6177,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -6136,13 +6297,15 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images_tracked(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -6178,13 +6341,15 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images_tracked(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
@@ -6223,6 +6388,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
@@ -6232,6 +6398,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as media_err:
+                        _record_delivery(SendResult(success=False, error=str(media_err)))
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -6252,6 +6419,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -6265,6 +6433,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as file_err:
+                        _record_delivery(SendResult(success=False, error=str(file_err)))
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -6297,6 +6466,13 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            journal_delivery_complete = (
+                delivery_attempted
+                and delivery_succeeded
+                and not delivery_failed
+            ) or (not delivery_attempted and not bool(response))
+            if journal_delivery_complete:
+                _clear_inflight_marker()
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -6354,18 +6530,14 @@ class BasePlatformAdapter(ABC):
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
+                _notice_result = await self.send(
                     chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
+                    content=_processing_error_content(self.config, e),
                     metadata=_thread_metadata,
                 )
+                if getattr(_notice_result, "success", False):
+                    _clear_inflight_marker()
             except Exception as notify_err:
                 logger.error(
                     "[%s] Failed to send error notification to user: %s",
@@ -6418,6 +6590,14 @@ class BasePlatformAdapter(ABC):
                 metadata=_thread_metadata,
                 stop_attempts=1,
             )
+            # Active-turn markers that were not acknowledged by this turn
+            # must remain durable for restart recovery, but must never leak
+            # into a later turn and be cleared by its successful delivery.
+            getattr(self, "_gateway_active_inflight_tokens", {}).pop(
+                (session_key, turn_generation), None
+            )
+            if generation_map.get(session_key) is turn_generation:
+                generation_map.pop(session_key, None)
             # Final drain/release boundary: force-flush any timer that missed
             # the in-band drain before deciding whether the guard can clear.
             await self._flush_text_debounce_now(session_key)

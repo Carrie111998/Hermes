@@ -16,11 +16,13 @@ import logging
 import os
 import html as _html
 import re
+import shlex
 import threading
 import time
 from contextvars import ContextVar
+from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -612,6 +614,59 @@ _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
 
 class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
+
+
+def _resolve_telegram_channel_prompt(
+    extra: dict,
+    *,
+    chat_id: str,
+    thread_id: str | None,
+    chat_type: str,
+) -> str | None:
+    """Resolve collision-free additive Telegram group/topic prompts.
+
+    Defining ``topic_prompts`` opts Telegram into scoped keys of the form
+    ``<chat_id>:<thread_id>``. In that mode numeric ``channel_prompts`` keys
+    are not consulted, preventing a forum policy from leaking into a DM topic
+    or another group that happens to reuse the same thread id. Profiles without
+    ``topic_prompts`` retain the legacy cross-platform resolution.
+    """
+    from gateway.platforms.base import resolve_channel_prompt
+
+    scoped = extra.get("topic_prompts")
+    if not isinstance(scoped, dict):
+        return resolve_channel_prompt(
+            extra,
+            thread_id or chat_id,
+            chat_id if thread_id else None,
+        )
+
+    base = resolve_channel_prompt(extra, chat_id)
+    if chat_type != "group" or not thread_id:
+        return base
+
+    topic_prompt = scoped.get(f"{chat_id}:{thread_id}")
+    if topic_prompt is None:
+        nested = scoped.get(chat_id)
+        if nested is None:
+            try:
+                nested = scoped.get(int(chat_id))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(nested, dict):
+            topic_prompt = nested.get(thread_id)
+            if topic_prompt is None:
+                try:
+                    topic_prompt = nested.get(int(thread_id))
+                except (TypeError, ValueError):
+                    pass
+
+    parts: list[str] = []
+    for value in (base, topic_prompt):
+        text = str(value or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "\n\n".join(parts) or None
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -3571,7 +3626,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, exc_info=True,
                 )
 
-    def _start_post_connect_housekeeping(self) -> None:
+    def _start_post_connect_housekeeping(self, *, recover_inflight: bool = False) -> None:
         """Kick off deferred post-connect housekeeping in the background.
 
         Idempotent: if a previous housekeeping task is still running (e.g. a
@@ -3581,14 +3636,76 @@ class TelegramAdapter(BasePlatformAdapter):
         if task and not task.done():
             return
         self._post_connect_task = asyncio.ensure_future(
-            self._run_post_connect_housekeeping()
+            self._run_post_connect_housekeeping(recover_inflight=recover_inflight)
         )
 
-    async def _run_post_connect_housekeeping(self) -> None:
+    async def _reconcile_inflight_journal(self) -> None:
+        """Notify original Telegram topics about turns lost to a hard restart."""
+        if not self.config.extra.get("inflight_recovery_enabled"):
+            return
+        try:
+            from gateway.inflight_journal import clear_inflight, list_inflight
+            records = list_inflight("telegram")
+        except Exception:
+            logger.warning("[%s] Could not read inbound in-flight journal", self.name, exc_info=True)
+            return
+
+        notice = (
+            "Предыдущая обработка была прервана перезапуском gateway до доставки "
+            "финального ответа. Пожалуйста, отправьте сообщение ещё раз."
+        )
+        grouped: Dict[tuple[str, str], List[dict]] = {}
+        for record in records:
+            try:
+                record_pid = record.get("process_id")
+                if record_pid is not None and int(str(record_pid)) == os.getpid():
+                    continue
+            except (TypeError, ValueError):
+                # Legacy/malformed records without an owner PID are treated as
+                # stale so an actual prior-process interruption is not lost.
+                pass
+            chat_id = str(record.get("chat_id") or "")
+            if not chat_id:
+                continue
+            thread_id = str(record.get("thread_id") or "")
+            grouped.setdefault((chat_id, thread_id), []).append(record)
+
+        for (chat_id, thread_id), group_records in grouped.items():
+            metadata = None
+            if thread_id:
+                metadata = {"message_thread_id": thread_id}
+            try:
+                result = await self.send(
+                    chat_id=chat_id,
+                    content=notice,
+                    metadata=metadata,
+                )
+                if getattr(result, "success", False):
+                    uncleared = sum(
+                        1 for record in group_records
+                        if not clear_inflight(record.get("_token"))
+                    )
+                    if uncleared:
+                        logger.warning(
+                            "[%s] Delivered restart notice but could not clear %d marker(s)",
+                            self.name,
+                            uncleared,
+                        )
+            except Exception:
+                logger.warning(
+                    "[%s] Could not deliver in-flight restart notice; retaining marker",
+                    self.name,
+                    exc_info=True,
+                )
+
+    async def _run_post_connect_housekeeping(self, *, recover_inflight: bool = False) -> None:
         """Register the command menu, surface the status indicator, and set up
         DM topics — all off the connect path so a slow Bot API call cannot blow
         the gateway connect timeout (#46298). Every step is non-fatal."""
         try:
+            if recover_inflight:
+                await self._reconcile_inflight_journal()
+
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
             # gateway command there automatically adds it to the Telegram menu.
@@ -4029,6 +4146,25 @@ class TelegramAdapter(BasePlatformAdapter):
                             pass
             await self._app.start()
 
+            # Reconcile prior-process markers before webhook/polling begins,
+            # so a same-message retry cannot overwrite a stale marker between
+            # snapshot and cleanup. Bound this startup obligation; timeout
+            # retains every marker for the next cold start.
+            if (
+                not is_reconnect
+                and self.config.extra.get("inflight_recovery_enabled")
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self._reconcile_inflight_journal(),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] In-flight reconciliation timed out; retaining markers",
+                        self.name,
+                    )
+
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 
@@ -4201,7 +4337,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # though polling/webhook is already live (#46298). Defer them to a
             # cancellable background task so connect() returns as soon as the
             # transport is up.
-            self._start_post_connect_housekeeping()
+            self._start_post_connect_housekeeping(recover_inflight=False)
 
             return True
             
@@ -6996,11 +7132,77 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_multiple_images(
         self,
         chat_id: str,
-        images: List[tuple],
+        images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
     ) -> None:
-        """Send a batch of images natively via Telegram's media group API.
+        """Preserve the public multi-image API while using tracked delivery."""
+        await self.send_multiple_images_tracked(
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        )
+
+    async def _send_images_individually_tracked(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]],
+        human_delay: float,
+    ) -> SendResult:
+        """Telegram fallback that retains per-image delivery outcomes."""
+        from urllib.parse import unquote as _unquote
+
+        outcomes: List[SendResult] = []
+        for image_url, alt_text in images:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                if image_url.startswith("file://"):
+                    result = await self.send_image_file(
+                        chat_id,
+                        _unquote(image_url[7:]),
+                        alt_text or None,
+                        metadata=metadata,
+                    )
+                elif self._is_animation_url(image_url):
+                    result = await self.send_animation(
+                        chat_id,
+                        image_url,
+                        alt_text or None,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await self.send_image(
+                        chat_id,
+                        image_url,
+                        alt_text or None,
+                        metadata=metadata,
+                    )
+                outcomes.append(result)
+            except Exception as exc:
+                outcomes.append(
+                    SendResult(
+                        success=False,
+                        error=_redact_telegram_error_text(exc),
+                    )
+                )
+        return SendResult(
+            success=all(result.success for result in outcomes) if outcomes else not images,
+            error="; ".join(
+                str(result.error) for result in outcomes if not result.success
+            ),
+        )
+
+    async def send_multiple_images_tracked(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> SendResult:
+        """Send a batch with an aggregate result for journal accounting.
 
         Telegram's ``send_media_group`` bundles up to 10 photos/videos into
         a single album. Larger batches are chunked. Animated GIFs cannot
@@ -7012,9 +7214,10 @@ class TelegramAdapter(BasePlatformAdapter):
         the base adapter's per-image loop.
         """
         if not self._bot:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=True)
+        results: List[SendResult] = []
 
         try:
             from telegram import InputMediaPhoto
@@ -7023,8 +7226,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await self._send_images_individually_tracked(
+                chat_id, images, metadata, human_delay
+            )
 
         # Peel off animations — they need send_animation, not send_media_group
         animations: List[tuple] = []
@@ -7037,12 +7241,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Animations: route through the base default (per-image send_animation)
         if animations:
-            await super().send_multiple_images(
-                chat_id, animations, metadata, human_delay=human_delay,
+            results.append(
+                await self._send_images_individually_tracked(
+                    chat_id, animations, metadata, human_delay
+                )
             )
 
         if not photos:
-            return
+            return SendResult(success=all(result.success for result in results))
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
@@ -7067,6 +7273,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 "[%s] Skipping missing image in media group: %s",
                                 self.name, local_path,
                             )
+                            results.append(SendResult(success=False, error="Missing image path"))
                             continue
                         fh = open(local_path, "rb")
                         opened_files.append(fh)
@@ -7112,6 +7319,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                results.append(SendResult(success=True))
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -7119,8 +7327,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
-                await super().send_multiple_images(
-                    chat_id, chunk, metadata, human_delay=human_delay,
+                results.append(
+                    await self._send_images_individually_tracked(
+                        chat_id, chunk, metadata, human_delay
+                    )
                 )
             finally:
                 for fh in opened_files:
@@ -7128,6 +7338,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         fh.close()
                     except Exception:
                         pass
+
+        return SendResult(
+            success=all(result.success for result in results) if results else False,
+            error="; ".join(str(result.error) for result in results if not result.success),
+        )
 
     async def send_image_file(
         self,
@@ -9630,6 +9845,138 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    async def _enrich_reply_context(self, event: MessageEvent) -> MessageEvent:
+        """Attach bounded read-only MTProto history to a Telegram reply.
+
+        The command is opt-in through ``extra.reply_context_command``.  It runs
+        out of process so Telethon and user-account credentials remain outside
+        the Bot API process.  Any timeout, non-zero exit, malformed JSON, or
+        empty result fails open to Telegram's native single-message reply.
+        """
+        command = self.config.extra.get("reply_context_command")
+        source = getattr(event, "source", None)
+        if not (
+            command
+            and getattr(event, "reply_to_message_id", None)
+            and source is not None
+            and getattr(source, "chat_type", None) == "group"
+        ):
+            return event
+        if str(getattr(event, "text", "") or "").lstrip().startswith("/"):
+            return event
+
+        try:
+            argv = shlex.split(str(command))
+        except ValueError:
+            logger.warning("[%s] Invalid reply_context_command", self.name)
+            return event
+        if not argv:
+            return event
+
+        def _bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                value = int(self.config.extra.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(value, maximum))
+
+        max_chars = _bounded_int("reply_context_max_chars", 80000, 1000, 200000)
+        argv.extend(
+            [
+                "--chat-id", str(source.chat_id),
+                "--thread-id", str(getattr(source, "thread_id", None) or "1"),
+                "--message-id", str(getattr(event, "message_id", "") or ""),
+                "--reply-to-message-id", str(event.reply_to_message_id),
+                "--depth", str(_bounded_int("reply_context_depth", 30, 1, 30)),
+                "--neighbors", str(_bounded_int("reply_context_neighbors", 5, 0, 5)),
+                "--max-messages", str(_bounded_int("reply_context_max_messages", 100, 1, 100)),
+                "--max-chars", str(max_chars),
+            ]
+        )
+        timeout = float(_bounded_int("reply_context_timeout", 5, 1, 30))
+        proc = None
+        communicate_task = None
+
+        async def _read_limited(stream, limit: int) -> bytes:
+            if stream is None:
+                return b""
+            data = await stream.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("reply context subprocess output exceeded limit")
+            return data
+
+        async def _bounded_communicate():
+            process = proc
+            if process is None:
+                raise RuntimeError("reply context process was not started")
+            stdout_task = asyncio.create_task(
+                _read_limited(process.stdout, min(500_000, max_chars * 4 + 8192))
+            )
+            stderr_task = asyncio.create_task(_read_limited(process.stderr, 65_536))
+            try:
+                stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+                await process.wait()
+                return stdout, stderr
+            finally:
+                for task in (stdout_task, stderr_task):
+                    if not task.done():
+                        task.cancel()
+
+        async def _kill_and_reap() -> None:
+            process = proc
+            if process is None or process.returncode is not None:
+                return
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await process.wait()
+            except Exception:
+                pass
+
+        try:
+            allowed_env = {
+                "HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+                "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+                "HERMES_HOME",
+            }
+            child_env = {key: value for key, value in os.environ.items() if key in allowed_env}
+            child_env.setdefault("HOME", str(Path.home()))
+            child_env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            child_env["PYTHONNOUSERSITE"] = "1"
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_env,
+            )
+            communicate_task = asyncio.create_task(_bounded_communicate())
+            stdout, _stderr = await asyncio.wait_for(communicate_task, timeout=timeout)
+            if proc.returncode != 0 or not stdout:
+                return event
+            payload = json.loads(stdout.decode("utf-8", errors="replace"))
+            context = payload.get("context") if isinstance(payload, dict) else None
+            if payload.get("ok") and isinstance(context, str) and context.strip():
+                existing = getattr(event, "channel_context", None)
+                event.channel_context = (
+                    f"{existing}\n\n{context.strip()}" if existing else context.strip()
+                )
+        except asyncio.TimeoutError:
+            await _kill_and_reap()
+            logger.warning("[%s] MTProto reply context timed out; using native reply", self.name)
+        except Exception:
+            await _kill_and_reap()
+            logger.warning("[%s] MTProto reply context failed; using native reply", self.name, exc_info=True)
+        finally:
+            if communicate_task is not None and not communicate_task.done():
+                communicate_task.cancel()
+                await asyncio.gather(communicate_task, return_exceptions=True)
+        return event
+
+    async def enrich_message_context(self, event: MessageEvent) -> MessageEvent:
+        return await self._enrich_reply_context(event)
+
     def _build_message_event(
         self,
         message: Message,
@@ -9775,13 +10122,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception:
                         reply_to_text = None
 
-        # Per-channel/topic ephemeral prompt
-        from gateway.platforms.base import resolve_channel_prompt
+        # Per-channel/topic ephemeral prompt. Scoped Telegram topic prompts are
+        # additive with the group baseline and cannot collide with a DM or
+        # another group that reuses the same numeric thread id.
         _chat_id_str = str(chat.id)
-        _channel_prompt = resolve_channel_prompt(
+        _channel_prompt = _resolve_telegram_channel_prompt(
             self.config.extra,
-            thread_id_str or _chat_id_str,
-            _chat_id_str if thread_id_str else None,
+            chat_id=_chat_id_str,
+            thread_id=thread_id_str,
+            chat_type=chat_type,
         )
 
         return MessageEvent(
@@ -10115,7 +10464,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     _GENERIC_MERGE_KEYS = {
         "reply_prefix", "reply_in_thread", "reply_to_mode",
         "unauthorized_dm_behavior", "notice_delivery", "require_mention",
-        "channel_skill_bindings", "channel_prompts", "gateway_restart_notification",
+        "channel_skill_bindings", "channel_prompts", "topic_prompts", "gateway_restart_notification",
         "allow_from", "allow_admin_from", "dm_policy", "group_policy",
     }
     for _k, _v in _telegram_extra.items():

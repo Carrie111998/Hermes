@@ -1590,6 +1590,15 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if "topic_prompts" in platform_cfg:
+                    topic_prompts = platform_cfg["topic_prompts"]
+                    if isinstance(topic_prompts, dict):
+                        bridged["topic_prompts"] = {
+                            str(k): ({str(nk): nv for nk, nv in v.items()} if isinstance(v, dict) else v)
+                            for k, v in topic_prompts.items()
+                        }
+                    else:
+                        bridged["topic_prompts"] = topic_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
                 if "typing_indicator" in platform_cfg:
