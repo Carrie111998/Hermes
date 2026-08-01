@@ -36,7 +36,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.provider_health_probe import ProbeOutcome, probe_provider_endpoint
-from agent.provider_stall import ProviderStalledError
+from agent.provider_stall import ProviderStalledError, format_provider_stall_status
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -4201,6 +4201,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # retain the pre-existing generic safety policy and are never probed.
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
+            # A completed worker may still be unwinding managed-stream cleanup.
+            # Its settled result is authoritative; do not emit a stale notice
+            # for that cleanup window.
+            if result["response"] is not None or result["error"] is not None:
+                continue
             _stale_attempt_id = _current_stream_attempt_id()
             _zero_real_chunks = not _stream_attempt_has_real_chunks(
                 _stale_attempt_id
@@ -4238,41 +4243,56 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     continue
 
+                # The worker can finish the already-cancelled terminal attempt
+                # while the probe is in flight. Do not diagnose or report that
+                # same attempt a second time during thread cleanup.
+                if result["response"] is not None or result["error"] is not None:
+                    continue
+
                 stall_recovery["zero_chunk_stalls"] += 1
                 stall_recovery["last_probe"] = _probe
                 _mark_zero_chunk_stall(_stale_attempt_id, _stale_elapsed)
-                _probe_diagnosis = {
-                    "reachable": (
-                        "Provider endpoint reachable but generation produced no chunks"
+                _stall_error = ProviderStalledError(
+                    provider=str(getattr(agent, "provider", "") or "unknown"),
+                    model=str(
+                        getattr(agent, "model", "")
+                        or api_kwargs.get("model", "unknown")
                     ),
-                    "unreachable": (
-                        "Provider endpoint unreachable while generation produced no chunks"
-                    ),
-                    "disabled": (
-                        "Provider health probe disabled; generation produced no chunks"
-                    ),
-                    "unavailable": (
-                        "Provider health probe unavailable; generation produced no chunks"
-                    ),
-                }.get(
-                    _probe.status,
-                    "Provider health probe unavailable; generation produced no chunks",
+                    silent_seconds=_stale_elapsed,
+                    attempt=stall_recovery["zero_chunk_stalls"],
+                    probe=_probe,
                 )
                 if (
                     stall_recovery["zero_chunk_stalls"]
                     <= stall_recovery_config.same_provider_retries
                 ):
-                    agent._buffer_status(f"{_probe_diagnosis}; reconnecting once.")
-                else:
-                    agent._buffer_status(f"{_probe_diagnosis}; provider stalled.")
+                    agent._buffer_status(
+                        format_provider_stall_status(_stall_error, "reconnecting")
+                    )
+
+                _stall_log = logger.info if (
+                    stall_recovery["zero_chunk_stalls"]
+                    <= stall_recovery_config.same_provider_retries
+                ) else logger.warning
+                _stall_log(
+                    "Provider stall provider=%s model=%s attempt=%s silent_seconds=%.3f "
+                    "probe_status=%s probe_http_status=%s",
+                    _stall_error.provider,
+                    _stall_error.model,
+                    _stall_error.attempt,
+                    _stall_error.silent_seconds,
+                    _stall_error.probe.status,
+                    _stall_error.probe.http_status,
+                )
 
             _est_ctx = estimate_request_context_tokens(api_kwargs)
-            logger.warning(
-                "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
-                "model=%s context=~%s tokens. Killing connection.",
-                _stale_elapsed, _stream_stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
+            if not (stall_recovery_config.enabled and _zero_real_chunks):
+                logger.warning(
+                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stream_stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
             if not (stall_recovery_config.enabled and _zero_real_chunks):
                 agent._buffer_status(
                     f"⚠️ No response from provider for {int(_stale_elapsed)}s "
@@ -4312,10 +4332,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
-            agent._emit_wait_notice(
-                f"⚠ no output from provider for {int(_stale_elapsed)}s — "
-                f"reconnecting..."
-            )
+            if not (stall_recovery_config.enabled and _zero_real_chunks):
+                agent._emit_wait_notice(
+                    f"⚠ no output from provider for {int(_stale_elapsed)}s — "
+                    f"reconnecting..."
+                )
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
             )

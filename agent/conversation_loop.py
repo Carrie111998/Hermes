@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.provider_stall import format_provider_stall_status
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -900,26 +901,6 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
-
-
-def _format_provider_stall_error(api_error: Exception) -> str:
-    """Format the bounded Task 5 diagnosis for a repeated stream stall."""
-    probe_status = getattr(getattr(api_error, "probe", None), "status", "unavailable")
-    diagnosis = {
-        "reachable": "endpoint reachable but request wedged",
-        "unreachable": "endpoint unreachable",
-        "disabled": "probe disabled",
-        "unavailable": "probe unavailable",
-    }.get(probe_status, "probe unavailable")
-    provider = str(getattr(api_error, "provider", "") or "unknown")
-    model = str(getattr(api_error, "model", "") or "unknown")
-    attempts = int(getattr(api_error, "attempt", 0) or 0)
-    silent_seconds = float(getattr(api_error, "silent_seconds", 0.0) or 0.0)
-    return (
-        f"Provider {provider} model {model} stalled after {attempts} attempts "
-        f"({silent_seconds:g}s silent): {diagnosis}. "
-        "Configure fallback_providers to continue on another provider."
-    )
 
 
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
@@ -3782,14 +3763,16 @@ def run_conversation(
                     max_retries=max_retries,
                     retryable=classified.retryable,
                     reason=classified.reason.value,
+                    error_context=classified.error_context,
                 )
 
                 if classified.reason == FailoverReason.provider_stalled:
-                    stall_error = _format_provider_stall_error(api_error)
-                    agent._buffer_status(stall_error)
                     if agent._try_activate_fallback(
                         reason=FailoverReason.provider_stalled
                     ):
+                        agent._buffer_status(
+                            format_provider_stall_status(api_error, "falling_back")
+                        )
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt
                         )
@@ -3797,6 +3780,8 @@ def run_conversation(
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
+                    stall_error = format_provider_stall_status(api_error, "failed")
+                    agent._buffer_status(stall_error)
                     agent._flush_status_buffer()
                     agent._persist_session(messages, conversation_history)
                     return {

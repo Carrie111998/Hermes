@@ -33,3 +33,29 @@ class ProviderStalledError(TimeoutError):
             f"{int(self.silent_seconds)}s on attempt {self.attempt}; "
             f"probe={self.probe.status}"
         )
+
+
+def format_provider_stall_status(
+    error: ProviderStalledError, action: str
+) -> str:
+    """Return the canonical sanitized user-facing provider-stall status."""
+    diagnosis = {
+        "reachable": "endpoint reachable but request wedged",
+        "unreachable": "provider endpoint unreachable",
+        "unavailable": "provider health probe unavailable",
+        "disabled": "provider health probe disabled",
+    }.get(error.probe.status, "provider health probe unavailable")
+    action_text = {
+        "reconnecting": "Reconnecting once with a fresh connection.",
+        "falling_back": "Switching to configured fallback.",
+        "failed": (
+            "No configured fallback is available. Configure fallback_providers "
+            "to continue on another provider."
+        ),
+    }
+    if action not in action_text:
+        raise ValueError(f"unsupported provider stall action: {action}")
+    return (
+        f"⚠️ No response chunks from {error.provider}/{error.model} for "
+        f"{int(error.silent_seconds)}s; {diagnosis}. {action_text[action]}"
+    )

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.provider_health_probe import ProbeOutcome
-from agent.provider_stall import ProviderStalledError
+from agent.provider_stall import ProviderStalledError, format_provider_stall_status
 from hermes_cli.timeouts import ProviderStallRecoveryConfig
 
 
@@ -112,6 +112,104 @@ def _install_policy(monkeypatch, *, enabled=True, probe=True, retries=1):
     )
 
 
+@pytest.mark.parametrize(
+    ("probe", "diagnosis"),
+    [
+        (
+            ProbeOutcome("reachable", 404, "endpoint returned HTTP 404"),
+            "endpoint reachable but request wedged",
+        ),
+        (
+            ProbeOutcome("unreachable", None, "ConnectError"),
+            "provider endpoint unreachable",
+        ),
+        (
+            ProbeOutcome("unavailable", None, "unsupported URL"),
+            "provider health probe unavailable",
+        ),
+        (
+            ProbeOutcome("disabled", None, "health probe disabled"),
+            "provider health probe disabled",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("action", "action_text"),
+    [
+        ("reconnecting", "Reconnecting once with a fresh connection."),
+        ("falling_back", "Switching to configured fallback."),
+        (
+            "failed",
+            "No configured fallback is available. Configure fallback_providers "
+            "to continue on another provider.",
+        ),
+    ],
+)
+def test_provider_stall_status_is_concise_and_structured(
+    probe, diagnosis, action, action_text
+):
+    error = ProviderStalledError(
+        provider="test-provider",
+        model="test/model",
+        silent_seconds=360,
+        attempt=2,
+        probe=probe,
+    )
+
+    status = format_provider_stall_status(error, action)
+
+    assert status == (
+        f"⚠️ No response chunks from test-provider/test/model for 360s; "
+        f"{diagnosis}. {action_text}"
+    )
+    if probe.detail != diagnosis.removeprefix("provider "):
+        assert probe.detail not in status
+
+
+def test_provider_stall_lifecycle_hook_includes_structured_probe_context(
+    agent, monkeypatch
+):
+    events = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.has_hook",
+        lambda name: name == "api_request_error",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda name, **payload: events.append((name, payload)),
+    )
+
+    agent._invoke_api_request_error_hook(
+        task_id="task-1",
+        turn_id="turn-1",
+        api_request_id="request-1",
+        api_call_count=2,
+        api_start_time=0.0,
+        api_kwargs={"messages": [{"role": "user", "content": "continue"}]},
+        error_type="ProviderStalledError",
+        error_message="provider stalled",
+        retryable=False,
+        reason="provider_stalled",
+        error_context={
+            "probe_status": "reachable",
+            "probe_http_status": 404,
+            "silent_seconds": 360.0,
+            "attempt": 2,
+        },
+    )
+
+    event_name, payload = events[-1]
+    assert event_name == "api_request_error"
+    assert payload["reason"] == "provider_stalled"
+    assert payload["retryable"] is False
+    assert payload["error_context"] == {
+        "probe_status": "reachable",
+        "probe_http_status": 404,
+        "silent_seconds": pytest.approx(360, abs=1),
+        "attempt": 2,
+    }
+
+
 def test_first_zero_chunk_stall_probes_cancels_and_retries_with_fresh_client(
     agent, monkeypatch
 ):
@@ -144,11 +242,10 @@ def test_first_zero_chunk_stall_probes_cancels_and_retries_with_fresh_client(
     assert agent._create_request_openai_client.call_count == 2
     assert first_client is not second_client
     assert first_aborted.is_set()
-    assert any(
-        status
-        == "Provider endpoint reachable but generation produced no chunks; reconnecting once."
-        for status in statuses
-    )
+    assert statuses == [
+        "⚠️ No response chunks from unknown/test/model for 0s; "
+        "endpoint reachable but request wedged. Reconnecting once with a fresh connection."
+    ]
 
 
 def test_chunk_arriving_during_probe_prevents_cancellation(agent, monkeypatch):
@@ -391,8 +488,8 @@ def test_second_stall_without_fallback_reports_probe_diagnosis(
     assert sum(client.chat.completions.create.call_count for client in clients) == 2
     assert "primary-provider" in result["error"]
     assert "primary/model" in result["error"]
-    assert "2 attempts" in result["error"]
-    assert "s silent" in result["error"]
+    assert "No configured fallback is available" in result["error"]
+    assert "for 0s" in result["error"]
     assert "endpoint reachable but request wedged" in result["error"]
     assert "fallback_providers" in result["error"]
     assert "HTTP None" not in result["error"]
