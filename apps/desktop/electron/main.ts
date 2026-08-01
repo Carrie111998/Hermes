@@ -3712,11 +3712,107 @@ function resolveWebDist() {
   return fallback
 }
 
+// Recursively finds the newest mtime under `dir`, capped at a fixed file
+// count so a huge tree can't make this scan slow -- an approximate signal is
+// enough for a "does this look stale?" warning, not a build system.
+function newestMtimeUnder(dir, { maxFiles = 4000 } = {}) {
+  let newest = 0
+  let scanned = 0
+  const stack = [dir]
+
+  while (stack.length && scanned < maxFiles) {
+    const current = stack.pop()
+    let entries
+
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true })
+    } catch {
+      continue
+    }
+
+    for (const entry of entries) {
+      if (scanned >= maxFiles) {
+        break
+      }
+
+      const full = path.join(current, entry.name)
+
+      if (entry.isDirectory()) {
+        stack.push(full)
+        continue
+      }
+
+      if (!/\.(ts|tsx)$/.test(entry.name)) {
+        continue
+      }
+
+      scanned += 1
+
+      try {
+        const mtime = fs.statSync(full).mtimeMs
+
+        if (mtime > newest) {
+          newest = mtime
+        }
+      } catch {
+        // best effort
+      }
+    }
+  }
+
+  return newest
+}
+
+// Dev-only staleness guard (#stale-dist-2026-08-01): this desktop app has no
+// automatic way to know its own `dist/` is out of date -- `npm run dev` never
+// reads dist/ at all (the renderer is served live by Vite), so a manually
+// rebuilt-once, then-abandoned dist/ can sit for days without anything
+// noticing. The only place that DOES load it is here, whenever there's no
+// dev server override (a packaged build, or `electron .` run directly without
+// one) -- exactly the scenario that once produced a `ReferenceError` from a
+// six-day-stale bundle that looked like "the gateway won't start" (see
+// douglas/README.md, "Si la app arranca y muere"). Gated on the REAL
+// `app.isPackaged` (Electron's own signal for a genuine asar-packaged
+// build, which npm run pack/dist always rebuilds dist/ fresh for) -- NOT
+// the combined IS_PACKAGED, which also goes true for the manual
+// HERMES_DESKTOP_IS_PACKAGED override used to test the packaged code path
+// from a dev checkout. That override is exactly the risky pattern this
+// exists to catch, so it must not be exempted from it.
+function warnIfRendererBundleStale(indexPath) {
+  if (app.isPackaged) {
+    return
+  }
+
+  try {
+    const bundleMtime = fs.statSync(indexPath).mtimeMs
+    const srcMtime = newestMtimeUnder(path.join(APP_ROOT, 'src'))
+    const STALE_THRESHOLD_MS = 5 * 60 * 1000 // ignore normal build-vs-save timing overlap
+
+    if (srcMtime > bundleMtime + STALE_THRESHOLD_MS) {
+      const staleMs = srcMtime - bundleMtime
+      const staleAge =
+        staleMs >= 24 * 60 * 60 * 1000
+          ? `${(staleMs / (24 * 60 * 60 * 1000)).toFixed(1)} day(s)`
+          : `${(staleMs / (60 * 60 * 1000)).toFixed(1)} hour(s)`
+      const message =
+        `[renderer] dist/ looks stale: apps/desktop/src has changes ~${staleAge} newer than ` +
+        `${indexPath}. If the app boots then dies with a renderer error, run \`npm run build\` first.`
+
+      console.warn(message)
+      rememberLog(message)
+    }
+  } catch {
+    // best effort -- never block boot over this
+  }
+}
+
 function resolveRendererIndex() {
   const candidates = [path.join(APP_ROOT, 'dist', 'index.html'), path.join(resolveWebDist(), 'index.html')]
   const found = candidates.find(fileExists)
 
   if (found) {
+    warnIfRendererBundleStale(found)
+
     return found
   }
 
