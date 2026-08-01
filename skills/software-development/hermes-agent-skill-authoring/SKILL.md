@@ -90,6 +90,34 @@ Common quality failures:
 - **Sprawl** — too much always-visible material; push branch-specific reference behind pointers.
 - **No-op prose** — generic advice the agent would already follow without the skill.
 
+## Skill Classification
+
+A skill exists to make agent behavior more predictable. Classify the content
+before writing so the skill stays reusable and receives the right trigger.
+
+1. **Behavior library** — reusable flows, procedures, pitfalls, and techniques.
+   Name it by problem class (`service-unreachable-diagnostics`, `auth-bypass`),
+   never by the project where the behavior was first discovered. Any project
+   hitting the same problem class should be able to trigger it.
+2. **Information library** — durable facts, in one of two scopes:
+   - **Environment-specific:** facts about an environment the user owns, such
+     as a server, app instance, or product setup. Name it for that environment
+     and update it when the environment changes.
+   - **Public/topic:** general reference material such as command references,
+     protocol tables, or format rules. Name it for the topic. This is the
+     large, on-demand sibling of memory: topic-triggered rather than injected
+     into every turn.
+
+**Flow logs are not skills.** PR numbers, deployment timestamps, backup
+filenames, branch names, and one-time session state belong in the transcript
+or task tracker. Preserve the verified reusable lesson; discard the temporary
+coordinates.
+
+**The trigger phrase decides reuse.** The description's first 57 characters
+are the routing signal (`Use when <trigger>`). Behavior libraries and public
+information libraries need problem/topic triggers. Only environment-specific
+information libraries should use an environment name as the trigger.
+
 ## Peer-Matched Structure
 
 Every in-repo skill follows roughly:
@@ -200,6 +228,8 @@ Pick the closest existing category. Don't invent new top-level categories casual
 - [ ] Total file ≤ 100,000 chars (aim for 8-15k)
 - [ ] Structure: `# Title` → `## Overview` → `## When to Use` → body → `## Common Pitfalls` → `## Verification Checklist`
 - [ ] Each ordered step has a checkable completion criterion
+- [ ] Content is reusable behavior or durable information; no flow-log/session facts included
+- [ ] Skill name and first-57-character trigger match the problem, topic, or owned environment scope
 - [ ] Description is trigger-focused and avoids duplicated body content
 - [ ] Bulky or branch-specific reference is progressively disclosed in linked files
 - [ ] No-op prose and duplicated rules removed
