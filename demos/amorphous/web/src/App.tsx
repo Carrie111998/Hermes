@@ -158,25 +158,25 @@ export default function App() {
   };
 
   const gridPadRight = dockPos === "right" ? 418 : 0;
-  const gridPadBottom = dockPos === "bottom" ? (dockCollapsed ? 58 : 250) : 12;
+  const gridPadBottom = dockPos === "bottom" ? (dockCollapsed ? 64 : 268) : 16;
 
   return (
     <div className="min-h-screen">
       {/* top bar */}
-      <header className="sticky top-0 z-40 h-14 flex items-center justify-between px-4 border-b border-line bg-background/90 backdrop-blur-md">
-        <div className="flex items-center gap-2.5 font-semibold text-[15px]">
-          <span className="text-gold text-[17px]">☤</span> Hermes Station
+      <header className="sticky top-0 z-40 h-14 flex items-center justify-between px-4 border-b border-line bg-background/85 backdrop-blur-xl">
+        <div className="flex items-center gap-2.5 text-[15px]">
+          <span className="text-accent-2 text-[17px]">☤</span> <span className="w510">Hermes Station</span>
           <span className="text-ink-3 text-[11.5px] font-normal hidden sm:inline">amorphous applications</span>
         </div>
         <div className="flex items-center gap-2">
           <span className="hidden md:inline-flex items-center gap-2 h-7 px-3 rounded-full border border-line text-[12px] text-ink-2 max-w-[240px]">
-            <span className="w-1.5 h-1.5 rounded-full bg-green shadow-[0_0_7px] shadow-green shrink-0" />
+            <span className="w-1.5 h-1.5 rounded-full bg-green shadow-[0_0_6px] shadow-green shrink-0" />
             <span className="truncate">{state.agent.model || "agent"}</span>
           </span>
           <TopBtn onClick={evolveNow}><FlaskConical size={14} /> Evolve</TopBtn>
           <TopBtn onClick={() => setTrayOpen(!trayOpen)}>
             <LayoutGrid size={14} /> Proposals
-            <span className={`min-w-[18px] h-[18px] px-1 rounded-full text-[11px] font-bold inline-flex items-center justify-center ${state.proposals.length ? "bg-gold text-gold-ink" : "bg-line text-ink-3"}`}>
+            <span className={`min-w-[18px] h-[18px] px-1 rounded-full text-[11px] font-bold inline-flex items-center justify-center ${state.proposals.length ? "bg-brand text-white" : "bg-white/[0.07] text-ink-3"}`}>
               {state.proposals.length}
             </span>
           </TopBtn>
@@ -186,20 +186,20 @@ export default function App() {
 
       {/* preview banner */}
       {preview && (
-        <div className="sticky top-14 z-40 flex items-center gap-3 px-4 py-2.5 bg-gold/10 border-b border-gold/40 text-[13.5px]">
-          <Eye size={15} className="text-gold shrink-0" />
-          <b className="text-gold shrink-0">Previewing proposal</b>
+        <div className="sticky top-14 z-40 flex items-center gap-3 px-4 py-2.5 bg-brand/10 border-b border-brand/40 text-[13.5px]">
+          <Eye size={15} className="text-accent-2 shrink-0" />
+          <b className="text-accent-2 w590 shrink-0">Previewing proposal</b>
           <span className="flex-1 text-ink-2 truncate">
             {preview.diff.map((d) => `${d.change}: ${d.title}`).join(" · ") || "reflow only"}
           </span>
           <button onClick={() => actProposal(preview.p.id, "approve", "", "up")}
-                  className="h-8 px-3.5 rounded-lg bg-gold text-gold-ink text-[13px] font-semibold inline-flex items-center gap-1.5">
+                  className="h-8 px-3.5 rounded-md bg-brand text-white text-[13px] w510 inline-flex items-center gap-1.5 hover:bg-accent-2 transition-colors">
             <Check size={13} /> Keep
           </button>
           <button onClick={() => {
             const why = prompt("Why keep the current layout? (optional — steers the curator)") || "";
             actProposal(preview.p.id, "reject", why, "down");
-          }} className="h-8 px-3.5 rounded-lg border border-line-2 text-[13px] inline-flex items-center gap-1.5 hover:bg-surface-2">
+          }} className="h-8 px-3.5 rounded-md border border-line-2 bg-white/[0.02] text-[13px] text-ink-2 inline-flex items-center gap-1.5 hover:bg-white/[0.05]">
             <XIcon size={13} /> Go back
           </button>
         </div>
@@ -220,7 +220,7 @@ export default function App() {
             Hidden:
             {hidden.map((c) => (
               <button key={c.id} onClick={() => showComp(c.id)}
-                      className="inline-flex items-center gap-1 h-7 px-2.5 rounded-lg border border-line text-ink-2 hover:border-line-2 hover:text-ink">
+                      className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md border border-line bg-white/[0.02] text-ink-3 hover:border-line-2 hover:text-ink-2">
                 <Plus size={12} /> {c.title}
               </button>
             ))}
@@ -230,7 +230,7 @@ export default function App() {
 
       {/* proposals tray */}
       {trayOpen && (
-        <aside className="fixed top-14 right-0 bottom-0 w-[420px] z-[60] bg-surface border-l border-line overflow-auto p-4"
+        <aside className="fixed top-14 right-0 bottom-0 w-[420px] z-[60] bg-panel border-l border-line overflow-auto p-4"
                style={{ paddingBottom: gridPadBottom + 20 }}>
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-[15px] font-semibold m-0">Evolution proposals</h3>
@@ -259,7 +259,7 @@ export default function App() {
       />
 
       {toast && (
-        <div className="fixed left-1/2 -translate-x-1/2 z-[95] bg-surface-2 border border-line-2 rounded-lg px-4 py-2.5 text-[13.5px] shadow-2xl shadow-black/50"
+        <div className="fixed left-1/2 -translate-x-1/2 z-[95] bg-surface-2 border border-line-2 rounded-lg px-4 py-2.5 text-[13.5px] shadow-[0_10px_36px_rgba(0,0,0,.5)]"
              style={{ bottom: gridPadBottom + 16 }}>
           {toast}
         </div>
@@ -301,7 +301,7 @@ function GridBody({ visible, rglLayout, preview, onPersist, onHide, onRemove }: 
 function TopBtn({ children, onClick }: any) {
   return (
     <button onClick={onClick}
-            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] text-ink-2 hover:text-ink hover:bg-surface-2 border border-transparent hover:border-line">
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] text-ink-2 hover:text-ink hover:bg-white/[0.04] border border-transparent">
       {children}
     </button>
   );
@@ -323,16 +323,16 @@ function ProposalCard({ p, onTry, onAct }: { p: Proposal; onTry: () => void; onA
     return t[m.op] || m.op;
   };
   return (
-    <div className="border border-line rounded-xl bg-surface-2 p-3.5 mt-3">
+    <div className="card-surface rounded-[10px] p-3.5 mt-3">
       <div className="text-[10.5px] uppercase tracking-wider text-ink-3 mb-1.5">{p.engine} · {when(p.created_at)}</div>
-      <div className="text-[13.5px] font-semibold leading-snug">{p.summary}</div>
+      <div className="text-[13.5px] w590 leading-snug">{p.summary}</div>
       <ul className="my-2.5 pl-4 text-[13px] text-ink-2 leading-relaxed list-disc">
         {p.mutations.slice(0, 8).map((m, i) => <li key={i}>{label(m)}</li>)}
       </ul>
       {p.rationale && <div className="text-[12.5px] text-ink-3 leading-relaxed">{p.rationale}</div>}
       <textarea value={fb} onChange={(e) => setFb(e.target.value)}
                 placeholder="Optional feedback — steers the next evolution"
-                className="w-full min-h-[44px] mt-2.5 px-2.5 py-2 bg-background border border-line rounded-lg text-[13px] text-ink placeholder:text-ink-3 outline-none focus:border-line-2 resize-y" />
+                className="w-full min-h-[44px] mt-2.5 px-2.5 py-2 bg-white/[0.03] border border-line rounded-md text-[13px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2 resize-y" />
       <div className="flex gap-2 mt-2.5">
         <ActionBtn onClick={onTry}><Eye size={13} /> Try it</ActionBtn>
         <ActionBtn primary onClick={() => onAct("approve", fb)}><Check size={13} /> Apply</ActionBtn>
@@ -346,9 +346,9 @@ function ActionBtn({ children, onClick, primary, destructive }: any) {
   return (
     <button onClick={onClick}
             className={`inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] font-medium border
-              ${primary ? "bg-gold text-gold-ink border-gold font-semibold" :
+              ${primary ? "bg-brand text-white border-brand w510" :
                 destructive ? "border-red/40 text-red hover:bg-red/10" :
-                "border-line-2 text-ink hover:bg-surface"}`}>
+                "border-line-2 bg-white/[0.02] text-ink-2 hover:bg-white/[0.05]"}`}>
       {children}
     </button>
   );

@@ -2,66 +2,92 @@
 @import "react-grid-layout/css/styles.css";
 @import "react-resizable/css/styles.css";
 
+/* ============ Linear-derived design system ============
+   Near-black canvas, luminance-stepped surfaces, semi-transparent
+   white borders, ONE chromatic accent (indigo-violet). */
+
 @theme {
-  --color-background: #0a0a0b;
-  --color-surface: #111113;
-  --color-surface-2: #18181b;
-  --color-line: #1f1f23;
-  --color-line-2: #2c2c31;
-  --color-ink: #f4f4f5;
-  --color-ink-2: #b6b8bf;
-  --color-ink-3: #7b7e87;
-  --color-gold: #e6c368;
-  --color-gold-ink: #1a1610;
-  --color-teal: #45d5c0;
-  --color-red: #ff7a70;
-  --color-green: #5fdd8d;
-  --font-sans: "Geist", "Inter", "SF Pro Text", system-ui, sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
+  --color-background: #08090a;
+  --color-panel: #0f1011;
+  --color-surface: #141516;          /* solid card base under translucency */
+  --color-surface-2: #191a1b;
+  --color-line: rgba(255, 255, 255, 0.06);
+  --color-line-2: rgba(255, 255, 255, 0.10);
+  --color-ink: #f7f8f8;
+  --color-ink-2: #d0d6e0;
+  --color-ink-3: #8a8f98;
+  --color-ink-4: #62666d;
+  --color-accent: #7170ff;
+  --color-accent-2: #828fff;
+  --color-brand: #5e6ad2;
+  --color-red: #ec6a5e;
+  --color-green: #10b981;
+  --color-amber: #f2b34c;
+  --font-sans: "Inter", "SF Pro Display", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 html, body, #root { height: 100%; }
 body {
   margin: 0;
   background: var(--color-background);
-  background-image:
-    radial-gradient(1200px 500px at 20% -10%, rgba(230,195,104,.05), transparent 60%),
-    radial-gradient(1000px 500px at 90% -10%, rgba(69,213,192,.04), transparent 60%);
-  background-attachment: fixed;
   color: var(--color-ink);
   font-family: var(--font-sans);
   font-size: 14px;
+  font-feature-settings: "cv01", "ss03";
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
+/* Linear's signature between-weights */
+.w510 { font-weight: 510; }
+.w590 { font-weight: 590; }
+
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: var(--color-line-2); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-* { scrollbar-width: thin; scrollbar-color: var(--color-line-2) transparent; }
+* { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.12) transparent; }
+
+/* Card surface: translucent white over near-black (Linear luminance model) */
+.card-surface {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  transition: background .15s ease, border-color .15s ease;
+}
+.card-surface:hover {
+  background: rgba(255, 255, 255, 0.032);
+  border-color: rgba(255, 255, 255, 0.11);
+}
+
+/* Scrollable card bodies fade out at the bottom instead of hard-clipping */
+.body-fade {
+  mask-image: linear-gradient(to bottom, black calc(100% - 18px), transparent 100%);
+}
 
 /* react-grid-layout theming */
 .react-grid-item.react-grid-placeholder {
-  background: color-mix(in srgb, var(--color-gold) 22%, transparent) !important;
-  border: 1px dashed color-mix(in srgb, var(--color-gold) 60%, transparent);
-  border-radius: 12px;
+  background: rgba(113, 112, 255, 0.12) !important;
+  border: 1px dashed rgba(113, 112, 255, 0.45);
+  border-radius: 10px;
   opacity: 1 !important;
 }
-.react-grid-item > .react-resizable-handle {
-  opacity: 0;
-  transition: opacity .15s;
-}
-.react-grid-item:hover > .react-resizable-handle { opacity: .7; }
+.react-grid-item > .react-resizable-handle { opacity: 0; transition: opacity .15s; }
+.react-grid-item:hover > .react-resizable-handle { opacity: .6; }
 .react-grid-item > .react-resizable-handle::after {
-  border-color: var(--color-ink-3) !important;
+  border-color: #62666d !important;
   width: 7px; height: 7px;
 }
 .react-grid-item.react-draggable-dragging {
   z-index: 30;
-  box-shadow: 0 18px 60px rgba(0,0,0,.6);
+  box-shadow: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.1);
+  border-radius: 10px;
 }
+.react-grid-item { transition: transform .18s ease, width .18s ease, height .18s ease; }
+.react-grid-item.react-draggable-dragging,
+.react-grid-item.resizing { transition: none; }
 
 .shimmer {
-  background: linear-gradient(90deg, #202024 25%, #2b2b31 50%, #202024 75%);
+  background: linear-gradient(90deg, rgba(255,255,255,.04) 25%, rgba(255,255,255,.08) 50%, rgba(255,255,255,.04) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.3s infinite;
 }

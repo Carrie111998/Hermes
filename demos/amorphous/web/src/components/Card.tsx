@@ -6,7 +6,7 @@ import {
   Send, X, LoaderCircle,
 } from "lucide-react";
 import { DataView, useComponentData } from "./DataViews";
-import { accentFor, SOURCE_ICONS } from "../lib/accents";
+import { iconFor } from "../lib/accents";
 import { post, track, USER, type Component } from "../lib/api";
 
 interface Props {
@@ -19,14 +19,13 @@ interface Props {
 export default function Card({ c, preview, onHide, onRemove }: Props) {
   const { data, err, refresh } = useComponentData(c, preview);
   const [chatOpen, setChatOpen] = useState(false);
-  const accent = accentFor(c.type);
-  const Icon = SOURCE_ICONS[c.props?.source] || accent.icon;
+  const Icon = iconFor(c.type, c.props?.source);
 
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>
         <div
-          className="relative h-full flex flex-col bg-surface border border-line rounded-xl overflow-hidden hover:border-line-2 hover:shadow-[0_4px_24px_rgba(0,0,0,.35)] transition-all group"
+          className="card-surface relative h-full flex flex-col rounded-[10px] overflow-hidden group"
           onClickCapture={() => track("click", c.id)}
           onMouseEnter={() => ((c as any)._t0 = performance.now())}
           onMouseLeave={() => {
@@ -37,13 +36,10 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
             }
           }}
         >
-          <div className={`absolute top-0 left-0 right-0 h-px bg-gradient-to-r ${accent.line} to-transparent`} />
-          <div className="drag-handle flex items-center justify-between h-10 px-3 border-b border-line shrink-0 cursor-grab active:cursor-grabbing select-none">
+          <div className="drag-handle flex items-center justify-between h-9 pl-3.5 pr-2 border-b border-line shrink-0 cursor-grab active:cursor-grabbing select-none">
             <div className="flex items-center gap-2 min-w-0">
-              <span className={`w-6 h-6 rounded-md ${accent.bg} ${accent.fg} flex items-center justify-center shrink-0`}>
-                <Icon size={13} />
-              </span>
-              <span className="text-[13px] font-semibold truncate">{c.title}</span>
+              <Icon size={14} className="text-ink-4 shrink-0" strokeWidth={1.75} />
+              <span className="text-[13px] w510 text-ink-2 truncate">{c.title}</span>
             </div>
             {!preview && (
               <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -56,7 +52,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
               </div>
             )}
           </div>
-          <div className="flex-1 overflow-auto px-3.5 py-3 min-h-0">
+          <div className="body-fade flex-1 overflow-auto px-3.5 py-3 min-h-0">
             <DataView c={c} data={data} err={err} />
           </div>
           {chatOpen && <ComponentChat c={c} onClose={() => setChatOpen(false)} onChanged={refresh} />}
@@ -64,7 +60,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
       </ContextMenu.Trigger>
       {!preview && (
         <ContextMenu.Portal>
-          <ContextMenu.Content className="min-w-[210px] bg-surface-2 border border-line-2 rounded-xl p-1.5 shadow-2xl shadow-black/60 z-[100] text-[13px]">
+          <ContextMenu.Content className="min-w-[210px] bg-surface-2 border border-line-2 rounded-[10px] p-1 shadow-[0_8px_30px_rgba(0,0,0,.5),0_0_0_1px_rgba(255,255,255,.04)] z-[100] text-[13px]">
             <CtxLabel>{c.title}</CtxLabel>
             <CtxItem onSelect={() => { setChatOpen(true); track("component_chat_open", c.id); }}>
               <MessageCircle size={13} /> Ask this component…
@@ -96,7 +92,7 @@ function CtxItem({ children, onSelect, destructive }: any) {
   return (
     <ContextMenu.Item
       onSelect={onSelect}
-      className={`flex items-center gap-2.5 px-3 py-2 rounded-lg cursor-pointer outline-none data-[highlighted]:bg-surface ${destructive ? "text-red" : "text-ink"}`}
+      className={`flex items-center gap-2.5 px-2.5 py-[7px] rounded-md cursor-pointer outline-none data-[highlighted]:bg-white/[0.05] ${destructive ? "text-red" : "text-ink-2"}`}
     >
       {children}
     </ContextMenu.Item>
@@ -132,16 +128,16 @@ function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () =>
   };
 
   return (
-    <div className="absolute inset-0 z-20 bg-surface/97 backdrop-blur-sm flex flex-col rounded-xl border border-teal/40"
+    <div className="absolute inset-0 z-20 bg-panel/97 backdrop-blur-sm flex flex-col rounded-xl border border-accent/40"
          onMouseDown={(e) => e.stopPropagation()}>
       <div className="flex items-center justify-between px-3.5 h-10 border-b border-line shrink-0">
-        <span className="text-[13px] font-semibold text-teal truncate">◎ {c.title}</span>
+        <span className="text-[13px] font-semibold text-accent-2 truncate">◎ {c.title}</span>
         <button onClick={onClose} className="text-ink-3 hover:text-ink"><X size={15} /></button>
       </div>
       <div className="flex-1 overflow-auto px-3.5 py-2.5 space-y-2.5 min-h-0">
         {msgs.map((m, i) => (
           <div key={i} className="text-[13px] leading-relaxed">
-            <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-teal" : "text-gold"}`}>{m.who}</span>
+            <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-accent-2" : "text-ink-3"}`}>{m.who}</span>
             <span className="text-ink-2 whitespace-pre-wrap">{m.text}</span>
           </div>
         ))}
@@ -156,7 +152,7 @@ function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () =>
           placeholder="Ask or change this component…"
           className="flex-1 bg-transparent px-3.5 py-2.5 text-[13px] outline-none placeholder:text-ink-3"
         />
-        <button onClick={send} className="pr-3 text-ink-3 hover:text-gold"><Send size={15} /></button>
+        <button onClick={send} className="pr-3 text-ink-3 hover:text-accent-2"><Send size={15} /></button>
       </div>
     </div>
   );
