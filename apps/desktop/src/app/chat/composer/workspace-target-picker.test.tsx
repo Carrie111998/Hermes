@@ -65,38 +65,38 @@ describe('WorkspaceTargetPicker', () => {
   it('displays the project inherited by a blank new session without making it explicit', () => {
     renderPicker()
 
-    expect(screen.getByRole('button', { name: 'Projects' }).textContent).toContain('App')
+    expect(screen.getByRole('button', { name: 'Projects: App' }).textContent).toContain('App')
     expect($newChatWorkspaceTarget.get()).toBeUndefined()
   })
 
   it('switches the one-shot target and current cwd to another visible project', () => {
     renderPicker()
 
-    fireEvent.pointerDown(screen.getByRole('button', { name: 'Projects' }), { button: 0, ctrlKey: false })
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Projects: App' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Docs' }))
 
     expect($newChatWorkspaceTarget.get()).toBe('/repo/docs')
     expect($currentCwd.get()).toBe('/repo/docs')
     expect($currentBranch.get()).toBe('')
-    expect(screen.getByRole('button', { name: 'Projects' }).textContent).toContain('Docs')
+    expect(screen.getByRole('button', { name: 'Projects: Docs' }).textContent).toContain('Docs')
   })
 
   it('clears the one-shot target and current cwd when Home is selected', () => {
     renderPicker()
 
-    fireEvent.pointerDown(screen.getByRole('button', { name: 'Projects' }), { button: 0, ctrlKey: false })
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Projects: App' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Home' }))
 
     expect($newChatWorkspaceTarget.get()).toBeNull()
     expect($currentCwd.get()).toBe('')
     expect($currentBranch.get()).toBe('')
-    expect(screen.getByRole('button', { name: 'Projects' }).textContent).toContain('Home')
+    expect(screen.getByRole('button', { name: 'Projects: Home' }).textContent).toContain('Home')
   })
 
   it('does not render once a session exists or the draft already contains messages', () => {
     const { rerender } = renderPicker({ sessionId: 'runtime-1' })
 
-    expect(screen.queryByRole('button', { name: 'Projects' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Projects:/ })).toBeNull()
 
     rerender(
       <I18nProvider configClient={null} initialLocale="en">
@@ -104,6 +104,6 @@ describe('WorkspaceTargetPicker', () => {
       </I18nProvider>
     )
 
-    expect(screen.queryByRole('button', { name: 'Projects' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Projects:/ })).toBeNull()
   })
 })

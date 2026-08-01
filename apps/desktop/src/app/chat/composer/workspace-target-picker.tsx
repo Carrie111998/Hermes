@@ -63,7 +63,7 @@ export function WorkspaceTargetPicker({ cwd, hasMessages = false, sessionId = nu
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button
-            aria-label={t.sidebar.projects.sectionLabel}
+            aria-label={`${t.sidebar.projects.sectionLabel}: ${label}`}
             className="flex min-w-0 items-center gap-1 bg-transparent text-left transition-colors hover:text-foreground"
             type="button"
           >
