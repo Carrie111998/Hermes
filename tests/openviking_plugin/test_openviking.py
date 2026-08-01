@@ -226,6 +226,10 @@ class TestOpenVikingSkillQuerySafety:
         provider._user = "default"
         provider._agent = "hermes"
         provider._session_id = "session-1"
+        # Local peer-only guard: sync_turn refuses to write into sessions that
+        # were not ensured with the peer-only memory policy. Mark the session
+        # as ensured so this test exercises the content-filtering behavior.
+        provider._ensured_peer_sessions.add("session-1")
         skill_message = (
             '[IMPORTANT: The user has invoked the "skill-creator" skill, indicating they want '
             "you to follow its instructions. The full skill content is loaded below.]\n\n"
@@ -248,6 +252,10 @@ class TestOpenVikingSkillQuerySafety:
                             "parts": [
                                 {"type": "text", "text": "make a skill for release triage"},
                             ],
+                            # Local strict-isolation architecture tags BOTH
+                            # user and assistant messages with peer_id so
+                            # extraction lands in the actor's peer tree.
+                            "peer_id": "hermes",
                         },
                         {
                             "role": "assistant",
