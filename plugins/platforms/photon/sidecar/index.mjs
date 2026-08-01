@@ -480,15 +480,11 @@ async function normalizeBinaryContent(content) {
   return meta;
 }
 
-// Best-effort text preview of a reaction's resolved target Message, so the
-// Python adapter can populate the gateway's `reply_to_text` (context: WHAT was
-// tapped back). The SDK only emits a reaction once it has resolved the full
-// target Message (toReactionMessages bails otherwise), so `target.content` is
-// hydrated here — no extra round trip. Handles plain text and our patched mixed
-// text+attachment groups (first text child); null for attachment/voice-only
-// targets. Capped so one long bubble can't balloon the NDJSON line.
+// Best-effort text preview of a resolved target message. Capped so one long
+// bubble cannot balloon the NDJSON line. Handles plain text and mixed
+// text+attachment groups; returns null for attachment/voice-only targets.
 const REACTION_TARGET_TEXT_CAP = 2000;
-function reactionTargetText(target) {
+function messageTextPreview(target) {
   const c = target && typeof target === "object" ? target.content : null;
   if (!c || typeof c !== "object") return null;
   let text = null;
@@ -557,7 +553,7 @@ async function normalizeContent(content) {
       targetDirection: target?.direction ?? null,
       // Text of the reacted-to message, so Python can correlate the tapback to
       // the gateway's reply_to_text. Null for attachment/voice-only targets.
-      targetText: reactionTargetText(target),
+      targetText: messageTextPreview(target),
     };
   }
   // A user tapping a poll choice arrives as `poll_option` carrying the chosen
@@ -590,8 +586,31 @@ async function normalizeEvent(space, message) {
   try {
     const msgSpace = message.space || {};
     const ts = message.timestamp;
+    const replyTargetId =
+      message.replyTargetGuid ?? message.reply_to_guid ??
+      message.threadOriginatorGuid ?? message.threadRootMessageId ?? null;
+    // Reply targets are often Hermes' outbound messages, so they are not in
+    // knownMessages (which is populated from inbound events only). Hydrate a
+    // cache miss through Spectrum so the adapter can preserve quoted context.
+    let replyTarget = replyTargetId
+      ? knownMessages.get(replyTargetId)
+      : null;
+    if (replyTargetId && !replyTarget && typeof space.getMessage === "function") {
+      try {
+        replyTarget = await space.getMessage(replyTargetId);
+        if (replyTarget) rememberKnownMessage(replyTarget);
+      } catch (e) {
+        console.error(
+          `photon-sidecar: failed to hydrate reply target ${replyTargetId}: ` +
+            (e && e.message ? e.message : String(e))
+        );
+      }
+    }
     return {
       messageId: message.id ?? null,
+      replyToMessageId: replyTargetId,
+      replyToText: messageTextPreview(replyTarget),
+      replyToIsOwnMessage: replyTarget?.isFromMe === true,
       platform: message.platform || space.__platform || "iMessage",
       space: {
         id: space.id ?? msgSpace.id ?? null,
