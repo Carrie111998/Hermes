@@ -21450,8 +21450,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if should_notify:
                     from tools.ansi_strip import strip_ansi
 
+                    # Strip ANSI on the full buffer before tail truncation so a
+                    # multi-byte escape cannot be split across the cut boundary.
                     new_output = (
-                        strip_ansi(session.output_buffer[-1000:])
+                        strip_ansi(session.output_buffer)[-1000:]
                         if session.output_buffer
                         else ""
                     )
@@ -21486,8 +21488,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
                 from tools.ansi_strip import strip_ansi
 
+                # Strip ANSI on the full buffer before tail truncation so a
+                # multi-byte escape cannot be split across the cut boundary.
                 new_output = (
-                    strip_ansi(session.output_buffer[-500:])
+                    strip_ansi(session.output_buffer)[-500:]
                     if session.output_buffer
                     else ""
                 )
