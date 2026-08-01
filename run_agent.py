@@ -4751,6 +4751,38 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
+
+        # Session affinity belongs to the effective primary AIAgent route, not
+        # shared provider/client state. Derive it for each OpenAI-wire chat
+        # request after route resolution and before cache comparison so route,
+        # session, and opt-in changes naturally select a separate wire client.
+        # Native transports and auxiliary clients never pass through this seam.
+        session_affinity_key = None
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        session_id = str(getattr(self, "session_id", "") or "")
+        if (
+            getattr(self, "api_mode", None) == "chat_completions"
+            and (provider == "custom" or provider.startswith("custom:"))
+            and session_id
+        ):
+            from hermes_cli.config import (
+                build_session_affinity_key,
+                custom_provider_session_affinity_enabled,
+            )
+
+            effective_base_url = request_kwargs.get("base_url") or self.base_url
+            provider_name = str(
+                getattr(self, "requested_provider", "") or provider
+            )
+            if custom_provider_session_affinity_enabled(
+                effective_base_url,
+                getattr(self, "_custom_providers", []) or [],
+                provider_name=provider_name,
+                model=str(getattr(self, "model", "") or ""),
+            ):
+                session_affinity_key = build_session_affinity_key(
+                    effective_base_url, session_id
+                )
         # Per-request OpenAI-wire clients (used by both the non-streaming
         # chat-completions path and the streaming chat-completions path
         # in `_interruptible_api_call`) should not run the SDK's built-in
@@ -4767,6 +4799,20 @@ class AIAgent:
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
+        if session_affinity_key is not None:
+            affinity_header = "X-Hermes-Affinity-Key"
+            # Copy the final nested mapping and remove case-insensitive aliases;
+            # the generated route/session value remains authoritative after any
+            # provider-specific request-header construction above.
+            headers = {
+                key: value
+                for key, value in dict(
+                    request_kwargs.get("default_headers") or {}
+                ).items()
+                if str(key).lower() != affinity_header.lower()
+            }
+            headers[affinity_header] = session_affinity_key
+            request_kwargs["default_headers"] = headers
         # Reuse the cached wire client while the effective kwargs are
         # unchanged: constructing openai.OpenAI + its httpx pool costs
         # ~19-35ms per LLM call (fresh TCP+TLS handshake), ~5x per turn.

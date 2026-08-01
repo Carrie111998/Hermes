@@ -1214,11 +1214,42 @@ providers:
     transport: anthropic_messages  # for Anthropic-compatible proxies
 ```
 
-Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `session_affinity`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
 
 :::note Legacy format
 Older configs used a top-level `custom_providers:` list instead. It still works — Hermes reads both — and `hermes update` auto-migrates it to the `providers:` dict (config v12). Field names differ slightly in the dict format: legacy `model` is `default_model`, and legacy `api_mode` is `transport`.
 :::
+
+#### Session affinity for trusted self-hosted routers
+
+An OpenAI-compatible router can use a stable request key to keep sequential
+turns near the same healthy model replica and improve prompt-prefix cache
+locality. Enable this only on a named provider you trust:
+
+```yaml
+providers:
+  trusted-local-router:
+    api: https://llm.internal.example/v1
+    key_env: INTERNAL_LLM_API_KEY
+    transport: chat_completions
+    default_model: my-model
+    session_affinity: true
+```
+
+`session_affinity` is absent/`false` by default and only the YAML boolean
+`true` opts in. For opted-in `chat_completions` primary agent requests, Hermes
+sends `X-Hermes-Affinity-Key: v1.<sha256>`. The digest is scoped to the
+normalized effective provider URL and the current agent session; the raw
+session ID is not sent. Resumed turns reuse the key, while `/new`, a different
+provider route, and each delegated child agent get distinct values. Provider
+switches and fallbacks reevaluate the new route's opt-in, so the header does
+not leak to an untrusted route.
+
+This metadata is a routing hint, not authentication or authorization. Do not
+enable it for a third-party provider unless you intentionally trust that
+provider with pseudonymous session-linking metadata. Native transports and
+auxiliary work such as compression, title generation, memory processing,
+vision, and web extraction do not inherit the parent agent's affinity key.
 
 Some OpenAI-compatible endpoints need provider-specific request body fields. Add an `extra_body` map to the matching custom provider and Hermes will merge it into each chat-completions request for that endpoint:
 

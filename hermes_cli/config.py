@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -1317,7 +1318,7 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body", "extra_headers",
+        "discover_models", "extra_body", "extra_headers", "session_affinity",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1378,6 +1379,12 @@ def _normalize_custom_provider_entry(
         "name": name,
         "base_url": base_url,
     }
+    if "session_affinity" in entry:
+        # Provider session affinity is a trust decision: only the literal YAML
+        # boolean ``true`` opts in. Quoted strings and other truthy values fail
+        # closed. Leave an omitted setting absent so existing provider-catalog
+        # data shapes remain backward compatible while lookups still default off.
+        normalized["session_affinity"] = entry.get("session_affinity") is True
 
     provider_key = provider_key.strip()
     if provider_key:
@@ -1491,6 +1498,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "session_affinity",
         "ssl_ca_cert",
         "ssl_verify",
     ):
@@ -1682,6 +1690,72 @@ def get_custom_provider_extra_headers(
         if headers:
             return headers
     return {}
+
+
+def normalize_session_affinity_base_url(base_url: Any) -> str:
+    """Return the stable effective-route identity used by affinity digests."""
+    raw = str(base_url or "").strip()
+    if not raw:
+        return ""
+    return normalize_route_base_url(raw)
+
+
+def build_session_affinity_key(base_url: Any, session_id: Any) -> str:
+    """Build the opaque v1 provider-scoped affinity key for one agent session."""
+    digest_input = "\0".join(
+        (
+            "hermes-affinity-v1",
+            normalize_session_affinity_base_url(base_url),
+            str(session_id or ""),
+        )
+    ).encode("utf-8")
+    return f"v1.{hashlib.sha256(digest_input).hexdigest()}"
+
+
+def custom_provider_session_affinity_enabled(
+    base_url: Any,
+    custom_providers: List[Dict[str, Any]],
+    *,
+    provider_name: str = "custom",
+    model: str = "",
+) -> bool:
+    """Return whether the exact effective custom-provider route opted in.
+
+    A named identity wins over URL-only matching. URL-only matching fails
+    closed when multiple provider entries own the same route, preventing one
+    entry's opt-in from silently enabling another entry.
+    """
+    target_url = normalize_session_affinity_base_url(base_url)
+    if not target_url:
+        return False
+
+    identity = str(provider_name or "").strip().lower()
+    if identity.startswith("custom:"):
+        identity = identity.split(":", 1)[1].strip()
+    elif identity == "custom":
+        identity = ""
+
+    candidates: List[Dict[str, Any]] = []
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        if normalize_session_affinity_base_url(entry.get("base_url")) != target_url:
+            continue
+        if identity:
+            aliases = {
+                str(entry.get("provider_key") or "").strip().lower(),
+                str(entry.get("name") or "").strip().lower(),
+            }
+            aliases.update(alias.replace(" ", "-") for alias in tuple(aliases))
+            if identity not in aliases:
+                continue
+        # ``session_affinity`` is provider-route scoped, not model scoped. Keep
+        # the ``model`` argument for call-site compatibility, but do not let a
+        # configured default model disable affinity after a same-provider model
+        # switch.
+        candidates.append(entry)
+
+    return len(candidates) == 1 and candidates[0].get("session_affinity") is True
 
 
 def apply_custom_provider_extra_headers_to_client_kwargs(
