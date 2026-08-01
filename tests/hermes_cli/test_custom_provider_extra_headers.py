@@ -42,6 +42,94 @@ def test_normalize_entry_keeps_extra_headers():
 
 
 
+
+def test_shared_base_url_matches_named_provider_identity():
+    providers = [
+        {
+            "provider_key": "first",
+            "name": "first",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "first"},
+        },
+        {
+            "provider_key": "second",
+            "name": "second",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "second"},
+        },
+    ]
+
+    assert get_custom_provider_extra_headers(
+        "https://shared.example.com/v1",
+        custom_providers=providers,
+        provider_key="custom:second",
+    ) == {"X-Route": "second"}
+
+
+def test_shared_base_url_matches_legacy_custom_provider_name():
+    providers = [
+        {
+            "name": "first",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "first"},
+        },
+        {
+            "name": "second",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "second"},
+        },
+    ]
+
+    assert get_custom_provider_extra_headers(
+        "https://shared.example.com/v1",
+        custom_providers=providers,
+        provider_key="custom:second",
+    ) == {"X-Route": "second"}
+
+
+def test_identity_does_not_fall_back_to_wrong_shared_url_entry():
+    providers = [
+        {
+            "name": "first",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "first"},
+        }
+    ]
+
+    assert get_custom_provider_extra_headers(
+        "https://shared.example.com/v1",
+        custom_providers=providers,
+        provider_key="custom:missing",
+    ) == {}
+
+
+def test_apply_extra_headers_selects_named_provider_on_shared_route():
+    client_kwargs = {"default_headers": {"X-Keep": "1"}}
+    providers = [
+        {
+            "provider_key": "first",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "first"},
+        },
+        {
+            "provider_key": "second",
+            "base_url": "https://shared.example.com/v1",
+            "extra_headers": {"X-Route": "second"},
+        },
+    ]
+
+    apply_custom_provider_extra_headers_to_client_kwargs(
+        client_kwargs,
+        "https://shared.example.com/v1",
+        custom_providers=providers,
+        provider_key="custom:second",
+    )
+    assert client_kwargs["default_headers"] == {
+        "X-Keep": "1",
+        "X-Route": "second",
+    }
+
+
 def test_fetch_api_models_sends_extra_headers_to_models_probe(monkeypatch):
     captured = {}
 
