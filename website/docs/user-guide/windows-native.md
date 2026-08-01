@@ -41,7 +41,7 @@ No admin rights required. The installer goes to `%LOCALAPPDATA%\hermes\` and add
 | `-HermesHome` | `%LOCALAPPDATA%\hermes` | Override data directory |
 | `-InstallDir` | `%LOCALAPPDATA%\hermes\hermes-agent` | Override code location |
 
-The installer auto-retries flaky git fetches and strips BOM from any downloaded `install.ps1` payload, so a UTF-8 BOM picked up during HTTP transit no longer breaks the `[scriptblock]::Create((irm ...))` form.
+The installer automatically retries transient Git fetch failures. The scriptblock form does not strip a UTF-8 BOM from a downloaded `install.ps1`; if PowerShell reports `The assignment expression is not valid`, use the one-line `irm | iex` form or save the script as UTF-8 without a BOM first.
 
 ### Desktop installer (alternative)
 
@@ -67,12 +67,12 @@ Each dep has a `shutil.which(...)`-style check; if a binary is missing and the r
 
 Top-to-bottom, in order:
 
-1. **Bootstraps `uv`** — Astral's fast Python manager. Installed to `%USERPROFILE%\.local\bin`.
+1. **Bootstraps `uv`** — Astral's fast Python manager. Installed to `%LOCALAPPDATA%\hermes\bin` by default.
 2. **Installs Python 3.11** via `uv`. No existing Python needed.
-3. **Installs Node.js 22** (winget if available, else a portable Node tarball unpacked under `%LOCALAPPDATA%\hermes\node`). Used for the browser tool and the WhatsApp bridge.
+3. **Installs Node.js 22** — first tries a portable ZIP under `%LOCALAPPDATA%\hermes\node`, then falls back to winget if the portable install fails. Used for the browser tool and the WhatsApp bridge.
 4. **Installs portable Git** — if `git` is already on PATH the installer uses it; otherwise it downloads a trimmed, self-contained **PortableGit** (~45 MB, from the official `git-for-windows` release) to `%LOCALAPPDATA%\hermes\git`. No admin, no Windows installer registry, no interference with anything else on the box.
 5. **Clones the repo** to `%LOCALAPPDATA%\hermes\hermes-agent` and creates a virtualenv inside it.
-6. **Tiered `uv pip install`** — tries `.[all]` first, falls back to progressively smaller sets (`[messaging,dashboard,ext]` → `[messaging]` → `.`) if a `git+https` dep flakes on rate-limited GitHub. Prevents "single flake drops you to a bare install" failure mode.
+6. **Installs Python dependencies** — prefers the hash-verified `uv sync --extra all --locked` path when `uv.lock` is available. If that fails, it falls back to editable `uv pip install` tiers: `.[all]`, the curated `[all]` set without known-broken extras, then core `.`.
 7. **Auto-installs messaging SDKs** keyed off `.env` — if `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` / `WHATSAPP_ENABLED` are present, runs `python -m ensurepip --upgrade` and targeted `pip install` calls so each platform's SDK is actually importable.
 8. **Sets `HERMES_GIT_BASH_PATH`** to the resolved `bash.exe` so Hermes finds it deterministically in fresh shells.
 9. **Adds `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` to User PATH and sets `HERMES_HOME=%LOCALAPPDATA%\hermes`** — exposes the `hermes` command (and points it at your data dir) after you open a new terminal.
@@ -262,7 +262,7 @@ From PowerShell:
 hermes uninstall
 ```
 
-That's the clean path — removes the schtasks entry, Startup folder shortcut, `hermes.cmd` shim, deletes `%LOCALAPPDATA%\hermes\hermes-agent\`, and trims the User PATH. It leaves the rest of `%LOCALAPPDATA%\hermes\` alone (your config, auth, skills, sessions, logs) in case you're reinstalling.
+This is the recommended uninstall path: it removes the scheduled task, the Startup folder shortcut, `%LOCALAPPDATA%\hermes\hermes-agent\`, and Hermes-managed entries from User PATH. It leaves the rest of `%LOCALAPPDATA%\hermes\` alone (your config, auth, skills, sessions, logs) in case you're reinstalling.
 
 To nuke everything:
 
@@ -288,7 +288,7 @@ Consequence: any codepath that said "check if this PID is alive" via `os.kill(pi
 ## Common pitfalls
 
 **`hermes: command not found` right after install.**
-Open a new PowerShell window. The installer added `%LOCALAPPDATA%\hermes\bin` to User PATH, but existing shells need to be restarted to pick it up. In the meantime you can run `& "$env:LOCALAPPDATA\hermes\bin\hermes.cmd"`.
+Open a new PowerShell window. The installer added `%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts` to User PATH, but existing shells need to be restarted to pick it up. In the meantime, run Hermes directly with `& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe"`.
 
 **`WinError 193: %1 is not a valid Win32 application` when running a tool.**
 You hit a shebang-script invocation that bypassed the `.cmd` shim. Hermes resolves commands through `shutil.which(cmd, path=local_bin)` so PATHEXT picks up `.CMD` — if you're invoking the tool via a hardcoded path instead, switch to the `.cmd` variant (e.g., `npx.cmd`, not `npx`).
