@@ -101,7 +101,10 @@ def _run_python(
 
 
 def _wait_for_path(path: Path, process: subprocess.Popen[str]) -> None:
-    deadline = time.monotonic() + 5.0
+    # Windows process startup can exceed five seconds when the parallel suite is
+    # launching many isolated interpreters. Keep enough headroom for scheduler
+    # contention while remaining below pytest's per-test timeout.
+    deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         if path.exists():
             return
