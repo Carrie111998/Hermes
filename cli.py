@@ -9503,7 +9503,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if cmd.execute is not None:
                 return True
             # Known read-only dispatch commands without an execute attribute
-            if cmd.name in {"status", "agents"}:
+            if cmd.name in {"status", "agents", "context"}:
                 return True
             return False
         except Exception:
