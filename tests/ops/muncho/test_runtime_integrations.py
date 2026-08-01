@@ -950,6 +950,62 @@ def test_deploy_staging_dependency_package_is_final_address_bound():
     assert syntax.returncode == 0, syntax.stderr
 
 
+def test_cutover_packaging_delegates_the_root_lock_before_dropping_privilege():
+    helper = RUNTIME / "muncho-auto-deploy-release"
+    source = helper.read_text(encoding="utf-8")
+    delegate = source[
+        source.index("run_cutover_artifact_step() {") : source.index(
+            "prepare_release_staging_directory() {"
+        )
+    ]
+    run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
+    cutover_attestation = source[
+        source.index("cutover_artifacts_match() {") : source.index(
+            "cleanup_old_releases() {"
+        )
+    ]
+
+    open_lock = delegate.index("descriptor = os.open(")
+    lock = delegate.index(
+        "fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+    )
+    pass_descriptor = delegate.index("pass_fds=(descriptor,)")
+    child = delegate.index("completed = subprocess.run(")
+
+    assert open_lock < lock < child < pass_descriptor
+    assert 'SYSTEM_SETPRIV="/usr/bin/setpriv"' in source
+    assert (
+        'CUTOVER_ACTIVATION_LOCK_PATH="/run/muncho-writer-activation.lock"'
+        in source
+    )
+    assert (
+        'CUTOVER_ACTIVATION_LOCK_FD_ENV="MUNCHO_WRITER_ACTIVATION_LOCK_FD"'
+        in source
+    )
+    assert '"--clear-groups"' in delegate
+    assert '"--no-new-privs"' in delegate
+    assert '"--bounding-set=-all"' in delegate
+    assert '"-B",' in delegate
+    assert "close_fds=True" in delegate
+    assert "for key, value in os.environ.items()" not in delegate
+    assert "flags | os.O_CREAT | os.O_EXCL" in delegate
+    assert "os.fchown(descriptor, 0, 0)" in delegate
+    assert "os.fchmod(descriptor, 0o600)" in delegate
+    assert "os.fsync(parent_descriptor)" in delegate
+    assert 'action not in {"build", "verify"}' in delegate
+    assert '"build" "$tmp" "$new" "$sha"' in run_deploy
+    assert '"verify" "$tmp" "$new" "$sha"' in run_deploy
+    assert (
+        '"verify" "$release" "$release" "$expected_head"'
+        in cutover_attestation
+    )
+    assert (
+        'sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \\\n'
+        '"$tmp/scripts/canary/package_production_cutover_artifacts.py"'
+        not in run_deploy
+    )
+
+
 def test_deploy_packaging_failure_is_terminal_and_cleans_inactive_staging(
     tmp_path,
 ):
@@ -1158,7 +1214,12 @@ def test_already_active_fast_path_is_read_only_and_fully_attested():
     assert "systemctl restart" not in fast_path
     assert '"already_active\\": true' in fast_path
     assert '"$release/.venv/bin/python" -I -B -P -s -' in venv_attestation
-    assert cutover_attestation.count('"$release/.venv/bin/python" -I -B') == 2
+    assert cutover_attestation.count('"$release/.venv/bin/python" -I -B') == 1
+    assert (
+        'run_cutover_artifact_step \\\n'
+        '    "verify" "$release" "$release" "$expected_head"'
+        in cutover_attestation
+    )
 
 
 def _write_fake_flock(path: Path) -> None:
