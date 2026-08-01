@@ -3,10 +3,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   lineSelectionFromOffsets,
   lineSelectionFromSelectedText,
+  offsetOfLineStart,
+  preferOffsetFromRange,
+  PREVIEW_ADD_TO_CHAT_ATTR,
   previewOwnsAddSelectionShortcut,
   previewSelectionFileLabel,
   readHostTextSelection,
   retainPreviewAddShortcutClaim,
+  selectionBelongsToPreviewAddToChat,
   sourceLineSelectionRef
 } from './preview-add-to-chat'
 
@@ -75,6 +79,57 @@ describe('previewOwnsAddSelectionShortcut', () => {
 
     releaseB()
     expect(previewOwnsAddSelectionShortcut()).toBe(false)
+  })
+
+  it('treats a live selection inside the preview frame as ownership without a claim', () => {
+    const host = document.createElement('div')
+    host.setAttribute(PREVIEW_ADD_TO_CHAT_ATTR, '')
+    const span = document.createElement('span')
+    span.textContent = 'select-all me'
+    host.appendChild(span)
+    document.body.appendChild(host)
+
+    const range = document.createRange()
+    range.selectNodeContents(span)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    expect(selectionBelongsToPreviewAddToChat()).toBe(true)
+    expect(previewOwnsAddSelectionShortcut()).toBe(true)
+  })
+})
+
+describe('preferOffsetFromRange', () => {
+  it('maps nearby data-preview-line markers to a source char offset', () => {
+    const source = 'a\nrepeat\nb\nrepeat\nc\n'
+    const host = document.createElement('div')
+    const gutterEarly = document.createElement('div')
+    gutterEarly.dataset.previewLine = '2'
+    Object.defineProperty(gutterEarly, 'getBoundingClientRect', {
+      value: () => ({ top: 0, bottom: 10, height: 10, left: 0, right: 10, width: 10, x: 0, y: 0, toJSON: () => ({}) })
+    })
+    const gutterLate = document.createElement('div')
+    gutterLate.dataset.previewLine = '4'
+    Object.defineProperty(gutterLate, 'getBoundingClientRect', {
+      value: () => ({ top: 40, bottom: 50, height: 10, left: 0, right: 10, width: 10, x: 0, y: 40, toJSON: () => ({}) })
+    })
+    const span = document.createElement('span')
+    span.textContent = 'repeat'
+    host.append(gutterEarly, gutterLate, span)
+    document.body.appendChild(host)
+
+    const range = document.createRange()
+    range.selectNodeContents(span)
+    Object.defineProperty(range, 'getBoundingClientRect', {
+      value: () => ({ top: 42, bottom: 48, height: 6, left: 20, right: 80, width: 60, x: 20, y: 42, toJSON: () => ({}) })
+    })
+
+    expect(preferOffsetFromRange(source, host, range)).toBe(offsetOfLineStart(source, 4))
+    expect(lineSelectionFromSelectedText(source, 'repeat', preferOffsetFromRange(source, host, range))).toEqual({
+      end: 4,
+      start: 4
+    })
   })
 })
 

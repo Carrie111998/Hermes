@@ -41,6 +41,7 @@ import { notifyWorkspaceChanged } from '@/store/workspace-events'
 import {
   type LineSelection,
   lineSelectionFromSelectedText,
+  preferOffsetFromRange,
   readHostTextSelection,
   retainPreviewAddShortcutClaim,
   sourceLineSelectionRef
@@ -539,23 +540,7 @@ function PreviewAddToChatFrame({
       }
 
       const source = getSourceText?.() ?? ''
-
-      const preferOffset = (() => {
-        const pointer = lastPointerRef.current
-
-        if (!pointer || !source) {
-          return undefined
-        }
-
-        // Rough char offset near the pointer for duplicate-needle disambiguation.
-        const ratio = Math.min(
-          1,
-          Math.max(0, (pointer.y - frame.getBoundingClientRect().top) / Math.max(1, frame.clientHeight))
-        )
-
-        return Math.floor(ratio * source.length)
-      })()
-
+      const preferOffset = source ? preferOffsetFromRange(source, frame, live.range) : undefined
       const resolved = source ? lineSelectionFromSelectedText(source, live.text, preferOffset) : null
 
       if (!resolved) {
@@ -643,6 +628,13 @@ function PreviewAddToChatFrame({
     const onKeyUp = (event: KeyboardEvent) => {
       if (event.shiftKey || event.key === 'Shift') {
         publishTextLineSelection({ fromKeyboard: true })
+
+        return
+      }
+
+      // Select-all and other mod+letter selections do not set shiftKey.
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a') {
+        publishTextLineSelection({ fromKeyboard: true })
       }
     }
 
@@ -692,9 +684,10 @@ function PreviewAddToChatFrame({
     const frame = frameRef.current
     const live = frame ? readHostTextSelection(frame) : null
     const source = getSourceText?.() ?? ''
-
+    const preferOffset = frame && live && source ? preferOffsetFromRange(source, frame, live.range) : undefined
     const resolved =
-      textLineSelection || (live && source ? lineSelectionFromSelectedText(source, live.text) : null)
+      textLineSelection ||
+      (live && source ? lineSelectionFromSelectedText(source, live.text, preferOffset) : null)
 
     if (!resolved || !insertLineRef(resolved)) {
       return false
@@ -714,8 +707,9 @@ function PreviewAddToChatFrame({
     addTextSelectionToChat()
   }, [addLineSelectionToChat, addTextSelectionToChat])
 
-  // Claim ⌘/Ctrl+L while a preview selection is live so the terminal's earlier
-  // capture listener does not also quote the same native selection.
+  // Claim ⌘/Ctrl+L while a preview selection is published so the terminal's
+  // earlier capture listener defers (live DOM selections are also covered by
+  // previewOwnsAddSelectionShortcut → selectionBelongsToPreviewAddToChat).
   useEffect(() => {
     if (!filePath || (!lineSelection && !textLineSelection)) {
       return
@@ -724,8 +718,10 @@ function PreviewAddToChatFrame({
     return retainPreviewAddShortcutClaim()
   }, [filePath, lineSelection, textLineSelection])
 
+  // Always listen while a file is previewed — Cmd/Ctrl+A may leave a live
+  // selection before React state has published a chip.
   useEffect(() => {
-    if (!filePath || (!lineSelection && !textLineSelection)) {
+    if (!filePath) {
       return
     }
 
@@ -750,10 +746,10 @@ function PreviewAddToChatFrame({
     window.addEventListener('keydown', onKeyDown, { capture: true })
 
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
-  }, [addLineSelectionToChat, addTextSelectionToChat, filePath, lineSelection, textLineSelection])
+  }, [addLineSelectionToChat, addTextSelectionToChat, filePath, lineSelection])
 
   return (
-    <div className="relative h-full min-h-0" ref={frameRef}>
+    <div className="relative h-full min-h-0" data-preview-add-to-chat="" ref={frameRef}>
       {showAddToChat && chipPos && (
         <div className="pointer-events-none absolute inset-0 z-50 overflow-hidden">
           <div
@@ -869,6 +865,7 @@ export function SourceView({
                         ? 'bg-amber-200/45 text-amber-900 dark:bg-amber-300/20 dark:text-amber-100'
                         : filePath && 'hover:text-foreground'
                     )}
+                    data-preview-line={line}
                     draggable={Boolean(filePath)}
                     key={line}
                     onClick={event => handleLineClick(event, line)}

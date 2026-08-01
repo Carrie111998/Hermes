@@ -94,6 +94,9 @@ export function lineSelectionFromSelectedText(
   return lineSelectionFromOffsets(haystack, idx, idx + needle.length)
 }
 
+/** Marks the preview Add-to-Chat frame so the terminal can defer ⌘/Ctrl+L. */
+export const PREVIEW_ADD_TO_CHAT_ATTR = 'data-preview-add-to-chat'
+
 /** Live window selection that belongs to `host` (collapsed / outside → null). */
 export function readHostTextSelection(host: HTMLElement): { range: Range; text: string } | null {
   const selection = window.getSelection()
@@ -119,6 +122,97 @@ export function readHostTextSelection(host: HTMLElement): { range: Range; text: 
   return { range, text }
 }
 
+/** True when the live window selection is inside a preview Add-to-Chat frame. */
+export function selectionBelongsToPreviewAddToChat(): boolean {
+  const selection = window.getSelection()
+
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0 || !selection.toString().trim()) {
+    return false
+  }
+
+  const anchor = selection.getRangeAt(0).commonAncestorContainer
+  const node = anchor.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor
+
+  return node instanceof Element && Boolean(node.closest(`[${PREVIEW_ADD_TO_CHAT_ATTR}]`))
+}
+
+/** Char offset of the start of a 1-based line in newline-normalized text. */
+export function offsetOfLineStart(fullText: string, line1Based: number): number {
+  const text = normalizeNewlines(fullText)
+
+  if (line1Based <= 1) {
+    return 0
+  }
+
+  let line = 1
+
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\n') {
+      line += 1
+
+      if (line === line1Based) {
+        return i + 1
+      }
+    }
+  }
+
+  return text.length
+}
+
+/**
+ * Prefer-offset for duplicate-needle disambiguation. Uses nearby
+ * `[data-preview-line]` gutter markers when present (virtualized source);
+ * otherwise falls back to the DOM prefix length inside `host`.
+ */
+export function preferOffsetFromRange(source: string, host: HTMLElement, range: Range): number | undefined {
+  const text = normalizeNewlines(source)
+
+  if (!text) {
+    return undefined
+  }
+
+  try {
+    const rect = range.getBoundingClientRect()
+    const y = rect.height > 0 ? rect.top + Math.min(4, rect.height / 2) : rect.top
+    const markers = host.querySelectorAll<HTMLElement>('[data-preview-line]')
+    let bestLine: number | null = null
+    let bestDist = Infinity
+
+    for (const el of markers) {
+      const markerRect = el.getBoundingClientRect()
+
+      if (markerRect.height <= 0) {
+        continue
+      }
+
+      const mid = (markerRect.top + markerRect.bottom) / 2
+      const dist = Math.abs(mid - y)
+
+      if (dist < bestDist) {
+        bestDist = dist
+        const line = Number(el.dataset.previewLine)
+
+        if (Number.isFinite(line) && line >= 1) {
+          bestLine = line
+        }
+      }
+    }
+
+    if (bestLine != null) {
+      return offsetOfLineStart(text, bestLine)
+    }
+
+    const pre = document.createRange()
+
+    pre.selectNodeContents(host)
+    pre.setEnd(range.startContainer, range.startOffset)
+
+    return normalizeNewlines(pre.toString()).length
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * When the preview frame has a claimable line/text selection, it owns ⌘/Ctrl+L.
  * The terminal's long-lived capture listener registers earlier and would otherwise
@@ -135,5 +229,5 @@ export function retainPreviewAddShortcutClaim(): () => void {
 }
 
 export function previewOwnsAddSelectionShortcut(): boolean {
-  return previewAddShortcutClaims > 0
+  return previewAddShortcutClaims > 0 || selectionBelongsToPreviewAddToChat()
 }

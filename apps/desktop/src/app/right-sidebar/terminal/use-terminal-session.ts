@@ -484,6 +484,9 @@ export function useTerminalSession({
 
       event.preventDefault()
       event.stopPropagation()
+      // Block later capture listeners (preview Add to Chat) when we handle a
+      // real xterm selection — otherwise both `@terminal:` and `@line:` insert.
+      event.stopImmediatePropagation()
       addSelectionToChat()
     }
 
