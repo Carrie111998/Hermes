@@ -880,6 +880,7 @@ def _cutover_plan(
     target_discord_policy = {
         **copy.deepcopy(legacy_discord_policy),
         "allowed_channel_ids": [
+            "1282930260911984660",
             "1504852355588423801",
             "1504852408227069993",
             "1504852444407140402",
@@ -3147,7 +3148,10 @@ def test_host_boundary_embeds_exact_connector_unit_and_gateway_drop_in(
             "thread_require_mention": False,
             "reviewed_cron_history_targets": {
                 "06ef64d72891": ["1504852355588423801"],
-                "e62f55ca93ca": ["1524321461714681976"],
+                "e62f55ca93ca": [
+                    "1282930260911984660",
+                    "1524321461714681976",
+                ],
             },
             "ready_timeout_seconds": 30,
             "request_timeout_seconds": 15,
