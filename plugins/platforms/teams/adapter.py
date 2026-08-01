@@ -1008,38 +1008,23 @@ class TeamsAdapter(BasePlatformAdapter):
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
         """Handle an Adaptive Card Action.Execute button click."""
-        from tools.approval import (
-            get_blocking_approval_data,
-            resolve_gateway_approval,
-        )
+        from tools.approval import resolve_gateway_approval_by_id
 
         action = ctx.activity.value.action
         data = action.data or {}
         hermes_action = data.get("hermes_action", "")
-        session_key = data.get("session_key", "")
+        # Cards bind to the queue entry's opaque approval id, never the
+        # session key: the payload round-trips through the Teams client and
+        # is untrusted, and an unguessable id resolves to exactly one entry.
+        approval_id = data.get("approval_id", "")
 
-        if not hermes_action or not session_key:
+        if not hermes_action or not approval_id:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        # The session_key round-trips through the Teams client and is
-        # untrusted: bind it to this conversation before anything else.
-        # Teams session keys embed the conversation id as the chat id
-        # segment, so a key that doesn't contain this conversation's id
-        # belongs to a different session (cross-session approval).
         conversation_id = getattr(ctx.activity.conversation, "id", "")
-        if not conversation_id or conversation_id not in session_key:
-            logger.warning(
-                "[teams] card action rejected: session_key %r does not match conversation %r",
-                session_key, conversation_id,
-            )
-            return InvokeResponse(
-                status=200,
-                body=AdaptiveCardActionMessageResponse(
-                    value="⛔ Approval does not belong to this conversation."),
-            )
 
         # Only authorized users may click approval buttons.
         # Default-deny: require either TEAMS_ALLOWED_USERS or an explicit
@@ -1084,11 +1069,16 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        # Enforce the render-time permissions server-side: a client can
-        # resubmit button choices the card never offered (smart DENY /
-        # allow_session=False / allow_permanent=False withhold them).
-        approval_data = get_blocking_approval_data(session_key)
-        if approval_data is None:
+        # Validate and consume the target entry atomically (under the
+        # approval queue's lock): entry exists, invoking conversation exactly
+        # matches the conversation the card was bound to at render time, and
+        # the choice was actually offered by the render-time permissions
+        # (smart DENY / allow_session=False / allow_permanent=False withhold
+        # them) — a client can resubmit button choices the card never showed.
+        status, _approval_data = resolve_gateway_approval_by_id(
+            approval_id, choice, conversation_id=conversation_id,
+        )
+        if status == "not_found":
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionCardResponse(
@@ -1097,29 +1087,22 @@ class TeamsAdapter(BasePlatformAdapter):
                     .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
                 ),
             )
-        smart_denied = bool(approval_data.get("smart_denied"))
-        allow_session = bool(approval_data.get("allow_session", True))
-        allow_permanent = bool(approval_data.get("allow_permanent", True))
-        if smart_denied and choice in {"session", "always"}:
+        if status == "conversation_mismatch":
+            logger.warning(
+                "[teams] card action rejected: approval %r not bound to conversation %r",
+                approval_id, conversation_id,
+            )
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(
-                    value="⛔ Smart DENY: owner override applies to this one operation only."),
+                    value="⛔ Approval does not belong to this conversation."),
             )
-        if choice == "session" and not allow_session:
+        if status == "choice_not_allowed":
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(
-                    value="⛔ Session-wide approval was not offered for this command."),
+                    value="⛔ That approval choice was not offered for this command."),
             )
-        if choice == "always" and (not allow_session or not allow_permanent):
-            return InvokeResponse(
-                status=200,
-                body=AdaptiveCardActionMessageResponse(
-                    value="⛔ Permanent approval was not offered for this command."),
-            )
-
-        resolve_gateway_approval(session_key, choice)
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1154,15 +1137,24 @@ class TeamsAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
+        # Bind the card to this conversation server-side and carry ONLY the
+        # opaque approval id in the button payload — the payload round-trips
+        # through the Teams client, so it must neither leak the session key
+        # nor be trusted to identify the session on invoke.
+        if approval_id:
+            from tools.approval import bind_gateway_approval_conversation
+            bind_gateway_approval_conversation(approval_id, chat_id)
+
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
         # Truncated for button data payload — just enough to reconstruct the card body.
         btn_data_base = {
-            "session_key": session_key,
+            "approval_id": approval_id,
             "cmd": command[:200] + "..." if len(command) > 200 else command,
             "desc": description,
         }
