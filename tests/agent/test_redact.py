@@ -375,6 +375,66 @@ class TestWebUrlsNotRedacted:
         assert "dbpass" not in result
 
 
+class TestDbConnstrDialectDriver:
+    """Database URI variants with drivers and encrypted schemes (#43666)."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "postgresql+psycopg://postgres:s3cretpw@127.0.0.1:5432/postgres",
+            "postgresql+asyncpg://postgres:s3cretpw@db/app",
+            "mysql+pymysql://root:s3cretpw@db:3306/app",
+            "mariadb+mariadbconnector://u:s3cretpw@h/db",
+            "mssql+pyodbc://sa:s3cretpw@h/db",
+            "oracle+oracledb://u:s3cretpw@h/service",
+            "clickhouse+native://u:s3cretpw@h/default",
+            "mongodb+srv://u:s3cretpw@cluster0.mongodb.net/db",
+            "rediss://default:s3cretpw@h:6380/0",
+            "amqps://guest:s3cretpw@h:5671/",
+        ],
+    )
+    def test_dialect_driver_password_redacted(self, text):
+        result = redact_sensitive_text(text)
+        assert "s3cretpw" not in result
+        assert ":***@" in result
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "redis://:s3cretpw@h:6379/0",
+            "rediss://:s3cretpw@h:6380/0",
+            "amqp://:s3cretpw@h:5672/",
+            "postgresql://:s3cretpw@h/db",
+        ],
+    )
+    def test_empty_username_password_redacted(self, text):
+        result = redact_sensitive_text(text)
+        assert "s3cretpw" not in result
+        assert "://:***@" in result
+
+    def test_percent_encoded_password_redacted(self):
+        text = "postgresql+psycopg://user:p%40ss%2Fword@db.example/app"
+        result = redact_sensitive_text(text)
+        assert "p%40ss%2Fword" not in result
+        assert ":***@" in result
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "postgresql+psycopg://host.example.com:5432/db",
+            "redis://h:6379/0",
+            "postgresql://host:5432/db/user@example.com",
+            "postgresql://host:5432/db?email=user@example.com",
+            "postgresql://host:5432/db#user@example.com",
+            "https://user:opaqueToken@host.example.com/path",
+            "notpostgresql://user:opaqueToken@host.example.com/path",
+            "custom+postgresql://user:opaqueToken@host.example.com/path",
+        ],
+    )
+    def test_non_credential_urls_unchanged(self, text):
+        assert redact_sensitive_text(text) == text
+
+
 class TestStrictUrlCredentialRedaction:
     @pytest.mark.parametrize(
         ("text", "secret", "expected"),
@@ -650,10 +710,14 @@ class TestDbConnstrCodeOutput:
 
     def test_literal_connstr_still_redacted_with_code_file(self):
         """A real password in a literal DSN is still masked under code_file."""
-        text = "postgresql://admin:realpassword@db.internal:5432/app"
+        text = "postgresql+psycopg://admin:realpassword@db.internal:5432/app"
         result = redact_sensitive_text(text, code_file=True, force=True)
         assert "realpassword" not in result
         assert "***" in result
+
+    def test_driver_connstr_template_preserved_with_code_file(self):
+        text = 'f"postgresql+psycopg://{user}:{password}@{host}/{database}"'
+        assert redact_sensitive_text(text, code_file=True, force=True) == text
 
     def test_literal_connstr_redacted_all_schemes(self):
         for scheme, secret in [
@@ -829,5 +893,3 @@ class TestKeywordWordBoundary:
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
-
-

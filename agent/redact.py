@@ -329,16 +329,28 @@ _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
 )
 
-# Database connection strings: protocol://user:PASSWORD@host
-# Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password.
-# The userinfo and password groups forbid whitespace ([^:\s]+ / [^@\s]+) so the
-# match can never span a line break. A real DSN password never contains
-# whitespace; without this bound the greedy [^@]+ would scan past the end of a
-# code line to the next stray "@" (e.g. a Python decorator), swallowing
-# intervening lines and corrupting tool OUTPUT for any source containing a
-# postgresql:// f-string template. See issue #33801.
+# Database connection strings: dialect[+driver]://[user]:PASSWORD@host
+# Catches postgres, mysql, mariadb, mongodb, mssql, oracle, clickhouse,
+# redis(s), and amqp(s) URLs and redacts the password. The optional driver
+# segment covers SQLAlchemy-style schemes such as postgresql+psycopg,
+# mysql+pymysql, and mongodb+srv. The username may be empty for URI forms such
+# as redis://:password@host.
+#
+# The userinfo and password groups forbid path/query/fragment delimiters as
+# well as whitespace. Besides keeping matches on one line, this prevents a
+# host:port URL followed later by an email address from being mistaken for
+# user:password@host. A real DSN password containing one of those delimiters
+# must percent-encode it, which remains matchable.
+#
+# A permissive password group used to scan past the end of a code line to the
+# next stray "@" (e.g. a Python decorator), swallowing intervening lines and
+# corrupting tool output for source containing a postgresql:// f-string
+# template. The leading guard also keeps a database name from matching inside
+# a longer custom scheme. See issues #33801 and #43666.
 _DB_CONNSTR_RE = re.compile(
-    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]+:)([^@\s]+)(@)",
+    r"(?<![a-z0-9+.-])"
+    r"((?:postgres(?:ql)?|mysql|mariadb|mongodb|mssql|oracle|clickhouse|rediss?|amqps?)"
+    r"(?:\+[a-z0-9_.-]+)?://[^:/?#\s]*:)([^@/?#\s]+)(@)",
     re.IGNORECASE,
 )
 
