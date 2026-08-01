@@ -549,7 +549,8 @@ def test_skill_pending_stage_list_get_and_count_share_snapshot(hermes_home, monk
     assert wa.get_pending(wa.SKILLS, stage["id"])["id"] == stage["id"]
 
 
-def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home):
+@pytest.mark.parametrize("command", ["/skills", "/skills pending"])
+def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home, command):
     from gateway.platforms.base import MessageEvent
     from gateway.slash_commands import GatewaySlashCommandsMixin
     from tools import write_approval as wa
@@ -563,7 +564,7 @@ def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home)
     runner = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
     runner._session_key_for_source = lambda source: "test-session"
 
-    out = asyncio.run(runner._handle_skills_command(MessageEvent(text="/skills pending")))
+    out = asyncio.run(runner._handle_skills_command(MessageEvent(text=command)))
 
     assert "Cleanup removed 1 expired pending skill write(s)." in out
 
