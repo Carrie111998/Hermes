@@ -354,7 +354,12 @@ def review_stage(cwd: str, file_path: str | None) -> dict:
 
 
 def review_unstage(cwd: str, file_path: str | None) -> dict:
-    _git_ok(cwd, ["reset", "-q", "HEAD", "--", file_path] if file_path else ["reset", "-q", "HEAD"])
+    # Unstaging everything must not name HEAD: before the first commit it resolves
+    # to no revision and `reset HEAD` exits 128, so the whole operation fails. Bare
+    # `reset` defaults to HEAD where one exists and to the empty tree where none
+    # does, resetting the entire index in both cases. The pathspec form is safe as
+    # written -- a path-limited reset already treats a missing HEAD as empty.
+    _git_ok(cwd, ["reset", "-q", "HEAD", "--", file_path] if file_path else ["reset", "-q"])
     return {"ok": True}
 
 

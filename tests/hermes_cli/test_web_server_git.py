@@ -103,3 +103,60 @@ def test_git_endpoints_require_auth(repo):
 
     assert unauth.get("/api/git/status", params={"path": str(repo)}).status_code == 401
     assert unauth.post("/api/git/review/stage", json={"path": str(repo)}).status_code == 401
+
+
+def _staged_paths(repo: Path) -> set[str]:
+    """Paths the index carries for the next commit. Also valid on an unborn HEAD,
+    where `diff --cached` compares the index against the empty tree."""
+    listing = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return {line for line in listing.stdout.splitlines() if line}
+
+
+def _repo_before_first_commit(tmp_path: Path) -> Path:
+    """A `git init` repo with work already staged and no commit yet, which is what
+    the review pane sees on a new project the agent has just written files into."""
+    root = tmp_path / "fresh"
+    (root / "nested").mkdir(parents=True)
+    _git(root, "init", "-q")
+    (root / "new.py").write_text("print(1)\n")
+    (root / "nested" / "deep.py").write_text("print(2)\n")
+    _git(root, "add", "-A")
+    return root
+
+
+def test_unstage_all_before_the_first_commit(client, tmp_path):
+    fresh = _repo_before_first_commit(tmp_path)
+    assert _staged_paths(fresh) == {"new.py", "nested/deep.py"}
+
+    response = client.post("/api/git/review/unstage", json={"path": str(fresh)})
+
+    assert response.status_code == 200
+    assert _staged_paths(fresh) == set()
+    # A mixed reset moves the index only; the work itself has to survive.
+    assert (fresh / "new.py").read_text() == "print(1)\n"
+    assert (fresh / "nested" / "deep.py").read_text() == "print(2)\n"
+
+
+def test_unstage_one_file_before_the_first_commit(client, tmp_path):
+    fresh = _repo_before_first_commit(tmp_path)
+
+    response = client.post("/api/git/review/unstage", json={"path": str(fresh), "file": "new.py"})
+
+    assert response.status_code == 200
+    assert _staged_paths(fresh) == {"nested/deep.py"}
+
+
+def test_unstage_all_covers_the_whole_index(client, repo):
+    _git(repo, "add", "-A")
+    assert _staged_paths(repo) == {"a.txt", "new.py"}
+
+    assert client.post("/api/git/review/unstage", json={"path": str(repo)}).json() == {"ok": True}
+
+    assert _staged_paths(repo) == set()
+    assert (repo / "a.txt").read_text() == "one\ntwo\nthree\n"
