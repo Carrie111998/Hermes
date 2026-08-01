@@ -286,3 +286,16 @@ class TestSkillGist:
         assert wa.skill_gist("remove_file", "demo", file_path="a.py") == "remove a.py from 'demo'"
         assert wa.skill_gist("delete", "demo") == "delete skill 'demo'"
         assert wa.skill_gist("unknown", "demo") == "unknown 'demo'"
+
+
+def test_pending_id_cannot_escape_its_subsystem_directory(hermes_home):
+    from tools import write_approval as wa
+
+    escaped = wa._pending_dir(wa.SKILLS).parent / "outside.json"
+    wa._pending_dir(wa.SKILLS).mkdir(parents=True, exist_ok=True)
+    escaped.parent.mkdir(parents=True, exist_ok=True)
+    escaped.write_text('{"id": "outside"}', encoding="utf-8")
+
+    assert wa.get_pending(wa.SKILLS, "../outside") is None
+    assert wa.discard_pending(wa.SKILLS, "../outside") is False
+    assert escaped.exists()

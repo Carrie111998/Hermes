@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 MEMORY = "memory"
 SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
+_PENDING_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 # Config key (per subsystem). A single boolean: the approval gate is OFF by
 # default (writes flow freely, the pre-gate behaviour), and ON means stage /
@@ -109,6 +111,15 @@ def _normalize_enabled(value: Any) -> bool:
 
 def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
+
+
+def _pending_record_path(subsystem: str, pending_id: Any) -> Optional[Path]:
+    """Return a pending-record path only for generated, safe identifiers."""
+    if subsystem not in _SUBSYSTEMS or not isinstance(pending_id, str):
+        return None
+    if _PENDING_ID_RE.fullmatch(pending_id) is None:
+        return None
+    return _pending_dir(subsystem) / f"{pending_id}.json"
 
 
 def stage_write(subsystem: str, payload: Dict[str, Any],
@@ -168,8 +179,8 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
-    if not path.exists():
+    path = _pending_record_path(subsystem, pending_id)
+    if path is None or not path.exists():
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -179,7 +190,9 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    path = _pending_record_path(subsystem, pending_id)
+    if path is None:
+        return False
     try:
         if path.exists():
             path.unlink()
