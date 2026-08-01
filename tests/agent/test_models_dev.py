@@ -311,6 +311,25 @@ class TestFetchModelsDev:
         assert result == expected
         mock_get.assert_not_called()
 
+    @patch("agent.models_dev.requests.get")
+    def test_hermes_offline_env_never_fetches(self, mock_get, monkeypatch):
+        """HERMES_OFFLINE=1 must suppress all network access, even on
+        force_refresh, falling back to any disk cache regardless of age."""
+        import agent.models_dev as md
+
+        monkeypatch.setenv("HERMES_OFFLINE", "1")
+        with patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY):
+            result = fetch_models_dev(force_refresh=True)
+
+        assert result == SAMPLE_REGISTRY
+        mock_get.assert_not_called()
+
+        # With no cache at all it returns empty rather than trying network.
+        md._models_dev_cache = {}
+        with patch.object(md, "_load_disk_cache", return_value={}):
+            assert fetch_models_dev() == {}
+        mock_get.assert_not_called()
+
 
 
 

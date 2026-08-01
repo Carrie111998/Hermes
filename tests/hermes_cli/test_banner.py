@@ -9,6 +9,13 @@ import model_tools
 import tools.mcp_tool
 
 
+def test_check_for_updates_returns_none_under_hermes_offline(monkeypatch):
+    """HERMES_OFFLINE=1 must skip the update check's network path entirely."""
+    monkeypatch.setenv("HERMES_OFFLINE", "1")
+    with patch.object(banner.subprocess, "run", side_effect=AssertionError("no subprocess allowed")):
+        assert banner.check_for_updates() is None
+
+
 def test_cprint_falls_back_to_plain_print_when_prompt_toolkit_has_no_console(capsys):
     with patch(
         "prompt_toolkit.print_formatted_text",

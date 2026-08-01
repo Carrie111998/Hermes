@@ -24,6 +24,7 @@ rather than parsing the raw JSON themselves.
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -387,6 +388,12 @@ def fetch_models_dev(
     that must never wait on the network.
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+
+    # HERMES_OFFLINE=1 (air-gapped / intranet deployments): never open a
+    # socket. Behave as if allow_network=False for every caller, including
+    # force_refresh, so the process lives entirely off disk/memory caches.
+    if os.environ.get("HERMES_OFFLINE"):
+        allow_network = False
 
     if not allow_network:
         if _models_dev_cache:
