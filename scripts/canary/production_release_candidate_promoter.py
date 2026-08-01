@@ -165,6 +165,46 @@ _PRODUCTION_RUNTIME_GROUP_NAMES = (
 )
 _EXPECTED_RUNTIME_UID_COUNT = 17
 _EXPECTED_RUNTIME_GID_COUNT = 28
+_PRODUCTION_RUNTIME_UID_BY_NAME = {
+    "ai-platform-brain": 999,
+    "muncho-canonical-writer": 2000,
+    "muncho-projector": 2004,
+    "muncho-discord-egress": 2002,
+    "muncho-discord-connector": 2001,
+    "muncho-mac-ops-edge": 2003,
+    "muncho-capability-browser": 2006,
+    "muncho-worker": 2007,
+    **{
+        f"muncho-edge-{domain}": 2100 + index
+        for index, domain in enumerate(
+            _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
+        )
+    },
+}
+_PRODUCTION_RUNTIME_GID_BY_NAME = {
+    "ai-platform-brain": 994,
+    "muncho-canonical-writer": 2000,
+    "muncho-projector": 2004,
+    "muncho-discord-egress": 2002,
+    "muncho-discord-connector": 2001,
+    "muncho-mac-ops-edge": 2003,
+    "muncho-capability-browser": 2006,
+    "muncho-worker": 2007,
+    "muncho-writer-client": 2005,
+    "muncho-worker-clients": 2008,
+    **{
+        f"muncho-edge-{domain}": 2100 + index
+        for index, domain in enumerate(
+            _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
+        )
+    },
+    **{
+        f"muncho-edge-{domain}-c": 2200 + index
+        for index, domain in enumerate(
+            _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
+        )
+    },
+}
 
 
 class ProductionReleaseCandidatePromoterError(RuntimeError):
@@ -521,64 +561,70 @@ def _open_root_file(
 def _derive_production_release_identities(
     *,
     user_lookup: Callable[[str], Any] = pwd.getpwnam,
+    user_id_lookup: Callable[[int], Any] = pwd.getpwuid,
     group_lookup: Callable[[str], Any] = grp.getgrnam,
+    group_id_lookup: Callable[[int], Any] = grp.getgrgid,
 ) -> builder.ReleaseIdentities:
-    """Resolve the exact identity catalog owned by the cutover contracts."""
+    """Reserve the exact cutover identity catalog before host activation."""
 
-    try:
-        users = [user_lookup(name) for name in _PRODUCTION_RUNTIME_USER_NAMES]
-        groups = [
-            group_lookup(name) for name in _PRODUCTION_RUNTIME_GROUP_NAMES
-        ]
-    except (KeyError, OSError, TypeError, ValueError) as exc:
-        _fail("candidate_promoter_identity_contract_invalid", exc)
     if (
-        len(users) != _EXPECTED_RUNTIME_UID_COUNT
-        or len(groups) != _EXPECTED_RUNTIME_GID_COUNT
-        or any(
-            item.pw_name != name
-            or type(item.pw_uid) is not int
-            or item.pw_uid <= 0
-            for name, item in zip(
-                _PRODUCTION_RUNTIME_USER_NAMES,
-                users,
-                strict=True,
-            )
-        )
-        or any(
-            item.gr_name != name
-            or type(item.gr_gid) is not int
-            or item.gr_gid <= 0
-            for name, item in zip(
-                _PRODUCTION_RUNTIME_GROUP_NAMES,
-                groups,
-                strict=True,
-            )
-        )
+        set(_PRODUCTION_RUNTIME_UID_BY_NAME)
+        != set(_PRODUCTION_RUNTIME_USER_NAMES)
+        or set(_PRODUCTION_RUNTIME_GID_BY_NAME)
+        != set(_PRODUCTION_RUNTIME_GROUP_NAMES)
+        or len(_PRODUCTION_RUNTIME_UID_BY_NAME)
+        != _EXPECTED_RUNTIME_UID_COUNT
+        or len(_PRODUCTION_RUNTIME_GID_BY_NAME)
+        != _EXPECTED_RUNTIME_GID_COUNT
+        or len(set(_PRODUCTION_RUNTIME_UID_BY_NAME.values()))
+        != _EXPECTED_RUNTIME_UID_COUNT
+        or len(set(_PRODUCTION_RUNTIME_GID_BY_NAME.values()))
+        != _EXPECTED_RUNTIME_GID_COUNT
     ):
         _fail("candidate_promoter_identity_contract_invalid")
-    group_by_name = {
-        name: item
-        for name, item in zip(
-            _PRODUCTION_RUNTIME_GROUP_NAMES,
-            groups,
-            strict=True,
-        )
-    }
-    if any(
-        item.pw_gid != group_by_name[item.pw_name].gr_gid
-        for item in users
-    ):
-        _fail("candidate_promoter_identity_contract_invalid")
+    try:
+        for name in _PRODUCTION_RUNTIME_USER_NAMES:
+            expected_uid = _PRODUCTION_RUNTIME_UID_BY_NAME[name]
+            expected_gid = _PRODUCTION_RUNTIME_GID_BY_NAME[name]
+            try:
+                item = user_lookup(name)
+            except KeyError:
+                try:
+                    user_id_lookup(expected_uid)
+                except KeyError:
+                    continue
+                _fail("candidate_promoter_identity_contract_invalid")
+            if (
+                item.pw_name != name
+                or item.pw_uid != expected_uid
+                or item.pw_gid != expected_gid
+            ):
+                _fail("candidate_promoter_identity_contract_invalid")
+        for name in _PRODUCTION_RUNTIME_GROUP_NAMES:
+            expected_gid = _PRODUCTION_RUNTIME_GID_BY_NAME[name]
+            try:
+                item = group_lookup(name)
+            except KeyError:
+                try:
+                    group_id_lookup(expected_gid)
+                except KeyError:
+                    continue
+                _fail("candidate_promoter_identity_contract_invalid")
+            if item.gr_name != name or item.gr_gid != expected_gid:
+                _fail("candidate_promoter_identity_contract_invalid")
+    except ProductionReleaseCandidatePromoterError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("candidate_promoter_identity_contract_invalid", exc)
     identities = builder.ReleaseIdentities(
         builder_uid=phase.BUILDER_UID,
         builder_gid=phase.BUILDER_GID,
         reserved_runtime_uids=tuple(
-            sorted(item.pw_uid for item in users)
+            sorted(_PRODUCTION_RUNTIME_UID_BY_NAME.values())
         ),
         reserved_runtime_gids=tuple(
-            sorted(item.gr_gid for item in groups)
-        ),
+            sorted(_PRODUCTION_RUNTIME_GID_BY_NAME.values())
+        )
     )
     try:
         return builder.validate_release_identities(

@@ -566,43 +566,53 @@ def test_systemd_collector_executes_only_the_exact_fixed_show(
     ]
 
 
-def test_production_identities_are_derived_from_exact_nss_catalog(
+def test_production_identities_reserve_exact_cutover_catalog_before_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gid_by_name = {
-        name: 41000 + index
-        for index, name in enumerate(
-            promoter._PRODUCTION_RUNTIME_GROUP_NAMES
-        )
-    }
-    uid_by_name = {
-        name: 31000 + index
-        for index, name in enumerate(
-            promoter._PRODUCTION_RUNTIME_USER_NAMES
-        )
-    }
     monkeypatch.setattr(promoter.os, "geteuid", lambda: 0)
 
+    def absent(_value: Any) -> Any:
+        raise KeyError
+
     identities = promoter._derive_production_release_identities(
-        user_lookup=lambda name: SimpleNamespace(
-            pw_name=name,
-            pw_uid=uid_by_name[name],
-            pw_gid=gid_by_name[name],
-        ),
-        group_lookup=lambda name: SimpleNamespace(
-            gr_name=name,
-            gr_gid=gid_by_name[name],
-        ),
+        user_lookup=absent,
+        user_id_lookup=absent,
+        group_lookup=absent,
+        group_id_lookup=absent,
     )
 
     assert identities.reserved_runtime_uids == tuple(
-        sorted(uid_by_name.values())
+        sorted(promoter._PRODUCTION_RUNTIME_UID_BY_NAME.values())
     )
     assert identities.reserved_runtime_gids == tuple(
-        sorted(gid_by_name.values())
+        sorted(promoter._PRODUCTION_RUNTIME_GID_BY_NAME.values())
     )
     assert len(identities.reserved_runtime_uids) == 17
     assert len(identities.reserved_runtime_gids) == 28
+
+
+def test_production_identity_reservation_rejects_uid_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(promoter.os, "geteuid", lambda: 0)
+
+    def absent(_value: Any) -> Any:
+        raise KeyError
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="identity_contract_invalid",
+    ):
+        promoter._derive_production_release_identities(
+            user_lookup=absent,
+            user_id_lookup=lambda uid: SimpleNamespace(
+                pw_name="collision",
+                pw_uid=uid,
+                pw_gid=uid,
+            ),
+            group_lookup=absent,
+            group_id_lookup=absent,
+        )
 
 
 def test_rehashed_terminal_tamper_is_rejected_against_root_inputs(
