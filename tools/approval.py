@@ -2672,6 +2672,31 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _get_noninteractive_approval_mode() -> str:
+    """Read ``approvals.noninteractive_mode``. Returns 'deny' or 'approve'.
+
+    Governs the dangerous-command path in a non-interactive, non-gateway,
+    non-cron context: a scripted or headless run, hermes-agent embedded as a
+    library, a test harness, or a dispatched kanban worker. That path fails
+    OPEN -- everything below the hardline floor is auto-approved with nobody
+    present to answer -- and ``cron_mode`` covers only the cron case.
+
+    Defaults to 'approve', preserving existing behaviour: an operator opts in
+    to fail-closed rather than having a deployment change under them on
+    upgrade. Mirrors ``_get_cron_approval_mode``.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        mode = str(cfg_get(config, "approvals", "noninteractive_mode",
+                           default="approve")).lower().strip()
+        if mode in {"deny", "block", "closed", "no"}:
+            return "deny"
+        return "approve"
+    except Exception:
+        return "approve"
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -3125,6 +3150,13 @@ def check_dangerous_command(command: str, env_type: str,
         ),
         autoapprove_log_prefix=(
             "AUTO-APPROVED dangerous command in non-interactive non-gateway context"
+        ),
+        fail_closed_when_no_human=(_get_noninteractive_approval_mode() == "deny"),
+        no_human_block_message=(
+            f"BLOCKED: Command flagged as dangerous ({description}) but no "
+            "interactive user or gateway is present to approve it "
+            "(approvals.noninteractive_mode: deny). Find an alternative approach, "
+            "or run this where a human can answer."
         ),
     )
 
