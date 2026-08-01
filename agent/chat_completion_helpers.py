@@ -2945,14 +2945,41 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             return stream_attempt_id in stream_attempt_state["cancelled"]
 
-    def _record_real_stream_chunk(stream_attempt_id: int) -> None:
+    def _accept_real_stream_chunk(stream_attempt_id: int) -> bool:
+        """Atomically admit a real chunk and advance its activity snapshot."""
         with stream_attempt_lock:
+            if (
+                stream_attempt_id != int(stream_attempt_state.get("current") or 0)
+                or stream_attempt_id in stream_attempt_state["cancelled"]
+            ):
+                return False
+            last_chunk_time["t"] = time.time()
             stream_attempt_state["real_chunks"][stream_attempt_id] = (
-                int(
-                    stream_attempt_state["real_chunks"].get(stream_attempt_id, 0)
-                )
+                int(stream_attempt_state["real_chunks"].get(stream_attempt_id, 0))
                 + 1
             )
+            return True
+
+    def _cancel_stalled_attempt_if_unchanged(
+        stream_attempt_id: int,
+        chunk_timestamp: float,
+        silent_seconds: float,
+        probe: ProbeOutcome,
+    ) -> bool:
+        """Atomically let either the exact attempt's next chunk or cancel win."""
+        with stream_attempt_lock:
+            if (
+                stream_attempt_id != int(stream_attempt_state.get("current") or 0)
+                or stream_attempt_id in stream_attempt_state["cancelled"]
+                or stream_attempt_state["real_chunks"].get(stream_attempt_id, 0)
+                or last_chunk_time["t"] != chunk_timestamp
+            ):
+                return False
+            stream_attempt_state["cancelled"].add(stream_attempt_id)
+            stream_attempt_state["zero_chunk_stalls"][stream_attempt_id] = (
+                float(silent_seconds), probe
+            )
+            return True
 
     def _stream_attempt_has_real_chunks(stream_attempt_id: int) -> bool:
         with stream_attempt_lock:
@@ -2962,11 +2989,57 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             return int(stream_attempt_state.get("current") or 0)
 
-    def _mark_zero_chunk_stall(stream_attempt_id: int, silent_seconds: float) -> None:
+    def _zero_chunk_probe_snapshot() -> tuple[int, float] | None:
         with stream_attempt_lock:
-            stream_attempt_state["zero_chunk_stalls"][stream_attempt_id] = (
-                float(silent_seconds), stall_recovery["last_probe"]
+            attempt_id = int(stream_attempt_state.get("current") or 0)
+            if (
+                not attempt_id
+                or attempt_id in stream_attempt_state["cancelled"]
+                or stream_attempt_state["real_chunks"].get(attempt_id, 0)
+            ):
+                return None
+            return attempt_id, float(last_chunk_time["t"])
+
+    def _run_interruptible_health_probe() -> ProbeOutcome | None:
+        """Return ``None`` when an interrupt wins a bounded probe wait."""
+        completed = threading.Event()
+        holder: dict[str, Any] = {}
+
+        def _probe_owner() -> None:
+            try:
+                holder["outcome"] = probe_provider_endpoint(
+                    base_url=str(getattr(agent, "base_url", "") or ""),
+                    timeout_seconds=(
+                        stall_recovery_config.health_probe_timeout_seconds
+                    ),
+                )
+            except Exception as exc:
+                holder["exception"] = exc
+            finally:
+                completed.set()
+
+        threading.Thread(
+            target=_context_thread_target(_probe_owner),
+            name="interruptible-provider-probe",
+            daemon=True,
+        ).start()
+        deadline = (
+            time.monotonic()
+            + stall_recovery_config.health_probe_timeout_seconds
+            + 0.1
+        )
+        while not completed.wait(0.01):
+            if agent._interrupt_requested:
+                return None
+            if time.monotonic() >= deadline:
+                return ProbeOutcome(status="unavailable", detail="ProbeTimeout")
+        if "exception" in holder:
+            exc = holder["exception"]
+            logger.warning(
+                "Provider health probe failed safely: %s", type(exc).__name__
             )
+            return ProbeOutcome(status="unavailable", detail=type(exc).__name__)
+        return holder["outcome"]
 
     def _zero_chunk_stall_for_attempt(stream_attempt_id: int):
         with stream_attempt_lock:
@@ -3122,8 +3195,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     provider_tool_in_flight["yes"] = True
             except Exception:
                 pass
-            if not _stream_attempt_is_active(stream_attempt_id):
-                return False
             token = _writer_token["value"]
             if token is not None and not stream_writer_is_current(agent, token):
                 logger.warning(
@@ -3137,9 +3208,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # prevents the stale watchdog from cancelling a live stream while
             # an interceptor or codec is still handling an already-received
             # event.
-            last_chunk_time["t"] = time.time()
-            _record_real_stream_chunk(stream_attempt_id)
-            return True
+            return _accept_real_stream_chunk(stream_attempt_id)
 
         def _relay_final_response() -> dict[str, Any]:
             tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
@@ -3603,13 +3672,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_anthropic_event(_event: Any) -> bool:
-            if not _stream_attempt_is_active(stream_attempt_id):
-                return False
             token = _writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
-                last_chunk_time["t"] = time.time()
-                _record_real_stream_chunk(stream_attempt_id)
-                return True
+                return _accept_real_stream_chunk(stream_attempt_id)
             logger.warning(
                 "Anthropic streaming attempt superseded by a newer stream; "
                 "stopping consumption to preserve the single-writer "
@@ -4206,27 +4271,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # for that cleanup window.
             if result["response"] is not None or result["error"] is not None:
                 continue
-            _stale_attempt_id = _current_stream_attempt_id()
-            _zero_real_chunks = not _stream_attempt_has_real_chunks(
-                _stale_attempt_id
+            _probe_state = _zero_chunk_probe_snapshot()
+            _stale_attempt_id = (
+                _probe_state[0] if _probe_state is not None
+                else _current_stream_attempt_id()
             )
+            _zero_real_chunks = _probe_state is not None
             if stall_recovery_config.enabled and _zero_real_chunks:
-                _probe_snapshot = last_chunk_time["t"]
+                _probe_snapshot = _probe_state[1]
                 if stall_recovery_config.health_probe_enabled:
-                    try:
-                        _probe = probe_provider_endpoint(
-                            base_url=str(getattr(agent, "base_url", "") or ""),
-                            timeout_seconds=(
-                                stall_recovery_config.health_probe_timeout_seconds
-                            ),
+                    _probe = _run_interruptible_health_probe()
+                    if _probe is None:
+                        _request_cancelled["value"] = True
+                        _cancel_current_stream_attempt(
+                            "interrupt_during_provider_health_probe"
                         )
-                    except Exception as _probe_exc:
-                        logger.warning(
-                            "Provider health probe failed safely: %s",
-                            type(_probe_exc).__name__,
-                        )
-                        _probe = ProbeOutcome(
-                            status="unavailable", detail=type(_probe_exc).__name__
+                        try:
+                            _close_request_client_once(
+                                "interrupt_during_provider_health_probe"
+                            )
+                        except Exception:
+                            pass
+                        raise InterruptedError(
+                            "Agent interrupted during provider health probe"
                         )
                 else:
                     _probe = ProbeOutcome(
@@ -4236,22 +4303,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # A provider chunk can race the bounded probe. Recheck the
                 # exact real-chunk timestamp before touching cancellation or
                 # transport state; the recovered original request must win.
-                if last_chunk_time["t"] != _probe_snapshot:
+                if result["response"] is not None or result["error"] is not None:
+                    continue
+
+                if not _cancel_stalled_attempt_if_unchanged(
+                    _stale_attempt_id,
+                    _probe_snapshot,
+                    _stale_elapsed,
+                    _probe,
+                ):
                     logger.info(
                         "Provider probe completed but stream attempt %s recovered",
                         _stale_attempt_id,
                     )
                     continue
 
-                # The worker can finish the already-cancelled terminal attempt
-                # while the probe is in flight. Do not diagnose or report that
-                # same attempt a second time during thread cleanup.
-                if result["response"] is not None or result["error"] is not None:
-                    continue
-
                 stall_recovery["zero_chunk_stalls"] += 1
                 stall_recovery["last_probe"] = _probe
-                _mark_zero_chunk_stall(_stale_attempt_id, _stale_elapsed)
                 _stall_error = ProviderStalledError(
                     provider=str(getattr(agent, "provider", "") or "unknown"),
                     model=str(
