@@ -2392,6 +2392,11 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Optional systemd unit base name. A trailing .service is normalized
+        # away by the gateway service manager. None preserves profile-aware
+        # hermes-gateway[-<profile-or-hash>] naming.
+        "systemd_unit_name": None,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

@@ -97,7 +97,21 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+    if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+        return True
+
+    try:
+        from hermes_cli.gateway import get_service_name
+
+        unit_name = get_service_name()
+    except Exception:
+        return False
+    custom_systemd_pattern = re.compile(
+        rf"(?i)(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*"
+        rf"(?<![A-Za-z0-9_.@:-]){re.escape(unit_name)}(?:\.service)?"
+        rf"(?![A-Za-z0-9_.@:-]))"
+    )
+    return bool(custom_systemd_pattern.search(normalized))
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -339,8 +353,6 @@ def contains_gateway_lifecycle_command_or_referenced_script(
         visited=set(),
         read_remote_script=read_remote_script,
     )
-
-
 
 
 def _resolve_script_path(script_path: str) -> Path:

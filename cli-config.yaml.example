@@ -963,6 +963,12 @@ platform_toolsets:
 # =============================================================================
 # Gateway Platform Settings
 # =============================================================================
+# Linux only: override the gateway systemd unit base name. A trailing
+# `.service` suffix is accepted and normalized. Omit this setting to keep the
+# default profile-derived unit name.
+# gateway:
+#   systemd_unit_name: hermes-gateway-staging
+#
 # Optional per-platform messaging settings.
 # Platform-specific knobs live under `extra`.
 #

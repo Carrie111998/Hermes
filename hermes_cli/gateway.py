@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -45,6 +46,7 @@ from hermes_cli.config import (
     is_managed,
     managed_error,
     read_raw_config,
+    read_user_config_raw,
     save_env_value,
     write_platform_config_field,
 )
@@ -106,13 +108,16 @@ def _get_service_pids() -> set:
 
     # --- systemd (Linux): user and system scopes ---
     if supports_systemd_services():
-        for scope_args in [["systemctl", "--user"], ["systemctl"]]:
+        for system, scope_args in [
+            (False, ["systemctl", "--user"]),
+            (True, ["systemctl"]),
+        ]:
             try:
                 result = subprocess.run(
                     scope_args
                     + [
                         "list-units",
-                        "hermes-gateway*",
+                        *_systemd_gateway_unit_patterns(system=system),
                         "--plain",
                         "--no-legend",
                         "--no-pager",
@@ -958,7 +963,10 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
     return parsed
 
 
-def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
+def _hermes_home_from_systemd_unit_file(
+    system: bool = False,
+    unit_path: Path | None = None,
+) -> str | None:
     """Read ``HERMES_HOME`` from the on-disk unit file (not ``systemctl show``).
 
     Prefer the file when refreshing/comparing: under ``sudo``, ``systemctl``
@@ -966,25 +974,168 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
     ``systemd_unit_is_current`` / ``refresh_systemd_unit_if_needed`` already
     compare against.
     """
-    unit_path = get_systemd_unit_path(system=system)
-    if not unit_path.exists():
-        return None
-    try:
-        text = unit_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in text.splitlines():
+    unit_path = unit_path or get_systemd_unit_path(system=system)
+    return _systemd_unit_file_environment(unit_path).get("HERMES_HOME") or None
+
+
+def _parse_systemd_unit_environment(unit_text: str) -> dict[str, str]:
+    """Parse simple ``Environment=KEY=VALUE`` directives from unit text."""
+    parsed: dict[str, str] = {}
+    for line in unit_text.splitlines():
         stripped = line.strip()
         if not stripped.startswith("Environment="):
             continue
         body = stripped[len("Environment=") :].strip().strip('"')
-        if body.startswith("HERMES_HOME="):
-            value = body.split("=", 1)[1].strip().strip('"')
-            return value or None
-    return None
+        if "=" not in body:
+            continue
+        key, value = body.split("=", 1)
+        parsed[key] = value.strip().strip('"')
+    return parsed
 
 
-def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
+def _read_systemd_unit_file(unit_path: Path) -> tuple[str, dict[str, str]]:
+    """Read unit text and its environment in one filesystem operation."""
+    try:
+        unit_text = unit_path.read_text(encoding="utf-8")
+    except OSError:
+        return "", {}
+    return unit_text, _parse_systemd_unit_environment(unit_text)
+
+
+def _systemd_unit_file_environment(unit_path: Path) -> dict[str, str]:
+    """Read simple ``Environment=KEY=VALUE`` directives from a unit file."""
+    return _read_systemd_unit_file(unit_path)[1]
+
+
+def _systemd_unit_invokes_hermes_gateway(unit_text: str) -> bool:
+    return any(marker in unit_text for marker in _LEGACY_UNIT_EXECSTART_MARKERS)
+
+
+def _systemd_unit_is_managed(
+    unit_path: Path,
+    expected_name: str | None = None,
+    conventional_name: str | None = None,
+) -> bool:
+    """Return whether Hermes may mutate the selected unit file.
+
+    Conventional ``hermes-gateway[-profile]`` units predate the private unit
+    marker and remain backward compatible. A configured custom path has no
+    such provenance, so require both the generated marker and Hermes gateway
+    ExecStart signature before changing an existing file.
+    """
+    expected_name = expected_name or get_service_name()
+    conventional_name = conventional_name or _profile_service_name()
+    if expected_name == conventional_name:
+        return True
+
+    unit_text, environment = _read_systemd_unit_file(unit_path)
+    if not unit_text:
+        return False
+    persisted = environment.get(_SYSTEMD_UNIT_NAME_ENV, "").strip()
+    try:
+        persisted = _normalize_systemd_unit_name(persisted, _SYSTEMD_UNIT_NAME_ENV)
+    except ValueError:
+        return False
+    return (
+        unit_path.name == f"{persisted}.service"
+        and persisted == expected_name
+        and _systemd_unit_invokes_hermes_gateway(unit_text)
+    )
+
+
+def _require_managed_systemd_unit(
+    unit_path: Path,
+    action: str,
+    expected_name: str | None = None,
+    conventional_name: str | None = None,
+) -> None:
+    if _systemd_unit_is_managed(unit_path, expected_name, conventional_name):
+        return
+    print(
+        f"✗ Refusing to {action} {unit_path}: the existing custom-name unit "
+        "is not a Hermes gateway service."
+    )
+    sys.exit(1)
+
+
+def _systemd_manager_fragment_path(
+    service_name: str,
+    system: bool = False,
+) -> tuple[bool, Path | None]:
+    """Probe the manager's selected unit file as ``(succeeded, path)``."""
+    try:
+        result = _run_systemctl(
+            [
+                "show",
+                service_name,
+                "--no-pager",
+                "--property",
+                "LoadState,FragmentPath",
+            ],
+            system=system,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    properties: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        properties[key] = value.strip()
+    if "LoadState" not in properties or "FragmentPath" not in properties:
+        return False, None
+    load_state = properties["LoadState"]
+    fragment_path = properties["FragmentPath"]
+    if fragment_path:
+        if load_state == "not-found":
+            return False, None
+        return True, Path(fragment_path)
+    if load_state == "not-found":
+        return True, None
+    return False, None
+
+
+def _managed_systemd_fragment_outside_writable_path(
+    unit_path: Path,
+    service_name: str,
+    system: bool,
+    action: str,
+    conventional_name: str,
+) -> Path | None:
+    """Validate any manager-visible custom unit outside Hermes' write path."""
+    if service_name == conventional_name:
+        return None
+    probe_succeeded, fragment_path = _systemd_manager_fragment_path(
+        service_name, system=system
+    )
+    if not probe_succeeded:
+        print(
+            f"✗ Refusing to {action} {unit_path}: could not verify whether the "
+            "custom-name unit is already owned by another systemd service."
+        )
+        sys.exit(1)
+    if fragment_path is None or fragment_path == unit_path:
+        return fragment_path
+    _require_managed_systemd_unit(
+        fragment_path,
+        action,
+        service_name,
+        conventional_name,
+    )
+    return fragment_path
+
+
+def _sync_hermes_home_from_systemd_unit(
+    system: bool,
+    unit_path: Path | None = None,
+) -> None:
     """When acting on a system-scope unit, adopt its ``HERMES_HOME``.
 
     Under ``sudo``, ``HERMES_HOME`` is stripped and ``HOME=/root``, so
@@ -995,10 +1146,30 @@ def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
     """
     if not system:
         return
+    file_environment = (
+        _systemd_unit_file_environment(unit_path) if unit_path is not None else {}
+    )
+    persisted_name = file_environment.get(_SYSTEMD_UNIT_NAME_ENV, "").strip()
+    if persisted_name and unit_path is not None:
+        try:
+            persisted_name = _normalize_systemd_unit_name(
+                persisted_name, _SYSTEMD_UNIT_NAME_ENV
+            )
+        except ValueError:
+            persisted_name = ""
+        if unit_path.name != f"{persisted_name}.service":
+            persisted_name = ""
+    if persisted_name:
+        os.environ[_SYSTEMD_UNIT_NAME_ENV] = persisted_name
+
     # Prefer the on-disk unit (source of truth for refresh/compare). Fall
     # back to ``systemctl show`` for units that only exist in the manager.
-    unit_home = (_hermes_home_from_systemd_unit_file(system=True) or "").strip()
-    if not unit_home:
+    unit_home = file_environment.get("HERMES_HOME", "").strip()
+    if not unit_home and unit_path is None:
+        unit_home = (
+            _hermes_home_from_systemd_unit_file(system=True) or ""
+        ).strip()
+    if not unit_home and unit_path is None:
         unit_home = _read_systemd_unit_environment(system=True).get("HERMES_HOME", "").strip()
     if not unit_home:
         return
@@ -1721,10 +1892,62 @@ def _windows_gateway_should_absorb_console_controls() -> bool:
 # =============================================================================
 
 _SERVICE_BASE = "hermes-gateway"
+_SYSTEMD_UNIT_NAME_ENV = "_HERMES_GATEWAY_SYSTEMD_UNIT"
+_SYSTEMD_UNIT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$")
 SERVICE_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 
 
-def _profile_suffix() -> str:
+def _normalize_systemd_unit_name(value: object, source: str) -> str:
+    """Validate and return a systemd unit base name without ``.service``."""
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {source}: expected a string")
+
+    name = value.removesuffix(".service")
+    if (
+        not name
+        or "/" in name
+        or ".." in name
+        or _SYSTEMD_UNIT_NAME_PATTERN.fullmatch(name) is None
+    ):
+        raise ValueError(f"Invalid {source}: {value!r}")
+    return name
+
+
+def _systemd_unit_name_override(
+    hermes_home: str | Path | None = None,
+) -> str | None:
+    """Resolve the private service-child marker or public gateway config."""
+    persisted = os.environ.get(_SYSTEMD_UNIT_NAME_ENV)
+    if persisted is not None and hermes_home is None:
+        return _normalize_systemd_unit_name(persisted, _SYSTEMD_UNIT_NAME_ENV)
+
+    config_home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+    try:
+        config = read_user_config_raw(config_home / "config.yaml")
+    except Exception:
+        # A broken/unreadable user file must not suppress administrator-managed
+        # configuration. Continue with an empty user layer and apply managed
+        # policy below.
+        config = {}
+    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.managed_scope import apply_managed_overlay
+
+    config = apply_managed_overlay(_expand_env_vars(config))
+    gateway_config = config.get("gateway") if isinstance(config, dict) else None
+    configured = (
+        gateway_config.get("systemd_unit_name")
+        if isinstance(gateway_config, dict)
+        else None
+    )
+    if configured is None:
+        return None
+    return _normalize_systemd_unit_name(configured, "gateway.systemd_unit_name")
+
+
+def _profile_suffix(
+    hermes_home: str | Path | None = None,
+    default_root: str | Path | None = None,
+) -> str:
     """Derive a service-name suffix from the current HERMES_HOME.
 
     Returns ``""`` for the default root, the profile name for
@@ -1735,8 +1958,16 @@ def _profile_suffix() -> str:
     import re
     from hermes_constants import get_default_hermes_root
 
-    home = get_hermes_home().resolve()
-    default = get_default_hermes_root().resolve()
+    home = (
+        Path(hermes_home).resolve()
+        if hermes_home is not None
+        else get_hermes_home().resolve()
+    )
+    default = (
+        Path(default_root).resolve()
+        if default_root is not None
+        else get_default_hermes_root().resolve()
+    )
     if home == default:
         return ""
     # Detect <root>/profiles/<name> pattern → use the profile name
@@ -1795,24 +2026,143 @@ def _profile_arg_for_target_user(hermes_home: str, target_home_dir: str) -> str:
         return _profile_arg(hermes_home)
 
 
-def get_service_name() -> str:
+def get_service_name(
+    hermes_home: str | Path | None = None,
+    default_root: str | Path | None = None,
+) -> str:
     """Derive a systemd service name scoped to this HERMES_HOME.
 
     Default ``~/.hermes`` returns ``hermes-gateway`` (backward compatible).
     Profile ``~/.hermes/profiles/coder`` returns ``hermes-gateway-coder``.
     Any other HERMES_HOME appends a short hash for uniqueness.
     """
-    suffix = _profile_suffix()
+    override = _systemd_unit_name_override(hermes_home)
+    if override is not None:
+        return override
+    return _profile_service_name(hermes_home, default_root)
+
+
+def _profile_service_name(
+    hermes_home: str | Path | None = None,
+    default_root: str | Path | None = None,
+) -> str:
+    """Return the conventional service name without a configured override."""
+    suffix = (
+        _profile_suffix()
+        if hermes_home is None and default_root is None
+        else _profile_suffix(hermes_home, default_root)
+    )
     if not suffix:
         return _SERVICE_BASE
     return f"{_SERVICE_BASE}-{suffix}"
 
 
-def get_systemd_unit_path(system: bool = False) -> Path:
-    name = get_service_name()
+def get_systemd_unit_path(
+    system: bool = False,
+    hermes_home: str | Path | None = None,
+    default_root: str | Path | None = None,
+) -> Path:
+    name = get_service_name(hermes_home, default_root)
+    return _systemd_unit_directory(system=system) / f"{name}.service"
+
+
+def _systemd_unit_directory(system: bool = False) -> Path:
     if system:
-        return Path("/etc/systemd/system") / f"{name}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+        return Path("/etc/systemd/system")
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def _persisted_systemd_gateway_unit_records(
+    system: bool,
+) -> list[tuple[Path, dict[str, str]]]:
+    """Find generated custom-name units and their persisted environment."""
+    units: list[tuple[Path, dict[str, str]]] = []
+    try:
+        candidates = _systemd_unit_directory(system=system).glob("*.service")
+        for path in candidates:
+            text, environment = _read_systemd_unit_file(path)
+            if not text:
+                continue
+            persisted = environment.get(_SYSTEMD_UNIT_NAME_ENV, "").strip()
+            if not persisted:
+                continue
+            try:
+                persisted = _normalize_systemd_unit_name(
+                    persisted, _SYSTEMD_UNIT_NAME_ENV
+                )
+            except ValueError:
+                continue
+            if path.name != f"{persisted}.service":
+                continue
+            if "-m hermes_cli.main" not in text or "gateway run" not in text:
+                continue
+            units.append((path, environment))
+    except OSError:
+        return []
+    return units
+
+
+def _persisted_systemd_gateway_units(system: bool) -> list[Path]:
+    return [path for path, _ in _persisted_systemd_gateway_unit_records(system)]
+
+
+def _adopt_persisted_systemd_unit(system: bool) -> None:
+    """Adopt a generated custom unit when root lacks the service-user config."""
+    if not system or os.environ.get(_SYSTEMD_UNIT_NAME_ENV):
+        return
+
+    records = _persisted_systemd_gateway_unit_records(system=True)
+    if not records:
+        return
+    environments = dict(records)
+    units = list(environments)
+
+    preferred_paths: list[Path] = []
+    target_user = _default_system_service_user()
+    target_hermes_home: str | None = None
+    if target_user:
+        try:
+            import pwd
+
+            target_home_dir = pwd.getpwnam(target_user).pw_dir
+            target_hermes_home = _hermes_home_for_target_user(target_home_dir)
+            target_default_root = Path(target_home_dir) / ".hermes"
+            target_name = get_service_name(
+                target_hermes_home,
+                target_default_root,
+            )
+            preferred_paths.append(
+                _systemd_unit_directory(system=True) / f"{target_name}.service"
+            )
+        except (KeyError, OSError):
+            pass
+    preferred_paths.append(get_systemd_unit_path(system=True))
+    for preferred in preferred_paths:
+        if preferred in units:
+            _sync_hermes_home_from_systemd_unit(system=True, unit_path=preferred)
+            return
+
+    candidate_homes = {str(get_hermes_home())}
+    if target_hermes_home:
+        candidate_homes.add(target_hermes_home)
+    matching_home = [
+        path
+        for path in units
+        if environments[path].get("HERMES_HOME") in candidate_homes
+    ]
+    candidates = matching_home or units
+    if len(candidates) != 1:
+        return
+    _sync_hermes_home_from_systemd_unit(system=True, unit_path=candidates[0])
+
+
+def _systemd_gateway_unit_patterns(system: bool = False) -> list[str]:
+    """Return systemctl patterns covering legacy/profile and owned custom units."""
+    patterns = ["hermes-gateway*"]
+    for path in _persisted_systemd_gateway_units(system=system):
+        if path.name not in patterns:
+            patterns.append(path.name)
+    return patterns
 
 
 class UserSystemdUnavailableError(RuntimeError):
@@ -2749,7 +3099,11 @@ def _systemd_watchdog_service_fields(
     return "notify", f"NotifyAccess=main\nWatchdogSec={seconds}s\n"
 
 
-def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
+def generate_systemd_unit(
+    system: bool = False,
+    run_as_user: str | None = None,
+    unit_name_override: str | None = None,
+) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
     detected_venv = _detect_venv_dir()
@@ -2784,10 +3138,17 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     # 60s floor, so a configured 45s drain yields 75s rather than 90s.
     _drain_timeout = int(_get_restart_drain_timeout() or 0)
     restart_timeout = max(60, _drain_timeout + 30)
-
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
         hermes_home = _hermes_home_for_target_user(home_dir)
+        unit_name_override = unit_name_override or _systemd_unit_name_override(
+            hermes_home
+        )
+        unit_name_env_line = (
+            f'Environment="{_SYSTEMD_UNIT_NAME_ENV}={unit_name_override}"\n'
+            if unit_name_override is not None
+            else ""
+        )
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
@@ -2824,7 +3185,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+{unit_name_env_line}Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
@@ -2841,6 +3202,12 @@ WantedBy=multi-user.target
 """
 
     hermes_home = str(get_hermes_home().resolve())
+    unit_name_override = unit_name_override or _systemd_unit_name_override()
+    unit_name_env_line = (
+        f'Environment="{_SYSTEMD_UNIT_NAME_ENV}={unit_name_override}"\n'
+        if unit_name_override is not None
+        else ""
+    )
     systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
         hermes_home
     )
@@ -2862,7 +3229,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+{unit_name_env_line}Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
@@ -2925,6 +3292,21 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     )
 
 
+def _generate_installed_systemd_unit(
+    system: bool,
+    run_as_user: str | None = None,
+) -> str:
+    """Generate against the selected persisted identity when one is active."""
+    selected_name = _systemd_unit_name_override()
+    if selected_name is None:
+        return generate_systemd_unit(system=system, run_as_user=run_as_user)
+    return generate_systemd_unit(
+        system=system,
+        run_as_user=run_as_user,
+        unit_name_override=selected_name,
+    )
+
+
 def systemd_unit_is_current(system: bool = False) -> bool:
     # ── HERMES_HOME sync chokepoint ──────────────────────────────────────
     # Every path that compares OR regenerates the unit funnels through here:
@@ -2950,7 +3332,7 @@ def systemd_unit_is_current(system: bool = False) -> bool:
 
     installed = unit_path.read_text(encoding="utf-8")
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
-    expected = generate_systemd_unit(system=system, run_as_user=expected_user)
+    expected = _generate_installed_systemd_unit(system, expected_user)
     # Normalize out directives that older systemd versions silently drop
     # (RestartMaxDelaySec, RestartSteps) so a unit that differs only by
     # those directives is not perpetually flagged as outdated.
@@ -3027,6 +3409,12 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     unit_path = get_systemd_unit_path(system=system)
     if not unit_path.exists():
         return False
+    if not _systemd_unit_is_managed(unit_path):
+        print(
+            f"✗ Refusing to refresh {unit_path}: the existing custom-name unit "
+            "is not a Hermes gateway service."
+        )
+        return False
 
     # The gate below funnels through ``systemd_unit_is_current``, which is the
     # single HERMES_HOME-sync chokepoint (adopts the unit's pinned home before
@@ -3036,7 +3424,7 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
         return False
 
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
-    new_unit = generate_systemd_unit(system=system, run_as_user=expected_user)
+    new_unit = _generate_installed_systemd_unit(system, expected_user)
 
     # ── Test-environment safety belt ─────────────────────────────────────
     # The user-scope unit path resolves under ``Path.home()``, which is NOT
@@ -3132,11 +3520,19 @@ def _ensure_linger_enabled() -> None:
 
 def _select_systemd_scope(system: bool = False) -> bool:
     if system:
+        _adopt_persisted_systemd_unit(system=True)
         return True
-    return (
-        get_systemd_unit_path(system=True).exists()
-        and not get_systemd_unit_path(system=False).exists()
-    )
+    user_unit_exists = get_systemd_unit_path(system=False).exists()
+    if user_unit_exists:
+        return False
+    _adopt_persisted_systemd_unit(system=True)
+    return get_systemd_unit_path(system=True).exists()
+
+
+def _systemd_service_is_installed(system: bool = False) -> bool:
+    """Resolve persisted custom names before testing the selected unit path."""
+    selected_system = _select_systemd_scope(system)
+    return get_systemd_unit_path(system=selected_system).exists()
 
 
 def _system_scope_wizard_would_need_root(system: bool = False) -> bool:
@@ -3216,7 +3612,22 @@ def systemd_install(
             remove_legacy_hermes_units(interactive=False)
             print()
 
-    unit_path = get_systemd_unit_path(system=system)
+    target_hermes_home = None
+    target_default_root = None
+    if system:
+        _, _, target_home_dir = _system_service_identity(run_as_user)
+        target_hermes_home = _hermes_home_for_target_user(target_home_dir)
+        target_default_root = Path(target_home_dir) / ".hermes"
+        service_name = get_service_name(target_hermes_home, target_default_root)
+        unit_path = get_systemd_unit_path(
+            system=True,
+            hermes_home=target_hermes_home,
+            default_root=target_default_root,
+        )
+    else:
+        service_name = get_service_name()
+        unit_path = get_systemd_unit_path(system=False)
+    conventional_name = _profile_service_name(target_hermes_home, target_default_root)
     scope_flag = " --system" if system else ""
 
     # Existing system units already pin HERMES_HOME; adopt it before any
@@ -3226,7 +3637,21 @@ def systemd_install(
     # ``sudo hermes gateway install --system --force`` would bake /root/.hermes
     # into an already-correct unit. Keep it to protect that bypass path.
     if unit_path.exists():
-        _sync_hermes_home_from_systemd_unit(system=system)
+        _require_managed_systemd_unit(
+            unit_path,
+            "overwrite",
+            service_name,
+            conventional_name,
+        )
+        _sync_hermes_home_from_systemd_unit(system=system, unit_path=unit_path)
+    else:
+        _managed_systemd_fragment_outside_writable_path(
+            unit_path,
+            service_name,
+            system,
+            "overwrite",
+            conventional_name,
+        )
 
     if unit_path.exists() and not force:
         if not systemd_unit_is_current(system=system):
@@ -3235,7 +3660,7 @@ def systemd_install(
             )
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:
-                _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+                _run_systemctl(["enable", service_name], system=system, check=True, timeout=30)
             print(f"✓ {_service_scope_label(system).capitalize()} service definition updated")
             return
         print(f"Service already installed at: {unit_path}")
@@ -3248,10 +3673,12 @@ def systemd_install(
         return
     print(f"Installing {_service_scope_label(system)} systemd service to: {unit_path}")
     unit_path.write_text(new_unit, encoding="utf-8")
+    if system:
+        _sync_hermes_home_from_systemd_unit(system=True, unit_path=unit_path)
 
     _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
     if enable_on_startup:
-        _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+        _run_systemctl(["enable", service_name], system=system, check=True, timeout=30)
 
     print()
     enable_label = "installed and enabled" if enable_on_startup else "installed"
@@ -3265,7 +3692,7 @@ def systemd_install(
         f"  {'sudo ' if system else ''}hermes gateway status{scope_flag}             # Check status"
     )
     print(
-        f"  {'journalctl' if system else 'journalctl --user'} -u {get_service_name()} -f  # View logs"
+        f"  {'journalctl' if system else 'journalctl --user'} -u {service_name} -f  # View logs"
     )
     print()
 
@@ -3285,12 +3712,26 @@ def systemd_uninstall(system: bool = False):
     if system:
         _require_root_for_system_service("uninstall")
 
+    unit_path = get_systemd_unit_path(system=system)
+    if unit_path.exists():
+        _require_managed_systemd_unit(unit_path, "uninstall")
+    else:
+        fragment_path = _managed_systemd_fragment_outside_writable_path(
+            unit_path,
+            get_service_name(),
+            system,
+            "uninstall",
+            _profile_service_name(),
+        )
+        if get_service_name() != _profile_service_name() and fragment_path is None:
+            print("Gateway service is not installed")
+            return
+
     _run_systemctl(["stop", get_service_name()], system=system, check=False, timeout=90)
     _run_systemctl(
         ["disable", get_service_name()], system=system, check=False, timeout=30
     )
 
-    unit_path = get_systemd_unit_path(system=system)
     if unit_path.exists():
         unit_path.unlink()
         print(f"✓ Removed {unit_path}")
@@ -3318,6 +3759,7 @@ def systemd_start(system: bool = False):
         # Raises UserSystemdUnavailableError with a remediation message.
         _preflight_user_systemd()
     _require_service_installed("start", system=system)
+    _require_managed_systemd_unit(get_systemd_unit_path(system=system), "start")
     # HERMES_HOME sync happens inside refresh_systemd_unit_if_needed's
     # systemd_unit_is_current gate (the single chokepoint), and the unit is
     # guaranteed to exist here by _require_service_installed, so the gate runs.
@@ -3331,6 +3773,7 @@ def systemd_stop(system: bool = False):
     if system:
         _require_root_for_system_service("stop")
     _require_service_installed("stop", system=system)
+    _require_managed_systemd_unit(get_systemd_unit_path(system=system), "stop")
     _sync_hermes_home_from_systemd_unit(system=system)
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
@@ -3361,6 +3804,7 @@ def systemd_restart(system: bool = False):
     else:
         _preflight_user_systemd()
     _require_service_installed("restart", system=system)
+    _require_managed_systemd_unit(get_systemd_unit_path(system=system), "restart")
     # HERMES_HOME sync happens inside refresh_systemd_unit_if_needed's
     # systemd_unit_is_current gate (the single chokepoint). The unit exists
     # here (_require_service_installed), so the gate runs and its os.environ
@@ -7027,10 +7471,7 @@ def _gateway_command_inner(args):
         if stop_all:
             # --all: kill every gateway process on the machine
             service_available = False
-            if supports_systemd_services() and (
-                get_systemd_unit_path(system=False).exists()
-                or get_systemd_unit_path(system=True).exists()
-            ):
+            if supports_systemd_services() and _systemd_service_is_installed(system):
                 try:
                     systemd_stop(system=system)
                     service_available = True
@@ -7060,10 +7501,7 @@ def _gateway_command_inner(args):
         else:
             # Default: stop only the current profile's gateway
             service_available = False
-            if supports_systemd_services() and (
-                get_systemd_unit_path(system=False).exists()
-                or get_systemd_unit_path(system=True).exists()
-            ):
+            if supports_systemd_services() and _systemd_service_is_installed(system):
                 try:
                     systemd_stop(system=system)
                     service_available = True
@@ -7124,10 +7562,7 @@ def _gateway_command_inner(args):
         if restart_all:
             # --all: stop every gateway process across all profiles, then start fresh
             service_stopped = False
-            if supports_systemd_services() and (
-                get_systemd_unit_path(system=False).exists()
-                or get_systemd_unit_path(system=True).exists()
-            ):
+            if supports_systemd_services() and _systemd_service_is_installed(system):
                 try:
                     systemd_stop(system=system)
                     service_stopped = True
@@ -7156,10 +7591,7 @@ def _gateway_command_inner(args):
 
             # Start the current profile's service fresh
             print("Starting gateway...")
-            if supports_systemd_services() and (
-                get_systemd_unit_path(system=False).exists()
-                or get_systemd_unit_path(system=True).exists()
-            ):
+            if supports_systemd_services() and _systemd_service_is_installed(system):
                 systemd_start(system=system)
             elif is_macos() and get_launchd_plist_path().exists():
                 launchd_start()
@@ -7177,10 +7609,7 @@ def _gateway_command_inner(args):
                 run_gateway(verbose=0)
             return
 
-        if supports_systemd_services() and (
-            get_systemd_unit_path(system=False).exists()
-            or get_systemd_unit_path(system=True).exists()
-        ):
+        if supports_systemd_services() and _systemd_service_is_installed(system):
             service_configured = True
             try:
                 systemd_restart(system=system)

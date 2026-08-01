@@ -3251,10 +3251,11 @@ def _cold_start_windows_gateway_after_update() -> None:
 def _for_each_systemd_gateway_unit(
     list_units_stdout: str,
     *,
+    custom_unit_names: set[str] | None = None,
     process_unit,
     on_unit_timeout,
 ) -> None:
-    """Process each ``hermes-gateway*.service`` from ``systemctl list-units``.
+    """Process each recognized gateway service from ``systemctl list-units``.
 
     ``subprocess.TimeoutExpired`` raised by ``process_unit`` is isolated to
     that unit via ``on_unit_timeout`` so one wedged systemctl call cannot
@@ -3269,9 +3270,11 @@ def _for_each_systemd_gateway_unit(
             continue
         # list-units is already pattern-filtered, but keep the name gate so a
         # stray non-gateway line cannot enter the restart path.
-        if not unit.startswith("hermes-gateway"):
-            continue
         svc_name = unit.removesuffix(".service")
+        if not unit.startswith("hermes-gateway") and svc_name not in (
+            custom_unit_names or set()
+        ):
+            continue
         try:
             process_unit(svc_name)
         except subprocess.TimeoutExpired as exc:
@@ -4718,6 +4721,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 find_profile_gateway_processes,
                 _prepare_profile_gateway_update_restart,
                 _get_service_pids,
+                _systemd_gateway_unit_patterns,
                 _graceful_restart_via_sigusr1,
                 _wait_for_gateway_exit,
             )
@@ -4913,12 +4917,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ("user", ["systemctl", "--user"]),
                     ("system", ["systemctl"]),
                 ]:
+                    unit_patterns = _systemd_gateway_unit_patterns(
+                        system=scope == "system"
+                    )
+                    custom_unit_names = {
+                        pattern.removesuffix(".service")
+                        for pattern in unit_patterns
+                        if pattern != "hermes-gateway*"
+                    }
                     try:
                         result = subprocess.run(
                             scope_cmd
                             + [
                                 "list-units",
-                                "hermes-gateway*",
+                                *unit_patterns,
                                 "--plain",
                                 "--no-legend",
                                 "--no-pager",
@@ -5197,6 +5209,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                     _for_each_systemd_gateway_unit(
                         result.stdout,
+                        custom_unit_names=custom_unit_names,
                         process_unit=_restart_one_systemd_gateway_unit,
                         on_unit_timeout=_on_unit_timeout,
                     )

@@ -90,6 +90,18 @@ class TestFleetRestartTimeoutIsolation:
 
         assert seen == ["hermes-gateway-coder"]
 
+    def test_resolved_custom_gateway_unit_is_processed(self):
+        seen: list[str] = []
+
+        _for_each_systemd_gateway_unit(
+            _list_units_stdout(["hermes-gateway", "custom-hermes-service"]),
+            custom_unit_names={"custom-hermes-service"},
+            process_unit=seen.append,
+            on_unit_timeout=lambda *_: pytest.fail("unexpected timeout"),
+        )
+
+        assert seen == ["hermes-gateway", "custom-hermes-service"]
+
     def test_process_errors_other_than_timeout_still_propagate(self):
         def process_unit(_svc_name: str) -> None:
             raise RuntimeError("not a timeout")
@@ -112,4 +124,3 @@ class TestIncompleteFleetRestartWarning:
         assert out.count("hermes-gateway-xiaomo5") == 1
         assert "hermes-gateway-xiaomo6" in out
         assert "pre-update code" in out
-

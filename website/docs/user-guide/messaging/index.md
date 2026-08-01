@@ -186,6 +186,28 @@ process when they stop. The default `0` keeps the existing `Type=simple`
 behavior. This setting is Linux/systemd-only and does not treat an ordinary
 platform network disconnect as an event-loop failure.
 
+### Custom Linux systemd unit name
+
+Set `gateway.systemd_unit_name` when an external deployment convention needs
+a stable unit name instead of Hermes' profile-derived default:
+
+```yaml title="~/.hermes/config.yaml"
+gateway:
+  systemd_unit_name: hermes-gateway-staging
+```
+
+The value must start with an ASCII letter or digit, may contain only ASCII
+letters, digits, `_`, `.`, `@`, `:`, and `-`, and may be at most 128
+characters. A trailing `.service` is accepted and removed automatically;
+slashes, `..`, whitespace, and empty values are rejected.
+
+Set the name before installing the service. Hermes persists the resolved name
+in generated user and system units so gateway-initiated lifecycle operations
+continue to target the same unit. To rename an existing service, uninstall it
+while the old setting is still active, change the setting, then install it
+again. This setting affects Linux systemd units only; macOS launchd labels
+remain profile-derived.
+
 ## Chat Commands (Inside Messaging)
 
 | Command | Description |

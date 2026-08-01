@@ -218,15 +218,24 @@ def uninstall_gateway_service():
     if system == "Linux":
         try:
             from hermes_cli.gateway import (
+                _adopt_persisted_systemd_unit,
+                _systemd_unit_is_managed,
                 get_systemd_unit_path,
                 get_service_name,
                 _systemctl_cmd,
             )
-            svc_name = get_service_name()
 
             for is_system in (False, True):
+                if is_system:
+                    _adopt_persisted_systemd_unit(system=True)
+                svc_name = get_service_name()
                 unit_path = get_systemd_unit_path(system=is_system)
                 if not unit_path.exists():
+                    continue
+                if not _systemd_unit_is_managed(unit_path):
+                    log_warn(
+                        f"Skipping unrelated custom-name unit at {unit_path}"
+                    )
                     continue
 
                 scope = "system" if is_system else "user"

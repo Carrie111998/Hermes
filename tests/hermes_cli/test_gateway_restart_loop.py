@@ -106,6 +106,29 @@ class TestGatewayLifecyclePattern:
     def test_safe_commands(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "systemctl --user restart custom-hermes-service.service",
+            "systemctl --user restart 'custom-hermes-service.service'",
+            'systemctl --user stop "custom-hermes-service.service"',
+            "systemctl --user restart custom-hermes-service.service; echo done",
+            "systemctl --user restart \\\n custom-hermes-service.service",
+        ],
+    )
+    def test_configured_systemd_unit_is_blocked(
+        self, tmp_path, monkeypatch, command
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n  systemd_unit_name: custom-hermes-service\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        assert _contains_gateway_lifecycle_command(command)
+
 
 class TestCronCreateLifecycleBlock:
     """Verify cron create rejects gateway lifecycle prompts."""
@@ -145,7 +168,9 @@ class TestCronCreateLifecycleBlock:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         scripts_dir = tmp_path / ".hermes" / "scripts"
         scripts_dir.mkdir(parents=True)
-        (scripts_dir / "restart.sh").write_text("#!/bin/bash\nhermes gateway restart\n")
+        (scripts_dir / "restart.sh").write_text(
+            "#!/bin/bash\nhermes gateway restart\n", encoding="utf-8"
+        )
         args = Namespace(
             cron_command="create",
             schedule="1h",
@@ -540,6 +565,21 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    def test_blocks_configured_unit_inside_gateway(self, monkeypatch):
+        monkeypatch.setenv("_HERMES_GATEWAY_SYSTEMD_UNIT", "custom-hermes-service")
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(
+            tt.terminal_tool(
+                command="systemctl --user restart custom-hermes-service.service"
+            )
+        )
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -638,7 +678,8 @@ class TestLifecycleGuardModule:
         scripts_dir = tmp_path / ".hermes" / "scripts"
         scripts_dir.mkdir(parents=True)
         (scripts_dir / "restart.sh").write_text(
-            "launchctl kickstart -k gui/501/ai.hermes.gateway\n"
+            "launchctl kickstart -k gui/501/ai.hermes.gateway\n",
+            encoding="utf-8",
         )
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily", "restart.sh")
