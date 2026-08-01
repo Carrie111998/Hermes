@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import numpy as np
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -80,18 +81,32 @@ class FactRetriever:
             jaccard = self._jaccard_similarity(query_tokens, all_tokens)
             fts_score = fact.get("fts_rank", 0.0)
 
-            # HRR similarity
+            # ── 双引擎: HRR + 智谱 Embedding-3 ──
+            hrr_sim = 0.5  # neutral
+            zhipu_sim = 0.5  # neutral
+
+            # HRR 快速筛选
             if self.hrr_weight > 0 and fact.get("hrr_vector"):
                 fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
                 query_vec = hrr.encode_text(query, self.hrr_dim)
                 hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
-            else:
-                hrr_sim = 0.5  # neutral
 
-            # Combine FTS5 + Jaccard + HRR
+            # 智谱语义深度检索
+            if hrr._check_zhipu() and fact.get("zhipu_vector"):
+                fact_zhipu = np.frombuffer(fact["zhipu_vector"], dtype=np.float64).copy()
+                query_zhipu = hrr.encode_with_zhipu(query)
+                if query_zhipu.any():  # 非零向量 = 有效
+                    zhipu_sim = (hrr.zhipu_similarity(query_zhipu, fact_zhipu) + 1.0) / 2.0
+
+            # 动态权重：有智谱时提高其权重
+            zhipu_weight = 0.35 if zhipu_sim > 0.5 else 0.0
+            hrr_effective = self.hrr_weight * (1.0 - zhipu_weight)
+
+            # Combine FTS5 + Jaccard + HRR + Zhipu
             relevance = (self.fts_weight * fts_score
                         + self.jaccard_weight * jaccard
-                        + self.hrr_weight * hrr_sim)
+                        + hrr_effective * hrr_sim
+                        + zhipu_weight * zhipu_sim)
 
             # Trust weighting
             score = relevance * fact["trust_score"]

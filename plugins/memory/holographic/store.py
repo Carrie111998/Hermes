@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    zhipu_vector    BLOB
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -179,6 +180,8 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        if "zhipu_vector" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN zhipu_vector BLOB")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -542,6 +545,18 @@ class MemoryStore:
                 "UPDATE facts SET hrr_vector = ? WHERE fact_id = ?",
                 (hrr.phases_to_bytes(vector), fact_id),
             )
+
+            # ── 智谱 Embedding-3 增强向量 ──
+            if hrr._check_zhipu():
+                try:
+                    zhipu_vec = hrr.encode_with_zhipu(content)
+                    zhipu_bytes = zhipu_vec.tobytes()
+                    self._conn.execute(
+                        "UPDATE facts SET zhipu_vector = ? WHERE fact_id = ?",
+                        (zhipu_bytes, fact_id),
+                    )
+                except Exception:
+                    pass  # 智谱失败不影响主流程
             self._conn.commit()
 
     def _rebuild_bank(self, category: str) -> None:

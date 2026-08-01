@@ -21,6 +21,7 @@ References:
 
 import hashlib
 import logging
+import os
 import struct
 import math
 
@@ -201,3 +202,82 @@ def snr_estimate(dim: int, n_items: int) -> float:
         )
 
     return snr
+
+
+# ── 智谱 Embedding-3 增强层 ──────────────────────────────────────────
+
+_ZHIPU_CACHE: dict[str, "np.ndarray"] = {}
+_ZHIPU_AVAILABLE: bool | None = None
+_ZHIPU_API_KEY: str = ""
+_ZHIPU_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"
+_ZHIPU_EMBED_DIM: int = 2048
+
+
+def _check_zhipu() -> bool:
+    """检测智谱 API 是否可用（API Key + httpx）。"""
+    global _ZHIPU_AVAILABLE, _ZHIPU_API_KEY
+    if _ZHIPU_AVAILABLE is not None:
+        return _ZHIPU_AVAILABLE
+    _ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
+    if not _ZHIPU_API_KEY:
+        _ZHIPU_AVAILABLE = False
+        return False
+    try:
+        import httpx  # noqa: F401
+        _ZHIPU_AVAILABLE = True
+        return True
+    except ImportError:
+        logger.warning("智谱 embedding 需要 httpx: pip install httpx")
+        _ZHIPU_AVAILABLE = False
+        return False
+
+
+def encode_with_zhipu(text: str) -> "np.ndarray":
+    """智谱 Embedding-3 语义编码。
+
+    优先使用缓存，未命中时调用智谱 API。
+    返回 (1024,) float64 numpy 数组。
+    """
+    _require_numpy()
+    if not _check_zhipu():
+        return np.zeros(_ZHIPU_EMBED_DIM, dtype=np.float64)
+
+    cache_key = hashlib.sha256(text.encode()).hexdigest()
+    cached = _ZHIPU_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    import httpx
+    try:
+        resp = httpx.post(
+            f"{_ZHIPU_BASE_URL}/embeddings",
+            headers={
+                "Authorization": f"Bearer {_ZHIPU_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": "embedding-3", "input": text},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        vec = np.array(data["data"][0]["embedding"], dtype=np.float64)
+        _ZHIPU_CACHE[cache_key] = vec
+        return vec
+    except Exception as e:
+        logger.warning(f"智谱 embedding 调用失败: {e}")
+        return np.zeros(_ZHIPU_EMBED_DIM, dtype=np.float64)
+
+
+def zhipu_similarity(a: "np.ndarray", b: "np.ndarray") -> float:
+    """余弦相似度（L2 归一化后点积）。范围 [-1, 1]。"""
+    _require_numpy()
+    a_norm = a / (np.linalg.norm(a) + 1e-10)
+    b_norm = b / (np.linalg.norm(b) + 1e-10)
+    return float(np.dot(a_norm, b_norm))
+
+
+def flush_zhipu_cache() -> None:
+    """清空智谱 embedding 缓存。"""
+    _ZHIPU_CACHE.clear()
+    global _ZHIPU_AVAILABLE
+    _ZHIPU_AVAILABLE = None
