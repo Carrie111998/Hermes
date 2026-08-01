@@ -376,6 +376,97 @@ acquire_deploy_lock() {
   acquire_deploy_lock_at "$1" "$2" "$DEPLOY_LOCK_PATH" "/run" 0 0
 }
 
+prepare_release_staging_directory() {
+  local staging="$1"
+  local expected_short="$2"
+  local owner_uid=""
+  local owner_gid=""
+  case "$staging" in
+    "$RELEASES"/".hermes-agent-$expected_short.tmp."[1-9][0-9]*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [ -e "$staging" ] || [ -L "$staging" ]; then
+    return 1
+  fi
+  owner_uid="$("$SYSTEM_ID" -u "$OWNER")"
+  owner_gid="$("$SYSTEM_ID" -g "$OWNER")"
+  if ! "$SYSTEM_PYTHON" -I -S - \
+    "$RELEASES" "$staging" "$owner_uid" "$owner_gid" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+parent = Path(sys.argv[1])
+staging = Path(sys.argv[2])
+owner_uid = int(sys.argv[3])
+owner_gid = int(sys.argv[4])
+if (
+    not parent.is_absolute()
+    or not staging.is_absolute()
+    or staging.parent != parent
+    or parent.resolve(strict=True) != parent
+):
+    raise SystemExit("BLOCKED_RELEASE_STAGING_PATH_INVALID")
+parent_state = parent.lstat()
+if (
+    stat.S_ISLNK(parent_state.st_mode)
+    or not stat.S_ISDIR(parent_state.st_mode)
+    or parent_state.st_uid != 0
+    or parent_state.st_gid != 0
+    or stat.S_IMODE(parent_state.st_mode) != 0o755
+):
+    raise SystemExit("BLOCKED_RELEASE_PARENT_IDENTITY_INVALID")
+try:
+    os.mkdir(staging, 0o700)
+except FileExistsError:
+    raise SystemExit("BLOCKED_RELEASE_STAGING_ALREADY_EXISTS") from None
+try:
+    os.chown(staging, owner_uid, owner_gid)
+    os.chmod(staging, 0o700)
+    state = staging.lstat()
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISDIR(state.st_mode)
+        or state.st_uid != owner_uid
+        or state.st_gid != owner_gid
+        or stat.S_IMODE(state.st_mode) != 0o700
+    ):
+        raise RuntimeError("release staging identity invalid")
+except BaseException:
+    try:
+        os.rmdir(staging)
+    except OSError:
+        pass
+    raise
+PY
+  then
+    return 1
+  fi
+}
+
+publish_release_staging_directory() {
+  local staging="$1"
+  local release="$2"
+  local expected_short="$3"
+  case "$staging" in
+    "$RELEASES"/".hermes-agent-$expected_short.tmp."[1-9][0-9]*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [ "$release" != "$RELEASES/hermes-agent-$expected_short" ] \
+    || [ -e "$release" ] \
+    || [ -L "$release" ]; then
+    return 1
+  fi
+  mv -T -- "$staging" "$release"
+}
+
 gateway_deploy_topology_json() {
   local observation=""
   observation="$($SYSTEMCTL show --no-pager \
@@ -2546,7 +2637,15 @@ run_deploy() {
       write_status "blocked_active_venv_missing" "$sha" "$pr" "{}"
       exit 4
     fi
-    sudo -n -u "$OWNER" git clone --depth 1 --branch main "$REPO_URL" "$tmp"
+    if ! prepare_release_staging_directory "$tmp" "$short"; then
+      write_status "blocked_release_staging_prepare_failed" "$sha" "$pr" "{}"
+      exit 5
+    fi
+    if ! sudo -n -u "$OWNER" git clone --depth 1 --branch main "$REPO_URL" "$tmp"; then
+      rm -rf "$tmp"
+      write_status "blocked_release_clone_failed" "$sha" "$pr" "{}"
+      exit 5
+    fi
     local clone_head
     clone_head="$(sudo -n -u "$OWNER" git -C "$tmp" rev-parse HEAD)"
     if [ "$clone_head" != "$sha" ]; then
@@ -2615,7 +2714,7 @@ PY"
       rm -rf "$tmp"
       return "$publish_rc"
     }
-    if [ -e "$new" ] || ! sudo -n -u "$OWNER" mv -T "$tmp" "$new"; then
+    if ! publish_release_staging_directory "$tmp" "$new" "$short"; then
       rm -rf "$tmp"
       write_status "blocked_target_release_publish_failed" "$sha" "$pr" "{}"
       exit 5

@@ -925,7 +925,10 @@ def test_deploy_staging_dependency_package_is_final_address_bound():
         '--release-address "$new"',
         verify,
     )
-    move = run_deploy.index('mv -T "$tmp" "$new"', verify_address)
+    move = run_deploy.index(
+        'publish_release_staging_directory "$tmp" "$new" "$short"',
+        verify_address,
+    )
 
     assert (
         prepare
@@ -952,7 +955,9 @@ def test_deploy_reinstalls_and_attests_entrypoints_at_final_address():
     source = helper.read_text(encoding="utf-8")
     run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
 
-    publish = run_deploy.index('mv -T "$tmp" "$new"')
+    publish = run_deploy.index(
+        'publish_release_staging_directory "$tmp" "$new" "$short"'
+    )
     identity = run_deploy.index('release_identity_matches "$new" "$sha"')
     final_install = run_deploy.index(
         'install_target_release_wheel "$new" "$new"',
@@ -1006,7 +1011,10 @@ def test_deploy_lock_and_active_release_rechecks_precede_target_mutations():
         'active="$(readlink -f "$ACTIVE_LINK" 2>/dev/null || true)"'
     )
     publish_guard = run_deploy.index('"pre_release_publish"')
-    publish = run_deploy.index('mv -T "$tmp" "$new"', publish_guard)
+    publish = run_deploy.index(
+        'publish_release_staging_directory "$tmp" "$new" "$short"',
+        publish_guard,
+    )
     final_install_guard = run_deploy.index('"pre_final_address_wheel_install"')
     final_install = run_deploy.index(
         'install_target_release_wheel "$new" "$new"',
@@ -1030,6 +1038,45 @@ def test_deploy_lock_and_active_release_rechecks_precede_target_mutations():
     assert 'exec 9<>"$lock_path"' in lock_function
     assert '"$SYSTEM_FLOCK" --exclusive --nonblock 9' in lock_function
     assert "blocked_concurrent_deploy" in lock_function
+
+
+def test_root_owned_release_parent_keeps_staging_and_publish_authority_at_root():
+    helper = RUNTIME / "muncho-auto-deploy-release"
+    source = helper.read_text(encoding="utf-8")
+    prepare = source[
+        source.index("prepare_release_staging_directory() {") : source.index(
+            "publish_release_staging_directory() {"
+        )
+    ]
+    publish = source[
+        source.index("publish_release_staging_directory() {") : source.index(
+            "gateway_deploy_topology_json() {"
+        )
+    ]
+    run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
+
+    prepare_call = run_deploy.index(
+        'prepare_release_staging_directory "$tmp" "$short"'
+    )
+    clone = run_deploy.index(
+        'sudo -n -u "$OWNER" git clone --depth 1 --branch main',
+        prepare_call,
+    )
+    publish_guard = run_deploy.index('"pre_release_publish"')
+    publish_call = run_deploy.index(
+        'publish_release_staging_directory "$tmp" "$new" "$short"',
+        publish_guard,
+    )
+
+    assert "parent_state.st_uid != 0" in prepare
+    assert "parent_state.st_gid != 0" in prepare
+    assert "stat.S_IMODE(parent_state.st_mode) != 0o755" in prepare
+    assert "os.mkdir(staging, 0o700)" in prepare
+    assert "os.chown(staging, owner_uid, owner_gid)" in prepare
+    assert '[ -L "$release" ]' in publish
+    assert 'mv -T -- "$staging" "$release"' in publish
+    assert prepare_call < clone < publish_guard < publish_call
+    assert 'sudo -n -u "$OWNER" mv -T "$tmp" "$new"' not in run_deploy
 
 
 def test_already_active_fast_path_is_read_only_and_fully_attested():
