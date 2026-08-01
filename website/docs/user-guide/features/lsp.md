@@ -94,6 +94,18 @@ manager makes sense for that language (rustup, ghcup, opam, brew,
 …). Hermes auto-detects the binary on PATH or in
 `<HERMES_HOME>/lsp/bin/`.
 
+### Laravel Blade
+
+laravel-lsp is installed via Composer:
+
+```bash
+composer global require laravel/lsp
+```
+
+Hermes detects the `laravel-lsp` binary on PATH (typically at
+`~/.config/composer/vendor/bin/laravel-lsp`) and routes `.blade.php`
+files to it. Plain `.php` files continue to use intelephense.
+
 ### PowerShell
 
 PowerShellEditorServices isn't a single binary — it's a PowerShell
