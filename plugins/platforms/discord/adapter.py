@@ -524,6 +524,15 @@ class VoiceReceiver:
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
+        # Privacy-safe transport counters. Packet callbacks pin the active
+        # playback token at entry; per-token stats remain alive until every
+        # in-flight callback that saw that token has finished.
+        self._transport_stats: Dict[str, int] = defaultdict(int)
+        self._playback_transport_stats: Dict[int, Dict[str, int]] = {}
+        self._playback_seen_ssrcs: Dict[int, set[int]] = {}
+        self._playback_inflight: Dict[int, int] = defaultdict(int)
+        self._playback_ending_tokens: set[int] = set()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -554,28 +563,99 @@ class VoiceReceiver:
             self._ssrc_to_user.clear()
             self._playback_capture_token = None
             self._buffer_playback_tokens.clear()
+            self._playback_transport_stats.clear()
+            self._playback_seen_ssrcs.clear()
+            self._playback_inflight.clear()
+            self._playback_ending_tokens.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
-        self._paused = True
+        with self._lock:
+            self._paused = True
 
     def resume(self):
-        self._paused = False
+        with self._lock:
+            self._paused = False
+
+    def snapshot_transport_stats(self) -> Dict[str, int]:
+        """Return an immutable snapshot of privacy-safe receive counters."""
+        with self._lock:
+            return dict(self._transport_stats)
+
+    def _take_playback_summary_locked(
+        self,
+        token: int,
+    ) -> Optional[Tuple[Optional[Dict[str, int]], int]]:
+        if token not in self._playback_ending_tokens:
+            return None
+        if self._playback_inflight.get(token, 0) > 0:
+            return None
+        self._playback_ending_tokens.discard(token)
+        self._playback_inflight.pop(token, None)
+        stats = self._playback_transport_stats.pop(token, None)
+        seen_count = len(self._playback_seen_ssrcs.pop(token, set()))
+        return (dict(stats) if stats is not None else None, seen_count)
+
+    @staticmethod
+    def _log_playback_summary(
+        token: int,
+        summary: Tuple[Optional[Dict[str, int]], int],
+    ) -> None:
+        stats, seen_count = summary
+        if stats is None:
+            logger.info(
+                "Discord voice playback capture summary token=%s baseline=missing",
+                token,
+            )
+            return
+        logger.info(
+            "Discord voice playback capture summary token=%s udp=%d paused=%d "
+            "voice_rtp=%d non_bot=%d ssrcs=%d decoded=%d tagged=%d "
+            "pcm_bytes=%d decrypt_fail=%d dave_fail=%d opus_fail=%d",
+            token,
+            stats.get("udp_callbacks", 0),
+            stats.get("paused_drops", 0),
+            stats.get("voice_rtp_packets", 0),
+            stats.get("non_bot_rtp_packets", 0),
+            seen_count,
+            stats.get("decoded_packets", 0),
+            stats.get("playback_tagged_packets", 0),
+            stats.get("decoded_pcm_bytes", 0),
+            stats.get("nacl_decrypt_failures", 0),
+            stats.get("dave_decrypt_failures", 0),
+            stats.get("opus_decode_failures", 0),
+        )
 
     def begin_playback_capture(self, token: int) -> None:
         """Enable and tag inbound capture for one TTS playback."""
         with self._lock:
             self._playback_capture_token = token
+            self._playback_transport_stats[token] = defaultdict(int)
+            self._playback_seen_ssrcs[token] = set()
+            self._playback_inflight[token] = 0
+            self._playback_ending_tokens.discard(token)
             # Capture mode must override any echo-prevention pause left on the
             # real receiver. Set the token first so the SocketReader thread
             # cannot admit an untagged playback packet during the transition.
             self._paused = False
+        logger.info("Discord voice playback capture armed (token=%s)", token)
 
     def end_playback_capture(self, token: int) -> None:
-        """Stop tagging new packets without erasing pending tagged buffers."""
+        """Stop new tagging; finalize after token-pinned callbacks drain."""
         with self._lock:
             if self._playback_capture_token == token:
                 self._playback_capture_token = None
+            self._playback_ending_tokens.add(token)
+            inflight = self._playback_inflight.get(token, 0)
+            summary = self._take_playback_summary_locked(token)
+        if summary is not None:
+            self._log_playback_summary(token, summary)
+        else:
+            logger.info(
+                "Discord voice playback capture draining token=%s inflight=%d",
+                token,
+                inflight,
+            )
 
     # ------------------------------------------------------------------
     # SSRC -> user_id mapping via SPEAKING opcode hook
@@ -623,149 +703,243 @@ class VoiceReceiver:
     # ------------------------------------------------------------------
 
     def _on_packet(self, data: bytes):
-        if not self._running or self._paused:
-            return
+        # Pin the playback token once at callback entry. A playback may finish
+        # while NaCl/DAVE/Opus work is still running; every result from this
+        # callback must keep the entry token rather than re-reading live state.
+        packet_stats: Dict[str, int] = defaultdict(int)
+        packet_stats["udp_callbacks"] = 1
+        packet_token: Optional[int] = None
+        decoded_pcm: Optional[bytes] = None
+        decoded_ssrc: Optional[int] = None
+        seen_ssrc: Optional[int] = None
+        reset_decoder = False
+        summary = None
 
-        # Log first few raw packets for debugging
-        self._packet_debug_count += 1
-        if self._packet_debug_count <= 5:
-            logger.debug(
-                "Raw UDP packet: len=%d, first_bytes=%s",
-                len(data), data[:4].hex() if len(data) >= 4 else "short",
-            )
+        with self._lock:
+            running = self._running
+            paused = self._paused
+            packet_token = self._playback_capture_token
+            if packet_token is not None:
+                self._playback_inflight[packet_token] += 1
 
-        if len(data) < 16:
-            return
+        try:
+            if not running:
+                packet_stats["not_running_drops"] += 1
+                return
+            if paused:
+                packet_stats["paused_drops"] += 1
+                return
 
-        # RTP version check: top 2 bits must be 10 (version 2).
-        # Lower bits may vary (padding, extension, CSRC count).
-        # Payload type (byte 1 lower 7 bits) = 0x78 (120) for voice.
-        if (data[0] >> 6) != 2 or (data[1] & 0x7F) != 0x78:
+            # Log first few raw packets for debugging
+            self._packet_debug_count += 1
             if self._packet_debug_count <= 5:
-                logger.debug("Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1])
-            return
+                logger.debug(
+                    "Raw UDP packet: len=%d, first_bytes=%s",
+                    len(data), data[:4].hex() if len(data) >= 4 else "short",
+                )
 
-        first_byte = data[0]
-        _, _, seq, timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
+            if len(data) < 16:
+                packet_stats["short_packet_drops"] += 1
+                return
 
-        # Skip bot's own audio
-        if ssrc == self._bot_ssrc:
-            return
+            # RTP version check: top 2 bits must be 10 (version 2).
+            # Lower bits may vary (padding, extension, CSRC count).
+            # Payload type (byte 1 lower 7 bits) = 0x78 (120) for voice.
+            if (data[0] >> 6) != 2 or (data[1] & 0x7F) != 0x78:
+                packet_stats["non_voice_rtp_drops"] += 1
+                if self._packet_debug_count <= 5:
+                    logger.debug(
+                        "Skipped non-RTP: byte0=0x%02x byte1=0x%02x",
+                        data[0],
+                        data[1],
+                    )
+                return
 
-        # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
-        cc = first_byte & 0x0F  # CSRC count
-        has_extension = bool(first_byte & 0x10)  # extension bit
-        has_padding = bool(first_byte & 0x20)  # padding bit (RFC 3550 §5.1)
-        header_size = 12 + (4 * cc) + (4 if has_extension else 0)
+            packet_stats["voice_rtp_packets"] += 1
+            first_byte = data[0]
+            _, _, seq, timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
 
-        if len(data) < header_size + 4:  # need at least header + nonce
-            return
+            # Skip bot's own audio
+            if ssrc == self._bot_ssrc:
+                packet_stats["bot_rtp_packets"] += 1
+                return
+            packet_stats["non_bot_rtp_packets"] += 1
+            seen_ssrc = ssrc
 
-        # Read extension length from preamble (for skipping after decrypt)
-        ext_data_len = 0
-        if has_extension:
-            ext_preamble_offset = 12 + (4 * cc)
-            ext_words = struct.unpack_from(">H", data, ext_preamble_offset + 2)[0]
-            ext_data_len = ext_words * 4
+            # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
+            cc = first_byte & 0x0F  # CSRC count
+            has_extension = bool(first_byte & 0x10)  # extension bit
+            has_padding = bool(first_byte & 0x20)  # padding bit (RFC 3550 §5.1)
+            header_size = 12 + (4 * cc) + (4 if has_extension else 0)
 
-        if self._packet_debug_count <= 10:
-            with self._lock:
-                known_user = self._ssrc_to_user.get(ssrc, "unknown")
-            logger.debug(
-                "RTP packet: ssrc=%d, seq=%d, user=%s, hdr=%d, ext_data=%d",
-                ssrc, seq, known_user, header_size, ext_data_len,
-            )
+            if len(data) < header_size + 4:  # need at least header + nonce
+                packet_stats["short_payload_drops"] += 1
+                return
 
-        header = bytes(data[:header_size])
-        payload_with_nonce = data[header_size:]
+            # Read extension length from preamble (for skipping after decrypt)
+            ext_data_len = 0
+            if has_extension:
+                ext_preamble_offset = 12 + (4 * cc)
+                ext_words = struct.unpack_from(">H", data, ext_preamble_offset + 2)[0]
+                ext_data_len = ext_words * 4
 
-        # --- NaCl transport decrypt (aead_xchacha20_poly1305_rtpsize) ---
-        if len(payload_with_nonce) < 4:
-            return
-        nonce = bytearray(24)
-        nonce[:4] = payload_with_nonce[-4:]
-        encrypted = bytes(payload_with_nonce[:-4])
-
-        try:
-            import nacl.secret  # noqa: E402 — delayed import, only in voice path
-            box = nacl.secret.Aead(self._secret_key)
-            decrypted = box.decrypt(encrypted, header, bytes(nonce))
-        except Exception as e:
             if self._packet_debug_count <= 10:
-                logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
-            return
+                with self._lock:
+                    known_user = self._ssrc_to_user.get(ssrc, "unknown")
+                logger.debug(
+                    "RTP packet: ssrc=%d, seq=%d, user=%s, hdr=%d, ext_data=%d",
+                    ssrc,
+                    seq,
+                    known_user,
+                    header_size,
+                    ext_data_len,
+                )
 
-        # Skip encrypted extension data to get the actual opus payload
-        if ext_data_len and len(decrypted) > ext_data_len:
-            decrypted = decrypted[ext_data_len:]
+            header = bytes(data[:header_size])
+            payload_with_nonce = data[header_size:]
 
-        # --- Strip RTP padding (RFC 3550 §5.1) ---
-        # When the P bit is set, the last payload byte holds the count of
-        # trailing padding bytes (including itself) that must be removed
-        # before further processing. Skipping this passes padding-contaminated
-        # bytes into DAVE/Opus and corrupts inbound audio.
-        if has_padding:
-            if not decrypted:
+            # --- NaCl transport decrypt (aead_xchacha20_poly1305_rtpsize) ---
+            if len(payload_with_nonce) < 4:
+                packet_stats["short_nonce_drops"] += 1
+                return
+            nonce = bytearray(24)
+            nonce[:4] = payload_with_nonce[-4:]
+            encrypted = bytes(payload_with_nonce[:-4])
+
+            try:
+                import nacl.secret  # noqa: E402 — delayed import, only in voice path
+                box = nacl.secret.Aead(self._secret_key)
+                decrypted = box.decrypt(encrypted, header, bytes(nonce))
+            except Exception as e:
+                packet_stats["nacl_decrypt_failures"] += 1
                 if self._packet_debug_count <= 10:
                     logger.warning(
-                        "RTP padding bit set but no payload (ssrc=%d)", ssrc,
+                        "NaCl decrypt failed: %s (hdr=%d, enc=%d)",
+                        e,
+                        header_size,
+                        len(encrypted),
                     )
-                return
-            pad_len = decrypted[-1]
-            if pad_len == 0 or pad_len > len(decrypted):
-                if self._packet_debug_count <= 10:
-                    logger.warning(
-                        "Invalid RTP padding length %d for payload size %d (ssrc=%d)",
-                        pad_len, len(decrypted), ssrc,
-                    )
-                return
-            decrypted = decrypted[:-pad_len]
-            if not decrypted:
-                # Padding consumed entire payload — nothing to decode
                 return
 
-        # --- DAVE E2EE decrypt ---
-        if self._dave_session:
-            with self._lock:
-                user_id = self._ssrc_to_user.get(ssrc, 0)
-            if user_id:
-                try:
-                    import davey
-                    decrypted = self._dave_session.decrypt(
-                        user_id, davey.MediaType.audio, decrypted
-                    )
-                except Exception as e:
-                    # Unencrypted passthrough — use NaCl-decrypted data as-is
-                    if "Unencrypted" not in str(e):
-                        if self._packet_debug_count <= 10:
-                            logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
-                        return
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
-            # Opus decode directly — audio may be in passthrough mode.
-            # Buffer will get a user_id when SPEAKING event arrives later.
+            # Skip encrypted extension data to get the actual opus payload
+            if ext_data_len and len(decrypted) > ext_data_len:
+                decrypted = decrypted[ext_data_len:]
 
-        # --- Opus decode -> PCM ---
-        try:
-            if ssrc not in self._decoders:
-                self._decoders[ssrc] = discord.opus.Decoder()
-            pcm = self._decoders[ssrc].decode(decrypted)
+            # --- Strip RTP padding (RFC 3550 §5.1) ---
+            if has_padding:
+                if not decrypted:
+                    packet_stats["invalid_padding_drops"] += 1
+                    if self._packet_debug_count <= 10:
+                        logger.warning(
+                            "RTP padding bit set but no payload (ssrc=%d)", ssrc,
+                        )
+                    return
+                pad_len = decrypted[-1]
+                if pad_len == 0 or pad_len > len(decrypted):
+                    packet_stats["invalid_padding_drops"] += 1
+                    if self._packet_debug_count <= 10:
+                        logger.warning(
+                            "Invalid RTP padding length %d for payload size %d (ssrc=%d)",
+                            pad_len,
+                            len(decrypted),
+                            ssrc,
+                        )
+                    return
+                decrypted = decrypted[:-pad_len]
+                if not decrypted:
+                    packet_stats["padding_only_drops"] += 1
+                    return
+
+            # --- DAVE E2EE decrypt ---
+            if self._dave_session:
+                with self._lock:
+                    user_id = self._ssrc_to_user.get(ssrc, 0)
+                if user_id:
+                    try:
+                        import davey
+                        decrypted = self._dave_session.decrypt(
+                            user_id, davey.MediaType.audio, decrypted
+                        )
+                    except Exception as e:
+                        # Unencrypted passthrough — use NaCl-decrypted data as-is
+                        if "Unencrypted" not in str(e):
+                            packet_stats["dave_decrypt_failures"] += 1
+                            if self._packet_debug_count <= 10:
+                                logger.warning(
+                                    "DAVE decrypt failed for ssrc=%d: %s", ssrc, e
+                                )
+                            return
+                # If SSRC unknown, skip DAVE and try Opus directly.
+
+            # --- Opus decode -> PCM ---
+            try:
+                if ssrc not in self._decoders:
+                    self._decoders[ssrc] = discord.opus.Decoder()
+                decoded_pcm = self._decoders[ssrc].decode(decrypted)
+                decoded_ssrc = ssrc
+                packet_stats["decoded_packets"] += 1
+                packet_stats["decoded_pcm_bytes"] += len(decoded_pcm)
+            except Exception as e:
+                packet_stats["opus_decode_failures"] += 1
+                reset_decoder = True
+                logger.debug(
+                    "Opus decode error for SSRC %s; reset decoder: %s",
+                    ssrc,
+                    e,
+                )
+                return
+        finally:
+            # One critical section commits this callback's counters and PCM.
+            # No INFO logging runs while the receive lock is held.
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
-                if self._playback_capture_token is not None:
-                    self._buffer_playback_tokens.setdefault(
-                        ssrc,
-                        self._playback_capture_token,
+                for key, amount in packet_stats.items():
+                    self._transport_stats[key] += amount
+                if packet_token is not None:
+                    token_stats = self._playback_transport_stats.get(packet_token)
+                    if token_stats is not None:
+                        for key, amount in packet_stats.items():
+                            token_stats[key] = token_stats.get(key, 0) + amount
+                        if seen_ssrc is not None:
+                            self._playback_seen_ssrcs.setdefault(
+                                packet_token, set()
+                            ).add(seen_ssrc)
+
+                if reset_decoder and decoded_ssrc is not None:
+                    self._decoders.pop(decoded_ssrc, None)
+                elif reset_decoder and seen_ssrc is not None:
+                    self._decoders.pop(seen_ssrc, None)
+
+                if (
+                    decoded_pcm is not None
+                    and decoded_ssrc is not None
+                    and self._running
+                ):
+                    self._buffers[decoded_ssrc].extend(decoded_pcm)
+                    self._last_packet_time[decoded_ssrc] = time.monotonic()
+                    if packet_token is not None:
+                        self._transport_stats["playback_tagged_packets"] += 1
+                        token_stats = self._playback_transport_stats.get(packet_token)
+                        if token_stats is not None:
+                            token_stats["playback_tagged_packets"] = (
+                                token_stats.get("playback_tagged_packets", 0) + 1
+                            )
+                        self._buffer_playback_tokens.setdefault(
+                            decoded_ssrc,
+                            packet_token,
+                        )
+
+                if (
+                    packet_token is not None
+                    and packet_token in self._playback_inflight
+                ):
+                    self._playback_inflight[packet_token] = max(
+                        0,
+                        self._playback_inflight[packet_token] - 1,
                     )
-        except Exception as e:
-            with self._lock:
-                self._decoders.pop(ssrc, None)
-            logger.debug(
-                "Opus decode error for SSRC %s; reset decoder: %s",
-                ssrc,
-                e,
-            )
-            return
+                    summary = self._take_playback_summary_locked(packet_token)
+
+            if summary is not None and packet_token is not None:
+                self._log_playback_summary(packet_token, summary)
 
     # ------------------------------------------------------------------
     # Silence detection
@@ -801,6 +975,7 @@ class VoiceReceiver:
         """Return completed utterances, optionally with playback tokens."""
         now = time.monotonic()
         completed = []
+        endpoint_logs = []
 
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
@@ -817,12 +992,20 @@ class VoiceReceiver:
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
-                        # Infer from allowed users in the voice channel.
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
                         playback_token = self._buffer_playback_tokens.get(ssrc)
                         item = (user_id, bytes(buf), playback_token)
                         completed.append(item if with_context else item[:2])
+                        if playback_token is not None:
+                            endpoint_logs.append(
+                                (
+                                    playback_token,
+                                    len(buf),
+                                    round(buf_duration * 1000),
+                                    round(silence_duration * 1000),
+                                )
+                            )
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
                     self._buffer_playback_tokens.pop(ssrc, None)
@@ -832,11 +1015,21 @@ class VoiceReceiver:
                     self._last_packet_time.pop(ssrc, None)
                     self._buffer_playback_tokens.pop(ssrc, None)
 
+        for playback_token, pcm_bytes, duration_ms, silence_ms in endpoint_logs:
+            logger.info(
+                "Discord voice endpoint playback=%s pcm_bytes=%d "
+                "duration_ms=%d silence_ms=%d mapped=true",
+                playback_token,
+                pcm_bytes,
+                duration_ms,
+                silence_ms,
+            )
         return completed
 
     def flush_pending(self, *, with_context: bool = False) -> list:
         """Return pending utterances, optionally with playback tokens."""
         completed = []
+        flush_logs = []
 
         with self._lock:
             ssrc_user_map = dict(self._ssrc_to_user)
@@ -851,10 +1044,26 @@ class VoiceReceiver:
                         playback_token = self._buffer_playback_tokens.get(ssrc)
                         item = (user_id, bytes(buf), playback_token)
                         completed.append(item if with_context else item[:2])
+                        if playback_token is not None:
+                            flush_logs.append(
+                                (
+                                    playback_token,
+                                    len(buf),
+                                    round(buf_duration * 1000),
+                                )
+                            )
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
                 self._buffer_playback_tokens.pop(ssrc, None)
 
+        for playback_token, pcm_bytes, duration_ms in flush_logs:
+            logger.info(
+                "Discord voice flush playback=%s pcm_bytes=%d "
+                "duration_ms=%d mapped=true",
+                playback_token,
+                pcm_bytes,
+                duration_ms,
+            )
         return completed
 
     # ------------------------------------------------------------------
@@ -3879,13 +4088,14 @@ class DiscordAdapter(BasePlatformAdapter):
         """Read the opt-in conservative TTS interruption policy.
 
         ``discord.voice_barge_in`` is disabled by default and has no default
-        phrases. Barge-in acknowledgements are a separate opt-in and also have
-        no defaults. This preserves the existing privacy boundary: Discord does
-        not keep broad-capture enabled during bot speech unless the user
-        explicitly supplies strong phrases such as ``세린아 멈춰``.
+        phrases. ``monitor_only`` is a separate opt-in that captures and logs
+        privacy-safe transport/STT metadata without interrupting playback,
+        acknowledging, or routing a model turn. Barge-in acknowledgements are
+        also a separate opt-in with no defaults.
         """
         defaults: Dict[str, Any] = {
             "enabled": False,
+            "monitor_only": False,
             "phrases": (),
             "min_trailing_characters": 2,
             "ack_enabled": False,
@@ -3925,6 +4135,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return tuple(cleaned)
 
             enabled = _as_bool(raw.get("enabled", False))
+            monitor_only = _as_bool(raw.get("monitor_only", False))
             ack_enabled = _as_bool(raw.get("ack_enabled", False))
 
             phrases_raw = raw.get("phrases", ())
@@ -3945,10 +4156,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 min_chars = 2
 
             return {
-                "enabled": enabled,
+                # monitor_only is fail-closed and always wins over live side
+                # effects, even when a contradictory config enables both.
+                "enabled": enabled and not monitor_only,
+                "monitor_only": monitor_only,
                 "phrases": tuple(phrases),
                 "min_trailing_characters": min(100, max(1, min_chars)),
-                "ack_enabled": ack_enabled,
+                "ack_enabled": ack_enabled and not monitor_only,
                 "stop_ack_phrases": _ack_phrases("stop_ack_phrases"),
                 "follow_up_ack_phrases": _ack_phrases("follow_up_ack_phrases"),
             }
@@ -3958,7 +4172,55 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _voice_barge_in_enabled(self) -> bool:
         cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
-        return bool(cfg.get("enabled") and cfg.get("phrases"))
+        return bool(
+            not cfg.get("monitor_only")
+            and cfg.get("enabled")
+            and cfg.get("phrases")
+        )
+
+    def _voice_barge_in_monitor_only(self) -> bool:
+        cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
+        return bool(cfg.get("monitor_only") and cfg.get("phrases"))
+
+    def _voice_barge_in_capture_enabled(self) -> bool:
+        return self._voice_barge_in_enabled() or self._voice_barge_in_monitor_only()
+
+    def _next_voice_barge_in_ack_phrase(self, kind: str) -> Optional[str]:
+        """Return the next configured stop/follow-up ack in round-robin order."""
+        cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
+        if (
+            cfg.get("monitor_only")
+            or not cfg.get("ack_enabled")
+            or kind not in {"stop", "follow_up"}
+        ):
+            return None
+        phrases = cfg.get(f"{kind}_ack_phrases") or ()
+        if not phrases:
+            return None
+
+        indices = getattr(self, "_voice_barge_in_ack_indices", None)
+        if not isinstance(indices, dict):
+            indices = {"stop": 0, "follow_up": 0}
+            self._voice_barge_in_ack_indices = indices
+        index = int(indices.get(kind, 0) or 0)
+        indices[kind] = index + 1
+        return phrases[index % len(phrases)]
+
+    async def _play_voice_barge_in_ack(self, guild_id: int, kind: str) -> bool:
+        """Best-effort barge-in ack on the shared interruptible playback path."""
+        try:
+            phrase = self._next_voice_barge_in_ack_phrase(kind)
+            if not phrase:
+                return False
+            return await self.play_ack_in_voice(guild_id, phrase)
+        except Exception:
+            logger.debug(
+                "Discord voice barge-in %s ack failed (guild=%s)",
+                kind,
+                guild_id,
+                exc_info=True,
+            )
+            return False
 
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
@@ -4437,13 +4699,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 return playback_state
             playback_state = self._begin_voice_playback(guild_id)
             if receiver is not None:
-                if self._voice_barge_in_enabled():
+                if self._voice_barge_in_capture_enabled():
                     receiver.begin_playback_capture(playback_state.token)
                     receiver_capturing = True
                 else:
                     # Mixer and legacy paths share the same echo-prevention
                     # default. Broad inbound capture during bot speech remains
-                    # off unless strict configured phrases are enabled.
+                    # off unless strict phrases are enabled for live or
+                    # monitor-only capture.
                     receiver.pause()
                     receiver_paused = True
             return playback_state
@@ -4756,23 +5019,88 @@ class DiscordAdapter(BasePlatformAdapter):
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
+        audio_ms = round(
+            len(pcm_data)
+            / (VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2)
+            * 1000
+        )
+        stt_started: Optional[float] = None
+        processing_stage = "pcm_to_wav"
         try:
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
 
             from tools.transcription_tools import transcribe_audio
+            processing_stage = "stt"
+            stt_started = time.monotonic()
+            if playback_token is not None:
+                logger.info(
+                    "Discord barge-in STT start playback=%s pcm_bytes=%d audio_ms=%d",
+                    playback_token,
+                    len(pcm_data),
+                    audio_ms,
+                )
             result = await asyncio.to_thread(transcribe_audio, wav_path)
+            stt_ms = round((time.monotonic() - stt_started) * 1000)
 
             if not result.get("success"):
+                if playback_token is not None:
+                    logger.info(
+                        "Discord barge-in STT decision playback=%s "
+                        "pcm_bytes=%d audio_ms=%d stt_ms=%d outcome=stt_failed",
+                        playback_token,
+                        len(pcm_data),
+                        audio_ms,
+                        stt_ms,
+                    )
                 return
             transcript = result.get("transcript", "").strip()
             if not transcript:
+                if playback_token is not None:
+                    logger.info(
+                        "Discord barge-in STT decision playback=%s "
+                        "pcm_bytes=%d audio_ms=%d stt_ms=%d outcome=empty",
+                        playback_token,
+                        len(pcm_data),
+                        audio_ms,
+                        stt_ms,
+                    )
                 return
 
             if playback_token is not None:
                 cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
                 phrases = cfg.get("phrases") or ()
-                if not self._voice_barge_in_enabled():
+                live_enabled = self._voice_barge_in_enabled()
+                monitor_only = self._voice_barge_in_monitor_only()
+                if not (live_enabled or monitor_only):
                     return
+                matched, trailing = _match_voice_barge_in_phrase(
+                    transcript,
+                    tuple(phrases),
+                )
+                logger.info(
+                    "Discord barge-in STT decision playback=%s "
+                    "pcm_bytes=%d audio_ms=%d stt_ms=%d transcript_chars=%d "
+                    "matched=%s trailing_chars=%d",
+                    playback_token,
+                    len(pcm_data),
+                    audio_ms,
+                    stt_ms,
+                    len(transcript),
+                    matched,
+                    len(trailing),
+                )
+                # Fail closed: monitor-only always returns before stale-state,
+                # interruption, acknowledgement, claim, or model routing.
+                if monitor_only:
+                    logger.info(
+                        "Discord barge-in monitor-only playback=%s matched=%s "
+                        "follow_up_candidate=%s",
+                        playback_token,
+                        matched,
+                        bool(trailing),
+                    )
+                    return
+
                 current_state = getattr(self, "_voice_playback_states", {}).get(
                     guild_id
                 )
@@ -4787,10 +5115,6 @@ class DiscordAdapter(BasePlatformAdapter):
                         current_state.token,
                     )
                     return
-                matched, trailing = _match_voice_barge_in_phrase(
-                    transcript,
-                    tuple(phrases),
-                )
                 if not matched:
                     logger.debug(
                         "Discarded Discord voice captured during playback: no barge-in phrase"
@@ -4804,17 +5128,27 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     return
 
-                self._interrupt_voice_playback(guild_id, playback_token)
+                interrupted = self._interrupt_voice_playback(guild_id, playback_token)
                 usable_characters = len(re.findall(r"\w", trailing, flags=re.UNICODE))
                 min_characters = int(cfg.get("min_trailing_characters", 2) or 2)
-                if (
-                    not trailing
-                    or usable_characters < min_characters
-                    or is_whisper_hallucination(trailing)
-                ):
-                    await self._play_voice_barge_in_ack(guild_id, "stop")
+                has_follow_up = bool(
+                    trailing
+                    and usable_characters >= min_characters
+                    and not is_whisper_hallucination(trailing)
+                )
+                logger.info(
+                    "Discord barge-in accepted playback=%s "
+                    "interrupted=%s follow_up=%s",
+                    playback_token,
+                    interrupted,
+                    has_follow_up,
+                )
+                await self._play_voice_barge_in_ack(
+                    guild_id,
+                    "follow_up" if has_follow_up else "stop",
+                )
+                if not has_follow_up:
                     return
-                await self._play_voice_barge_in_ack(guild_id, "follow_up")
                 transcript = trailing
             elif is_whisper_hallucination(transcript):
                 return
@@ -4828,6 +5162,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     transcript=transcript,
                 )
         except Exception as e:
+            if playback_token is not None:
+                stt_ms = (
+                    round((time.monotonic() - stt_started) * 1000)
+                    if stt_started is not None
+                    else 0
+                )
+                logger.info(
+                    "Discord barge-in STT decision playback=%s pcm_bytes=%d "
+                    "audio_ms=%d stt_ms=%d outcome=exception stage=%s type=%s",
+                    playback_token,
+                    len(pcm_data),
+                    audio_ms,
+                    stt_ms,
+                    processing_stage,
+                    type(e).__name__,
+                )
             logger.warning("Voice input processing failed: %s", e, exc_info=True)
         finally:
             try:

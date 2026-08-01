@@ -72,6 +72,7 @@ class _Mixer:
 def _make_adapter(
     *,
     enabled=True,
+    monitor_only=False,
     phrases=KOREAN_PHRASES,
     ack_enabled=False,
     stop_ack_phrases=(),
@@ -99,6 +100,7 @@ def _make_adapter(
     adapter._voice_fx_cfg = {"speech_gain": 1.0, "lead_silence_ms": 0}
     adapter._voice_barge_in_cfg = {
         "enabled": enabled,
+        "monitor_only": monitor_only,
         "phrases": tuple(phrases),
         "min_trailing_characters": 2,
         "ack_enabled": ack_enabled,
@@ -158,6 +160,7 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
         default_adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
     assert default_adapter._voice_barge_in_cfg == {
         "enabled": False,
+        "monitor_only": False,
         "phrases": (),
         "min_trailing_characters": 2,
         "ack_enabled": False,
@@ -171,6 +174,7 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
             "discord": {
                 "voice_barge_in": {
                     "enabled": True,
+                    "monitor_only": False,
                     "phrases": [" 세린아 멈춰 ", "", 123, "세린아 잠깐"],
                     "min_trailing_characters": 3,
                     "ack_enabled": "yes",
@@ -192,12 +196,40 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
         configured = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
     assert configured._voice_barge_in_cfg == {
         "enabled": True,
+        "monitor_only": False,
         "phrases": KOREAN_PHRASES,
         "min_trailing_characters": 3,
         "ack_enabled": True,
         "stop_ack_phrases": ("네, 멈출게요.",),
         "follow_up_ack_phrases": ("말씀하세요.", "이어갈게요."),
     }
+
+
+def test_monitor_only_normalizes_contradictory_live_and_ack_flags_off():
+    from gateway.config import PlatformConfig
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    with patch(
+        "hermes_cli.config.read_raw_config",
+        return_value={
+            "discord": {
+                "voice_barge_in": {
+                    "enabled": True,
+                    "monitor_only": True,
+                    "phrases": ["하나야 멈춰"],
+                    "ack_enabled": True,
+                }
+            }
+        },
+    ):
+        adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+    assert adapter._voice_barge_in_cfg["enabled"] is False
+    assert adapter._voice_barge_in_cfg["monitor_only"] is True
+    assert adapter._voice_barge_in_cfg["ack_enabled"] is False
+    assert adapter._voice_barge_in_enabled() is False
+    assert adapter._voice_barge_in_monitor_only() is True
+    assert adapter._voice_barge_in_capture_enabled() is True
 
 
 def test_playback_capture_reactivates_a_started_receiver_left_paused():
@@ -407,6 +439,22 @@ async def test_playback_echo_without_phrase_never_reaches_model():
 
 
 @pytest.mark.asyncio
+async def test_playback_gate_logs_decision_without_transcript_content(caplog):
+    adapter = _make_adapter()
+    state = adapter._begin_voice_playback(111)
+    transcript = "민감한 내용이지만 호출어는 없는 재생 중 발화"
+    caplog.set_level("INFO")
+
+    await _process_transcript(adapter, transcript, token=state.token)
+
+    assert "Discord barge-in STT decision" in caplog.text
+    assert f"playback={state.token}" in caplog.text
+    assert "matched=False" in caplog.text
+    assert f"transcript_chars={len(transcript)}" in caplog.text
+    assert transcript not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_short_trailing_fragment_stops_but_is_not_forwarded():
     adapter = _make_adapter()
     mixer = _Mixer()
@@ -531,6 +579,120 @@ async def test_disabled_default_pauses_receiver_during_mixer_speech():
 
     assert receiver.resume_calls == 1
     assert receiver._paused is False
+    adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_only_captures_without_interrupt_ack_or_model_event(caplog):
+    adapter = _make_adapter(enabled=False, monitor_only=True, ack_enabled=True)
+    receiver = _Receiver()
+    mixer = _Mixer()
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    adapter._voice_receivers[111] = receiver
+    adapter._voice_mixers[111] = mixer
+    adapter._voice_clients[111] = vc
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    caplog.set_level("INFO")
+
+    with _patch_mixer_decode():
+        play_task = asyncio.create_task(adapter.play_in_voice_channel(111, "/tmp/x.mp3"))
+        for _ in range(20):
+            if receiver.playback_token is not None and mixer.active:
+                break
+            await asyncio.sleep(0)
+        token = receiver.playback_token
+        assert token is not None
+
+        await _process_transcript(
+            adapter,
+            "세린아 멈춰, 날씨 알려줘",
+            token=token,
+        )
+
+        assert mixer.active is True
+        mixer.stop_speech()
+        assert await asyncio.wait_for(play_task, timeout=1) is True
+
+    adapter.play_ack_in_voice.assert_not_awaited()
+    adapter._voice_input_callback.assert_not_awaited()
+    assert "Discord barge-in monitor-only" in caplog.text
+    assert "matched=True" in caplog.text
+    assert "날씨 알려줘" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_monitor_only_fail_closed_when_runtime_dict_enables_both_modes():
+    adapter = _make_adapter(enabled=True, monitor_only=True, ack_enabled=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+
+    await _process_transcript(
+        adapter,
+        "세린아 멈춰, 날씨 알려줘",
+        token=state.token,
+    )
+
+    assert state.interrupted.is_set() is False
+    mixer.stop_speech.assert_not_called()
+    adapter.play_ack_in_voice.assert_not_awaited()
+    adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_only_records_stale_playback_match_before_return(caplog):
+    adapter = _make_adapter(enabled=False, monitor_only=True)
+    old_state = adapter._begin_voice_playback(111)
+    current_state = adapter._begin_voice_playback(111)
+    caplog.set_level("INFO")
+
+    await _process_transcript(
+        adapter,
+        "세린아 멈춰, 날씨 알려줘",
+        token=old_state.token,
+    )
+
+    assert current_state.interrupted.is_set() is False
+    adapter._voice_input_callback.assert_not_awaited()
+    assert f"playback={old_state.token}" in caplog.text
+    assert "matched=True" in caplog.text
+    assert "Discord barge-in monitor-only" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_monitor_only_stt_exception_logs_bounded_outcome(caplog):
+    adapter = _make_adapter(enabled=False, monitor_only=True)
+    state = adapter._begin_voice_playback(111)
+    caplog.set_level("INFO")
+
+    with (
+        patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav"),
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            side_effect=RuntimeError("sensitive provider detail"),
+        ),
+        patch("tools.voice_mode.is_whisper_hallucination", return_value=False),
+    ):
+        await adapter._process_voice_input(
+            111,
+            42,
+            b"pcm",
+            playback_token=state.token,
+        )
+
+    decision_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Discord barge-in STT decision")
+    ]
+    assert len(decision_logs) == 1
+    assert "outcome=exception" in decision_logs[0]
+    assert "stage=stt" in decision_logs[0]
+    assert "type=RuntimeError" in decision_logs[0]
+    assert "sensitive provider detail" not in decision_logs[0]
     adapter._voice_input_callback.assert_not_awaited()
 
 

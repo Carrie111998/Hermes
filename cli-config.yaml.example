@@ -1003,6 +1003,7 @@ platform_toolsets:
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
 #   voice_barge_in:                   # Strict VC interruption while bot TTS plays (default: off)
 #     enabled: false                  # Opt in; otherwise inbound capture pauses during bot speech
+#     monitor_only: false             # Fail-closed; when true it overrides enabled and never interrupts, ACKs, or routes input
 #     phrases:                        # Use distinctive multi-word phrases, not broad single words
 #       - "세린아 멈춰"
 #       - "세린아 잠깐"
