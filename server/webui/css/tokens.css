@@ -5,20 +5,20 @@
 
 :root {
   --bg: #FAF9F5;
-  --surface: #F3F1EB;
-  --surface-2: #EBE8E0;
-  --surface-3: #E3DFD5;
+  --surface: #F1ECE3;
+  --surface-2: #E6E0D3;
+  --surface-3: #D8D1C1;
 
   --apple-blue: #0062D6;
 
-  --sidebar: #0062D6;
+  --sidebar: #0A3E85;
   --sidebar-2: rgba(255, 255, 255, 0.12);
   --sidebar-active: rgba(255, 255, 255, 0.22);
   --sidebar-text: rgba(255, 255, 255, 0.82);
   --sidebar-text-strong: #FFFFFF;
   --sidebar-faint: rgba(255, 255, 255, 0.55);
   --sidebar-badge-bg: #FFFFFF;
-  --sidebar-badge-text: #0062D6;
+  --sidebar-badge-text: #0A3E85;
 
   --text: #2B2926;
   --text-strong: #1C1B18;
@@ -40,23 +40,23 @@
   --cta-glow: transparent;
 
   --success: #2D6A4F;
-  --success-soft: #E4EFE9;
-  --warning: #9A6700;
-  --warning-soft: #F5EDD8;
+  --success-soft: #E4EFE8;
+  --warning: #8C6200;
+  --warning-soft: #F2E9D0;
   --error: #B42318;
-  --error-soft: #F8E8E6;
-  --info: #0B6E99;
-  --info-soft: #E4F0F6;
+  --error-soft: #F8E6E2;
+  --info: #1F63C9;
+  --info-soft: #E7EEFB;
 
   --score-high: #2D6A4F;
   --score-mid: #9A6700;
   --score-low: #9C9890;
 
-  --border: transparent;
-  --border-strong: var(--surface-3);
+  --border: #E6E0D2;
+  --border-strong: #CFC7B5;
 
-  --map-land: #E3DFD5;
-  --map-land-hover: #D4CFC4;
+  --map-land: #D8D1C1;
+  --map-land-hover: #C9C1AD;
   --map-border: transparent;
   --map-selected: #1C1B18;
   --map-selected-hover: #3A3834;
@@ -108,16 +108,19 @@
   --surface-2: #282624;
   --surface-3: #32302D;
 
+  --border: #34302B;
+  --border-strong: #48423A;
+
   --apple-blue: #0074E5;
 
-  --sidebar: #0074E5;
+  --sidebar: #0C4488;
   --sidebar-2: rgba(255, 255, 255, 0.1);
   --sidebar-active: rgba(255, 255, 255, 0.2);
   --sidebar-text: rgba(255, 255, 255, 0.82);
   --sidebar-text-strong: #FFFFFF;
   --sidebar-faint: rgba(255, 255, 255, 0.5);
   --sidebar-badge-bg: #FFFFFF;
-  --sidebar-badge-text: #0074E5;
+  --sidebar-badge-text: #0C4488;
 
   --text: #E8E4DC;
   --text-strong: #F5F3EE;
@@ -142,8 +145,8 @@
   --warning-soft: #2E2618;
   --error: #E87A70;
   --error-soft: #2E1A18;
-  --info: #5BB8E8;
-  --info-soft: #182A32;
+  --info: #6AA6F2;
+  --info-soft: #17233A;
 
   --map-land: #32302D;
   --map-land-hover: #3F3C38;

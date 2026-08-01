@@ -40,9 +40,20 @@ h1, h2, h3, h4, p { margin: 0; }
   outline: none;
 }
 
-/* Global keyboard focus — do not remove without replacement */
+/* Global keyboard focus — visible ring for keyboard users only (a11y: WCAG 2.4.7).
+   Mouse/touch focus stays ringless via :focus; :focus-visible fires on keyboard nav.
+   Offset sits the ring outside the element so it reads even on ink/CTA fills. */
 :focus { outline: none; }
-:focus-visible { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Sidebar sits on a saturated fill — ink ring would vanish; use the light text color, inset. */
+.ifz-nav-item:focus-visible,
+.ifz-sidebar :focus-visible {
+  outline-color: var(--sidebar-text-strong);
+  outline-offset: -2px;
+}
 
 /* Scrollbars */
 * { scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
@@ -526,7 +537,6 @@ h1, h2, h3, h4, p { margin: 0; }
   font-variant-numeric: tabular-nums;
 }
 .ifz-table tbody tr { transition: background 0.1s; }
-.ifz-table tbody tr:last-child td 
 .ifz-table tbody tr.clickable { cursor: pointer; }
 .ifz-table tbody tr.clickable:hover { background: var(--accent-softer); }
 .ifz-table tbody tr.clickable:focus-visible {
@@ -637,8 +647,6 @@ h1, h2, h3, h4, p { margin: 0; }
   color: var(--error);
   margin-top: 2px;
 }
-.ifz-input.is-invalid, .ifz-select.is-invalid, .ifz-textarea.is-invalid 
-
 .ifz-switchrow { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: 10px 0; }
 .ifz-switch {
   width: 36px; height: 20px;
@@ -715,7 +723,7 @@ h1, h2, h3, h4, p { margin: 0; }
   flex-direction: column;
   gap: 3px;
 }
-.ifz-radiocard:hover 
+.ifz-radiocard:hover { background: var(--surface-2); }
 .ifz-radiocard:active { transform: scale(0.96); }
 .ifz-radiocard.on {
   
@@ -1047,7 +1055,6 @@ h1, h2, h3, h4, p { margin: 0; }
   gap: 10px;
   padding: 10px 0;
 }
-.ifz-actionrow:last-child 
 .ifz-actionrow-icon {
   width: 30px; height: 30px;
   border-radius: var(--radius-sm);
@@ -1115,7 +1122,7 @@ h1, h2, h3, h4, p { margin: 0; }
   background: var(--surface-3);
   color: var(--text-strong);
 }
-.ifz-home-chat-message.streaming .ifz-home-chat-copy 
+.ifz-home-chat-message.streaming .ifz-home-chat-copy { opacity: 0.75; }
 .ifz-home-chat-suggestions {
   display: flex;
   flex-wrap: wrap;
@@ -1815,13 +1822,17 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 .ifz-input:focus,
 .ifz-select:focus,
-.ifz-textarea:focus,
+.ifz-textarea:focus {
+  background: var(--surface-3);
+  outline: none;
+  box-shadow: none;
+}
 .ifz-input:focus-visible,
 .ifz-select:focus-visible,
 .ifz-textarea:focus-visible {
   background: var(--surface-3);
-  outline: none;
-  box-shadow: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .ifz-input.is-invalid,
 .ifz-select.is-invalid,
@@ -1855,10 +1866,13 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-table tbody tr:nth-child(odd) {
   background: transparent;
 }
-.ifz-table tbody tr.clickable:hover,
+.ifz-table tbody tr.clickable:hover {
+  background: var(--surface-2);
+}
 .ifz-table tbody tr.clickable:focus-visible {
   background: var(--surface-2);
-  outline: none;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .ifz-tabs {
   display: flex;
