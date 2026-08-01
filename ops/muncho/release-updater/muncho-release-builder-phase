@@ -3,6 +3,6 @@ set -eu
 
 exec /usr/bin/flock --exclusive --no-fork \
   /run/lock/muncho-release-builder-promotion.lock \
-  /usr/bin/python3 -I -c \
+  /usr/bin/python3 -B -I -c \
   'import runpy,sys; sys.path.insert(0,"/usr/lib/muncho-release-updater"); sys.argv=sys.argv[1:]; runpy.run_module("scripts.canary.production_release_builder_phase",run_name="__main__")' \
   muncho-release-builder-phase "$@"

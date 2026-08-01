@@ -690,8 +690,8 @@ def test_launcher_verifies_promoted_release_before_exact_exec(tmp_path: Path) ->
     executable, argv, environment = executions[0]
     assert executable == str(interpreter)
     assert argv[-1] == "prepare-release-unit-inputs"
-    assert argv[1:3] == ("-I", "-c")
-    assert str(release) in argv[3]
+    assert argv[1:4] == ("-B", "-I", "-c")
+    assert str(release) in argv[4]
     assert "PYTHONPATH" not in environment
 
 

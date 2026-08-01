@@ -28,20 +28,21 @@ def test_builder_wrapper_preserves_label_as_module_argv0(
     wrapper = WRAPPER.read_text(encoding="ascii")
     command = wrapper.split("exec ", maxsplit=1)[1].replace("\\\n", "")
     argv = shlex.split(command)
-    assert argv[:7] == [
+    assert argv[:8] == [
         "/usr/bin/flock",
         "--exclusive",
         "--no-fork",
         "/run/lock/muncho-release-builder-promotion.lock",
         "/usr/bin/python3",
+        "-B",
         "-I",
         "-c",
     ]
-    assert argv[8:] == [
+    assert argv[9:] == [
         "muncho-release-builder-phase",
         "$@",
     ]
-    bootstrap = argv[7]
+    bootstrap = argv[8]
     assert bootstrap == (
         'import runpy,sys; sys.path.insert(0,'
         '"/usr/lib/muncho-release-updater"); '
@@ -150,4 +151,4 @@ def test_builder_assets_preserve_debian_12_boundary_contract() -> None:
     assert (
         "  /run/lock/muncho-release-builder-promotion.lock \\"
     ) in wrapper
-    assert "  /usr/bin/python3 -I -c \\" in wrapper
+    assert "  /usr/bin/python3 -B -I -c \\" in wrapper
