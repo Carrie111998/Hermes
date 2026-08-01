@@ -3617,7 +3617,14 @@ class ManagedKeyError(Exception):
     """
 
     def __init__(self, key: str):
-        super().__init__(key)
+        # A descriptive message, not the bare key: paths that stringify the
+        # exception (``_apply_pending_model_switch``, the live-session slash
+        # mirror) would otherwise render "Could not switch model: model.default".
+        # ``.key`` stays authoritative for the structured 4030 mapping in
+        # ``_managed_err``, which never reads str(exc).
+        super().__init__(
+            f"'{key}' is managed by your administrator and cannot be changed"
+        )
         self.key = key
 
 
@@ -10097,7 +10104,10 @@ def _config_set(rid, params: dict) -> dict:
             if not value:
                 return _err(rid, 4002, "model value required")
             if session:
-                from hermes_cli.model_switch import parse_model_switch_args
+                from hermes_cli.model_switch import (
+                    parse_model_switch_args,
+                    resolve_persist_behavior,
+                )
 
                 # A live swap can't run in-place while a turn streams:
                 # agent.switch_model() mutates self.model / self.provider /
@@ -10111,6 +10121,26 @@ def _config_set(rid, params: dict) -> dict:
                 # the new model without waiting for the swap or interrupting.
                 if session.get("running"):
                     parsed = parse_model_switch_args(value)
+                    # Refuse a persisting pick BEFORE it is stashed. Deferring
+                    # first would ack the write with {"deferred": true}, and the
+                    # ManagedKeyError would not surface until the next turn, where
+                    # _apply_pending_model_switch's blanket handler downgrades it
+                    # to a generic error event — the caller never sees 4030.
+                    # Resolve the full persistence policy rather than testing
+                    # parsed.is_global: with model.persist_switch_by_default set,
+                    # a bare `/model X` persists too (resolve_persist_behavior
+                    # rule 5), and a --global-only check would let it through.
+                    if resolve_persist_behavior(
+                        parsed.is_global,
+                        parsed.is_session,
+                        is_once=parsed.is_once,
+                        explicit_provider=parsed.explicit_provider,
+                    ):
+                        blocked_model = _managed_block(
+                            "model.default", "model.provider", "model.base_url"
+                        )
+                        if blocked_model is not None:
+                            raise ManagedKeyError(blocked_model)
                     try:
                         pending_model = parsed.model_input
                     except Exception:

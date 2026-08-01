@@ -602,6 +602,118 @@ def test_managed_guard_matches_exact_leaf_only(server, managed_gw):
     assert server._load_cfg_raw()["display"]["tui_theme"] == "light"
 
 
+def _running_session(server, sid="managed-running"):
+    """Register a session that reports a turn in flight."""
+    server._sessions[sid] = {"session_key": sid, "agent": None, "running": True}
+    return sid
+
+
+@pytest.mark.parametrize(
+    ("managed_yaml", "user_yaml", "value", "blocked_key"),
+    [
+        # Explicit --global during a running turn: the deferred branch stashes
+        # the pick and acks it, so without a pre-stash guard the persisting
+        # write is accepted and only fails (as a generic error event) next turn.
+        (
+            "model:\n  default: acme/pinned\n",
+            "theme: dark\n",
+            "other/model --global",
+            "model.default",
+        ),
+        # Sibling leaves of the same persisted triple.
+        (
+            "model:\n  provider: acme\n",
+            "theme: dark\n",
+            "other/model --global",
+            "model.provider",
+        ),
+        (
+            "model:\n  base_url: https://acme.example/v1\n",
+            "theme: dark\n",
+            "other/model --global",
+            "model.base_url",
+        ),
+        # No --global at all: model.persist_switch_by_default makes a bare
+        # `/model X` persist (resolve_persist_behavior rule 5), which a
+        # parsed.is_global check would miss.
+        (
+            "model:\n  default: acme/pinned\n",
+            "model:\n  persist_switch_by_default: true\n",
+            "other/model",
+            "model.default",
+        ),
+    ],
+)
+def test_config_set_model_refuses_managed_key_while_running(
+    server, managed_gw, managed_yaml, user_yaml, value, blocked_key
+):
+    """A persisting mid-turn /model must 4030 instead of being queued."""
+    managed_gw.seed(user_yaml=user_yaml, managed_yaml=managed_yaml)
+    sid = _running_session(server)
+    before = managed_gw.user_text()
+
+    resp = _set(server, key="model", value=value, session_id=sid)
+
+    assert "error" in resp, f"expected a refusal, got {resp}"
+    assert resp["error"]["code"] == 4030
+    assert blocked_key in resp["error"]["message"]
+    assert "managed by your administrator" in resp["error"]["message"]
+    # The refusal must happen BEFORE the stash — a queued switch would apply
+    # the pinned-over model at the next turn start.
+    assert "pending_model_switch" not in server._sessions[sid]
+    assert managed_gw.user_text() == before
+
+
+@pytest.mark.parametrize("value", ["other/model --session", "other/model --once"])
+def test_config_set_model_defers_non_persisting_switch_while_running(
+    server, managed_gw, value
+):
+    """Negative control: session-/once-scoped picks never persist, so they queue.
+
+    Without this the suite cannot tell "the guard is scoped to persisting
+    writes" apart from "every mid-turn /model is now refused".
+    """
+    managed_gw.seed(managed_yaml="model:\n  default: acme/pinned\n")
+    sid = _running_session(server)
+
+    resp = _set(server, key="model", value=value, session_id=sid)
+
+    assert "error" not in resp, resp
+    assert resp["result"]["deferred"] is True
+    assert server._sessions[sid]["pending_model_switch"]["raw"] == value
+
+
+def test_config_set_model_defers_global_switch_without_managed_scope(
+    server, managed_gw, monkeypatch
+):
+    """Fail-open control: no managed scope → a mid-turn --global still queues."""
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    managed_gw.seed(managed_yaml="")
+    sid = _running_session(server)
+
+    resp = _set(server, key="model", value="other/model --global", session_id=sid)
+
+    assert "error" not in resp, resp
+    assert resp["result"]["deferred"] is True
+    assert server._sessions[sid]["pending_model_switch"]["raw"] == (
+        "other/model --global"
+    )
+
+
+def test_managed_key_error_message_is_descriptive(server):
+    """str(ManagedKeyError) must not be the bare dotted key.
+
+    ``_apply_pending_model_switch`` and the live-session slash mirror both
+    interpolate the exception into user-facing copy.
+    """
+    exc = server.ManagedKeyError("model.default")
+
+    assert exc.key == "model.default"
+    assert str(exc) == (
+        "'model.default' is managed by your administrator and cannot be changed"
+    )
+
+
 # ── _cli_exec_blocked ────────────────────────────────────────────────
 
 
