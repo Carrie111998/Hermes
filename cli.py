@@ -9476,14 +9476,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _should_handle_readonly_dispatch_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when a read-only dispatch-policy command should run immediately.
 
-        Commands like /status, /agents, /context, and /egress have
-        ``busy_policy="dispatch"`` in their CommandDef, meaning the gateway
-        runs them without queuing behind the active turn. The classic CLI
-        ignores this policy and queues them through ``_pending_input`` --
-        ``process_loop`` is blocked inside ``self.chat()``, so the command
-        silently waits until the turn finishes. Dispatching inline on the
-        UI thread shows output immediately. These commands are safe to run
-        concurrently with an active agent -- they only read state.
+        Commands with ``busy_policy="dispatch"`` in their CommandDef are meant
+        to run without queuing behind the active turn. The gateway honors this;
+        the classic CLI ignores it. Derive eligibility from the CommandDef
+        instead of a hard-coded name list so new dispatch-policy commands
+        pick up the behavior automatically.
+
+        A command is safe to dispatch inline when it uses a shared read-only
+        executor (``execute`` is set) or is a known read-only dispatch command
+        (/status, /agents). Commands with ``busy_handler``, ``subcommands``,
+        or ``cli_only`` state toggles are excluded.
         """
         if not text or has_images or not _looks_like_slash_command(text):
             return False
@@ -9491,7 +9493,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.commands import resolve_command
             base = text.split(None, 1)[0].lower().lstrip("/")
             cmd = resolve_command(base)
-            return bool(cmd and cmd.name in {"status", "agents", "context", "egress"})
+            if not cmd or cmd.busy_policy != "dispatch":
+                return False
+            if cmd.gateway_only:
+                return False
+            if cmd.name in {"model", "steer", "background"}:
+                return False
+            # Shared read-only executor path (/profile, /version, /help, /egress)
+            if cmd.execute is not None:
+                return True
+            # Known read-only dispatch commands without an execute attribute
+            if cmd.name in {"status", "agents"}:
+                return True
+            return False
         except Exception:
             return False
 
