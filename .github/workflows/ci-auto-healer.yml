@@ -11,8 +11,13 @@ on:
     types:
       - completed
   schedule:
-    # Check for failed workflows every 30 minutes
-    - cron: '*/30 * * * *'
+    # Hourly backstop, not the primary trigger. The `workflow_run` entries above
+    # already fire the moment a watched workflow completes, so this only catches
+    # failures whose completion event was missed. At */30 it ran ~48 times a day
+    # to do nothing, which buried the actual Tests/Lint history in the run list.
+    # Off-minute on purpose: :00 is the most contended slot on GitHub's
+    # scheduler and the most likely to be delayed.
+    - cron: '23 * * * *'
 
 concurrency:
   group: ci-auto-healer

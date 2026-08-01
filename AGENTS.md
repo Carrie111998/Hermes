@@ -383,6 +383,24 @@ exactly where a real key gets pasted by accident. Same principle as
 `supply-chain-audit.yml`: a scanner that fires on every PR trains reviewers to
 ignore it, so keep the allowlist narrow and give every entry a reason.
 
+### Catching it before it leaves your machine (optional)
+
+`.pre-commit-config.yaml` runs the same gitleaks against your **staged** diff.
+It's opt-in — nothing happens until you install the hook:
+
+```bash
+uv tool install pre-commit   # or: pipx install pre-commit
+pre-commit install
+```
+
+Worth the two commands: once a secret reaches a remote, removing it is a
+history rewrite and a rotation, not an amend. The hook reads the same
+`.gitleaks.toml`, so local and CI verdicts agree. First run builds gitleaks
+from source (the upstream hook is `language: golang`) and is then cached.
+
+CI remains the enforcement boundary — the hook is a convenience, and a
+contributor who hasn't installed it is not doing anything wrong.
+
 ---
 
 ## Adding Configuration
