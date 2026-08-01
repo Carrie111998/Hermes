@@ -2919,6 +2919,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
             stream_attempt_state["real_chunks"][attempt_id] = 0
+            # Scope the zero-chunk deadline to this exact attempt. Client
+            # construction can itself take time, so never inherit the prior
+            # attempt's already-expired activity timestamp.
+            last_chunk_time["t"] = time.time()
         provider_tool_in_flight["yes"] = False
         return attempt_id
 
