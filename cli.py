@@ -5339,7 +5339,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Session cost
         cost = getattr(agent, "session_estimated_cost_usd", 0) or 0
-        snapshot["cost_usd"] = cost if cost > 0 else 0
+        snapshot["cost_usd"] = cost
         snapshot["cost_status"] = getattr(agent, "session_cost_status", "unknown") or "unknown"
 
         compressor = getattr(agent, "context_compressor", None)
@@ -5896,7 +5896,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             cost_usd = snapshot.get("cost_usd", 0)
             cost_label = (
                 f"${cost_usd:.2f}"
-                if cost_usd > 0 and getattr(self, "show_cost", False)
+                if getattr(self, "show_cost", False)
                 else ""
             )
             cost_part = f" {cost_label}" if cost_label else ""
@@ -5997,7 +5997,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             cost_usd = snapshot.get("cost_usd", 0)
             cost_label = (
                 f"${cost_usd:.2f}"
-                if cost_usd > 0 and getattr(self, "show_cost", False)
+                if getattr(self, "show_cost", False)
                 else ""
             )
 
