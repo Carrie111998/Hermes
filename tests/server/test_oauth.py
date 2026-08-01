@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,6 +47,29 @@ def _configured_client(**overrides):
         public_base_url="https://api.example.test",
         **overrides,
     )
+
+
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+@pytest.mark.parametrize("payload", [None, {}])
+def test_legacy_direct_connect_requires_oauth_and_creates_no_integration(provider, payload):
+    app, client = _configured_client()
+    _admin, headers, company_id = chat_tenant(client)
+    kwargs = {"headers": headers}
+    if payload is not None:
+        kwargs["json"] = payload
+
+    res = client.post(f"/api/v1/integrations/email/connect/{provider}", **kwargs)
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["message"] == f"Connect {provider} mailboxes with OAuth"
+    assert detail["oauth_start"] == (
+        f"/api/v1/integrations/email/oauth/{provider}/start"
+    )
+    assert app.state.db.one(
+        "SELECT id FROM integrations WHERE company_id=? AND kind='email' AND provider=?",
+        (company_id, provider),
+    ) is None
 
 
 def _callback(client, provider: str, state: str, **query):
