@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import importlib.util
-import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
+import subprocess
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -31,6 +31,53 @@ def check_mark(ok: bool) -> str:
     if ok:
         return color("✓", Colors.GREEN)
     return color("✗", Colors.RED)
+
+
+def _detect_sudo_status(terminal_env: str) -> tuple[bool, str]:
+    """Return whether sudo is available/configured and a safe description.
+
+    ``SUDO_PASSWORD`` only represents Hermes's password-fed sudo path.  On a
+    local backend, also probe non-interactive sudo so access that currently
+    works without prompting is not reported as disabled.  Remote/sandbox
+    backends cannot be safely inferred by running a command on the local host.
+    """
+    terminal_env = terminal_env.strip().lower() or "local"
+    has_configured_password = "SUDO_PASSWORD" in os.environ
+    sudo_password = os.getenv("SUDO_PASSWORD", "")
+    password_label = (
+        "password configured" if sudo_password else "empty password configured"
+    )
+
+    if terminal_env != "local":
+        return (
+            has_configured_password,
+            password_label if has_configured_password else "password not configured",
+        )
+
+    getuid = getattr(os, "geteuid", None)
+    if callable(getuid) and getuid() == 0:
+        return True, "root"
+
+    if has_configured_password:
+        return True, password_label
+
+    # Avoid spawning platform commands in Termux's lightweight status path.
+    if not _is_termux():
+        try:
+            probe = subprocess.run(
+                ["sudo", "-n", "true"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+            if probe.returncode == 0:
+                return True, "available without prompt"
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+
+    return False, "unavailable"
 
 def redact_key(key: str) -> str:
     """Redact an API key for display.
@@ -450,8 +497,8 @@ def show_status(args):
         print(f"  Persistence:  {'snapshot filesystem' if persist_enabled else 'ephemeral filesystem'}")
         print("  Processes:    live processes do not survive cleanup, snapshots, or sandbox recreation")
 
-    sudo_password = os.getenv("SUDO_PASSWORD", "")
-    print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
+    sudo_ok, sudo_label = _detect_sudo_status(terminal_env)
+    print(f"  Sudo:         {check_mark(sudo_ok)} {sudo_label}")
 
     # =========================================================================
     # Messaging Platforms

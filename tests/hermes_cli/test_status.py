@@ -3,6 +3,72 @@ from types import SimpleNamespace
 from hermes_cli.status import show_status
 
 
+def test_detect_sudo_status_reports_noninteractive_local_sudo(monkeypatch):
+    from hermes_cli import status as status_mod
+
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.setattr(status_mod, "_is_termux", lambda: False)
+    monkeypatch.setattr(status_mod.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(
+        status_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
+
+    assert status_mod._detect_sudo_status(" LOCAL ") == (
+        True,
+        "available without prompt",
+    )
+
+
+def test_detect_sudo_status_reports_unavailable_local_sudo(monkeypatch):
+    from hermes_cli import status as status_mod
+
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.setattr(status_mod, "_is_termux", lambda: False)
+    monkeypatch.setattr(status_mod.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(
+        status_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1),
+    )
+
+    assert status_mod._detect_sudo_status("local") == (False, "unavailable")
+
+
+def test_detect_sudo_status_does_not_probe_nonlocal_backend(monkeypatch):
+    from hermes_cli import status as status_mod
+
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+
+    def _unexpected_probe(*args, **kwargs):
+        raise AssertionError("nonlocal backend must not probe host sudo")
+
+    monkeypatch.setattr(status_mod.subprocess, "run", _unexpected_probe)
+
+    assert status_mod._detect_sudo_status("ssh") == (
+        False,
+        "password not configured",
+    )
+
+
+def test_detect_sudo_status_honors_explicit_empty_password(monkeypatch):
+    from hermes_cli import status as status_mod
+
+    monkeypatch.setenv("SUDO_PASSWORD", "")
+    monkeypatch.setattr(status_mod.os, "geteuid", lambda: 1000, raising=False)
+
+    def _unexpected_probe(*args, **kwargs):
+        raise AssertionError("configured password path must not probe host sudo")
+
+    monkeypatch.setattr(status_mod.subprocess, "run", _unexpected_probe)
+
+    assert status_mod._detect_sudo_status("local") == (
+        True,
+        "empty password configured",
+    )
+
+
 def test_show_status_all_does_not_print_tavily_key_value(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     sentinel = "NONSECRET_SENTINEL_VALUE_DO_NOT_PRINT_123456"
