@@ -1001,6 +1001,187 @@ class TestDetectSudoStdin:
             assert is_dangerous is False, cmd
 
 
+class TestApprovalDetectionLengthClassifier:
+    @staticmethod
+    def _normalized_over_limit_command():
+        return "x;" * 5_000 + "x"
+
+    def test_over_normalized_limit_blocks_before_all_work(self, monkeypatch):
+        mod = approval_module
+        command = self._normalized_over_limit_command()
+        parser_limit = mod._command_parser_limit_exceeded
+        normalize = mod._normalize_command_for_detection
+        calls = {"parser": 0, "normalize": 0}
+
+        def count_parser(value):
+            calls["parser"] += 1
+            return parser_limit(value)
+
+        def count_normalize(value):
+            calls["normalize"] += 1
+            return normalize(value)
+
+        def downstream(*_args, **_kwargs):
+            raise AssertionError("over-limit command reached downstream approval work")
+
+        monkeypatch.setattr(mod, "_command_parser_limit_exceeded", count_parser)
+        monkeypatch.setattr(mod, "_normalize_command_for_detection", count_normalize)
+        for helper in (
+            "_should_skip_container_guards",
+            "_call_detect_hardline_command",
+            "_check_sudo_stdin_guard",
+            "_match_user_deny_rule",
+            "_get_approval_mode",
+            "_command_matches_permanent_allowlist",
+        ):
+            monkeypatch.setattr(mod, helper, downstream)
+
+        result = mod.check_all_command_guards(command, "local")
+
+        assert result["approved"] is False
+        assert result["description"] == "command exceeds approval detection length limit"
+        assert calls == {"parser": 1, "normalize": 1}
+
+    def test_raw_ceiling_skips_normalization_parser_and_matchers(self, monkeypatch):
+        mod = approval_module
+        command = "x;" * 10_000 + "x"
+
+        def downstream(*_args, **_kwargs):
+            raise AssertionError("raw-over-limit command reached bounded work")
+
+        for helper in (
+            "_command_parser_limit_exceeded",
+            "_normalize_command_for_detection",
+            "_is_verification_artifact_cleanup",
+            "_command_detection_variants_normalized",
+            "_should_skip_container_guards",
+        ):
+            monkeypatch.setattr(mod, helper, downstream)
+
+        result = mod.check_all_command_guards(command, "local")
+
+        assert result["approved"] is False
+        assert result["description"] == "command exceeds approval detection length limit"
+
+    @pytest.mark.parametrize(
+        "bypass",
+        ["isolated_container", "yolo", "mode_off", "allowlist", "cron_approve", "noninteractive"],
+    )
+    def test_over_limit_precedes_approval_bypasses(self, monkeypatch, bypass):
+        mod = approval_module
+        command = self._normalized_over_limit_command()
+        env_type = "local"
+        if bypass == "isolated_container":
+            env_type = "docker"
+        elif bypass == "yolo":
+            monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
+        elif bypass == "mode_off":
+            monkeypatch.setattr(mod, "_get_approval_mode", lambda: "off")
+        elif bypass == "allowlist":
+            monkeypatch.setattr(mod, "_command_matches_permanent_allowlist", lambda _command: True)
+        elif bypass == "cron_approve":
+            monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+            monkeypatch.setattr(mod, "_get_cron_approval_mode", lambda: "approve")
+
+        result = mod.check_all_command_guards(command, env_type)
+
+        assert result["approved"] is False
+        assert result["description"] == "command exceeds approval detection length limit"
+
+    def test_check_dangerous_command_over_limit_blocks_before_bypass(self, monkeypatch):
+        mod = approval_module
+        command = self._normalized_over_limit_command()
+
+        def downstream(*_args, **_kwargs):
+            raise AssertionError("over-limit command reached a dangerous-command bypass")
+
+        for helper in (
+            "_should_skip_container_guards",
+            "_call_detect_hardline_command",
+            "_match_user_deny_rule",
+            "is_current_session_yolo_enabled",
+            "_command_matches_permanent_allowlist",
+            "_call_detect_dangerous_command",
+        ):
+            monkeypatch.setattr(mod, helper, downstream)
+
+        result = mod.check_dangerous_command(command, "local")
+
+        assert result["approved"] is False
+        assert result["description"] == "command exceeds approval detection length limit"
+
+    def test_direct_detectors_fail_closed_with_classifier_results(self):
+        command = self._normalized_over_limit_command()
+        description = "command exceeds approval detection length limit"
+
+        assert detect_hardline_command(command) == (True, description)
+        assert detect_dangerous_command(command) == (
+            True,
+            "command length limit",
+            description,
+        )
+        assert approval_module._check_sudo_stdin_guard(command) == (True, description)
+
+    def test_parser_limit_stays_distinct_from_length_limit(self):
+        command = "x" * 4_097
+
+        assert detect_hardline_command(command) == (
+            True,
+            "command parser limit exceeded",
+        )
+        assert detect_dangerous_command(command) == (
+            True,
+            "command parser limit exceeded",
+            "command parser limit exceeded",
+        )
+        result = approval_module.check_all_command_guards(command, "local")
+        assert result["approved"] is False
+        assert "command parser limit exceeded" in result["message"]
+
+    def test_exact_normalized_limit_and_normalizing_short_input_continue(self):
+        command = "x;\x00" * 4_999 + "xx"
+        classification = approval_module._classify_command_for_detection(command)
+
+        assert len(command) > 10_000
+        assert len(classification.normalized_command) == 10_000
+        assert classification.limit is None
+        assert detect_hardline_command(command) == (False, None)
+        assert detect_dangerous_command(command) == (False, None, None)
+
+    def test_over_limit_cleanup_shape_is_not_exempt(self, monkeypatch):
+        command = "rm -f /tmp/hermes-verify-example.py" + " " * 20_001
+        monkeypatch.setattr("tempfile.gettempdir", lambda: "/tmp")
+
+        result = detect_dangerous_command(command)
+
+        assert result == (
+            True,
+            "command length limit",
+            "command exceeds approval detection length limit",
+        )
+
+    def test_unpatched_shared_entrypoints_classify_and_normalize_once(self, monkeypatch):
+        mod = approval_module
+        original_classify = mod._classify_command_for_detection
+        original_normalize = mod._normalize_command_for_detection
+        calls = {"classify": 0, "normalize": 0}
+
+        def count_classify(command):
+            calls["classify"] += 1
+            return original_classify(command)
+
+        def count_normalize(command):
+            calls["normalize"] += 1
+            return original_normalize(command)
+
+        monkeypatch.setattr(mod, "_classify_command_for_detection", count_classify)
+        monkeypatch.setattr(mod, "_normalize_command_for_detection", count_normalize)
+        for checker in (mod.check_dangerous_command, mod.check_all_command_guards):
+            calls.update(classify=0, normalize=0)
+            assert checker("echo hello", "local")["approved"] is True
+            assert calls == {"classify": 1, "normalize": 1}
+
+
 class TestMacOSPrivateSystemPaths:
     """Inspired by Claude Code 2.1.113 "dangerous path protection".
 

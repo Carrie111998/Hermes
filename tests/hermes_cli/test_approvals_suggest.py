@@ -142,6 +142,35 @@ class TestScan:
         assert len(scan_approval_history(path, days=90)) == 1
         assert len(scan_approval_history(path, days=0)) == 2
 
+    def test_scan_shares_one_classification_per_command(self, db_path, monkeypatch):
+        path, con = db_path
+        _add_terminal_call(con, "git push --force origin main")
+        original_classify = approval_module._classify_command_for_detection
+        original_normalize = approval_module._normalize_command_for_detection
+        calls = {"classify": 0, "normalize": 0}
+
+        def count_classify(command):
+            calls["classify"] += 1
+            return original_classify(command)
+
+        def count_normalize(command):
+            calls["normalize"] += 1
+            return original_normalize(command)
+
+        monkeypatch.setattr(approval_module, "_classify_command_for_detection", count_classify)
+        monkeypatch.setattr(approval_module, "_normalize_command_for_detection", count_normalize)
+
+        assert scan_approval_history(path, days=0) == [
+            ("git push --force origin main", "git force push (rewrites remote history)"),
+        ]
+        assert calls == {"classify": 1, "normalize": 1}
+
+    def test_scan_excludes_over_limit_history_before_ranking(self, db_path):
+        path, con = db_path
+        _add_terminal_call(con, "x;" * 10_000 + "x")
+
+        assert scan_approval_history(path, days=0) == []
+
 
 
 # ---------------------------------------------------------------------------
