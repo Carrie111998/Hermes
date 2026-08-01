@@ -166,6 +166,68 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 )
 
 
+def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
+    """Persist a session-hygiene compression-failure cooldown to the state DB.
+
+    Uses the same ``compression_failure_cooldown_until`` column and
+    ``record_compression_failure_cooldown`` method that the in-conversation
+    compression path (``agent/context_compressor.py``) already uses, so the
+    cooldown survives gateway restarts (#74136).
+    """
+    import time as _time
+    session_db = getattr(gateway, "_session_db", None)
+    if session_db is None:
+        return
+    session_db = getattr(session_db, "_db", session_db)
+    recorder = getattr(session_db, "record_compression_failure_cooldown", None)
+    if recorder is None:
+        return
+    try:
+        recorder(session_id, _time.time() + cooldown_seconds)
+    except Exception as exc:
+        logger.debug("session hygiene cooldown persist failed: %s", exc)
+
+
+def _status_template_to_regex(template: str) -> str:
+    """Compile a compression status template constant into a regex source.
+
+    Literal text is escaped verbatim (so wording drift in
+    agent/conversation_compression.py cannot silently diverge from this
+    matcher — the constants ARE the wording) and each ``{field}`` format
+    placeholder is replaced with a numeric-ish pattern covering every value
+    the emit sites format in (ints, ``{:,}`` thousands separators).
+    """
+    parts = re.split(r"\{[^{}]*\}", template)
+    return r"[\d,]+".join(re.escape(part) for part in parts)
+
+
+# ROUTINE compression progress statuses, derived from the SAME template
+# constants the emit sites format (agent/conversation_compression.py, #69550)
+# — never re-inlined wording. Used ONLY by the opt-in
+# ``compression.progress_notices`` gate below (#52995) to decide which of the
+# noisy statuses matched by _TELEGRAM_NOISY_STATUS_RE are compression
+# progress (deliverable when the user opted in) versus unrelated aux/retry
+# chatter (always suppressed on chat surfaces). Failure notices and manual
+# /compress feedback never match _TELEGRAM_NOISY_STATUS_RE in the first
+# place, so they are unaffected by this gate.
+_COMPRESSION_PROGRESS_STATUS_RE = re.compile(
+    "|".join(
+        _status_template_to_regex(_template)
+        for _template in (
+            COMPACTION_STATUS,
+            PRE_API_COMPRESSION_STATUS_TEMPLATE,
+            PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+            IDLE_COMPACTION_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
 def _gateway_compression_progress_notices_enabled() -> bool:
     """True when the user opted into routine compression progress notices.
 
@@ -19726,20 +19788,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
-                    _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
-                    if _cooldowns is None:
-                        _cooldowns = {}
-                        self._hygiene_compression_failure_cooldowns = _cooldowns
-                    _cooldown_key = session_entry.session_id
-                    _cooldown_until = float(_cooldowns.get(_cooldown_key) or 0.0)
-                    if _cooldown_until > time.time():
-                        logger.info(
-                            "Session hygiene: skipping compression for %s; "
-                            "previous failure cooldown active for %.1fs",
-                            _cooldown_key,
-                            max(0.0, _cooldown_until - time.time()),
-                        )
-                        _needs_compress = False
+                    # Use the persistent DB-backed cooldown (same as the
+                    # in-conversation compression path in context_compressor.py)
+                    # so the cooldown survives gateway restarts. The in-memory
+                    # dict was reset on every restart, re-triggering the same
+                    # failing compression and wedging session storage (#74136).
+                    _session_db = getattr(self, "_session_db", None)
+                    if _session_db is not None:
+                        _session_db = getattr(_session_db, "_db", _session_db)
+                        _getter = getattr(_session_db, "get_compression_failure_cooldown", None)
+                        if _getter is not None:
+                            try:
+                                _cooldown_state = _getter(session_entry.session_id)
+                            except Exception:
+                                _cooldown_state = None
+                            if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
+                                logger.info(
+                                    "Session hygiene: skipping compression for %s; "
+                                    "previous failure cooldown active for %.1fs",
+                                    session_entry.session_id,
+                                    _cooldown_state["remaining_seconds"],
+                                )
+                                _needs_compress = False
 
                 if _needs_compress:
                     logger.info(
@@ -19922,9 +19992,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                self._hygiene_compression_failure_cooldowns[
-                                                    session_entry.session_id
-                                                ] = time.time() + _hyg_failure_cooldown_seconds
+                                                _record_hygiene_cooldown(
+                                                    self, session_entry.session_id,
+                                                    _hyg_failure_cooldown_seconds,
+                                                )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
@@ -20144,9 +20215,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         if _hyg_failure_cooldown_seconds >= 0:
-                                            self._hygiene_compression_failure_cooldowns[
-                                                session_entry.session_id
-                                            ] = time.time() + _hyg_failure_cooldown_seconds
+                                            _record_hygiene_cooldown(
+                                                self, session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
+                                            )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
