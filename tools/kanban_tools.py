@@ -1057,7 +1057,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "id": t.id, "title": _field(t.title),
                     "body": _field(t.body),
                     "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
+                    "tenant": _field(t.tenant), "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
                     "created_by": _field(t.created_by), "created_at": t.created_at,

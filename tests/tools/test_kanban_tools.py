@@ -3300,6 +3300,152 @@ def test_resolver_show_bounds_single_oversized_mandatory_task_field(
     assert shown["task"]["title"]["original_bytes"] == len(("标题🙂é" * 40_000).encode("utf-8"))
 
 
+def test_resolver_show_public_create_bounds_tenant_without_changing_modes(
+    monkeypatch, tmp_path,
+):
+    """Resolver show must retain task state when public create stores a huge tenant."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-tenant-bound"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    oversized_tenant = "T" * 200_000
+    created = json.loads(kt._handle_create({
+        "title": "public tenant-bound task",
+        "assignee": "developer",
+        "tenant": oversized_tenant,
+        "workspace_kind": "scratch",
+        "workflow_template_id": "product",
+        "current_step_key": "development",
+        "board": board,
+    }))
+    assert created["ok"] is True, created
+    task_id = created["task_id"]
+
+    normal_tenant = "tenant-normal"
+    normal_created = json.loads(kt._handle_create({
+        "title": "public normal tenant task",
+        "assignee": "developer",
+        "tenant": normal_tenant,
+        "workspace_kind": "scratch",
+        "workflow_template_id": "product",
+        "current_step_key": "development",
+        "board": board,
+    }))
+    assert normal_created["ok"] is True, normal_created
+    normal_task_id = normal_created["task_id"]
+
+    with kb.connect(board=board) as conn:
+        stored = kb.get_task(conn, task_id)
+        assert stored is not None
+        assert stored.tenant == oversized_tenant
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a bounded tenant display",
+            kind="needs_input",
+            attempted_resolutions=["checked the resolver display contract"],
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None and resolver.current_run_id is not None
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        assert set(expected) == set(kb._RESOLVER_EXPECTED_KEYS)
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show.encode("utf-8")) < 100_000
+    shown = json.loads(raw_show)
+    assert "task" in shown, shown
+    assert shown["expected"] == expected
+    assert shown["unresolved_preflight"]["event_id"] == preflight.id
+    assert shown["unresolved_preflight"]["payload"] == preflight.payload
+    assert shown["task"]["status"] == expected["status"]
+    for task_field, expected_field in (
+        ("assignee", "assignee"),
+        ("status", "status"),
+        ("project_id", "project_id"),
+        ("workflow_template_id", "workflow_template_id"),
+        ("workspace_kind", "workspace_kind"),
+        ("workspace_path", "workspace_path"),
+        ("branch_name", "branch_name"),
+        ("current_run_id", "run_id"),
+        ("current_step_key", "phase"),
+        ("running", "running"),
+        ("blocked", "blocked"),
+    ):
+        assert shown["task"][task_field] == expected[expected_field]
+    tenant_view = shown["task"]["tenant"]
+    assert tenant_view["truncated"] is True
+    assert tenant_view["original_chars"] == len(oversized_tenant)
+    assert tenant_view["original_bytes"] == len(oversized_tenant.encode("utf-8"))
+    assert isinstance(tenant_view["preview"], str)
+
+    resolved = json.loads(kt._handle_resolve({
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The bounded tenant display preserves Resolver state.",
+        "reason": "Resume with the exact Resolver snapshot.",
+        "expected": expected,
+    }))
+    assert resolved["ok"] is True, resolved
+    stale = json.loads(kt._handle_resolve({
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The bounded tenant display preserves Resolver state.",
+        "reason": "Resume with the exact Resolver snapshot.",
+        "expected": expected,
+    }))
+    assert "kanban_resolve conflict" in stale["error"]
+
+    # Resolver-view bounding is mode-dependent: ordinary show keeps the
+    # existing raw task value, while a normal bounded field stays exact.
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    ordinary = json.loads(kt._handle_show({}))
+    assert ordinary["task"]["tenant"] == oversized_tenant
+
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", normal_task_id)
+    normal = json.loads(kt._handle_show({}))
+    assert normal["task"]["tenant"] == normal_tenant
+
+
 def test_resolver_tool_resumes_release_preflight(
     monkeypatch, tmp_path,
 ):
