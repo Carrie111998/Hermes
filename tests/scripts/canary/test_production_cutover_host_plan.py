@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -148,6 +149,16 @@ def test_stage_uses_runtime_pinned_mac_ops_project(
         observe_mac_ops_config,
     )
 
+    entered: list[str] = []
+
+    @contextlib.contextmanager
+    def lock():
+        entered.append("entered")
+        try:
+            yield
+        finally:
+            entered.append("exited")
+
     with pytest.raises(MacOpsConfigObserved):
         producer.stage_fixed_host_artifacts(
             REVISION,
@@ -155,7 +166,9 @@ def test_stage_uses_runtime_pinned_mac_ops_project(
             filesystem_root=tmp_path,
             unit_inputs=inputs,
             require_root=False,
+            lock_factory=lock,
         )
+    assert entered == ["entered", "exited"]
 
 
 def test_staging_receipt_validates_projected_secret_foundation(
