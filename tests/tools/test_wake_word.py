@@ -23,11 +23,22 @@ import tools.wake_word as ww
 
 
 def test_config_defaults_and_clamping():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert ww._DEFAULTS["duplex_output_device"] is None
+    assert DEFAULT_CONFIG["wake_word"]["duplex_output_device"] is None
     assert ww._provider({}) == "openwakeword"
     assert ww._provider({"provider": "Porcupine"}) == "porcupine"
     assert ww._input_device({}) is None
     assert ww._input_device({"input_device": 7}) == 7
     assert ww._input_device({"input_device": " Microphone Array "}) == "Microphone Array"
+    assert ww._duplex_output_device({}) is None
+    assert ww._duplex_output_device({"duplex_output_device": 8}) == 8
+    assert (
+        ww._duplex_output_device({"duplex_output_device": " Jabra Bluetooth "})
+        == "Jabra Bluetooth"
+    )
+    assert ww._duplex_output_device({"duplex_output_device": ""}) is None
     assert ww._input_device({"input_device": ""}) is None
     assert ww._input_device({"input_device": False}) is None
     assert ww._sensitivity({"sensitivity": 5}) == 1.0
@@ -472,6 +483,79 @@ def test_detector_opens_configured_input_device_and_reports_backend(monkeypatch)
         det.stop()
 
 
+def test_detector_keeps_optional_duplex_output_open_and_silent(monkeypatch):
+    opened = []
+    input_streams = []
+    output_streams = []
+
+    class _OutputStream(_FakeStream):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            output_streams.append(self)
+
+    class _OutputBuffer:
+        def __init__(self):
+            self.value = None
+
+        def fill(self, value):
+            self.value = value
+
+    class _CallbackInputStream(_FakeStream):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            input_streams.append(self)
+
+        def read(self, _n):
+            raise AssertionError("duplex wake capture must not use blocking read()")
+
+    def _input_stream(**kwargs):
+        opened.append(("input", kwargs))
+        return _CallbackInputStream(**kwargs)
+
+    def _output_stream(**kwargs):
+        opened.append(("output", kwargs))
+        return _OutputStream(**kwargs)
+
+    fake_sd = types.SimpleNamespace(
+        InputStream=_input_stream,
+        OutputStream=_output_stream,
+        query_devices=lambda selector, kind: {
+            "name": str(selector),
+            "hostapi": 0,
+            "max_input_channels": 1,
+            "default_samplerate": 16000.0,
+        },
+        query_hostapis=lambda index: {"name": "ALSA"},
+    )
+    monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, None))
+
+    det = ww.WakeWordDetector(
+        _FakeEngine(fire=False),
+        lambda: None,
+        input_device="Bluetooth Mic",
+        duplex_output_device="Bluetooth Speaker",
+    )
+    det.start()
+    try:
+        assert [kind for kind, _kwargs in opened] == ["output", "input"]
+        output_kwargs = opened[0][1]
+        assert output_kwargs["device"] == "Bluetooth Speaker"
+        assert output_kwargs["samplerate"] == ww.SAMPLE_RATE
+        assert output_kwargs["channels"] == 1
+        assert output_kwargs["dtype"] == "int16"
+        buffer = _OutputBuffer()
+        output_kwargs["callback"](buffer, 4, None, None)
+        assert buffer.value == 0
+        input_kwargs = opened[1][1]
+        assert callable(input_kwargs["callback"])
+        input_kwargs["callback"](_Frame([500] * 4), 4, None, None)
+    finally:
+        det.stop()
+
+    assert input_streams[0].closed is True
+    assert output_streams[0].closed is True
+
+
 def test_windows_silent_hint_names_selected_device(monkeypatch):
     monkeypatch.setattr(ww.sys, "platform", "win32")
     hint = ww.silent_audio_hint(
@@ -523,6 +607,7 @@ def test_detector_flags_silent_stream_and_recovers(monkeypatch):
 
 def test_detection_callback_can_pause_and_close_stream(monkeypatch, tmp_path):
     streams = []
+    callback_saw_closed_stream = []
 
     def _stream(**kw):
         stream = _FakeStream(**kw)
@@ -537,6 +622,7 @@ def test_detection_callback_can_pause_and_close_stream(monkeypatch, tmp_path):
     paused = threading.Event()
 
     def _on_wake():
+        callback_saw_closed_stream.append(streams[0].closed)
         if ww.pause_listening(owner=owner):
             paused.set()
 
@@ -544,6 +630,7 @@ def test_detection_callback_can_pause_and_close_stream(monkeypatch, tmp_path):
     assert paused.wait(2)
     assert ww.is_listening() is False
     assert streams[0].closed is True
+    assert callback_saw_closed_stream == [True]
     assert ww.stop_listening(owner=owner) is True
 
 

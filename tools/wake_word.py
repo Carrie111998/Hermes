@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import sys
 import threading
 import time
@@ -81,6 +82,7 @@ _DEFAULTS: Dict[str, Any] = {
     "sensitivity": 0.6,
     "confirmation_frames": _DEFAULT_CONFIRMATION_FRAMES,
     "start_new_session": True,
+    "duplex_output_device": None,
 }
 
 # Bundled "hey hermes" model (tools/wakewords/) — the default, so the wake word
@@ -206,6 +208,17 @@ def _provider(cfg: Dict[str, Any]) -> str:
 def _input_device(cfg: Dict[str, Any]) -> int | str | None:
     """Configured PortAudio input selector, preserving indices and names."""
     raw = _get(cfg, "input_device")
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    value = str(raw).strip()
+    return value or None
+
+
+def _duplex_output_device(cfg: Dict[str, Any]) -> int | str | None:
+    """Optional output selector kept open to support full-duplex input devices."""
+    raw = _get(cfg, "duplex_output_device")
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
@@ -875,12 +888,14 @@ class WakeWordDetector:
     def __init__(self, engine: _Engine, on_wake: Callable[[], None],
                  cooldown: float = _FIRE_COOLDOWN_SECONDS,
                  on_failure: Optional[Callable[["WakeWordDetector"], None]] = None,
-                 input_device: int | str | None = None):
+                 input_device: int | str | None = None,
+                 duplex_output_device: int | str | None = None):
         self.engine = engine
         self.on_wake = on_wake
         self.cooldown = cooldown
         self.on_failure = on_failure
         self.input_device = input_device
+        self.duplex_output_device = duplex_output_device
         self.input_device_details: Dict[str, Any] = {"selector": input_device}
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -969,17 +984,60 @@ class WakeWordDetector:
             self.input_device_details.get("default_samplerate") or "unknown",
             SAMPLE_RATE,
         )
+        output_stream = None
+        audio_queue = None
+        capture_callback = None
         try:
+            if self.duplex_output_device is not None:
+                def _write_silence(outdata, _frames, _time_info, _status):
+                    outdata.fill(0)
+
+                audio_queue = queue.Queue(maxsize=8)
+
+                def _capture_audio(indata, _frames, _time_info, status):
+                    if status:
+                        logger.debug("wake word: duplex capture status: %s", status)
+                    frame = indata.copy()
+                    try:
+                        audio_queue.put_nowait(frame)
+                    except queue.Full:
+                        try:
+                            audio_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            audio_queue.put_nowait(frame)
+                        except queue.Full:
+                            pass
+
+                capture_callback = _capture_audio
+
+                output_stream = sd.OutputStream(
+                    device=self.duplex_output_device,
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=frame_length,
+                    callback=_write_silence,
+                )
+                output_stream.start()
             stream = sd.InputStream(
                 device=self.input_device,
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="int16",
                 blocksize=frame_length,
+                callback=capture_callback,
             )
             stream.start()
         except Exception as e:
             logger.error("wake word: failed to open microphone: %s", e)
+            if output_stream is not None:
+                try:
+                    output_stream.stop()
+                    output_stream.close()
+                except Exception:
+                    pass
             startup_errors.append(e)
             ready.set()
             return
@@ -995,13 +1053,22 @@ class WakeWordDetector:
         logger.info("wake word: listening (frame=%d, rate=%d)", frame_length, SAMPLE_RATE)
         ready.set()
         failed = False
+        dispatch_wake = False
         # ~seconds of consecutive near-zero frames before we flag the stream
         # as silent.
         silent_alert_frames = max(1, int(_SILENCE_ALERT_SECONDS * SAMPLE_RATE / max(1, frame_length)))
         try:
             while not self._stop.is_set():
                 try:
-                    data, _overflow = stream.read(frame_length)
+                    if audio_queue is None:
+                        data, _overflow = stream.read(frame_length)
+                    else:
+                        try:
+                            data = audio_queue.get(timeout=0.2)
+                        except queue.Empty:
+                            if not getattr(stream, "active", True):
+                                raise RuntimeError("duplex input stream became inactive")
+                            continue
                 except Exception as e:
                     logger.warning("wake word: stream read error: %s", e)
                     failed = not self._stop.is_set()
@@ -1037,11 +1104,10 @@ class WakeWordDetector:
                         logger.info("wake word: phrase detected — firing callback")
                         if not self._callback_inflight.is_set():
                             self._callback_inflight.set()
-                            threading.Thread(
-                                target=self._dispatch_wake,
-                                daemon=True,
-                                name="wake-word-callback",
-                            ).start()
+                            dispatch_wake = True
+                            # Release both halves of a duplex device before the
+                            # callback opens the command recorder and first cue.
+                            break
                     else:
                         logger.debug("wake word: detection within cooldown — ignored")
         finally:
@@ -1050,9 +1116,21 @@ class WakeWordDetector:
                 stream.close()
             except Exception:
                 pass
+            if output_stream is not None:
+                try:
+                    output_stream.stop()
+                    output_stream.close()
+                except Exception:
+                    pass
             logger.info("wake word: stream closed")
             if failed and self.on_failure is not None:
                 self.on_failure(self)
+        if dispatch_wake:
+            threading.Thread(
+                target=self._dispatch_wake,
+                daemon=True,
+                name="wake-word-callback",
+            ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1241,7 @@ def start_listening(
                 on_wake,
                 on_failure=_detector_failed,
                 input_device=_input_device(cfg),
+                duplex_output_device=_duplex_output_device(cfg),
             )
             _detector = detector
             _detector_owner = owner

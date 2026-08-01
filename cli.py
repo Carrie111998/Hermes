@@ -11870,10 +11870,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # continuous recording falls back to the documented defaults
         # instead of crashing on ``.get()``.
         voice_cfg: dict = {}
+        wake_cfg: dict = {}
         try:
             from hermes_cli.config import load_config
-            _cfg = load_config().get("voice")
+            _full_cfg = load_config()
+            _cfg = _full_cfg.get("voice")
             voice_cfg = _cfg if isinstance(_cfg, dict) else {}
+            _wake_cfg = _full_cfg.get("wake_word")
+            wake_cfg = _wake_cfg if isinstance(_wake_cfg, dict) else {}
         except Exception:
             pass
 
@@ -11932,7 +11936,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self._voice_beeps_enabled():
             try:
                 from tools.voice_mode import play_beep
-                play_beep(frequency=880, count=1)
+                if (
+                    getattr(self, "_wake_suspended", False)
+                    and wake_cfg.get("duplex_output_device") is not None
+                ):
+                    # A newly reopened HFP sink can discard the first short
+                    # buffer while SCO starts. Warm it with silence so the
+                    # actual wake cue remains audible.
+                    play_beep(frequency=880, count=1, pre_roll=0.25)
+                else:
+                    play_beep(frequency=880, count=1)
             except Exception:
                 pass
 

@@ -1481,6 +1481,7 @@ DEFAULT_CONFIG = {
 
     "voice": {
         "record_key": "ctrl+b",
+        "output_device": None,         # PortAudio output index/name for beeps; null uses platform default
         "max_recording_seconds": 120,
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
@@ -1504,6 +1505,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "surface": "auto",            # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
         "input_device": None,          # PortAudio input device index/name; null uses the process default
+        "duplex_output_device": None,  # optional output kept silently open for HFP-style full-duplex capture
         "provider": "openwakeword",   # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
         "phrase": "hey hermes",       # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
         "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)

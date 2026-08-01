@@ -101,6 +101,27 @@ def _audio_available() -> bool:
         return False
 
 
+def configured_output_device() -> int | str | None:
+    """Return the explicit PortAudio output selector for voice audio cues."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        voice = config.get("voice") if isinstance(config, dict) else None
+        voice = voice if isinstance(voice, dict) else {}
+        value = voice.get("output_device")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+    except Exception:
+        pass
+    return None
+
+
 def _default_input_samplerate(sd) -> int:
     """Return the preferred capture rate for the default input device.
 
@@ -474,13 +495,19 @@ def _is_nan(value: float) -> bool:
         return False
 
 
-def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> None:
+def play_beep(
+    frequency: int = 880,
+    duration: float = 0.12,
+    count: int = 1,
+    pre_roll: float = 0.0,
+) -> None:
     """Play a short beep tone using numpy + sounddevice.
 
     Args:
         frequency: Tone frequency in Hz (default 880 = A5).
         duration: Duration of each beep in seconds.
         count: Number of beeps to play (with short gap between).
+        pre_roll: Optional leading silence used to warm a cold output transport.
     """
     # Synthesize the tone with numpy only (no sounddevice import yet, so the
     # macOS TCC prompt is not triggered on the synthesis step).
@@ -492,9 +519,15 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
         gap = 0.06  # seconds between beeps
         samples_per_beep = int(SAMPLE_RATE * duration)
         samples_per_gap = int(SAMPLE_RATE * gap)
+        try:
+            pre_roll_seconds = max(0.0, float(pre_roll))
+        except (TypeError, ValueError):
+            pre_roll_seconds = 0.0
 
         beep_volume = _get_beep_volume()
         parts = []
+        if pre_roll_seconds:
+            parts.append(np.zeros(int(SAMPLE_RATE * pre_roll_seconds), dtype=np.int16))
         for i in range(count):
             t = np.linspace(0, duration, samples_per_beep, endpoint=False)
             # Apply fade in/out to avoid click artifacts
@@ -517,7 +550,11 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
             sd, _ = _import_audio()
         except (ImportError, OSError):
             return
-        sd.play(audio, samplerate=SAMPLE_RATE)
+        sd.play(
+            audio,
+            samplerate=SAMPLE_RATE,
+            device=configured_output_device(),
+        )
         # sd.wait() calls Event.wait() without timeout — hangs forever if the
         # audio device stalls.  Poll with a 2s ceiling and force-stop.
         deadline = time.monotonic() + 2.0

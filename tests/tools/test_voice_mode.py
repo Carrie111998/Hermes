@@ -708,6 +708,35 @@ class TestPlayBeep:
         assert audio_arg.dtype == np.int16
         assert len(audio_arg) > 0
 
+    def test_beep_can_prepend_silent_device_warmup(self, mock_sd):
+        np = pytest.importorskip("numpy")
+        from tools import voice_mode as vm
+
+        mock_stream = MagicMock(active=False)
+        mock_sd.get_stream.return_value = mock_stream
+
+        vm.play_beep(frequency=880, duration=0.1, count=1, pre_roll=0.25)
+
+        audio = mock_sd.play.call_args[0][0]
+        warmup_samples = int(vm.SAMPLE_RATE * 0.25)
+        assert len(audio) == warmup_samples + int(vm.SAMPLE_RATE * 0.1)
+        assert np.all(audio[:warmup_samples] == 0)
+        assert np.any(audio[warmup_samples:] != 0)
+
+    def test_beep_uses_configured_output_device(self, mock_sd):
+        pytest.importorskip("numpy")
+        from tools.voice_mode import play_beep
+
+        mock_stream = MagicMock(active=False)
+        mock_sd.get_stream.return_value = mock_stream
+        with patch(
+            "tools.voice_mode.configured_output_device",
+            return_value="Jabra Speak2 55 UC",
+        ):
+            play_beep()
+
+        assert mock_sd.play.call_args.kwargs["device"] == "Jabra Speak2 55 UC"
+
 # ============================================================================
 # Silence detection
 # ============================================================================

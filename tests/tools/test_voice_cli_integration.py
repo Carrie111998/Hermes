@@ -180,6 +180,39 @@ class TestVoiceBeepConfigReal:
         recorder.start.assert_called_once()
         mock_beep.assert_not_called()
 
+    @patch("cli._cprint")
+    @patch("cli.threading.Thread")
+    @patch("tools.voice_mode.play_beep")
+    @patch("tools.voice_mode.create_audio_recorder")
+    @patch(
+        "tools.voice_mode.check_voice_requirements",
+        return_value={
+            "available": True,
+            "audio_available": True,
+            "stt_available": True,
+            "details": "OK",
+            "missing_packages": [],
+        },
+    )
+    @patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "voice": {"beep_enabled": True},
+            "wake_word": {"duplex_output_device": "jabra_bluetooth"},
+        },
+    )
+    def test_wake_recording_warms_duplex_output_before_first_beep(
+        self, _cfg, _req, mock_create, mock_beep, mock_thread, _cp
+    ):
+        recorder = MagicMock(supports_silence_autostop=True)
+        mock_create.return_value = recorder
+        mock_thread.return_value = MagicMock(start=MagicMock())
+
+        cli = _make_voice_cli(_wake_suspended=True)
+        cli._voice_start_recording()
+
+        mock_beep.assert_called_once_with(frequency=880, count=1, pre_roll=0.25)
+
 
 class TestMaxRecordingSecondsConfigReal:
     """voice.max_recording_seconds must reach the recorder from config.
