@@ -4033,21 +4033,6 @@ def _d4_canonical_assignee(raw: Any, *, field: str) -> str:
     return canonical
 
 
-def _d4_governed_resolver_profile(meta: Optional[dict]) -> str:
-    """Return the board-governed Resolver identity, not event provenance."""
-    workflow = _product_workflow_dict(meta)
-    if "human_escalation_profile" not in workflow:
-        return "resolver"
-    raw_profile = workflow.get("human_escalation_profile")
-    if not isinstance(raw_profile, str) or not raw_profile.strip():
-        raise TaskSnapshotConflict(
-            "resolver re-entry", {"governed_resolver_profile": "invalid"}
-        )
-    return _d4_canonical_assignee(
-        raw_profile, field="governed_resolver_profile"
-    )
-
-
 def _d4_raw_governed_assignee(
     meta: Optional[dict], step_key: str,
 ) -> tuple[bool, Any]:
@@ -4269,7 +4254,7 @@ def reenter_resolver_escalation(
             resolver_profile = _d4_canonical_assignee(
                 run["profile"], field="resolver_profile"
             )
-            governed_resolver_profile = _d4_governed_resolver_profile(meta)
+            governed_resolver_profile = "resolver"
             if resolver_profile != governed_resolver_profile:
                 raise TaskSnapshotConflict(
                     "resolver re-entry",

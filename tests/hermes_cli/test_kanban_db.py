@@ -14091,6 +14091,61 @@ def test_d4_rejects_coherently_forged_non_resolver_cycle_without_mutation(kanban
         assert kb.list_events(conn, tid) == before_events
 
 
+def test_d4_default_human_escalation_profile_accepts_resolver_cycle(kanban_home):
+    board = "d4-default-human-profile"
+    _v2_product_board(board)
+    _set_human_escalation_profile(board, "default")
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        event_id = kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="answer", answered_by="operator",
+            expected=expected,
+        )
+        task = kb.get_task(conn, tid)
+        answer_event = next(event for event in kb.list_events(conn, tid) if event.id == event_id)
+    assert task is not None and task.assignee == "resolver"
+    assert answer_event.payload["hermes_assignee"] == "resolver"
+
+
+def test_d4_rejects_coherently_forged_default_cycle_without_mutation(kanban_home):
+    board = "d4-forged-default"
+    _v2_product_board(board)
+    _set_human_escalation_profile(board, "default")
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        blocked_id = expected["escalation_event_id"]
+        preflight = next(
+            event for event in kb.list_events(conn, tid)
+            if event.id == expected["preflight_event_id"]
+        )
+        resolved_id = blocked_id - 1
+        resolved = next(event for event in kb.list_events(conn, tid) if event.id == resolved_id)
+        forged_preflight = dict(preflight.payload)
+        forged_preflight["hermes_assignee"] = "default"
+        forged_resolved = dict(resolved.payload)
+        forged_resolved["resolver_profile"] = "default"
+        conn.execute(
+            "UPDATE task_runs SET profile='default' WHERE id=?",
+            (expected["run_id"],),
+        )
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(forged_preflight), preflight.id),
+        )
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(forged_resolved), resolved.id),
+        )
+        conn.commit()
+        before = _full_tables_state(conn)
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+        assert _full_tables_state(conn) == before
+
+
 @pytest.mark.parametrize(
     "field,bad_value",
     [
