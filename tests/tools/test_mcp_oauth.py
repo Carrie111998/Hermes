@@ -383,6 +383,56 @@ class TestCallbackPortReservation:
         assert code == "flowA"
         assert state == "sA"
 
+    def test_same_pinned_port_waiters_are_serialized(self, monkeypatch):
+        """A second active flow waits instead of binding an owned pinned port."""
+        import asyncio
+        import threading
+        import tools.mcp_oauth as mod
+
+        port = _find_free_port()
+        monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+        monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda lead: None)
+
+        async def drive():
+            real_http_server = mod.HTTPServer
+            first_active = asyncio.Event()
+            second_active = asyncio.Event()
+            activation_count = 0
+
+            class RecordingHTTPServer(real_http_server):
+                def server_activate(self):
+                    nonlocal activation_count
+                    super().server_activate()
+                    activation_count += 1
+                    (first_active if activation_count == 1 else second_active).set()
+
+            monkeypatch.setattr(mod, "HTTPServer", RecordingHTTPServer)
+
+            first = asyncio.create_task(mod._make_callback_waiter(port)())
+            await asyncio.wait_for(first_active.wait(), timeout=2)
+
+            second = asyncio.create_task(mod._make_callback_waiter(port)())
+            await asyncio.sleep(0)
+            assert not second.done()
+            assert activation_count == 1
+
+            threading.Thread(
+                target=_hit_callback_when_ready,
+                args=(f"http://127.0.0.1:{port}/callback?code=first&state=s1",),
+                daemon=True,
+            ).start()
+            assert await asyncio.wait_for(first, timeout=2) == ("first", "s1")
+
+            await asyncio.wait_for(second_active.wait(), timeout=2)
+            threading.Thread(
+                target=_hit_callback_when_ready,
+                args=(f"http://127.0.0.1:{port}/callback?code=second&state=s2",),
+                daemon=True,
+            ).start()
+            assert await asyncio.wait_for(second, timeout=2) == ("second", "s2")
+
+        asyncio.run(drive())
+
 
 # ---------------------------------------------------------------------------
 # remove_oauth_tokens
@@ -833,6 +883,7 @@ def test_wait_for_callback_port_in_use_reports_clear_error(monkeypatch):
     assert "54321" in msg
     assert "already in use" in msg
     assert "timed out" not in msg
+    assert 54321 not in mo._active_callback_ports
 
 
 # ---------------------------------------------------------------------------
