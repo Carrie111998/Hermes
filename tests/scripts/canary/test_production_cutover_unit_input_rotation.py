@@ -848,6 +848,99 @@ def test_legacy_rotate_accepts_exact_pre_edge_expansion_v3_predecessor(
     assert json.loads((archived / "unit-input-plan.json").read_bytes()) == plan
 
 
+def test_rotate_reads_completed_exact_legacy_v3_audit_before_current_successor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000
+    evidence = (tmp_path / "evidence").resolve()
+    evidence.mkdir(mode=0o700)
+    evidence.chmod(0o700)
+    os.chown(evidence, os.geteuid(), os.getegid())
+    staged = evidence / "staged"
+    _patch_staged_paths(monkeypatch, staged)
+    monkeypatch.setattr(cutover, "EVIDENCE_ROOT", evidence)
+
+    private_key = Ed25519PrivateKey.generate()
+    legacy_credentials = {
+        domain: package.CREDENTIALS_BY_DOMAIN[domain]
+        for domain in package.LEGACY_V3_OPERATIONAL_EDGE_DOMAINS
+    }
+    with monkeypatch.context() as legacy:
+        legacy.setattr(package, "CREDENTIALS_BY_DOMAIN", legacy_credentials)
+        predecessor = owner.build_unit_input_authority(
+            release_revision="a" * 40,
+            unit_inputs=_unit_input_payload("a" * 40),
+            owner_subject_sha256="a" * 64,
+            private_key=private_key,
+            owner_runtime_attestation=_runtime_attestation("a" * 40),
+            now_unix=now,
+        )
+        legacy_successor = owner.build_unit_input_authority(
+            release_revision="b" * 40,
+            unit_inputs=_unit_input_payload("b" * 40),
+            owner_subject_sha256="a" * 64,
+            private_key=private_key,
+            owner_runtime_attestation=_runtime_attestation("b" * 40),
+            now_unix=now,
+        )
+        stager.stage_publication(
+            predecessor[2],
+            require_root=False,
+            now_unix=now,
+        )
+        package.bootstrap_fixed_unit_inputs(
+            authority_plan_path=package.STAGED_UNIT_INPUT_PLAN_PATH,
+            authority_approval_path=package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+            unit_inputs_path=package.FIXED_UNIT_INPUTS_PATH,
+            require_root=False,
+            now_unix=now,
+        )
+        legacy_receipt = rotation.rotate_unit_input_authority(
+            legacy_successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+
+    current_successor = owner.build_unit_input_authority(
+        release_revision="c" * 40,
+        unit_inputs=_unit_input_payload("c" * 40),
+        owner_subject_sha256="a" * 64,
+        private_key=private_key,
+        owner_runtime_attestation=_runtime_attestation("c" * 40),
+        now_unix=now + 1,
+    )
+    current_receipt = rotation.rotate_unit_input_authority(
+        current_successor[2],
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    replay = rotation.rotate_unit_input_authority(
+        current_successor[2],
+        require_root=False,
+        now_unix=now + 2,
+        lock_factory=nullcontext,
+    )
+
+    assert legacy_receipt["successor_revision"] == "b" * 40
+    assert current_receipt["predecessor_revision"] == "b" * 40
+    assert current_receipt["successor_revision"] == "c" * 40
+    assert replay == current_receipt
+    assert _live_triplet() == {
+        "plan": _canonical(current_successor[0]),
+        "approval": _canonical(current_successor[1]),
+        "fixed": _canonical(
+            package._unit_inputs_from_authority(
+                current_successor[0],
+                current_successor[1],
+            )
+        )
+        + b"\n",
+    }
+
+
 @pytest.mark.parametrize(
     "crash_stage",
     (
