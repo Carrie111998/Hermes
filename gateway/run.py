@@ -21534,6 +21534,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
                 out[f"{section}.{key}"] = None
+
+        # The writer flag affects frozen tool schemas and may come from managed
+        # scope or an environment reference. Store the resolved boolean, not
+        # the raw YAML value, so a real policy change rebuilds the cached agent.
+        try:
+            from hermes_cli.config import resolve_builtin_memory_writer_enabled
+
+            out["memory.builtin_writer_enabled"] = (
+                resolve_builtin_memory_writer_enabled(
+                    cfg,
+                    config_path=_gateway_config_home() / "config.yaml",
+                )
+            )
+        except Exception:
+            out["memory.builtin_writer_enabled"] = False
+
         try:
             from tools.registry import registry
 

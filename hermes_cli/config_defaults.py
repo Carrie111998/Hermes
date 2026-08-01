@@ -1554,6 +1554,10 @@ DEFAULT_CONFIG = {
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
+        # Expose the built-in MEMORY.md / USER.md writer schema to the model.
+        # False hides only that mutating tool; read injection, the memory
+        # toolset, and external provider tools remain available.
+        "builtin_writer_enabled": True,
         # Approval gate for memory writes (add/replace/remove), applied to BOTH
         # foreground agent turns and the background self-improvement review fork
         # (the source of unprompted "wrong assumption" saves users reported).

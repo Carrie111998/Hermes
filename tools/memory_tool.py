@@ -1123,7 +1123,12 @@ def memory_tool(
 
 
 def check_memory_requirements() -> bool:
-    """Memory tool has no external requirements -- always available."""
+    """The built-in file-memory implementation has no external requirements.
+
+    Operator policy for exposing its schema is resolved in ``model_tools``;
+    keeping policy out of this availability probe avoids registry TTL and
+    last-good-result caching.
+    """
     return True
 
 

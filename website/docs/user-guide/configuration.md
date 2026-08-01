@@ -652,10 +652,17 @@ When on, skill writes are staged under `~/.hermes/pending/skills/` and reviewed 
 memory:
   memory_enabled: true
   user_profile_enabled: true
+  builtin_writer_enabled: true  # false = hide only the built-in writer tool
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # true = require approval before any memory write
 ```
+
+`memory.builtin_writer_enabled` defaults to `true`. Set it to `false` to hide
+the built-in `memory` tool that writes `MEMORY.md` and `USER.md`. This does
+not disable prompt injection from those files, the `memory` toolset, or tools
+provided by an external memory provider. See [Controlling access to the
+built-in writer](/user-guide/features/memory#controlling-access-to-the-built-in-writer-builtin_writer_enabled).
 
 With `memory.write_approval: true`, memory writes need your approval before they land: interactive CLI turns prompt inline; messaging sessions and the background self-improvement review stage the write for `/memory pending` → `/memory approve <id>` / `/memory reject <id>` review. Toggle at runtime with `/memory approval on|off`. See [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 

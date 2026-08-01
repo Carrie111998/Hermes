@@ -256,8 +256,9 @@ _LEGACY_TOOLSET_MAP = {
 # get_tool_definitions  (the main schema provider)
 # =============================================================================
 
-# Module-level memoization for get_tool_definitions(). Keyed on
-# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
+# Module-level memoization for get_tool_definitions(). Keyed on toolset inputs,
+# registry generation, config fingerprint, and effective policy values that can
+# change independently of the user config file.
 # Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
 # with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
 # filtering + check_fn probing per call. Only active when quiet_mode=True
@@ -309,6 +310,14 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    # Resolve operator policy before cache lookup. The effective boolean covers
+    # defaults, managed scope, and environment expansion; keying it directly
+    # avoids stale schemas when those sources change without touching the user
+    # config file's stat fingerprint.
+    from hermes_cli.config import resolve_builtin_memory_writer_enabled
+
+    builtin_memory_writer_enabled = resolve_builtin_memory_writer_enabled()
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -330,6 +339,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
+            builtin_memory_writer_enabled,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
@@ -344,8 +354,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        builtin_memory_writer_enabled=builtin_memory_writer_enabled,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -369,8 +384,13 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    builtin_memory_writer_enabled: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
+    if builtin_memory_writer_enabled is None:
+        from hermes_cli.config import resolve_builtin_memory_writer_enabled
+
+        builtin_memory_writer_enabled = resolve_builtin_memory_writer_enabled()
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -457,6 +477,16 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    # Operator policy is not a transient dependency probe. Apply it outside
+    # registry check_fn caching so a resolved false takes effect immediately,
+    # while keeping the memory toolset available for external providers.
+    if not builtin_memory_writer_enabled:
+        filtered_tools = [
+            tool
+            for tool in filtered_tools
+            if tool.get("function", {}).get("name") != "memory"
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
