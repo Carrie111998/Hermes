@@ -1254,6 +1254,43 @@ OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
 AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
 
 
+# ─── Venv layout ─────────────────────────────────────────────────────────────
+
+def venv_bin_dir(venv_dir, *, windows: bool | None = None) -> Path:
+    """Directory holding a venv's executables (``Scripts`` / ``bin``).
+
+    Canonical helper for venv layout. This was open-coded in seven places
+    across four ``hermes_cli`` modules using three different Windows
+    predicates (``platform.system()``, ``is_windows()``, ``_is_windows()``);
+    each new call site had to re-derive it, and #76091 shipped an eighth copy
+    because the correct behaviour lived 2400 lines away in another function.
+    A few sites outside ``hermes_cli`` (``tools/code_execution_tool.py``,
+    ``agent/lsp/install.py``, ``agent/lsp/servers.py``) still hand-roll it —
+    convert them as they are touched.
+
+    *windows* lets a caller pass its own platform verdict. Several callers
+    resolve this through predicates the test-suite patches to exercise
+    Windows paths on Linux CI (``hermes_cli.main._is_windows`` and friends);
+    reading ``sys.platform`` unconditionally here would silently drop those
+    paths out of coverage. Defaults to the host platform.
+
+    The path is returned unconditionally — callers legitimately differ on
+    whether a missing venv is an error, so existence checking stays with them.
+    """
+    if windows is None:
+        windows = sys.platform == "win32"
+    return Path(venv_dir) / ("Scripts" if windows else "bin")
+
+
+def venv_python_path(venv_dir, *, windows: bool | None = None) -> Path:
+    """Path to the Python interpreter inside *venv_dir* (may not exist)."""
+    if windows is None:
+        windows = sys.platform == "win32"
+    return venv_bin_dir(venv_dir, windows=windows) / (
+        "python.exe" if windows else "python"
+    )
+
+
 # ─── Partial-update diagnostics ──────────────────────────────────────────────
 
 # Top-level packages/modules that ship as part of Hermes itself. An ImportError
