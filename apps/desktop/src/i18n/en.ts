@@ -2287,7 +2287,7 @@ export const en: Translations = {
       scopeLastTurn: 'Last turn',
       commit: 'Commit',
       commitAndPush: 'Commit & Push',
-      commitPlaceholder: 'Message (⌘↵ to commit)',
+      commitPlaceholder: shortcut => `Message (${shortcut} to commit)`,
       generateCommitMessage: 'Generate commit message',
       stopGenerating: 'Stop generating',
       createPr: 'Create PR',
