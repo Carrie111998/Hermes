@@ -7,6 +7,8 @@ claim for a given fire. Single-machine deployments always win (unaffected).
 These exercise the real store against a temp HERMES_HOME (no mocks) per the
 E2E-over-mocks discipline for file-touching code.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 
@@ -58,3 +60,47 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_matching_fire_claim_heartbeat_refreshes_only_its_incarnation(temp_home, monkeypatch):
+    from cron.jobs import (
+        claim_job_for_fire,
+        create_job,
+        get_job,
+        heartbeat_fire_claim,
+        load_jobs,
+        save_jobs,
+    )
+
+    now = [datetime(2026, 7, 12, 12, 0, tzinfo=timezone.utc)]
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now[0])
+
+    job = create_job(prompt="x", schedule="every 5m", name="heartbeat")
+    job_id = job["id"]
+    assert claim_job_for_fire(job_id) is True
+    claim = get_job(job_id)["fire_claim"]
+    incarnation = claim["incarnation"]
+    original_at = claim["at"]
+
+    now[0] += timedelta(seconds=240)
+    assert heartbeat_fire_claim(job_id, expected_incarnation=incarnation) is True
+    refreshed_claim = get_job(job_id)["fire_claim"]
+    assert refreshed_claim["at"] != original_at
+    assert refreshed_claim["incarnation"] == incarnation
+
+    # The original fire is more than five minutes old, but the matching
+    # heartbeat keeps this exact worker's claim from being reclaimed.
+    now[0] += timedelta(seconds=61)
+    assert claim_job_for_fire(job_id) is False
+
+    assert heartbeat_fire_claim(job_id, expected_incarnation="different") is False
+
+    jobs = load_jobs()
+    jobs[0]["fire_claim"] = {"at": original_at, "by": "legacy"}
+    save_jobs(jobs)
+    assert heartbeat_fire_claim(job_id, expected_incarnation=incarnation) is False
+
+    jobs = load_jobs()
+    jobs[0]["fire_claim"] = "malformed"
+    save_jobs(jobs)
+    assert heartbeat_fire_claim(job_id, expected_incarnation=incarnation) is False

@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -225,6 +226,39 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+
+
+def test_live_run_keeps_ledger_running_until_worker_release(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    import cron.scheduler as scheduler
+
+    record = executions.create_execution("live-ledger", source="direct")
+    started = threading.Event()
+    release = threading.Event()
+
+    def run_job(job, *, defer_agent_teardown=None):
+        started.set()
+        assert release.wait(timeout=5)
+        return True, "output", "response", None
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    worker = threading.Thread(
+        target=lambda: scheduler.run_one_job({"id": "live-ledger", "execution_id": record["id"]}),
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    assert executions.latest_execution("live-ledger")["status"] == "running"
+    assert worker.is_alive()
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert executions.latest_execution("live-ledger")["status"] == "completed"
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

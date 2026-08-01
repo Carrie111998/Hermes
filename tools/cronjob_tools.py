@@ -588,8 +588,17 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    lease = None
     try:
-        from cron.scheduler import run_one_job
+        from cron.scheduler import _acquire_running_job_lease, run_one_job
+
+        lease = _acquire_running_job_lease(job_id)
+        if lease is None:
+            return {
+                "claimed": False,
+                "success": False,
+                "error": "Job is already running locally; not run again.",
+            }
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
@@ -606,9 +615,16 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
+        job = get_job(job_id)
+        if job is None:
+            return {
+                "claimed": False,
+                "success": False,
+                "error": "Job no longer exists; nothing to run.",
+            }
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        processed = run_one_job(job, lease=lease)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -624,6 +640,9 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 def cronjob(

@@ -1246,6 +1246,21 @@ class TestParallelTick:
         assert len(ends) == 2
         assert max(starts) < min(ends), f"Jobs not concurrent: {call_order}"
 
+    def test_tick_rejects_existing_lease_before_creating_execution(self):
+        import cron.scheduler as scheduler
+
+        lease = scheduler._acquire_running_job_lease("tick-overlap")
+        assert lease is not None
+        try:
+            created = []
+            with patch("cron.scheduler.get_due_jobs", return_value=[{"id": "tick-overlap", "name": "t"}]), \
+                 patch("cron.scheduler.advance_next_run"), \
+                 patch("cron.scheduler.create_execution", side_effect=lambda *_args, **_kwargs: created.append(True)):
+                assert scheduler.tick(verbose=False, sync=False) == 0
+            assert not created
+        finally:
+            lease.release()
+
     def test_parallel_jobs_isolated_contextvars(self):
         """Each job's ContextVars must be isolated — no cross-contamination."""
         from gateway.session_context import get_session_env

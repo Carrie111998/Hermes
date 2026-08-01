@@ -281,7 +281,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_fire_claim,
+    heartbeat_run_claim,
+    mark_job_run,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -326,6 +334,59 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+
+
+class _RunningJobLease(str):
+    """An exact-once transfer of one job's existing local admission."""
+
+    def __new__(cls, job_id: str):
+        lease = super().__new__(cls, job_id)
+        lease.job_id = job_id
+        lease._released = False
+        lease._release_lock = threading.Lock()
+        lease._waiting_for_worker_exit = False
+        return lease
+
+    def retain_while_worker_lives(self) -> None:
+        """Keep shutdown terminalization out of a timed-out worker's join."""
+        with self._release_lock:
+            if not self._released:
+                self._waiting_for_worker_exit = True
+
+    def worker_exited(self) -> None:
+        """Allow the existing terminal path to own the completed worker."""
+        with self._release_lock:
+            self._waiting_for_worker_exit = False
+
+    def waits_for_worker_exit(self) -> bool:
+        with self._release_lock:
+            return self._waiting_for_worker_exit
+
+    def release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        with _running_lock:
+            _running_job_ids.discard(self.job_id)
+
+
+class _DeferredCronAgentTeardown(list):
+    """Carry the shared lease through run_job without another lifecycle owner."""
+
+    def __init__(self, running_lease: _RunningJobLease):
+        super().__init__()
+        self.running_lease = running_lease
+
+
+def _acquire_running_job_lease(job_id: str) -> Optional[_RunningJobLease]:
+    """Acquire the scheduler's one local admission slot for ``job_id``."""
+    with _running_lock:
+        if job_id in _running_job_ids:
+            return None
+        lease = _RunningJobLease(job_id)
+        _running_job_ids.add(lease)
+    return lease
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -381,7 +442,15 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     Returns the list of job IDs marked, for the caller to log.
     """
     with _running_lock:
-        job_ids = list(_running_job_ids)
+        active_jobs = list(_running_job_ids)
+        job_ids = [
+            str(job_id)
+            for job_id in active_jobs
+            if not (
+                isinstance(job_id, _RunningJobLease)
+                and job_id.waits_for_worker_exit()
+            )
+        ]
         _interrupted_job_ids.update(job_ids)
     marked = []
     for job_id in job_ids:
@@ -2341,26 +2410,36 @@ def _run_job_script(
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """Run a cron script while keeping its owned one-shot claim fresh.
+    """Run a cron script while keeping its owned durable claims fresh.
 
     Script execution is synchronous and may legitimately outlive the stale
-    claim TTL.  Without a concurrent heartbeat, another scheduler process can
-    mistake the live run for a dead owner and dispatch the same one-shot again.
-    Recurring jobs and unclaimed/manual runs have no durable one-shot claim and
-    therefore use the ordinary script path without starting a thread.
+    claim TTL. Without a concurrent heartbeat, another scheduler process can
+    mistake the live run for a dead owner and dispatch the same fire again.
+    Recurring jobs and unclaimed/manual runs have no durable claim and therefore
+    use the ordinary script path without starting a thread.
 
-    The claim owner is captured from the dispatched job and never re-read from
-    storage.  ``heartbeat_run_claim`` compares that stable owner before every
-    refresh, so a stale runner cannot extend a replacement owner's claim.
+    Claim identities are captured from the dispatched job and never re-read
+    from storage. ``heartbeat_run_claim`` and ``heartbeat_fire_claim`` compare
+    their stable owner or incarnation before every refresh, so a stale runner
+    cannot extend a replacement owner's claim.
     """
     schedule = job.get("schedule")
-    claim = job.get("run_claim")
-    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
-    if not (
+    run_claim = job.get("run_claim")
+    run_claim_owner = (
+        str(run_claim.get("by") or "") if isinstance(run_claim, dict) else ""
+    )
+    has_run_claim = (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
-        and owner
-    ):
+        and bool(run_claim_owner)
+    )
+    fire_claim = job.get("fire_claim")
+    fire_claim_incarnation = (
+        str(fire_claim.get("incarnation") or "")
+        if isinstance(fire_claim, dict)
+        else ""
+    )
+    if not has_run_claim and not fire_claim_incarnation:
         return _run_job_script(script_path, workdir=workdir)
 
     job_id = str(job.get("id") or "")
@@ -2369,14 +2448,27 @@ def _run_job_script_with_claim_heartbeat(
 
     def _heartbeat_loop() -> None:
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
-            try:
-                heartbeat_run_claim(job_id, expected_owner=owner)
-            except Exception:
-                logger.debug(
-                    "Job '%s': script run_claim heartbeat failed",
-                    job_id,
-                    exc_info=True,
-                )
+            if has_run_claim:
+                try:
+                    heartbeat_run_claim(job_id, expected_owner=run_claim_owner)
+                except Exception:
+                    logger.debug(
+                        "Job '%s': script run_claim heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
+            if fire_claim_incarnation:
+                try:
+                    heartbeat_fire_claim(
+                        job_id,
+                        expected_incarnation=fire_claim_incarnation,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Job '%s': script fire_claim heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
 
     heartbeat_thread = threading.Thread(
         target=heartbeat_context.run,
@@ -2388,10 +2480,12 @@ def _run_job_script_with_claim_heartbeat(
         heartbeat_thread.start()
     except Exception:
         logger.debug(
-            "Job '%s': could not start script run_claim heartbeat",
+            "Job '%s': could not start script claim heartbeat",
             job_id,
             exc_info=True,
         )
+        if fire_claim_incarnation:
+            return False, "Script execution skipped: external fire-claim heartbeat could not start"
         return _run_job_script(script_path, workdir=workdir)
 
     try:
@@ -3098,12 +3192,6 @@ def run_job(
     # checks _SESSION_CWD first, so gateway sessions with no override see
     # their own cwd, not the cron's workdir (#69396).
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
-
     _holds_cwd_write = _job_workdir is not None
     if _holds_cwd_write:
         _terminal_cwd_lock.acquire_write()
@@ -3115,7 +3203,9 @@ def run_job(
     # statement raises.  A leaked writer would deadlock the whole scheduler
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
+    _prior_terminal_cwd = "_UNSET_"
     try:
+        _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3544,22 +3634,38 @@ def run_job(
         _run_claim_owner = (
             str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
         )
+        _fire_claim = job.get("fire_claim")
+        _fire_claim_incarnation = (
+            str(_fire_claim.get("incarnation") or "")
+            if isinstance(_fire_claim, dict) else ""
+        )
         _last_claim_heartbeat = time.monotonic()
 
-        def _heartbeat_run_claim_if_due():
+        def _heartbeat_claims_if_due():
             nonlocal _last_claim_heartbeat
-            if not _is_oneshot or not _run_claim_owner:
+            if not _run_claim_owner and not _fire_claim_incarnation:
                 return
             _mono = time.monotonic()
             if _mono - _last_claim_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
                 return
             _last_claim_heartbeat = _mono
-            try:
-                heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
-            except Exception:
-                logger.debug(
-                    "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
-                )
+            if _is_oneshot and _run_claim_owner:
+                try:
+                    heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
+                except Exception:
+                    logger.debug(
+                        "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
+                    )
+            if _fire_claim_incarnation:
+                try:
+                    heartbeat_fire_claim(
+                        job_id,
+                        expected_incarnation=_fire_claim_incarnation,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Job '%s': fire_claim heartbeat failed", job_name, exc_info=True
+                    )
 
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
@@ -3570,9 +3676,9 @@ def run_job(
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
+                # Unlimited — no inactivity watchdog, but any durable claim
+                # still needs its heartbeat, so poll instead of blocking.
+                if _is_oneshot or _fire_claim_incarnation:
                     result = None
                     while True:
                         done, _ = concurrent.futures.wait(
@@ -3581,7 +3687,7 @@ def run_job(
                         if done:
                             result = _cron_future.result()
                             break
-                        _heartbeat_run_claim_if_due()
+                        _heartbeat_claims_if_due()
                 else:
                     result = _cron_future.result()
             else:
@@ -3593,7 +3699,7 @@ def run_job(
                     if done:
                         result = _cron_future.result()
                         break
-                    _heartbeat_run_claim_if_due()
+                    _heartbeat_claims_if_due()
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -3605,11 +3711,9 @@ def run_job(
                     if _idle_secs >= _cron_inactivity_limit:
                         _inactivity_timeout = True
                         break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
+        except BaseException:
+            _cron_pool.shutdown(wait=True, cancel_futures=True)
             raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -3632,13 +3736,37 @@ def run_job(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
+            _running_lease = getattr(defer_agent_teardown, "running_lease", None)
+            if _running_lease is not None:
+                _running_lease.retain_while_worker_lives()
+            try:
+                if hasattr(agent, "interrupt"):
+                    try:
+                        agent.interrupt("Cron job timed out (inactivity)")
+                    except Exception:
+                        logger.debug("Job '%s': cooperative interrupt failed", job_name, exc_info=True)
+                while True:
+                    done, _ = concurrent.futures.wait(
+                        {_cron_future}, timeout=_POLL_INTERVAL,
+                    )
+                    if done:
+                        try:
+                            _cron_future.result()
+                        except BaseException:
+                            pass
+                        break
+                    _heartbeat_claims_if_due()
+            finally:
+                if _running_lease is not None:
+                    _running_lease.worker_exited()
+            _cron_pool.shutdown(wait=True, cancel_futures=True)
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
                 f"— last activity: {_last_desc}"
             )
+
+        _cron_pool.shutdown(wait=True, cancel_futures=True)
 
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
@@ -3875,7 +4003,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    lease: Optional[_RunningJobLease] = None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3890,9 +4025,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+    lease = lease or _acquire_running_job_lease(job["id"])
+    if lease is None:
+        logger.info("Job '%s' already running — skipping", job.get("name", job["id"]))
+        return False
+    try:
+        execution_id = job.get("execution_id")
+        if not execution_id:
+            execution_id = create_execution(job["id"], source="direct")["id"]
+    except BaseException:
+        lease.release()
+        raise
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3940,7 +4083,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # list makes run_job hand the agent back instead, and we tear it down
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
-        _deferred_agents: list = []
+        _deferred_agents = _DeferredCronAgentTeardown(lease)
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents
@@ -4076,6 +4219,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        lease.release()
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -4186,12 +4331,18 @@ def tick(
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict) -> bool:
+        def _process_job(job: dict, lease: _RunningJobLease) -> bool:
             """Run one due job end-to-end. Thin wrapper around the shared
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                lease=lease,
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -4224,29 +4375,27 @@ def tick(
                     job.get("name", job_id),
                 )
                 return None
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+            lease = _acquire_running_job_lease(job_id)
+            if lease is None:
+                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except BaseException:
+                lease.release()
+                raise
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
-                try:
-                    return ctx.run(_process_job, j)
-                finally:
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
+            def _run_one(j=dispatched_job, ctx=_ctx, run_lease=lease):
+                return ctx.run(_process_job, j, run_lease)
 
             try:
-                return pool.submit(_run_and_release)
+                return pool.submit(_run_one)
             except Exception as submit_err:
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
+                lease.release()
                 finish_execution(
                     execution["id"],
                     success=False,
