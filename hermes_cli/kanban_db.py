@@ -2525,30 +2525,32 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
     # calls have something to write to. The adoption is wrapped in write_txn
-    # to serialize against any concurrent dispatcher, and the per-row UPDATE
-    # uses ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
-    # produce an orphaned row if it interleaves with the backfill pass.
+    # to serialize against any concurrent dispatcher.
     #
-    # The *search* deliberately runs outside that transaction: this pass runs
-    # on every process's first open of a board, and on a board migrated long
-    # ago (i.e. nearly all of them) it was taking the write lock per process
-    # to adopt nothing. A claim landing between the search and the adoption is
-    # already handled by that CAS: the loser's run row is retired below.
+    # The preflight search outside that transaction is an optimization only:
+    # this pass runs on every process's first open of a board, and on a board
+    # migrated long ago (i.e. nearly all of them) it was taking the write lock
+    # per process to adopt nothing. A preflight hit can go stale before the
+    # lock is granted, so it decides only *whether* to open the transaction —
+    # the list that is actually adopted is re-read under the lock. That
+    # re-read is what carries correctness: ``release_stale_claims`` can move a
+    # legacy task running -> ready in between, and on such a task ``_end_run``
+    # leaves ``current_run_id`` NULL, so the CAS below would happily hang a
+    # live run on a task that is no longer running. An empty re-read means the
+    # window closed on us and the transaction simply writes nothing.
     runs_exist = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
-    if runs_exist:
-        inflight = conn.execute(
-            "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
-            "       max_runtime_seconds, last_heartbeat_at, started_at "
-            "FROM tasks "
-            "WHERE status = 'running' AND current_run_id IS NULL"
-        ).fetchall()
-    else:
-        inflight = []
-    if inflight:
+    legacy_inflight_sql = (
+        "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+        "       max_runtime_seconds, last_heartbeat_at, started_at "
+        "FROM tasks "
+        "WHERE status = 'running' AND current_run_id IS NULL"
+    )
+    preflight = conn.execute(legacy_inflight_sql).fetchall() if runs_exist else []
+    if preflight:
         with write_txn(conn):
-            for row in inflight:
+            for row in conn.execute(legacy_inflight_sql).fetchall():
                 started = row["started_at"] or int(time.time())
                 cur = conn.execute(
                     """
@@ -2566,11 +2568,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                         started,
                     ),
                 )
-                # CAS: only install the pointer if nothing else claimed
-                # the task between the search above and here — a live
-                # dispatcher can, since the search runs outside this
-                # transaction. If the CAS fails we've got an orphan run row
-                # — mark it reclaimed so it doesn't look in-flight.
+                # CAS: only install the pointer if nothing else claimed the
+                # task between the re-read above and here. Under the write
+                # lock nothing should, so this is belt-and-suspenders against
+                # a non-serializable interleave rather than the guard that
+                # carries the race. If it does fail we've got an orphan run
+                # row — mark it reclaimed so it doesn't look in-flight.
                 upd = conn.execute(
                     "UPDATE tasks SET current_run_id = ? "
                     "WHERE id = ? AND current_run_id IS NULL",

@@ -1462,6 +1462,69 @@ def test_first_open_of_a_migrated_board_opens_no_write_transaction(tmp_path):
     assert boundaries == [], f"first open opened a transaction: {boundaries}"
 
 
+def test_backfill_ignores_a_task_reclaimed_after_its_preflight(tmp_path):
+    """A preflight hit outside the lock may be stale by the time the lock lands.
+
+    ``release_stale_claims`` moves a legacy in-flight task running -> ready,
+    and on such a task ``_end_run`` finds no run to close, so
+    ``current_run_id`` stays NULL. If the backfill adopts the list it saw
+    *before* the write lock, its ``current_run_id IS NULL`` CAS still matches
+    and a live ``running`` run is hung on a task nobody is working on. Only a
+    re-read under the lock is serialized against the reclaim.
+
+    The reclaim is injected at the moment the backfill asks for its
+    transaction — i.e. after the preflight has already read the task as
+    running, which is exactly the window that matters.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    now = int(time.time())
+    with kb.connect(db_path=db_path) as conn:
+        tid = kb.create_task(conn, title="legacy in flight", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='running', current_run_id=NULL, "
+            "claim_lock=?, claim_expires=?, worker_pid=?, started_at=? "
+            "WHERE id=?",
+            ("host:1", now + 60, 4242, now, tid),
+        )
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    reclaimed: list[str] = []
+    real_write_txn = kb.write_txn
+
+    def reclaiming_write_txn(conn):
+        backfill = sys._getframe(1).f_code.co_name == "_migrate_add_optional_columns"
+        if backfill and not reclaimed:
+            # What release_stale_claims commits: the claim is dropped and the
+            # task goes back to ready, while current_run_id stays NULL.
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (tid,),
+            )
+            reclaimed.append(tid)
+        return real_write_txn(conn)
+
+    with unittest.mock.patch.object(kb, "write_txn", reclaiming_write_txn):
+        kb.connect(db_path=db_path).close()
+
+    assert reclaimed, "the backfill never opened its transaction — nothing was raced"
+    with kb.connect(db_path=db_path) as conn:
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+        runs = conn.execute(
+            "SELECT status FROM task_runs WHERE task_id=?", (tid,)
+        ).fetchall()
+    assert task["status"] == "ready"
+    assert task["current_run_id"] is None, (
+        "the backfill adopted a task the reclaim had already released"
+    )
+    assert [r["status"] for r in runs] == [], (
+        "the backfill synthesized a run for a task that is no longer running"
+    )
+
+
 # ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
