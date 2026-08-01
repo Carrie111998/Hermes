@@ -84,35 +84,140 @@ mantiene "hey hermes" tal cual: es la opción honesta, no un descuido.
 
 ### Fuente de marca
 
-La cabecera y los títulos usan **Space Grotesk** (SIL OFL, gratuita) en vez
-de la fuente "Dimitri" original del brief — los archivos TTF de Dimitri nunca
-aparecieron en los assets rescatados. Si se consiguen, sustituyen el
-`@font-face` en `apps/desktop/src/styles.css` sin tocar nada más (la variable
-`--dt-font-display` es el único punto de cambio).
+El wordmark (`assets/logo.svg`) usa **Dimitri Swank Normal** — los TTF
+llegaron después de que se escribiera esta nota; los glifos se extrajeron con
+`fontTools` (`SVGPathPen`) y quedaron como paths ya trazados en el SVG, no
+como texto en vivo con `@font-face`, así que no dependen de que la fuente
+esté instalada en la máquina que renderiza el archivo. El resto de la
+cabecera y los títulos de la UI del desktop siguen en **Space Grotesk** (SIL
+OFL, gratuita) — Dimitri no se aplicó ahí; sigue siendo trabajo pendiente si
+se quiere unificar.
 
 ### Iconografía e ilustraciones
 
-Sin arte de diseño real de Douglas Agent todavía — todo lo de abajo es un
-placeholder tipográfico generado programáticamente (Pillow, mismo verde
-esmeralda que el resto de la identidad), no diseño encargado. Suficiente
-para no distribuir la marca de un tercero, no para una release pública.
-
 - **`BrandMark`** (`apps/desktop/src/components/brand-mark.tsx`,
-  `apps/bootstrap-installer/src/components/brand-mark.tsx`): "DA" tipográfico
-  sobre verde esmeralda, sin imagen externa.
-- **Ícono real de la app** (`apps/desktop/assets/icon.{png,ico,icns}`, usado
-  en el `.exe`/`.app`/`.dmg`/taskbar vía `electron-builder`) y los íconos del
-  instalador Tauri (`apps/bootstrap-installer/src-tauri/icons/{128x128,
-  128x128@2x,32x32}.png`, `icon.{ico,icns}`): ya **no** son la mascota de
-  Nous — mismo placeholder "DA" sobre esmeralda, generado en las resoluciones
-  que cada plataforma necesita (incluye un `.icns` escrito a mano con los
-  tipos de ícono modernos basados en PNG, ic07-ic14, porque no había
-  `icnsutil` disponible).
-- **Favicon** (`apps/desktop/public/apple-touch-icon.png`): mismo placeholder,
-  180×180 (el tamaño que pide `index.html`).
+  `apps/bootstrap-installer/src/components/brand-mark.tsx`): ya no es "DA"
+  tipográfico — ambas copias usan el mismo PNG (`logo_white.png`, línea
+  blanca, fondo transparente) sobre el mismo tile verde esmeralda que tenía
+  el placeholder, importado localmente en cada app
+  (`src/assets/brand/logo_white.png`).
+- **Ícono real de la app** (`apps/desktop/assets/icon.{ico,icns}`, usado en
+  el `.exe`/`.app`/taskbar vía `electron-builder`) y los íconos del
+  instalador Tauri (`apps/bootstrap-installer/src-tauri/icons/icon.{ico,icns}`):
+  regenerados con la misma marca (ya no "DA"). El `.icns` sigue escrito a
+  mano (mismo layout ic07–ic14 basado en PNG, sin `icnsutil`) — ver
+  "Verificar en hardware real" más abajo antes de firmar/notarizar para
+  macOS.
+- **Favicon** (`apps/desktop/public/apple-touch-icon.png`): regenerado igual,
+  180×180.
+- No hay ícono de bandeja del sistema (`Tray`) ni pantalla de splash como
+  imagen separada — el overlay de arranque es React, no un asset — así que
+  no hay nada que cablear ahí todavía.
 - **Mascota "petdex" de Hermes** (`apps/desktop/public/{hermes.png,
   hermes-sprite.png,hermes-frames/}` — un personaje pixel-art con casco alado
   y caduceo): eliminada — se confirmó que ningún componente la referenciaba.
+
+### Instalador NSIS / identidad `appId` sin resolver
+
+`apps/desktop/package.json`'s `build.appId` cambió de
+`com.nousresearch.hermes` a `com.douglasdevsec.douglas-agent`. Windows
+"Agregar o quitar programas" y la clave de desinstalación de NSIS están
+indexadas por ese `appId` — un instalador Douglas no reconoce una instalación
+Hermes previa como "la misma app": queda como una entrada separada (segundo
+directorio de instalación, segundo acceso directo de Start Menu) en vez de
+actualizar en el lugar. No es pérdida de datos (`HERMES_HOME`/el backend
+compartido se resuelven igual desde cualquiera de las dos), es duplicación de
+disco y confusión de usuario. **Deliberadamente sin tocar** — va junto con el
+renombrado de `hermes-setup` (`installer_dest()` en
+`apps/bootstrap-installer/src-tauri/src/paths.rs`, todavía literalmente
+`hermes-setup.exe`) en la sesión previa a la primera release pública, no
+antes.
+
+## Verificar en hardware real
+
+Cosas que este entorno de desarrollo (Windows, sin macOS/Linux disponibles en
+la sesión que las tocó) no puede confirmar por sí mismo. No asumir que
+"pasó la revisión de código" equivale a "verificado" para ninguno de estos
+cuatro — bloquear la primera release pública hasta correrlos en el hardware
+real.
+
+### 1. `safeStorage` en macOS (Keychain) y Linux (libsecret)
+
+`safeStorage.decryptString()` (`apps/desktop/electron/main.ts`,
+`decryptDesktopSecret()`) es una llamada nativa al almacén de credenciales
+del SO. En Windows usa DPAPI, ligado a la cuenta de usuario — inmune al
+rebrand. En macOS/Linux, Electron documenta que el lookup queda ligado a la
+identidad de la app (bundle id / nombre de app), que sí cambió
+(`com.nousresearch.hermes` → `com.douglasdevsec.douglas-agent`). Hipótesis
+sin verificar: un `native-oauth-tokens.json` o un token de gateway remoto
+cifrados por un build viejo (identidad Hermes) pueden no descifrar bajo la
+identidad nueva.
+
+**El código ya asume que esto puede fallar** — todo fallo de
+`decryptString()` se captura, se registra vía `rememberLog` con el contexto
+específico (qué secreto, qué perfil/URL), nunca vuelve a lanzar, se trata
+como "no autenticado" (mismo camino que "nunca inició sesión"), y dispara una
+vez por sesión `dialog.showErrorBox` con el texto exacto: *"Tus credenciales
+guardadas no pudieron leerse tras la actualización. Vuelve a conectar tus
+cuentas."* El archivo cifrado nunca se borra en el fallo — sigue disponible
+si el usuario revierte a una versión anterior.
+
+**Qué falta verificar en hardware real:** instalar un build viejo (identidad
+Hermes) en un Mac y en una máquina Linux, iniciar sesión / guardar un token
+remoto, actualizar al build Douglas, y confirmar (a) si de verdad no
+descifra, y (b) si no descifra, que aparece el diálogo exacto de arriba y la
+app sigue arrancando con normalidad (no crashea, no queda en un estado a
+medias).
+
+### 2. Validez del `.icns` para firma/notarización de macOS
+
+`apps/desktop/assets/icon.icns` y la copia de
+`apps/bootstrap-installer/src-tauri/icons/icon.icns` están escritos a mano
+(sin `icnsutil`/`iconutil`) — verificados byte a byte en esta sesión (magic
+`icns`, longitud total, framing TLV de cada entrada, CRC de cada PNG interno,
+dimensiones correctas para cada OSType `ic07`–`ic14`, todos RGBA de 8 bits).
+Eso confirma que el **contenedor** es válido; no confirma que `codesign`/
+`notarytool` lo acepten sin quejarse — eso solo se sabe firmando de verdad en
+una Mac. Falta también `ic04`/`ic05` (16×16/32×32 legado) — Finder debería
+poder reescalar desde `ic07`/`ic11`, pero no se ha visto renderizado en un
+Finder real.
+
+**Qué falta verificar:** `codesign --verify` y `xcrun notarytool submit` (o
+el paso equivalente de `electron-builder`'s `afterSign`) contra un build
+real de macOS, y una revisión visual del ícono en Finder/Dock/Launchpad a
+varios tamaños.
+
+### 3. Migración de `userData` en las tres plataformas
+
+La lógica de migración (`apps/desktop/electron/userdata-migration.ts`) está
+cubierta por tests unitarios que corren contra el filesystem real de
+cualquier SO que ejecute la suite — pero esta sesión solo tuvo Windows
+disponible. El diseño deliberadamente no tiene ramas condicionadas a la
+plataforma (usa `app.getPath('appData')` de Electron en vez de literales por
+SO), así que no hay lógica *distinta* por plataforma que pueda estar rota de
+forma distinta — pero eso en sí es una suposición que vale la pena confirmar
+con una migración real de principio a fin en cada plataforma.
+
+**Qué falta verificar:** en macOS y Linux, instalar un build viejo
+(identidad Hermes), generar datos reales de usuario (conexión guardada,
+estado de ventana, sesión OAuth nativa), actualizar al build Douglas, y
+confirmar que `~/Library/Application Support/Douglas Agent/` (macOS) y
+`~/.config/Douglas Agent/` (Linux) terminan con los archivos migrados, el
+marcador `.migrated-from-hermes`, y — específicamente — que
+`native-oauth-tokens.json` conserva su modo de archivo (`0600`) tras la
+copia, no solo el contenido.
+
+### 4. Tests POSIX (`termios`/`tty`/`pty`) que no corren en Windows
+
+No es un bug — `termios`, y las partes de `tty`/`pty` que dependen de él,
+son módulos de la librería estándar de Python que no existen en Windows.
+Cualquier test que los importe se salta o falla en un checkout Windows por
+definición, nunca en verde. La señal local en esta plataforma está
+contaminada para esos tests específicamente; no usarla como confirmación de
+que pasan. **CI con runner Linux es la fuente de verdad** para estos —
+Hermes ya trae 21 workflows en `.github/workflows/`, probablemente solo haga
+falta activarlos en el fork antes de confiar en la señal verde/roja de un
+PR que los toque.
 
 ## Estructura
 
