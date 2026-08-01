@@ -382,32 +382,49 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
-# Per-session variables that the gateway bridges freshly onto every command's
-# process environment (via tools/environments/local._inject_session_context_env,
-# reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
-# the shared bash session snapshot: a single long-lived backend serves many
-# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
-# collapse the terminal to one "default" environment), so ``export -p`` dumping
-# the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
-# session ``source`` that stale value and see a FOREIGN session's identity —
-# overriding the correct per-command Popen env (issue: cross-session
-# HERMES_SESSION_ID leak via the shared snapshot). Stripping them from the
-# snapshot is safe because they are re-injected on every command; a snapshot
-# should only carry the user's own shell state (PATH, functions, exports they
-# set), not Hermes' per-turn session identity.
+# Hermes-owned variables that are injected freshly into each command's process
+# environment must NEVER be persisted into the shared bash session snapshot. A
+# single long-lived backend serves the parent and every ``delegate_task`` child
+# (plus many gateway/TUI/desktop sessions) through one "default" environment.
+# Persisting command-scoped metadata therefore crosses authority boundaries:
 #
-# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
-# as the Python-side contract for the exclusion set; the dump path unsets by
-# name/prefix instead of grepping declare lines (see below / issue #71296).
+# * a session id from one turn can override the next turn's fresh identity;
+# * parent ``HERMES_KANBAN_*`` ownership can be restored inside a delegated
+#   child's scrubbed process; and
+# * a child's ``HERMES_DELEGATED_CHILD_CONTEXT`` marker can be restored inside
+#   the parent process after delegation returns.
+# * the fresh sanitizer Bash increments exported ``SHLVL`` before dumping it,
+#   so persisting that shell-maintained value ratchets it on every command.
+#
+# Session variables are bridged by
+# tools/environments/local._inject_session_context_env. Delegated-child and
+# Kanban variables are likewise derived from the current command context by
+# _make_run_env. Stripping all of them from the snapshot is safe because they
+# are re-injected on every command; a snapshot should carry only the user's own
+# shell state (PATH, functions, exports they set), not Hermes authority state.
+#
+# The session subset is kept in sync with gateway.session_context._VAR_MAP;
+# Kanban ownership and delegated-child lineage are the additional command-local
+# authority classes. ``SHLVL`` is also excluded because each command already
+# starts at a stable process depth; it is not user-owned session state. Used by
+# unit tests as the Python-side contract for the exclusion set; the dump path
+# unsets by name/prefix instead of grepping declare lines (see below / issue
+# #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|"
+    "HERMES_CRON_AUTO_DELIVER_|HERMES_KANBAN_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "SHLVL)"
 )
 
 
-def _export_dump_excluding_session_vars(tmp_path: str) -> str:
-    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+def _export_dump_excluding_session_vars(
+    tmp_path: str,
+    *,
+    trusted_bash: str = '"$BASH"',
+) -> str:
+    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus
+    Hermes' command-scoped authority vars and shell-maintained ``SHLVL`` (see
+    ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
 
     Unset the bridged vars in a subshell *before* ``export -p``. A line-based
     ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
@@ -426,14 +443,32 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     The brace-group redirect is expanded in the current shell, keeping both
     expansions consistent.
     """
-    # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
-    # because ``unset`` with only missing names is ignored under 2>/dev/null.
+    # Quoted ${!PREFIX@} is bash 3.2+ name-prefix expansion that yields each
+    # matched name as a distinct word without consulting a command-poisoned
+    # IFS. Remove the export attribute before unsetting: ``unset`` cannot remove
+    # a readonly variable,
+    # while ``export -n`` can still keep that value out of ``export -p``. The
+    # two explicit markers keep the name list nonempty even when every prefix
+    # expansion is empty; bare ``export -n`` prints the whole environment.
+    # Run the dump in a fresh privileged Bash: ``-p`` ignores exported shell
+    # functions and BASH_ENV, so a model-defined function named ``builtin``,
+    # ``export``, or ``unset`` cannot shadow the sanitizer. ``trusted_bash`` is
+    # captured by _wrap_command before the model-authored command executes.
+    dump_script = (
+        'builtin export -n "${!HERMES_SESSION_@}" '
+        '"${!HERMES_CRON_AUTO_DELIVER_@}" "${!HERMES_KANBAN_@}" '
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT SHLVL "
+        "2>/dev/null || true; "
+        'builtin unset "${!HERMES_SESSION_@}" '
+        '"${!HERMES_CRON_AUTO_DELIVER_@}" "${!HERMES_KANBAN_@}" '
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT SHLVL "
+        "2>/dev/null || true; "
+        "builtin export -p"
+    )
     return (
-        "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
-        "export -p; "
-        ") || true; } "
+        "{ "
+        f"{trusted_bash} --noprofile --norc -p -c {shlex.quote(dump_script)} "
+        "|| true; } "
         f"> {tmp_path}"
     )
 
@@ -681,6 +716,13 @@ class BaseEnvironment(ABC):
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
 
+        # Capture the actual Bash executable before the model-authored command
+        # runs. The readonly, session-unique name cannot be redirected to a
+        # model-supplied executable before the post-command snapshot dump.
+        _trusted_bash_var = f"__hermes_snapshot_bash_{self._session_id}"
+        parts.append(f'builtin readonly {_trusted_bash_var}="$BASH"')
+        _trusted_bash = f'"${{{_trusted_bash_var}}}"'
+
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
@@ -705,7 +747,7 @@ class BaseEnvironment(ABC):
         # _export_dump_excluding_session_vars.
         if self._snapshot_ready:
             parts.append(
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, trusted_bash=_trusted_bash)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )

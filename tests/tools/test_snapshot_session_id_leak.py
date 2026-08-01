@@ -10,9 +10,10 @@ stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
 — overriding the correct per-command Popen env injected by
 ``_inject_session_context_env``.
 
-The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
-CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
-``tools/environments/base.py``; they are re-injected fresh on every command.
+The fix strips command-scoped Hermes authority vars (session/UI/delivery,
+Kanban ownership, and delegated-child lineage) from the snapshot at both dump
+sites in ``tools/environments/base.py``; they are re-injected fresh on every
+command.
 """
 
 import os
@@ -28,7 +29,7 @@ from tools.environments.base import (
 
 
 # ---------------------------------------------------------------------------
-# Unit: the exclusion regex matches exactly the bridged vars, nothing else.
+# Unit: the exclusion contract covers every Hermes-owned ephemeral class.
 # ---------------------------------------------------------------------------
 
 def test_regex_matches_bridged_session_vars():
@@ -40,6 +41,16 @@ def test_regex_matches_bridged_session_vars():
         line = f'declare -x {name}="whatever"'
         assert rx.search(line), f"{name} should be excluded from the snapshot"
 
+    for name in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_DELEGATED_CHILD_CONTEXT",
+        "SHLVL",
+    ):
+        line = f'declare -x {name}="whatever"'
+        assert rx.search(line), f"{name} should be excluded from the snapshot"
+
 
 def test_export_snippet_shape():
     snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
@@ -47,9 +58,16 @@ def test_export_snippet_shape():
     # Unset-by-name (not line-grep): multi-line declare values must not leave
     # continuation lines in the snapshot (issue #71296).
     assert "unset" in snippet
-    assert "${!HERMES_SESSION_*}" in snippet
-    assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
+    assert '"${!HERMES_SESSION_@}"' in snippet
+    assert '"${!HERMES_CRON_AUTO_DELIVER_@}"' in snippet
+    assert '"${!HERMES_KANBAN_@}"' in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
+    assert "SHLVL" in snippet
+    assert "builtin export -n" in snippet
+    assert snippet.index("builtin export -n") < snippet.index("builtin unset")
+    assert "builtin export -p" in snippet
+    assert '"$BASH" --noprofile --norc -p -c' in snippet
     assert "grep -vE" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -103,5 +121,66 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_preserves_parent_child_kanban_boundary(monkeypatch, tmp_path):
+    """A child cannot regain parent Kanban env or contaminate the parent."""
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+    command = (
+        "printf '%s|%s|%s|%s\\n' "
+        '"${HERMES_KANBAN_TASK-unset}" '
+        '"${HERMES_DELEGATED_CHILD_CONTEXT-unset}" '
+        '"${SNAPSHOT_CANARY-unset}" '
+        '"${SHLVL-unset}"'
+    )
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        parent_before = env.execute(
+            "export SNAPSHOT_CANARY=kept; " + command
+        )["output"]
+        readonly_result = env.execute(
+            "IFS=_; export HERMES_KANBAN_TASK=t_readonly; "
+            "readonly HERMES_KANBAN_TASK; "
+            "export HERMES_DELEGATED_CHILD_CONTEXT=readonly-child; "
+            "readonly HERMES_DELEGATED_CHILD_CONTEXT; "
+            "builtin() { :; }; export -f builtin; "
+            "BASH=/definitely/not/a/bash"
+        )
+        assert readonly_result["returncode"] == 0, readonly_result["output"]
+        with delegated_child_context():
+            child = env.execute(command)["output"]
+        parent_after = env.execute(command)["output"]
+
+        parent_before_state = re.search(
+            r"t_parent\|unset\|kept\|(\d+)", parent_before
+        )
+        child_state = re.search(r"unset\|1\|kept\|(\d+)", child)
+        parent_after_state = re.search(
+            r"t_parent\|unset\|kept\|(\d+)", parent_after
+        )
+        assert parent_before_state, parent_before
+        assert child_state, child
+        assert parent_after_state, parent_after
+        assert {
+            parent_before_state.group(1),
+            child_state.group(1),
+            parent_after_state.group(1),
+        } == {parent_before_state.group(1)}
+
+        snapshot = open(env._snapshot_path, encoding="utf-8").read()
+        assert 'declare -x SNAPSHOT_CANARY="kept"' in snapshot
+        assert not re.search(r"^declare -x SHLVL=", snapshot, re.MULTILINE)
+        assert "HERMES_KANBAN_" not in snapshot
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snapshot
     finally:
         env.cleanup()
