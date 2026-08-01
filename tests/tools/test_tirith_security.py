@@ -179,6 +179,33 @@ class TestDisabled:
 
 
 # ---------------------------------------------------------------------------
+# Circuit breaker respects tirith_fail_open (issue #74922)
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreakerFailOpen:
+    @patch("tools.tirith_security._load_security_config")
+    def test_circuit_open_fail_open_allows(self, mock_cfg):
+        """When the circuit breaker is open and fail_open=True, commands are allowed."""
+        _tirith_mod._circuit_open = True
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert "circuit breaker" in result["summary"]
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_circuit_open_fail_closed_blocks(self, mock_cfg):
+        """When the circuit breaker is open and fail_open=False, commands are blocked."""
+        _tirith_mod._circuit_open = True
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": False}
+        result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert "circuit breaker" in result["summary"]
+        assert "fail-closed" in result["summary"]
+
+
+# ---------------------------------------------------------------------------
 # Findings cap + summary cap
 # ---------------------------------------------------------------------------
 
