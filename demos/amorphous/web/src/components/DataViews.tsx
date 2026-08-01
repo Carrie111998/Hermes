@@ -251,24 +251,35 @@ function ChartView({ data }: { data: any }) {
           <AreaChart data={pts} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
             <defs>
               <linearGradient id="blueFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.28} />
-                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.02} />
+                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.32} />
+                <stop offset="55%" stopColor="#3b82f6" stopOpacity={0.08} />
+                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
               </linearGradient>
+              <filter id="lineGlow" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="3.5" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
             </defs>
-            <CartesianGrid stroke="#24304a" strokeDasharray="3 3" vertical={false} />
+            <CartesianGrid stroke="#1c2740" strokeDasharray="3 3" vertical={false} />
             <XAxis dataKey="label" hide />
             <YAxis domain={[mn, mx]} hide />
             <Tooltip
               contentStyle={{
-                background: "#1e293b", border: "1px solid #334155", borderRadius: 10,
-                fontSize: 12, color: "#f4f4f5", padding: "6px 10px",
+                background: "#16203a", border: "1px solid #334155", borderRadius: 10,
+                fontSize: 12, color: "#f8fafc", padding: "6px 10px",
+                boxShadow: "0 8px 24px rgba(2,6,23,.6)",
               }}
-              labelStyle={{ color: "#7b7e87", fontSize: 11 }}
+              labelStyle={{ color: "#64748b", fontSize: 11 }}
               formatter={(v: any) => [fmt(v), ""]}
               separator=""
             />
-            <Area type="monotone" dataKey="v" stroke="#3b82f6" strokeWidth={2}
-                  fill="url(#blueFill)" dot={false} activeDot={{ r: 3.5, fill: "#3b82f6" }} />
+            <Area type="monotone" dataKey="v" stroke="#60a5fa" strokeWidth={2}
+                  fill="url(#blueFill)" dot={false}
+                  style={{ filter: "url(#lineGlow)" }}
+                  activeDot={{ r: 4, fill: "#93c5fd", stroke: "#3b82f6", strokeWidth: 2 }} />
           </AreaChart>
         </ResponsiveContainer>
       </div>
