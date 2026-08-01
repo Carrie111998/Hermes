@@ -387,7 +387,10 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+            """UPDATE async_delegations SET delivery_state='delivered',
+                      state=CASE WHEN state IN ('running','finalizing') AND event_json IS NULL
+                                 THEN 'delivered_unpersisted' ELSE state END,
+                      delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
@@ -489,6 +492,8 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
+                      state=CASE WHEN state IN ('running','finalizing') AND event_json IS NULL
+                                 THEN 'delivered_unpersisted' ELSE state END,
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
                       delivery_claimed_at=NULL
                WHERE delegation_id=? AND delivery_state='pending'

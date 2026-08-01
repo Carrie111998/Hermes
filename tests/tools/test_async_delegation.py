@@ -158,6 +158,33 @@ def test_single_completion_is_queued_when_persistence_fails(monkeypatch):
     assert (evt["status"], evt["summary"]) == ("completed", "done")
 
 
+def test_acknowledged_unpersisted_completion_is_terminal_after_restart(monkeypatch):
+    def fail_persist(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ad, "_persist_completion", fail_persist)
+    dispatched = ad.dispatch_async_delegation(
+        goal="single", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", runner=lambda: {"status": "completed", "summary": "done"},
+    )
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+
+    claim_id = ad.claim_event_delivery(evt, "test")
+    assert claim_id
+    ad.complete_event_delivery(evt, claim_id)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    recovered = queue.Queue()
+    assert ad.restore_undelivered_completions(recovered) == 0
+    assert recovered.empty()
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert durable is not None
+    assert durable["state"] == "delivered_unpersisted"
+    assert durable["result"] is None
+    assert durable["delivery_state"] == "delivered"
+
+
 def test_batch_completion_is_queued_when_persistence_fails(monkeypatch):
     def fail_persist(*_args):
         raise OSError("disk full")
