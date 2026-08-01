@@ -66,7 +66,10 @@ except ModuleNotFoundError:
 # any dependency touching ``platform.uname()`` at import time flashes a
 # visible console when this process is windowless (pythonw gateway + every
 # kanban worker).  No-op on POSIX; never raises.
-from hermes_cli._subprocess_compat import suppress_platform_ver_console
+from hermes_cli._subprocess_compat import (
+    suppress_platform_ver_console,
+    windows_hide_flags,
+)
 
 suppress_platform_ver_console()
 
@@ -2046,9 +2049,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         # terminal handler is Windows Terminal (Settings > For developers >
         # Terminal delegation) — even though the parent has no window of
         # its own. Same pattern as the wmic scan above; see
-        # windows_hide_flags()'s docstring.
-        from hermes_cli._subprocess_compat import windows_hide_flags
-
+        # windows_hide_flags()'s docstring. Imported at module scope: the
+        # build spawns below run even when this install block is skipped.
         def _run_tui_install() -> subprocess.CompletedProcess:
             return subprocess.run(
                 npm_install_cmd,

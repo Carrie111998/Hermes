@@ -218,6 +218,60 @@ def test_tui_dependency_install_hides_npm_window(tmp_path, monkeypatch):
     assert npm_calls[0][1].get("creationflags") == _CREATE_NO_WINDOW
 
 
+def test_tui_build_hides_npm_window_when_install_is_skipped(tmp_path, monkeypatch):
+    """The build spawn must still be hidden when the install block is skipped.
+
+    Regression test for two things at once:
+
+    1. The reviewer's outstanding ask -- assert the normal non-Termux
+       `npm run build` spawn is hidden, not just the install spawn.
+    2. An UnboundLocalError this test would have caught: `windows_hide_flags`
+       used to be imported *inside* the `_tui_need_npm_install(...)` branch
+       while being referenced by the build spawns outside it. Python compiles
+       the name as a function-local for the whole function, so on the common
+       path (dependencies already installed -> install skipped -> import never
+       runs) the build spawn raised
+       `UnboundLocalError: cannot access local variable 'windows_hide_flags'`
+       on every platform. The pre-existing test forced
+       `_tui_need_npm_install -> True`, so it never exercised this path.
+    """
+    from hermes_cli import main as main_mod
+    from hermes_cli import _subprocess_compat
+
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    (tui_dir / "dist" / "entry.js").parent.mkdir(parents=True)
+    (tui_dir / "dist" / "entry.js").write_text("console.log('tui')")
+    (tmp_path / "package-lock.json").write_text("{}")
+
+    # The path that was broken: nothing to install, but a build still runs.
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: False)
+    monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: True)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"C:/bin/{name}.cmd")
+    monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(_subprocess_compat, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
+
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append((cmd, kwargs))
+        return _Completed(stdout="", returncode=0)
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    # Before the fix this raised UnboundLocalError instead of returning.
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+
+    install_calls = _spawns(captured, "install", "--workspace", "ui-tui")
+    assert not install_calls, "install should have been skipped in this scenario"
+
+    build_calls = _spawns(captured, "run", "build")
+    assert build_calls, f"expected an npm run build spawn, got: {captured}"
+    for cmd, kwargs in build_calls:
+        assert kwargs.get("creationflags") == _CREATE_NO_WINDOW, (cmd, kwargs)
+
+
 
 # ── #56747 GUI-reachable exec paths + provider transports (PR #56877) ──────
 #
