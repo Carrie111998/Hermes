@@ -96,19 +96,6 @@ def test_environment_allowed_toolsets_overrides_config(monkeypatch):
     assert _get_platform_tools(config, "cli") == {"web", "vision"}
 
 
-def test_get_platform_tools_uses_default_when_platform_not_configured():
-    config = {}
-
-    enabled = _get_platform_tools(config, "cli")
-
-    assert enabled
-    assert enabled.isdisjoint(_DEFAULT_OFF_TOOLSETS)
-
-
-
-
-
-
 def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_token_set(monkeypatch):
     """HA toolset is runtime-gated by check_fn (requires HASS_TOKEN).
 

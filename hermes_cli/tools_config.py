@@ -2477,7 +2477,9 @@ def _get_platform_tools(
             allowed_toolsets = None
         elif isinstance(configured_allowed, list):
             allowed_toolsets = {
-                str(value).strip() for value in configured_allowed if str(value).strip()
+                str(value).strip()
+                for value in configured_allowed
+                if str(value).strip()
             }
         else:
             allowed_toolsets = {
