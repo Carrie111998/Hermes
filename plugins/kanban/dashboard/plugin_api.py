@@ -2145,8 +2145,13 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # Same kanban_pre_spawn policy gate as the gateway dispatcher: the
+        # dashboard nudge must not bypass plugin spawn policy.
+        from hermes_cli.plugins import make_kanban_spawn_gate
+
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            spawn_gate=make_kanban_spawn_gate(board),
         )
         # DispatchResult is a dataclass.
         try:

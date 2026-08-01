@@ -1222,29 +1222,15 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                def _spawn_gate(task):
-                    # kanban_pre_spawn plugin hook: per-candidate policy veto
-                    # (budget windows, maintenance freezes). Fail-open by
-                    # design — a broken hook must never stall the board.
-                    try:
-                        from hermes_cli.lifecycle import invoke_hook as _ih
-                        _results = _ih(
-                            "kanban_pre_spawn", task=task, board=slug,
-                        )
-                    except Exception as _exc:
-                        logger.warning(
-                            "kanban_pre_spawn invocation failed: %s", _exc,
-                        )
-                        return None
-                    for _r in _results:
-                        if isinstance(_r, dict) and _r.get("action") == "defer":
-                            return _r
-                    return None
+                # kanban_pre_spawn plugin hook: per-candidate policy veto
+                # (budget windows, maintenance freezes). Shared fail-open
+                # builder — same gate on every dispatcher entry point.
+                from hermes_cli.plugins import make_kanban_spawn_gate
 
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
-                    spawn_gate=_spawn_gate,
+                    spawn_gate=make_kanban_spawn_gate(slug),
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,

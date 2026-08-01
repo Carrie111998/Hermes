@@ -1626,3 +1626,43 @@ def test_dispatch_spawn_gate_defers_and_spawns(kanban_home):
         )
         assert t1 in spawned
         assert not res2.deferred_by_gate
+
+
+def test_dispatch_spawn_gate_payload_contract(kanban_home):
+    """The dict handed to ``spawn_gate`` carries exactly the documented
+    public ``kanban_pre_spawn`` payload: id, title, assignee, priority,
+    status, tenant, created_by, created_at, workspace_kind, workspace_path,
+    branch_name, project_id. Guards the candidate SELECT against silent
+    drift from the contract promised in plugins.VALID_HOOKS and hooks.md."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="payload", assignee="w", priority=7,
+            created_by="tester", tenant="acme",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+
+        seen: list[dict] = []
+
+        def gate(task):
+            seen.append(task)
+            return {"action": "defer", "reason": "capture only"}
+
+        kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *a, **k: None, spawn_gate=gate
+        )
+        assert len(seen) == 1
+        payload = seen[0]
+        assert set(payload) == {
+            "id", "title", "assignee", "priority", "status", "tenant",
+            "created_by", "created_at", "workspace_kind", "workspace_path",
+            "branch_name", "project_id",
+        }
+        assert payload["id"] == tid
+        assert payload["title"] == "payload"
+        assert payload["assignee"] == "w"
+        assert payload["priority"] == 7
+        assert payload["status"] == "ready"
+        assert payload["tenant"] == "acme"
+        assert payload["created_by"] == "tester"
+        assert payload["workspace_kind"] == "scratch"

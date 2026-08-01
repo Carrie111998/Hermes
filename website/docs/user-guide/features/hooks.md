@@ -382,7 +382,7 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
 - If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
-- Two hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, and [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
+- Three hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call, and [`kanban_pre_spawn`](#kanban_pre_spawn) can **defer** a kanban task spawn. All other hooks are fire-and-forget observers.
 - Observer callbacks receive `telemetry_schema_version` automatically. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
 
 ### Quick reference
@@ -406,6 +406,7 @@ def register(ctx):
 | [`transform_tool_result`](#transform_tool_result) | After any tool returns, before the result is handed back to the model | `str` to replace the result, `None` to leave unchanged |
 | [`transform_terminal_output`](#transform_terminal_output) | Inside the `terminal` tool, before truncation/ANSI-strip/redact | `str` to replace the raw output, `None` to leave unchanged |
 | [`transform_llm_output`](#transform_llm_output) | After the tool-calling loop completes, before the final response is delivered | `str` to replace the response text, `None`/empty to leave unchanged |
+| [`kanban_pre_spawn`](#kanban_pre_spawn) | Kanban dispatcher tick, once per candidate ready task before it is claimed | `{"action": "defer", "reason": str}` to postpone the spawn to a later tick |
 
 ---
 
@@ -1290,6 +1291,41 @@ def register(ctx):
 ```
 
 The hook is guarded on a non-empty, non-interrupted response — it will not fire on stop-button interrupts or empty turns. Exceptions are logged as warnings and do not break agent execution.
+
+---
+
+### `kanban_pre_spawn`
+
+Fires on every kanban dispatcher tick, **once per candidate ready task, before the task is claimed**. Lets a plugin veto individual spawns with dynamic policy — provider budget windows (defer ready work while a subscription quota window is exhausted), maintenance freezes, cost-aware pacing — complementing the static `kanban.max_in_progress` cap. All dispatcher entry points consult it: the gateway-embedded dispatcher, `hermes kanban dispatch`, and the dashboard's dispatch nudge.
+
+**Callback signature:**
+
+```python
+def my_callback(
+    task: dict,
+    board: str | None,
+    **kwargs,
+) -> dict | None:
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `task` | `dict` | The candidate ready task. Contains exactly: `id`, `title`, `assignee`, `priority`, `status`, `tenant`, `created_by`, `created_at`, `workspace_kind`, `workspace_path`, `branch_name`, `project_id`. |
+| `board` | `str \| None` | Board slug for this tick, or `None` when the tick used current-board resolution. |
+
+**Return value:** `{"action": "defer", "reason": "..."}` to leave the task in `ready` for a later tick — it is recorded in `DispatchResult.deferred_by_gate` as `(task_id, reason)` and re-evaluated on the next tick. `{"action": "allow"}` or `None` proceeds with the normal claim + spawn. First deferring plugin wins.
+
+**Fail-open by design:** a crashing callback (or a failure invoking the hook machinery itself) is logged and treated as "allow" — a broken policy plugin can never stall the board. Deferral is **not** a failure: it does not touch the task's failure counters or trigger the auto-block circuit breaker.
+
+```python
+def budget_gate(task, board=None, **kwargs):
+    if quota_window_exhausted() and task.get("priority", 0) < 5:
+        return {"action": "defer", "reason": "provider quota window exhausted"}
+    return None
+
+def register(ctx):
+    ctx.register_hook("kanban_pre_spawn", budget_gate)
+```
 
 ---
 

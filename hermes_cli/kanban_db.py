@@ -8231,13 +8231,19 @@ def _dispatch_once_locked(
 
     ``spawn_gate`` is an optional policy callback consulted per candidate
     ready task BEFORE it is claimed: ``spawn_gate(task_row_dict) ->
-    Optional[dict]``. Returning ``{"action": "defer", "reason": "..."}``
-    leaves the task in ``ready`` for a later tick (recorded in
+    Optional[dict]``. The dict passed to the gate carries exactly the
+    columns of the candidate SELECT below (id, title, assignee, priority,
+    status, tenant, created_by, created_at, workspace_kind, workspace_path,
+    branch_name, project_id) — the public ``kanban_pre_spawn`` payload;
+    keep the three in sync (SELECT, this docstring, plugins.VALID_HOOKS).
+    Returning ``{"action": "defer", "reason": "..."}`` leaves the task in
+    ``ready`` for a later tick (recorded in
     ``DispatchResult.deferred_by_gate``); any other return proceeds. The
     gate is fail-open: exceptions are swallowed and the task spawns. This
-    is the dependency-injection seam for the gateway's ``kanban_pre_spawn``
-    plugin hook (budget windows, maintenance freezes, priority policies)
-    — kanban_db itself stays plugin-free.
+    is the dependency-injection seam for the ``kanban_pre_spawn`` plugin
+    hook (budget windows, maintenance freezes, priority policies) — every
+    dispatcher entry point injects it via ``plugins.make_kanban_spawn_gate``
+    while kanban_db itself stays plugin-free.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -8283,8 +8289,13 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
+    # Column list = the public ``kanban_pre_spawn`` payload (see the
+    # ``spawn_gate`` docstring above). Widen deliberately, never implicitly:
+    # plugins receive ``dict(row)`` of exactly these fields.
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, title, assignee, priority, status, tenant, "
+        "created_by, created_at, workspace_kind, workspace_path, "
+        "branch_name, project_id FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()

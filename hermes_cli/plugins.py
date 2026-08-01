@@ -177,12 +177,18 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "defer", "reason": "..."}  -> leave the task ready this
     #                                            tick (re-evaluated next tick)
     #   {"action": "allow"}  /  None           -> normal claim + spawn
-    # Kwargs: task (ready-row dict: id, title, assignee, priority, ...),
-    # board (slug). Fail-open at every layer: hook errors never stall the
-    # board. Policy examples: provider budget windows (defer spawns while a
-    # subscription quota window is exhausted), maintenance freezes,
-    # cost-aware pacing. Complements the static ``kanban.max_in_progress``
-    # cap with dynamic, plugin-defined policy.
+    # Kwargs: task (candidate ready-row dict with exactly: id, title,
+    # assignee, priority, status, tenant, created_by, created_at,
+    # workspace_kind, workspace_path, branch_name, project_id — keep in
+    # sync with the dispatcher SELECT in kanban_db._dispatch_once_locked),
+    # board (slug, or None when the tick used current-board resolution).
+    # Fail-open at every layer: hook errors never stall the board. Policy
+    # examples: provider budget windows (defer spawns while a subscription
+    # quota window is exhausted), maintenance freezes, cost-aware pacing.
+    # Complements the static ``kanban.max_in_progress`` cap with dynamic,
+    # plugin-defined policy. All dispatcher entry points (gateway watcher,
+    # ``hermes kanban dispatch``, dashboard nudge) consult this hook via
+    # ``make_kanban_spawn_gate``.
     "kanban_pre_spawn",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
@@ -2106,6 +2112,48 @@ def has_middleware(kind: str) -> bool:
 def has_hook(hook_name: str) -> bool:
     """Return True when a loaded plugin handles a hook."""
     return get_plugin_manager().has_hook(hook_name)
+
+
+def make_kanban_spawn_gate(
+    board: Optional[str] = None,
+) -> Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]]:
+    """Build the ``spawn_gate`` callback backing the ``kanban_pre_spawn`` hook.
+
+    Shared by every dispatcher entry point (gateway watcher, ``hermes kanban
+    dispatch`` CLI, dashboard nudge) so the policy gate behaves identically
+    no matter which path triggered the tick, while ``kanban_db`` itself
+    stays plugin-free (the gate is injected as a plain callable).
+
+    Returns ``None`` when no plugin consumes the hook, so callers skip the
+    per-candidate overhead entirely. The returned gate is fail-open: hook
+    errors are logged and treated as "allow" — a broken policy plugin must
+    never stall the board.
+    """
+    try:
+        # Via lifecycle rather than this module's invoke_hook so first-party
+        # observability sees the event too. Imported lazily: lifecycle
+        # imports back into this module at call time.
+        from hermes_cli.lifecycle import has_hook as _has_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+        if not _has_hook("kanban_pre_spawn"):
+            return None
+    except Exception:
+        logger.warning("kanban_pre_spawn availability check failed", exc_info=True)
+        return None
+
+    def _gate(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            results = _invoke_hook("kanban_pre_spawn", task=task, board=board)
+        except Exception:
+            logger.warning("kanban_pre_spawn invocation failed", exc_info=True)
+            return None
+        for verdict in results:
+            if isinstance(verdict, dict) and verdict.get("action") == "defer":
+                return verdict
+        return None
+
+    return _gate
 
 
 _thread_tool_whitelist = threading.local()

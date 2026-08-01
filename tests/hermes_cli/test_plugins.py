@@ -1111,3 +1111,64 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestMakeKanbanSpawnGate:
+    """The shared spawn-gate builder used by every dispatcher entry point
+    (gateway watcher, ``hermes kanban dispatch``, dashboard nudge)."""
+
+    def test_returns_none_when_no_plugin_consumes_the_hook(self, monkeypatch):
+        from hermes_cli.plugins import make_kanban_spawn_gate
+
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: False)
+        assert make_kanban_spawn_gate("myboard") is None
+
+    def test_first_defer_verdict_wins_and_kwargs_match_contract(self, monkeypatch):
+        from hermes_cli.plugins import make_kanban_spawn_gate
+
+        seen = {}
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+
+        def fake_invoke(name, **kwargs):
+            seen["name"] = name
+            seen["kwargs"] = kwargs
+            # None and allow verdicts are skipped; the defer dict is returned.
+            return [
+                None,
+                {"action": "allow"},
+                {"action": "defer", "reason": "quota window exhausted"},
+            ]
+
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fake_invoke)
+        gate = make_kanban_spawn_gate("myboard")
+        assert gate is not None
+
+        task = {"id": "t_1", "title": "x", "priority": 3}
+        verdict = gate(task)
+        assert verdict == {"action": "defer", "reason": "quota window exhausted"}
+        assert seen["name"] == "kanban_pre_spawn"
+        assert seen["kwargs"] == {"task": task, "board": "myboard"}
+
+    def test_allow_only_verdicts_pass_through(self, monkeypatch):
+        from hermes_cli.plugins import make_kanban_spawn_gate
+
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda name, **kwargs: [{"action": "allow"}, "garbage", 42],
+        )
+        gate = make_kanban_spawn_gate(None)
+        assert gate({"id": "t_1"}) is None
+
+    def test_fail_open_when_invoke_hook_raises(self, monkeypatch):
+        from hermes_cli.plugins import make_kanban_spawn_gate
+
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+
+        def boom(name, **kwargs):
+            raise RuntimeError("hook machinery broke")
+
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", boom)
+        gate = make_kanban_spawn_gate("myboard")
+        # Fail-open: a broken hook must never stall the board.
+        assert gate({"id": "t_1"}) is None
