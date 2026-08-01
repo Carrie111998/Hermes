@@ -34,6 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import kanban_db as _kanban_db
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -466,6 +467,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "class_of_service": task.class_of_service,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -512,6 +514,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "class_of_service": t.class_of_service,
                 }
 
             def _run_dict(r):
@@ -1265,6 +1268,7 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    class_of_service = args.get("class_of_service")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1308,6 +1312,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                class_of_service=class_of_service,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1324,6 +1329,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                class_of_service=new_task.class_of_service if new_task else None,
                 subscribed=subscribed,
             )
         finally:
@@ -1960,6 +1966,11 @@ KANBAN_CREATE_SCHEMA = {
                     "Dispatcher tiebreaker. Higher = picked sooner "
                     "when multiple ready tasks share an assignee."
                 ),
+            },
+            "class_of_service": {
+                "type": "string",
+                "enum": list(_kanban_db.VALID_CLASSES_OF_SERVICE),
+                "description": "Optional descriptive Class of Service. It does not affect dispatch or priority.",
             },
             "workspace_kind": {
                 "type": "string",

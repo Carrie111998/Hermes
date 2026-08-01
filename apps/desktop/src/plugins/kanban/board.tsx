@@ -67,6 +67,8 @@ import {
   boardKey,
   BOARDS_KEY,
   bulkTasks,
+  classOfServiceCreatePayload,
+  classOfServiceOptions,
   createTask,
   deleteTask,
   estimateNew,
@@ -78,6 +80,7 @@ import {
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
+import { classOfServiceLabel } from './i18n'
 import { OrchestrationPanel } from './orchestration'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
@@ -160,7 +163,12 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const meta = columnMeta(task.status)
 
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+      <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+      {task.class_of_service && (
+        <span className="rounded bg-(--ui-bg-tertiary) px-1.5 py-0.5 text-(--ui-text-secondary)">
+          {classOfServiceLabel(k, task.class_of_service)}
+        </span>
+      )}
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -533,10 +541,12 @@ function Field({ children, label }: { children: ReactNode; label: string }) {
 }
 
 function NewTaskDialog({
+  classesOfService,
   onClose,
   parents,
   target
 }: {
+  classesOfService: string[]
   onClose: () => void
   parents: Array<{ id: string; title: string }>
   target: null | string
@@ -564,6 +574,7 @@ function NewTaskDialog({
   const [bodyText, setBodyText] = useState('')
   const [assignee, setAssignee] = useState('')
   const [priority, setPriority] = useState('0')
+  const [classOfService, setClassOfService] = useState('')
   const [skills, setSkills] = useState('')
   const [workspaceKind, setWorkspaceKind] = useState<string>(boardDefaultKind)
   // Empty = inherit the board's default project dir (backend resolves it);
@@ -598,6 +609,7 @@ function NewTaskDialog({
       setBodyText('')
       setAssignee('')
       setPriority('0')
+      setClassOfService('')
       setSkills('')
       setWorkspaceKind(boardDefaultKind)
       setWorkspacePath('')
@@ -630,6 +642,7 @@ function NewTaskDialog({
       const { task, warning } = await createTask({
         assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
         body: bodyText.trim() || undefined,
+        ...classOfServiceCreatePayload(classOfService),
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
         priority: Number(priority) || 0,
@@ -705,6 +718,22 @@ function NewTaskDialog({
               </Select>
             </Field>
           </div>
+
+          <Field label={k.classOfService}>
+            <Select onValueChange={value => setClassOfService(value === NO_PARENT ? '' : value)} value={classOfService || NO_PARENT}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NO_PARENT}>{k.unclassified}</SelectItem>
+                {classesOfService.map(value => (
+                  <SelectItem key={value} value={value}>
+                    {classOfServiceLabel(k, value)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
 
           {workspaceKind !== 'scratch' && (
             <Field label={k.workspaceOverride}>
@@ -1406,8 +1435,19 @@ export function KanbanBoardPage() {
         />
       )}
 
-      <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
-      <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
+      <NewTaskDialog
+        classesOfService={classOfServiceOptions(board)}
+        onClose={() => setAddStatus(null)}
+        parents={parentOptions}
+        target={addStatus}
+      />
+      <TaskDrawer
+        classesOfService={classOfServiceOptions(board)}
+        columns={columnNames}
+        id={openId}
+        onClose={() => setOpenId(null)}
+        onOpen={setOpenId}
+      />
     </div>
   )
 }

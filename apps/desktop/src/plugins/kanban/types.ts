@@ -10,6 +10,7 @@ export interface KanbanTask {
   status: string
   assignee?: null | string
   priority?: number
+  class_of_service?: null | string
   tenant?: null | string
   created_at?: number
   latest_summary?: null | string
@@ -32,6 +33,7 @@ export interface KanbanColumn {
 
 export interface KanbanBoard {
   columns: KanbanColumn[]
+  classes_of_service?: string[]
   tenants: string[]
   assignees: string[]
   latest_event_id: number

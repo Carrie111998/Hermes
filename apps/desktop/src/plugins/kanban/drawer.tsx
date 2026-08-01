@@ -20,6 +20,11 @@ import {
   host,
   Loader,
   LogView,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Textarea,
   Tip,
   useMutation,
@@ -32,6 +37,7 @@ import { type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   $boardSlug,
   addComment,
+  classOfServicePatchPayload,
   deleteTask,
   estimateTask,
   fetchLog,
@@ -45,6 +51,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { classOfServiceLabel } from './i18n'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -174,6 +181,40 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
       <span className="text-(--ui-text-quaternary)">{label}</span>
       <span className="min-w-0 truncate text-(--ui-text-secondary)">{children}</span>
     </>
+  )
+}
+
+const UNCLASSIFIED_CLASS_OF_SERVICE = '__unclassified__'
+
+function ClassOfServiceMenu({
+  current,
+  options,
+  onChange
+}: {
+  current?: null | string
+  options: string[]
+  onChange: (value: null | string) => void
+}) {
+  const k = useKanban()
+  const visibleOptions = current && !options.includes(current) ? [current, ...options] : options
+
+  return (
+    <Select
+      onValueChange={value => onChange(value === UNCLASSIFIED_CLASS_OF_SERVICE ? null : value)}
+      value={current || UNCLASSIFIED_CLASS_OF_SERVICE}
+    >
+      <SelectTrigger className="h-6 text-[0.71rem]">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={UNCLASSIFIED_CLASS_OF_SERVICE}>{k.unclassified}</SelectItem>
+        {visibleOptions.map(value => (
+          <SelectItem key={value} value={value}>
+            {classOfServiceLabel(k, value)}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 
@@ -537,11 +578,13 @@ function EstimateSection({ id }: { id: string }) {
 }
 
 export function TaskDrawer({
+  classesOfService,
   columns,
   id,
   onClose,
   onOpen
 }: {
+  classesOfService: string[]
   columns: string[]
   id: null | string
   onClose: () => void
@@ -763,6 +806,13 @@ export function TaskDrawer({
                 />
               </MetaRow>
               {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
+              <MetaRow label={k.metaClassOfService}>
+                <ClassOfServiceMenu
+                  current={task.class_of_service}
+                  onChange={value => void mutate(() => patchTask(task.id, classOfServicePatchPayload(value)))()}
+                  options={classesOfService}
+                />
+              </MetaRow>
               {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
               {task.workspace_path && (
                 <MetaRow label={k.workspace}>

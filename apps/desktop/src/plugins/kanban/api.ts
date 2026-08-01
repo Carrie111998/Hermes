@@ -158,6 +158,15 @@ export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/project
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
 
+export const classOfServiceOptions = (board?: Pick<KanbanBoard, 'classes_of_service'>): string[] =>
+  board?.classes_of_service ?? []
+
+export const classOfServiceCreatePayload = (value: string): Record<string, string> =>
+  value ? { class_of_service: value } : {}
+
+export const classOfServicePatchPayload = (value: null | string): { class_of_service: null | string } =>
+  ({ class_of_service: value })
+
 // ── writes ────────────────────────────────────────────────────────────────────
 
 // Every board edit nudges the dispatcher (debounced, fire-and-forget) so the

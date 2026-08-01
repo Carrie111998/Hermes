@@ -501,6 +501,7 @@ def get_board(
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],
+            "classes_of_service": list(kanban_db.VALID_CLASSES_OF_SERVICE),
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -610,6 +611,7 @@ class CreateTaskBody(BaseModel):
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
+    class_of_service: Optional[str] = None
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
@@ -639,6 +641,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_max_turns=payload.goal_max_turns,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
+            class_of_service=payload.class_of_service,
             project_id=payload.project_id,
             board=board,
         )
@@ -839,6 +842,8 @@ class UpdateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # ``None`` clears when the client explicitly includes this field.
+    class_of_service: Optional[str] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -849,6 +854,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        fields_set = getattr(payload, "model_fields_set", None)
+        if fields_set is None:
+            fields_set = getattr(payload, "__fields_set__", set())
+        class_of_service_set = "class_of_service" in fields_set
+        try:
+            class_of_service = (
+                kanban_db.validate_class_of_service(payload.class_of_service)
+                if class_of_service_set else None
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -930,6 +947,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     provider=payload.provider_override,
                 )
             except (ValueError, RuntimeError) as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
+
+        # --- Class of Service ----------------------------------------------
+        if class_of_service_set:
+            try:
+                ok = kanban_db.set_class_of_service(conn, task_id, class_of_service)
+            except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
