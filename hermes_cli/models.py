@@ -1383,7 +1383,22 @@ def get_preferred_silent_default_model(provider: str = "openrouter") -> str:
     (never hits the network — safe on hot resolution paths), falling back to
     :data:`PREFERRED_SILENT_DEFAULT_MODEL` when no cached manifest exists or
     the provider block carries no label.
+
+    A user-configured ``model.silent_default`` (config.yaml) wins over both:
+    operators running curated fleets can pin which model silently backs
+    surfaces created without an explicit model, instead of patching this
+    module.
     """
+    try:
+        from hermes_cli.config import load_config
+
+        configured = str(
+            (load_config().get("model") or {}).get("silent_default") or ""
+        ).strip()
+        if configured:
+            return configured
+    except Exception:
+        pass
     try:
         from hermes_cli.model_catalog import get_default_model_from_cache
         labeled = get_default_model_from_cache(provider)

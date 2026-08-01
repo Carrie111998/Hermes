@@ -110,3 +110,48 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_block_recurrence_limit_config_override(
+    kanban_home: Path,
+) -> None:
+    """``kanban.block_recurrence_limit`` raises the loop-breaker threshold."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  block_recurrence_limit: 3\n", encoding="utf-8"
+    )
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # second same-cause re-block: below the raised limit → stays blocked
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()[0]
+        assert status == "blocked"
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # third same-cause re-block: reaches the configured limit → triage
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()[0]
+        assert status == "triage"
+        events = [e for e in kb.list_events(conn, tid)
+                  if e.kind == "block_loop_detected"]
+        assert events and (events[-1].payload or {}).get("limit") == 3
+
+
+def test_block_recurrence_limit_invalid_config_falls_back(
+    kanban_home: Path,
+) -> None:
+    """Garbage or sub-1 values fall back to the built-in default."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  block_recurrence_limit: 0\n", encoding="utf-8"
+    )
+    assert kb.block_recurrence_limit() == kb.BLOCK_RECURRENCE_LIMIT
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  block_recurrence_limit: banana\n", encoding="utf-8"
+    )
+    assert kb.block_recurrence_limit() == kb.BLOCK_RECURRENCE_LIMIT
