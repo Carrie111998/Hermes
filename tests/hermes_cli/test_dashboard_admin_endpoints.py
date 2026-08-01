@@ -766,11 +766,14 @@ class TestSkillsHubScanEndpoint:
         scanned = {}
 
         def _scan(path, source="community"):
+            from tools.skills_guard import _resolve_trust_level
+
             scanned["source"] = source
+            trust = _resolve_trust_level(source)
             return ScanResult(
                 skill_name="evil",
                 source=source,
-                trust_level="community",
+                trust_level=trust,
                 verdict="dangerous",
                 summary="s",
             )
@@ -784,7 +787,9 @@ class TestSkillsHubScanEndpoint:
         assert scanned["source"] == "attacker/evil"
         assert scanned["source"] != "official"
         assert body["source"] == "attacker/evil"
+        assert body["trust_level"] != "builtin"
         assert body["policy"] == "block"
+        assert "Blocked" in body["policy_reason"]
 
 
 class TestWebhookToggleEndpoint:

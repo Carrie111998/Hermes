@@ -172,8 +172,27 @@ def _is_official_optional_adapter(matched_source) -> bool:
 _RESERVED_SCAN_PROVENANCE = frozenset({"official", "agent-created"})
 
 
+def _scrub_reserved_scan_provenance(candidate: str, matched_source=None) -> str:
+    """Refuse reserved trust markers unless the adapter is OptionalSkillSource.
+
+    Reserved tokens unlock privileged trust in skills_guard._resolve_trust_level.
+    Never honor them from unsigned index metadata, lock identifiers, or any
+    non-optional adapter (e.g. hermes-index echoing identifier="official").
+    """
+    if candidate not in _RESERVED_SCAN_PROVENANCE:
+        return candidate
+    if _is_official_optional_adapter(matched_source):
+        return candidate
+    source_id = getattr(matched_source, "source_id", None)
+    if callable(source_id):
+        sid = source_id()
+        if sid and sid not in _RESERVED_SCAN_PROVENANCE:
+            return sid
+    return "community"
+
+
 def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> str:
-    """Choose the scanner trust identity for an install/audit scan."""
+    """Choose the scanner trust identity for an install/hub-scan."""
     if _is_official_optional_adapter(matched_source):
         return "official"
     candidate = (
@@ -182,15 +201,16 @@ def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> s
         or identifier
         or ""
     )
-    # Reserved tokens unlock privileged trust in skills_guard._resolve_trust_level.
-    # Only OptionalSkillSource may supply them; never honor them from other adapters
-    # (e.g. unsigned hermes-index echoing identifier="official").
+    return _scrub_reserved_scan_provenance(candidate, matched_source)
+
+
+def _scan_source_for_lock_entry(entry: dict) -> str:
+    """Choose scanner trust identity for an already-installed hub lock entry."""
+    candidate = entry.get("identifier") or entry.get("source") or "community"
     if candidate in _RESERVED_SCAN_PROVENANCE:
-        source_id = getattr(matched_source, "source_id", None)
-        if callable(source_id):
-            sid = source_id()
-            if sid and sid not in _RESERVED_SCAN_PROVENANCE:
-                return sid
+        alt = entry.get("source") or ""
+        if alt and alt not in _RESERVED_SCAN_PROVENANCE:
+            return alt
         return "community"
     return candidate
 
@@ -1172,7 +1192,7 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
             c.print(f"[yellow]Warning:[/] {entry['name']} — path missing: {entry['install_path']}")
             continue
 
-        result = scan_skill(skill_path, source=entry.get("identifier", entry["source"]))
+        result = scan_skill(skill_path, source=_scan_source_for_lock_entry(entry))
         c.print(format_scan_report(result))
 
         if deep:
