@@ -3851,6 +3851,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # versions). Probe the venv's core imports and repair if broken —
             # otherwise "Already up to date!" gaslights the user while their
             # install stays bricked.
+            # The same is true for Node dependencies. A failed npm refresh has
+            # already moved HEAD to the fetched commit, so the documented
+            # "fix npm and re-run hermes update" recovery lands in this
+            # commit_count == 0 branch. Re-check the manifest digest here and
+            # rebuild a stale web bundle after the dependency refresh succeeds.
+            node_failures = _update_node_dependencies()
+            web_ok = False
+            if not node_failures:
+                web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+
             healthy, detail = _venv_core_imports_healthy()
             if not healthy:
                 print("⚠ Checkout is current, but the venv is unhealthy:")
@@ -3891,6 +3901,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
+            elif node_failures or not web_ok:
+                print(
+                    "⚠ Checkout is current, but Node.js dependency recovery is still incomplete."
+                )
+                print("  Fix the npm error above and re-run `hermes update`.")
             else:
                 print("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():

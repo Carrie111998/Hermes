@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.npm_engine import (
+    actual_node_version,
     actual_npm_version,
     is_ebadengine,
     managed_npm_prefix,
@@ -28,6 +29,13 @@ npm error engine Not compatible with your version of node/npm: hermes-agent@1.0.
 npm error notsup Not compatible with your version of node/npm: hermes-agent@1.0.0
 npm error notsup Required: {"node":">=20.0.0","npm":"<11.10.0 || >=12.0.0"}
 npm error notsup Actual:   {"npm":"11.10.0","node":"v22.23.1"}
+"""
+
+NODE25_EBADENGINE_OUTPUT = """
+npm error code EBADENGINE
+npm error engine Unsupported engine
+npm error notsup Required: {"node":">=20.0.0","npm":"<11.10.0 || >=12.0.0"}
+npm error notsup Actual:   {"node":"v25.9.0","npm":"11.12.1"}
 """
 
 LEGACY_EBADENGINE_OUTPUT = """
@@ -62,6 +70,7 @@ class TestDetection:
 
     def test_actual_version_is_reported_back(self):
         assert actual_npm_version(EBADENGINE_OUTPUT) == "11.10.0"
+        assert actual_node_version(EBADENGINE_OUTPUT) == "22.23.1"
 
     def test_no_range_for_non_engine_output(self):
         assert required_npm_range(ELOCK_OUTPUT) is None
@@ -194,11 +203,18 @@ class TestRepairDecision:
             raise AssertionError(f"must not run a subprocess for a foreign npm: {cmd}")
 
         monkeypatch.setattr(subprocess, "run", explode)
-        assert not maybe_repair_npm_engine(str(system_npm), EBADENGINE_OUTPUT)
+        assert not maybe_repair_npm_engine(
+            str(system_npm), NODE25_EBADENGINE_OUTPUT
+        )
 
-        # The user gets the exact command to run, since we refuse to run it.
+        # A foreign npm stays untouched, and the guidance describes a compatible
+        # Node/npm *pair* instead of suggesting npm 12 on an unsupported Node.
         err = capsys.readouterr().err
-        assert 'npm install -g npm@"<11.10.0 || >=12.0.0"' in err
+        assert "Current toolchain: Node 25.9.0, npm 11.12.1" in err
+        assert "Required npm: <11.10.0 || >=12.0.0" in err
+        assert "version manager that owns this Node install" in err
+        assert "re-run `hermes update`" in err
+        assert "npm install -g" not in err
 
     def test_non_engine_failure_never_upgrades(self, managed_npm, monkeypatch):
         def explode(cmd, **kwargs):  # pragma: no cover - must not be reached

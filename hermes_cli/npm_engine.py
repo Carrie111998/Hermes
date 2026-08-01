@@ -17,8 +17,8 @@ Scope of the repair is deliberately narrow. Hermes only upgrades an npm that
 lives inside its **own** managed Node tree (``$HERMES_HOME/node``), installing
 in place with ``--prefix`` so ``bin/npm`` keeps resolving to the upgraded
 ``lib/node_modules/npm``. A system / nvm / brew / Nix npm belongs to the user
-and their other projects; for those we print the exact command and let the
-original failure stand.
+and their other projects; for those we print the actual/required toolchain and
+let the original failure stand.
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ from hermes_constants import get_hermes_home, with_hermes_node_path
 __all__ = [
     "is_ebadengine",
     "required_npm_range",
+    "actual_node_version",
+    "actual_npm_version",
     "managed_npm_prefix",
     "upgrade_managed_npm",
     "maybe_repair_npm_engine",
@@ -108,6 +110,18 @@ def actual_npm_version(output: str) -> str | None:
             continue
         if isinstance(parsed, dict) and parsed.get("npm"):
             return str(parsed["npm"]).strip()
+    return None
+
+
+def actual_node_version(output: str) -> str | None:
+    """Return the Node version npm reported as ``Actual`` in *output*."""
+    for match in _ACTUAL_RE.finditer(output or ""):
+        try:
+            parsed = json.loads(match.group(1))
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("node"):
+            return str(parsed["node"]).strip().removeprefix("v")
     return None
 
 
@@ -237,14 +251,29 @@ def _probe_version(npm: str) -> str | None:
     return (result.stdout or "").strip() or None
 
 
-def _print_manual_fix(npm: str, npm_range: str, actual: str | None) -> None:
-    have = f"npm {actual} " if actual else "This npm "
+def _print_manual_fix(
+    npm: str,
+    npm_range: str,
+    actual_npm: str | None,
+    actual_node: str | None,
+) -> None:
+    current = ", ".join(
+        part
+        for part in (
+            f"Node {actual_node}" if actual_node else None,
+            f"npm {actual_npm}" if actual_npm else None,
+        )
+        if part
+    )
     print(
-        f"\n✗ {have}does not satisfy the range this project requires: {npm_range}\n"
-        f"  Resolved npm: {npm}\n"
-        "  Hermes only upgrades npm inside its own managed Node install, so this\n"
-        "  one is left alone. Upgrade it yourself with:\n"
-        f'      npm install -g npm@"{npm_range}"',
+        "\n✗ This Node/npm toolchain does not satisfy the project's engine requirements.\n"
+        + (f"  Current toolchain: {current}\n" if current else "")
+        + f"  Required npm: {npm_range}\n"
+        + f"  Resolved npm: {npm}\n"
+        + "  Hermes only upgrades npm inside its own managed Node install, so this\n"
+        + "  one is left alone. Use the version manager that owns this Node install\n"
+        + "  to select a compatible Node/npm pair, then re-run `hermes update`.\n"
+        + "  Do not disable engine-strict; npm releases do not support every Node major.",
         file=sys.stderr,
     )
 
@@ -270,7 +299,12 @@ def maybe_repair_npm_engine(
     prefix = managed_npm_prefix(npm)
     if prefix is None:
         if not quiet:
-            _print_manual_fix(npm, npm_range, actual_npm_version(output))
+            _print_manual_fix(
+                npm,
+                npm_range,
+                actual_npm_version(output),
+                actual_node_version(output),
+            )
         return False
 
     return upgrade_managed_npm(npm, npm_range, prefix=prefix, quiet=quiet)

@@ -234,6 +234,58 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_up_to_date_rerun_repairs_stale_node_deps_and_web_ui(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """The documented recovery after a partial npm update must work even
+        when the failed pull already moved HEAD to the latest commit."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(commit_count="0")
+        with patch.object(
+            hm, "_get_origin_url", return_value="https://github.com/NousResearch/hermes-agent.git"
+        ), patch.object(
+            update_cmd, "_update_node_dependencies", return_value=[]
+        ) as refresh_node, patch.object(
+            hm, "_build_web_ui", return_value=True
+        ) as build_web, patch.object(
+            update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
+        ):
+            cmd_update(mock_args)
+
+        refresh_node.assert_called_once_with()
+        build_web.assert_called_once_with(PROJECT_ROOT / "web")
+        assert "Already up to date!" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_up_to_date_rerun_does_not_claim_success_when_node_repair_fails(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(commit_count="0")
+        with patch.object(
+            hm, "_get_origin_url", return_value="https://github.com/NousResearch/hermes-agent.git"
+        ), patch.object(
+            update_cmd, "_update_node_dependencies", return_value=["repo root"]
+        ) as refresh_node, patch.object(
+            hm, "_build_web_ui"
+        ) as build_web, patch.object(
+            update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
+        ):
+            cmd_update(mock_args)
+
+        refresh_node.assert_called_once_with()
+        build_web.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Already up to date!" not in out
+        assert "Node.js dependency recovery is still incomplete" in out
+
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
