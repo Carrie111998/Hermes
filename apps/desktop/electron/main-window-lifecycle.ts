@@ -2,6 +2,30 @@ type MainWindowLike = {
   isDestroyed: () => boolean
 }
 
+type FocusableMainWindowLike = MainWindowLike & {
+  focus: () => unknown
+  isMinimized: () => boolean
+  isVisible: () => boolean
+  restore: () => unknown
+  show: () => unknown
+}
+
+export function focusMainWindow(window: FocusableMainWindowLike): void {
+  if (!window || window.isDestroyed()) {
+    return
+  }
+
+  if (window.isMinimized()) {
+    window.restore()
+  }
+
+  if (!window.isVisible()) {
+    window.show()
+  }
+
+  window.focus()
+}
+
 type EnsureMainWindowOptions<T extends MainWindowLike> = {
   isReady: boolean
   createWindow: () => unknown

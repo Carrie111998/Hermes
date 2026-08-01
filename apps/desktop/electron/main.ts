@@ -27,7 +27,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 import nodePty from 'node-pty'
 
@@ -134,7 +135,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
-import { ensureMainWindow } from './main-window-lifecycle'
+import { ensureMainWindow, focusMainWindow as focusWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -238,6 +239,11 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import {
+  shouldCreateWindowsTray,
+  shouldHideMainWindowOnClose,
+  shouldStartMainWindowHidden
+} from './windows-tray-lifecycle'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -1043,6 +1049,8 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let windowsTray: Tray | null = null
+let isFinalQuitRequested = false
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -8653,22 +8661,6 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
 // builder live in session-windows.ts so they stay unit-testable.
 const sessionWindows = createSessionWindowRegistry()
 
-function focusWindow(win) {
-  if (!win || win.isDestroyed()) {
-    return
-  }
-
-  if (win.isMinimized()) {
-    win.restore()
-  }
-
-  if (!win.isVisible()) {
-    win.show()
-  }
-
-  win.focus()
-}
-
 function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
@@ -9150,7 +9142,7 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
-function createWindow() {
+function createWindow({ startHidden = false }: { startHidden?: boolean } = {}) {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
@@ -9207,7 +9199,7 @@ function createWindow() {
   }
 
   mainWindow.once('ready-to-show', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    if (!startHidden && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show()
     }
 
@@ -9238,7 +9230,7 @@ function createWindow() {
   // Under Playright testing, instantly show the window.
   // `ready-to-show` doesn't fire in some testing envs.
   if (process.env.TEST_WORKER_INDEX !== undefined) {
-    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+    if (!startHidden && mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
       mainWindow.show()
     }
   }
@@ -9259,6 +9251,18 @@ function createWindow() {
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
   mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', event => {
+    if (
+      shouldHideMainWindowOnClose({
+        platform: process.platform,
+        isQuitting: isFinalQuitRequested,
+        trayAvailable: Boolean(windowsTray)
+      })
+    ) {
+      event.preventDefault()
+      mainWindow?.hide()
+    }
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   const createdMainWindow = mainWindow
@@ -9376,6 +9380,51 @@ function createWindow() {
     broadcastBootProgress()
     sendWindowStateChanged()
   })
+}
+
+function restoreMainWindow() {
+  ensureMainWindow(mainWindow, {
+    isReady: app.isReady(),
+    createWindow,
+    focusWindow
+  })
+}
+
+function createWindowsTray(): boolean {
+  if (!shouldCreateWindowsTray(process.platform) || windowsTray) {
+    return Boolean(windowsTray)
+  }
+
+  const icon = getAppIconPath()
+
+  if (!icon) {
+    rememberLog('[tray] app icon not found; Windows tray unavailable')
+
+    return false
+  }
+
+  let tray: Tray | null = null
+
+  try {
+    tray = new Tray(icon)
+    tray.setToolTip('Hermes')
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: 'Open Hermes', click: restoreMainWindow },
+        { type: 'separator' },
+        { label: 'Quit Hermes', click: () => app.quit() }
+      ])
+    )
+    tray.on('double-click', restoreMainWindow)
+    windowsTray = tray
+
+    return true
+  } catch (error) {
+    tray?.destroy()
+    rememberLog(`[tray] Windows tray creation failed: ${error?.message || error}`)
+
+    return false
+  }
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
@@ -11607,11 +11656,7 @@ function handleDeepLink(url) {
   }
 
   try {
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore()
-    }
-
-    mainWindow.focus()
+    focusWindow(mainWindow)
     mainWindow.webContents.send('hermes:deep-link', payload)
     rememberLog(`[deeplink] delivered ${kind}/${name}`)
   } catch (err) {
@@ -11711,7 +11756,14 @@ app.whenReady().then(() => {
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
   applyQuickEntrySettings(readQuickEntrySettings())
-  createWindow()
+  const trayAvailable = createWindowsTray()
+  createWindow({
+    startHidden: shouldStartMainWindowHidden({
+      platform: process.platform,
+      argv: process.argv,
+      trayAvailable
+    })
+  })
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
@@ -11807,6 +11859,10 @@ app.on('before-quit', event => {
     return
   }
 
+  // Main-window close events follow before-quit. Latch here so explicit quit,
+  // update/uninstall handoff, and confirmed active-work quit bypass close-to-tray.
+  isFinalQuitRequested = true
+
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
     event.preventDefault()
     sshBootstrapCoordinator.cancelAll()
@@ -11869,6 +11925,11 @@ app.on('before-quit', event => {
 
   stopBackendChild(backendConnectionState.getProcess())
   stopAllPoolBackends()
+})
+
+app.on('will-quit', () => {
+  windowsTray?.destroy()
+  windowsTray = null
 })
 
 app.on('window-all-closed', () => {
