@@ -25093,6 +25093,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # ``cronjob`` is service-gated through HERMES_GATEWAY_SESSION.  This is a
+    # process-role marker (not per-chat routing state), so bind it once for the
+    # lifetime of the gateway before any agent snapshots its tool schemas.
+    # Session-specific values remain on gateway.session_context ContextVars.
+    os.environ["HERMES_GATEWAY_SESSION"] = "1"
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
