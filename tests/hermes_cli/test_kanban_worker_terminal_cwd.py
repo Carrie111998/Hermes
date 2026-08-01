@@ -13,7 +13,12 @@ Pinning ``TERMINAL_CWD`` to the workspace fixes both.
 
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
+from unittest import mock
+
+import pytest
 
 
 def _make_task(kb, *, assignee: str = "w"):
@@ -51,9 +56,31 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    with monkeypatch.context() as capture_patch:
+        capture_patch.setattr(subprocess, "Popen", fake_popen)
+        kb._default_spawn(_make_task(kb), workspace)
     return captured
+
+
+def _shell_file_operations(workspace: Path):
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+
+    environment = LocalEnvironment(cwd=str(workspace))
+    return ShellFileOperations(environment, cwd=str(workspace))
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
 
 
 def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
@@ -77,3 +104,224 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
+def test_narrow_inherited_root_replaced_for_scratch_workspace_write(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "board"
+    workspace = root / "scratch-a"
+    sibling = root / "scratch-b"
+    inherited = tmp_path / "deployment-root"
+    workspace.mkdir(parents=True)
+    sibling.mkdir()
+    inherited.mkdir()
+    (tmp_path / ".hermes" / "profiles" / "w").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_CWD", str(inherited))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(inherited))
+
+    from hermes_cli import kanban_db as kb
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    child_root = os.path.realpath(workspace)
+    assert captured["env"]["TERMINAL_CWD"] == child_root
+
+    target = workspace / "own.txt"
+    with mock.patch.dict(os.environ, captured["env"], clear=True):
+        result = _shell_file_operations(workspace).write_file(str(target), "own")
+
+    assert result.error is None
+    assert captured["env"]["HERMES_WRITE_SAFE_ROOT"] == child_root
+    assert target.read_text(encoding="utf-8") == "own"
+
+
+def test_sibling_and_traversal_mutations_are_denied(monkeypatch, tmp_path):
+    root = tmp_path / "board"
+    workspace = root / "scratch-a"
+    sibling = root / "scratch-b"
+    workspace.mkdir(parents=True)
+    sibling.mkdir()
+    (tmp_path / ".hermes" / "profiles" / "w").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_CWD", str(root))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    direct = sibling / "direct.txt"
+    traversal = sibling / "traversal.txt"
+    direct.write_text("before", encoding="utf-8")
+    traversal.write_text("before", encoding="utf-8")
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    with mock.patch.dict(os.environ, captured["env"], clear=True):
+        ops = _shell_file_operations(workspace)
+        direct_result = ops.patch_replace(str(direct), "before", "after")
+        traversal_result = ops.patch_replace(
+            str(workspace / ".." / "scratch-b" / "traversal.txt"),
+            "before",
+            "after",
+        )
+
+    assert direct_result.error is not None
+    assert "outside HERMES_WRITE_SAFE_ROOT" in direct_result.error
+    assert traversal_result.error is not None
+    assert "outside HERMES_WRITE_SAFE_ROOT" in traversal_result.error
+    assert direct.read_text(encoding="utf-8") == "before"
+    assert traversal.read_text(encoding="utf-8") == "before"
+
+
+def test_symlink_escape_is_denied(monkeypatch, tmp_path):
+    if os.name == "nt":
+        pytest.skip("symlink boundary is covered on POSIX CI")
+
+    root = tmp_path / "board"
+    workspace = root / "scratch-a"
+    outside = root / "outside"
+    workspace.mkdir(parents=True)
+    outside.mkdir()
+    try:
+        (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    (tmp_path / ".hermes" / "profiles" / "w").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_CWD", str(root))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    target = workspace / "escape" / "escaped.txt"
+    with mock.patch.dict(os.environ, captured["env"], clear=True):
+        result = _shell_file_operations(workspace).write_file(str(target), "blocked")
+
+    assert result.error is not None
+    assert "outside HERMES_WRITE_SAFE_ROOT" in result.error
+    assert not (outside / "escaped.txt").exists()
+
+
+def test_workspace_variables_share_realpath(monkeypatch, tmp_path):
+    target = tmp_path / "real-workspace"
+    workspace = tmp_path / "workspace-link"
+    target.mkdir()
+    try:
+        workspace.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    inherited = tmp_path / "inherited-root"
+    inherited.mkdir()
+    (tmp_path / ".hermes" / "profiles" / "w").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_CWD", str(inherited))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(inherited))
+
+    from hermes_cli import kanban_db as kb
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    assert captured["cwd"] == str(workspace)
+    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert captured["env"]["TERMINAL_CWD"] == os.path.realpath(workspace)
+    assert captured["env"]["HERMES_WRITE_SAFE_ROOT"] == os.path.realpath(workspace)
+
+
+def test_invalid_workspace_preserves_inherited_policy(monkeypatch, tmp_path):
+    inherited_cwd = tmp_path / "inherited-cwd"
+    inherited_root = tmp_path / "inherited-root"
+    existing_file = tmp_path / "workspace-file"
+    separator_dir = tmp_path / f"workspace{os.pathsep}roots"
+    inherited_cwd.mkdir()
+    inherited_root.mkdir()
+    existing_file.write_text("file", encoding="utf-8")
+    separator_dir.mkdir()
+    (tmp_path / ".hermes" / "profiles" / "w").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_CWD", str(inherited_cwd))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(inherited_root))
+
+    candidates = [
+        "relative-workspace",
+        "",
+        str(tmp_path / "missing-workspace"),
+        str(existing_file),
+        os.path.abspath(os.sep),
+        str(separator_dir),
+    ]
+    from hermes_cli import kanban_db as kb
+
+    for candidate in candidates:
+        captured = _capture_spawn_env(kb, monkeypatch, candidate)
+        assert captured["env"]["TERMINAL_CWD"] == str(inherited_cwd), candidate
+        assert captured["env"]["HERMES_WRITE_SAFE_ROOT"] == str(inherited_root), candidate
+
+
+def test_dispatch_scopes_materialized_scratch_workspace(kanban_home, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    inherited = kanban_home.parent / "deployment-root"
+    inherited.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(inherited))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(inherited))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        captured["cwd"] = kwargs["cwd"]
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="scoped scratch",
+            assignee="default",
+            workspace_kind="scratch",
+        )
+        result = kb.dispatch_once(conn, max_spawn=1)
+        task = kb.get_task(conn, task_id)
+
+    assert [item[0] for item in result.spawned] == [task_id]
+    assert task is not None
+    workspace = Path(task.workspace_path)
+    assert workspace.is_dir()
+    assert captured["cwd"] == str(workspace)
+    assert captured["env"]["HERMES_WRITE_SAFE_ROOT"] == os.path.realpath(workspace)
+
+
+def test_scoped_spawn_failure_records_existing_failure_flow(kanban_home, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    def failing_popen(*args, **kwargs):
+        raise OSError("spawn boom")
+
+    monkeypatch.setattr(subprocess, "Popen", failing_popen)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="spawn failure",
+            assignee="default",
+            workspace_kind="scratch",
+        )
+        first = kb.dispatch_once(conn, failure_limit=2)
+        after_first = kb.get_task(conn, task_id)
+        second = kb.dispatch_once(conn, failure_limit=2)
+        after_second = kb.get_task(conn, task_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, task_id)]
+
+    assert first.spawned == []
+    assert second.spawned == []
+    assert after_first is not None
+    assert after_first.status == "ready"
+    assert after_first.claim_lock is None
+    assert after_first.consecutive_failures == 1
+    assert after_second is not None
+    assert after_second.status == "blocked"
+    assert after_second.claim_lock is None
+    assert after_second.consecutive_failures == 2
+    assert "spawn_failed" in event_kinds
+    assert "gave_up" in event_kinds
