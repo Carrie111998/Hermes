@@ -412,6 +412,30 @@ def test_disabled_optional_feature_is_explicit_not_failure(
     assert queue["work_state"]["required_for_service_impact"] is False
 
 
+@pytest.mark.parametrize(
+    ("flag", "timestamp", "queue_name"),
+    [
+        ("hydration_enabled", "hydration_observed_at", "sidebar_hydration"),
+        (
+            "claude_visibility_enabled",
+            "claude_visibility_observed_at",
+            "claude_visibility",
+        ),
+    ],
+)
+def test_invalid_optional_queue_observation_remains_service_required(
+    flag: str, timestamp: str, queue_name: str
+) -> None:
+    inputs = healthy_inputs()
+    inputs[flag] = False
+    inputs[timestamp] = None
+    queue = build_session_health_evidence(**inputs)["queues"][queue_name]
+    assert queue["work_state"]["code"] == "invalid_observation_time"
+    assert queue["work_state"]["required_for_service_impact"] is True
+    assert queue["ledger_integrity"]["code"] == "invalid_observation_time"
+    assert queue["ledger_integrity"]["required_for_service_impact"] is True
+
+
 def test_registered_claude_visibility_failed_code_is_current_error() -> None:
     inputs = healthy_inputs()
     inputs["claude_visibility_status"]["counts"]["claude_failed"] = 1

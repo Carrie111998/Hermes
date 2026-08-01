@@ -582,7 +582,7 @@ def _queue_work_axis(
         return _invalid_observation_axis(
             scope=name,
             owner=owner,
-            required_for_service_impact=required_for_service_impact,
+            required_for_service_impact=True,
         )
     raw_counts = _mapping(source.get(counts_key))
     counts = {field: _count_fact(raw_counts.get(field)) for field in count_fields}
@@ -666,7 +666,7 @@ def _queue(
             "ledger_integrity": _invalid_observation_axis(
                 scope=name,
                 owner=owner,
-                required_for_service_impact=feature_flag is not False,
+                required_for_service_impact=True,
             ),
         }
     if feature_flag is False:
