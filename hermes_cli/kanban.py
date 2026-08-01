@@ -735,6 +735,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_answer_escalation = sub.add_parser(
+        "answer-escalation",
+        help=(
+            "Answer one live Resolver escalation and return it to the ordinary "
+            "Resolver dispatcher (use `--` before an answer beginning with `-` )"
+        ),
+    )
+    p_answer_escalation.add_argument("task_id")
+    p_answer_escalation.add_argument(
+        "answer", nargs="+",
+        help="Operator answer. Use `--` before answers beginning with `-`.",
+    )
+    p_answer_escalation.add_argument(
+        "--answered-by", default=None,
+        help="Operator identity (default: $HERMES_PROFILE or the active profile)",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1152,6 +1169,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "answer-escalation": _cmd_answer_escalation,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1217,6 +1235,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "answer-escalation",
     "promote",
     "archive",
     "dispatch",
@@ -2593,6 +2612,39 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_answer_escalation(args: argparse.Namespace) -> int:
+    answer = " ".join(args.answer).strip() if args.answer else ""
+    answered_by = getattr(args, "answered_by", None) or _profile_author()
+    with kb.connect_closing() as conn:
+        expected = kb.resolver_escalation_expected_snapshot(conn, args.task_id)
+        if expected is None:
+            print(
+                f"kanban: cannot answer {args.task_id}: task changed; "
+                "refresh before resolver escalation answer",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            event_id = kb.reenter_resolver_escalation(
+                conn,
+                args.task_id,
+                answer=answer,
+                answered_by=answered_by,
+                expected=expected,
+            )
+        except (ValueError, kb.TaskSnapshotConflict) as exc:
+            print(
+                f"kanban: cannot answer {args.task_id}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    print(
+        f"Answered {args.task_id}; fresh Resolver run is eligible for ordinary dispatch "
+        f"(preflight event {event_id})"
+    )
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:

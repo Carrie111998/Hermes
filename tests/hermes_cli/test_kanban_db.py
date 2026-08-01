@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -13507,3 +13508,514 @@ def test_human_cli_block_uses_connection_board_for_omitted_escalation(
 
     assert task.assignee == "resolver"
     assert preflight.payload["hermes_assignee"] == "resolver"
+
+
+# ---------------------------------------------------------------------------
+# D4 resolver escalation answer/re-entry contract
+# ---------------------------------------------------------------------------
+
+
+def _d4_expected_snapshot(conn, task_id: str) -> dict:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    events = kb.list_events(conn, task_id)
+    blocked = [event for event in events if event.kind == "blocked"][-1]
+    resolved = next(event for event in events if event.id == blocked.id - 1)
+    preflights = [
+        event for event in events
+        if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT and event.id < resolved.id
+    ]
+    assert preflights
+    return {
+        "escalation_event_id": blocked.id,
+        "preflight_event_id": preflights[-1].id,
+        "run_id": blocked.run_id,
+        "status": task.status,
+        "phase": task.current_step_key,
+        "assignee": task.assignee,
+        "project_id": task.project_id,
+        "workflow_template_id": task.workflow_template_id,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+        "running": task.running,
+        "blocked": task.blocked,
+    }
+
+
+def _d4_escalated(conn, board: str, *, step: str = "development") -> tuple[str, int, dict]:
+    if step in {"development", "test", "review"}:
+        tid, run_id = _route_task_to_resolver(conn, board, step=step)
+    else:
+        original = "productowner" if step == "backlog" else "measure"
+        tid = kb.create_task(
+            conn,
+            title=f"Story: {step} resolver",
+            assignee=original,
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        first = kb.claim_task(conn, tid, board=board)
+        assert first is not None and first.current_run_id is not None
+        assert kb.block_task(
+            conn, tid, reason="Need a decision", kind="needs_input",
+            attempted_resolutions=["read docs"],
+            expected_run_id=first.current_run_id, board=board,
+            human_escalation_assignee="resolver",
+        )
+        resolver = kb.claim_task(conn, tid, board=board)
+        assert resolver is not None and resolver.current_run_id is not None
+        run_id = resolver.current_run_id
+    assert _resolve_preflight(
+        conn, tid, run_id, board, decision="escalate",
+        fault_domain="framework", reason="Need operator context",
+    )
+    return tid, run_id, _d4_expected_snapshot(conn, tid)
+
+
+def test_d4_answer_reentry_happy_path_and_comments_are_tolerated(kanban_home):
+    board = "d4-board"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        kb.add_comment(conn, tid, "operator", "I am checking the fixture.")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (tid, "audit", json.dumps({"note": "read-only observation"}), int(time.time())),
+        )
+        conn.commit()
+        event_id = kb.reenter_resolver_escalation(
+            conn, tid, board=board,
+            answer="Use the vendored fixture token.", answered_by="operator",
+            expected=expected,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert task is not None
+    assert task.assignee == "resolver"
+    assert task.status == "ready"
+    assert task.blocked is False
+    assert task.current_run_id is None
+    answer_events = [event for event in events if event.id == event_id]
+    assert len(answer_events) == 1
+    assert answer_events[0].payload["human_answer"] == "Use the vendored fixture token."
+    assert answer_events[0].payload["answered_by"] == "operator"
+    assert not [comment for comment in comments if "Use the vendored" in comment.body]
+
+
+def test_d4_expected_snapshot_is_a_db_boundary_cas(kanban_home):
+    board = "d4-cas"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        stale = dict(expected)
+        stale["escalation_event_id"] += 1
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=stale,
+            )
+
+
+def test_d4_lifecycle_mutation_makes_escalation_stale(kanban_home):
+    board = "d4-stale-lifecycle"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        conn.execute("UPDATE tasks SET current_step_key='review' WHERE id=?", (tid,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (tid, "workflow_step", json.dumps({"current_step_key": "review"}), int(time.time())),
+        )
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="stale", answered_by="operator",
+                expected=expected,
+            )
+
+
+def test_d4_provenance_rejects_malformed_cross_task_and_wrong_profile(kanban_home):
+    board = "d4-provenance"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        resolved_id = expected["escalation_event_id"] - 1
+        conn.execute("UPDATE task_events SET payload='not-json' WHERE id=?", (resolved_id,))
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        resolved_id = expected["escalation_event_id"] - 1
+        payload = {"action": "escalate", "preflight_event_id": expected["preflight_event_id"]}
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), resolved_id))
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
+        payload = dict(preflight.payload)
+        payload["hermes_assignee"] = "not-resolver"
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), preflight.id))
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+
+
+def test_d4_cross_task_preflight_reference_is_rejected(kanban_home):
+    board = "d4-cross-task"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        _, _, other_expected = _d4_escalated(conn, board)
+        resolved_id = expected["escalation_event_id"] - 1
+        resolved = next(event for event in kb.list_events(conn, tid) if event.id == resolved_id)
+        payload = dict(resolved.payload or {})
+        payload["preflight_event_id"] = other_expected["preflight_event_id"]
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), resolved_id),
+        )
+        conn.commit()
+        current = kb.resolver_escalation_expected_snapshot(conn, tid)
+        assert current is not None
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="cross-task", answered_by="operator",
+                expected=current,
+            )
+
+
+def test_d4_rejects_same_task_historical_run_substitution(kanban_home):
+    board = "d4-historical-run"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, first_run, first_expected = _d4_escalated(conn, board)
+        kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="first answer", answered_by="operator",
+            expected=first_expected,
+        )
+        fresh = kb.claim_task(conn, tid, board=board)
+        assert fresh is not None and fresh.current_run_id is not None
+        assert _resolve_preflight(
+            conn, tid, fresh.current_run_id, board, decision="escalate",
+            fault_domain="framework", reason="Second escalation",
+        )
+        current = _d4_expected_snapshot(conn, tid)
+        conn.execute("UPDATE task_events SET run_id=? WHERE id=?", (first_run, current["escalation_event_id"]))
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="stale second", answered_by="operator",
+                expected=current,
+            )
+
+
+@pytest.mark.parametrize("bad_identity", ["", "   ", None, 0, [], {}, "x" * 257])
+def test_d4_rejects_blank_or_non_string_answered_by(kanban_home, bad_identity):
+    board = "d4-identity"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        with pytest.raises(ValueError, match="answered_by"):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by=bad_identity,
+                expected=expected,
+            )
+
+
+@pytest.mark.parametrize("bad_answer", ["", "   ", None, 0, [], {}, "x" * 2049])
+def test_d4_rejects_blank_non_string_or_oversized_answer(kanban_home, bad_answer):
+    board = "d4-answer"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        with pytest.raises(ValueError, match="answer"):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer=bad_answer, answered_by="operator",
+                expected=expected,
+            )
+
+
+@pytest.mark.parametrize("raw_assignee", [{}, [], 0, False, "", "   ", "x" * 257])
+def test_d4_source_assignee_is_validated_before_coercion(kanban_home, raw_assignee):
+    board = "d4-source-assignee"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
+        payload = dict(preflight.payload)
+        payload["original_assignee"] = raw_assignee
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), preflight.id))
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+
+
+def test_d4_missing_or_none_assignee_uses_governed_backlog_derivation(kanban_home):
+    board = "d4-backlog"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board, step="backlog")
+        preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
+        payload = dict(preflight.payload)
+        payload.pop("original_assignee", None)
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), preflight.id))
+        conn.commit()
+        kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="backlog answer", answered_by="operator",
+            expected=expected,
+        )
+        events = kb.list_events(conn, tid)
+    reentry = [event for event in events if event.payload.get("kind") == "resolver_reentry"][-1]
+    assert reentry.payload["original_assignee"] == "productowner"
+
+
+def test_d4_release_measure_resume_preserves_canonical_none(kanban_home):
+    board = "d4-release-measure"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board, step="release_measure")
+        preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
+        payload = dict(preflight.payload)
+        payload["original_assignee"] = None
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), preflight.id))
+        conn.commit()
+        kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="measure answer", answered_by="operator",
+            expected=expected,
+        )
+        event = [event for event in kb.list_events(conn, tid) if event.payload.get("kind") == "resolver_reentry"][-1]
+    assert event.payload["original_assignee"] is None
+
+
+def test_d4_release_measure_resume_restores_none_after_fresh_resolver(kanban_home):
+    board = "d4-release-measure-resume"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board, step="release_measure")
+        preflight = next(
+            event for event in kb.list_events(conn, tid)
+            if event.id == expected["preflight_event_id"]
+        )
+        payload = dict(preflight.payload)
+        payload["original_assignee"] = None
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), preflight.id),
+        )
+        conn.commit()
+        kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="measure answer", answered_by="operator",
+            expected=expected,
+        )
+        fresh = kb.claim_task(conn, tid, board=board)
+        assert fresh is not None and fresh.current_run_id is not None
+        assert _resolve_preflight(
+            conn, tid, fresh.current_run_id, board, decision="resume",
+            fault_domain="task_state", reason="Apply measure answer",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee is None
+    assert task.current_step_key == "release_measure"
+
+
+@pytest.mark.parametrize("bad_configured_assignee", ["x" * 257, "", "   ", False, 0, [], {}])
+def test_d4_configured_assignee_is_validated_before_helper_coercion(
+    kanban_home, bad_configured_assignee,
+):
+    board = "d4-configured-assignee"
+    _v2_product_board(board)
+    metadata = kb.read_board_metadata(board)
+    workflow = metadata.setdefault("product_workflow", {})
+    workflow.setdefault("assignees", dict(kb.PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES))
+    workflow["assignees"]["developer"] = bad_configured_assignee
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        preflight = next(
+            event for event in kb.list_events(conn, tid)
+            if event.id == expected["preflight_event_id"]
+        )
+        payload = dict(preflight.payload)
+        payload["original_assignee"] = None
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), preflight.id),
+        )
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+
+
+def test_d4_non_resolver_block_fails_closed(kanban_home):
+    board = "d4-non-resolver-block"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        blocked = next(
+            event for event in kb.list_events(conn, tid)
+            if event.id == expected["escalation_event_id"]
+        )
+        payload = dict(blocked.payload)
+        payload["kind"] = "needs_input"
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), blocked.id),
+        )
+        conn.commit()
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+
+
+def test_d4_attempted_resolutions_are_bounded_and_one_event_is_written(kanban_home):
+    board = "d4-bounds"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        blocked = next(event for event in kb.list_events(conn, tid) if event.id == expected["escalation_event_id"])
+        payload = dict(blocked.payload)
+        payload["attempted_resolutions"] = ["x" * 1000 for _ in range(100)]
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), blocked.id))
+        conn.commit()
+        before = len(kb.list_events(conn, tid))
+        event_id = kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="bounded", answered_by="operator",
+            expected=expected,
+        )
+        events = kb.list_events(conn, tid)
+    assert len(events) == before + 1
+    answered = next(event for event in events if event.id == event_id)
+    assert len(answered.payload["attempted_resolutions"]) <= 20
+    assert sum(len(item) for item in answered.payload["attempted_resolutions"]) <= 4096
+
+
+def test_d4_second_escalation_reentry_cycle_works(kanban_home):
+    board = "d4-repeat"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, first_expected = _d4_escalated(conn, board)
+        kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="first", answered_by="operator",
+            expected=first_expected,
+        )
+        fresh = kb.claim_task(conn, tid, board=board)
+        assert fresh is not None and fresh.current_run_id is not None
+        assert _resolve_preflight(
+            conn, tid, fresh.current_run_id, board, decision="resume",
+            fault_domain="task_state", reason="First answer applied",
+        )
+        worker = kb.claim_task(conn, tid, board=board)
+        assert worker is not None and worker.current_run_id is not None
+        assert kb.block_task(
+            conn, tid, reason="Need another decision", kind="needs_input",
+            expected_run_id=worker.current_run_id, board=board,
+            human_escalation_assignee="resolver",
+        )
+        second = kb.claim_task(conn, tid, board=board)
+        assert second is not None and second.current_run_id is not None
+        assert _resolve_preflight(
+            conn, tid, second.current_run_id, board, decision="escalate",
+            fault_domain="framework", reason="Second question",
+        )
+        second_expected = _d4_expected_snapshot(conn, tid)
+        event_id = kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="second", answered_by="operator",
+            expected=second_expected,
+        )
+        events = kb.list_events(conn, tid)
+    assert event_id > 0
+    assert len([event for event in events if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT]) == 4
+
+
+def test_d4_concurrent_answers_have_exactly_one_winner_and_public_conflict(kanban_home):
+    board = "d4-concurrent"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def answer(answer_text):
+        with kb.connect(board=board) as conn:
+            barrier.wait(timeout=5)
+            try:
+                event_id = kb.reenter_resolver_escalation(
+                    conn, tid, board=board, answer=answer_text, answered_by="operator",
+                    expected=dict(expected),
+                )
+                results.append(("ok", event_id))
+            except Exception as exc:
+                results.append(("error", exc))
+
+    threads = [threading.Thread(target=answer, args=(f"answer-{i}",)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert len([result for result in results if result[0] == "ok"]) == 1, results
+    errors = [result[1] for result in results if result[0] == "error"]
+    assert len(errors) == 1, results
+    assert isinstance(errors[0], kb.TaskSnapshotConflict), errors
+    with kb.connect(board=board) as conn:
+        answer_events = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT
+            and event.payload.get("kind") == "resolver_reentry"
+        ]
+    assert len(answer_events) == 1
+
+
+def test_d4_real_dispatcher_claims_development_and_review_reentry(kanban_home, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    original_claim_review = kb.claim_review_task
+    for step, board in [("development", "d4-dispatch-dev"), ("review", "d4-dispatch-review")]:
+        _v2_product_board(board)
+        with kb.connect(board=board) as conn:
+            tid, _, expected = _d4_escalated(conn, board, step=step)
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="dispatch answer", answered_by="operator",
+                expected=expected,
+            )
+
+        calls = []
+        monkeypatch.setattr(
+            kb, "claim_review_task",
+            lambda conn, task_id, _claim=original_claim_review, **kwargs: (
+                calls.append(task_id), _claim(conn, task_id, **kwargs)
+            )[1],
+        )
+        with kb.connect(board=board) as conn:
+            result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 9001, board=board)
+            task = kb.get_task(conn, tid)
+            run = kb.get_run(conn, task.current_run_id) if task and task.current_run_id else None
+        assert tid in [spawn[0] for spawn in result.spawned]
+        assert task is not None and task.current_run_id is not None
+        assert run is not None and run.profile == "resolver"
+        if step == "review":
+            assert tid in calls

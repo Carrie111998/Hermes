@@ -3559,6 +3559,9 @@ def resolve_product_preflight(
             "status": next_status,
             "resolver_profile": resolver_profile,
             "resolver_model": resolver_model,
+            # D4 provenance anchor: the exact preflight this Resolver run
+            # resolved, not a later same-task preflight inferred by position.
+            "preflight_event_id": preflight_event_id,
         }
         if decision == "resume":
             resolved_payload["assignee"] = original_assignee
@@ -3733,6 +3736,553 @@ def _route_product_human_block_to_preflight(
             run_id=run_id,
         )
     return True, transition_event_id, memory_capture_id
+
+
+# D4 operator re-entry is deliberately narrower than ``unblock_task`` or
+# ``resolve_product_preflight``: it accepts only a product card whose current
+# lifecycle is the exact terminal Resolver-escalation shape.  The answer is
+# recorded as the next preflight event so the ordinary Resolver dispatcher can
+# claim it; this seam never creates a run itself.
+_RESOLVER_REENTRY_ANSWER_MAX_CHARS = 2048
+_RESOLVER_REENTRY_ASSIGNEE_MAX_CHARS = 256
+_RESOLVER_REENTRY_ANSWERED_BY_MAX_CHARS = 256
+_RESOLVER_REENTRY_ATTEMPTED_RESOLUTIONS_MAX_ITEMS = 20
+_RESOLVER_REENTRY_ATTEMPTED_RESOLUTION_ITEM_MAX_CHARS = 512
+_RESOLVER_REENTRY_ATTEMPTED_RESOLUTIONS_TOTAL_MAX_CHARS = 4096
+_RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS = 2048
+_RESOLVER_ESCALATION_RUN_STATUS = "blocked"
+_RESOLVER_ESCALATION_RUN_OUTCOME = "preflight_escalated"
+_RESOLVER_ESCALATION_POST_ASSIGNEE = "default"
+_RESOLVER_ESCALATION_BENIGN_EVENT_KINDS = frozenset({
+    "audit",
+    "audit_only",
+    "comment",
+    "commented",
+    "diagnostic",
+    "dispatcher_metadata_conflict",
+    "heartbeat",
+    "traceability",
+})
+_RESOLVER_ESCALATION_EXPECTED_KEYS = frozenset(
+    set(_RESOLVER_EXPECTED_KEYS) | {"escalation_event_id"}
+)
+
+
+def _d4_event_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _d4_positive_event_id(value: Any) -> Optional[int]:
+    if type(value) is not int or value <= 0:  # bool is intentionally rejected.
+        return None
+    return value
+
+
+def _latest_resolver_escalation(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[int, dict[str, Any], int]]:
+    """Return the current canonical Resolver escalation, ignoring audit noise.
+
+    Event order is the lifecycle CAS.  A later event is tolerated only when
+    it is explicitly audit/comment-only; an unknown event fails closed.  Thus
+    a later assignment, status/step mutation, answer/preflight, or ordinary
+    block makes the prior escalation stale even if a caller manually leaves
+    the task row looking blocked.
+    """
+    rows = conn.execute(
+        "SELECT id, kind, payload, run_id FROM task_events "
+        "WHERE task_id = ? ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    latest_lifecycle: Optional[tuple[sqlite3.Row, Optional[dict[str, Any]]]] = None
+    for row in rows:
+        payload = _d4_event_payload(row)
+        if row["kind"] in _RESOLVER_ESCALATION_BENIGN_EVENT_KINDS:
+            continue
+        latest_lifecycle = (row, payload)
+    if latest_lifecycle is None:
+        return None
+    row, payload = latest_lifecycle
+    if row["kind"] != "blocked" or not isinstance(payload, dict):
+        return None
+    if payload.get("kind") != "resolver_escalation":
+        return None
+    run_id = row["run_id"]
+    if type(run_id) is not int or run_id <= 0:
+        return None
+    return int(row["id"]), payload, run_id
+
+
+def _resolver_escalation_snapshot(
+    row: sqlite3.Row,
+    *,
+    escalation_event_id: int,
+    preflight_event_id: Optional[int],
+    resolver_run_id: int,
+) -> dict[str, Any]:
+    return {
+        "escalation_event_id": escalation_event_id,
+        "preflight_event_id": preflight_event_id,
+        "run_id": resolver_run_id,
+        "status": row["status"],
+        "phase": row["current_step_key"],
+        "assignee": row["assignee"],
+        "project_id": row["project_id"],
+        "workflow_template_id": row["workflow_template_id"],
+        "workspace_kind": row["workspace_kind"],
+        "workspace_path": row["workspace_path"],
+        "branch_name": row["branch_name"],
+        "running": bool(row["running"]),
+        "blocked": bool(row["blocked"]),
+    }
+
+
+def _d4_prior_task_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    event_id: int,
+) -> Optional[sqlite3.Row]:
+    """Find the immediately preceding event in this task's own stream."""
+    return conn.execute(
+        "SELECT id, kind, payload, run_id FROM task_events "
+        "WHERE task_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+        (task_id, event_id),
+    ).fetchone()
+
+
+def resolver_escalation_expected_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the D4 CAS snapshot for the task's current escalation."""
+    escalation = _latest_resolver_escalation(conn, task_id)
+    if escalation is None:
+        return None
+    event_id, _payload, run_id = escalation
+    resolved = _d4_prior_task_event(conn, task_id, event_id)
+    if resolved is None or resolved["kind"] != "human_input_preflight_resolved":
+        return None
+    resolved_payload = _d4_event_payload(resolved)
+    if not isinstance(resolved_payload, dict):
+        return None
+    preflight_event_id = _d4_positive_event_id(
+        resolved_payload.get("preflight_event_id")
+    )
+    if preflight_event_id is None or resolved["run_id"] != run_id:
+        return None
+    row = conn.execute(
+        "SELECT status, assignee, project_id, workflow_template_id, "
+        "current_step_key, workspace_kind, workspace_path, branch_name, "
+        "running, blocked FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _resolver_escalation_snapshot(
+        row,
+        escalation_event_id=event_id,
+        preflight_event_id=preflight_event_id,
+        resolver_run_id=run_id,
+    )
+
+
+def _d4_bounded_copied_text(value: Any, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value[:limit]
+
+
+def _d4_bounded_attempted_resolutions(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value[-_RESOLVER_REENTRY_ATTEMPTED_RESOLUTIONS_MAX_ITEMS:]:
+        text = item if isinstance(item, str) else str(item)
+        items.append(text[:_RESOLVER_REENTRY_ATTEMPTED_RESOLUTION_ITEM_MAX_CHARS])
+    bounded: list[str] = []
+    total = 0
+    for item in reversed(items):
+        if total + len(item) > _RESOLVER_REENTRY_ATTEMPTED_RESOLUTIONS_TOTAL_MAX_CHARS:
+            break
+        bounded.append(item)
+        total += len(item)
+    bounded.reverse()
+    return bounded
+
+
+def _d4_canonical_assignee(raw: Any, *, field: str) -> str:
+    """Validate raw assignee identity before applying profile normalization."""
+    if not isinstance(raw, str):
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {field: "non-string"}
+        )
+    value = raw.strip()
+    if not value or len(value) > _RESOLVER_REENTRY_ASSIGNEE_MAX_CHARS:
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {field: "invalid"}
+        )
+    try:
+        canonical = _canonical_assignee(value)
+    except Exception as exc:
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {field: "invalid"}
+        ) from exc
+    if not isinstance(canonical, str):
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {field: "non-string-canonical"}
+        )
+    canonical = canonical.strip()
+    if not canonical or len(canonical) > _RESOLVER_REENTRY_ASSIGNEE_MAX_CHARS:
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {field: "invalid-canonical"}
+        )
+    return canonical
+
+
+def _d4_raw_governed_assignee(
+    meta: Optional[dict], step_key: str,
+) -> tuple[bool, Any]:
+    """Read the configured phase assignee without coercing its raw value."""
+    if not isinstance(meta, dict):
+        return False, None
+    qualification = meta.get("qualification")
+    if isinstance(qualification, dict) and qualification.get("required") is True:
+        phase_assignees = qualification.get("phase_assignees")
+        if not isinstance(phase_assignees, dict) or step_key not in phase_assignees:
+            return False, None
+        return True, phase_assignees[step_key]
+    phase_roles = PRODUCT_QUALIFICATION_DEFAULTS.get("phase_assignees", {})
+    if not isinstance(phase_roles, dict) or step_key not in phase_roles:
+        return False, None
+    role = phase_roles[step_key]
+    if role is None:
+        return True, None
+    workflow_assignees = _product_workflow_dict(meta).get("assignees")
+    if not isinstance(workflow_assignees, dict) or role not in workflow_assignees:
+        return False, None
+    return True, workflow_assignees[role]
+
+
+def _d4_original_assignee(
+    meta: Optional[dict],
+    task_row: sqlite3.Row,
+    source_payload: dict[str, Any],
+    step_key: str,
+) -> Optional[str]:
+    # Presence is significant: falsey malformed values are not "missing".
+    if "original_assignee" in source_payload:
+        raw_original = source_payload["original_assignee"]
+        if raw_original is not None:
+            return _d4_canonical_assignee(raw_original, field="original_assignee")
+
+    # Use the existing governance helper for ownership/derivation, then
+    # inspect the raw configured value separately so a non-string/oversized
+    # configuration cannot be silently stringified into authority.
+    owns_assignee, derived = _product_unblock_assignee(meta, task_row)
+    raw_configured_present, raw_configured = _d4_raw_governed_assignee(meta, step_key)
+    if owns_assignee:
+        if step_key == "release_measure" and raw_configured is None:
+            if derived is not None:
+                _d4_canonical_assignee(derived, field="derived_assignee")
+            return None
+        if not raw_configured_present or raw_configured is None:
+            raise TaskSnapshotConflict(
+                "resolver re-entry", {"derived_assignee": "missing"}
+            )
+        configured = _d4_canonical_assignee(
+            raw_configured, field="configured_assignee"
+        )
+        if not isinstance(derived, str):
+            raise TaskSnapshotConflict(
+                "resolver re-entry", {"derived_assignee": "non-string"}
+            )
+        derived_canonical = _d4_canonical_assignee(
+            derived, field="derived_assignee"
+        )
+        if configured != derived_canonical:
+            raise TaskSnapshotConflict(
+                "resolver re-entry",
+                {"configured_assignee": configured, "derived_assignee": derived_canonical},
+            )
+        return configured
+
+    # A configured value that is present but falsey must not be mistaken for
+    # an absent mapping after the existing helper stringifies it.
+    if raw_configured_present and raw_configured is not None:
+        _d4_canonical_assignee(raw_configured, field="configured_assignee")
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {"configured_assignee": "not-governed"}
+        )
+
+    phase_roles = PRODUCT_QUALIFICATION_DEFAULTS.get("phase_assignees", {})
+    fallback = phase_roles.get(step_key) if isinstance(phase_roles, dict) else None
+    if fallback is None:
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {"original_assignee": "undetermined"}
+        )
+    return _d4_canonical_assignee(fallback, field="derived_assignee")
+
+
+def reenter_resolver_escalation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    answer: str,
+    answered_by: str,
+    expected: Optional[dict[str, Any]] = None,
+    expected_snapshot: Optional[dict[str, Any]] = None,
+    expected_escalation_event_id: Optional[int] = None,
+) -> int:
+    """Atomically answer one live Resolver escalation and re-enter dispatch.
+
+    The caller must provide the complete D4 snapshot.  The transaction
+    validates event provenance and the row CAS, writes one fresh
+    ``human_input_preflight`` event, and only then exposes the task to the
+    ordinary ready/review dispatcher.  It never creates or claims a run.
+    """
+    if expected is not None and expected_snapshot is not None and expected != expected_snapshot:
+        raise ValueError("expected and expected_snapshot disagree")
+    expected = expected if expected is not None else expected_snapshot
+    if not isinstance(expected, dict) or set(expected) != _RESOLVER_ESCALATION_EXPECTED_KEYS:
+        raise ValueError("expected must contain the complete Resolver escalation snapshot")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("answer is required")
+    answer = answer.strip()
+    if len(answer) > _RESOLVER_REENTRY_ANSWER_MAX_CHARS:
+        raise ValueError(
+            f"answer exceeds {_RESOLVER_REENTRY_ANSWER_MAX_CHARS} characters"
+        )
+    if not isinstance(answered_by, str) or not answered_by.strip():
+        raise ValueError("answered_by is required")
+    answered_by = answered_by.strip()
+    if len(answered_by) > _RESOLVER_REENTRY_ANSWERED_BY_MAX_CHARS:
+        raise ValueError(
+            f"answered_by exceeds {_RESOLVER_REENTRY_ANSWERED_BY_MAX_CHARS} characters"
+        )
+
+    board = board or _board_slug_for_connection(conn)
+    meta = product_board_metadata(board)
+    if meta is None:
+        raise ValueError("resolver re-entry requires a product board")
+
+    try:
+        with authorized_governance_write(), write_txn(conn):
+            row = conn.execute(
+                "SELECT status, assignee, project_id, workflow_template_id, "
+                "current_step_key, workspace_kind, workspace_path, branch_name, "
+                "running, blocked, current_run_id, block_kind "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown task {task_id}")
+
+            escalation = _latest_resolver_escalation(conn, task_id)
+            if escalation is None:
+                raise TaskSnapshotConflict("resolver re-entry", {})
+            escalation_event_id, escalation_payload, escalation_run_id = escalation
+            if (
+                expected_escalation_event_id is not None
+                and expected_escalation_event_id != escalation_event_id
+            ):
+                raise TaskSnapshotConflict(
+                    "resolver re-entry", {"escalation_event_id": escalation_event_id}
+                )
+
+            resolved = _d4_prior_task_event(conn, task_id, escalation_event_id)
+            resolved_payload = _d4_event_payload(resolved) if resolved is not None else None
+            preflight_event_id = (
+                _d4_positive_event_id(resolved_payload.get("preflight_event_id"))
+                if isinstance(resolved_payload, dict) else None
+            )
+            current = _resolver_escalation_snapshot(
+                row,
+                escalation_event_id=escalation_event_id,
+                preflight_event_id=preflight_event_id,
+                resolver_run_id=escalation_run_id,
+            )
+            if current != expected:
+                raise TaskSnapshotConflict("resolver re-entry", current)
+            if (
+                row["workflow_template_id"] != PRODUCT_WORKFLOW_TEMPLATE_ID
+                or row["status"] != "blocked"
+                or not bool(row["blocked"])
+                or bool(row["running"])
+                or row["current_run_id"] is not None
+                or row["assignee"] != _RESOLVER_ESCALATION_POST_ASSIGNEE
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", current)
+
+            if (
+                resolved is None
+                or resolved["kind"] != "human_input_preflight_resolved"
+                or resolved["run_id"] != escalation_run_id
+                or not isinstance(resolved_payload, dict)
+                or resolved_payload.get("action") != "escalate"
+                or preflight_event_id is None
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "resolved"})
+
+            source = conn.execute(
+                "SELECT id, task_id, kind, payload, run_id FROM task_events "
+                "WHERE id = ? AND task_id = ?",
+                (preflight_event_id, task_id),
+            ).fetchone()
+            source_payload = _d4_event_payload(source) if source is not None else None
+            if (
+                source is None
+                or source["kind"] != PRODUCT_WORKFLOW_PRECHECK_EVENT
+                or not isinstance(source_payload, dict)
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "preflight"})
+            if (
+                "task_id" in source_payload
+                and source_payload["task_id"] != task_id
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "task"})
+
+            run = conn.execute(
+                "SELECT id, task_id, status, outcome, profile, step_key, ended_at "
+                "FROM task_runs WHERE id = ?",
+                (escalation_run_id,),
+            ).fetchone()
+            if (
+                run is None
+                or run["task_id"] != task_id
+                or run["status"] != _RESOLVER_ESCALATION_RUN_STATUS
+                or run["outcome"] != _RESOLVER_ESCALATION_RUN_OUTCOME
+                or run["ended_at"] is None
+                or not isinstance(run["profile"], str)
+                or not run["profile"].strip()
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "run"})
+            resolver_profile = _d4_canonical_assignee(
+                run["profile"], field="resolver_profile"
+            )
+            try:
+                resolver_step = run["step_key"]
+                current_step = row["current_step_key"]
+                if not isinstance(resolver_step, str) or not resolver_step.strip():
+                    raise ValueError
+                if not isinstance(current_step, str) or not current_step.strip():
+                    raise ValueError
+                resolver_step = resolver_step.strip()
+                current_step = current_step.strip()
+            except (TypeError, ValueError) as exc:
+                raise TaskSnapshotConflict(
+                    "resolver re-entry", {"provenance": "step"}
+                ) from exc
+            if resolver_step != current_step:
+                raise TaskSnapshotConflict(
+                    "resolver re-entry",
+                    {"recorded_step": resolver_step, "current_step": current_step},
+                )
+            if source_payload.get("step_key") != resolver_step:
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "source-step"})
+            if source_payload.get("hermes_assignee") != resolver_profile:
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "profile"})
+            source_run_id = source["run_id"]
+            source_run = conn.execute(
+                "SELECT id, task_id, status, outcome, step_key, ended_at FROM task_runs "
+                "WHERE id = ?",
+                (source_run_id,),
+            ).fetchone()
+            if (
+                type(source_run_id) is not int
+                or source_run_id <= 0
+                or source_run is None
+                or source_run["task_id"] != task_id
+                or source_run["status"] != "blocked"
+                or source_run["outcome"] != "preflight"
+                or source_run["ended_at"] is None
+                or source_run["step_key"] != resolver_step
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "source-run"})
+            if resolved_payload.get("resolver_profile") != resolver_profile:
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "resolved-profile"})
+            if resolved_payload.get("step_key") != resolver_step:
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "resolved-step"})
+
+            claimed = conn.execute(
+                "SELECT id FROM task_events "
+                "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+                "ORDER BY id ASC LIMIT 1",
+                (task_id, escalation_run_id),
+            ).fetchone()
+            source_before_claim = conn.execute(
+                "SELECT id FROM task_events "
+                "WHERE task_id = ? AND kind = ? AND id < ? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, PRODUCT_WORKFLOW_PRECHECK_EVENT, claimed["id"] if claimed else -1),
+            ).fetchone()
+            if (
+                claimed is None
+                or source_before_claim is None
+                or int(source_before_claim["id"]) != preflight_event_id
+            ):
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "claim"})
+
+            original_assignee = _d4_original_assignee(
+                meta, row, source_payload, resolver_step
+            )
+            resume_status = _column_status_for_step(meta, resolver_step)
+            if resume_status not in VALID_STATUSES or resume_status in {
+                "running", "blocked", "done", "archived",
+            }:
+                resume_status = "ready"
+
+            updated = conn.execute(
+                "UPDATE tasks SET status = ?, assignee = ?, running = 0, blocked = 0, "
+                "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, block_kind = NULL, block_recurrences = 0 "
+                "WHERE id = ? AND status = 'blocked' AND blocked = 1 AND running = 0 "
+                "AND current_run_id IS NULL AND assignee = ? AND current_step_key = ?",
+                (
+                    resume_status, resolver_profile, task_id,
+                    _RESOLVER_ESCALATION_POST_ASSIGNEE, resolver_step,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise TaskSnapshotConflict("resolver re-entry", current)
+            transition_event_id = _append_event(
+                conn,
+                task_id,
+                PRODUCT_WORKFLOW_PRECHECK_EVENT,
+                {
+                    "reason": _d4_bounded_copied_text(
+                        escalation_payload.get("reason"),
+                        _RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS,
+                    ),
+                    "kind": "resolver_reentry",
+                    "attempted_resolutions": _d4_bounded_attempted_resolutions(
+                        escalation_payload.get("attempted_resolutions")
+                    ),
+                    "original_assignee": original_assignee,
+                    "hermes_assignee": resolver_profile,
+                    "step_key": resolver_step,
+                    "resume_status": resume_status,
+                    "memory_capture_id": secrets.token_hex(16),
+                    "reentry_of_event_id": escalation_event_id,
+                    "resolver_escalation_reason": _d4_bounded_copied_text(
+                        escalation_payload.get("resolution"),
+                        _RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS,
+                    ),
+                    "human_answer": answer,
+                    "answered_by": answered_by,
+                },
+                run_id=escalation_run_id,
+            )
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            raise TaskSnapshotConflict("resolver re-entry", {}) from exc
+        raise
+    return transition_event_id
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
