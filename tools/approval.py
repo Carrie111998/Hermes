@@ -522,6 +522,11 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
+# Pattern to strip leading VAR=value assignments from command segments
+# before deny-rule matching, so that 'VAR=1 git push --force' is caught.
+_LEADING_DENY_ASSIGNMENTS = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
+
+
 def _match_user_deny_rule(command: str) -> str | None:
     """Return the matching ``approvals.deny`` glob, or None.
 
@@ -548,9 +553,17 @@ def _match_user_deny_rule(command: str) -> str | None:
         return None
     for command_variant in _command_detection_variants(command):
         candidate = command_variant.lower().strip()
-        for pattern in globs:
-            if fnmatch.fnmatchcase(candidate, pattern.lower()):
-                return pattern
+        candidates = [candidate]
+        marked = _mark_command_starts(command_variant)
+        if marked != command_variant:
+            candidates.extend(marked.split("\n"))
+        for raw in candidates:
+            stripped = _LEADING_DENY_ASSIGNMENTS.sub("", raw.lower().strip()).lstrip("({ ").strip()
+            if not stripped:
+                continue
+            for pattern in globs:
+                if fnmatch.fnmatchcase(stripped, pattern.lower()):
+                    return pattern
     return None
 
 
