@@ -462,6 +462,8 @@ export interface Translations {
       keepAwakeDesc: string
       attachmentSizeTitle: string
       attachmentSizeDesc: string
+      voiceShortcutHintTitle: string
+      voiceShortcutHintDesc: string
       attachmentSizeUnit: string
       attachmentSizeLabel: string
     }
