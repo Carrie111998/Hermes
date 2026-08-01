@@ -53,9 +53,71 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "jwt",
     "secret",
     "private_key",
+    "credential",
+    "credentials",
+    "client_credentials",
+    "aws_credentials",
+    "registry_config",
     "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "api-key",
+    "auth-token",
+    "cookie",
+    "set-cookie",
+    "session",
     "key",
 })
+
+_SENSITIVE_STRUCTURED_FIELDS = frozenset(
+    {
+        *(name.replace("-", "_") for name in _SENSITIVE_BODY_KEYS),
+        "auth_token",
+        "bearer",
+        "csrf_token",
+        "session_cookie",
+        "session_token",
+        "xsrf_token",
+    }
+)
+_SENSITIVE_STRUCTURED_SUFFIXES = (
+    "_api_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_credential",
+    "_credentials",
+    "_private_key",
+    "_authorization",
+    "_cookie",
+    "_auth",
+    "_auth_key",
+    "_subscription_key",
+    "_registry_config",
+)
+
+
+def is_sensitive_field_name(key: object) -> bool:
+    """Return whether a structured field name unambiguously carries a secret."""
+    try:
+        raw = str(key).strip().replace("-", " ")
+        # Normalize camelCase/PascalCase and separator variants to snake_case:
+        # accessToken, access-token, and access_token are the same field.
+        normalized = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", raw)
+        normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+        normalized = re.sub(r"[\s._]+", "_", normalized).lower()
+        # A bare ``key`` is too ambiguous for arbitrary browser JSON (keyboard
+        # events and public-key metadata use it legitimately). The remaining
+        # exact names unambiguously identify authentication material.
+        return normalized != "key" and (
+            normalized in _SENSITIVE_STRUCTURED_FIELDS
+            or normalized.endswith(_SENSITIVE_STRUCTURED_SUFFIXES)
+        )
+    except Exception:
+        # A non-stringifiable key cannot be classified safely.
+        return True
 
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
 # `export HERMES_REDACT_SECRETS=false`) cannot disable redaction
@@ -260,7 +322,7 @@ def _key_has_secret_keyword(key: str) -> bool:
     return False
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|id_token|auth_token|authorization|bearer|cookie|set-cookie|session|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,
@@ -279,7 +341,15 @@ _JSON_FIELD_RE = re.compile(
 # (unterminated quote → shell EOF / Python SyntaxError). Real credentials never
 # contain ``"`` or ``'``, so excluding them is safe. See #43083.
 _AUTH_HEADER_RE = re.compile(
-    r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)",
+    r"((?:Proxy-)?Authoriz" r"ation:\s*)([A-Za-z][\w.+-]*\s+)?([^\s\"']+)",
+    re.IGNORECASE,
+)
+
+# Cookie headers can contain multiple opaque credentials separated by semicolons.
+# Redact the full header value rather than attempting to classify individual
+# cookie names; session cookies frequently have no recognizable token prefix.
+_COOKIE_HEADER_RE = re.compile(
+    r"((?:Set-)?Cookie:\s*)([^\r\n\"']+)",
     re.IGNORECASE,
 )
 
@@ -772,6 +842,12 @@ def redact_sensitive_text(
             text,
         )
 
+    # Cookie / Set-Cookie headers are authentication material regardless of
+    # cookie name or token shape. Unlike generic token masking, erase the full
+    # value so a replayable session cannot survive in logs or transcripts.
+    if "ookie:" in text or "OOKIE:" in text:
+        text = _COOKIE_HEADER_RE.sub(lambda m: m.group(1) + "***", text)
+
     # API-key style headers (x-api-key, api-key, …). Header values are
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
@@ -914,6 +990,124 @@ def redact_terminal_output(
         return output
     code_file = not is_env_dump_command(command or "")
     return redact_sensitive_text(output, force=force, code_file=code_file)
+
+
+_TOOL_ERROR_REDACTION_FALLBACK = (
+    "Tool error redaction failed; exception details were suppressed."
+)
+
+# Tool failures are diagnostics, not source code: redact whole authentication
+# header lines so parameterized schemes (Digest, AWS signatures) cannot leave
+# replayable nonce/signature fields behind. Split the header literal to prevent
+# the source-code redactor from treating this regex definition as a credential.
+_TOOL_AUTH_HEADER_LINE_RE = re.compile(
+    r"([A-Za-z0-9-]*(?:Auth|Token|Secret|Api-Key|Subscription-Key|Registry-Config)"
+    r"[A-Za-z0-9-]*:\s*)[^\r\n]+",
+    re.IGNORECASE,
+)
+_TOOL_COOKIE_HEADER_LINE_RE = re.compile(
+    r"((?:Set-)?Cookie:\s*)[^\r\n]+",
+    re.IGNORECASE,
+)
+_TOOL_SENSITIVE_REPR_FIELD_RE = re.compile(
+    r"(?P<prefix>['\"][A-Za-z0-9_.-]*(?:api[-_]?key|token|secret|password|passwd|"
+    r"credentials?|private[-_]?key|authorization|auth[-_]?key|auth|jwt|cookie|"
+    r"subscription[-_]?key|registry[-_]?config|session)['\"]\s*:\s*)"
+    r"(?:(?P<quote>['\"])(?P<scalar>.*?)(?P=quote)|"
+    r"(?P<container>\[[^\]\r\n]*\]|\{[^}\r\n]*\}|\([^\)\r\n]*\)))",
+    re.IGNORECASE,
+)
+
+
+def redact_tool_error(error: object) -> str:
+    """Return a fail-closed, force-redacted tool exception string.
+
+    Tool exceptions cross two persistence boundaries: the tool-result message
+    stored in the transcript and the process logs. They must therefore ignore
+    the user-configurable redaction opt-out. If converting or redacting an
+    exception fails, discard its details rather than risk serializing a secret.
+    """
+    try:
+        text = str(error)
+        text = _TOOL_SENSITIVE_REPR_FIELD_RE.sub(
+            lambda m: (
+                f"{m.group('prefix')}{m.group('quote')}***{m.group('quote')}"
+                if m.group("quote")
+                else f"{m.group('prefix')}['***']"
+            ),
+            text,
+        )
+        text = _TOOL_AUTH_HEADER_LINE_RE.sub(lambda m: m.group(1) + "***", text)
+        text = _TOOL_COOKIE_HEADER_LINE_RE.sub(lambda m: m.group(1) + "***", text)
+        return redact_sensitive_text(
+            text,
+            force=True,
+            code_file=False,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return _TOOL_ERROR_REDACTION_FALLBACK
+
+
+def redact_tool_error_value(value: object):
+    """Recursively force-redact a structured tool failure.
+
+    Error envelopes may carry authentication material outside the human-readable
+    ``error`` field (for example in ``headers`` or token metadata). This helper
+    keeps the policy centralized for registry, browser, observer, and transcript
+    boundaries and suppresses the entire value if recursive redaction fails.
+    """
+    return _redact_tool_error_value(value, set())
+
+
+def _redact_tool_error_value(value: object, active_containers: set[int]):
+    """Recursive implementation with cycle detection."""
+    try:
+        if isinstance(value, BaseException):
+            return redact_tool_error(value)
+        if isinstance(value, str):
+            return redact_tool_error(value)
+        if isinstance(value, (list, tuple, dict)):
+            marker = id(value)
+            if marker in active_containers:
+                return _TOOL_ERROR_REDACTION_FALLBACK
+            active_containers.add(marker)
+            try:
+                if isinstance(value, list):
+                    return [
+                        _redact_tool_error_value(item, active_containers)
+                        for item in value
+                    ]
+                if isinstance(value, tuple):
+                    return tuple(
+                        _redact_tool_error_value(item, active_containers)
+                        for item in value
+                    )
+                redacted = {}
+                for key, item in value.items():
+                    safe_key = (
+                        redact_tool_error(key)
+                        if isinstance(key, str)
+                        else key
+                        if key is None or isinstance(key, (int, float, bool))
+                        else "[REDACTED_KEY]"
+                    )
+                    redacted[safe_key] = (
+                        "***"
+                        if is_sensitive_field_name(key)
+                        else _redact_tool_error_value(item, active_containers)
+                    )
+                return redacted
+            finally:
+                active_containers.remove(marker)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        # Unknown objects have no trustworthy field name or serialization
+        # contract. Suppress them rather than risk an opaque credential from a
+        # custom ``__str__`` implementation.
+        return _TOOL_ERROR_REDACTION_FALLBACK
+    except Exception:
+        return _TOOL_ERROR_REDACTION_FALLBACK
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in

@@ -19,6 +19,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from agent.redact import redact_tool_error
 from tools.browser_supervisor import SUPERVISOR_REGISTRY
 from tools.registry import registry
 
@@ -128,7 +129,10 @@ def _browser_dialog_check() -> bool:
     try:
         from tools.browser_cdp_tool import _browser_cdp_check  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("browser_dialog check: browser_cdp_tool import failed: %s", exc)
+        logger.debug(
+            "browser_dialog check: browser_cdp_tool import failed: %s",
+            redact_tool_error(exc),
+        )
         return False
     return _browser_cdp_check()
 

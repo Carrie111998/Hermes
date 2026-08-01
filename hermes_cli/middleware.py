@@ -301,11 +301,13 @@ def _run_execution_chain(
         except _DownstreamExecutionError as exc:
             raise exc.original
         except Exception as exc:
+            from agent.redact import redact_tool_error
+
             logger.warning(
                 "Middleware '%s' callback %s raised: %s",
                 kind,
-                getattr(callback, "__name__", repr(callback)),
-                exc,
+                redact_tool_error(getattr(callback, "__name__", callback)),
+                redact_tool_error(exc),
             )
             if next_succeeded:
                 return next_result

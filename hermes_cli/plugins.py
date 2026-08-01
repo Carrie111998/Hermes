@@ -1937,11 +1937,13 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                from agent.redact import redact_tool_error
+
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
+                    redact_tool_error(getattr(cb, "__name__", cb)),
+                    redact_tool_error(exc),
                 )
         return results
 
@@ -1968,11 +1970,13 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                from agent.redact import redact_tool_error
+
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
                     kind,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
+                    redact_tool_error(getattr(cb, "__name__", cb)),
+                    redact_tool_error(exc),
                 )
         return results
 

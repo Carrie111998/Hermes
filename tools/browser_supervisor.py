@@ -50,9 +50,9 @@ def _redact_cdp_error_text(exc: object) -> str:
     fixed sentinel if redaction itself raises, erring toward masking.
     """
     try:
-        from agent.redact import redact_cdp_url
+        from agent.redact import redact_tool_error
 
-        return redact_cdp_url(str(exc))
+        return redact_tool_error(exc)
     except Exception:
         return "<error redacted>"
 
@@ -622,7 +622,11 @@ class CDPSupervisor:
                 self._start_error = e
                 self._ready_event.set()
             else:
-                logger.warning("CDP supervisor %s crashed: %s", self.task_id, e)
+                logger.warning(
+                    "CDP supervisor %s crashed: %s",
+                    self.task_id,
+                    _redact_cdp_error_text(e),
+                )
         finally:
             # Flush any remaining tasks before closing the loop so we don't
             # emit "Task was destroyed but it is pending" warnings.
@@ -791,7 +795,8 @@ class CDPSupervisor:
         except Exception as e:
             logger.debug(
                 "dialog bridge: addScriptToEvaluateOnNewDocument failed on sid=%s: %s",
-                (session_id or "")[:16], e,
+                (session_id or "")[:16],
+                _redact_cdp_error_text(e),
             )
         try:
             await self._cdp(
@@ -811,7 +816,8 @@ class CDPSupervisor:
         except Exception as e:
             logger.debug(
                 "dialog bridge: Fetch.enable failed on sid=%s: %s",
-                (session_id or "")[:16], e,
+                (session_id or "")[:16],
+                _redact_cdp_error_text(e),
             )
         # Also try to inject into the already-loaded document so existing
         # pages pick up the override on reconnect. Best-effort.
@@ -875,7 +881,7 @@ class CDPSupervisor:
                 elif "method" in msg:
                     await self._on_event(msg["method"], msg.get("params", {}), msg.get("sessionId"))
         except Exception as e:
-            logger.debug("CDP read loop exited: %s", e)
+            logger.debug("CDP read loop exited: %s", _redact_cdp_error_text(e))
 
     # ── Event dispatch ──────────────────────────────────────────────────────
 
@@ -964,7 +970,11 @@ class CDPSupervisor:
                 timeout=5.0,
             )
         except Exception as e:
-            logger.debug("auto-handle CDP call failed for %s: %s", dialog.id, e)
+            logger.debug(
+                "auto-handle CDP call failed for %s: %s",
+                dialog.id,
+                _redact_cdp_error_text(e),
+            )
 
     async def _dialog_timeout_expired(self, dialog_id: str) -> None:
         with self._state_lock:
@@ -996,7 +1006,11 @@ class CDPSupervisor:
                     timeout=5.0,
                 )
         except Exception as e:
-            logger.debug("auto-dismiss failed for %s: %s", dialog_id, e)
+            logger.debug(
+                "auto-dismiss failed for %s: %s",
+                dialog_id,
+                _redact_cdp_error_text(e),
+            )
 
     def _archive_dialog_locked(self, dialog: PendingDialog, closed_by: str) -> None:
         """Move a pending dialog to the recent_dialogs ring buffer. Must hold state_lock."""
@@ -1194,7 +1208,11 @@ class CDPSupervisor:
                 timeout=5.0,
             )
         except Exception as e:
-            logger.debug("bridge fulfill failed for %s: %s", dialog.id, e)
+            logger.debug(
+                "bridge fulfill failed for %s: %s",
+                dialog.id,
+                _redact_cdp_error_text(e),
+            )
 
     # ── Frame / target tracking ─────────────────────────────────────────────
 
@@ -1315,7 +1333,11 @@ class CDPSupervisor:
                 timeout=3.0,
             )
         except Exception as e:
-            logger.debug("child session %s setup failed: %s", sid[:16], e)
+            logger.debug(
+                "child session %s setup failed: %s",
+                sid[:16],
+                _redact_cdp_error_text(e),
+            )
         # Install the dialog bridge on the child so iframe dialogs are captured.
         await self._install_dialog_bridge(sid)
 

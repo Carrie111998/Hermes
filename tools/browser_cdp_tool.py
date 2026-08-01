@@ -22,6 +22,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from agent.redact import redact_tool_error
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -44,17 +45,9 @@ _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
 
 def _redact_cdp_output(value: Any) -> Any:
     """Redact browser-originated CDP result data before returning it."""
-    from agent.redact import redact_sensitive_text
+    from agent.redact import redact_tool_error_value
 
-    if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, list):
-        return [_redact_cdp_output(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_cdp_output(item) for item in value)
-    if isinstance(value, dict):
-        return {key: _redact_cdp_output(item) for key, item in value.items()}
-    return value
+    return redact_tool_error_value(value)
 
 # ``websockets`` is a direct hermes-agent dependency because the browser CDP
 # supervisor and browser_dialog tool import it during tool discovery. Wrap the
@@ -110,7 +103,10 @@ def _resolve_cdp_endpoint() -> str:
 
         return (_get_cdp_override() or "").strip()
     except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("browser_cdp: failed to resolve CDP endpoint: %s", exc)
+        logger.debug(
+            "browser_cdp: failed to resolve CDP endpoint: %s",
+            redact_tool_error(exc),
+        )
         return ""
 
 
@@ -176,7 +172,10 @@ def _browser_cdp_private_guard(
     except Exception as exc:  # noqa: BLE001
         # Match the existing browser guards' posture: guard probes are
         # best-effort and should not break local/custom CDP workflows.
-        logger.debug("browser_cdp: private-page guard probe failed: %s", exc)
+        logger.debug(
+            "browser_cdp: private-page guard probe failed: %s",
+            redact_tool_error(exc),
+        )
     return None
 
 
@@ -515,7 +514,7 @@ def browser_cdp(
             method=method,
         )
     except Exception as exc:  # pragma: no cover — unexpected
-        logger.exception("browser_cdp unexpected error")
+        logger.error("browser_cdp unexpected error: %s", redact_tool_error(exc))
         return tool_error(
             f"Unexpected error: {type(exc).__name__}: {exc}",
             method=method,
@@ -657,7 +656,10 @@ def _browser_cdp_check() -> bool:
             check_browser_requirements,
         )
     except ImportError as exc:  # pragma: no cover — defensive
-        logger.debug("browser_cdp check: browser_tool import failed: %s", exc)
+        logger.debug(
+            "browser_cdp check: browser_tool import failed: %s",
+            redact_tool_error(exc),
+        )
         return False
     if not check_browser_requirements():
         return False

@@ -53,6 +53,13 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _safe_tool_exception(prefix: str, error: object) -> str:
+    """Format a tool exception for transcript/log persistence without secrets."""
+    from agent.redact import redact_tool_error
+
+    return f"{prefix}: {redact_tool_error(error)}"
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -869,8 +876,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 return
             except Exception as tool_error:
-                result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+                result = _safe_tool_exception(
+                    f"Error executing tool '{function_name}'", tool_error
+                )
+                logger.error("_invoke_tool failed for %s: %s", function_name, result)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
@@ -1613,8 +1622,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
                 _ce_result = function_result
             except Exception as tool_error:
-                function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
-                logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _safe_tool_exception(
+                    f"Context engine tool '{function_name}' failed", tool_error
+                )
+                function_result = json.dumps({"error": safe_error})
+                logger.error(
+                    "context_engine.handle_tool_call failed for %s: %s",
+                    function_name,
+                    safe_error,
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
@@ -1649,8 +1665,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 ))
                 _mem_result = function_result
             except Exception as tool_error:
-                function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
-                logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                safe_error = _safe_tool_exception(
+                    f"Memory tool '{function_name}' failed", tool_error
+                )
+                function_result = json.dumps({"error": safe_error})
+                logger.error(
+                    "memory_manager.handle_tool_call failed for %s: %s",
+                    function_name,
+                    safe_error,
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
@@ -1728,8 +1751,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     pass
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                function_result = _safe_tool_exception(
+                    f"Error executing tool '{function_name}'", tool_error
+                )
+                logger.error(
+                    "handle_function_call failed for %s: %s",
+                    function_name,
+                    function_result,
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
@@ -1796,8 +1825,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     pass
                 raise
             except Exception as tool_error:
-                function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                function_result = _safe_tool_exception(
+                    f"Error executing tool '{function_name}'", tool_error
+                )
+                logger.error(
+                    "handle_function_call failed for %s: %s",
+                    function_name,
+                    function_result,
+                )
             tool_duration = time.time() - tool_start_time
 
         if isinstance(function_result, str):

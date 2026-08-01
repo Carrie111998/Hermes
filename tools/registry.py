@@ -653,7 +653,29 @@ class ToolRegistry:
         persistence from receiving values they cannot safely slice or size.
         """
         if isinstance(result, str):
-            return result
+            try:
+                parsed = json.loads(result)
+            except (TypeError, ValueError):
+                return result
+            if not isinstance(parsed, dict) or "error" not in parsed:
+                return result
+            try:
+                from agent.redact import redact_tool_error_value
+
+                parsed = redact_tool_error_value(parsed)
+            except Exception:
+                # A structured failure is diagnostic-only. If its error field
+                # cannot be sanitized, discard the payload instead of returning
+                # authentication material to hooks, transcripts, or logs.
+                return json.dumps(
+                    {
+                        "error": "Tool error redaction failed; details were suppressed.",
+                        "error_type": "redaction_failure",
+                        "tool": name,
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(parsed, ensure_ascii=False)
         if (
             isinstance(result, dict)
             and result.get("_multimodal") is True
@@ -694,16 +716,21 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
-            logger.exception("Tool %s dispatch error: %s", name, e)
-            # Route through the sanitizer so framing tokens / CDATA / fences
-            # in exception strings don't reach the model as structural noise.
-            # See model_tools._sanitize_tool_error for rationale.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+            # Sanitize before both logging and serialization. Never attach
+            # exc_info here: traceback exception lines repeat the raw message.
             try:
+                from agent.redact import redact_tool_error
                 from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(raw)
+
+                safe_detail = redact_tool_error(e)
+                sanitized = _sanitize_tool_error(
+                    f"Tool execution failed: {type(e).__name__}: {safe_detail}"
+                )
             except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
+                sanitized = (
+                    "[TOOL_ERROR] Tool error redaction failed; details were suppressed."
+                )
+            logger.error("Tool %s dispatch error: %s", name, sanitized)
             return tool_error(sanitized)
 
     # ------------------------------------------------------------------
@@ -852,9 +879,15 @@ def tool_error(message, **extra) -> str:
     >>> tool_error("bad input", success=False)
     '{"error": "bad input", "success": false}'
     """
-    result = {"error": str(message)}
-    if extra:
-        result.update(extra)
+    try:
+        from agent.redact import redact_tool_error_value
+
+        result = {"error": message}
+        if extra:
+            result.update(extra)
+        result = redact_tool_error_value(result)
+    except Exception:
+        result = {"error": "Tool error redaction failed; details were suppressed."}
     return json.dumps(result, ensure_ascii=False)
 
 

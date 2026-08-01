@@ -687,15 +687,43 @@ def _sanitize_tool_error(error_msg: str) -> str:
 
     See _TOOL_ERROR_ROLE_TAG_RE docstring above for rationale.
     """
+    from agent.redact import redact_tool_error
+
     if not error_msg:
         return "[TOOL_ERROR] "
-    sanitized = _TOOL_ERROR_ROLE_TAG_RE.sub("", error_msg)
+    sanitized = redact_tool_error(error_msg)
+    sanitized = _TOOL_ERROR_ROLE_TAG_RE.sub("", sanitized)
     sanitized = _TOOL_ERROR_FENCE_OPEN_RE.sub("", sanitized)
     sanitized = _TOOL_ERROR_FENCE_CLOSE_RE.sub("", sanitized)
     sanitized = _TOOL_ERROR_CDATA_RE.sub("", sanitized)
     if len(sanitized) > _TOOL_ERROR_MAX_LEN:
         sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
     return f"[TOOL_ERROR] {sanitized}"
+
+
+def _sanitize_browser_tool_result(result: Any) -> Any:
+    """Force-redact a browser result before observers or transcript storage."""
+    from agent.redact import redact_tool_error_value
+
+    try:
+        was_string = isinstance(result, str)
+        if was_string:
+            try:
+                parsed = json.loads(result)
+            except (TypeError, ValueError):
+                return redact_tool_error_value(result)
+        else:
+            parsed = result
+        redacted = redact_tool_error_value(parsed)
+        return json.dumps(redacted, ensure_ascii=False) if was_string else redacted
+    except Exception:
+        return json.dumps(
+            {
+                "error": "Tool error redaction failed; details were suppressed.",
+                "error_type": "redaction_failure",
+            },
+            ensure_ascii=False,
+        )
 
 
 # =========================================================================
@@ -1078,7 +1106,12 @@ def _emit_post_tool_call_hook(
             middleware_trace=list(middleware_trace or []),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        from agent.redact import redact_tool_error
+
+        logger.debug(
+            "post_tool_call hook error: %s",
+            redact_tool_error(_hook_err),
+        )
 
 
 def handle_function_call(
@@ -1225,7 +1258,12 @@ def handle_function_call(
             _tool_original_args = _tool_request_mw.original_payload
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
-            logger.debug("tool_request middleware error: %s", _mw_err)
+            from agent.redact import redact_tool_error
+
+            logger.debug(
+                "tool_request middleware error: %s",
+                redact_tool_error(_mw_err),
+            )
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -1257,7 +1295,12 @@ def handle_function_call(
                     middleware_trace=list(_tool_middleware_trace),
                 )
             except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
+                from agent.redact import redact_tool_error
+
+                logger.debug(
+                    "pre_tool_call hook error: %s",
+                    redact_tool_error(_hook_err),
+                )
 
             if block_message is not None:
                 result = tool_error(block_message)
@@ -1287,7 +1330,12 @@ def handle_function_call(
             if edit_block_message is not None:
                 return edit_block_message
         except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
+            from agent.redact import redact_tool_error
+
+            logger.debug(
+                "ACP edit approval guard error: %s",
+                redact_tool_error(_edit_approval_err),
+            )
             if function_name in {"write_file", "patch"}:
                 return tool_error("Edit approval denied: approval guard failed")
 
@@ -1362,6 +1410,8 @@ def handle_function_call(
                     reset_current_observability_context(_approval_tokens)
                 except Exception:
                     pass
+        if function_name.startswith("browser_"):
+            result = _sanitize_browser_tool_result(result)
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
         _emit_post_tool_call_hook(
@@ -1409,13 +1459,34 @@ def handle_function_call(
                         result = hook_result
                         break
         except Exception as _hook_err:
-            logger.debug("transform_tool_result hook error: %s", _hook_err)
+            from agent.redact import redact_tool_error
+
+            logger.debug(
+                "transform_tool_result hook error: %s",
+                redact_tool_error(_hook_err),
+            )
+
+        # A plugin transform is the last mutation seam before transcript
+        # serialization. Re-apply the mandatory browser boundary so a plugin
+        # cannot accidentally reintroduce authentication material after the
+        # registry and post-tool observer received a safe result.
+        if function_name.startswith("browser_"):
+            result = _sanitize_browser_tool_result(result)
 
         return result
 
     except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
+        from agent.redact import redact_tool_error
+
+        # Redact the exception object before interpolation: even a broken
+        # ``__str__`` implementation must fail closed rather than escape this
+        # handler or expose its underlying fields.
+        safe_detail = redact_tool_error(e)
+        error_msg = f"Error executing {function_name}: {safe_detail}"
+        safe_error = _sanitize_tool_error(error_msg)
+        # Never attach exc_info here: exception messages are included in the
+        # traceback and can contain browser Authorization/cookie material.
+        logger.error("Tool execution failed for %s: %s", function_name, safe_error)
         return tool_error(_sanitize_tool_error(error_msg))
 
 
