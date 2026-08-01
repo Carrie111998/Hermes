@@ -67,6 +67,7 @@ export function findGitBash(opts: GitBashOptions): string | null {
 
   candidates.push(joinWin(programFiles, 'Git', 'bin', exe))
   candidates.push(joinWin(programFiles, 'Git', 'cmd', exe))
+  candidates.push(joinWin(programFilesX86, 'Git', 'bin', exe))
   candidates.push(joinWin(programFilesX86, 'Git', 'cmd', exe))
 
   if (localAppData) {
