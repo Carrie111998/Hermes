@@ -65,7 +65,7 @@ def _dev_template(user_id: str, repo: str = ".") -> list[dict]:
 
 def _trader_template(user_id: str) -> list[dict]:
     return [
-        new_component("table", "Prices", 4, 2,
+        new_component("table", "Prices", 4, 3,
                       {"source": "crypto.price",
                        "query": {"coins": "bitcoin,ethereum,solana,dogecoin"}}, "tr-prices"),
         new_component("timeseries", "BTC 7d", 4, 2,
