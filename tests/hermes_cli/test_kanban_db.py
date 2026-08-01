@@ -1585,7 +1585,7 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     conn.close()  # explicit close to avoid leaking THIS test
 
 
-def test_dispatch_spawn_gate_defers_and_spawns(kanban_home):
+def test_dispatch_spawn_gate_defers_and_spawns(kanban_home, all_assignees_spawnable):
     """``spawn_gate`` returning {"action": "defer"} leaves the task ready
     (recorded in ``DispatchResult.deferred_by_gate``) without claiming it;
     ungated tasks spawn normally. A crashing gate is fail-open."""
@@ -1628,7 +1628,7 @@ def test_dispatch_spawn_gate_defers_and_spawns(kanban_home):
         assert not res2.deferred_by_gate
 
 
-def test_dispatch_spawn_gate_payload_contract(kanban_home):
+def test_dispatch_spawn_gate_payload_contract(kanban_home, all_assignees_spawnable):
     """The dict handed to ``spawn_gate`` carries exactly the documented
     public ``kanban_pre_spawn`` payload: id, title, assignee, priority,
     status, tenant, created_by, created_at, workspace_kind, workspace_path,
