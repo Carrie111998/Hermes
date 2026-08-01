@@ -3559,6 +3559,18 @@ def resolve_product_preflight(
                 normalized_repair["adopt_handoff_sha"] = adopted_sha
                 repair_before["adopt_handoff_sha"] = None
                 repair_after["adopt_handoff_sha"] = adopted_sha
+            _validate_resolver_cas_fields(
+                {
+                    "status": next_status,
+                    "assignee": ordinary_assignee,
+                    "project_id": project_id,
+                    "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+                    "current_step_key": phase,
+                    "workspace_kind": workspace_kind,
+                    "workspace_path": workspace_path,
+                    "branch_name": branch_name,
+                }
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status=?, assignee=?, project_id=?, "
                 "workspace_kind=?, workspace_path=?, branch_name=?, "

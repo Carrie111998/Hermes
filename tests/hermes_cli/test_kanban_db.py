@@ -1173,6 +1173,69 @@ def test_resolve_product_preflight_rejects_preflight_routed_to_other_profile(
         assert _resolver_state(conn, tid) == before
 
 
+def test_resolver_repair_rejects_overbound_governed_assignee_atomically(kanban_home):
+    board = "resolver-repair-assignee-bound"
+    _v2_product_board(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {}).setdefault("assignees", {})["developer"] = "D" * 300
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"phase": "development"}},
+        )
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="assignee"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=request,
+                resolver_profile="resolver",
+                resolver_model="test-model",
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_resolver_repair_rejects_overbound_derived_workspace_path_atomically(
+    kanban_home, tmp_path
+):
+    from hermes_cli import projects_db as pdb
+
+    board = "resolver-repair-workspace-bound"
+    _v2_product_board(board)
+    long_primary_path = str(tmp_path / ("p" * 4100))
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Long Resolver Project",
+            primary_path=long_primary_path,
+            board_slug=board,
+        )
+
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"project_id": project_id}},
+        )
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="workspace_path"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=request,
+                resolver_profile="resolver",
+                resolver_model="test-model",
+            )
+        assert _resolver_state(conn, tid) == before
+
+
 def test_resolver_workflow_repair_is_atomic_and_returns_to_ordinary_role(kanban_home):
     board = "resolver-workflow-repair"
     _v2_product_board(board)
