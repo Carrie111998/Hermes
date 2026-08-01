@@ -693,6 +693,107 @@ class TestSearchSessions:
         assert page1[0]["id"] != page2[0]["id"]
 
 
+    # Pre-fix SQL form: LEFT JOIN over a derived-table aggregate of the
+    # ENTIRE messages table. Kept here as the parity reference.
+    _OLD_SQL = (
+        "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
+        "FROM sessions s "
+        "LEFT JOIN ("
+        "SELECT session_id, MAX(timestamp) AS last_active "
+        "FROM messages GROUP BY session_id"
+        ") m ON m.session_id = s.id "
+    )
+
+    def _seed_mru(self, db):
+        """Three sessions with distinct activity; s2 has NO messages
+        (exercises the COALESCE-to-started_at path)."""
+        import time as _time
+        now = _time.time()
+        for sid, age in (("s1", 300), ("s2", 200), ("s3", 100)):
+            db.create_session(session_id=sid, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - age, sid),
+            )
+        db.append_message("s1", role="user", content="old msg")
+        db._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+            (now - 50, "s1"),
+        )
+        db.append_message("s3", role="user", content="newest msg")
+        db._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+            (now - 10, "s3"),
+        )
+        db._conn.commit()
+        return now
+
+    def test_last_active_ordering_and_fallback(self, db):
+        """Behavioral: MRU order by last message, sessions without
+        messages fall back to started_at."""
+        now = self._seed_mru(db)
+        sessions = db.search_sessions()
+        order = [s["id"] for s in sessions]
+        assert order[0] == "s3"                       # newest message
+        assert sessions[0]["last_active"] == now - 10
+        # s2 (no messages, started_at=now-200) vs s1 (msg at now-50):
+        assert order[1:] == ["s1", "s2"]
+        s2 = [s for s in sessions if s["id"] == "s2"][0]
+        assert s2["last_active"] == s2["started_at"]  # COALESCE fallback
+
+    def test_results_parity_with_prefix_join_form(self, db):
+        """The correlated-subquery form must return byte-identical rows
+        to the pre-fix derived-table aggregate — unfiltered, filtered,
+        and paginated."""
+        self._seed_mru(db)
+        for kwargs in ({}, {"source": "cli"}, {"limit": 2}, {"limit": 1, "offset": 1}):
+            new_rows = db.search_sessions(**kwargs)
+            where = " WHERE s.source = ?" if kwargs.get("source") else ""
+            params = (["cli"] if kwargs.get("source") else [])
+            limit = kwargs.get("limit", 20)
+            offset = kwargs.get("offset", 0)
+            old_rows = [dict(r) for r in db._conn.execute(
+                f"{self._OLD_SQL}{where} "
+                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC "
+                "LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()]
+            assert [dict(r) for r in new_rows] == old_rows
+
+    def test_search_sessions_bounded_work(self, db):
+        """Perf contract: search_sessions must not scan the whole messages
+        table to compute last_active. Measured behaviorally — SQLite
+        progress-handler step counts for the real method on a seeded DB —
+        not via EXPLAIN plan text (behavior contracts over snapshots,
+        AGENTS.md). Calibrated on this seed (50 sessions / 5000 messages):
+        pre-fix aggregate = 601 handler calls, correlated subquery = 43.
+        Threshold 300: 7x headroom above the fix, 2x below the pre-fix.
+        Same accepted pattern as the json.loads call-count test in
+        tests/agent/test_canon_args_memo_parity.py."""
+        import time as _time
+        now = _time.time()
+        for i in range(50):
+            db.create_session(session_id=f"s{i}", source="cli")
+        for i in range(5000):
+            db.append_message(f"s{(i * 37) % 50}",
+                              role="user" if i % 2 else "assistant",
+                              content=f"msg {i}")
+        steps = [0]
+
+        def progress():
+            steps[0] += 1
+            return 0
+
+        db._conn.set_progress_handler(progress, 100)
+        try:
+            db.search_sessions(limit=20)
+        finally:
+            db._conn.set_progress_handler(None, 0)
+        assert steps[0] < 300, (
+            f"search_sessions executed {steps[0]}x100 VM steps — the "
+            "whole-messages-table aggregate is back")
+
+
 # =========================================================================
 # Counts
 # =========================================================================
