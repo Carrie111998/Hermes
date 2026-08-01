@@ -146,6 +146,19 @@ def _is_ancestor_pid(pid: int) -> bool:
     parent chain. This heals the fleet of staged ``hermes-setup`` binaries
     that predate the HANDOFF_PID_ENV export and can never send it.
 
+    On Windows the staged ``hermes-setup.exe`` sits behind a ``hermes.exe``
+    launcher shim (``venv\\Scripts\\hermes.exe``), so the direct parent
+    (``os.getppid()``) points at the shim, not the lock owner.  A full
+    ``psutil`` walk is needed to bridge that extra process level.  When
+    ``psutil`` is unavailable we fall back to the direct-parent check — it
+    will miss the shimmed case but still covers the common POSIX topology
+    where the updater is the immediate parent.
+
+    Only the nearest *3* ancestors are inspected: the expected chain is
+    ``hermes-setup.exe → hermes.exe → python.exe`` (length 2 on Windows,
+    1 on POSIX).  A deeper match would be an unrelated process that reused
+    the pid, not our orchestrator.
+
     Never includes our own pid, and any failure counts as "not an ancestor":
     an unprovable ancestry must fall back to the normal refusal.
     """
@@ -154,7 +167,20 @@ def _is_ancestor_pid(pid: int) -> bool:
     try:
         import psutil
 
-        return any(parent.pid == pid for parent in psutil.Process().parents())
+        for i, parent in enumerate(psutil.Process().parents()):
+            if i >= 3:
+                break
+            if parent.pid == pid:
+                return True
+        return False
+    except ImportError:
+        # psutil not installed — fall back to the direct parent check.
+        # Covers POSIX (updater is the immediate parent) but will miss the
+        # Windows shimmed topology.  Still strictly better than giving up.
+        try:
+            return pid == os.getppid()
+        except Exception:
+            return False
     except Exception as exc:
         logger.debug("Could not walk process ancestry for pid %s: %s", pid, exc)
         return False
@@ -241,10 +267,18 @@ class UpdateLock:
         rather than refusing or re-writing the marker, and ``release`` leaves
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
+
+        When the explicit handoff PID is present but *wrong* (doesn't match
+        the live marker), we reject immediately — a stale or forged env var
+        must not fall through to the ancestor check.  Only when the env var
+        is absent does the legacy ancestry bridge activate.
         """
         existing = read_live_update(path=self.path)
         if existing is not None:
-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+            handoff_pid = _handoff_pid()
+            if handoff_pid is not None and existing.pid == handoff_pid:
+                return True
+            if handoff_pid is None and _is_ancestor_pid(existing.pid):
                 return True
             self.holder = existing
             return False
