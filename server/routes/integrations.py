@@ -87,6 +87,7 @@ def email_integrations(request: Request, principal: Principal = Depends(current_
 def connect_google(request: Request, body: IntegrationConnect | None = None,
                    principal: Principal = Depends(current_principal),
                    x_company_id: str | None = Header(default=None)):
+    _scope(principal, x_company_id)
     _oauth_connect_required("google")
 
 
@@ -94,6 +95,7 @@ def connect_google(request: Request, body: IntegrationConnect | None = None,
 def connect_microsoft(request: Request, body: IntegrationConnect | None = None,
                       principal: Principal = Depends(current_principal),
                       x_company_id: str | None = Header(default=None)):
+    _scope(principal, x_company_id)
     _oauth_connect_required("microsoft")
 
 

@@ -72,6 +72,52 @@ def test_legacy_direct_connect_requires_oauth_and_creates_no_integration(provide
     ) is None
 
 
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+def test_legacy_direct_connect_requires_company_for_admin(provider):
+    _app, client = _configured_client()
+    admin_headers, _headers, _company_id = chat_tenant(client)
+
+    res = client.post(
+        f"/api/v1/integrations/email/connect/{provider}",
+        headers=admin_headers,
+    )
+
+    assert res.status_code == 400
+
+
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+def test_legacy_direct_connect_rejects_cross_company_user(provider):
+    _app, client = _configured_client()
+    admin_headers, company_a_headers, _company_a_id = chat_tenant(client, "Tenant A")
+    company_b = client.post(
+        "/api/v1/admin/companies",
+        headers=admin_headers,
+        json={"name": "Tenant B"},
+    ).json()
+    user = client.post(
+        "/api/v1/admin/users",
+        headers=company_a_headers,
+        json={
+            "email": "sales@tenant-a.test",
+            "password": "another-secure-password",
+            "role": "customer",
+            "company_id": company_a_headers["X-Company-ID"],
+        },
+    ).json()
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": user["email"], "password": "another-secure-password"},
+    ).json()
+
+    res = client.post(
+        f"/api/v1/integrations/email/connect/{provider}",
+        headers={"Authorization": f"Bearer {login['access_token']}",
+                 "X-Company-ID": company_b["id"]},
+    )
+
+    assert res.status_code == 403
+
+
 def _callback(client, provider: str, state: str, **query):
     params = {"state": state, **query}
     return client.get(
