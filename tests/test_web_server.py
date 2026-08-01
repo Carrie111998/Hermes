@@ -191,6 +191,33 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     )
 
 
+def test_start_server_bounded_graceful_shutdown_timeout(monkeypatch):
+    """On Desktop quit, Electron sends a single SIGTERM to the hermes serve
+    backend. Without ``timeout_graceful_shutdown``, uvicorn defaults to
+    ``None`` (unbounded) and ``Server.shutdown()`` does
+    ``asyncio.wait_for(..., timeout=None)`` — waiting forever on a lingering
+    ASGI task and producing an orphaned process (#76244).
+
+    Assert that the graceful-shutdown timeout is always set to a finite value
+    (≤ 3s is comfortably under the desktop's 5s SIGKILL budget).
+    """
+    captured = _stub_uvicorn(monkeypatch)
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert "timeout_graceful_shutdown" in captured, (
+        "start_server must pass timeout_graceful_shutdown to uvicorn.Config "
+        "to avoid unbounded waits on SIGTERM"
+    )
+    timeout = captured["timeout_graceful_shutdown"]
+    assert timeout is not None and timeout > 0, (
+        f"timeout_graceful_shutdown must be a positive number, got {timeout}"
+    )
+    assert timeout <= 5, (
+        f"timeout_graceful_shutdown={timeout} is too high for the desktop's "
+        "5s SIGKILL budget; recommend ≤3s"
+    )
+
+
 def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     """POSIX behavior must be byte-for-byte unchanged: serve via the plain
     ``asyncio.run(_serve())`` path, never the Windows loop-factory branch.

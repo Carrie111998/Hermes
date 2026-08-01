@@ -20226,6 +20226,13 @@ def start_server(
         # reaped via the WebSocketDisconnect → disconnect/reap path.
         ws_ping_interval=None if _is_loopback else 20.0,
         ws_ping_timeout=None if _is_loopback else 20.0,
+        # (#76244) Bounded graceful-shutdown window. Without this,
+        # uvicorn.Server.shutdown() does asyncio.wait_for(..., timeout=None)
+        # which waits forever on a lingering ASGI task. Electron Desktop
+        # sends a single SIGTERM on quit; uvicorn only force-exits on a
+        # second SIGINT. 3s is comfortably under the desktop's 5s SIGKILL
+        # budget while letting lifespan shutdown + cron_stop.set() run.
+        timeout_graceful_shutdown=3,
     )
     server = uvicorn.Server(config)
 
