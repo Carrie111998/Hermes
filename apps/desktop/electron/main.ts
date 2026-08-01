@@ -1726,7 +1726,7 @@ function directoryExists(filePath) {
 // How long we'll park the launch waiting for a live update to finish before
 // giving up and starting the backend anyway (belt-and-suspenders alongside the
 // marker's own age ceiling; covers a stuck-but-alive updater).
-const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
+const UPDATE_WAIT_TIMEOUT_MS = 5 * 60 * 1000
 const UPDATE_WAIT_POLL_MS = 1000
 // How long the desktop lingers on the "updating, don't reopen" overlay after
 // spawning the detached updater, before it quits to release the venv shim. The

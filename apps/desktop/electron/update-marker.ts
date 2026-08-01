@@ -24,10 +24,12 @@ import fs from 'fs'
 import path from 'path'
 
 // Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
-export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+// update. A full update (git pull + pip + desktop rebuild) is typically 2-4
+// minutes; 5 minutes is generous while still self-healing quickly when a marker
+// is stranded by a Windows file-lock (ERROR_SHARING_VIOLATION) combined with
+// PID recycling.  The previous 20-minute ceiling left users blocked for the
+// full duration when `complete()` failed to `DeleteFileW`.
+export const UPDATE_MARKER_MAX_AGE_MS = 5 * 60 * 1000
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')

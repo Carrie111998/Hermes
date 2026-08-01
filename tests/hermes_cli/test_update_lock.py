@@ -224,3 +224,73 @@ class TestHandoffFromOrchestratingUpdater:
         assert lock.acquire() is True
         assert lock.acquired is True
         assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+
+
+class TestReleaseRetry:
+    """release() retries unlink on Windows file-lock contention."""
+
+    def test_release_retries_unlink_on_transient_failure(self, marker, monkeypatch):
+        """If unlink fails the first time but succeeds on retry, the marker is removed."""
+        import time as _time
+
+        lock = UpdateLock(path=marker)
+        lock.acquire()
+        assert marker.exists()
+
+        call_count = {"n": 0}
+        original_unlink = type(marker).unlink
+
+        def flaky_unlink(self_path, *args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OSError(32, "Sharing violation")  # WinError 32
+            return original_unlink(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(type(marker), "unlink", flaky_unlink)
+        # Speed up the test by patching sleep to a no-op
+        monkeypatch.setattr(_time, "sleep", lambda _: None)
+
+        lock.release()
+
+        assert call_count["n"] == 2, "should retry after transient failure"
+        assert not marker.exists(), "marker removed after successful retry"
+
+    def test_release_force_deletes_unreadable_marker(self, marker, monkeypatch):
+        """If the marker can't be read (corrupt/locked), unlink anyway."""
+        lock = UpdateLock(path=marker)
+        lock.acquire()
+        assert marker.exists()
+
+        # Make read_text fail
+        original_read = type(marker).read_text
+
+        def broken_read(*args, **kwargs):
+            raise OSError(32, "Sharing violation")
+
+        monkeypatch.setattr(type(marker), "read_text", broken_read)
+
+        lock.release()
+
+        assert not marker.exists(), "unreadable marker force-deleted"
+
+    def test_release_gives_up_after_max_retries(self, marker, monkeypatch):
+        """If unlink keeps failing, release() gives up after 5 attempts."""
+        import time as _time
+
+        lock = UpdateLock(path=marker)
+        lock.acquire()
+
+        call_count = {"n": 0}
+
+        def always_fail(*args, **kwargs):
+            call_count["n"] += 1
+            raise OSError(32, "Sharing violation")
+
+        monkeypatch.setattr(type(marker), "unlink", always_fail)
+        monkeypatch.setattr(_time, "sleep", lambda _: None)
+
+        # Should not raise even after max retries
+        lock.release()
+
+        assert call_count["n"] == 5, "should try exactly 5 times"
+        assert lock.acquired is False, "acquired is always cleared"

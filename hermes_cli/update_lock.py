@@ -51,8 +51,10 @@ logger = logging.getLogger(__name__)
 # Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
 # apps/desktop/electron/update-marker.ts — the same marker is read by both, and
 # a shorter ceiling here would let Python steal a lock Electron still considers
-# live. A full update (git pull + uv sync + desktop rebuild) is minutes.
-UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
+# live.  A full update (git pull + uv sync + desktop rebuild) is typically 2-4
+# minutes; 5 minutes is generous while still self-healing quickly when a marker
+# is stranded by a Windows file-lock combined with PID recycling.
+UPDATE_MARKER_MAX_AGE_SECONDS = 5 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
 
@@ -228,23 +230,49 @@ class UpdateLock:
         return True
 
     def release(self) -> None:
-        """Drop the marker if this process still owns it. Never raises."""
+        """Drop the marker if this process still owns it. Never raises.
+
+        On Windows, ``read_text`` or ``unlink`` can fail with
+        ``ERROR_SHARING_VIOLATION`` when another process (antivirus, Windows
+        Search indexer) briefly holds the file open.  Since ``self.acquired``
+        is cleared on the first call, a failed cleanup has no retry path
+        through this object — the marker is stranded until the age ceiling
+        expires.  Retry up to 5 times with 200 ms backoff to ride out
+        transient file-lock contention.
+        """
         if not self.acquired:
             return
         self.acquired = False
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
-            return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
-            return
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        import time as _time
+
+        for _attempt in range(5):
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+                owner = int(raw.splitlines()[0].strip())
+            except (OSError, IndexError, ValueError):
+                # Unreadable or malformed — if we wrote it (acquired=True
+                # was set), assume it's ours and try to unlink anyway.
+                # A corrupt marker must not strand the lock.
+                try:
+                    self.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return
+            if owner != os.getpid():
+                # A handoff partner took ownership (e.g. the Tauri updater wrote
+                # its own pid). Leave it alone — it's still a live update.
+                return
+            try:
+                self.path.unlink()
+                return
+            except OSError:
+                if _attempt < 4:
+                    _time.sleep(0.2)
+                else:
+                    logger.warning(
+                        "Could not remove update marker %s after 5 attempts",
+                        self.path,
+                    )
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

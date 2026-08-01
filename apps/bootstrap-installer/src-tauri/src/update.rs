@@ -126,7 +126,13 @@ struct UpdateMarkerGuard {
 /// UPDATE_MARKER_MAX_AGE_SECONDS in hermes_cli/update_lock.py — all three read
 /// this one file, so a shorter ceiling in any of them would steal a lock the
 /// others still consider live.
-const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
+///
+/// A full update (git pull + uv sync + desktop rebuild) is typically 2-4
+/// minutes; 5 minutes is a generous ceiling that still self-heals quickly
+/// when a marker is stranded by a Windows file-lock (ERROR_SHARING_VIOLATION)
+/// combined with PID recycling.  The previous 20-minute ceiling left users
+/// blocked for the full duration when `complete()` failed to `DeleteFileW`.
+const UPDATE_MARKER_MAX_AGE_SECS: u64 = 5 * 60;
 
 /// The pid + age of a confirmed-live update holding the marker.
 struct MarkerOwner {
@@ -233,13 +239,39 @@ impl UpdateMarkerGuard {
     /// pid holding a fresh marker — which blocks desktop startup and every
     /// other updater for the full age ceiling. Idempotent: `Drop` still runs
     /// and tolerates an already-removed marker.
+    ///
+    /// On Windows, `DeleteFileW` fails with `ERROR_SHARING_VIOLATION` when
+    /// another process (antivirus, Windows Search indexer, the shutting-down
+    /// Electron renderer) has the file open without `FILE_SHARE_DELETE`.
+    /// Since `exit_after_success` uses `process::exit(0)` which bypasses
+    /// `Drop`, a failed `complete()` leaves the marker stranded until the
+    /// age ceiling expires — which with PID recycling can block every
+    /// subsequent update for 20 minutes.  Retry with exponential backoff
+    /// to ride out transient file-lock contention.
     fn complete(&self) {
         if !self.owned {
             return;
         }
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = ?self.path, %err, "could not remove completed update marker");
+        // 5 attempts × 200ms backoff = up to ~1s total wait.  Enough for
+        // a briefly-held sharing violation (antivirus scan, index probe)
+        // without noticeably delaying the relaunch.
+        for attempt in 0..5u32 {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => return,
+                Err(ref err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                Err(err) => {
+                    if attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    } else {
+                        tracing::warn!(
+                            path = ?self.path,
+                            %err,
+                            attempts = attempt + 1,
+                            "could not remove update marker after retries; \
+                             stale detection will self-heal on next launch"
+                        );
+                    }
+                }
             }
         }
     }
