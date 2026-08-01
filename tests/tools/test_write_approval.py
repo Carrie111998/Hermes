@@ -597,6 +597,50 @@ def test_skill_pending_stage_and_review_serialize_cleanup_counts(hermes_home, mo
     assert sum(counts) == 1
 
 
+def test_skill_approve_all_serializes_cleanup(hermes_home, monkeypatch):
+    import hermes_cli.write_approval_commands as commands
+    from tools import write_approval as wa
+
+    _set_skill_policy(1, 30)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(wa.time, "time", lambda: now)
+    _write_pending_record(hermes_home, wa.SKILLS, "pending", created_at=now)
+
+    apply_started = threading.Event()
+    release_apply = threading.Event()
+
+    def blocked_apply(subsystem, record, memory_store):
+        apply_started.set()
+        assert release_apply.wait(5)
+        return True, ""
+
+    monkeypatch.setattr(commands, "_apply_one", blocked_apply)
+    approval = threading.Thread(
+        target=commands.handle_pending_subcommand,
+        args=(wa.SKILLS, ["approve", "all"]),
+    )
+    approval.start()
+    assert apply_started.wait(5)
+
+    staging = threading.Thread(
+        target=wa.stage_write,
+        args=(
+            wa.SKILLS,
+            {"action": "write_file", "name": "new", "file_path": "new.txt", "file_content": "fresh"},
+        ),
+        kwargs={"summary": "new skill", "origin": "foreground"},
+    )
+    staging.start()
+    time.sleep(0.05)
+    assert staging.is_alive()
+
+    release_apply.set()
+    approval.join(timeout=5)
+    staging.join(timeout=5)
+    assert not approval.is_alive()
+    assert not staging.is_alive()
+
+
 @pytest.mark.parametrize("command", ["/skills", "/skills pending"])
 def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home, command):
     from gateway.platforms.base import MessageEvent
@@ -615,6 +659,33 @@ def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home,
     out = asyncio.run(runner._handle_skills_command(MessageEvent(text=command)))
 
     assert "Cleanup removed 1 expired pending skill write(s)." in out
+    assert out.count("Cleanup removed 1 expired pending skill write(s).") == 1
+
+
+def test_gateway_pending_list_surfaces_stage_cleanup_notice(hermes_home):
+    from gateway.platforms.base import MessageEvent
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+    from tools import write_approval as wa
+
+    _write_pending_record(
+        hermes_home,
+        wa.SKILLS,
+        "expired",
+        created_at=time.time() - (31 * 86400),
+    )
+    wa.stage_write(
+        wa.SKILLS,
+        {"action": "write_file", "name": "new", "file_path": "new.txt", "file_content": "fresh"},
+        summary="new skill",
+        origin="foreground",
+    )
+    runner = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+    runner._session_key_for_source = lambda source: "test-session"
+
+    out = asyncio.run(
+        runner._handle_skills_command(MessageEvent(text="/skills pending"))
+    )
+
     assert out.count("Cleanup removed 1 expired pending skill write(s).") == 1
 
 

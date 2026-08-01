@@ -133,26 +133,29 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     if err or target is None:
         return err or f"Usage: /{subsystem} approve <id>"
 
-    records = wa.list_pending(subsystem)
-    if not records:
-        return f"No pending {subsystem} writes."
+    with wa.pending_operation_lock(subsystem):
+        records = wa.list_pending(subsystem)
+        if not records:
+            return f"No pending {subsystem} writes."
 
-    if target.lower() == "all":
-        targets = list(records)
-    else:
-        rec = wa.get_pending(subsystem, target)
-        if not rec:
-            return f"No pending {subsystem} write with id '{target}'."
-        targets = [rec]
-
-    applied, failed = 0, []
-    for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
-        if ok:
-            wa.discard_pending(subsystem, rec["id"])
-            applied += 1
+        if target.lower() == "all":
+            targets = list(records)
         else:
-            failed.append(f"{rec['id']}: {msg}")
+            rec = wa.get_pending(subsystem, target)
+            if not rec:
+                return f"No pending {subsystem} write with id '{target}'."
+            targets = [rec]
+
+        applied, failed = 0, []
+        for rec in targets:
+            ok, msg = _apply_one(subsystem, rec, memory_store)
+            if ok:
+                if wa.discard_pending(subsystem, rec["id"]):
+                    applied += 1
+                else:
+                    failed.append(f"{rec['id']}: no longer pending")
+            else:
+                failed.append(f"{rec['id']}: {msg}")
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if failed:

@@ -49,6 +49,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -344,6 +345,17 @@ def pending_review_snapshot(subsystem: str) -> Dict[str, Any]:
         return snapshot
 
 
+@contextmanager
+def pending_operation_lock(subsystem: str):
+    """Serialize skill cleanup with approval and rejection operations."""
+    if subsystem == SKILLS:
+        state = _skill_pending_state()
+        with state["lock"]:
+            yield
+        return
+    yield
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any],
                 *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
@@ -420,14 +432,15 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
-    try:
-        if path.exists():
-            path.unlink()
-            return True
-    except Exception as e:  # pragma: no cover
-        logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
-    return False
+    with pending_operation_lock(subsystem):
+        path = _pending_dir(subsystem) / f"{pending_id}.json"
+        try:
+            if path.exists():
+                path.unlink()
+                return True
+        except Exception as e:  # pragma: no cover
+            logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
+        return False
 
 
 def pending_count(subsystem: str) -> int:
