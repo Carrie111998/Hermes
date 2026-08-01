@@ -2238,6 +2238,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -2591,23 +2592,83 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
-    """Context note prepended to a user turn when they attach a document.
+_MAX_INLINE_TEXT_DOCUMENT_BYTES = 100 * 1024
 
-    Text documents (``text/*``) have their content inlined upstream by the
-    platform adapter, so the note just confirms that and records the path.
+_TEXT_DOCUMENT_MIME_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/javascript",
+    "application/sql",
+    "application/toml",
+    "application/x-toml",
+    "application/xml",
+    "application/yaml",
+    "application/x-yaml",
+}
 
-    Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
-    must tell the agent to *extract* the text itself before answering — earlier
-    wording ("Ask the user what they'd like you to do with it") steered the
-    model into punting back to the user, which is why attached PDFs/DOCX looked
-    "unreadable" to the agent even though it has the tools to read them.
+
+def _is_text_document(path: str, mtype: str) -> bool:
+    """Return whether an attachment is safe to treat as UTF-8 prompt text."""
+    normalized_mtype = (mtype or "").split(";", 1)[0].strip().lower()
+    extension = Path(path).suffix.lower()
+    return (
+        normalized_mtype.startswith("text/")
+        or normalized_mtype in _TEXT_DOCUMENT_MIME_TYPES
+        or extension in _TEXT_INJECT_EXTENSIONS
+    )
+
+
+def _read_text_document_for_prompt(path: str) -> Optional[str]:
+    """Read a small UTF-8 text attachment without ever reading it unbounded."""
+    try:
+        with open(path, "rb") as document_file:
+            raw = document_file.read(_MAX_INLINE_TEXT_DOCUMENT_BYTES + 1)
+    except OSError as exc:
+        logger.warning("Could not read text document for prompt %s: %s", path, exc)
+        return None
+
+    if len(raw) > _MAX_INLINE_TEXT_DOCUMENT_BYTES:
+        logger.info(
+            "Text document exceeds prompt inline limit (%s bytes): %s",
+            _MAX_INLINE_TEXT_DOCUMENT_BYTES,
+            path,
+        )
+        return None
+
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        logger.warning("Could not decode text document as UTF-8 %s: %s", path, exc)
+        return None
+
+
+def _build_document_context_note(
+    display_name: str,
+    agent_path: str,
+    mtype: str,
+    *,
+    is_text_document: Optional[bool] = None,
+    content_inlined: bool = True,
+) -> str:
+    """Build a truthful path/content note for an attached document.
+
+    ``content_inlined`` defaults to ``True`` for compatibility with existing
+    callers. The inbound-message path passes the actual result of reading (or
+    detecting adapter-injected content), so it never claims content was included
+    when only a cached path is available.
     """
-    if mtype.startswith("text/"):
+    textual = mtype.startswith("text/") if is_text_document is None else is_text_document
+    if textual:
+        if content_inlined:
+            return (
+                f"[The user sent a text document: '{display_name}'. "
+                f"Its content has been included below. "
+                f"The file is also saved at: {agent_path}]"
+            )
         return (
             f"[The user sent a text document: '{display_name}'. "
-            f"Its content has been included below. "
-            f"The file is also saved at: {agent_path}]"
+            f"Its content was not inlined. The file is saved at: {agent_path}. "
+            f"Read it from that path before answering instead of assuming its contents.]"
         )
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
@@ -2616,6 +2677,40 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
         f"terminal tool or the ocr-and-documents skill — before answering, instead "
         f"of asking the user to paste the contents.]"
     )
+
+
+def _build_document_prompt_context(
+    *,
+    host_path: str,
+    display_name: str,
+    agent_path: str,
+    mtype: str,
+    existing_text: str,
+) -> str:
+    """Build the document note and inline small text files when needed.
+
+    Some adapters already inject text using ``[Content of <name>]:``. Detect
+    that marker to avoid duplicating the same attachment. Otherwise, use the
+    cached host path to inline any allowlisted UTF-8 document up to 100 KiB.
+    """
+    textual = _is_text_document(host_path, mtype)
+    content_marker = f"[Content of {display_name}]:"
+    already_inlined = textual and content_marker in (existing_text or "")
+    inline_content = None
+    if textual and not already_inlined:
+        inline_content = _read_text_document_for_prompt(host_path)
+
+    content_inlined = already_inlined or inline_content is not None
+    note = _build_document_context_note(
+        display_name,
+        agent_path,
+        mtype,
+        is_text_document=textual,
+        content_inlined=content_inlined,
+    )
+    if inline_content is None:
+        return note
+    return f"{note}\n\n{content_marker}\n{inline_content}"
 
 
 def _format_duration(seconds: float) -> str:
@@ -15254,7 +15349,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             import mimetypes as _mimetypes
             from tools.credential_files import to_agent_visible_cache_path
 
-            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
                 # Per-attachment document handling. Skip anything already routed
                 # as image / audio / video by the buckets above — only genuine
@@ -15272,7 +15366,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype in {"", "application/octet-stream"}:
                     _ext = os.path.splitext(path)[1].lower()
-                    if _ext in _TEXT_EXTENSIONS:
+                    if _ext in _TEXT_INJECT_EXTENSIONS:
                         mtype = "text/plain"
                     else:
                         guessed, _ = _mimetypes.guess_type(path)
@@ -15294,7 +15388,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
                 agent_path = to_agent_visible_cache_path(path)
 
-                context_note = _build_document_context_note(display_name, agent_path, mtype)
+                context_note = _build_document_prompt_context(
+                    host_path=path,
+                    display_name=display_name,
+                    agent_path=agent_path,
+                    mtype=mtype,
+                    existing_text=event.text or "",
+                )
                 message_text = f"{context_note}\n\n{message_text}"
 
         # Discord: surface the triggering message id per-turn on the user
