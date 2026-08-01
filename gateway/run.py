@@ -362,6 +362,24 @@ def _seed_hygiene_system_prompt(
     return bool(stored_prompt)
 
 
+def _merge_stream_message_metadata(
+    metadata: Optional[Dict[str, Any]],
+    event: Any,
+) -> Optional[Dict[str, Any]]:
+    """Carry an adapter-created streaming message id into send/edit metadata."""
+    event_metadata = (
+        event if isinstance(event, dict) else getattr(event, "metadata", None)
+    )
+    if not isinstance(event_metadata, dict):
+        return metadata
+    stream_message_id = event_metadata.get("_stream_message_id")
+    if not stream_message_id:
+        return metadata
+    merged = dict(metadata or {})
+    merged["_stream_message_id"] = str(stream_message_id)
+    return merged
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -22894,7 +22912,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else bool(_plat_streaming)
         )
 
-        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        _thread_metadata: Optional[Dict[str, Any]] = _merge_stream_message_metadata(
+            self._thread_metadata_for_source(source, event_message_id),
+            event,
+        )
 
         if _streaming_enabled:
             try:
@@ -23701,6 +23722,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=event_message_id,
                 )
             ) if _progress_thread_id else None
+        _status_thread_metadata = _merge_stream_message_metadata(
+            _status_thread_metadata,
+            event,
+        )
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
@@ -24689,6 +24714,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
+            _stream_placeholder_id = None
+            if isinstance(_status_thread_metadata, dict):
+                _stream_placeholder_id = _status_thread_metadata.get("_stream_message_id")
             # Only suppress the normal send when the actual final reply reached
             # the user: the stream consumer streamed it (final_response_sent /
             # final_content_delivered), or the interim preview delivered that
@@ -24709,6 +24737,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
+            elif (
+                not _is_empty_sentinel
+                and not _transformed
+                and _stream_placeholder_id
+                and _sc is not None
+            ):
+                try:
+                    _placeholder_edit = await _sc.adapter.edit_message(
+                        chat_id=source.chat_id,
+                        message_id=str(_stream_placeholder_id),
+                        content=response["final_response"],
+                        finalize=True,
+                        metadata=_status_thread_metadata,
+                    )
+                    if getattr(_placeholder_edit, "success", False):
+                        response["already_sent"] = True
+                        logger.info(
+                            "Edited placeholder message %s with final response for session %s.",
+                            _stream_placeholder_id,
+                            session_key or "?",
+                        )
+                    else:
+                        logger.warning(
+                            "Placeholder final edit failed for session %s: %s",
+                            session_key or "?",
+                            getattr(_placeholder_edit, "error", None),
+                        )
+                except Exception as _edit_err:
+                    logger.warning(
+                        "Failed to edit placeholder final response for session %s: %s",
+                        session_key or "?",
+                        _edit_err,
+                    )
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.

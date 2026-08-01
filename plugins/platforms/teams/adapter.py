@@ -701,6 +701,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
     splits_long_messages = True  # send() chunks via truncate_message()
+    supports_status_text = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("teams"))
@@ -982,6 +983,38 @@ class TeamsAdapter(BasePlatformAdapter):
         else:
             msg_type = MessageType.TEXT
 
+        metadata: Dict[str, Any] = {}
+        if (
+            self._streaming_placeholder_enabled()
+            and (text.strip() or media_urls)
+            and not text.lstrip().startswith("/")
+        ):
+            placeholder = await self.send(
+                conv.id,
+                self._streaming_placeholder_text(),
+                reply_to=msg_id,
+            )
+            if placeholder.success and placeholder.message_id:
+                metadata["_stream_message_id"] = str(placeholder.message_id)
+                logger.debug(
+                    "[teams] streaming placeholder id=%s (the answer edits it)",
+                    placeholder.message_id,
+                )
+            elif placeholder.success:
+                # Without the id the stream has nothing to edit: the answer
+                # lands in a second message and the placeholder stays on
+                # screen. Every requester sees that, so warn rather than
+                # swallow it.
+                logger.warning(
+                    "[teams] streaming placeholder sent but returned no message "
+                    "id; the answer will arrive as a separate message"
+                )
+            else:
+                logger.warning(
+                    "[teams] streaming placeholder send failed: %s",
+                    placeholder.error,
+                )
+
         event = MessageEvent(
             text=text,
             source=source,
@@ -989,6 +1022,7 @@ class TeamsAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             message_id=msg_id,
+            metadata=metadata,
         )
         await self.handle_message(event)
 
@@ -1199,9 +1233,87 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return
         try:
+            status_text = self._status_text_for_chat(chat_id)
+            stream_message_id = None
+            if isinstance(metadata, dict):
+                stream_message_id = metadata.get("_stream_message_id")
+            if status_text and stream_message_id:
+                result = await self.edit_message(
+                    chat_id,
+                    str(stream_message_id),
+                    f"🤔 {status_text}",
+                    metadata=metadata,
+                )
+                if result.success:
+                    return
             await self._app.send(chat_id, TypingActivityInput())
         except Exception:
             pass
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        try:
+            from microsoft_teams.api import MessageActivityInput
+
+            activity = MessageActivityInput(text=self.format_message(content))
+            result = await self._app.api.conversations.activities(chat_id).update(
+                message_id,
+                activity,
+            )
+            return SendResult(
+                success=True,
+                message_id=str(getattr(result, "id", None) or message_id),
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    def _status_text_for_chat(self, chat_id: str) -> Optional[str]:
+        store = getattr(self, "_status_text", None)
+        if not isinstance(store, dict):
+            return None
+        return store.get(str(chat_id))
+
+    def _streaming_placeholder_text(self) -> str:
+        extra = getattr(self.config, "extra", None) or {}
+        configured = extra.get("streaming_placeholder_text")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        return "Working on it..."
+
+    def _streaming_placeholder_enabled(self) -> bool:
+        extra = getattr(self.config, "extra", None) or {}
+        configured = extra.get("streaming_placeholder")
+        if configured is not None:
+            return _parse_bool(configured, default=True)
+
+        try:
+            from hermes_cli.config import load_config
+
+            raw_config = load_config()
+        except Exception:
+            return False
+
+        streaming = raw_config.get("streaming") if isinstance(raw_config, dict) else None
+        if not isinstance(streaming, dict):
+            gateway = raw_config.get("gateway") if isinstance(raw_config, dict) else None
+            streaming = gateway.get("streaming") if isinstance(gateway, dict) else None
+        if not isinstance(streaming, dict):
+            return False
+
+        enabled = _parse_bool(streaming.get("enabled"), default=False)
+        transport = str(
+            streaming.get("transport") or streaming.get("mode") or "edit"
+        ).strip().lower()
+        return enabled and transport not in {"0", "false", "off", "disabled", "none"}
 
     async def _send_media_attachment(
         self,
