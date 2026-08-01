@@ -1224,6 +1224,67 @@ def switch_model(
     resolved_moa_preset = False
 
     # =================================================================
+    # PATH A0: Provider-slug prefix in the model target
+    # (/model <provider>/<model>)
+    # =================================================================
+    # A typed "provider/model" string (e.g. `/model opencode-zen/gpt-5.5`
+    # while on opencode-go) is an explicit provider switch when the leading
+    # segment resolves to a known provider.  Without this the whole string
+    # is treated as a model name on the CURRENT provider: the leading slug
+    # is stripped by per-provider normalization and the bare model is
+    # searched in the wrong catalog — an error when it's missing there
+    # ("Model `gpt-5.5` was not found in this provider's model listing"),
+    # or a silent no-op stay on the current provider when a same-named
+    # model happens to exist (e.g. kimi-k2.5 on both opencode-zen and
+    # opencode-go).  Routing through PATH A makes the typed form behave
+    # exactly like the picker (model + explicit provider).
+    #
+    # Two exceptions preserve aggregator-vendor slugs, which legitimately
+    # contain "/":
+    #   1. The CURRENT provider's catalog natively contains the full
+    #      "prefix/model" string (e.g. "openai/gpt-5.5" or
+    #      "anthropic/claude-sonnet-4.6" on OpenRouter) — that is a model
+    #      on the current aggregator, not a provider hop.
+    #   2. The prefix resolves to the current provider itself (or its
+    #      group id) — a same-provider switch that must keep the normal
+    #      path (e.g. "opencode-zen/gpt-5.5" while already on the
+    #      "opencode" group).
+    if (
+        not explicit_provider
+        and "/" in new_model
+        and not new_model.startswith("/")
+    ):
+        _pfx, _rest = new_model.split("/", 1)
+        _pfx_norm = _pfx.strip().lower()
+        _rest = _rest.strip()
+        _cur_norm = str(current_provider or "").strip().lower()
+        if _pfx_norm and _rest and _pfx_norm != _cur_norm:
+            _native_slug = False
+            if is_aggregator(current_provider):
+                try:
+                    _cat = list_provider_models(current_provider)
+                    _native_slug = any(
+                        str(m).lower() == new_model.lower() for m in _cat
+                    )
+                except Exception:
+                    _native_slug = False
+            if not _native_slug:
+                _pfx_pdef = resolve_provider_full(
+                    _pfx_norm, user_providers, custom_providers
+                )
+                if (
+                    _pfx_pdef is not None
+                    and str(_pfx_pdef.id or "").strip().lower() != _cur_norm
+                ):
+                    logger.debug(
+                        "Provider-slug prefix %r in /model %s -> explicit "
+                        "provider switch to %s with model %s",
+                        _pfx_norm, raw_input, _pfx_pdef.id, _rest,
+                    )
+                    explicit_provider = _pfx_norm
+                    new_model = _rest
+
+    # =================================================================
     # PATH A: Explicit --provider given
     # =================================================================
     if explicit_provider:
