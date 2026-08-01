@@ -1498,6 +1498,51 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    # Build the child's request overrides before construction so an operator can
+    # opt delegated agents into Fast/Priority processing independently of the
+    # parent session.  This is deliberately config-authoritative rather than a
+    # delegate_task argument: the parent model must not be able to select a more
+    # expensive service tier on its own.
+    child_request_overrides = (
+        dict(override_request_overrides or {})
+        if override_provider
+        else dict(getattr(parent_agent, "request_overrides", {}) or {})
+    )
+    child_service_tier = None
+    if is_truthy_value(delegation_cfg.get("fast"), default=False):
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        # A fast-enabled delegation request owns the child's tier choice. Strip
+        # inherited/session tier keys even when the child model is unsupported,
+        # so the warn-and-continue path actually runs at normal speed instead of
+        # leaking a parent Fast override onto an incompatible model.
+        child_request_overrides.pop("service_tier", None)
+        child_request_overrides.pop("speed", None)
+        extra_body = child_request_overrides.get("extra_body")
+        if isinstance(extra_body, dict):
+            child_extra_body = dict(extra_body)
+            child_extra_body.pop("service_tier", None)
+            child_extra_body.pop("speed", None)
+            if child_extra_body:
+                child_request_overrides["extra_body"] = child_extra_body
+            else:
+                child_request_overrides.pop("extra_body", None)
+
+        fast_overrides = resolve_fast_mode_overrides(effective_model)
+        if fast_overrides:
+            child_request_overrides.update(fast_overrides)
+            # service_tier is the durable generic marker Hermes uses for both
+            # OpenAI Priority Processing and Anthropic speed="fast" sessions.
+            child_service_tier = "priority"
+        else:
+            logger.warning(
+                "delegation.fast is enabled, but model %r does not support Fast Mode; "
+                "starting the subagent normally",
+                effective_model,
+            )
+    if child_service_tier:
+        child_optional_kwargs["service_tier"] = child_service_tier
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
@@ -1532,11 +1577,7 @@ def _build_child_agent(
             provider_sort=child_provider_sort,
             provider_require_parameters=child_provider_require_parameters,
             provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
+            request_overrides=child_request_overrides,
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent

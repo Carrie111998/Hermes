@@ -960,6 +960,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     },
+    "delegation.fast": {
+        "type": "boolean",
+        "description": "Use Fast/Priority processing for supported delegated subagent models",
+    },
     "updates.non_interactive_local_changes": {
         "type": "select",
         "description": (

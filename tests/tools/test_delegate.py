@@ -79,6 +79,7 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
+        self.assertNotIn("fast", props)  # operator-controlled via delegation.fast
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
 class TestChildSystemPrompt(unittest.TestCase):
@@ -1099,6 +1100,285 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+
+
+class TestDelegationFastMode(unittest.TestCase):
+    """Tests for the operator-controlled delegation.fast override."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_fast_config_forces_child_fast_without_changing_parent(self, MockAgent, mock_cfg):
+        """A normal Sol parent can run a Luna child at xhigh + fast."""
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "reasoning_effort": "xhigh",
+            "fast": True,
+        }
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.model = "gpt-5.6-sol"
+        parent.provider = "openai-codex"
+        parent.api_mode = "codex_responses"
+        parent.reasoning_config = {"enabled": True, "effort": "ultra"}
+        parent.service_tier = None
+        parent.request_overrides = {"custom": "keep"}
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="gpt-5.6-luna",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(
+            call_kwargs["reasoning_config"],
+            {"enabled": True, "effort": "xhigh"},
+        )
+        self.assertEqual(call_kwargs["service_tier"], "priority")
+        self.assertEqual(
+            call_kwargs["request_overrides"],
+            {"custom": "keep", "service_tier": "priority"},
+        )
+        self.assertIsNone(parent.service_tier)
+        self.assertEqual(parent.request_overrides, {"custom": "keep"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_fast_config_overrides_provider_tier_without_mutating_it(self, MockAgent, mock_cfg):
+        """Fast wins over a provider's flex tier while preserving other overrides."""
+        mock_cfg.return_value = {"max_iterations": 50, "fast": True}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        provider_overrides = {
+            "extra_body": {"service_tier": "flex", "provider_option": "keep"},
+            "custom": "keep",
+        }
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="gpt-5.6-luna",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            override_provider="openai-codex",
+            override_request_overrides=provider_overrides,
+        )
+
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(
+            call_kwargs["request_overrides"],
+            {
+                "extra_body": {"provider_option": "keep"},
+                "custom": "keep",
+                "service_tier": "priority",
+            },
+        )
+        self.assertEqual(
+            provider_overrides,
+            {
+                "extra_body": {"service_tier": "flex", "provider_option": "keep"},
+                "custom": "keep",
+            },
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_fast_config_uses_anthropic_speed_override(self, MockAgent, mock_cfg):
+        """Anthropic Fast Mode uses speed=fast while retaining the durable marker."""
+        mock_cfg.return_value = {"max_iterations": 50, "fast": True}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.model = "claude-opus-4-6"
+        parent.provider = "anthropic"
+        parent.api_mode = "anthropic_messages"
+        parent.service_tier = None
+        parent.request_overrides = {"custom": "keep"}
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="claude-opus-4-6",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["service_tier"], "priority")
+        self.assertEqual(
+            call_kwargs["request_overrides"],
+            {"custom": "keep", "speed": "fast"},
+        )
+        self.assertIsNone(parent.service_tier)
+        self.assertEqual(parent.request_overrides, {"custom": "keep"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_fast_config_does_not_invent_overrides_for_unsupported_model(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {"max_iterations": 50, "fast": True}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.request_overrides = {
+            "custom": "keep",
+            "service_tier": "priority",
+            "speed": "fast",
+            "extra_body": {
+                "service_tier": "priority",
+                "speed": "fast",
+                "nested": "keep",
+            },
+        }
+        original_parent_overrides = {
+            "custom": "keep",
+            "service_tier": "priority",
+            "speed": "fast",
+            "extra_body": {
+                "service_tier": "priority",
+                "speed": "fast",
+                "nested": "keep",
+            },
+        }
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="google/gemini-3-flash-preview",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+        )
+
+        call_kwargs = MockAgent.call_args[1]
+        self.assertIsNone(call_kwargs.get("service_tier"))
+        self.assertEqual(
+            call_kwargs["request_overrides"],
+            {"custom": "keep", "extra_body": {"nested": "keep"}},
+        )
+        self.assertEqual(parent.request_overrides, original_parent_overrides)
+
+
+def test_fast_profile_config_reaches_child_request(tmp_path, monkeypatch):
+    """Exercise config.yaml -> real child construction -> provider wire kwargs."""
+    from agent.chat_completion_helpers import build_api_kwargs
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n"
+        "  model: gpt-5.6-luna\n"
+        "  reasoning_effort: xhigh\n"
+        "  fast: true\n",
+        encoding="utf-8",
+    )
+
+    parent = AIAgent(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="test-key",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        model="gpt-5.6-sol",
+        max_iterations=1,
+        enabled_toolsets=[],
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        session_id="test-fast-profile-parent",
+        reasoning_config={"enabled": True, "effort": "ultra"},
+        request_overrides={},
+    )
+
+    config = _load_config()
+    credentials = _resolve_delegation_credentials(config, parent)
+    child = _build_child_agent(
+        task_index=0,
+        goal="test",
+        context=None,
+        toolsets=None,
+        model=credentials["model"],
+        max_iterations=config["max_iterations"],
+        parent_agent=parent,
+        task_count=1,
+        override_provider=credentials["provider"],
+        override_base_url=credentials["base_url"],
+        override_api_key=credentials["api_key"],
+        override_api_mode=credentials["api_mode"],
+        override_request_overrides=credentials["request_overrides"],
+    )
+    wire_kwargs = build_api_kwargs(
+        child,
+        [{"role": "user", "content": "ping"}],
+        [],
+    )
+
+    assert getattr(child, "model") == "gpt-5.6-luna"
+    assert getattr(child, "reasoning_config") == {"enabled": True, "effort": "xhigh"}
+    assert getattr(child, "service_tier") == "priority"
+    assert getattr(child, "request_overrides") == {"service_tier": "priority"}
+    assert wire_kwargs["service_tier"] == "priority"
+    assert getattr(parent, "model") == "gpt-5.6-sol"
+    assert getattr(parent, "reasoning_config") == {"enabled": True, "effort": "ultra"}
+    assert getattr(parent, "service_tier") is None
+
+
+def test_fast_profile_config_reaches_native_anthropic_wire(tmp_path, monkeypatch):
+    """Exercise delegate Fast Mode through the native Anthropic request shape."""
+    from agent.anthropic_adapter import _FAST_MODE_BETA
+    from agent.chat_completion_helpers import build_api_kwargs
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  fast: true\n",
+        encoding="utf-8",
+    )
+    parent = AIAgent(
+        base_url="https://api.anthropic.com",
+        api_key="test-key",
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model="claude-opus-4-6",
+        max_iterations=1,
+        enabled_toolsets=[],
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        session_id="test-fast-profile-anthropic-parent",
+        request_overrides={},
+    )
+
+    child = _build_child_agent(
+        task_index=0,
+        goal="test",
+        context=None,
+        toolsets=None,
+        model="claude-opus-4-6",
+        max_iterations=1,
+        parent_agent=parent,
+        task_count=1,
+    )
+    wire_kwargs = build_api_kwargs(
+        child,
+        [{"role": "user", "content": "ping"}],
+        [],
+    )
+
+    assert getattr(child, "request_overrides") == {"speed": "fast"}
+    assert wire_kwargs["extra_body"]["speed"] == "fast"
+    assert _FAST_MODE_BETA in wire_kwargs["extra_headers"]["anthropic-beta"]
+    assert getattr(parent, "request_overrides") == {}
 
 # =========================================================================
 # Dispatch helper, progress events, concurrency

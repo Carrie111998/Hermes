@@ -140,18 +140,20 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
-## Model Override
+## Model and Fast-Mode Override
 
 You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
 
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
-  model: "google/gemini-flash-2.0"    # Cheaper model for subagents
-  provider: "openrouter"              # Optional: route subagents to a different provider
+  model: "gpt-5.6-luna"        # Different model for subagents
+  provider: "openai-codex"     # Optional: route subagents to a different provider
+  reasoning_effort: "xhigh"    # Independent child reasoning level
+  fast: true                    # Fast/Priority processing for supported child models only
 ```
 
-If omitted, subagents use the same model as the parent.
+If omitted, subagents use the same model as the parent. `fast: true` applies only to delegated agents and does not change the parent session's Fast Mode. Hermes maps it to the provider-appropriate request setting for supported models and runs unsupported models normally with a warning. Fast/Priority processing can carry a provider billing premium.
 
 ## Inherited Tool Access
 
@@ -357,6 +359,8 @@ delegation:
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
+  reasoning_effort: "xhigh"                         # Optional child reasoning override
+  # fast: true                                       # Optional child-only Fast/Priority processing (supported models only)
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
 
 # Or use a direct custom endpoint instead of provider:
