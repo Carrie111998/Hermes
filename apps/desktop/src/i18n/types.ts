@@ -2331,6 +2331,7 @@ export interface Translations {
       command: string
       moreOptions: string
       allowSession: string
+      sessionNote: string
       alwaysAllowMenu: string
       jumpToApproval: string
       reject: string
