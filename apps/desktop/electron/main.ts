@@ -201,6 +201,8 @@ import {
   sandboxPreflight
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import { resolveUpdateStrategy } from './update-strategy'
+import { configureElectronUpdater, checkForUpdates, quitAndInstall, pendingUpdateVersion } from './electron-updater-controller'
 import { resolveStagedUpdaterBinary, spawnUpdaterProcess } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
@@ -2297,10 +2299,15 @@ function readDesktopUpdateConfig() {
   try {
     const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
     const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
+    // Optional self-update feed (remote-client / tenant path). When set on a
+    // packaged app, the update-strategy ladder routes to electron-updater
+    // instead of the source/CLI rebuild. Empty string = unconfigured → the
+    // existing paths are used unchanged.
+    const feedUrl = typeof parsed?.feed_url === 'string' ? parsed.feed_url.trim() : ''
 
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
+    return { branch: branch || DEFAULT_UPDATE_BRANCH, feedUrl }
   } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
+    return { branch: DEFAULT_UPDATE_BRANCH, feedUrl: '' }
   }
 }
 
@@ -2851,6 +2858,30 @@ async function applyUpdates(opts = {}) {
   updateInFlight = true
 
   try {
+    // Update-strategy ladder (electron/update-strategy.ts). The top rung —
+    // electron-updater — is the remote-client path: a packaged app with a
+    // configured feed self-updates from a signed release binary and needs no
+    // repo/CLI/toolchain on the device. Every other install (source checkout,
+    // or packaged with no feed) falls through to the exact path it uses
+    // today, so this changes nothing for current users.
+    const { feedUrl } = readDesktopUpdateConfig()
+    const strategy = resolveUpdateStrategy({
+      isPackaged: app.isPackaged,
+      feedUrl,
+      hasStagedUpdater: Boolean(resolveUpdaterBinary()),
+      isWindows: IS_WINDOWS
+    })
+
+    if (strategy === 'electron-updater') {
+      configureElectronUpdater({ feedUrl, onProgress: emitUpdateProgress, log: rememberLog })
+      emitUpdateProgress({ stage: 'check', message: 'Checking for updates…', percent: null })
+      await checkForUpdates()
+      // Download + install are driven by the autoUpdater event handlers in
+      // electron-updater-controller.ts; the UI's "restart to update" action
+      // calls quitAndInstall() once an update is downloaded.
+      return { ok: true, electronUpdater: true }
+    }
+
     const updater = resolveUpdaterBinary()
 
     if (!updater && !IS_WINDOWS) {
@@ -11339,10 +11370,23 @@ ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig(
 
 ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
-  writeDesktopUpdateConfig({ branch })
+  // Preserve the configured self-update feed across a branch change — writing
+  // only { branch } would silently wipe feed_url and drop the install off the
+  // electron-updater rung back onto the source path.
+  const { feedUrl } = readDesktopUpdateConfig()
+  writeDesktopUpdateConfig({ branch, feed_url: feedUrl })
 
   return { branch }
 })
+
+// Remote-client self-update (electron-updater rung): restart into a downloaded
+// update. Returns false when no update has been downloaded yet, so the UI only
+// offers this in the "ready" state. No-op on installs that aren't on the
+// electron-updater rung.
+ipcMain.handle('hermes:updates:install-downloaded', async () => ({
+  ok: quitAndInstall(),
+  pendingVersion: pendingUpdateVersion()
+}))
 
 // Resolve the canonical Hermes version (the one `release.py` bumps in
 // hermes_cli/__init__.py + pyproject.toml) so the desktop About panel shows the
