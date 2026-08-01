@@ -274,6 +274,18 @@ export const $attentionSessionIds = computed(
     ))
 )
 
+let failedRuntimeIds: readonly string[] = []
+export const $failedSessionIds = computed(
+  $sessionStates,
+  states =>
+    (failedRuntimeIds = stableArray(
+      failedRuntimeIds,
+      Object.entries(states)
+        .filter(([, state]) => state.failed)
+        .map(([runtimeId]) => runtimeId)
+    ))
+)
+
 // ---------------------------------------------------------------------------
 // Session tiles.
 // ---------------------------------------------------------------------------

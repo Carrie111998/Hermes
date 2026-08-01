@@ -37,7 +37,7 @@ import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { revealDesktopPane } from '@/store/pane-focus'
-import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
+import { markPetUnread } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
@@ -464,7 +464,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             state => {
               const busy = Boolean(payload!.running)
 
-              if (state.busy === busy && (busy || !state.awaitingResponse)) {
+              if (state.busy === busy && (busy || !state.awaitingResponse) && (!busy || !state.failed)) {
                 return state
               }
 
@@ -481,6 +481,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 return {
                   ...state,
                   busy,
+                  failed: false,
                   turnStartedAt: state.turnStartedAt ?? Date.now()
                 }
               }
@@ -566,6 +567,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           return {
             ...state,
             busy: true,
+            failed: false,
             awaitingResponse: true,
             sawAssistantPayload: false,
             interrupted: false,
@@ -609,17 +611,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId) {
           appendReasoningDelta(sessionId, coerceThinkingText(payload?.text))
         }
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
-        }
       } else if (event.type === 'reasoning.available') {
         if (sessionId) {
           appendReasoningDelta(sessionId, coerceThinkingText(payload?.text), true)
-        }
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
         }
       } else if (event.type === 'moa.reference') {
         // MoA reference-model output — surface as a labelled thinking chunk
@@ -653,16 +647,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             flushQueuedDeltas(sessionId)
           }
         }
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
-        }
       } else if (event.type === 'moa.aggregating') {
         // Status transition only; the aggregator's reply arrives via the normal
         // message stream. No reasoning/transcript mutation here.
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
-        }
       } else if (event.type === 'moa.progress') {
         // Live reference fan-out progress ("refs k/n") — surfaced in the same
         // reasoning disclosure the references land in. These lines arrive
@@ -679,10 +666,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           appendReasoningDelta(sessionId, line, payload.refs_done <= 1)
           flushQueuedDeltas(sessionId)
         }
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
-        }
       } else if (event.type === 'moa.phase') {
         // Phase transition — currently only phase="aggregator" (fan-out done,
         // aggregator acting). Append a one-line marker; the first
@@ -690,10 +673,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId && payload?.phase === 'aggregator') {
           appendReasoningDelta(sessionId, '◇ MoA aggregating…\n', false)
           flushQueuedDeltas(sessionId)
-        }
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: true })
         }
       } else if (event.type === 'message.complete') {
         if (!sessionId) {
@@ -731,6 +710,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             : undefined
 
         completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure)
+        updateSessionState(sessionId, state => ({ ...state, failed: Boolean(failure) }))
 
         // Structured billing wall forwarded by the gateway (out of credits /
         // payment required) — cache it + raise a billing-specific toast.
@@ -740,13 +720,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (isActiveEvent) {
           setTurnStartedAt(null)
-
-          // Pet beat: a finished turn always celebrates — go straight to the
-          // jump, never linger on the run/reason pose. One atom update (clears
-          // toolRunning/reasoning AND sets celebrate together) so no stray "run"
-          // frame leaks to the sprite — including the popped-out overlay, which
-          // mirrors each activity change. The jump runs ~2 loops, then settles.
-          flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
 
           // Light up the pet's mail icon if the user wasn't looking when the turn
           // finished — a glanceable "new message" hint on the popped-out overlay.
@@ -792,10 +765,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         setSessionDraftingTool(sessionId, typeof payload?.name === 'string' ? payload.name : '')
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: false, toolRunning: true })
-        }
       } else if (event.type === 'tool.start' || event.type === 'tool.progress') {
         if (!sessionId) {
           return
@@ -803,18 +772,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         flushQueuedDeltas(sessionId)
         upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type)
-
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: false, toolRunning: true })
-        }
       } else if (event.type === 'tool.complete') {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type)
-
-          if (isActiveEvent) {
-            setPetActivity({ toolRunning: false })
-          }
 
           // A pending clarify blocks the turn, so the first tool.complete after
           // one is the clarify resolving — drop the "needs input" flag here so
@@ -1158,11 +1119,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           compactedTurnRef.current.delete(sessionId)
         }
 
-        if (isActiveEvent) {
-          setPetActivity({ reasoning: false, toolRunning: false })
-          flashPetActivity({ error: true })
-        }
-
         dispatchNativeNotification({
           body: errorMessage,
           kind: 'turnError',
@@ -1188,6 +1144,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         if (sessionId) {
+          updateSessionState(sessionId, state => ({ ...state, failed: true }))
           flushQueuedDeltas(sessionId)
           failAssistantMessage(sessionId, errorMessage)
         }

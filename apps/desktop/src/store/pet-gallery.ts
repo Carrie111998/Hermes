@@ -1,7 +1,7 @@
 import { atom } from 'nanostores'
 
 import { normalize } from '@/lib/text'
-import { $petInfo, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
+import { $petInfo, cachePetInfo, type PetInfo, petProfile } from '@/store/pet'
 
 /**
  * Feature store for the petdex gallery picker (Cmd+K "Pets…" + Settings).
@@ -141,7 +141,7 @@ export function loadPetGallery(request: GatewayRequest, options: { force?: boole
       }
 
       if (info) {
-        setPetInfo(info)
+        cachePetInfo(info)
       }
     } catch (e) {
       if (isMissingMethod(e)) {
@@ -182,7 +182,7 @@ async function syncInfo(request: GatewayRequest): Promise<void> {
     const info = await petRpc<PetInfo>(request, 'pet.info')
 
     if (info) {
-      setPetInfo(info)
+      cachePetInfo(info)
     }
   } catch {
     // The mutation already succeeded; a stale mascot self-heals on its poll.
@@ -360,7 +360,7 @@ let scalePersist: ReturnType<typeof setTimeout> | undefined
 export function setPetScale(request: GatewayRequest, scale: number): void {
   const next = clampPetScale(scale)
 
-  setPetInfo({ ...$petInfo.get(), scale: next })
+  cachePetInfo({ ...$petInfo.get(), scale: next })
 
   clearTimeout(scalePersist)
   scalePersist = setTimeout(() => {
@@ -368,7 +368,7 @@ export function setPetScale(request: GatewayRequest, scale: number): void {
       .then(result => {
         // Reconcile with the server's clamp (cheap; only matters at the bounds).
         if (typeof result?.scale === 'number' && result.scale !== $petInfo.get().scale) {
-          setPetInfo({ ...$petInfo.get(), scale: result.scale })
+          cachePetInfo({ ...$petInfo.get(), scale: result.scale })
         }
       })
       .catch(() => {

@@ -8865,6 +8865,8 @@ function createInstanceWindow() {
 // pushes pet state over IPC (hermes:pet-overlay:state); the overlay just renders
 // it. Control flows back (pop-in, composer submit) via hermes:pet-overlay:control.
 let petOverlayWindow = null
+let petOverlayBoundsReportTimer = null
+let preservePetOverlayActiveOnClose = false
 
 function petOverlayUrl() {
   if (DEV_SERVER) {
@@ -8872,6 +8874,22 @@ function petOverlayUrl() {
   }
 
   return `${pathToFileURL(resolveRendererIndex()).toString()}?win=overlay#/`
+}
+
+function schedulePetOverlayBoundsReport(win) {
+  if (petOverlayBoundsReportTimer) {
+    clearTimeout(petOverlayBoundsReportTimer)
+  }
+
+  petOverlayBoundsReportTimer = setTimeout(() => {
+    petOverlayBoundsReportTimer = null
+
+    if (win.isDestroyed() || !mainWindow || mainWindow.isDestroyed()) {
+      return
+    }
+
+    mainWindow.webContents.send('hermes:pet-overlay:control', { bounds: win.getBounds(), type: 'bounds' })
+  }, 120)
 }
 
 function spawnPetOverlayWindow(bounds) {
@@ -8951,7 +8969,22 @@ function spawnPetOverlayWindow(bounds) {
     }
   })
 
+  // Renderer pointer capture normally reports the final drag position itself.
+  // Also observe the native window as a backstop: moving a frameless panel can
+  // lose pointerup on some window managers, which previously discarded the
+  // last desktop position. Debounce to one persistence write after movement.
+  win.on('move', () => schedulePetOverlayBoundsReport(win))
+  win.on('resize', () => schedulePetOverlayBoundsReport(win))
+
   win.on('closed', () => {
+    if (petOverlayBoundsReportTimer) {
+      clearTimeout(petOverlayBoundsReportTimer)
+      petOverlayBoundsReportTimer = null
+    }
+
+    const preserveActive = preservePetOverlayActiveOnClose
+    preservePetOverlayActiveOnClose = false
+
     if (petOverlayWindow === win) {
       petOverlayWindow = null
     }
@@ -8959,7 +8992,7 @@ function spawnPetOverlayWindow(bounds) {
     // If the overlay went away on its own (e.g. ⌘W), tell the main renderer to
     // pop the pet back in so it doesn't stay hidden. Harmless echo when we're
     // the ones who closed it (popInPet already cleared the active flag).
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    if (!preserveActive && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('hermes:pet-overlay:control', { type: 'pop-in' })
     }
   })
@@ -8990,8 +9023,9 @@ function openPetOverlay(bounds) {
   return petOverlayWindow
 }
 
-function closePetOverlay() {
+function closePetOverlay({ preserveActive = false } = {}) {
   if (petOverlayWindow && !petOverlayWindow.isDestroyed()) {
+    preservePetOverlayActiveOnClose = preserveActive
     petOverlayWindow.close()
   }
 
@@ -9572,6 +9606,16 @@ ipcMain.handle('hermes:pet-overlay:close', async () => {
 
   return { ok: true }
 })
+// Multi-display-safe desktop roam bounds. Browser `screen.availWidth` does not
+// expose a dependable global origin on secondary monitors, while Electron can
+// resolve the display containing the actual native overlay window.
+ipcMain.handle('hermes:pet-overlay:work-area', async () => {
+  if (!petOverlayWindow || petOverlayWindow.isDestroyed()) {
+    return null
+  }
+
+  return screen.getDisplayMatching(petOverlayWindow.getBounds()).workArea
+})
 // Drag/resize: the overlay reports new absolute screen bounds (it already knows
 // the pointer's screen coords). Drag keeps the size constant; the wheel-to-scale
 // gesture grows/shrinks it so the sprite is never cropped by the window edge.
@@ -9634,16 +9678,15 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
     return
   }
 
-  // Double-click toggles the app window: hide it away if it's up front, bring it
-  // back if it's minimized/buried. Pure window control — nothing for the
-  // renderer to do, so don't forward it.
-  if (payload && payload.type === 'toggle-app') {
-    if (mainWindow.isMinimized() || !mainWindow.isVisible()) {
-      mainWindow.show()
-      mainWindow.focus()
-    } else {
-      mainWindow.minimize()
+  // Ordinary pet click is one-way: surface Hermes without minimizing an
+  // already-visible window. Pure window control, so don't forward it.
+  if (payload && payload.type === 'show-app') {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
     }
+
+    mainWindow.show()
+    mainWindow.focus()
 
     return
   }
@@ -11923,7 +11966,7 @@ app.on('before-quit', event => {
 
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
-  closePetOverlay()
+  closePetOverlay({ preserveActive: true })
 
   // Same for the Quick Entry composer — and release its global accelerator so a
   // quitting Hermes never keeps another app's chord hostage.

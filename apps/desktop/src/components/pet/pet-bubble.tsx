@@ -13,8 +13,8 @@ import { $petActivity, $petState, type PetState } from '@/store/pet'
  *
  * Text is derived purely from the same `$petState` / `$petActivity` the sprite
  * already reacts to, so it never drifts from the animation. The bubble is shown
- * only when there's something worth saying (working / reviewing / a transient
- * done/error beat / waiting on the user) and is hidden at plain idle.
+ * only when there's something worth saying (working / ready / failed / waiting
+ * on the user) and is hidden at plain idle.
  */
 
 type Tone = 'error' | 'wait'
@@ -43,18 +43,7 @@ const SPECS: Partial<Record<PetState, Spec>> = {
     ]
   },
   review: {
-    lines: [
-      'thinking…',
-      'reading…',
-      'reviewing…',
-      'pondering…',
-      'connecting dots…',
-      'sizing it up…',
-      'tracing it…',
-      'mulling…',
-      'scheming…',
-      'hmm…'
-    ]
+    lines: ['ready for review', 'ready when you are', 'done', 'wrapped up', 'take a look']
   },
   failed: {
     glyph: AlertCircle,
@@ -98,10 +87,10 @@ export function PetBubble() {
   const specKey: null | PetState =
     state in SPECS ? state : state === 'idle' && activity.awaitingInput ? 'waiting' : null
 
-  const rotating = specKey === 'run' || specKey === 'review'
+  const rotating = specKey === 'run'
 
   // Pick a fresh line on every mood change, then keep rotating (random, no
-  // repeat) only while the agent is actively working/thinking.
+  // repeat) only while the agent is actively working.
   useEffect(() => {
     const spec = specKey ? SPECS[specKey] : null
 

@@ -1,7 +1,15 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
-import { $petActivity, $petInfo, $petUnread, clearPetUnread, type PetActivity, type PetInfo } from '@/store/pet'
+import {
+  $petActivity,
+  $petInfo,
+  $petRoam,
+  $petUnread,
+  clearPetUnread,
+  type PetActivity,
+  type PetInfo
+} from '@/store/pet'
 import { $awaitingResponse, $busy } from '@/store/session'
 
 /**
@@ -15,9 +23,9 @@ import { $awaitingResponse, $busy } from '@/store/session'
  * in, submit a composer message) via `onControl`.
  *
  * The overlay renders the same `PetSprite` / `PetBubble` as the in-window pet by
- * mirroring the four reactive inputs of `$petState` (`$petInfo`, `$petActivity`,
- * `$busy`, `$awaitingResponse`) into its own copies of those atoms — so the
- * popped-out mascot is pixel-identical and needs zero bespoke render logic.
+ * mirroring the live render inputs (`$petInfo`, `$petActivity`, `$busy`,
+ * `$awaitingResponse`) plus the roam preference into its own copies of those
+ * atoms — so the popped-out mascot stays in sync without a gateway connection.
  */
 
 export interface PetOverlayBounds {
@@ -44,6 +52,8 @@ export interface PetOverlayStatePayload {
   activity: PetActivity
   busy: boolean
   awaiting: boolean
+  /** Mirrors the device-local roam preference into the gateway-less overlay. */
+  roam: boolean
   /** Drives the overlay's mail icon: a finish landed while you were away. */
   unread: boolean
   /** Latest reaction — bumping its id forwards a burst to the overlay. */
@@ -56,7 +66,7 @@ export type PetOverlayControl =
   | { type: 'submit'; text: string }
   | { type: 'bounds'; bounds: PetOverlayBounds }
   | { type: 'open-app' }
-  | { type: 'toggle-app' }
+  | { type: 'show-app' }
   | { type: 'scale'; scale: number }
 
 // Persisted across restarts: was the pet popped out, and where on the desktop
@@ -134,6 +144,23 @@ export function overlayWindowSize(frameW: number, frameH: number, scale: number)
   }
 }
 
+/** Default screen-relative placement used when Settings opens the overlay. */
+export function initialOverlayBounds(
+  frameW: number,
+  frameH: number,
+  scale: number,
+  viewportH: number
+): PetOverlayBounds {
+  const { width, height } = overlayWindowSize(frameW, frameH, scale)
+
+  return {
+    height,
+    width,
+    x: 24,
+    y: Math.max(24, viewportH - height - 24)
+  }
+}
+
 let stateUnsubs: Array<() => void> = []
 let controlUnsub: (() => void) | null = null
 let submitHandler: ((text: string) => void) | null = null
@@ -146,6 +173,7 @@ function currentPayload(): PetOverlayStatePayload {
     activity: $petActivity.get(),
     busy: $busy.get(),
     awaiting: $awaitingResponse.get(),
+    roam: $petRoam.get(),
     unread: $petUnread.get(),
     reaction: $petReaction.get()
   }
@@ -183,18 +211,20 @@ function openOverlay(request: PetOverlayOpenRequest): void {
     $petActivity.subscribe(pushNow),
     $busy.subscribe(pushNow),
     $awaitingResponse.subscribe(pushNow),
+    $petRoam.subscribe(pushNow),
     $petUnread.subscribe(pushNow),
     $petReaction.subscribe(pushNow)
   ]
 }
 
 /**
- * Pop the pet out of the window. `petRect` is the in-window sprite's viewport
- * rect; we grow it to the padded overlay size and center the window on the
- * pet's old spot (main.ts adds the window's screen origin). If the user has
- * popped out before, reopen at that remembered desktop spot instead.
+ * Pop the pet out of the window. When `petRect` is provided (the Shift-click
+ * path), grow it to the padded overlay size and center the window on the pet's
+ * old spot. The settings path has no sprite rect, so it opens near the
+ * lower-left of the main window. If the user has popped out before, both paths
+ * reopen at the remembered desktop spot instead.
  */
-export function popOutPet(petRect: PetOverlayBounds): void {
+export function popOutPet(petRect?: PetOverlayBounds): void {
   if ($petOverlayActive.get() || stateUnsubs.length) {
     return
   }
@@ -210,7 +240,20 @@ export function popOutPet(petRect: PetOverlayBounds): void {
   // Size the window off the pet's scale (not the measured rect, which includes
   // the shadow) so it matches the live resize math exactly — no jump on open.
   const pet = $petInfo.get()
-  const { width, height } = overlayWindowSize(pet.frameW ?? 192, pet.frameH ?? 208, pet.scale ?? 0.33)
+  const frameW = pet.frameW ?? 192
+  const frameH = pet.frameH ?? 208
+  const scale = pet.scale ?? 0.33
+  const { width, height } = overlayWindowSize(frameW, frameH, scale)
+
+  if (!petRect) {
+    openOverlay({
+      bounds: initialOverlayBounds(frameW, frameH, scale, window.innerHeight || 600),
+      screen: false
+    })
+
+    return
+  }
+
   const x = Math.round(petRect.x - (width - petRect.width) / 2)
   const y = Math.round(petRect.y - (height - petRect.height) / 2)
 

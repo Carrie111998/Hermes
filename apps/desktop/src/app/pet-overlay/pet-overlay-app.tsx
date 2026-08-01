@@ -3,10 +3,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { PetHeartField, playVibeHearts } from '@/components/chat/vibe-hearts'
 import { PetBubble } from '@/components/pet/pet-bubble'
-import { PetSprite } from '@/components/pet/pet-sprite'
+import { PetSprite, roamWalkRow } from '@/components/pet/pet-sprite'
+import { usePetOverlayRoam } from '@/components/pet/use-pet-overlay-roam'
 import { type PetZoomAnchor, usePetZoomGesture } from '@/components/pet/use-pet-zoom-gesture'
 import { Mail } from '@/lib/icons'
-import { $petActivity, $petInfo, setPetInfo } from '@/store/pet'
+import { $petActivity, $petAtRest, $petInfo, $petRoam, $petRoamDir, setPetInfo } from '@/store/pet'
 import { overlayWindowSize } from '@/store/pet-overlay'
 import { setAwaitingResponse, setBusy } from '@/store/session'
 
@@ -46,8 +47,8 @@ const ALPHA_HIT_THRESHOLD = 16
 
 // Below this much pointer travel, a press counts as a click, not a drag.
 const CLICK_SLOP_PX = 3
-// A second click within this window is a double-click (raise app) and cancels
-// the deferred single-click (open composer), so a double never flashes it open.
+// A second click within this window is a double-click (open composer) and
+// cancels the deferred single-click (raise app), so Hermes never flashes first.
 const DOUBLE_CLICK_MS = 250
 
 interface DragState {
@@ -62,6 +63,9 @@ interface DragState {
 
 export function PetOverlayApp() {
   const info = useStore($petInfo)
+  const atRest = useStore($petAtRest)
+  const roam = useStore($petRoam)
+  const roamDir = useStore($petRoamDir)
   const [composerOpen, setComposerOpen] = useState(false)
   const [draft, setDraft] = useState('')
   // Mirrored from the main renderer: a finish landed while you were away.
@@ -94,6 +98,7 @@ export function PetOverlayApp() {
       $petActivity.set(payload.activity ?? {})
       setBusy(Boolean(payload.busy))
       setAwaitingResponse(Boolean(payload.awaiting))
+      $petRoam.set(Boolean(payload.roam))
       setUnread(Boolean(payload.unread))
 
       // Play a reaction on a new id (ignore the first sync, which just primes it).
@@ -268,19 +273,19 @@ export function PetOverlayApp() {
       return
     }
 
-    // Double-click toggles the app window (minimize ↔ restore); defer the
-    // single-click composer toggle so a double never flashes the composer open.
+    // Single-click brings Hermes forward. Defer it briefly so a double-click
+    // can open the quick composer without flashing/focusing the main app first.
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current)
       clickTimerRef.current = undefined
-      window.hermesDesktop?.petOverlay?.control({ type: 'toggle-app' })
+      setComposerOpen(open => !open)
 
       return
     }
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = undefined
-      setComposerOpen(open => !open)
+      window.hermesDesktop?.petOverlay?.control({ type: 'show-app' })
     }, DOUBLE_CLICK_MS)
   }
 
@@ -312,6 +317,18 @@ export function PetOverlayApp() {
   }, [])
 
   usePetZoomGesture(petRef, onScale, Boolean(info.enabled && info.spritesheetBase64))
+
+  const isDragging = useCallback(() => dragRef.current !== null, [])
+  const petW = (info.frameW ?? DEFAULT_FRAME_W) * (info.scale ?? DEFAULT_SCALE)
+
+  usePetOverlayRoam({
+    enabled: roam && atRest && !composerOpen && Boolean(info.enabled && info.spritesheetBase64),
+    isInteracting: isDragging,
+    loopMs: info.loopMs ?? 1100,
+    petW
+  })
+
+  const walk = roamWalkRow(roamDir, info.stateRows)
 
   // Grow/shrink the OS overlay window to fit the pet at its current scale so the
   // sprite is never cropped — covers both the wheel gesture here and a scale
@@ -432,8 +449,14 @@ export function PetOverlayApp() {
         <div style={{ marginBottom: 4 }}>
           <PetBubble />
         </div>
-        <div style={{ lineHeight: 0, position: 'relative' }}>
-          <PetSprite info={info} pauseWhenUnfocused={false} />
+        <div
+          style={{
+            lineHeight: 0,
+            position: 'relative',
+            transform: walk.mirror ? 'scaleX(-1)' : 'none'
+          }}
+        >
+          <PetSprite info={info} pauseWhenUnfocused={false} rowOverride={walk.row} />
 
           {/* Hearts on the popped-out pet — identical to in-window. */}
           <PetHeartField

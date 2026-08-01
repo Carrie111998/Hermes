@@ -19,7 +19,7 @@ vi.mock('@/store/pet', () => {
   }
 })
 
-import { PetSprite } from './pet-sprite'
+import { IDLE_REST_MIN_MS, PetSprite } from './pet-sprite'
 
 const INFO = {
   enabled: true,
@@ -35,6 +35,7 @@ const INFO = {
 let root: Root | null = null
 let container: HTMLDivElement | null = null
 let windowStateCallback: ((payload: { isMinimized?: boolean; isVisible?: boolean }) => void) | null = null
+let drawImage: ReturnType<typeof vi.fn>
 
 function render(ui: ReactNode) {
   container = document.createElement('div')
@@ -122,6 +123,7 @@ describe('PetSprite RAF scheduling', () => {
     ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     vi.useFakeTimers()
     setVisibility(false)
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 1 })
     vi.spyOn(document, 'hasFocus').mockReturnValue(true)
     installWindowStateBridge()
     vi.stubGlobal(
@@ -132,9 +134,10 @@ describe('PetSprite RAF scheduling', () => {
         src = ''
       } as unknown as typeof Image
     )
+    drawImage = vi.fn()
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
       clearRect: vi.fn(),
-      drawImage: vi.fn(),
+      drawImage,
       imageSmoothingEnabled: false
     } as unknown as CanvasRenderingContext2D)
   })
@@ -151,7 +154,7 @@ describe('PetSprite RAF scheduling', () => {
   it('sleeps between visible sprite frames instead of chaining RAFs', () => {
     const raf = installRaf()
 
-    render(<PetSprite info={INFO} />)
+    render(<PetSprite info={INFO} stateOverride="run" />)
 
     expect(raf.request).toHaveBeenCalledTimes(1)
 
@@ -168,6 +171,63 @@ describe('PetSprite RAF scheduling', () => {
     })
 
     expect(raf.request).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses a DPR-sized backing store while preserving the CSS footprint', () => {
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 })
+    const raf = installRaf()
+
+    render(<PetSprite info={INFO} />)
+
+    const canvas = container?.querySelector('canvas')
+
+    expect(canvas).not.toBeNull()
+    expect(canvas?.width).toBe(32)
+    expect(canvas?.height).toBe(32)
+    expect(canvas?.style.width).toBe('16px')
+    expect(canvas?.style.height).toBe('16px')
+
+    act(() => {
+      raf.runNext(0)
+    })
+
+    expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 16, 16, 0, 0, 32, 32)
+  })
+
+  it('holds the first live idle frame, plays one loop, then rests again', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const raf = installRaf()
+
+    render(<PetSprite info={INFO} />)
+
+    act(() => {
+      raf.runNext(0)
+    })
+
+    expect(drawImage).toHaveBeenCalledTimes(1)
+    expect(drawImage.mock.calls[0]?.[1]).toBe(0)
+
+    act(() => {
+      vi.advanceTimersByTime(IDLE_REST_MIN_MS - 1)
+    })
+    expect(raf.pending()).toBe(0)
+
+    act(() => {
+      vi.advanceTimersByTime(1)
+      raf.runNext(IDLE_REST_MIN_MS)
+      vi.advanceTimersByTime(60)
+      raf.runNext(IDLE_REST_MIN_MS + 60)
+    })
+
+    expect(drawImage.mock.calls.at(-1)?.[1]).toBe(16)
+
+    act(() => {
+      vi.advanceTimersByTime(60)
+      raf.runNext(IDLE_REST_MIN_MS + 120)
+    })
+
+    expect(drawImage.mock.calls.at(-1)?.[1]).toBe(0)
+    expect(vi.getTimerCount()).toBe(1)
   })
 
   it('cancels pending RAF work while the Electron window is paused and resumes when visible', () => {

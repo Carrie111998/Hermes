@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
 import { $petState, type PetInfo, type PetState } from '@/store/pet'
@@ -7,9 +7,58 @@ const DEFAULT_FRAME_W = 192
 const DEFAULT_FRAME_H = 208
 const DEFAULT_FRAMES = 6
 const DEFAULT_LOOP_MS = 1100
+// Codex-like calm live-idle rhythm: hold the reduced-motion first cell for
+// several seconds, play one complete idle loop, then settle again. Explicit
+// preview overrides stay continuous so Settings can still inspect the row.
+export const IDLE_REST_MIN_MS = 4200
+export const IDLE_REST_MAX_MS = 9000
 // Mirrors agent.pet.constants.DEFAULT_SCALE — fallback only; the gateway sends
 // the configured scale.
 const DEFAULT_SCALE = 0.33
+
+export const idleRestMs = (rng: () => number = Math.random): number =>
+  IDLE_REST_MIN_MS + rng() * (IDLE_REST_MAX_MS - IDLE_REST_MIN_MS)
+
+function readDevicePixelRatio(): number {
+  const ratio = window.devicePixelRatio
+
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : 1
+}
+
+/**
+ * Track the effective renderer pixel ratio. Electron page zoom and moving a
+ * window between displays can both change it without remounting the pet.
+ */
+function useDevicePixelRatio(): number {
+  const [ratio, setRatio] = useState(readDevicePixelRatio)
+
+  useEffect(() => {
+    let resolutionQuery: MediaQueryList | null = null
+
+    const update = () => {
+      resolutionQuery?.removeEventListener('change', update)
+
+      const next = readDevicePixelRatio()
+
+      setRatio(current => (current === next ? current : next))
+
+      resolutionQuery = typeof window.matchMedia === 'function' ? window.matchMedia(`(resolution: ${next}dppx)`) : null
+      resolutionQuery?.addEventListener('change', update)
+    }
+
+    window.addEventListener('resize', update)
+    window.visualViewport?.addEventListener('resize', update)
+    update()
+
+    return () => {
+      resolutionQuery?.removeEventListener('change', update)
+      window.removeEventListener('resize', update)
+      window.visualViewport?.removeEventListener('resize', update)
+    }
+  }, [])
+
+  return ratio
+}
 
 // Mirrors agent.pet.constants.CODEX_STATE_ROWS (Petdex current taxonomy).
 export const DEFAULT_STATE_ROWS = [
@@ -145,9 +194,12 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
   const loopMs = info.loopMs ?? DEFAULT_LOOP_MS
   const scale = (info.scale ?? DEFAULT_SCALE) * zoom
   const rows = info.stateRows ?? DEFAULT_STATE_ROWS
+  const pixelRatio = useDevicePixelRatio()
 
   const drawW = Math.round(frameW * scale)
   const drawH = Math.round(frameH * scale)
+  const backingW = Math.max(1, Math.round(drawW * pixelRatio))
+  const backingH = Math.max(1, Math.round(drawH * pixelRatio))
 
   const image = useMemo(() => {
     if (!info.spritesheetBase64) {
@@ -188,6 +240,9 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
     let drawnRow = -1
     let activeRow = -1
     let activeCount = -1
+    let activeSparseIdle = false
+    let idleResting = false
+    let idleRestUntil = 0
     let pauseController: ReturnType<typeof createRendererLoopPauseController> | null = null
 
     const rendererPaused = () => pauseController?.isPaused() ?? document.visibilityState === 'hidden'
@@ -294,13 +349,20 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
       }
 
       const forcedRow = rowOverrideRef.current
-      const { row, count } = forcedRow ? resolveRow(forcedRow) : resolve(overrideRef.current ?? stateRef.current)
+      const state = overrideRef.current ?? stateRef.current
+      const { row, count } = forcedRow ? resolveRow(forcedRow) : resolve(state)
+      // Only the live, ordinary idle state gets the long still beat. Settings
+      // previews and concrete roam rows intentionally keep looping.
+      const sparseIdle = !forcedRow && overrideRef.current === undefined && state === 'idle'
 
-      if (row !== activeRow || count !== activeCount) {
+      if (row !== activeRow || count !== activeCount || sparseIdle !== activeSparseIdle) {
         activeRow = row
         activeCount = count
+        activeSparseIdle = sparseIdle
         frame = 0
         lastStep = now
+        idleResting = sparseIdle
+        idleRestUntil = sparseIdle ? now + idleRestMs() : 0
         drawnFrame = -1
       }
 
@@ -308,12 +370,25 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
       // differ; counts vary per row so derive the cadence here, not once.
       const stepMs = loopMs / count
 
-      if (now - lastStep >= stepMs) {
+      if (sparseIdle && idleResting) {
+        frame = 0
+
+        if (now >= idleRestUntil) {
+          idleResting = false
+          lastStep = now
+        }
+      } else if (now - lastStep >= stepMs) {
         frame += 1
         lastStep = now
-      }
 
-      frame %= count
+        if (sparseIdle && frame >= count) {
+          frame = 0
+          idleResting = true
+          idleRestUntil = now + idleRestMs()
+        } else {
+          frame %= count
+        }
+      }
 
       if (!image.complete || image.naturalWidth <= 0) {
         return
@@ -326,12 +401,14 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
         const sy = row * frameH
         ctx.clearRect(0, 0, canvas.width, canvas.height)
         ctx.imageSmoothingEnabled = false
-        ctx.drawImage(image, sx, sy, frameW, frameH, 0, 0, drawW, drawH)
+        ctx.drawImage(image, sx, sy, frameW, frameH, 0, 0, backingW, backingH)
         drawnFrame = frame
         drawnRow = row
       }
 
-      scheduleFrame(Math.max(0, stepMs - (now - lastStep)))
+      scheduleFrame(
+        sparseIdle && idleResting ? Math.max(0, idleRestUntil - now) : Math.max(0, stepMs - (now - lastStep))
+      )
     }
 
     kickAnimationRef.current = kickAnimation
@@ -353,15 +430,15 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
       pauseController?.dispose()
       unsubState()
     }
-  }, [image, frameW, frameH, frames, framesByState, framesByRow, loopMs, drawW, drawH, rows, pauseWhenUnfocused])
+  }, [image, frameW, frameH, frames, framesByState, framesByRow, loopMs, backingW, backingH, rows, pauseWhenUnfocused])
 
   return (
     <canvas
       aria-label={info.displayName ? `${info.displayName} pet` : 'pet'}
-      height={drawH}
+      height={backingH}
       ref={canvasRef}
       style={{ height: drawH, width: drawW }}
-      width={drawW}
+      width={backingW}
     />
   )
 }

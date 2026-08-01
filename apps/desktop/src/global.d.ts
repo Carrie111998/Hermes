@@ -48,6 +48,7 @@ declare global {
       petOverlay: {
         open: (request: PetOverlayOpenRequest) => Promise<{ ok: boolean; bounds?: PetOverlayBounds }>
         close: () => Promise<{ ok: boolean }>
+        getWorkArea: () => Promise<PetOverlayBounds | null>
         setBounds: (bounds: PetOverlayBounds) => void
         setIgnoreMouse: (ignore: boolean) => void
         setFocusable: (focusable: boolean) => void

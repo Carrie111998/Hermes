@@ -12,6 +12,7 @@ import {
   $petInfo,
   $petRoam,
   $petRoamDir,
+  cachePetInfo,
   clearPetUnread,
   type PetInfo,
   petProfile,
@@ -163,7 +164,7 @@ export function FloatingPet() {
     // revision (scale-only move still changes the sig) short-circuits below
     // via samePetRevision.
     if (changeEventsAvailable && petChange.tick > 0 && petChange.meta?.enabled === false) {
-      setPetInfo({ enabled: false })
+      cachePetInfo({ enabled: false })
 
       return
     }
@@ -179,7 +180,7 @@ export function FloatingPet() {
             }
 
             if (!meta.enabled) {
-              setPetInfo({ enabled: false })
+              cachePetInfo({ enabled: false })
 
               return
             }
@@ -209,7 +210,7 @@ export function FloatingPet() {
             return
           }
 
-          setPetInfo(next)
+          cachePetInfo(next)
         }
       } catch {
         // cosmetic feature — never surface gateway errors
@@ -406,9 +407,8 @@ export function FloatingPet() {
 
   const isDragging = useCallback(() => dragRef.current !== null, [])
 
-  // Roam only the in-window pet, only while it's idle (agent at rest) and not
-  // popped out into the OS overlay. Activity pauses the wander; the pet reacts
-  // in place, then resumes strolling when the turn ends.
+  // The in-window half of roaming: only while the agent is at rest and the pet
+  // is not popped out. The overlay owns its own display-aware wander loop.
   usePetRoam({
     commit: commitRoamPosition,
     containerRef,
