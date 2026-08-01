@@ -834,7 +834,7 @@ wheels = [
 
 [[package]]
 name = "cua-fleet"
-version = "0.0.5"
+version = "0.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
@@ -842,10 +842,10 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/b9/c422ab18a5fcb5867aca475b80897ff9068d6155ade8578b12a06c943414/cua_fleet-0.0.5-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:e510abe08ab08bbf753ee430967673364ffba3627164f3367c3210a089dce3b8", size = 781058, upload-time = "2026-07-27T20:25:29.7Z" },
-    { url = "https://files.pythonhosted.org/packages/d7/6f/34e9bb32b75b5403b53bc64c0ba136bd5c84a8784392ea47640632bf1ce7/cua_fleet-0.0.5-py3-none-macosx_11_0_arm64.whl", hash = "sha256:57a0a81fa2be56325c93256e2bc3e1bfc3af77a672ab0ccf361fe1448ebc42f5", size = 757511, upload-time = "2026-07-27T20:25:31.151Z" },
-    { url = "https://files.pythonhosted.org/packages/43/7f/f816a5af70991bbfa7013b16d1ff7e991075092f5c06245a3c61a9e2937b/cua_fleet-0.0.5-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:976ace24c31c11e5fadb3e848e8871f0aa5e9bf9c7c615bb33270f16a3a7f3e1", size = 829236, upload-time = "2026-07-27T20:25:32.282Z" },
-    { url = "https://files.pythonhosted.org/packages/93/56/38f72bb99213efc816ebf74000c5730362ddc80e07b4d2c53b0bf1af5230/cua_fleet-0.0.5-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:4432fcc373dd2a4436c1bd624ca6fb39f63916a0a35ac585b2a5deb625d2d11f", size = 910232, upload-time = "2026-07-27T20:25:33.741Z" },
+    { url = "https://files.pythonhosted.org/packages/33/12/e0e08eb6b56e421c92815654f162ee1bcd9e5abb7dbc1e26e12f316dff46/cua_fleet-0.0.6-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:4a292b0519eaa172c4d4d081e771e0a66e6cb964a2bb01fc2cbd68020c302c8a", size = 2123635, upload-time = "2026-08-01T02:21:37.116Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/53/398c64149eaf467e9d97fb0958ec97f5fab22a4c08a0a8c47cb72412532a/cua_fleet-0.0.6-py3-none-macosx_11_0_arm64.whl", hash = "sha256:ed310ad529c6655a9fde8455fc764c2b7e53f5ca2581e39aec9e878296a0de6e", size = 2037302, upload-time = "2026-08-01T02:21:38.393Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/c2/ac127bde7f2ffe1b2affe49e11b48d4053728c15d700b2b96190768d2296/cua_fleet-0.0.6-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:612c3d2cfe4b4a1356503a0ddee6518f9cc1d8e5c410124b68627a8650977237", size = 2300923, upload-time = "2026-08-01T02:21:39.561Z" },
+    { url = "https://files.pythonhosted.org/packages/33/e1/67de4257140bc9d22f14cb9ee4d627d5e25cf0544aa323d4d6ff33a25c8e/cua_fleet-0.0.6-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:4d5119b7ff46bd2af9af1a2310c16b6993787bafa94f308512463929eddcc45a", size = 2355463, upload-time = "2026-08-01T02:21:40.87Z" },
 ]
 
 [[package]]
@@ -1839,7 +1839,7 @@ requires-dist = [
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==48.0.1" },
-    { name = "cua-fleet", marker = "extra == 'cua-fleet'", specifier = "==0.0.5" },
+    { name = "cua-fleet", marker = "extra == 'cua-fleet'", specifier = "==0.0.6" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = "==0.155.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = "==1.8.20" },
     { name = "defusedxml", marker = "extra == 'wecom'", specifier = "==0.7.1" },
