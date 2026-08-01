@@ -767,6 +767,28 @@ class TestWebServerEndpoints:
         assert "GATEWAY_PROXY_URL" not in managed
         assert "GATEWAY_PROXY_URL" in _MESSAGING_KEYS_PAGE_KEYS
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("SLACK_BOT_TOKEN", "xoxb-valid-bot-token"),
+            ("SLACK_APP_TOKEN", "xapp-valid-app-token"),
+        ],
+    )
+    def test_slack_token_update_does_not_run_allowed_users_validation(
+        self, key, value
+    ):
+        """Valid Slack tokens must not depend on allowed-user parser state."""
+        from hermes_cli.config import load_env
+
+        resp = self.client.put(
+            "/api/messaging/platforms/slack",
+            json={"env": {key: value}},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "platform": "slack"}
+        assert load_env()[key] == value
+
 
 
     def test_model_set_maps_unknown_vendor_to_aggregator(self, monkeypatch):

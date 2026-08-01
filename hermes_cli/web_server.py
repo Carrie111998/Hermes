@@ -3848,11 +3848,11 @@ def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> Non
             for user_id in user_ids
             if user_id != "*" and not _SLACK_MEMBER_ID_RE.fullmatch(user_id)
         ]
-    if invalid:
-        raise HTTPException(
-            status_code=400,
-            detail="Slack allowed user IDs must be comma-separated member IDs like U01ABC2DEF3.",
-        )
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail="Slack allowed user IDs must be comma-separated member IDs like U01ABC2DEF3.",
+            )
 
 
 def _normalized_email_keyword_groups(raw: str) -> set[tuple[str, ...]]:
