@@ -10,6 +10,14 @@ import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } f
 
 export {}
 
+export interface HermesServiceModeState {
+  active: boolean
+  host: '127.0.0.1'
+  pid: number | null
+  port: number | null
+  startedAt: number | null
+}
+
 declare global {
   interface Window {
     hermesDesktop: {
@@ -85,6 +93,7 @@ declare global {
         onShown: (callback: () => void) => () => void
       }
       getBootProgress: () => Promise<DesktopBootProgress>
+      getServiceMode: () => Promise<HermesServiceModeState>
       getConnectionConfig: (profile?: null | string) => Promise<DesktopConnectionConfig>
       saveConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
       applyConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>

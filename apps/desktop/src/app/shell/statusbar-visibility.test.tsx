@@ -38,10 +38,13 @@ const item = (id: string, label: string, extra: Partial<StatusbarItem> = {}): St
   ...extra
 })
 
-function bar(items: StatusbarItem[]) {
+function bar(
+  items: StatusbarItem[],
+  { leftItems = [], lockedOnly = false }: { leftItems?: StatusbarItem[]; lockedOnly?: boolean } = {}
+) {
   render(
     <MemoryRouter>
-      <StatusbarControls items={items} />
+      <StatusbarControls items={items} leftItems={leftItems} lockedOnly={lockedOnly} />
     </MemoryRouter>
   )
 
@@ -126,6 +129,20 @@ describe('statusbar item visibility', () => {
 })
 
 describe('whole-bar visibility', () => {
+  it('keeps only locked safety indicators visible when the full status bar is hidden', () => {
+    const statusbar = bar(
+      [item('gateway-health', 'Gateway'), item('service-mode', 'SERVICE', { lockedVisible: true })],
+      {
+        leftItems: [item('execution-boundary', 'LOCAL', { lockedVisible: true })],
+        lockedOnly: true
+      }
+    )
+
+    expect(within(statusbar).getByText('LOCAL')).toBeTruthy()
+    expect(within(statusbar).getByText('SERVICE')).toBeTruthy()
+    expect(within(statusbar).queryByText('Gateway')).toBeNull()
+  })
+
   it('hides the bar from the context menu, leaving the keybind as the way back', async () => {
     const statusbar = bar([item('gateway-health', 'Gateway')])
 

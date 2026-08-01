@@ -32,6 +32,31 @@ hermes desktop
 
 That uses your current config, keys, sessions, and skills.
 
+## Service Mode (local diagnostics)
+
+Packaged Desktop builds ask whether Hermes should start normally, start in
+Service Mode, or quit. **Start normally** is the safe default and does not open
+a Chrome DevTools Protocol (CDP) endpoint. **Start in Service Mode** is an
+explicit, temporary opt-in for local UI inspection: after you actively
+acknowledge the risk, Hermes relaunches with a dynamically selected CDP port
+bound only to `127.0.0.1`.
+
+:::warning
+CDP has no user authentication. Any local program that can discover and reach
+the endpoint can potentially read rendered Hermes content, execute renderer
+JavaScript, trigger UI actions, and call exposed preload APIs. Do not open
+passwords, credentials, or especially sensitive content while Service Mode is
+active. Quit Hermes and start normally when diagnostics are complete.
+:::
+
+The acknowledgement is never saved. Its relaunch grant can be consumed once
+and expires after 60 seconds; after a successful relaunch, Service Mode remains
+active only until Hermes exits. The status bar shows `SERVICE` with the actual
+loopback endpoint and a locked `LOCAL` or `REMOTE` execution-boundary indicator.
+These safety indicators remain visible even when optional status-bar content is
+hidden. Stale grants and runtime markers are removed during startup and
+shutdown so they cannot report false activity.
+
 ## What's in the app
 
 The desktop app is organized as a chat-first window with a left sidebar for navigation. It's built to allow managing multiple simultaneous agent conversations, configuring messaging providers, creating artifacts, browsing projects' folder structures, and working on multiple projects at once.
@@ -54,7 +79,7 @@ The bar along the bottom of the chat shows live session state and exposes quick 
 
 - **Per-session YOLO toggle** — flip YOLO on or off for just this session (matching the TUI). YOLO bypasses the dangerous-command approval prompts, so know what you're turning off — see [Security → YOLO Mode](./security.md#yolo-mode).
 - **Context-usage meter** — a live "% full" meter of the session's context window. Click it to open the **Context Usage** popover with a token breakdown by category (system prompt, tool definitions, skills, memory, rules, MCP, subagent definitions, and the conversation itself) so you can see exactly what's eating the window before compression kicks in.
-- **Customizable items** — right-click the status bar (**Show in status bar**) to choose what appears: the context meter, workspace, model, approvals, turn/session timers, terminal, Command Center, backend version, and more — or hide the bar entirely (**Cmd/Ctrl+Shift+S** toggles it).
+- **Customizable items** — right-click the status bar (**Show in status bar**) to choose what appears: the context meter, workspace, model, approvals, turn/session timers, terminal, Command Center, backend version, and more — or hide all optional status-bar content (**Cmd/Ctrl+Shift+S** toggles it). Safety-locked indicators for active Service Mode and the local/remote execution boundary remain visible.
 
 Chatting against a Hermes instance on another machine instead of the bundled local backend? See [Connecting to a remote backend](#connecting-to-a-remote-backend) below — and for the full picture of how the remote-hosted dashboard connection works (the auth gate, the `/api/ws` chat socket, and WebSocket close-code triage), see [Web Dashboard → Connecting Hermes Desktop to a remote backend](./features/web-dashboard.md#connecting-hermes-desktop-to-a-remote-backend).
 

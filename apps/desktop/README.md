@@ -48,6 +48,33 @@ hermes update
 
 ---
 
+## Service Mode (local diagnostics)
+
+Packaged Desktop builds ask whether Hermes should start normally, start in
+Service Mode, or quit. **Start normally** is the safe default and does not open
+a Chrome DevTools Protocol (CDP) endpoint. **Start in Service Mode** is an
+explicit, temporary opt-in for local UI inspection: after an active risk
+acknowledgement, Hermes relaunches with a dynamically selected CDP port bound
+only to `127.0.0.1`.
+
+> [!WARNING]
+> CDP has no user authentication. Any local program that can discover and
+> reach the endpoint can potentially read rendered Hermes content, execute
+> renderer JavaScript, trigger UI actions, and call exposed preload APIs. Do
+> not open passwords, credentials, or especially sensitive content while
+> Service Mode is active. Quit Hermes and start normally when diagnostics are
+> complete.
+
+The acknowledgement is never saved. Its relaunch grant can be consumed once
+and expires after 60 seconds; after a successful relaunch, Service Mode remains
+active only until Hermes exits. The status bar shows `SERVICE` with the actual
+loopback endpoint and a locked `LOCAL` or `REMOTE` execution-boundary indicator.
+These safety indicators remain visible even when optional status-bar content is
+hidden. Stale grants and runtime markers are removed during startup and
+shutdown so they cannot report false activity.
+
+---
+
 ## Requirements
 
 The installer handles everything for you (Python 3.11+, a portable Git, ripgrep).

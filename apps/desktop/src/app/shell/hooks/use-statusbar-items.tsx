@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
@@ -9,6 +9,7 @@ import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
+import { resolveExecutionBoundary } from '@/lib/execution-boundary'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
@@ -125,6 +126,33 @@ export function useStatusbarItems({
   const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
+
+  const [serviceMode, setServiceMode] = useState<null | {
+    active: boolean
+    host: '127.0.0.1'
+    port: number | null
+  }>(null)
+
+  useEffect(() => {
+    let current = true
+
+    void window.hermesDesktop
+      .getServiceMode()
+      .then(state => {
+        if (current) {
+          setServiceMode(state)
+        }
+      })
+      .catch(() => {
+        if (current) {
+          setServiceMode({ active: false, host: '127.0.0.1', port: null })
+        }
+      })
+
+    return () => {
+      current = false
+    }
+  }, [])
 
   // The FOCUSED session (interacted tile, else the primary — the same
   // derivation the titlebar title follows): every session-scoped readout
@@ -303,34 +331,63 @@ export function useStatusbarItems({
     copy
   ])
 
-  const connectionItem = useMemo<StatusbarItem | null>(() => {
-    if (connection?.mode !== 'remote' || !connection.remoteHost) {
-      return null
-    }
+  const connectionItem = useMemo<StatusbarItem>(() => {
+    const boundary = resolveExecutionBoundary(connection)
+    const host = boundary.host
 
-    const ssh = connection.remoteKind === 'ssh'
-    const cloud = connection.remoteKind === 'cloud'
+    const label =
+      boundary.kind === 'local'
+        ? 'LOCAL'
+        : boundary.kind === 'ssh'
+          ? host
+            ? copy.connectionSsh(host)
+            : 'SSH'
+          : boundary.kind === 'cloud'
+            ? host
+              ? copy.connectionCloud(host)
+              : 'CLOUD'
+            : host
+              ? copy.connectionRemote(host)
+              : 'REMOTE'
 
     return {
       className: cn(
         'px-2 -ml-1 font-medium',
-        ssh ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'
+        boundary.kind === 'ssh' ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'
       ),
       icon: <Terminal className="size-3" />,
       id: 'connection',
-      label: ssh
-        ? copy.connectionSsh(connection.remoteHost)
-        : cloud
-          ? copy.connectionCloud(connection.remoteHost)
-          : copy.connectionRemote(connection.remoteHost),
-      // Label already names the host — no "click to manage" tip lecture.
+      label,
+      lockedVisible: true,
+      title:
+        boundary.kind === 'local'
+          ? 'Agent tools, terminal commands, and files run on this computer.'
+          : `Agent tools, terminal commands, and files run on ${host || 'the remote gateway'}.`,
       to: `${SETTINGS_ROUTE}?tab=gateway`
     }
-  }, [connection?.mode, connection?.remoteHost, connection?.remoteKind, copy])
+  }, [connection, copy])
+
+  const serviceModeItem = useMemo<StatusbarItem | null>(() => {
+    if (!serviceMode?.active || !serviceMode.port) {
+      return null
+    }
+
+    return {
+      className: 'bg-destructive px-2 font-semibold text-destructive-foreground',
+      detail: `${serviceMode.host}:${serviceMode.port}`,
+      id: 'service-mode',
+      label: 'SERVICE',
+      lockedVisible: true,
+      title:
+        'Service Mode is active. Local programs can read Hermes content and control the renderer. Quitting Hermes closes the endpoint.',
+      variant: 'text'
+    }
+  }, [serviceMode])
 
   const coreLeftStatusbarItems = useMemo<readonly StatusbarItem[]>(
     () => [
-      ...(connectionItem ? [connectionItem] : []),
+      ...(serviceModeItem ? [serviceModeItem] : []),
+      connectionItem,
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
         icon: <Command className="size-3.5" />,
@@ -456,6 +513,7 @@ export function useStatusbarItems({
       inferenceStatus?.reason,
       openAgents,
       projectName,
+      serviceModeItem,
       subagentsFailed,
       subagentsRunning,
       toggleCommandCenter

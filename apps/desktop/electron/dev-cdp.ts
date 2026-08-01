@@ -7,13 +7,17 @@
  * and read the live DOM from. Every one of those scripts already defaults to
  * 9222, so a dev-server run opens 9222 and they just work.
  *
+ * This module owns only the source-tree developer path. Packaged builds remain
+ * closed to environment-variable opt-in here; their separately-audited,
+ * one-shot user-confirmed path lives in `service-mode.ts`.
+ *
  * If you are running a dev server you are already executing arbitrary local
  * JS — vite's module graph and every postinstall in node_modules — so a
  * loopback debugging port does not meaningfully widen that. `perf:serve`
- * already opens one unconditionally. What must never happen is a *packaged*
- * app exposing it, which is the one hard gate here.
+ * already opens one unconditionally. A packaged app must never be opened by an
+ * environment variable, which is the hard gate here.
  *
- *  - packaged build              → always closed, whatever the env says.
+ *  - packaged build              → closed through this developer path.
  *  - no HERMES_DESKTOP_DEV_SERVER → closed (an unpackaged `electron .` against
  *    dist/ is how the packaged app gets smoke tested; it should behave like
  *    the packaged app).

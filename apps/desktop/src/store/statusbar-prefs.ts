@@ -3,10 +3,9 @@ import { Codecs, persistentAtom } from '@/lib/persisted'
 const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
 const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
 
-// Whole-bar visibility, VS Code's `workbench.statusBar.visible`. Off by default
-// — the bar is opt-in. Hiding it unmounts the bar (its 15s status poll goes with
-// it), so the way back is the `view.toggleStatusbar` keybind or the ⌘K row,
-// never the bar itself.
+// Whole-bar preference, VS Code's `workbench.statusBar.visible`. Off by default:
+// optional items are opt-in while locked safety indicators remain mounted;
+// `view.toggleStatusbar` or the ⌘K row restores the complete bar.
 export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, false, Codecs.bool)
 
 export function toggleStatusbarVisible() {

@@ -720,7 +720,6 @@ function TitlebarSlot({ area, className, style }: TitlebarSlotProps) {
 
 export function ContribController() {
   const sidebarOpen = useStore($sidebarOpen)
-  const statusbarVisible = useStore($statusbarVisible)
 
   return (
     <SidebarProvider
@@ -786,11 +785,10 @@ export function ContribController() {
           {/* "Close running tab?" — the busy/input-blocked tile close gate. */}
           <SessionTileCloseConfirm />
 
-          {/* The REAL statusbar (model pill, command center, agents, …) with
-              statusBar.left/right contributions merged in. Unmounted — not
-              just hidden — while toggled off, so its 15s status poll and the
-              per-turn readouts stop with it. */}
-          {statusbarVisible && <WiredPane part="statusbar" />}
+          {/* The statusbar surface stays mounted so locked safety indicators
+              (execution boundary and active Service Mode) remain visible even
+              when the user's whole-bar preference suppresses optional items. */}
+          <WiredPane part="statusbar" />
         </div>
       </ContribWiring>
     </SidebarProvider>

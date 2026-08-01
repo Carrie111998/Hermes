@@ -168,6 +168,17 @@ import {
   revalidateRemoteConnection
 } from './remote-liveness'
 import {
+  buildServiceModeRelaunchArgs,
+  consumeServiceModeGrant,
+  removeServiceModeState,
+  resolveServiceModeActivation,
+  resolveServiceModePrompt,
+  waitForDevToolsActivePort,
+  writeServiceModeGrant,
+  writeServiceModeState
+} from './service-mode'
+import type { ServiceModeRuntimeState } from './service-mode'
+import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
@@ -288,26 +299,56 @@ if (REMOTE_DISPLAY_REASON) {
   )
 }
 
-// Renderer debugging port. On for dev-server runs (`hgui` / `npm run dev`) so
-// the CDP tooling in scripts/ can attach; never for a packaged build — see
-// electron/dev-cdp.ts. Must run before app `ready` like the switches above;
-// Chromium binds it at launch.
-const DEV_CDP = resolveDevCdpPort({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
+// Renderer debugging. Source-tree dev runs keep the existing fixed-port path.
+// A packaged build may open CDP only through a short-lived, one-shot grant that
+// the native startup prompt writes before relaunch. The grant is consumed before
+// Chromium starts, and the service port is dynamic to make collisions impossible.
+const SERVICE_MODE_GRANT_PATH = path.join(app.getPath('userData'), 'service-mode-grant.json')
+const SERVICE_MODE_STATE_PATH = path.join(app.getPath('userData'), 'service-mode.json')
+const DEVTOOLS_ACTIVE_PORT_PATH = path.join(app.getPath('userData'), 'DevToolsActivePort')
 
-if (DEV_CDP.port) {
-  app.commandLine.appendSwitch('remote-debugging-port', String(DEV_CDP.port))
-  // Loopback only. Chromium already defaults to 127.0.0.1, but say it out loud
-  // so a future edit can't widen it by omission.
+const SERVICE_MODE = resolveServiceModeActivation({
+  argv: process.argv,
+  grant: consumeServiceModeGrant(SERVICE_MODE_GRANT_PATH),
+  isPackaged: IS_PACKAGED,
+  now: Date.now()
+})
+
+let serviceModeRuntime: ServiceModeRuntimeState | null = null
+
+if (SERVICE_MODE.active) {
+  // Never accept a stale Chromium publication from a prior crash.
+  fs.rmSync(DEVTOOLS_ACTIVE_PORT_PATH, { force: true })
+  app.commandLine.appendSwitch('remote-debugging-port', '0')
   app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
-  console.log(
-    `[hermes] renderer debugging on http://127.0.0.1:${DEV_CDP.port} — anything that can reach it ` +
-      'can run code in the renderer. HERMES_DESKTOP_CDP_PORT=off to disable.'
+  console.warn(
+    '[hermes] service mode authorized for this launch; renderer debugging will bind to a dynamic 127.0.0.1 port.'
   )
 } else {
-  const why = describeDevCdpDecision(DEV_CDP)
+  // A prior Service Mode crash or normal quit can leave Chromium's publication
+  // file behind even though the listener is gone. Packaged Standard Mode removes
+  // it so external diagnostics never mistake stale metadata for an active CDP.
+  if (IS_PACKAGED) {
+    fs.rmSync(DEVTOOLS_ACTIVE_PORT_PATH, { force: true })
+  }
 
-  if (why) {
-    console.warn(`[hermes] ${why}`)
+  const devCdp = resolveDevCdpPort({ env: process.env, isPackaged: IS_PACKAGED, devServer: DEV_SERVER })
+
+  if (devCdp.port) {
+    app.commandLine.appendSwitch('remote-debugging-port', String(devCdp.port))
+    // Loopback only. Chromium already defaults to 127.0.0.1, but say it out loud
+    // so a future edit can't widen it by omission.
+    app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
+    console.log(
+      `[hermes] renderer debugging on http://127.0.0.1:${devCdp.port} — anything that can reach it ` +
+        'can run code in the renderer. HERMES_DESKTOP_CDP_PORT=off to disable.'
+    )
+  } else {
+    const why = describeDevCdpDecision(devCdp)
+
+    if (why) {
+      console.warn(`[hermes] ${why}`)
+    }
   }
 }
 
@@ -11728,7 +11769,133 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
+async function choosePackagedStartMode(): Promise<'continue' | 'handoff' | 'quit'> {
+  if (!IS_PACKAGED || SERVICE_MODE.active) {
+    return 'continue'
+  }
+
+  // This path runs after the packaged process acquired the single-instance
+  // lock. Standard startup is therefore the authority for this userData and
+  // clears any runtime marker left by a crashed or force-exited Service run.
+  removeServiceModeState(SERVICE_MODE_STATE_PATH)
+
+  while (true) {
+    const result = await dialog.showMessageBox({
+      buttons: ['Start normally', 'Start in Service Mode', 'Quit'],
+      cancelId: 2,
+      checkboxChecked: false,
+      checkboxLabel:
+        'I understand that local programs can read Hermes content and control this window while Service Mode is active.',
+      defaultId: 0,
+      detail:
+        'Service Mode opens a Chrome DevTools Protocol endpoint on 127.0.0.1 for this app run only. ' +
+        'Never expose it to LAN or Tailscale. Avoid displaying passwords or other sensitive content during diagnostics.',
+      message: 'How should Hermes start?',
+      noLink: true,
+      type: 'question'
+    })
+
+    const action = resolveServiceModePrompt(result)
+
+    if (action === 'standard') {
+      return 'continue'
+    }
+
+    if (action === 'quit') {
+      app.quit()
+
+      return 'quit'
+    }
+
+    if (action === 'retry') {
+      await dialog.showMessageBox({
+        buttons: ['Back'],
+        detail: 'Select the acknowledgement checkbox before starting Service Mode.',
+        message: 'Acknowledgement required',
+        type: 'warning'
+      })
+
+      continue
+    }
+
+    try {
+      const grant = writeServiceModeGrant(SERVICE_MODE_GRANT_PATH)
+      app.relaunch({ args: buildServiceModeRelaunchArgs(process.argv.slice(1), grant.token) })
+      app.exit(0)
+
+      return 'handoff'
+    } catch (error) {
+      await dialog.showMessageBox({
+        buttons: ['Back'],
+        detail: `Hermes could not create the one-time Service Mode grant: ${error?.message || error}`,
+        message: 'Service Mode could not start',
+        type: 'error'
+      })
+    }
+  }
+}
+
+async function initializeServiceModeRuntime(): Promise<boolean> {
+  if (!SERVICE_MODE.active) {
+    return true
+  }
+
+  const port = await waitForDevToolsActivePort(DEVTOOLS_ACTIVE_PORT_PATH)
+
+  if (!port) {
+    dialog.showErrorBox(
+      'Service Mode could not start',
+      'Chromium did not publish a valid local debugging port. Hermes will close instead of continuing with an uncertain diagnostic state.'
+    )
+    app.exit(1)
+
+    return false
+  }
+
+  serviceModeRuntime = {
+    active: true,
+    host: '127.0.0.1',
+    pid: process.pid,
+    port,
+    startedAt: Date.now()
+  }
+
+  try {
+    writeServiceModeState(SERVICE_MODE_STATE_PATH, serviceModeRuntime)
+  } catch (error) {
+    dialog.showErrorBox(
+      'Service Mode could not start',
+      `Hermes could not publish its local diagnostic state: ${error?.message || error}`
+    )
+    app.exit(1)
+
+    return false
+  }
+
+  await dialog.showMessageBox({
+    buttons: ['Continue'],
+    detail:
+      `CDP is listening only on 127.0.0.1:${port}. Local programs can read visible Hermes content and control the renderer. ` +
+      'Do not expose this port to a network or display sensitive information during diagnostics. Quitting Hermes ends Service Mode.',
+    message: 'Service Mode is active',
+    type: 'warning'
+  })
+
+  return true
+}
+
+ipcMain.handle(
+  'hermes:service-mode',
+  () => serviceModeRuntime ?? { active: false, host: '127.0.0.1', pid: null, port: null, startedAt: null }
+)
+
+app.whenReady().then(async () => {
+  const launchChoice = await choosePackagedStartMode()
+
+  if (launchChoice !== 'continue' || !(await initializeServiceModeRuntime())) {
+    return
+  }
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {
@@ -11851,6 +12018,13 @@ app.on('before-quit', event => {
   // exactly as it was.
   if (heldQuitForActiveWork(event)) {
     return
+  }
+
+  removeServiceModeState(SERVICE_MODE_STATE_PATH, process.pid)
+  serviceModeRuntime = null
+
+  if (SERVICE_MODE.active) {
+    fs.rmSync(DEVTOOLS_ACTIVE_PORT_PATH, { force: true })
   }
 
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {

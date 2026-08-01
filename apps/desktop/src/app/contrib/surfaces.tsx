@@ -15,6 +15,7 @@ import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
+import { $statusbarVisible } from '@/store/statusbar-prefs'
 
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
@@ -78,6 +79,7 @@ export const StatusbarSurface = memo(function StatusbarSurface({
 }) {
   const gatewayState = useStore($gatewayState)
   const freshDraftReady = useStore($freshDraftReady)
+  const statusbarVisible = useStore($statusbarVisible)
   const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway)
   const extraLeftItems = useStatusbarContributions('left')
   const extraRightItems = useStatusbarContributions('right')
@@ -98,7 +100,7 @@ export const StatusbarSurface = memo(function StatusbarSurface({
     toggleCommandCenter: actions.toggleCommandCenter
   })
 
-  return <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} />
+  return <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} lockedOnly={!statusbarVisible} />
 })
 
 /** The workspace pane: the real route table (chat + full-page views + plugin

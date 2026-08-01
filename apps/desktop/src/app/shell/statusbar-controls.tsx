@@ -80,14 +80,25 @@ export type SetStatusbarItemGroup = (id: string, items: readonly StatusbarItem[]
 interface StatusbarControlsProps extends ComponentProps<'footer'> {
   leftItems?: readonly StatusbarItem[]
   items?: readonly StatusbarItem[]
+  /** Keep the safety-critical execution boundary visible while the user's
+   *  whole-bar preference suppresses every optional status item. */
+  lockedOnly?: boolean
 }
 
-export function StatusbarControls({ className, leftItems = [], items = [], ...props }: StatusbarControlsProps) {
+export function StatusbarControls({
+  className,
+  leftItems = [],
+  items = [],
+  lockedOnly = false,
+  ...props
+}: StatusbarControlsProps) {
   const navigate = useNavigate()
   const hiddenIds = useStore($statusbarHiddenIds)
 
   const visible = (item: StatusbarItem) =>
-    !item.hidden && (item.lockedVisible || !item.toggleLabel || !hiddenIds.includes(item.id))
+    !item.hidden &&
+    (!lockedOnly || item.lockedVisible === true) &&
+    (item.lockedVisible || !item.toggleLabel || !hiddenIds.includes(item.id))
 
   return (
     <ContextMenu>
@@ -123,8 +134,8 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
 
 /** Right-click the bar to choose what it shows. Lists every item that named
  *  itself with `toggleLabel`, in bar order (left cluster then right), so the
- *  menu reads like the surface it edits. Hiding the whole bar lives at the
- *  bottom — VS Code puts it on the same context menu. */
+ *  menu reads like the surface it edits. The whole-bar preference lives at the
+ *  bottom; locked safety indicators remain in a minimal bar when it is off. */
 function StatusbarVisibilityMenu({
   hiddenIds,
   items,
@@ -185,7 +196,7 @@ function StatusbarVisibilityMenu({
   )
 }
 
-/** The live ⌘⇧S hint on the hide row — the way back once the bar is gone. */
+/** The live ⌘⇧S hint on the hide row — the way back to the complete bar. */
 function StatusbarHideHint() {
   const hint = useKeybindHint('view.toggleStatusbar')
 
