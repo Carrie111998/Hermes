@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
 import ssl
 import time
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -89,13 +91,36 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import CostResult, estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _openrouter_reported_cost(response: Any) -> Optional[float]:
+    """Return a finite, non-negative cost reported by OpenRouter."""
+    try:
+        usage = getattr(response, "usage", None)
+        cost = getattr(usage, "cost", None)
+        if cost is None:
+            return None
+        cost = float(cost)
+        if not math.isfinite(cost) or cost < 0:
+            return None
+        return cost
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _is_openrouter_billing_route(provider: Any, base_url: Any) -> bool:
+    """Identify OpenRouter after provider/MoA route resolution."""
+    return (
+        str(provider or "").strip().lower() == "openrouter"
+        or base_url_host_matches(str(base_url or ""), "openrouter.ai")
+    )
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
@@ -160,7 +185,6 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
     "Context was compacted. The previous response is complete — "
     "awaiting your next message."
 )
-
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -3687,13 +3711,33 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
-                        _agg_cost_model,
-                        aggregator_usage,
-                        provider=_agg_cost_provider,
-                        base_url=_agg_cost_base_url,
-                        api_key=getattr(agent, "api_key", ""),
+                    # Prefer the actual cost OpenRouter reports (usage.cost) —
+                    # the same field Kilo Code / Cline read so their session
+                    # costs match the dashboard. It is the real charged amount
+                    # and already accounts for dynamic provider routing; only
+                    # fall back to a list-price estimate when it's absent.
+                    _reported_cost = (
+                        _openrouter_reported_cost(response)
+                        if _is_openrouter_billing_route(
+                            _agg_cost_provider, _agg_cost_base_url
+                        )
+                        else None
                     )
+                    if _reported_cost is not None:
+                        cost_result = CostResult(
+                            amount_usd=Decimal(str(_reported_cost)),
+                            status="actual",
+                            source="provider_cost_api",
+                            label=f"${_reported_cost:.4f}",
+                        )
+                    else:
+                        cost_result = estimate_usage_cost(
+                            _agg_cost_model,
+                            aggregator_usage,
+                            provider=_agg_cost_provider,
+                            base_url=_agg_cost_base_url,
+                            api_key=getattr(agent, "api_key", ""),
+                        )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each

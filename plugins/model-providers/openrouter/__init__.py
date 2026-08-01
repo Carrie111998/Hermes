@@ -103,6 +103,11 @@ class OpenRouterProfile(ProviderProfile):
         if prefs:
             body["provider"] = prefs
 
+        # Ask OpenRouter to include the actual charged amount in usage.cost.
+        # The conversation loop uses it for exact session accounting and falls
+        # back to list-price estimation when an endpoint omits it.
+        body["usage"] = {"include": True}
+
         # Pareto Code router — model-gated. The plugins block is only
         # meaningful for openrouter/pareto-code; sending it on any other
         # model has no documented effect and would be confusing in logs.
