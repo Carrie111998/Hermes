@@ -1,4 +1,4 @@
-name: HA Integration Tests
+﻿name: HA Integration Tests
 
 on:
   push:

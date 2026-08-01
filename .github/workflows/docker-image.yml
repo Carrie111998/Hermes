@@ -1,4 +1,4 @@
-name: Docker Image CI
+﻿name: Docker Image CI
 
 on:
   push:
@@ -13,11 +13,14 @@ jobs:
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
+    - name: Lowercase repo for Docker tags
+      run: echo "REPO_LOWER=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
     - name: Build the Docker image
       run: |
         docker build . \
           --file Dockerfile \
           --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.21 \
           --build-arg BUILD_ARCH=amd64 \
-          --tag ghcr.io/${{ toLower(github.repository) }}:latest \
-          --tag ghcr.io/${{ toLower(github.repository) }}:${{ github.sha }}
+          --tag ghcr.io/${{ env.REPO_LOWER }}:latest \
+          --tag ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
