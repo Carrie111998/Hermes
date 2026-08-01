@@ -60,6 +60,7 @@ MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+STALE_SWEEP_INTERVAL = 300     # Check for stale background processes every 5 minutes
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -213,6 +214,17 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+        # Background sweep thread — kills running processes that exceed
+        # MAX_ACTIVE_PROCESS_AGE to prevent leaked subprocesses from consuming
+        # unbounded resources (issue #76115).
+        self._stale_sweep_stop = threading.Event()
+        self._stale_sweep_thread = threading.Thread(
+            target=self._stale_sweep_loop,
+            daemon=True,
+            name="process-stale-sweep",
+        )
+        self._stale_sweep_thread.start()
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -1944,6 +1956,59 @@ class ProcessRegistry:
                 source="kill_all",
                 consume_output=False,
             )
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
+
+    # ----- Stale-process sweep (issue #76115) -----
+
+    def _stale_sweep_loop(self) -> None:
+        """Background daemon that kills long-running background processes.
+
+        Prevents leaked subprocesses (e.g. abandoned builds) from consuming
+        unbounded memory and starving the gateway event loop.  Runs every
+        STALE_SWEEP_INTERVAL seconds and kills any running process that
+        exceeds MAX_ACTIVE_PROCESS_AGE.
+        """
+        while not self._stale_sweep_stop.is_set():
+            try:
+                self._stale_sweep_stop.wait(STALE_SWEEP_INTERVAL)
+                if self._stale_sweep_stop.is_set():
+                    break
+                self._reap_stale_running()
+            except Exception:
+                logger.debug("Stale-process sweep iteration failed", exc_info=True)
+
+    def _reap_stale_running(self, max_age: Optional[float] = None) -> int:
+        """Kill running processes that exceed *max_age* seconds.
+
+        Returns the number of processes killed.  Uses the existing
+        ``kill_process`` infrastructure which handles process-tree teardown
+        (SIGKILL/SIGTERM on POSIX, taskkill /T /F on Windows) and moves
+        the session to the finished dict.
+        """
+        if max_age is None:
+            max_age = float(MAX_ACTIVE_PROCESS_AGE)
+        now = time.time()
+        with self._lock:
+            stale_ids = [
+                s.id for s in self._running.values()
+                if not s.exited and (now - s.started_at) > max_age
+            ]
+
+        killed = 0
+        for sid in stale_ids:
+            age_hours = None
+            with self._lock:
+                s = self._running.get(sid)
+                if s:
+                    age_hours = (now - s.started_at) / 3600
+            logger.warning(
+                "Reaping stale background process %s (age %.1fh exceeds max %dh): %s",
+                sid, age_hours or 0, int(max_age // 3600),
+                s.command if s else "<unknown>",
+            )
+            result = self.kill_process(sid, source="stale_sweep", consume_output=False)
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
         return killed
