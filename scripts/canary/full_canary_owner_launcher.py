@@ -16096,7 +16096,9 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 for code in allowed_returncodes
             )
             or not 0 < timeout_seconds <= 2_400
-            or not 0 < maximum_output_bytes <= _HTTP_RESPONSE_MAX_BYTES
+            or not 0 < maximum_output_bytes <= (
+                _STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+            )
         ):
             raise OwnerLauncherError("stopped_release_remote_contract_invalid")
         authorization_before = self._authorization_snapshot(account)

@@ -3919,6 +3919,66 @@ def test_production_transport_invoke_uses_supported_remote_bounds() -> None:
     assert len(captured["input_bytes"]) < captured["maximum_input_bytes"]
 
 
+def test_production_transport_non_input_uses_supported_remote_bounds() -> None:
+    transport = _production_transport()
+    captured: dict[str, object] = {}
+
+    def run_remote(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b'{"ok":true}\n',
+            stderr=b"",
+        )
+
+    transport._run_remote = run_remote
+
+    assert transport.invoke(REVISION, "collect-initial") == {"ok": True}
+    assert captured["timeout_seconds"] == 2_400
+    assert captured["maximum_output_bytes"] == (
+        canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+    )
+
+
+def test_stopped_release_transport_accepts_opt_in_live_sized_response() -> None:
+    transport = _production_transport()
+    snapshot = ("1" * 64, "2" * 64, "3" * 64)
+    transport._authorization_snapshot = lambda _account: snapshot
+    transport._validate_dry_run = lambda _argv: None
+    transport._postflight = lambda: None
+    response = _canonical({"data": "x" * 2_700_000}) + b"\n"
+    calls: list[tuple[tuple[str, ...], dict]] = []
+
+    def run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=response,
+            stderr=b"",
+        )
+
+    transport._preflight_runner = run
+    remote = transport._remote_command(REVISION, "collect-initial")
+    completed = transport._run_remote(
+        remote,
+        account="owner@example.com",
+        maximum_output_bytes=(
+            canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+        ),
+    )
+
+    assert (
+        canary_transport._HTTP_RESPONSE_MAX_BYTES
+        < len(response)
+        <= canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+    )
+    assert completed.stdout == response
+    assert len(calls) == 1
+
+
 def test_stopped_release_transport_accepts_opt_in_live_sized_iam_response() -> None:
     transport = _production_transport()
     snapshot = ("1" * 64, "2" * 64, "3" * 64)
