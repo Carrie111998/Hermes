@@ -32,6 +32,48 @@ interfaze-api --host 127.0.0.1 --port 8000
 
 OpenAPI is available at `/openapi.json` and interactive API docs at `/docs`.
 
+## Connect Gmail and Microsoft 365
+
+Configure the public origin, credential-encryption key, and provider-issued
+OAuth credentials in the deployment environment:
+
+```bash
+export INTERFAZE_PUBLIC_BASE_URL='https://interfaze.example.com'
+export INTERFAZE_CREDENTIAL_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+
+export GOOGLE_OAUTH_CLIENT_ID="${GOOGLE_OAUTH_CLIENT_ID:?load the provider-issued id from the deployment secret manager}"
+export GOOGLE_OAUTH_CLIENT_SECRET="${GOOGLE_OAUTH_CLIENT_SECRET:?load the provider-issued secret from the deployment secret manager}"
+
+export MICROSOFT_OAUTH_CLIENT_ID="${MICROSOFT_OAUTH_CLIENT_ID:?load the provider-issued id from the deployment secret manager}"
+export MICROSOFT_OAUTH_CLIENT_SECRET="${MICROSOFT_OAUTH_CLIENT_SECRET:?load the provider-issued secret from the deployment secret manager}"
+export MICROSOFT_OAUTH_TENANT='common'
+```
+
+`INTERFAZE_PUBLIC_BASE_URL` must be the public HTTPS origin serving both the
+packaged WebUI and API. Register these exact redirect URIs with the providers:
+
+```text
+https://interfaze.example.com/api/v1/integrations/email/oauth/google/callback
+https://interfaze.example.com/api/v1/integrations/email/oauth/microsoft/callback
+```
+
+Google requires the Gmail modify scope and offline consent. Microsoft requires
+`offline_access Mail.ReadWrite Mail.Send User.Read`. Provider client secrets
+are deployment secrets and must never be configured in the browser.
+`MICROSOFT_OAUTH_TENANT` defaults to `common`.
+
+Demo checklist:
+
+1. Start the API on the same public origin registered with the provider.
+2. Sign in and open Integrations.
+3. Click Google Workspace or Microsoft 365 Connect and allow the popup.
+4. Complete consent and verify the popup closes.
+5. Verify the card changes to `connected` without reloading the browser page.
+6. Click Test to verify provider scopes.
+
+Live-provider consent stays outside automated CI. The automated suite must
+never call Google or Microsoft.
+
 ## Seed the tenant-backed test client
 
 For local product testing, seed the deterministic Silverine client into the
