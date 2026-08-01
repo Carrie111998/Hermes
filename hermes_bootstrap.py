@@ -65,10 +65,17 @@ import sys
 _IS_WINDOWS = sys.platform == "win32"
 _bootstrap_applied = False
 
-# Matches a versioned CPython directory segment, e.g. ".../lib/python3.12/
-# site-packages" — captures (major, minor) so it can be compared against the
-# running interpreter's own version.
-_PYVER_DIR_RE = re.compile(r"python(\d+)\.(\d+)(?=[\\/]|$)", re.IGNORECASE)
+# Matches a complete ".../pythonX.Y/site-packages" path — captures (major,
+# minor) so it can be compared against the running interpreter's own
+# version. The two path components must be adjacent: a "pythonX.Y" segment
+# immediately followed by a "site-packages" segment. Anchoring on the full
+# pair (rather than checking "pythonX.Y/" and "site-packages" as
+# independent substrings anywhere in the path) avoids misfiring on paths
+# where the two happen to appear separately, e.g.
+# ".../python3.12/config/site-packages-notes".
+_PYVER_DIR_RE = re.compile(
+    r"python(\d+)\.(\d+)[\\/]site-packages(?=[\\/]|$)", re.IGNORECASE
+)
 
 
 def apply_windows_utf8_bootstrap() -> bool:
@@ -229,6 +236,13 @@ def activate_durable_lazy_target() -> None:
     The activation appends to the END of ``sys.path`` so the core venv
     always wins name collisions (see ``tools.lazy_deps`` for the full
     security rationale). Never raises; a missing/empty target is a no-op.
+
+    Must run *after* :func:`harden_user_site_version` (see the module-level
+    call order below). A configured target is trusted, arbitrary path — it
+    can legitimately be named like a versioned site-packages dir (e.g.
+    ``/data/python3.12/site-packages``) even though it holds packages for
+    the *running* interpreter. Activating it before the version sanitizer
+    would let the sanitizer immediately strip it back off ``sys.path``.
     """
     if not os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip():
         return
@@ -261,6 +275,9 @@ def harden_user_site_version() -> None:
     always resolve into the running interpreter's own, healthy
     site-packages instead of silently shadowing into an incompatible one.
     Never raises; a clean ``sys.path`` is a no-op.
+
+    Must run *before* :func:`activate_durable_lazy_target` — see that
+    function's docstring for why the ordering matters.
     """
     current = (sys.version_info.major, sys.version_info.minor)
     try:
@@ -268,11 +285,7 @@ def harden_user_site_version() -> None:
         changed = False
         for entry in sys.path:
             match = _PYVER_DIR_RE.search(entry)
-            if (
-                match
-                and "site-packages" in entry.replace("\\", "/")
-                and (int(match.group(1)), int(match.group(2))) != current
-            ):
+            if match and (int(match.group(1)), int(match.group(2))) != current:
                 changed = True
                 continue
             cleaned.append(entry)
@@ -290,11 +303,16 @@ def harden_user_site_version() -> None:
 apply_windows_utf8_bootstrap()
 suppress_platform_ver_console()
 
+# Scrub any mismatched-Python-version site-packages dir off sys.path before
+# any backend module (PIL, etc.) can resolve an import into it. Must run
+# BEFORE activate_durable_lazy_target(): a configured durable target is a
+# trusted, arbitrary path that can legitimately be named like a versioned
+# site-packages dir (e.g. "/data/python3.12/site-packages") for a different
+# reason than an actual leaked interpreter version — activating it first
+# would let this sanitizer immediately strip it back off sys.path.
+harden_user_site_version()
+
 # Activate the durable lazy-install target (immutable Docker images) so
 # packages installed into the data volume on a previous run are importable
 # this run, before any backend module imports its SDK. No-op when unset.
 activate_durable_lazy_target()
-
-# Scrub any mismatched-Python-version site-packages dir off sys.path before
-# any backend module (PIL, etc.) can resolve an import into it.
-harden_user_site_version()
