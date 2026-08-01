@@ -120,14 +120,16 @@ async def test_websocket_auth_raises_on_rejection():
 
 
 
-
 @pytest.mark.asyncio
 async def test_membership_event_adopts_new_named_channel_when_unpinned():
     """A new community membership must subscribe without a gateway restart (#75107)."""
     adapter = _make_adapter()
     new_channel = "new-community-channel"
 
+    messages_get_calls = 0
+
     async def run_cli(args, **_kwargs):
+        nonlocal messages_get_calls
         if args == ["dms", "list"]:
             return 0, "[]", ""
         if args == ["channels", "list"]:
@@ -135,6 +137,7 @@ async def test_membership_event_adopts_new_named_channel_when_unpinned():
                 {"channel_id": new_channel, "name": "release-team", "description": "Announcements"}
             ]), ""
         if args[:2] == ["messages", "get"]:
+            messages_get_calls += 1
             return 0, json.dumps([{"id": "pre-join", "created_at": 41}]), ""
         raise AssertionError(f"unexpected CLI command: {args}")
 
@@ -159,6 +162,9 @@ async def test_membership_event_adopts_new_named_channel_when_unpinned():
         "REQ", subscription_id, {"kinds": [9], "#h": [new_channel], "since": 40}
     ]]
 
+    await adapter._handle_membership_event(websocket, subscriptions, {"created_at": 43})
+    assert messages_get_calls == 1
+    assert len(websocket.sent) == 1
 
 @pytest.mark.asyncio
 async def test_membership_event_does_not_adopt_channel_outside_explicit_watch_list():
@@ -176,7 +182,6 @@ async def test_membership_event_does_not_adopt_channel_outside_explicit_watch_li
     adapter._run_cli = run_cli
     await adapter._handle_membership_event(_FakeWebSocket(), {"membership": None}, {"created_at": 42})
     assert "not-configured" not in adapter._channel_state
-
 
 @pytest.mark.asyncio
 async def test_membership_event_leaves_state_unchanged_when_channel_lookup_fails():

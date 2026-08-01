@@ -803,8 +803,8 @@ class BuzzAdapter(BasePlatformAdapter):
         subscribe to any new ones (fresh DMs dispatch from their beginning)."""
         self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
         before = set(self._channel_state)
-        await self._discover_dms(seed=False)
         await self._discover_joined_channels()
+        await self._discover_dms(seed=False)
         for channel_id in self._channel_state:
             if channel_id in before:
                 continue
@@ -982,7 +982,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state:
+            if ch_id in self._channel_state or self._may_reclassify_as_dm(ch_id):
                 continue
             await self._seed_channel(ch_id, chat_type="group")
 
