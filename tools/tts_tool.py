@@ -3373,6 +3373,30 @@ def stream_tts_to_speaker(
     """
     tts_done_event.clear()
 
+    streamer = None
+    cancel_watcher_stop = None
+    cancel_invoked = threading.Event()
+    cancel_lock = threading.Lock()
+
+    def _invoke_streamer_cancel() -> None:
+        """Invoke an adapter's idempotent cancel hook once per speaker run."""
+        nonlocal streamer
+        if streamer is None:
+            return
+        with cancel_lock:
+            if cancel_invoked.is_set():
+                return
+            cancel_invoked.set()
+        cancel = getattr(streamer, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                # Adapter cancellation is contractually non-raising, so an
+                # exception here is an unexpected provider bug worth retaining
+                # in operational logs even though barge-in must still proceed.
+                logger.warning("Streaming TTS cancellation failed", exc_info=True)
+
     try:
         output_stream = None
         tts_config = _load_tts_config()
@@ -3381,6 +3405,21 @@ def stream_tts_to_speaker(
         # per-sentence sync synthesis (universal — edge + every non-streamer).
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
         streamer = resolve_streaming_provider(tts_config, preferred=provider)
+
+        # Stop can arrive from another thread while a provider is blocked in
+        # its network iterator. Bridge that event to the adapter's
+        # cross-thread cancellation hook; non-cancellable adapters still stop
+        # locally and simply leave the upstream request running.
+        if streamer is not None:
+            cancel_watcher_stop = threading.Event()
+
+            def _cancel_on_stop() -> None:
+                while not cancel_watcher_stop.wait(0.05):
+                    if stop_event.is_set():
+                        _invoke_streamer_cancel()
+                        return
+
+            threading.Thread(target=_cancel_on_stop, daemon=True).start()
 
         stream_max_len = 0
         if streamer is not None:
@@ -3515,6 +3554,10 @@ def stream_tts_to_speaker(
                 # os.unlink() below (WinError 32, swallowed → temp .wav files
                 # pile up).  Release the handle before playback and cleanup.
                 tmp.close()
+                # Barge-in while buffering must never turn a partial WAV into
+                # audible output. Cleanup still runs in the finally block.
+                if stop_evt.is_set():
+                    return
                 from tools.voice_mode import play_audio_file
                 play_audio_file(tmp_path)
             except Exception as exc:
@@ -3563,6 +3606,10 @@ def stream_tts_to_speaker(
     except Exception as exc:
         logger.warning("Streaming TTS pipeline error: %s", exc)
     finally:
+        if cancel_watcher_stop is not None:
+            cancel_watcher_stop.set()
+        if stop_event.is_set():
+            _invoke_streamer_cancel()
         # Always close the audio output stream to avoid locking the device
         if output_stream is not None:
             try:

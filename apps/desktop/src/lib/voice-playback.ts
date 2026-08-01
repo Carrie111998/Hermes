@@ -9,6 +9,13 @@ import {
 } from '@/store/voice-playback'
 
 import { sanitizeTextForSpeech } from './speech-text'
+import {
+  createVoicePlayoutController,
+  type VoiceAudioFrame,
+  type VoiceAudioSink,
+  type VoicePlayoutController,
+  type VoicePlayoutTelemetry
+} from './voice-playout'
 
 // Free Edge TTS occasionally hands back audio that never fires `playing`/`ended`
 // nor `error` — leaving voice mode stuck "speaking" forever. Reject if playback
@@ -91,9 +98,9 @@ export function stopVoicePlayback() {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming path — /api/audio/speak-stream WebSocket, raw int16 PCM frames
-// scheduled through Web Audio. Speech starts on the provider's first chunk
-// instead of after full synthesis + base64 transfer.
+// Streaming path — /api/audio/speak-stream WebSocket. Versioned streams feed
+// one bounded AudioWorklet ring-buffer clock; legacy raw PCM remains on its
+// compatibility scheduler. Speech starts while synthesis is still running.
 // ---------------------------------------------------------------------------
 
 async function resolveSpeakStreamUrl(): Promise<null | string> {
@@ -140,6 +147,99 @@ export interface SpeechStreamSession {
    *             text through `playSpeechText` instead.
    */
   done: Promise<'done' | 'fallback'>
+  /** Snapshot of provider-neutral playout counters for diagnostics. */
+  getTelemetry?: () => VoicePlayoutTelemetry
+}
+
+export type VoiceStreamProtocol = 'hermes.audio.v1' | 'legacy'
+
+export function negotiateVoiceStreamProtocol(frame: {
+  encoding?: string
+  protocol?: string
+  protocol_version?: string
+  sample_rate?: number
+  version?: number | string
+}): VoiceStreamProtocol {
+  const versioned =
+    frame.protocol === 'hermes.audio.v1' ||
+    frame.protocol_version === 'hermes.audio.v1' ||
+    frame.version === 'hermes.audio.v1'
+
+  return versioned ? 'hermes.audio.v1' : 'legacy'
+}
+
+async function createAudioWorkletSink(context: AudioContext, maxBufferSamples: number): Promise<VoiceAudioSink> {
+  const moduleUrl = new URL('audio-worklet/voice-playout-processor.js', window.location.href)
+  await context.audioWorklet.addModule(moduleUrl.toString())
+
+  const node = new AudioWorkletNode(context, 'hermes-voice-playout', {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    processorOptions: { maxBufferSamples }
+  })
+  node.connect(context.destination)
+  let drainId = 0
+  const pendingDrains = new Map<number, () => void>()
+  let sink: VoiceAudioSink
+
+  node.port.onmessage = event => {
+    const message = event.data as { id?: number; type?: string }
+
+    if (message.type === 'underrun') {
+      sink.onUnderrun?.()
+    } else if (message.type === 'overflow') {
+      sink.onOverflow?.()
+    } else if (message.type === 'stable') {
+      sink.onStablePlayback?.()
+    } else if (message.type === 'drained' && typeof message.id === 'number') {
+      pendingDrains.get(message.id)?.()
+      pendingDrains.delete(message.id)
+    }
+  }
+
+  let stopped = false
+  sink = {
+    drain: () => {
+      if (stopped) {
+        return
+      }
+
+      const id = ++drainId
+
+      return new Promise<void>(resolve => {
+        pendingDrains.set(id, resolve)
+        node.port.postMessage({ id, type: 'drain' })
+      })
+    },
+    pause: () => {
+      if (!stopped) {
+        node.port.postMessage({ type: 'pause' })
+      }
+    },
+    start: () => {
+      if (!stopped) {
+        node.port.postMessage({ type: 'start' })
+      }
+    },
+    stop: () => {
+      if (stopped) {
+        return
+      }
+
+      stopped = true
+      node.port.postMessage({ type: 'cancel' })
+      node.disconnect()
+      pendingDrains.forEach(resolve => resolve())
+      pendingDrains.clear()
+    },
+    write: samples => {
+      if (!stopped) {
+        node.port.postMessage({ samples: samples.buffer, type: 'write' }, [samples.buffer])
+      }
+    }
+  }
+
+  return sink
 }
 
 /**
@@ -156,6 +256,36 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
   let streamRate = 24_000
   let nextStartAt = 0
   let carry: null | Uint8Array = null
+  let versioned = false
+  let controller: VoicePlayoutController | null = null
+  let latestTelemetry: VoicePlayoutTelemetry = {
+    framesReceived: 0,
+    maxBufferedMs: 0,
+    orderingViolations: 0,
+    queueOverflows: 0,
+    samplesReceived: 0,
+    underruns: 0
+  }
+  let pendingAudioMeta: null | {
+    sample_count?: number
+    sample_offset?: number
+    sampleCount?: number
+    sampleOffset?: number
+    sequence?: number
+  } = null
+  const pendingVersionedAudio: Array<{
+    data: ArrayBuffer
+    meta: {
+      sample_count?: number
+      sample_offset?: number
+      sampleCount?: number
+      sampleOffset?: number
+      sequence?: number
+    }
+  }> = []
+  let versionedEnd = false
+  let maxPendingVersionedFrames = 50
+  let versionedInit: Promise<void> | null = null
   let started = false
   let settled = false
   let finished = false
@@ -196,14 +326,46 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
 
   // stopVoicePlayback() → immediate barge-in: kill the socket (the server
   // aborts synthesis on disconnect) and the audio context (cuts sound now).
-  currentStop = () => settle('done')
+  currentStop = () => {
+    controller?.cancel()
+
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: 'stop' }))
+      } catch {
+        // Closing the socket below remains the cancellation fallback.
+      }
+    }
+
+    settle('done')
+  }
 
   const finishWhenDrained = () => {
+    if (controller) {
+      if (controller.getTelemetry().framesReceived === 0) {
+        settle('fallback')
+        return
+      }
+
+      void controller
+        .end()
+        .then(() => settle('done'))
+        .catch(() => settle(started ? 'done' : 'fallback'))
+      return
+    }
+
     const remainingMs = context ? Math.max(0, nextStartAt - context.currentTime) * 1_000 : 0
     window.setTimeout(() => settle('done'), remainingMs + 100)
   }
 
-  const schedule = (data: ArrayBuffer) => {
+  const scheduleLegacy = (data: ArrayBuffer) => {
+    if (!context) {
+      context = new AudioContext()
+      if (context.state === 'suspended') {
+        void context.resume().catch(() => undefined)
+      }
+    }
+
     if (!context) {
       return
     }
@@ -251,18 +413,186 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
     }
   }
 
+  const pushVersioned = (
+    data: ArrayBuffer,
+    meta: {
+      sample_count?: number
+      sample_offset?: number
+      sampleCount?: number
+      sampleOffset?: number
+      sequence?: number
+    }
+  ) => {
+    if (!controller) {
+      if (pendingVersionedAudio.length >= maxPendingVersionedFrames) {
+        settle(started ? 'done' : 'fallback')
+        return
+      }
+      pendingVersionedAudio.push({ data, meta })
+      return
+    }
+
+    const bytes = new Uint8Array(data)
+
+    if (bytes.byteLength % 2 !== 0) {
+      controller.push({
+        sampleCount: Number(meta.sample_count ?? meta.sampleCount ?? 0),
+        sampleOffset: Number(meta.sample_offset ?? meta.sampleOffset ?? 0),
+        sequence: Number(meta.sequence ?? 0),
+        samples: new Int16Array()
+      })
+      return
+    }
+
+    const samples = new Int16Array(bytes.byteLength / 2)
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
+    for (let index = 0; index < samples.length; index += 1) {
+      samples[index] = view.getInt16(index * 2, true)
+    }
+
+    const frame: VoiceAudioFrame = {
+      sampleCount: Number(meta.sample_count ?? meta.sampleCount ?? samples.length),
+      sampleOffset: Number(meta.sample_offset ?? meta.sampleOffset ?? 0),
+      sequence: Number(meta.sequence ?? 0),
+      samples
+    }
+    controller.push(frame)
+    latestTelemetry = controller.getTelemetry()
+
+    if (!started && controller.getState().started) {
+      started = true
+      setVoicePlaybackState(currentState('speaking', options))
+    }
+  }
+
+  const initializeVersioned = (frame: {
+    channels?: number
+    encoding?: string
+    initial_buffer_ms?: number
+    max_buffer_ms?: number
+    initialBufferMs?: number
+    maxBufferMs?: number
+    sample_rate?: number
+    sampleRate?: number
+  }) => {
+    if (versionedInit) {
+      return versionedInit
+    }
+
+    streamRate = frame.sample_rate ?? frame.sampleRate ?? 24_000
+    const channels = frame.channels ?? 1
+    const maxBufferMs = frame.max_buffer_ms ?? frame.maxBufferMs ?? 1_000
+    maxPendingVersionedFrames = Math.max(1, Math.ceil(maxBufferMs / 20))
+
+    if (
+      frame.encoding !== 'pcm_s16le' ||
+      !Number.isInteger(streamRate) ||
+      streamRate < 8_000 ||
+      streamRate > 96_000 ||
+      channels !== 1
+    ) {
+      settle('fallback')
+      versionedInit = Promise.resolve()
+      return versionedInit
+    }
+
+    try {
+      // AudioWorklet samples are consumed on the AudioContext clock. Bind that
+      // clock to the negotiated PCM rate; otherwise 44.1 kHz providers play at
+      // the host's common 48 kHz rate (fast, pitched up, and prone to underrun).
+      context = new AudioContext({ sampleRate: streamRate })
+      if (context.sampleRate !== streamRate) {
+        throw new Error('AudioContext did not honor the negotiated sample rate')
+      }
+    } catch {
+      settle('fallback')
+      versionedInit = Promise.resolve()
+      return versionedInit
+    }
+    if (context.state === 'suspended') {
+      void context.resume().catch(() => undefined)
+    }
+
+    versionedInit = createAudioWorkletSink(context, Math.ceil((maxBufferMs / 1_000) * streamRate))
+      .then(sink => {
+        if (settled) {
+          sink.stop()
+          return
+        }
+
+        controller = createVoicePlayoutController(sink, {
+          channels,
+          initialBufferMs: frame.initial_buffer_ms ?? frame.initialBufferMs,
+          maxBufferMs,
+          onError: () => {
+            latestTelemetry = controller?.getTelemetry() ?? latestTelemetry
+            settle(started ? 'done' : 'fallback')
+          },
+          onState: state => {
+            if (!started && state.started) {
+              started = true
+              setVoicePlaybackState(currentState('speaking', options))
+            }
+          },
+          sampleRate: streamRate
+        })
+
+        pendingVersionedAudio.splice(0).forEach(item => pushVersioned(item.data, item.meta))
+
+        if (versionedEnd) {
+          finishWhenDrained()
+        }
+      })
+      .catch(() => {
+        settle('fallback')
+      })
+
+    return versionedInit
+  }
+
   ws.onopen = () => {
     pendingSends.splice(0).forEach(data => ws.send(data))
   }
 
   ws.onmessage = event => {
     if (typeof event.data !== 'string') {
-      schedule(event.data as ArrayBuffer)
+      if (versioned) {
+        if (versionedEnd) {
+          controller?.cancel()
+          settle(started ? 'done' : 'fallback')
+        } else if (pendingAudioMeta) {
+          pushVersioned(event.data as ArrayBuffer, pendingAudioMeta)
+          pendingAudioMeta = null
+        } else {
+          controller?.cancel()
+          settle(started ? 'done' : 'fallback')
+        }
+      } else {
+        // Older gateways send raw PCM without a versioned start frame.
+        scheduleLegacy(event.data as ArrayBuffer)
+      }
 
       return
     }
 
-    let frame: { channels?: number; sample_rate?: number; type?: string }
+    let frame: {
+      channels?: number
+      encoding?: string
+      initial_buffer_ms?: number
+      max_buffer_ms?: number
+      protocol?: string
+      protocol_version?: string
+      sample_count?: number
+      sample_offset?: number
+      sampleCount?: number
+      sampleOffset?: number
+      sample_rate?: number
+      sampleRate?: number
+      sequence?: number
+      type?: string
+      version?: number | string
+    }
 
     try {
       frame = JSON.parse(event.data) as typeof frame
@@ -271,21 +601,41 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
     }
 
     if (frame.type === 'start') {
-      streamRate = frame.sample_rate || 24_000
-      context = new AudioContext()
+      versioned = negotiateVoiceStreamProtocol(frame) === 'hermes.audio.v1'
 
-      // Autoplay policy can hand back a suspended context when playback wasn't
-      // started by a user gesture (e.g. a wake-word-started voice turn). Resume
-      // it so the first reply is audible instead of silently buffering. Electron
-      // chat windows also set autoplayPolicy: no-user-gesture-required, but the
-      // dashboard-embedded surface relies on this resume.
-      if (context.state === 'suspended') {
-        void context.resume().catch(() => undefined)
+      if (versioned) {
+        void initializeVersioned(frame)
+      } else {
+        // The old start frame only carries format information. Keep its raw
+        // PCM scheduling path intact until the versioned contract is observed.
+        streamRate = frame.sample_rate || 24_000
+        scheduleLegacy(new ArrayBuffer(0))
       }
-
-      nextStartAt = 0
+    } else if (versioned && frame.type === 'audio') {
+      if (pendingAudioMeta || versionedEnd) {
+        controller?.cancel()
+        settle(started ? 'done' : 'fallback')
+      } else {
+        pendingAudioMeta = frame
+      }
     } else if (frame.type === 'end') {
-      finishWhenDrained()
+      if (versioned) {
+        if (pendingAudioMeta) {
+          controller?.cancel()
+          settle(started ? 'done' : 'fallback')
+          return
+        }
+        versionedEnd = true
+        if (controller) {
+          finishWhenDrained()
+        }
+      } else {
+        finishWhenDrained()
+      }
+    } else if (frame.type === 'error') {
+      latestTelemetry = controller?.getTelemetry() ?? latestTelemetry
+      controller?.cancel()
+      settle(started ? 'done' : 'fallback')
     } else if (frame.type === 'fallback') {
       settle(started ? 'done' : 'fallback')
     }
@@ -295,7 +645,19 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
   // auth, network) → fall back. After audio started, replaying the whole
   // message via POST would stutter — treat what played as the playback.
   ws.onerror = () => settle(started ? 'done' : 'fallback')
-  ws.onclose = () => (started ? finishWhenDrained() : settle('fallback'))
+  ws.onclose = () => {
+    if (versioned && pendingAudioMeta) {
+      controller?.cancel()
+      settle(started ? 'done' : 'fallback')
+      return
+    }
+    if (versioned && versionedEnd && versionedInit) {
+      void versionedInit.then(() => finishWhenDrained())
+      return
+    }
+
+    started ? finishWhenDrained() : settle('fallback')
+  }
 
   return {
     // Raw deltas — the server strips markdown/emoji per *sentence*, which is
@@ -311,7 +673,8 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
         send({ done: true })
       }
     },
-    done
+    done,
+    getTelemetry: () => controller?.getTelemetry() ?? latestTelemetry
   }
 }
 

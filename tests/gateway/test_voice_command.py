@@ -1947,3 +1947,91 @@ class TestStreamTtsTempfileFallback:
         )
         # And the temp file is cleaned up afterwards.
         assert not os.path.exists(played[0]), "temp WAV was not unlinked"
+
+    def test_barge_in_during_buffering_does_not_play_partial_wav(self, monkeypatch):
+        import tools.tts_tool as tts_mod
+        import tools.voice_mode as vm
+        from tools.tts_tool import stream_tts_to_speaker
+
+        stop_evt = threading.Event()
+
+        class _BargingStreamer:
+            sample_rate = 24000
+            channels = 1
+
+            def stream(self, text):
+                yield b"\x00\x00" * 240
+                stop_evt.set()  # barge-in while the temp file is still filling
+                yield b"\x00\x00" * 240
+
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda tts_config, preferred=None: _BargingStreamer(),
+        )
+
+        def _no_sounddevice():
+            raise ImportError("sounddevice unavailable in test")
+
+        monkeypatch.setattr(tts_mod, "_import_sounddevice", _no_sounddevice)
+        played = []
+        monkeypatch.setattr(vm, "play_audio_file", lambda path: played.append(path))
+
+        text_q = queue.Queue()
+        done_evt = threading.Event()
+        text_q.put("This sentence is interrupted while buffering audio. ")
+        text_q.put(None)
+
+        stream_tts_to_speaker(text_q, stop_evt, done_evt)
+
+        assert done_evt.is_set()
+        assert played == []
+
+    def test_stop_invokes_streamer_cancel_from_another_thread(self, monkeypatch):
+        import tools.tts_tool as tts_mod
+        from tools.tts_tool import stream_tts_to_speaker
+
+        stream_started = threading.Event()
+        release_stream = threading.Event()
+        cancel_called = threading.Event()
+
+        class _BlockingStreamer:
+            sample_rate = 24000
+            channels = 1
+
+            def stream(self, text):
+                stream_started.set()
+                yield b"\x00\x00" * 240
+                release_stream.wait(timeout=2)
+
+            def cancel(self):
+                cancel_called.set()
+                release_stream.set()
+
+        streamer = _BlockingStreamer()
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda tts_config, preferred=None: streamer,
+        )
+
+        def _no_sounddevice():
+            raise ImportError("sounddevice unavailable in test")
+
+        monkeypatch.setattr(tts_mod, "_import_sounddevice", _no_sounddevice)
+
+        text_q = queue.Queue()
+        stop_evt = threading.Event()
+        done_evt = threading.Event()
+        text_q.put("This sentence blocks until cancellation arrives. ")
+
+        worker = threading.Thread(
+            target=stream_tts_to_speaker,
+            args=(text_q, stop_evt, done_evt),
+        )
+        worker.start()
+        assert stream_started.wait(timeout=2)
+        stop_evt.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert done_evt.is_set()
+        assert cancel_called.is_set()
