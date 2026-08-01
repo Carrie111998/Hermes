@@ -1,0 +1,7 @@
+name: stepfun
+version: 1.0.0
+description: "StepFun image generation backend (step-image-edit-2). Text-to-image via api.stepfun.ai."
+author: Hermes Agent
+kind: backend
+requires_env:
+  - STEPFUN_API_KEY

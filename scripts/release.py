@@ -1417,6 +1417,7 @@ AUTHOR_MAP = {
     "me@simontaggart.com": "SiTaggart",  # PR #35583 (docker_forward_env empty-secret .env fallback)
     "2663402852@qq.com": "x1am1",  # PR #35098 (chown root-owned top-level HERMES_HOME state files)
     "nicsequenzy@gmail.com": "polnikale",  # PR #35717 (discover Playwright headless_shell browser)
+    "ashuaria@users.noreply.github.com": "ashuaria",  # PR #75764 (image-gen: MiniMax + StepFun backends)
 }
 
 
