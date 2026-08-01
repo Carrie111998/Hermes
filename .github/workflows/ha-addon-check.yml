@@ -51,6 +51,10 @@ assert cfg['startup'] in ('application', 'services', 'once', 'initialize'), \
     f'Invalid startup value: {cfg[\"startup\"]}'
 assert cfg['boot'] in ('auto', 'manual'), f'Invalid boot value: {cfg[\"boot\"]}'
 
+# ingress_port required when ingress is enabled
+if cfg.get('ingress'):
+    assert cfg.get('ingress_port'), 'ingress: true but missing ingress_port'
+
 print('config.yaml: OK')
 "
 
@@ -74,11 +78,12 @@ for arch in ('aarch64', 'amd64'):
 print('build.yaml: OK')
 "
 
-      - name: Validate Dockerfile builds
+      - name: Validate Dockerfile builds (amd64)
         run: |
           docker build . \
             --file Dockerfile \
             --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.21 \
-            --tag test-build \
-            --quiet
-          echo 'Dockerfile: OK'
+                  --build-arg BUILD_ARCH=amd64 \
+                  --tag test-build \
+                  --quiet
+                echo 'Dockerfile (amd64): OK'
