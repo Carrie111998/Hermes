@@ -3473,6 +3473,28 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # Bind the runtime provider (task-local ContextVar) so tool-schema
+        # assembly can apply provider-specific overrides — e.g.
+        # tools.tool_search.disabled_providers force-disables the deferred-tool
+        # bridge for small local models that can't drive it. The global
+        # config's model.provider is only the DEFAULT, not this job's pinned
+        # provider, so the ContextVar is the source of truth here.
+        #
+        # A ContextVar (NOT os.environ) is required: the parallel cron pass
+        # dispatches workdir-less jobs CONCURRENTLY, so a process-global would
+        # let a 'custom' job and an 'openrouter' job clobber each other's
+        # provider between assignment and schema assembly. ContextVars are
+        # task-local and, set here, are captured by copy_context() below into
+        # the agent's execution context. Reset in the finally.
+        from gateway.session_context import (
+            set_active_provider as _set_active_provider,
+            reset_active_provider as _reset_active_provider,
+        )
+        _runtime_provider = str(runtime.get("provider") or "").strip()
+        _active_provider_token = (
+            _set_active_provider(_runtime_provider) if _runtime_provider else None
+        )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -3610,6 +3632,12 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+            # Restore the active-provider ContextVar. Task-local, so this only
+            # affects the current job's context — concurrent jobs are
+            # unaffected — but resetting keeps the scheduler thread's own
+            # context clean between jobs.
+            if _active_provider_token is not None:
+                _reset_active_provider(_active_provider_token)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.

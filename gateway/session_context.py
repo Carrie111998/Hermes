@@ -121,6 +121,15 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Active inference provider for the CURRENT run, used by tool-schema assembly
+# (tools.tool_search.disabled_providers force-disables the deferred-tool bridge
+# per provider). Task-local so concurrent cron jobs / gateway sessions pinned
+# to different providers each resolve their own value — process-global
+# os.environ would race here because the parallel cron pass and the gateway
+# both run jobs/sessions concurrently. Set per-job in run_job() and per-session
+# in the gateway's model-override path; read via resolve_active_provider().
+_ACTIVE_PROVIDER: ContextVar = ContextVar("HERMES_ACTIVE_PROVIDER", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -138,6 +147,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_ACTIVE_PROVIDER": _ACTIVE_PROVIDER,
 }
 
 
@@ -370,6 +380,28 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def set_active_provider(provider: str):
+    """Bind the active inference provider for the current task/context.
+
+    Concurrency-safe: sets the ``_ACTIVE_PROVIDER`` ContextVar so overlapping
+    cron jobs / gateway sessions pinned to different providers each see their
+    own value. Returns the reset token; pass it to ``reset_active_provider``
+    in a ``finally`` to restore the previous value (mirrors ``ContextVar.set``
+    semantics — safe under concurrency, unlike an ``os.environ`` swap).
+    """
+    return _ACTIVE_PROVIDER.set((provider or "").strip())
+
+
+def reset_active_provider(token) -> None:
+    """Restore the active-provider ContextVar from a ``set_active_provider`` token."""
+    try:
+        _ACTIVE_PROVIDER.reset(token)
+    except (ValueError, LookupError):
+        # Token from a different context (e.g. thread hop); leaving the var as
+        # the child set it is harmless because it's task-local.
+        pass
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

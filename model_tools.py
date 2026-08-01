@@ -325,6 +325,19 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        # The active provider affects tool-search assembly
+        # (tools.tool_search.disabled_providers force-disables the bridge
+        # per provider). Two concurrent jobs/sessions with identical toolsets
+        # + config but different pinned providers must NOT share a cached
+        # tool-def list, or a bridge-off provider would wrongly inherit a
+        # bridge-on schema. Resolved via the task-local ContextVar (see
+        # tools.tool_search.resolve_active_provider), NOT os.environ, so
+        # concurrent runs key correctly.
+        try:
+            from tools.tool_search import resolve_active_provider as _rap
+            _active_provider_key = _rap()
+        except Exception:
+            _active_provider_key = ""
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
@@ -333,6 +346,7 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
+            _active_provider_key,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -559,9 +573,27 @@ def _compute_tool_definitions(
     # has already normalized schemas, and the assembly is idempotent in
     # case some caller invokes get_tool_definitions twice.
     try:
-        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+        from tools.tool_search import (
+            assemble_tool_defs,
+            load_config as _load_ts_config,
+            resolve_active_provider as _resolve_ts_provider,
+        )
         ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+        # Per-provider force-off: small local models (e.g. Ollama-served
+        # qwen3) can't drive the tool_search/describe/call bridge — they wrap
+        # every call through a malformed ``tool_call`` envelope and loop until
+        # interrupt. When the active provider is listed in
+        # ``tools.tool_search.disabled_providers`` we behave as ``off`` so
+        # those models see and call real tools directly.
+        _active_provider = _resolve_ts_provider()
+        _provider_disabled = bool(
+            _active_provider and _active_provider in ts_cfg.disabled_providers
+        )
+        if (
+            not skip_tool_search_assembly
+            and ts_cfg.enabled != "off"
+            and not _provider_disabled
+        ):
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
                 filtered_tools,

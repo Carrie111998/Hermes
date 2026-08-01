@@ -4472,7 +4472,20 @@ class TurnRunner:
                     pass
 
         if agent is None:
-            # Config changed or first message — create fresh agent
+            # Config changed or first message — create fresh agent.
+            # Bind the resolved runtime provider (task-local ContextVar) so
+            # tool-schema assembly inside AIAgent.__init__ can apply
+            # provider-specific overrides — e.g.
+            # tools.tool_search.disabled_providers force-disables the
+            # deferred-tool bridge for a session pinned (via a per-session
+            # model override) to a provider whose model can't drive it. The
+            # ContextVar (not os.environ) is required because the gateway runs
+            # sessions concurrently; each per-message task has its own context.
+            try:
+                from gateway.session_context import set_active_provider as _set_ap
+                _set_ap(str((turn_route.get("runtime") or {}).get("provider") or ""))
+            except Exception:
+                logger.debug("set_active_provider failed (non-fatal)", exc_info=True)
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],

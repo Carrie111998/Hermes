@@ -81,6 +81,7 @@ tools:
     max_search_limit: 20
     listing: auto       # embed a grouped name+description catalog manifest
     listing_max_tokens: 20000
+    disabled_providers: []  # providers that force the bridge off (see below)
 ```
 
 | Key | Default | Meaning |
@@ -91,6 +92,33 @@ tools:
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 | `listing` | `auto` | Embed a skills-style manifest of every deferred tool (name + first sentence of its description, ≤60 chars, grouped by MCP server) in the `tool_search` bridge description. `auto` includes it when it fits the budget (falling back to names-only, then to the tier-2 server summary); `on`/`off` force either way. |
 | `listing_max_tokens` | `20000` | Absolute cap on the embedded listing, regardless of context size. Range 200–60000. |
+| `disabled_providers` | `[]` | Provider names for which the bridge is forced **off** regardless of `enabled`, so their models see and call real tools directly. See below. |
+
+### Disabling the bridge per provider
+
+Small local models (for example an Ollama-served model on a `custom`
+provider) often cannot drive the `tool_search`/`tool_describe`/`tool_call`
+indirection: instead of calling a tool directly they wrap every call in a
+malformed `tool_call` envelope and loop until interrupted, doing no real
+work. `disabled_providers` lets the bridge stay **on** for capable providers
+(Claude, OpenRouter — which keep the MCP-tool context savings) while being
+force-**off** for the listed ones:
+
+```yaml
+tools:
+  tool_search:
+    enabled: auto
+    disabled_providers:
+      - custom        # Ollama / small local models
+```
+
+Accepts a YAML list, a single string, or a comma-separated string;
+matching is case-insensitive. The active provider is resolved per run from
+the job's / session's pinned provider (cron jobs and gateway per-session
+model overrides both bind it task-locally), falling back to
+`model.provider`. Because provider resolution is task-local, concurrent
+cron jobs or gateway sessions pinned to different providers each get the
+correct bridge decision without racing.
 
 ### Why the listing exists
 
