@@ -1392,11 +1392,13 @@ def get_preferred_silent_default_model(provider: str = "openrouter") -> str:
     try:
         from hermes_cli.config import load_config
 
-        configured = str(
-            (load_config().get("model") or {}).get("silent_default") or ""
-        ).strip()
-        if configured:
-            return configured
+        model_cfg = load_config().get("model")
+        configured = (model_cfg.get("silent_default")
+                      if isinstance(model_cfg, dict) else None)
+        # Strings only: a YAML bool/int here is a config mistake, not a
+        # model id — fall through to the catalog/constant chain.
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
     except Exception:
         pass
     try:

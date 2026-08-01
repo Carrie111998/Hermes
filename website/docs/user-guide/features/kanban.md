@@ -281,9 +281,7 @@ a task's body text cannot opt out of it: the recurrence counter deliberately
 survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
-`kanban.block_recurrence_limit` in `config.yaml` if the loop is expected —
-e.g. an external stage machine (review → fix → review) that legitimately
-re-blocks the same task several times per cycle. Default: `2`.
+`BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
 ## How workers interact with the board

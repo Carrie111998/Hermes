@@ -132,30 +132,6 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
-
-
-def block_recurrence_limit() -> int:
-    """Effective unblock-loop threshold (``kanban.block_recurrence_limit``).
-
-    External stage machines (e.g. a review → fix → review pipeline driven by
-    an unblocker) legitimately re-block the same task several times, so the
-    anti-loop default of :data:`BLOCK_RECURRENCE_LIMIT` can be raised per
-    deployment instead of patching this module. Unreadable configs and
-    values below 1 fall back to the constant.
-    """
-    try:
-        from hermes_cli.config import load_config
-
-        raw = (load_config().get("kanban") or {}).get("block_recurrence_limit")
-        if raw is not None:
-            value = int(raw)
-            if value >= 1:
-                return value
-    except Exception:
-        pass
-    return BLOCK_RECURRENCE_LIMIT
-
-
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -5653,9 +5629,8 @@ def block_task(
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
-        limit = block_recurrence_limit()
 
-        if recurrences >= limit:
+        if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -5690,7 +5665,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
-                    "limit": limit,
+                    "limit": BLOCK_RECURRENCE_LIMIT,
                 },
                 run_id=run_id,
             )
