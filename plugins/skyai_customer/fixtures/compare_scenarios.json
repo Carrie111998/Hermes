@@ -86,6 +86,58 @@
     "focus": "provider-defined cutoff unknown; answer must not invent 24/48/global hours and should rely on product/provider facts or platform state"
   },
   {
+    "id": "reservation_identified_service_eight_hour_policy",
+    "message": "За полета с балон край София до колко часа преди слота мога да анулирам?",
+    "focus": "service is identified; use catalog canonical slug then bounded product detail refresh; answer from 8-hour structured cancellationPolicy"
+  },
+  {
+    "id": "reservation_identified_service_no_free_cancellation",
+    "message": "При това екстремно преживяване има ли безплатно анулиране?",
+    "focus": "service is identified; product detail structured cancellationPolicy says no free cancellation"
+  },
+  {
+    "id": "reservation_detail_fetch_policy_unknown",
+    "message": "За тази услуга какъв е точният срок за анулиране?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Гледам услугата Морско приключение за двама."
+      }
+    ],
+    "focus": "prior context identifies service but detail fetch/policy missing; say exact policy could not be verified, do not infer hours"
+  },
+  {
+    "id": "reservation_prior_turn_service_no_redundant_clarification",
+    "message": "До колко часа преди слота може да се анулира?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Интересувам се от Полет с балон край София."
+      },
+      {
+        "role": "assistant",
+        "content": "Това е конкретната услуга в SkyVision каталога."
+      }
+    ],
+    "focus": "service named in prior turn; no redundant service clarification; refresh detail by canonical slug"
+  },
+  {
+    "id": "reservation_ambiguous_service_clarification",
+    "message": "До колко часа преди резервацията мога да анулирам?",
+    "focus": "service not identifiable and answer depends on service; ask one concise service clarification"
+  },
+  {
+    "id": "reservation_reject_stale_prose_and_universal_hours",
+    "message": "Страницата казва едно, но какъв е актуалният срок за анулиране на тази услуга?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Гледам Полет с балон край София."
+      }
+    ],
+    "focus": "structured product detail cancellationPolicy has precedence over stale product prose; reject universal hardcoded hours"
+  },
+  {
     "id": "reservation_cancel_unavailable_or_deadline_passed",
     "message": "В профила ми няма бутон за анулиране на резервацията или системата отказва. Какво следва?",
     "focus": "cancellation unavailable or deadline passed: explain self-service boundary under applicable reservation conditions, then assistance/exception review only without promising cancellation"

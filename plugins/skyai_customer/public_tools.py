@@ -423,7 +423,19 @@ def handle_skyai_product_detail(product_url: str = "", product_path: str = "") -
     if not normalized_path:
         return {"status": "error", "error": "product_url_or_product_path_required"}
     url = f"{PUBLIC_CATALOG_BASE_URL}/product/{quote(normalized_path, safe='/')}"
-    payload = _http_json(url)
+    try:
+        payload = _http_json(url)
+    except Exception:
+        return {
+            "status": "error",
+            "source": "skyvision_public_cache",
+            "error": "product_detail_fetch_failed",
+            "product_path": normalized_path,
+            "detail": {
+                "cancellation_policy": None,
+                "cancellation": _structured_cancellation_policy(None, fetch_failed=True),
+            },
+        }
     return {
         "status": "ok",
         "source": "skyvision_public_cache",
@@ -1164,6 +1176,36 @@ def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _structured_cancellation_policy(policy: Any, *, fetch_failed: bool = False) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", str(policy or "")).strip()
+    if fetch_failed:
+        status = "unverified"
+        hours = None
+        normalized_policy = None
+    elif not text:
+        status = "unknown"
+        hours = None
+        normalized_policy = None
+    else:
+        normalized = _normalize_search_text(text)
+        hours_match = re.search(r"до\s+(\d+)\s*час", normalized)
+        hours = int(hours_match.group(1)) if hours_match else None
+        if "няма" in normalized and "безплат" in normalized and "анулиран" in normalized:
+            status = "no_free_cancellation"
+            hours = None
+        elif hours is not None and "безплат" in normalized and "анулиран" in normalized:
+            status = "free_until_hours_before_slot"
+        else:
+            status = "specified"
+        normalized_policy = text
+    return {
+        "source_field": "cancellationPolicy",
+        "policy": normalized_policy,
+        "status": status,
+        "hours_before_slot": hours,
+    }
+
+
 def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"raw_type": type(payload).__name__}
@@ -1208,6 +1250,12 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
         "id": _first_present(source, "id", "product_id"),
         "title": _first_present(source, "title", "name"),
         "slug": slug or None,
+        "category_slug": _first_present(
+            source,
+            "category_slug",
+            "categorySlug",
+            default=(slug.split("/", 1)[0] if "/" in slug else None),
+        ),
         "public_url": public_url,
         "location": _first_present(
             source,
@@ -1247,7 +1295,8 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
         "weather": source.get("weather"),
         "service_for_who": source.get("serviceForWho"),
         "schedule": _truncate_text(source.get("schedule")),
-        "cancellation_policy": source.get("cancellationPolicy"),
+        "cancellation_policy": _structured_cancellation_policy(source.get("cancellationPolicy"))["policy"],
+        "cancellation": _structured_cancellation_policy(source.get("cancellationPolicy")),
         "can_book": _exact_optional_bool_field(source, "canBook"),
         "can_buy_voucher": _exact_optional_bool_field(
             source,

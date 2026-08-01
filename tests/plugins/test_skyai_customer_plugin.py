@@ -230,6 +230,103 @@ def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
     ]
 
 
+def test_product_detail_exposes_structured_cancellation_policy_facts(monkeypatch) -> None:
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        return {
+            "data": {
+                "id": 90879,
+                "name": "Полет с балон край София",
+                "slug": "летене/полет-с-балон-край-софия",
+                "categorySlug": "летене",
+                "cancellationPolicy": "Безплатно анулиране до 8 часa преди слота",
+                "description": "Стар текст: анулиране не е възможно.",
+            }
+        }
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_product_detail(
+        product_path="летене/полет-с-балон-край-софия"
+    )
+
+    assert result["status"] == "ok"
+    detail = result["detail"]
+    assert detail["id"] == 90879
+    assert detail["title"] == "Полет с балон край София"
+    assert detail["category_slug"] == "летене"
+    assert detail["slug"] == "летене/полет-с-балон-край-софия"
+    assert detail["cancellation_policy"] == "Безплатно анулиране до 8 часa преди слота"
+    assert detail["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": "Безплатно анулиране до 8 часa преди слота",
+        "status": "free_until_hours_before_slot",
+        "hours_before_slot": 8,
+    }
+
+
+def test_product_detail_exposes_no_free_cancellation_policy(monkeypatch) -> None:
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        return {
+            "data": {
+                "id": 90881,
+                "name": "Екстремно преживяване",
+                "slug": "екстремно/екстремно-преживяване",
+                "cancellationPolicy": "Няма опция за безплатно анулиране",
+            }
+        }
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_product_detail(
+        product_path="екстремно/екстремно-преживяване"
+    )
+
+    assert result["status"] == "ok"
+    assert result["detail"]["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": "Няма опция за безплатно анулиране",
+        "status": "no_free_cancellation",
+        "hours_before_slot": None,
+    }
+
+
+def test_product_detail_marks_missing_cancellation_policy_unknown(monkeypatch) -> None:
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        return {"data": {"id": 42, "name": "Услуга", "slug": "категория/услуга"}}
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_product_detail(product_path="категория/услуга")
+
+    assert result["status"] == "ok"
+    assert result["detail"]["cancellation_policy"] is None
+    assert result["detail"]["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": None,
+        "status": "unknown",
+        "hours_before_slot": None,
+    }
+
+
+def test_product_detail_returns_bounded_error_when_detail_fetch_fails(monkeypatch) -> None:
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        raise TimeoutError("network timeout")
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_product_detail(product_path="категория/услуга")
+
+    assert result["status"] == "error"
+    assert result["error"] == "product_detail_fetch_failed"
+    assert result["product_path"] == "категория/услуга"
+    assert result["detail"]["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": None,
+        "status": "unverified",
+        "hours_before_slot": None,
+    }
+
+
 def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> None:
     calls: list[str] = []
 

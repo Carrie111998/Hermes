@@ -218,6 +218,10 @@ def test_confirmed_reservation_self_cancellation_is_general_principle() -> None:
     assert "Анулиране на резервацията" in prompt
     assert "не казвай, че екипът трябва да я анулира" in prompt
     assert "не измисляй универсален срок" in prompt
+    assert "точната услуга вече е ясна" in prompt
+    assert "skyai_product_detail" in prompt
+    assert "структурния cancellationPolicy" in prompt
+    assert "описателен текст" in prompt
     assert "след успешно анулиране" in prompt
     assert prompt.index("Анулиране на резервацията") < prompt.index("след успешно анулиране")
     assert "info@skyvision.bg" in prompt
@@ -247,6 +251,12 @@ def test_confirmed_reservation_self_cancellation_is_general_principle() -> None:
         "reservation_cancel_unavailable_or_deadline_passed",
         "reservation_already_cancelled_voucher_exchange",
         "reservation_self_cancel_reject_team_only",
+        "reservation_identified_service_eight_hour_policy",
+        "reservation_identified_service_no_free_cancellation",
+        "reservation_detail_fetch_policy_unknown",
+        "reservation_prior_turn_service_no_redundant_clarification",
+        "reservation_ambiguous_service_clarification",
+        "reservation_reject_stale_prose_and_universal_hours",
     } <= scenario_ids
     assert "Confirmed reservation self-cancellation is Hermes reasoning context" in architecture
     assert "not a runtime intent router" in architecture
@@ -347,3 +357,56 @@ def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
     }
     assert all("principle" in case for case in cases)
     assert all("scoring" in case for case in cases)
+
+
+def test_service_cancellation_policy_uses_hybrid_catalog_detail_facts() -> None:
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "hybrid catalog search plus bounded product detail refresh" in architecture
+    assert "structured `cancellationPolicy`" in architecture
+    assert "not free-form product description prose" in architecture
+    assert "no N+1 detail fetch" in architecture
+
+    principle = next(case for case in cases if case["id"] == "service_specific_cancellation_policy")
+    assert "current public product detail" in principle["principle"]
+    assert "ask one concise service clarification" in principle["principle"]
+    assert "not infer from prose" in principle["principle"]
+    assert "no universal cancellation window" in principle["principle"]
+
+    scenario_by_id = {case["id"]: case for case in scenarios}
+    assert "8-hour structured cancellationPolicy" in scenario_by_id["reservation_identified_service_eight_hour_policy"]["focus"]
+    assert "no redundant service clarification" in scenario_by_id["reservation_prior_turn_service_no_redundant_clarification"]["focus"]
+    assert "one concise service clarification" in scenario_by_id["reservation_ambiguous_service_clarification"]["focus"]
+
+
+def test_skyai_architecture_guardrails_absent_in_customer_plugin() -> None:
+    combined = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "plugins/skyai_customer/public_tools.py",
+            "plugins/skyai_customer/dev_gateway.py",
+        )
+    )
+    forbidden_runtime_markers = (
+        "IntentClassifier",
+        "intent_classifier",
+        "keyword_classifier",
+        "mandatory_question_router",
+        "answer_template_selector",
+        "template_selector",
+        "answer_replacing_post_processing",
+        "response_replacing_post_processing",
+        "universal_cancellation_hours",
+    )
+    for marker in forbidden_runtime_markers:
+        assert marker not in combined
+
+    product = public_tools.handle_skyai_product_detail(product_path="")
+    payload_keys = _payload_keys(product)
+    assert "guidance" not in payload_keys
+    assert "answer_guidance" not in payload_keys
+    assert "when_to_use" not in payload_keys
+    assert "suggested_question" not in payload_keys
+    assert "recommended_response" not in payload_keys

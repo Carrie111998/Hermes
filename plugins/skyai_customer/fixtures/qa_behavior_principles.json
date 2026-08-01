@@ -268,6 +268,21 @@
     ]
   },
   {
+    "id": "service_specific_cancellation_policy",
+    "source_threads": [
+      "structured_public_product_detail_audit_2026_08_01"
+    ],
+    "principle": "When a cancellation-hours answer depends on a specific SkyVision service, identify the service from current or prior conversation context and use the matching catalog item/canonical slug to refresh the current public product detail. The structured cancellationPolicy field from product detail is the authoritative customer-safe policy fact: state exact hours when present, state no free cancellation when that is the structured fact, and say the exact policy could not be verified when the field is missing or fetch fails. If the service is not identifiable, ask one concise service clarification only when the missing service changes the answer. Do not infer from prose, expose stale text conflicts by default, or invent any hours; there is no universal cancellation window.",
+    "scoring": [
+      "service_context_use",
+      "detail_refresh",
+      "structured_policy_precedence",
+      "no_redundant_clarification",
+      "no_universal_hours",
+      "voucher_exchange_separation"
+    ]
+  },
+  {
     "id": "no_keyword_backend_patches",
     "source_threads": [
       "architecture"
