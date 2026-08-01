@@ -6018,7 +6018,7 @@ def block_task(
                         expected_run_id=expected_run_id,
                     )
                 return False
-            if comment_body:
+            if comment_body and guarded:
                 _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
             run_id = _end_run(
                 conn, task_id,
@@ -6080,7 +6080,7 @@ def block_task(
                         expected_run_id=expected_run_id,
                     )
                 return False
-            if comment_body:
+            if comment_body and guarded:
                 _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
             run_id = _end_run(
                 conn, task_id,
@@ -6142,7 +6142,7 @@ def block_task(
                         expected_run_id=expected_run_id,
                     )
                 return False
-            if comment_body:
+            if comment_body and guarded:
                 _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
             run_id = _end_run(
                 conn, task_id,
