@@ -76,4 +76,11 @@ regexes = [
   '''(?i)(fake|dummy|placeholder|example|changeme|change-me|not-?a-?real|your[-_](api[-_])?key)''',
   '''(?i)\b(sk|pk|key|token|secret)[-_](test|fake|dummy|example|dotenv|local|stub)[-_]''',
   '''(?i)=\s*["']?<[a-z_]+>["']?\s*$''',
+
+  # Env-injection fixtures in the _sanitize_env_lines tests: a provider key
+  # name glued directly onto preceding value text (no whitespace, quote, or
+  # line start before it) is the concatenated-assignment shape those tests
+  # exist to exercise — never a real assignment, which puts the name at a
+  # boundary. Recurred in #118 and #122; this covers future such fixtures.
+  '''[A-Za-z0-9](ANTHROPIC|OPENAI|OPENROUTER|FIRECRAWL|FAL)_(API_)?KEY=''',
 ]
