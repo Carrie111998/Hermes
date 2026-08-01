@@ -6506,6 +6506,33 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
 
+    # The stateless assembler omits Tool Search when the scoped live catalog is
+    # empty, which keeps pure-core sessions free of three unusable schemas. An
+    # agent that already advertised the static bridge is different: removing
+    # the final MCP tool must not shrink its model-facing tools prefix. Stage a
+    # bridge that is published only if the current snapshot still has one.
+    empty_catalog_bridge = None
+    try:
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            bridge_tool_schemas,
+            classify_tools,
+            load_config as load_tool_search_config,
+        )
+
+        _, staged_deferrable = classify_tools(new_defs)
+        if (
+            load_tool_search_config().enabled != "off"
+            and not staged_deferrable
+            and BRIDGE_TOOL_NAMES.isdisjoint(new_names)
+        ):
+            empty_catalog_bridge = bridge_tool_schemas()
+    except Exception:
+        logger.debug(
+            "could not stage Tool Search bridge preservation",
+            exc_info=True,
+        )
+
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
@@ -6523,6 +6550,12 @@ def refresh_agent_mcp_tools(
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
         }
+        if (
+            empty_catalog_bridge is not None
+            and BRIDGE_TOOL_NAMES.issubset(current)
+        ):
+            new_defs.extend(empty_catalog_bridge)
+            new_names.update(BRIDGE_TOOL_NAMES)
         if new_names == current:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.

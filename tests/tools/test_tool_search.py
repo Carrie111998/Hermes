@@ -179,25 +179,17 @@ class TestRetrieval:
 
 class TestAssembly:
     @pytest.mark.parametrize("enabled", ["auto", "on"])
-    def test_enabled_mode_keeps_static_bridge_with_no_deferrable_tools(self, enabled):
-        """The bridge stays present across an MCP 1 -> 0 transition."""
-        from tools.tool_search import (
-            BRIDGE_TOOL_NAMES,
-            ToolSearchConfig,
-            assemble_tool_defs,
-        )
+    def test_enabled_mode_keeps_pure_core_surface_minimal(self, enabled):
+        """Pure-core sessions do not advertise an unusable bridge."""
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
         defs = [_td("terminal", "Run shell"), _td("read_file", "Read a file")]
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
             config=ToolSearchConfig.from_raw({"enabled": enabled}),
         )
-        assert result.activated
-        assert {t["function"]["name"] for t in result.tool_defs} == {
-            "terminal",
-            "read_file",
-            *BRIDGE_TOOL_NAMES,
-        }
+        assert not result.activated
+        assert result.tool_defs == defs
 
     @staticmethod
     def _register_mcp(name):
@@ -252,9 +244,7 @@ class TestAssembly:
             )
 
             registry.deregister(beta)
-            empty = assemble_tool_defs([], context_length=200_000, config=config)
-
-            assert first.tool_defs == second.tool_defs == empty.tool_defs
+            assert first.tool_defs == second.tool_defs
             assert alpha not in str(first.tool_defs)
             assert beta not in str(second.tool_defs)
         finally:
@@ -327,31 +317,38 @@ class TestRegression_OpenClawCron84141:
     """
 
     def test_core_tool_survives_alongside_many_mcp_tools(self):
+        from tools.registry import registry
         from tools.tool_search import (
             assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES,
             classify_tools,
         )
-        # 1 core tool + 50 unknown/MCP-shaped tools (deferrable).
+        mcp_names = [f"mcp_openclaw_regression_{i}" for i in range(50)]
         defs = [_td("terminal", "Run shell commands")]
-        # Pad with fake "deferrable" tools — without registry registration,
-        # classify_tools puts them in 'visible'. So instead, we just verify
-        # the core-tool side: terminal stays in visible regardless.
-        visible, deferrable = classify_tools(defs)
-        assert any(
-            (td.get("function") or {}).get("name") == "terminal"
-            for td in visible
-        ), "Core tool 'terminal' was wrongly classified as deferrable"
+        try:
+            for name in mcp_names:
+                schema = _td(name, "Deferred MCP capability.")["function"]
+                registry.register(
+                    name=name,
+                    handler=lambda args, **kwargs: json.dumps({"ok": True}),
+                    schema=schema,
+                    toolset="mcp-openclaw-regression",
+                )
+                defs.append({"type": "function", "function": schema})
 
-        # Enabled mode always keeps the static bridge, even for a core-only
-        # snapshot, so later MCP catalog edits cannot rewrite this prefix.
-        result = assemble_tool_defs(
-            defs,
-            context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on"}),
-        )
-        names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
-        assert "terminal" in names
-        assert BRIDGE_TOOL_NAMES <= names
+            visible, deferrable = classify_tools(defs)
+            assert {td["function"]["name"] for td in visible} == {"terminal"}
+            assert len(deferrable) == 50
+
+            result = assemble_tool_defs(
+                defs,
+                context_length=200_000,
+                config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            )
+            names = {td["function"]["name"] for td in result.tool_defs}
+            assert names == {"terminal", *BRIDGE_TOOL_NAMES}
+        finally:
+            for name in mcp_names:
+                registry.deregister(name)
 
     def test_unwrap_rejects_core_tool_attempt(self):
         """Even if the model tries to invoke a core tool through tool_call,

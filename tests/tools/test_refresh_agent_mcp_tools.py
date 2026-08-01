@@ -132,6 +132,24 @@ def test_refresh_reads_live_registry_without_republishing_static_bridge(monkeypa
         remove(beta)
 
 
+def test_refresh_removes_bridge_when_tool_search_is_disabled(monkeypatch):
+    """An explicit config disable overrides empty-catalog bridge preservation."""
+    import model_tools
+    from tools import tool_search
+
+    agent = _agent(sorted(tool_search.BRIDGE_TOOL_NAMES))
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [])
+    monkeypatch.setattr(
+        tool_search,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({"enabled": "off"}),
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

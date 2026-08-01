@@ -221,12 +221,14 @@ def should_activate(
 ) -> bool:
     """Decide whether tool search should activate for the current assembly.
 
-    ``"off"`` skips unconditionally. ``"on"`` and ``"auto"`` keep the bridge
-    present even when the live catalog is empty, so an MCP ``1 -> 0`` change
-    cannot mutate the model-facing tools prefix. The numeric arguments remain
-    in the signature for compatibility with callers and tests.
+    ``"off"`` skips unconditionally. ``"on"`` and ``"auto"`` activate when
+    there is a deferrable catalog. An established bridge is preserved across
+    the MCP ``1 -> 0`` boundary by ``refresh_agent_mcp_tools``; pure-core
+    sessions should not pay for three bridge schemas they cannot use.
+
+    ``context_length`` remains in the signature for compatibility with callers.
     """
-    return config.enabled != "off"
+    return config.enabled != "off" and deferrable_tokens > 0
 
 
 # ---------------------------------------------------------------------------
@@ -504,11 +506,15 @@ def assemble_tool_defs(
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
-    When tool search is off, this is a passthrough. When enabled, MCP and
-    plugin tools are stripped from the visible list and replaced with three
-    static bridge tools. The bridge remains present when no tools are
-    currently deferrable so registry mutations cannot rewrite the model's
-    cached tools prefix. Core tools are *never* deferred regardless of config.
+    When tool search is off or no tools are deferrable, this is a passthrough.
+    Otherwise MCP and plugin tools are stripped from the visible list and
+    replaced with three static bridge tools. Core tools are *never* deferred
+    regardless of config.
+
+    Once an agent has advertised the bridge, the MCP refresh path preserves it
+    across an empty live catalog. Keeping that session-specific state out of
+    this stateless assembler avoids adding unusable bridge tools to pure-core
+    sessions while retaining a stable prefix for established bridge sessions.
 
     Idempotent: calling with bridge tools already in the input is a no-op
     (they classify as non-core/non-deferrable but their names are reserved,
