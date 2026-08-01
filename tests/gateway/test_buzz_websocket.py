@@ -9,6 +9,7 @@ lifecycle as wired into BuzzAdapter.
 import asyncio
 import json
 import time
+from collections import OrderedDict
 
 import pytest
 
@@ -119,3 +120,55 @@ async def test_websocket_auth_raises_on_rejection():
         await adapter._authenticate_websocket(RejectingWs())
 
 
+
+
+@pytest.mark.asyncio
+async def test_membership_event_adopts_new_named_channel_when_unpinned():
+    """A new community membership must subscribe without a gateway restart (#75107)."""
+    adapter = _make_adapter()
+    new_channel = "new-community-channel"
+
+    async def run_cli(args, **_kwargs):
+        if args == ["dms", "list"]:
+            return 0, "[]", ""
+        if args == ["channels", "list"]:
+            return 0, json.dumps([
+                {"channel_id": new_channel, "name": "release-team", "description": "Announcements"}
+            ]), ""
+        if args[:2] == ["messages", "get"]:
+            return 0, "[]", ""
+        raise AssertionError(f"unexpected CLI command: {args}")
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+    adapter._run_cli = run_cli
+    websocket = WebSocket()
+    subscriptions = {"membership": None}
+    await adapter._handle_membership_event(websocket, subscriptions, {"created_at": 42})
+
+    assert adapter._channel_state[new_channel]["chat_type"] == "group"
+    assert adapter._channel_state[new_channel]["last_ts"] == 0
+    assert any(channel_id == new_channel for channel_id in subscriptions.values())
+
+
+@pytest.mark.asyncio
+async def test_membership_event_does_not_adopt_channel_outside_explicit_watch_list():
+    adapter = _make_adapter({"channels": [CHANNEL]})
+
+    async def run_cli(args, **_kwargs):
+        if args == ["dms", "list"]:
+            return 0, "[]", ""
+        if args == ["channels", "list"]:
+            return 0, json.dumps([
+                {"channel_id": "not-configured", "name": "release-team", "description": "Announcements"}
+            ]), ""
+        raise AssertionError(f"unexpected CLI command: {args}")
+
+    adapter._run_cli = run_cli
+    await adapter._handle_membership_event(_FakeWebSocket(), {"membership": None}, {"created_at": 42})
+    assert "not-configured" not in adapter._channel_state
