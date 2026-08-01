@@ -2034,8 +2034,16 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        if task.workspace_kind == "worktree":
+            workspace, resolved_branch_name, base_ref, base_commit = kb._resolve_worktree_workspace(
+                task, board=kb.get_current_board()
+            )
+            kb.set_workspace_path(conn, task.id, str(workspace))
+            kb.set_branch_name(conn, task.id, resolved_branch_name)
+            kb.set_workspace_base(conn, task.id, base_ref, base_commit)
+        else:
+            workspace = kb.resolve_workspace(task)
+            kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0

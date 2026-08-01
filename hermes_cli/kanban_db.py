@@ -3210,6 +3210,20 @@ def create_task(
 
     now = int(time.time())
 
+    # A board that opts into a worktree base ref is declaring a git-backed
+    # workspace policy for ordinary tasks created on that board. Promote the
+    # default scratch placeholder to worktree before inheriting the board's
+    # default_workdir so claim/dispatch materialize under <repo>/.worktrees/<id>
+    # instead of the board scratch root.
+    if workspace_kind == "scratch" and project_repo is None:
+        board_slug = board if board else get_current_board()
+        board_meta = read_board_metadata(board_slug)
+        if (
+            board_meta.get("default_workdir")
+            and (board_meta.get("worktree_base_ref") or "").strip()
+        ):
+            workspace_kind = "worktree"
+
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
     # persistent project checkouts, so only persistent workspace kinds may
