@@ -59,6 +59,13 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
     for name in files:
         (repo / name).unlink()
     _git(repo, "checkout", "--", ".")
+    subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "update-index", "--really-refresh"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     return repo
 
 
@@ -177,6 +184,7 @@ def test_autocrlf_input_is_left_alone(tmp_path: Path) -> None:
     assert _autocrlf(repo) == "input"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows command-line limit regression")
 def test_churn_across_more_files_than_fit_in_one_argv(tmp_path: Path) -> None:
     """The pathspec goes over stdin, so a fully renormalized tree fits.
 
