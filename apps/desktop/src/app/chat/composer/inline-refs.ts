@@ -186,6 +186,21 @@ export function insertInlineRefsIntoEditor(editor: HTMLDivElement, refs: readonl
     return null
   }
 
+  // Capture the insert point BEFORE focus(). Focusing a contenteditable
+  // restores its last caret — after Add-to-Chat the live selection was often
+  // cleared (or points at the preview), and focus() would resurrect a stale
+  // caret (commonly at offset 0 or after chip 1). Inserting there puts the
+  // next chip in the wrong place and leaves the caret mid-draft instead of
+  // after the new chip.
+  const selection = window.getSelection()
+
+  const rangeBeforeFocus =
+    selection?.rangeCount &&
+    editor.contains(selection.getRangeAt(0).startContainer) &&
+    editor.contains(selection.getRangeAt(0).endContainer)
+      ? selection.getRangeAt(0).cloneRange()
+      : null
+
   editor.focus({ preventScroll: true })
 
   // Empty (or scaffolding-only) editors: swap in the chip atomically.
@@ -208,19 +223,7 @@ export function insertInlineRefsIntoEditor(editor: HTMLDivElement, refs: readonl
     return composerPlainText(editor).replace(/^\n+/, '')
   }
 
-  const selection = window.getSelection()
-
-  // Require both endpoints inside the editor. A preview drag selection can
-  // leave a range whose common ancestor is an outer layout node that
-  // `contains` would accept incorrectly — or, after focus(), a stale endpoint
-  // still pointing at the preview; inserting there leaves the caret stranded
-  // before the new chip (especially on the second Add-to-Chat).
-  const range =
-    selection?.rangeCount &&
-    editor.contains(selection.getRangeAt(0).startContainer) &&
-    editor.contains(selection.getRangeAt(0).endContainer)
-      ? selection.getRangeAt(0)
-      : null
+  const range = rangeBeforeFocus
 
   if (range && selection) {
     const beforeText = plainTextInRange(editor, range, 'before')

@@ -23,8 +23,10 @@ import {
 } from '../focus'
 import { type InlineRefInput, insertInlineRefsIntoEditor } from '../inline-refs'
 import {
+  caretOffsetInEditor,
   composerPlainText,
   normalizeComposerEditorDom,
+  placeCaretAtOffset,
   placeCaretEnd,
   REF_RE,
   renderComposerContents
@@ -350,8 +352,18 @@ export function useComposerDraft({
     draftRef.current = draft
     skipDomRepaintRef.current = true
     setComposerText(draft)
-    // Keep the guard through the input-event rAF flush and the focus effect.
+
+    // Re-seat after AUI/focus churn: setText + requestMainFocus can move the
+    // caret (hidden textarea sync / focus retries) away from the chip we just
+    // inserted — especially on the second Add-to-Chat. Use the post-insert
+    // offset (not draft.length) so mid-line inserts stay mid-line.
+    const caretOffset = caretOffsetInEditor(editor)
+    placeCaretAtOffset(editor, caretOffset)
     window.requestAnimationFrame(() => {
+      if (editorRef.current === editor && draftRef.current === draft) {
+        placeCaretAtOffset(editor, caretOffset)
+      }
+
       window.requestAnimationFrame(() => {
         skipDomRepaintRef.current = false
       })

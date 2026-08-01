@@ -32,6 +32,12 @@ describe('sourceLineSelectionRef', () => {
   it('quotes values that contain spaces', () => {
     expect(sourceLineSelectionRef('/repo/my file.ts', { end: 3, start: 3 }, '/repo')).toBe('@line:`my file.ts:3`')
   })
+
+  it('keeps Windows absolute preview paths relative to cwd in the chip ref', () => {
+    expect(
+      sourceLineSelectionRef('C:\\workspace\\hermes-agent\\apps\\desktop\\foo.ts', { end: 12, start: 12 }, 'C:\\workspace\\hermes-agent')
+    ).toBe('@line:apps/desktop/foo.ts:12')
+  })
 })
 
 describe('previewSelectionFileLabel', () => {

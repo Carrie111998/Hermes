@@ -234,6 +234,36 @@ describe('insertInlineRefsIntoEditor', () => {
     outsider.remove()
     editor.remove()
   })
+
+  it('appends the second chip at the end when Add-to-Chat cleared the selection', () => {
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+
+    insertInlineRefsIntoEditor(editor, ['@line:`a.ts:1`'])
+
+    // Preview clears window selection, then insert focuses the editor. Focus
+    // would restore a stale caret at the start — that must not win over append.
+    window.getSelection()?.removeAllRanges()
+
+    const restore = document.createRange()
+    restore.selectNodeContents(editor)
+    restore.collapse(true)
+
+    const focus = editor.focus.bind(editor)
+    editor.focus = ((options?: FocusOptions) => {
+      focus(options)
+      const selection = window.getSelection()!
+      selection.removeAllRanges()
+      selection.addRange(restore)
+    }) as typeof editor.focus
+
+    const second = insertInlineRefsIntoEditor(editor, ['@line:`a.ts:2`'])
+    expect(second).toBe('@line:`a.ts:1` @line:`a.ts:2` ')
+    expect(caretOffsetInEditor(editor)).toBe(second!.length)
+
+    editor.remove()
+  })
 })
 
 describe('insertComposerContentsAtCaret', () => {
