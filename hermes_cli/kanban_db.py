@@ -6264,14 +6264,24 @@ def unblock_task(
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    guarded = bool(expected_states)
     now = int(time.time())
     with write_txn(conn):
         _validate_expected_task_states(conn, expected_states)
-        stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        if stale and stale["current_run_id"]:
+        if task_row is None:
+            return False
+        if comment_body:
+            if not comment_author or not comment_author.strip():
+                raise ValueError("comment author is required")
+            if not guarded:
+                _add_comment_in_txn(conn, task_id, comment_author, comment_body)
+        if task_row["status"] not in ("blocked", "scheduled"):
+            return False
+        if task_row["current_run_id"]:
             conn.execute(
                 """
                 UPDATE task_runs
@@ -6281,7 +6291,7 @@ def unblock_task(
                        claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
                  WHERE id = ? AND ended_at IS NULL
                 """,
-                (now, int(stale["current_run_id"])),
+                (now, int(task_row["current_run_id"])),
             )
         # Re-gate on parent completion before flipping 'blocked' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
@@ -6314,10 +6324,8 @@ def unblock_task(
         )
         if cur.rowcount != 1:
             return False
-        if comment_body:
-            if not comment_author or not comment_author.strip():
-                raise ValueError("comment author is required")
-            _add_comment_in_txn(conn, task_id, comment_author, comment_body)
+        if comment_body and guarded:
+            _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
@@ -7066,8 +7074,18 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
+    guarded = bool(expected_states)
     with write_txn(conn):
         _validate_expected_task_states(conn, expected_states)
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            return False
+        if comment_body:
+            if not comment_author or not comment_author.strip():
+                raise ValueError("comment author is required")
+            if not guarded:
+                _add_comment_in_txn(conn, task_id, comment_author, comment_body)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -7084,10 +7102,8 @@ def schedule_task(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
-        if comment_body:
-            if not comment_author or not comment_author.strip():
-                raise ValueError("comment author is required")
-            _add_comment_in_txn(conn, task_id, comment_author, comment_body)
+        if comment_body and guarded:
+            _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",
