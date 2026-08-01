@@ -2578,7 +2578,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     # The /api/nous/recommended-models endpoint is the authoritative source:
     # it distinguishes paid vs free tier recommendations, and get_nous_recommended_aux_model
     # auto-detects the caller's tier via check_nous_free_tier().  Fall back to
-    # _NOUS_MODEL (google/gemini-3-flash-preview) when the Portal is unreachable
+    # _NOUS_MODEL (google/gemini-3.6-flash) when the Portal is unreachable
     # or returns a null recommendation for this task type.
     model = _NOUS_MODEL
     try:
@@ -2637,7 +2637,7 @@ def _refresh_nous_recommended_model(
 
       * the Portal's current recommendation for the task, if it differs from
         the model that just failed; otherwise
-      * ``_NOUS_MODEL`` (google/gemini-3-flash-preview), the known-good default,
+      * ``_NOUS_MODEL`` (google/gemini-3.6-flash), the known-good default,
         if it too differs from the failed model.
 
     Returns ``None`` when no usable alternative is available (e.g. the Portal
@@ -5903,7 +5903,7 @@ def resolve_provider_client(
             return None, None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
         # local server), an OpenRouter-formatted model override like
-        # "google/gemini-3-flash-preview" won't work.  Drop it and use
+        # "google/gemini-3.6-flash" won't work.  Drop it and use
         # the provider's own default model instead.
         if model and "/" in model and resolved and "/" not in resolved:
             logger.debug(
@@ -6450,7 +6450,7 @@ def resolve_provider_client(
                            "could not mint token / resolve project")
             return None, None
 
-        default_model = "google/gemini-3-flash-preview"
+        default_model = "google/gemini-3.6-flash"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
             from openai import OpenAI

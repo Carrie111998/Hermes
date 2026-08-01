@@ -1103,6 +1103,33 @@ class TestOpenRouterPaidLaneGuard:
         assert model == _OPENROUTER_MODEL
         assert _OPENROUTER_MODEL.endswith(":free")
 
+    def test_openrouter_vision_model_is_separate_from_text(self):
+        """_OPENROUTER_VISION_MODEL must differ from _OPENROUTER_MODEL.
+
+        The text default (ring-2.6-1t:free) cannot process images. When
+        the vision auto-detect chain falls to OpenRouter, a vision-capable
+        model must be used so image-bearing requests succeed. See #75803.
+        """
+        assert _OPENROUTER_VISION_MODEL != _OPENROUTER_MODEL, (
+            "vision model must be separate from text-only default"
+        )
+        assert _OPENROUTER_VISION_MODEL.endswith(":free"), (
+            f"_OPENROUTER_VISION_MODEL={_OPENROUTER_VISION_MODEL!r} must end with ':free'"
+        )
+
+    def test_resolve_strict_vision_backend_openrouter_uses_vision_model(self, monkeypatch):
+        """_resolve_strict_vision_backend('openrouter') passes vision model."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            _, model = _resolve_strict_vision_backend("openrouter")
+
+        assert model == _OPENROUTER_VISION_MODEL, (
+            f"expected vision model {_OPENROUTER_VISION_MODEL!r}, got {model!r}"
+        )
+
 
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
