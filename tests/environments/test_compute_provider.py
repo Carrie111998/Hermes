@@ -183,10 +183,6 @@ class _FakeFleetClient:
             namespace="hermes-task", name="sandbox-1", services=["server", "mcp"]
         )
 
-    async def list_pools(self, namespace):
-        self.calls.append(("list_pools", namespace))
-        return self.pools
-
     async def create_pool(self, request):
         self.calls.append(("create_pool", request))
         self.pool.spec = request.spec
@@ -199,8 +195,10 @@ class _FakeFleetClient:
         self.pools = [pool]
         return pool
 
-    async def get_pool(self, pool):
-        self.calls.append(("get_pool", pool))
+    async def get_pool(self, name):
+        self.calls.append(("get_pool", name))
+        if not self.pools:
+            raise _FakeFleetSdk.SdkError.Status("get pool", 404, name)
         return self.pool
 
     async def create_claim(self, request):
@@ -232,6 +230,13 @@ class _FakeRecord:
 
 
 class _FakeFleetSdk:
+    class SdkError:
+        class Status(Exception):
+            def __init__(self, operation, status, body):
+                self.operation = operation
+                self.status = status
+                self.body = body
+
     class HttpClient:
         pass
 
@@ -315,7 +320,7 @@ def test_cua_fleet_reconciles_missing_pool_and_releases_only_claim() -> None:
     provider.release(lease)
     calls = [call[0] for call in _FakeFleetSdk.CyclopsClient.client.calls]
     assert calls[:5] == [
-        "list_pools",
+        "get_pool",
         "create_pool",
         "get_pool",
         "create_claim",
@@ -480,7 +485,7 @@ def test_cua_fleet_reconcile_recovers_pool_after_ambiguous_create_failure() -> N
     provider.release(lease)
     calls = [call[0] for call in client.calls]
     assert calls.count("create_pool") == 1
-    assert calls.count("list_pools") == 2
+    assert calls.count("get_pool") == 3
     assert "delete_pool" not in calls
 
 

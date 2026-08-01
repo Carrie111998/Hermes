@@ -611,35 +611,36 @@ class CuaFleetDesktopProvider:
         image: str,
     ) -> Any:
         desired = self._pool_request(sdk, namespace, image)
-        pools = worker.run(client.list_pools(namespace), self.config.request_timeout)
-        current = next(
-            (pool for pool in pools if pool.metadata.name == namespace), None
-        )
-        if current is None:
+        try:
+            current = worker.run(
+                client.get_pool(namespace), self.config.request_timeout
+            )
+        except BaseException as error:
+            if not self._is_missing_pool_error(sdk, error):
+                raise
             try:
                 return worker.run(
                     client.create_pool(desired), self.config.request_timeout
                 )
             except BaseException:
                 # Creation may have committed remotely before a local timeout.
-                pools = worker.run(
-                    client.list_pools(namespace), self.config.request_timeout
+                return worker.run(
+                    client.get_pool(namespace), self.config.request_timeout
                 )
-                current = next(
-                    (pool for pool in pools if pool.metadata.name == namespace), None
-                )
-                if current is None:
-                    raise
-                return current
         if current.spec != desired.spec:
             current.spec = desired.spec
             return worker.run(client.update_pool(current), self.config.request_timeout)
         return current
 
+    @staticmethod
+    def _is_missing_pool_error(sdk: Any, error: BaseException) -> bool:
+        status_error = getattr(getattr(sdk, "SdkError", None), "Status", None)
+        return status_error is not None and isinstance(error, status_error) and error.status == 404
+
     def _wait_pool(self, worker: _AsyncWorker, client: Any, pool: Any) -> Any:
         deadline = time.monotonic() + self.config.ready_timeout
         while True:
-            current = worker.run(client.get_pool(pool), self.config.request_timeout)
+            current = worker.run(client.get_pool(pool.metadata.name), self.config.request_timeout)
             status = getattr(current, "status", None)
             if (
                 status is not None
