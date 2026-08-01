@@ -661,6 +661,7 @@ def test_supporting_file_pending_patch_is_not_stale(hermes_home):
     )
 
     pending = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    assert target.read_text(encoding="utf-8") == "old supporting content"
     approved = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
 
     assert "[stale]" not in pending
