@@ -31,6 +31,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -40,7 +41,7 @@ import sys
 import signal
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -75,6 +76,13 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # wall deadlines plus readiness; other platforms retain the 30s isolation bound.
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_ASYNC_DELEGATION_PANEL_CYCLE_BUDGET_SECS = 0.2
+_ASYNC_DELEGATION_PANEL_REQUEST_TIMEOUT_SECS = 0.1
+_ASYNC_DELEGATION_PANEL_INITIAL_SEND_SPACING_SECS = 1.1
+_ASYNC_DELEGATION_PANEL_EDIT_SPACING_SECS = 5.0
+_ASYNC_DELEGATION_PANEL_WRITE_WINDOW_SECS = 60.0
+_ASYNC_DELEGATION_PANEL_MAX_WRITES_PER_WINDOW = 6
+_ASYNC_DELEGATION_PANEL_MAX_CHARS = 500
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -5727,6 +5735,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
+        self._async_delegation_panels: Dict[str, dict] = {}
+        self._async_delegation_panel_chats: Dict[tuple[int, str], dict] = {}
+        self._async_delegation_panel_snapshot_task: Optional[asyncio.Task[Any]] = None
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -12079,6 +12090,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            panel_snapshot_task = getattr(
+                self, "_async_delegation_panel_snapshot_task", None,
+            )
+            if panel_snapshot_task is not None and not panel_snapshot_task.done():
+                panel_snapshot_task.cancel()
+            self._async_delegation_panel_snapshot_task = None
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -15492,7 +15509,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cached_sources = OrderedDict()
             self._session_sources = cached_sources
         try:
-            cached_sources[session_key] = dataclasses.replace(source)
+            cached_source = dataclasses.replace(source)
+            transport_ref = getattr(source, "_transport_adapter_ref", None)
+            if transport_ref is not None:
+                cached_source._transport_adapter_ref = transport_ref
+            cached_sources[session_key] = cached_source
         except Exception:
             logger.debug("Failed to cache live session source for %s", session_key, exc_info=True)
             return
@@ -21248,6 +21269,290 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    @staticmethod
+    def _async_delegation_panel_status(raw_status: object) -> tuple[str, bool]:
+        """Normalize internal lifecycle state and identify terminal records."""
+        key = str(raw_status or "").strip().lower().replace("-", "_").replace(" ", "_")
+        states = {
+            "queued": ("pending", False),
+            "pending": ("pending", False),
+            "running": ("running", False),
+            "active": ("running", False),
+            "stalling": ("stalling", False),
+            "finalizing": ("finalizing", False),
+            "completing": ("finalizing", False),
+            "stalled": ("stalled", True),
+            "completed": ("completed", True),
+            "success": ("completed", True),
+            "error": ("error", True),
+            "failed": ("error", True),
+            "interrupted": ("interrupted", True),
+            "cancelled": ("interrupted", True),
+            "canceled": ("interrupted", True),
+            "timed_out": ("timed out", True),
+            "timeout": ("timed out", True),
+        }
+        # Unknown internal states are not safe to treat as indefinitely active.
+        return states.get(key, ("unknown", True))
+
+    @staticmethod
+    def _async_delegation_panel_clock() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def _async_delegation_panel_retry_after_seconds(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            seconds = value.total_seconds() if hasattr(value, "total_seconds") else float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+    @staticmethod
+    def _async_delegation_panel_text(record: dict, now: float) -> tuple[str, tuple]:
+        """Render a bounded allowlist; temporal ages never enter the signature."""
+        def clean(value: object, limit: int) -> str:
+            raw = str(value or "")[: max(256, limit * 4)]
+            redacted = _redact_gateway_user_facing_secrets(raw)
+            printable = "".join(char if char.isprintable() else " " for char in redacted)
+            text = " ".join(printable.split())
+            if len(text) <= limit:
+                return text.rstrip()
+            return text[: max(0, limit - 3)].rstrip() + "..."
+
+        def age_seconds(value: object) -> int | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return min(max(0, value), 999_999_999)
+            if not isinstance(value, float) or not math.isfinite(value):
+                return None
+            return min(max(0, int(value)), 999_999_999)
+
+        delegation_id = str(record.get("delegation_id") or "")
+        status, _terminal = GatewayRunner._async_delegation_panel_status(record.get("status"))
+        goal = clean(record.get("goal"), 100) or "(no goal)"
+        role = clean(record.get("role"), 40) or "leaf"
+        in_tool = record.get("in_tool") is True
+        lines = [
+            f"Delegation {delegation_id}",
+            f"status: {status} · {'in tool' if in_tool else 'waiting'}",
+            f"goal: {goal}",
+            f"role: {role}",
+        ]
+        visible_signature = list(lines)
+
+        children = record.get("children_activity")
+        if not isinstance(children, (list, tuple)):
+            children = []
+        for index, child in enumerate(children, start=1):
+            if not isinstance(child, dict):
+                continue
+            api_calls = child.get("api_calls")
+            if isinstance(api_calls, int) and not isinstance(api_calls, bool):
+                bounded_calls = min(max(0, api_calls), 999_999_999)
+                call_text = f"{bounded_calls}{'+' if api_calls > bounded_calls else ''}"
+            else:
+                call_text = "?"
+            tool_match = re.match(r"[A-Za-z0-9_.-]+", str(child.get("current_tool") or ""))
+            tool = clean(tool_match.group(0) if tool_match else "waiting", 40) or "waiting"
+            base = f"child {index}: {call_text} calls · {tool}"
+            if len("\n".join([*lines, base])) > _ASYNC_DELEGATION_PANEL_MAX_CHARS:
+                break
+            activity_age = age_seconds(child.get("seconds_since_activity"))
+            with_age = f"{base} · active {activity_age}s ago" if activity_age is not None else base
+            lines.append(
+                with_age
+                if len("\n".join([*lines, with_age])) <= _ASYNC_DELEGATION_PANEL_MAX_CHARS
+                else base
+            )
+            visible_signature.append(base)
+
+        ages = []
+        dispatched_at = record.get("dispatched_at")
+        if isinstance(dispatched_at, (int, float)) and not isinstance(dispatched_at, bool):
+            try:
+                dispatched = float(dispatched_at)
+            except OverflowError:
+                dispatched = math.inf
+            if math.isfinite(dispatched) and math.isfinite(now):
+                ages.append(f"elapsed: {max(0, int(now - dispatched))}s")
+        progress_age = age_seconds(record.get("seconds_since_progress"))
+        if progress_age is not None:
+            ages.append(f"progress: {progress_age}s ago")
+        if ages:
+            age_line = " · ".join(ages)
+            if len("\n".join([*lines, age_line])) <= _ASYNC_DELEGATION_PANEL_MAX_CHARS:
+                lines.append(age_line)
+
+        content = "\n".join(lines)
+        return content, (delegation_id, tuple(visible_signature))
+
+    def _canonical_async_delegation_panel_source(self, session_key: str):
+        """Return a retained origin only; a parsed key is not canonical routing."""
+        if not session_key:
+            return None
+        cached_source = self._get_cached_session_source(session_key)
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and cached_source is not None
+            and self._registered_transport_adapter(cached_source) is not None
+        ):
+            return cached_source
+        try:
+            self.session_store._ensure_loaded()
+            entry = self.session_store._entries.get(session_key)
+            source = getattr(entry, "origin", None) if entry else None
+            if source is not None:
+                return source
+        except Exception:
+            logger.debug("Delegation panel origin lookup failed", exc_info=True)
+        return cached_source
+
+    async def _update_async_delegation_telegram_panels(self) -> None:
+        """Best-effort Telegram status projection; never affects completion delivery."""
+        from tools.async_delegation import list_async_delegations
+
+        clock = self._async_delegation_panel_clock
+        deadline = clock() + _ASYNC_DELEGATION_PANEL_CYCLE_BUDGET_SECS
+        panels = getattr(self, "_async_delegation_panels", None)
+        if panels is None:
+            panels = self._async_delegation_panels = {}
+        chats = getattr(self, "_async_delegation_panel_chats", None)
+        if chats is None:
+            chats = self._async_delegation_panel_chats = {}
+        snapshot_task = getattr(self, "_async_delegation_panel_snapshot_task", None)
+        if snapshot_task is None:
+            snapshot_task = asyncio.create_task(asyncio.to_thread(list_async_delegations))
+            self._async_delegation_panel_snapshot_task = snapshot_task
+        try:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return
+            records = await asyncio.wait_for(asyncio.shield(snapshot_task), timeout=remaining)
+        except Exception:
+            logger.debug("Delegation panel snapshot failed", exc_info=True)
+            return
+        finally:
+            if snapshot_task.done():
+                self._async_delegation_panel_snapshot_task = None
+        live_ids = {str(record.get("delegation_id") or "") for record in records}
+        for delegation_id, panel in list(panels.items()):
+            if delegation_id in live_ids:
+                continue
+            status_ids = getattr(panel.get("adapter"), "_status_message_ids", None)
+            if isinstance(status_ids, dict):
+                status_ids.pop((panel.get("chat_id"), panel.get("status_key")), None)
+            panels.pop(delegation_id, None)
+
+        for record in records:
+            if clock() >= deadline:
+                break
+            delegation_id = str(record.get("delegation_id") or "")
+            source = self._canonical_async_delegation_panel_source(str(record.get("session_key") or ""))
+            if source is None or getattr(source, "platform", None) != Platform.TELEGRAM:
+                continue
+            transport_adapter = None
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                transport_adapter = self._registered_transport_adapter(source)
+                if transport_adapter is None:
+                    continue
+            adapter = self._adapter_for_source(source)
+            if transport_adapter is not None and adapter is not transport_adapter:
+                continue
+            if getattr(adapter, "platform", None) != Platform.TELEGRAM:
+                continue
+            sender = getattr(adapter, "send_or_update_status", None)
+            if not delegation_id or not callable(sender):
+                continue
+            content, signature = self._async_delegation_panel_text(record, time.time())
+            _status, terminal = self._async_delegation_panel_status(record.get("status"))
+            panel = panels.get(delegation_id)
+            panel = panels.setdefault(delegation_id, {
+                "adapter": adapter,
+                "chat_id": str(source.chat_id),
+                "status_key": f"delegation:{delegation_id}",
+                "signature": None,
+                "sent": False,
+                "terminal": terminal,
+            })
+            if terminal and not panel["sent"]:
+                panel["terminal"] = True
+                continue
+            if panel["terminal"] or panel["signature"] == signature:
+                continue
+            chat_key = (id(adapter), str(source.chat_id))
+            chat = chats.setdefault(chat_key, {
+                "last_send": -math.inf,
+                "last_edit": -math.inf,
+                "blocked_until": 0.0,
+                "writes": deque(),
+            })
+            mono_now = clock()
+            writes = chat["writes"]
+            while writes and writes[0] <= mono_now - _ASYNC_DELEGATION_PANEL_WRITE_WINDOW_SECS:
+                writes.popleft()
+            if (
+                mono_now < chat["blocked_until"]
+                or len(writes) >= _ASYNC_DELEGATION_PANEL_MAX_WRITES_PER_WINDOW
+                or (
+                    panel["sent"]
+                    and mono_now - chat["last_edit"] < _ASYNC_DELEGATION_PANEL_EDIT_SPACING_SECS
+                )
+                or (
+                    not panel["sent"]
+                    and mono_now - chat["last_send"]
+                    < _ASYNC_DELEGATION_PANEL_INITIAL_SEND_SPACING_SECS
+                )
+            ):
+                continue
+            # Consume an admitted update before I/O: failures must not replay it.
+            panel["signature"] = signature
+            writes.append(mono_now)
+            if panel["sent"]:
+                chat["last_edit"] = mono_now
+            else:
+                chat["last_send"] = mono_now
+            try:
+                timeout = min(
+                    _ASYNC_DELEGATION_PANEL_REQUEST_TIMEOUT_SECS,
+                    max(0.0, deadline - clock()),
+                )
+                if timeout <= 0:
+                    break
+                result = await asyncio.wait_for(
+                    sender(
+                        str(source.chat_id), panel["status_key"], content,
+                        metadata=self._thread_metadata_for_source(source),
+                        best_effort=True, terminal=terminal,
+                    ),
+                    timeout=timeout,
+                )
+                if getattr(result, "success", False) and getattr(result, "message_id", None):
+                    panel["sent"] = True
+                seconds = self._async_delegation_panel_retry_after_seconds(
+                    getattr(result, "retry_after", None),
+                )
+                if seconds is not None:
+                    chat["blocked_until"] = max(
+                        chat["blocked_until"], mono_now + seconds,
+                    )
+            except Exception as exc:
+                seconds = self._async_delegation_panel_retry_after_seconds(
+                    getattr(exc, "retry_after", None),
+                )
+                if seconds is not None:
+                    chat["blocked_until"] = max(chat["blocked_until"], mono_now + seconds)
+                logger.debug("Delegation panel delivery failed", exc_info=True)
+            finally:
+                if terminal:
+                    panel["terminal"] = True
+        active_chat_keys = {(id(panel["adapter"]), panel["chat_id"]) for panel in panels.values()}
+        for chat_key in list(chats):
+            if chat_key not in active_chat_keys:
+                chats.pop(chat_key, None)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -21296,6 +21601,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
+            try:
+                await self._update_async_delegation_telegram_panels()
+            except Exception:
+                logger.debug("Async delegation panel update failed", exc_info=True)
             await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:

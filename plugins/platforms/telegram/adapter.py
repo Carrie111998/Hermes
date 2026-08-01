@@ -4716,6 +4716,8 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         *,
         metadata: Optional[Dict[str, Any]] = None,
+        best_effort: bool = False,
+        terminal: bool = False,
     ) -> SendResult:
         """Send a status message, or edit the previous one with the same key.
 
@@ -4725,7 +4727,16 @@ class TelegramAdapter(BasePlatformAdapter):
         subsequent calls with the same (chat_id, status_key) edit that same
         message in place. If the edit fails (message deleted, too old, etc.)
         we drop the cached id and send fresh.
+
+        ``best_effort`` is deliberately opt-in for bounded informational panels.
+        It makes exactly one plain Bot API request (send *or* edit), with no
+        formatting, retry, fallback send, overflow continuations, or typing.
+        The normal status path remains unchanged.
         """
+        if best_effort:
+            return await self._send_or_update_status_best_effort(
+                chat_id, status_key, content, metadata=metadata, terminal=terminal,
+            )
         key = (str(chat_id), str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
@@ -4742,6 +4753,87 @@ class TelegramAdapter(BasePlatformAdapter):
         if result.success and result.message_id:
             self._status_message_ids[key] = str(result.message_id)
         return result
+
+    async def _send_or_update_status_best_effort(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        terminal: bool = False,
+    ) -> SendResult:
+        """Deliver one plain-text status request without normal recovery paths."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        key = (str(chat_id), str(status_key))
+        cached_id = self._status_message_ids.get(key)
+        thread_id = self._metadata_thread_id(metadata)
+        private_dm_topic_send = self._is_private_dm_topic_send(
+            chat_id, thread_id, metadata,
+        )
+        reply_to_id = self._reply_to_message_id_for_send(
+            None, metadata, self._reply_to_mode,
+        )
+        if cached_id is None and private_dm_topic_send and reply_to_id is None:
+            return SendResult(
+                success=False,
+                error=self._dm_topic_missing_anchor_error(),
+                retryable=False,
+            )
+        try:
+            if cached_id is not None:
+                await self._bot.edit_message_text(
+                    chat_id=normalize_telegram_chat_id(chat_id),
+                    message_id=int(cached_id),
+                    text=content,
+                )
+                result = SendResult(success=True, message_id=str(cached_id))
+            else:
+                thread_kwargs = self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+                if reply_to_id is not None:
+                    thread_kwargs["reply_to_message_id"] = reply_to_id
+                message = await self._bot.send_message(
+                    chat_id=normalize_telegram_chat_id(chat_id),
+                    text=content,
+                    **thread_kwargs,
+                    **self._notification_kwargs(metadata),
+                )
+                result = SendResult(
+                    success=True,
+                    message_id=str(getattr(message, "message_id", "")) or None,
+                )
+            if result.message_id and not terminal:
+                self._status_message_ids[key] = str(result.message_id)
+            return result
+        except Exception as exc:
+            raw_retry_after: Any = getattr(exc, "retry_after", None)
+            retry_after: Optional[float]
+            if raw_retry_after is None:
+                retry_after = None
+            else:
+                try:
+                    retry_after = float(
+                        raw_retry_after.total_seconds()
+                        if hasattr(raw_retry_after, "total_seconds")
+                        else raw_retry_after
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    retry_after = None
+            return SendResult(
+                success=False,
+                error=_redact_telegram_error_text(exc),
+                retry_after=retry_after,
+            )
+        finally:
+            if terminal:
+                self._status_message_ids.pop(key, None)
 
     async def edit_message(
         self,

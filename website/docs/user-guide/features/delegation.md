@@ -269,6 +269,16 @@ A delegation the stall monitor has flagged shows as
 children show their quiet time so you can tell "slow" from "stuck" at a
 glance.
 
+### Telegram status panel
+
+For background delegations started from Telegram, Hermes maintains one small
+plain-text status message in the originating chat or topic. It is updated in
+place only when visible task state changes and shows the full actionable delegation ID,
+normalized lifecycle state, goal/role, and bounded child activity. It never
+includes the delegation context, model, result/error payload, tool arguments,
+or session key. The panel is best-effort and locally rate-limited; it does not
+change normal Telegram delivery or global flood-control behavior.
+
 ## Live Transcripts
 
 Every `delegate_task` dispatch also creates one **append-only, human-readable log per task** so you (or the parent agent) can watch a subagent work in real time instead of waiting for the consolidated summary:
