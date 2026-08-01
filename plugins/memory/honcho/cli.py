@@ -1733,9 +1733,10 @@ def cmd_migrate(args) -> None:
     print("  these are injected via file search at prompt-build time.")
     print()
     print("  In Hermes, they are seeded once into Honcho's AI peer through the")
-    print("  observation pipeline. Honcho builds a representation from them and")
-    print("  from every subsequent assistant message (observe_me=True). Over time")
-    print("  the representation reflects actual behavior, not just declaration.")
+    print("  observation pipeline. Honcho builds the AI representation from these")
+    print("  seeded files. Assistant replies are not ingested back into it, so the")
+    print("  representation stays a statement of character rather than an echo of")
+    print("  the agent's own recent output.")
     print()
     if agent_files:
         print(f"  Found: {', '.join(f.name for f in agent_files)}")
