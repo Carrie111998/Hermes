@@ -620,8 +620,12 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/board?tenant=<name>&include_archived=…` | Full board grouped by status column, plus tenants + assignees for filter dropdowns |
-| `GET` | `/tasks/:id` | Task + comments + events + links |
+| `GET` | `/portfolio/board?board=<slug>&include_archived=true` | Reviewed bounded exhaustive board inventory from a stable zero-write DB+WAL snapshot. The route requires `include_archived=true` and rejects tenant, workflow, step, and all other filters. Returns contract `hermes-kanban-dashboard-get-zero-write-v1`, task revisions, and the global event watermark. |
+| `GET` | `/portfolio/tasks/:id?board=<slug>` | Reviewed bounded exhaustive task + comments + events + links + runs from the zero-write snapshot reader. Run and other evidence filters are rejected. |
+| `POST` | `/portfolio/tasks/:id/conditional-archive?board=<slug>` | Reviewed atomic expected-status/revision/event-watermark archive CAS with operation-key idempotency and immutable proof. Contract: `hermes-kanban-conditional-archive-cas-v1`. |
+| `GET` | `/portfolio/tasks/:id/conditional-archive?board=<slug>&operation_key=<key>` | Reviewed zero-write authoritative readback of an immutable conditional-archive operation. |
+| `GET` | `/board` | Legacy dashboard board inventory. May initialize the database or recompute state; it is not controller evidence. |
+| `GET` | `/tasks/:id` | Legacy dashboard task detail. May initialize the database or recompute state; it is not controller evidence. |
 | `POST` | `/tasks` | Create (wraps `kanban_db.create_task`, accepts `triage: bool` and `parents: [id, …]`) |
 | `PATCH` | `/tasks/:id` | Status / assignee / priority / title / body / result |
 | `POST` | `/tasks/bulk` | Apply the same patch (status / archive / assignee / priority) to every id in `ids`. Per-id failures reported without aborting siblings |
@@ -639,7 +643,26 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `include_archived_by_default`, `render_markdown` |
 | `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows |
 
-Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
+The reviewed controller contracts are `/api/plugins/kanban/portfolio/board`,
+`/api/plugins/kanban/portfolio/tasks/:id`, and
+`/api/plugins/kanban/portfolio/tasks/:id/conditional-archive`. They never call
+`connect()`, `init_db`, migrations, readiness recomputation, or SQLite against
+the live file. They copy a stable, bounded DB+WAL byte snapshot to a private
+temporary directory, query only that copy, validate the versioned portfolio
+schema, and fail closed on absent, partial, malformed, oversized, symlinked, or
+hard-linked boards. Run `hermes kanban --board <slug> init` through the normal
+operator/runtime path before using these routes; GET never creates or upgrades a
+board. Legacy `/api/plugins/kanban/board` and
+`/api/plugins/kanban/tasks/:id` may initialize or recompute state and are not
+controller evidence.
+
+Conditional archive is one `BEGIN IMMEDIATE` transaction: it revalidates the
+exact board/card/status/task revision/global event watermark, rejects any claim,
+worker, live/missing/inconsistent run, clears a pointer to an ended terminal run,
+archives the row, appends the audit event, and inserts the operation journal proof atomically. Reusing the exact
+operation key and binding is an idempotent read; reusing a key with changed
+inputs is HTTP 409. This primitive enforces provider liveness and supplied CAS
+state only—it does not decide controller ownership or staleness policy.
 
 ### Dashboard config
 
@@ -658,11 +681,16 @@ Each key is optional and falls back to the shown default.
 
 ### Security model
 
-The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
+Kanban plugin HTTP routes use the dashboard's session-token authentication
+middleware. Portfolio clients must send the same bearer token as other
+dashboard API clients. The browser receives the ephemeral token from the
+dashboard shell.
 
 The WebSocket takes one additional step: it requires the dashboard's ephemeral session token as a `?token=…` query parameter (browsers can't set `Authorization` on an upgrade request), matching the pattern used by the in-browser PTY bridge.
 
-If you run `hermes dashboard --host 0.0.0.0`, every plugin route — kanban included — becomes reachable from the network. **Don't do that on a shared host.** The board contains task bodies, comments, and workspace paths; an attacker reaching these routes gets read access to your entire collaboration surface and can also create / reassign / archive tasks.
+If you bind the dashboard beyond loopback, protect the session URL/token and use
+the supported OAuth gate. The board contains task bodies, comments, run metadata,
+and workspace paths; token holders have the dashboard's Kanban authority.
 
 Tasks in `~/.hermes/kanban.db` are profile-agnostic on purpose (that's the coordination primitive). If you open the dashboard with `hermes -p <profile> dashboard`, the board still shows tasks created by any other profile on the host. Same user owns all profiles, but this is worth knowing if multiple personas coexist.
 

@@ -44,11 +44,23 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status as http_status,
+)
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_portfolio
 from hermes_cli import kanban_diagnostics as kd
 
 log = logging.getLogger(__name__)
@@ -60,6 +72,7 @@ router = APIRouter()
 # Auth helper — WebSocket only (HTTP routes live behind the dashboard's
 # existing plugin-bypass; this is documented above).
 # ---------------------------------------------------------------------------
+
 
 def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     """Authorize a WebSocket upgrade by delegating to the dashboard's canonical
@@ -108,7 +121,11 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
         normed = kanban_db._normalize_board_slug(board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
+    if (
+        normed
+        and normed != kanban_db.DEFAULT_BOARD
+        and not kanban_db.board_exists(normed)
+    ):
         raise HTTPException(
             status_code=404,
             detail=f"board {normed!r} does not exist",
@@ -148,7 +165,14 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage",
+    "todo",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+    "done",
 ]
 
 
@@ -159,14 +183,31 @@ def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    include_volatile_metrics: bool = True,
 ) -> dict[str, Any]:
     d = asdict(task)
+    d["body"] = task.body or ""
+    # Reviewed portfolio adapters consume a non-blank string revision from the
+    # historical ``updated_at`` key. The underlying integer is maintained by a
+    # provider trigger on every task-row mutation.
+    d["updated_at"] = str(task.revision)
+    d["revision"] = str(task.revision)
+    d["workspace"] = (
+        f"{task.workspace_kind}:{task.workspace_path}"
+        if task.workspace_path
+        else task.workspace_kind
+    )
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
-    try:
-        d["age"] = kanban_db.task_age(task)
-    except Exception:
-        d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
+    if include_volatile_metrics:
+        try:
+            d["age"] = kanban_db.task_age(task)
+        except Exception:
+            d["age"] = {
+                "created_age_seconds": None,
+                "started_age_seconds": None,
+                "time_to_complete_seconds": None,
+            }
     # Surface the latest non-null run summary so dashboards don't show
     # blank cards/drawers for tasks where the worker handed off via
     # ``task_runs.summary`` (the kanban-worker pattern) instead of
@@ -232,6 +273,138 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "metadata": r.metadata,
         "error": r.error,
     }
+
+
+def _bounded_contract_response(value: dict[str, Any]) -> dict[str, Any]:
+    """Reject provider evidence that would exceed the controller body cap."""
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    if len(encoded) > kanban_portfolio.MAX_RESPONSE_BYTES:
+        raise kanban_portfolio.PortfolioSnapshotTooLarge(
+            "Kanban exhaustive response exceeded byte bound"
+        )
+    return value
+
+
+def _enforce_pre_materialization_byte_bound(
+    conn: sqlite3.Connection, *, task_id: Optional[str] = None
+) -> None:
+    """SQL-bound every row-backed string before constructing Python objects.
+
+    SQLite computes byte lengths from BLOB casts, not character counts.  We cap
+    each source row, each collection, and the aggregate across collections at a
+    sixth of the wire limit, covering worst-case JSON ``\\u00xx`` amplification.
+    The selected CTE scopes all evidence to the authoritative board or card;
+    unrelated legacy rows do not consume the budget.
+    """
+    selected = (
+        "SELECT id FROM tasks"
+        if task_id is None
+        else "SELECT id FROM tasks WHERE id = ?"
+    )
+    values: tuple[Any, ...] = () if task_id is None else (task_id,)
+    sql = f"""
+        WITH selected AS ({selected}), source_rows(collection, bytes) AS (
+            SELECT 'tasks',
+                length(CAST(COALESCE(t.id, '') AS BLOB)) +
+                length(CAST(COALESCE(t.title, '') AS BLOB)) +
+                length(CAST(COALESCE(t.body, '') AS BLOB)) +
+                length(CAST(COALESCE(t.assignee, '') AS BLOB)) +
+                length(CAST(COALESCE(t.status, '') AS BLOB)) +
+                length(CAST(COALESCE(t.created_by, '') AS BLOB)) +
+                length(CAST(COALESCE(t.workspace_kind, '') AS BLOB)) +
+                length(CAST(COALESCE(t.workspace_path, '') AS BLOB)) +
+                length(CAST(COALESCE(t.branch_name, '') AS BLOB)) +
+                length(CAST(COALESCE(t.project_id, '') AS BLOB)) +
+                length(CAST(COALESCE(t.claim_lock, '') AS BLOB)) +
+                length(CAST(COALESCE(t.tenant, '') AS BLOB)) +
+                length(CAST(COALESCE(t.result, '') AS BLOB)) +
+                length(CAST(COALESCE(t.idempotency_key, '') AS BLOB)) +
+                length(CAST(COALESCE(t.last_failure_error, '') AS BLOB)) +
+                length(CAST(COALESCE(t.workflow_template_id, '') AS BLOB)) +
+                length(CAST(COALESCE(t.current_step_key, '') AS BLOB)) +
+                length(CAST(COALESCE(t.skills, '') AS BLOB)) +
+                length(CAST(COALESCE(t.model_override, '') AS BLOB)) +
+                length(CAST(COALESCE(t.provider_override, '') AS BLOB)) +
+                length(CAST(COALESCE(t.session_id, '') AS BLOB)) +
+                length(CAST(COALESCE(t.block_kind, '') AS BLOB))
+            FROM tasks t JOIN selected s ON s.id = t.id
+            UNION ALL
+            SELECT 'links',
+                length(CAST(COALESCE(l.parent_id, '') AS BLOB)) +
+                length(CAST(COALESCE(l.child_id, '') AS BLOB))
+            FROM task_links l
+            WHERE l.parent_id IN (SELECT id FROM selected)
+               OR l.child_id IN (SELECT id FROM selected)
+            UNION ALL
+            SELECT 'comments',
+                length(CAST(COALESCE(c.task_id, '') AS BLOB)) +
+                length(CAST(COALESCE(c.author, '') AS BLOB)) +
+                length(CAST(COALESCE(c.body, '') AS BLOB))
+            FROM task_comments c JOIN selected s ON s.id = c.task_id
+            UNION ALL
+            SELECT 'events',
+                length(CAST(COALESCE(e.task_id, '') AS BLOB)) +
+                length(CAST(COALESCE(e.kind, '') AS BLOB)) +
+                length(CAST(COALESCE(e.payload, '') AS BLOB))
+            FROM task_events e JOIN selected s ON s.id = e.task_id
+            UNION ALL
+            SELECT 'runs',
+                length(CAST(COALESCE(r.task_id, '') AS BLOB)) +
+                length(CAST(COALESCE(r.profile, '') AS BLOB)) +
+                length(CAST(COALESCE(r.step_key, '') AS BLOB)) +
+                length(CAST(COALESCE(r.status, '') AS BLOB)) +
+                length(CAST(COALESCE(r.claim_lock, '') AS BLOB)) +
+                length(CAST(COALESCE(r.outcome, '') AS BLOB)) +
+                length(CAST(COALESCE(r.summary, '') AS BLOB)) +
+                length(CAST(COALESCE(r.metadata, '') AS BLOB)) +
+                length(CAST(COALESCE(r.error, '') AS BLOB))
+            FROM task_runs r JOIN selected s ON s.id = r.task_id
+            UNION ALL
+            SELECT 'attachments',
+                length(CAST(COALESCE(a.task_id, '') AS BLOB)) +
+                length(CAST(COALESCE(a.filename, '') AS BLOB)) +
+                length(CAST(COALESCE(a.stored_path, '') AS BLOB)) +
+                length(CAST(COALESCE(a.content_type, '') AS BLOB)) +
+                length(CAST(COALESCE(a.uploaded_by, '') AS BLOB))
+            FROM task_attachments a JOIN selected s ON s.id = a.task_id
+            UNION ALL
+            SELECT 'child_results',
+                length(CAST(COALESCE(child.id, '') AS BLOB)) +
+                length(CAST(COALESCE(child.title, '') AS BLOB)) +
+                length(CAST(COALESCE(child.status, '') AS BLOB)) +
+                length(CAST(COALESCE(child.result, '') AS BLOB))
+            FROM task_links l
+            JOIN selected s ON s.id = l.parent_id
+            JOIN tasks child ON child.id = l.child_id
+            UNION ALL
+            SELECT 'child_summaries',
+                length(CAST(COALESCE(r.task_id, '') AS BLOB)) +
+                length(CAST(COALESCE(r.summary, '') AS BLOB))
+            FROM task_links l
+            JOIN selected s ON s.id = l.parent_id
+            JOIN task_runs r ON r.task_id = l.child_id
+        )
+        SELECT collection, COALESCE(SUM(bytes), 0) AS total_bytes,
+               COALESCE(MAX(bytes), 0) AS max_row_bytes
+        FROM source_rows GROUP BY collection ORDER BY collection
+    """
+    rows = conn.execute(sql, values).fetchall()
+    limit = kanban_portfolio.MAX_PREMATERIALIZATION_SOURCE_BYTES
+    total = 0
+    for row in rows:
+        collection_total = int(row["total_bytes"] or 0)
+        max_row = int(row["max_row_bytes"] or 0)
+        total += collection_total
+        if collection_total > limit or max_row > limit:
+            raise kanban_portfolio.PortfolioSnapshotTooLarge(
+                f"Kanban {row['collection']} evidence exceeded byte bound"
+            )
+    if total > limit:
+        raise kanban_portfolio.PortfolioSnapshotTooLarge(
+            "Kanban aggregate evidence exceeded byte bound"
+        )
 
 
 # Hallucination-warning event kinds — see complete_task() in kanban_db.py.
@@ -375,16 +548,201 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 # GET /board
 # ---------------------------------------------------------------------------
 
+
+@router.get("/portfolio/board")
+def get_board_zero_write(
+    request: Request,
+    board: str = Query(..., min_length=1, description="Explicit Kanban board slug"),
+    include_archived: bool = Query(...),
+):
+    """Return the complete archive-inclusive board from a zero-write snapshot."""
+    keys = [key for key, _value in request.query_params.multi_items()]
+    if set(keys) - {"board", "include_archived"} or len(keys) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="the exhaustive board contract accepts only board and include_archived",
+        )
+    if not include_archived:
+        raise HTTPException(
+            status_code=400,
+            detail="include_archived=true is required by the exhaustive board contract",
+        )
+    try:
+        with kanban_portfolio.zero_write_snapshot(board) as (slug, conn):
+            values: tuple[Any, ...] = ()
+            clause = ""
+            selected_clause = ""
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM tasks" + clause, tuple(values)
+                ).fetchone()["n"]
+            )
+            if count > kanban_portfolio.MAX_BOARD_TASKS:
+                raise kanban_portfolio.PortfolioSnapshotTooLarge(
+                    "Kanban board exceeded exhaustive task bound"
+                )
+            _enforce_pre_materialization_byte_bound(conn)
+            rows = conn.execute(
+                "SELECT * FROM tasks"
+                + clause
+                + " ORDER BY priority DESC, created_at ASC, id ASC",
+                tuple(values),
+            ).fetchall()
+            tasks = [kanban_db.Task.from_row(row) for row in rows]
+            task_ids = [task.id for task in tasks]
+            summaries = kanban_db.latest_summaries(conn, task_ids)
+            aggregate_counts = {
+                "links": int(
+                    conn.execute(
+                        "SELECT COUNT(DISTINCT l.rowid) AS n FROM task_links l "
+                        "JOIN tasks selected ON selected.id = l.parent_id OR selected.id = l.child_id"
+                        + selected_clause,
+                        tuple(values),
+                    ).fetchone()["n"]
+                ),
+                "comments": int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM task_comments c JOIN tasks selected ON selected.id = c.task_id"
+                        + selected_clause,
+                        tuple(values),
+                    ).fetchone()["n"]
+                ),
+                "runs": int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM task_runs r "
+                        "JOIN tasks selected ON selected.id = r.task_id"
+                        + selected_clause,
+                        tuple(values),
+                    ).fetchone()["n"]
+                ),
+                "attachments": int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM task_attachments a "
+                        "JOIN tasks selected ON selected.id = a.task_id"
+                        + selected_clause,
+                        tuple(values),
+                    ).fetchone()["n"]
+                ),
+            }
+            if any(
+                value > kanban_portfolio.MAX_BOARD_AGGREGATE_ROWS
+                for value in aggregate_counts.values()
+            ):
+                raise kanban_portfolio.PortfolioSnapshotTooLarge(
+                    "Kanban board aggregates exceeded exhaustive row bound"
+                )
+            selected_ids = set(task_ids)
+            link_counts: dict[str, dict[str, int]] = {}
+            for row in conn.execute(
+                "SELECT DISTINCT l.parent_id, l.child_id FROM task_links l "
+                "JOIN tasks selected ON selected.id = l.parent_id OR selected.id = l.child_id"
+                + selected_clause
+                + " ORDER BY l.parent_id, l.child_id",
+                tuple(values),
+            ):
+                link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
+                    "children"
+                ] += 1
+                link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
+                    "parents"
+                ] += 1
+            comment_counts = {
+                row["task_id"]: int(row["n"])
+                for row in conn.execute(
+                    "SELECT c.task_id, COUNT(*) AS n FROM task_comments c "
+                    "JOIN tasks selected ON selected.id = c.task_id"
+                    + selected_clause
+                    + " GROUP BY c.task_id ORDER BY c.task_id",
+                    tuple(values),
+                )
+            }
+            progress: dict[str, dict[str, int]] = {}
+            for row in conn.execute(
+                "SELECT l.parent_id, t.status FROM task_links l "
+                "JOIN tasks t ON t.id = l.child_id "
+                "JOIN tasks selected ON selected.id = l.parent_id"
+                + selected_clause
+                + " ORDER BY l.parent_id, l.child_id",
+                tuple(values),
+            ):
+                item = progress.setdefault(row["parent_id"], {"done": 0, "total": 0})
+                item["total"] += 1
+                if row["status"] == "done":
+                    item["done"] += 1
+            names = [*BOARD_COLUMNS, "archived"]
+            columns: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+            for task in tasks:
+                preview = summaries.get(task.id)
+                item = _task_dict(
+                    task,
+                    latest_summary=(
+                        preview[:_CARD_SUMMARY_PREVIEW_CHARS] if preview else None
+                    ),
+                    include_volatile_metrics=False,
+                )
+                item["link_counts"] = link_counts.get(
+                    task.id, {"parents": 0, "children": 0}
+                )
+                item["comment_count"] = comment_counts.get(task.id, 0)
+                item["progress"] = progress.get(task.id)
+                if task.status not in columns:
+                    raise kanban_portfolio.PortfolioSnapshotUnavailable(
+                        "Kanban board contains an unknown status"
+                    )
+                columns[task.status].append(item)
+            watermark = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS value FROM task_events"
+                ).fetchone()["value"]
+            )
+            tenants = sorted({task.tenant for task in tasks if task.tenant is not None})
+            assignees = sorted({
+                task.assignee
+                for task in tasks
+                if task.assignee is not None and task.status != "archived"
+            })
+            return _bounded_contract_response({
+                "contract": kanban_db.PORTFOLIO_KANBAN_ZERO_WRITE_GET_CONTRACT,
+                "board": slug,
+                "exhaustive": True,
+                "bounded": True,
+                "task_count": count,
+                "task_limit": kanban_portfolio.MAX_BOARD_TASKS,
+                "aggregate_row_limit": kanban_portfolio.MAX_BOARD_AGGREGATE_ROWS,
+                "columns": [{"name": name, "tasks": columns[name]} for name in names],
+                "tenants": tenants,
+                "assignees": assignees,
+                "latest_event_id": watermark,
+                "event_watermark": watermark,
+            })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except kanban_portfolio.PortfolioSnapshotTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except (
+        PermissionError,
+        kanban_db.PortfolioContractSchemaUnavailable,
+        kanban_portfolio.PortfolioSnapshotUnavailable,
+    ) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
     workflow_template_id: Optional[str] = Query(
-        None, description="Restrict to tasks using this workflow template id",
+        None,
+        description="Restrict to tasks using this workflow template id",
     ),
     current_step_key: Optional[str] = Query(
-        None, description="Restrict to tasks at this workflow step key",
+        None,
+        description="Restrict to tasks at this workflow step key",
     ),
 ):
     """Return the full board grouped by status column.
@@ -461,9 +819,7 @@ def get_board(
 
         for t in tasks:
             full = summary_map.get(t.id)
-            preview = (
-                full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
-            )
+            preview = full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             d = _task_dict(t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
@@ -514,15 +870,160 @@ def get_board(
 # GET /tasks/:id
 # ---------------------------------------------------------------------------
 
+
+@router.get("/portfolio/tasks/{task_id}")
+def get_task_zero_write(
+    task_id: str,
+    request: Request,
+    board: str = Query(..., min_length=1),
+):
+    """Return complete unfiltered card/run evidence from the zero-write reader."""
+    keys = [key for key, _value in request.query_params.multi_items()]
+    if set(keys) != {"board"} or len(keys) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="filters are not supported by the exhaustive task contract",
+        )
+    try:
+        with kanban_portfolio.zero_write_snapshot(board) as (slug, conn):
+            exists = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if exists is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            _enforce_pre_materialization_byte_bound(conn, task_id=task_id)
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - snapshot transaction is stable
+                raise kanban_portfolio.PortfolioSnapshotUnavailable(
+                    "Kanban task disappeared from stable snapshot"
+                )
+            task = kanban_db.Task.from_row(row)
+            counts = {
+                table: int(
+                    conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()["n"]
+                )
+                for table in (
+                    "task_comments",
+                    "task_events",
+                    "task_attachments",
+                    "task_runs",
+                )
+            }
+            counts["task_links"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM task_links WHERE parent_id = ? OR child_id = ?",
+                    (task_id, task_id),
+                ).fetchone()["n"]
+            )
+            counts["child_summary_runs"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM task_runs r "
+                    "JOIN task_links l ON l.child_id = r.task_id "
+                    "WHERE l.parent_id = ?",
+                    (task_id,),
+                ).fetchone()["n"]
+            )
+            if any(
+                value > kanban_portfolio.MAX_TASK_EVIDENCE_ROWS
+                for value in counts.values()
+            ):
+                raise kanban_portfolio.PortfolioSnapshotTooLarge(
+                    "Kanban task evidence exceeded exhaustive row bound"
+                )
+            task_dict = _task_dict(
+                task,
+                latest_summary=kanban_db.latest_summary(conn, task_id),
+                include_volatile_metrics=False,
+            )
+            links = _links_for(conn, task_id)
+            child_summaries = kanban_db.latest_summaries(conn, links["children"])
+            child_results: list[dict[str, Any]] = []
+            child_rows: dict[str, sqlite3.Row] = {}
+            if links["children"]:
+                placeholders = ",".join("?" for _ in links["children"])
+                child_rows = {
+                    str(value["id"]): value
+                    for value in conn.execute(
+                        f"SELECT id, title, status, result FROM tasks WHERE id IN ({placeholders})",
+                        tuple(links["children"]),
+                    )
+                }
+            for child_id in links["children"]:
+                child = child_rows.get(child_id)
+                if child is None:
+                    raise kanban_portfolio.PortfolioSnapshotUnavailable(
+                        "Kanban task link references a missing child"
+                    )
+                child_results.append({
+                    "id": child["id"],
+                    "title": child["title"],
+                    "status": child["status"],
+                    "latest_summary": child_summaries.get(child["id"]),
+                    "result": child["result"],
+                })
+            watermark = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS value FROM task_events"
+                ).fetchone()["value"]
+            )
+            return _bounded_contract_response({
+                "contract": kanban_db.PORTFOLIO_KANBAN_ZERO_WRITE_GET_CONTRACT,
+                "board": slug,
+                "card_id": task_id,
+                "exhaustive": True,
+                "bounded": True,
+                "latest_event_id": watermark,
+                "event_watermark": watermark,
+                "evidence_counts": counts,
+                "evidence_row_limit": kanban_portfolio.MAX_TASK_EVIDENCE_ROWS,
+                "task": task_dict,
+                "comments": [
+                    _comment_dict(value)
+                    for value in kanban_db.list_comments(conn, task_id)
+                ],
+                "events": [
+                    _event_dict(value) for value in kanban_db.list_events(conn, task_id)
+                ],
+                "attachments": [
+                    _attachment_dict(value)
+                    for value in kanban_db.list_attachments(conn, task_id)
+                ],
+                "links": links,
+                "child_results": child_results,
+                "runs": [
+                    _run_dict(value) for value in kanban_db.list_runs(conn, task_id)
+                ],
+            })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except kanban_portfolio.PortfolioSnapshotTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except (
+        PermissionError,
+        kanban_db.PortfolioContractSchemaUnavailable,
+        kanban_portfolio.PortfolioSnapshotUnavailable,
+    ) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
     board: Optional[str] = Query(None),
     run_state_type: Optional[str] = Query(
-        None, description="With run_state_name: filter runs by column 'status' or 'outcome'",
+        None,
+        description="With run_state_name: filter runs by column 'status' or 'outcome'",
     ),
     run_state_name: Optional[str] = Query(
-        None, description="With run_state_type: exact value for that run column",
+        None,
+        description="With run_state_type: exact value for that run column",
     ),
 ):
     board = _resolve_board(board)
@@ -570,9 +1071,13 @@ def get_task(
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
             "task": task_d,
-            "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
+            "comments": [
+                _comment_dict(c) for c in kanban_db.list_comments(conn, task_id)
+            ],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
-            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
+            "attachments": [
+                _attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)
+            ],
             "links": links,
             "child_results": child_results,
             "runs": [
@@ -592,6 +1097,129 @@ def get_task(
 # ---------------------------------------------------------------------------
 # POST /tasks
 # ---------------------------------------------------------------------------
+
+
+class ConditionalArchiveBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contract: StrictStr = Field(min_length=1, max_length=128)
+    board: StrictStr = Field(min_length=1, max_length=64)
+    card_id: StrictStr = Field(min_length=1, max_length=256)
+    expected_status: StrictStr = Field(min_length=1, max_length=32)
+    expected_revision: StrictStr = Field(min_length=1, max_length=64)
+    expected_event_watermark: StrictInt = Field(ge=0)
+    operation_key: StrictStr = Field(
+        min_length=1, max_length=kanban_portfolio.MAX_OPERATION_KEY_CHARS
+    )
+    reason: StrictStr = Field(
+        min_length=1, max_length=kanban_portfolio.MAX_REASON_CHARS
+    )
+
+
+@router.post("/portfolio/tasks/{task_id}/conditional-archive")
+def conditional_archive_task(
+    task_id: str,
+    payload: ConditionalArchiveBody,
+    board: str = Query(..., min_length=1),
+):
+    """Atomically compare state+liveness, archive, and journal immutable proof."""
+    if payload.contract != kanban_db.PORTFOLIO_KANBAN_CONDITIONAL_ARCHIVE_CONTRACT:
+        raise HTTPException(
+            status_code=412, detail="unsupported conditional archive contract"
+        )
+    try:
+        slug = kanban_db._normalize_board_slug(board)
+        payload_slug = kanban_db._normalize_board_slug(payload.board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not slug or payload_slug != slug or payload.card_id != task_id:
+        raise HTTPException(status_code=409, detail="board/card binding mismatch")
+    if payload.expected_status not in kanban_db.VALID_STATUSES:
+        raise HTTPException(status_code=400, detail="unknown expected task status")
+    if (
+        not payload.expected_revision.isascii()
+        or not payload.expected_revision.isdigit()
+    ):
+        raise HTTPException(status_code=400, detail="task revision is malformed")
+    expected_revision = int(payload.expected_revision)
+    if expected_revision < 1:
+        raise HTTPException(status_code=400, detail="task revision is malformed")
+    try:
+        pinned_slug, path, inode, conn = kanban_portfolio.connect_existing_board_rw(
+            slug
+        )
+        try:
+            operation = kanban_portfolio.conditional_archive(
+                conn,
+                board=pinned_slug,
+                card_id=task_id,
+                expected_status=payload.expected_status,
+                expected_revision=expected_revision,
+                expected_event_watermark=payload.expected_event_watermark,
+                operation_key=payload.operation_key,
+                reason=payload.reason,
+            )
+        finally:
+            conn.close()
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != inode:
+            raise PermissionError("Kanban database path was replaced")
+        return operation
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"task {task_id} not found"
+        ) from exc
+    except kanban_db.ConditionalArchiveConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except kanban_db.PortfolioContractSchemaUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except sqlite3.Error as exc:
+        log.warning("conditional archive database failure: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Kanban CAS storage unavailable"
+        ) from exc
+
+
+@router.get("/portfolio/tasks/{task_id}/conditional-archive")
+def get_conditional_archive(
+    task_id: str,
+    board: str = Query(..., min_length=1),
+    operation_key: str = Query(
+        ..., min_length=1, max_length=kanban_portfolio.MAX_OPERATION_KEY_CHARS
+    ),
+):
+    """Read immutable operation proof through the zero-write snapshot path."""
+    try:
+        with kanban_portfolio.zero_write_snapshot(board) as (slug, conn):
+            operation = kanban_portfolio.read_operation(
+                conn,
+                board=slug,
+                card_id=task_id,
+                operation_key=operation_key,
+            )
+            return {
+                "contract": kanban_db.PORTFOLIO_KANBAN_CONDITIONAL_ARCHIVE_CONTRACT,
+                "board": slug,
+                "card_id": task_id,
+                "operation": operation,
+            }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        PermissionError,
+        kanban_db.PortfolioContractSchemaUnavailable,
+        kanban_portfolio.PortfolioSnapshotUnavailable,
+    ) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
 
 class CreateTaskBody(BaseModel):
     title: str
@@ -760,7 +1388,9 @@ async def upload_task_attachment(
         except HTTPException:
             raise
         except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+            raise HTTPException(
+                status_code=500, detail=f"failed to store attachment: {exc}"
+            )
 
         att_id = kanban_db.add_attachment(
             conn,
@@ -796,7 +1426,9 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         except (ValueError, OSError):
             raise HTTPException(status_code=404, detail="attachment file unavailable")
         if not stored.is_file():
-            raise HTTPException(status_code=404, detail="attachment file missing on disk")
+            raise HTTPException(
+                status_code=404, detail="attachment file missing on disk"
+            )
         return FileResponse(
             path=str(stored),
             filename=att.filename,
@@ -822,6 +1454,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 # ---------------------------------------------------------------------------
 # PATCH /tasks/:id  (status / assignee / priority / title / body)
 # ---------------------------------------------------------------------------
+
 
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
@@ -852,7 +1485,9 @@ class UpdateTaskBody(BaseModel):
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+def update_task(
+    task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -864,7 +1499,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.assignee is not None:
             try:
                 ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
+                    conn,
+                    task_id,
+                    payload.assignee or None,
                 )
             except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -877,7 +1514,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
-                    conn, task_id,
+                    conn,
+                    task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
@@ -931,12 +1569,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- model/provider override ---------------------------------------
         if payload.clear_model_override or payload.model_override is not None:
             new_model = (
-                None if payload.clear_model_override
+                None
+                if payload.clear_model_override
                 else (payload.model_override or "").strip() or None
             )
             try:
                 ok = kanban_db.set_model_override(
-                    conn, task_id, new_model,
+                    conn,
+                    task_id,
+                    new_model,
                     provider=payload.provider_override,
                 )
             except (ValueError, RuntimeError) as e:
@@ -967,8 +1608,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 conn.execute(
                     "INSERT INTO task_events (task_id, kind, payload, created_at) "
                     "VALUES (?, 'reprioritized', ?, ?)",
-                    (task_id, json.dumps({"priority": int(payload.priority)}),
-                     int(time.time())),
+                    (
+                        task_id,
+                        json.dumps({"priority": int(payload.priority)}),
+                        int(time.time()),
+                    ),
                 )
 
         # --- title / body -------------------------------------------------
@@ -977,7 +1621,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 sets, vals = [], []
                 if payload.title is not None:
                     if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
+                        raise HTTPException(
+                            status_code=400, detail="title cannot be empty"
+                        )
                     sets.append("title = ?")
                     vals.append(payload.title.strip())
                 if payload.body is not None:
@@ -985,7 +1631,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     vals.append(payload.body)
                 vals.append(task_id)
                 conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+                    vals,
                 )
                 conn.execute(
                     "INSERT INTO task_events (task_id, kind, payload, created_at) "
@@ -1003,6 +1650,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
+
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -1017,7 +1665,8 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 
 def _parents_blocking_ready(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection,
+    task_id: str,
 ) -> list:
     """Return parent rows (``id``, ``title``, ``status``) that aren't ``done``
     and therefore prevent ``task_id`` from being promoted to ``ready``.
@@ -1033,14 +1682,13 @@ def _parents_blocking_ready(
         "WHERE l.child_id = ? AND t.status != 'done'",
         (task_id,),
     ).fetchall()
-    return [
-        {"id": r["id"], "title": r["title"], "status": r["status"]}
-        for r in rows
-    ]
+    return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
 
 
 def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1077,10 +1725,10 @@ def _set_status_direct(
                 return False
 
         was_running = prev["status"] == "running"
-        reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
-        )
+        reopening_satisfied_parent = prev["status"] in {
+            "done",
+            "archived",
+        } and new_status not in {"done", "archived"}
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
@@ -1095,8 +1743,10 @@ def _set_status_direct(
         run_id = None
         if was_running and new_status != "running" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
                 summary=f"status changed to {new_status} (dashboard/direct)",
             )
         conn.execute(
@@ -1125,13 +1775,11 @@ def _set_status_direct(
                         "VALUES (?, 'status', ?, ?)",
                         (
                             child_id,
-                            json.dumps(
-                                {
-                                    "status": "todo",
-                                    "reason": "parent_reopened",
-                                    "parent": task_id,
-                                }
-                            ),
+                            json.dumps({
+                                "status": "todo",
+                                "reason": "parent_reopened",
+                                "parent": task_id,
+                            }),
                             int(time.time()),
                         ),
                     )
@@ -1144,6 +1792,7 @@ def _set_status_direct(
 # ---------------------------------------------------------------------------
 # Comments
 # ---------------------------------------------------------------------------
+
 
 class CommentBody(BaseModel):
     body: str
@@ -1160,7 +1809,10 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         kanban_db.add_comment(
-            conn, task_id, author=payload.author or "dashboard", body=payload.body,
+            conn,
+            task_id,
+            author=payload.author or "dashboard",
+            body=payload.body,
         )
         return {"ok": True}
     finally:
@@ -1170,6 +1822,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
+
 
 class LinkBody(BaseModel):
     parent_id: str
@@ -1207,6 +1860,7 @@ def delete_link(
 # ---------------------------------------------------------------------------
 # Bulk actions (multi-select on the board)
 # ---------------------------------------------------------------------------
+
 
 class BulkTaskBody(BaseModel):
     ids: list[str]
@@ -1256,7 +1910,8 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     s = payload.status
                     if s == "done":
                         ok = kanban_db.complete_task(
-                            conn, tid,
+                            conn,
+                            tid,
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
@@ -1293,12 +1948,16 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     try:
                         if payload.reclaim_first:
                             ok = kanban_db.reassign_task(
-                                conn, tid, payload.assignee or None,
+                                conn,
+                                tid,
+                                payload.assignee or None,
                                 reclaim_first=True,
                             )
                         else:
                             ok = kanban_db.assign_task(
-                                conn, tid, payload.assignee or None,
+                                conn,
+                                tid,
+                                payload.assignee or None,
                             )
                         if not ok:
                             entry.update(ok=False, error="assign refused")
@@ -1313,17 +1972,23 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         conn.execute(
                             "INSERT INTO task_events (task_id, kind, payload, created_at) "
                             "VALUES (?, 'reprioritized', ?, ?)",
-                            (tid, json.dumps({"priority": int(payload.priority)}),
-                             int(time.time())),
+                            (
+                                tid,
+                                json.dumps({"priority": int(payload.priority)}),
+                                int(time.time()),
+                            ),
                         )
                 if payload.clear_model_override or payload.model_override is not None:
                     new_model = (
-                        None if payload.clear_model_override
+                        None
+                        if payload.clear_model_override
                         else (payload.model_override or "").strip() or None
                     )
                     try:
                         ok = kanban_db.set_model_override(
-                            conn, tid, new_model,
+                            conn,
+                            tid,
+                            new_model,
                             provider=payload.provider_override,
                         )
                         if not ok:
@@ -1355,9 +2020,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
 # the rule engine.
 # ---------------------------------------------------------------------------
 
+
 @router.get("/diagnostics")
 def list_diagnostics(
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
     severity: Optional[str] = Query(
         None,
         description="Filter by severity: warning|error|critical",
@@ -1384,7 +2052,11 @@ def list_diagnostics(
         if severity:
             filtered: dict[str, list[dict]] = {}
             for tid, dl in diags_by_task.items():
-                keep = [d for d in dl if kd.severity_at_or_above(d.get("severity"), severity)]
+                keep = [
+                    d
+                    for d in dl
+                    if kd.severity_at_or_above(d.get("severity"), severity)
+                ]
                 if keep:
                     filtered[tid] = keep
             diags_by_task = filtered
@@ -1415,13 +2087,16 @@ def list_diagnostics(
             })
         # Sort: highest severity first, then most recent.
         from hermes_cli.kanban_diagnostics import SEVERITY_ORDER
+
         sev_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
+
         def _sort_key(row):
             top = row["diagnostics"][0]
             return (
                 -sev_idx.get(top.get("severity"), -1),
                 -(top.get("last_seen_at") or 0),
             )
+
         out.sort(key=_sort_key)
 
         return {
@@ -1430,7 +2105,6 @@ def list_diagnostics(
         }
     finally:
         conn.close()
-
 
 
 # ---------------------------------------------------------------------------
@@ -1445,7 +2119,9 @@ except ImportError:
 
 @router.get("/workers/active")
 def list_active_workers(
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
 ):
     """Return every currently-running worker on the board.
 
@@ -1499,7 +2175,11 @@ def list_active_workers(
             }
             for row in rows
         ]
-        return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+        return {
+            "workers": workers,
+            "count": len(workers),
+            "checked_at": int(time.time()),
+        }
     finally:
         conn.close()
 
@@ -1507,7 +2187,9 @@ def list_active_workers(
 @router.get("/runs/{run_id}")
 def get_run_endpoint(
     run_id: int,
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
 ):
     """Direct lookup of a ``task_runs`` row by its integer id.
 
@@ -1529,7 +2211,9 @@ def get_run_endpoint(
 @router.get("/runs/{run_id}/inspect")
 def inspect_run_endpoint(
     run_id: int,
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
 ):
     """Live PID stats for a run's worker process via psutil.
 
@@ -1561,14 +2245,25 @@ def inspect_run_endpoint(
     pid = r.worker_pid
 
     if _psutil is None:
-        return {"run_id": run_id, "alive": False, "pid": pid, "reason": "psutil not available"}
+        return {
+            "run_id": run_id,
+            "alive": False,
+            "pid": pid,
+            "reason": "psutil not available",
+        }
 
     try:
         proc = _psutil.Process(pid)
-        info = proc.as_dict(attrs=[
-            "cpu_percent", "memory_info", "num_threads",
-            "status", "create_time", "cmdline",
-        ])
+        info = proc.as_dict(
+            attrs=[
+                "cpu_percent",
+                "memory_info",
+                "num_threads",
+                "status",
+                "create_time",
+                "cmdline",
+            ]
+        )
         # num_fds is POSIX-only; skip gracefully on Windows.
         try:
             num_fds = proc.num_fds()
@@ -1589,7 +2284,12 @@ def inspect_run_endpoint(
             "cmdline": info.get("cmdline"),
         }
     except _psutil.NoSuchProcess:
-        return {"run_id": run_id, "alive": False, "pid": pid, "reason": "process not found"}
+        return {
+            "run_id": run_id,
+            "alive": False,
+            "pid": pid,
+            "reason": "process not found",
+        }
     except _psutil.AccessDenied:
         return {"run_id": run_id, "alive": True, "pid": pid, "error": "access denied"}
 
@@ -1602,7 +2302,9 @@ class TerminateRunBody(BaseModel):
 def terminate_run_endpoint(
     run_id: int,
     payload: TerminateRunBody,
-    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
 ):
     """Terminate the worker process backing an in-flight run.
 
@@ -1649,6 +2351,7 @@ def terminate_run_endpoint(
 # ---------------------------------------------------------------------------
 # Recovery actions — reclaim a running claim, reassign to a new profile
 # ---------------------------------------------------------------------------
+
 
 class ReclaimBody(BaseModel):
     reason: Optional[str] = None
@@ -1759,7 +2462,8 @@ def reassign_task_endpoint(
     conn = _conn(board=board)
     try:
         ok = kanban_db.reassign_task(
-            conn, task_id,
+            conn,
+            task_id,
             payload.profile or None,
             reclaim_first=bool(payload.reclaim_first),
             reason=payload.reason,
@@ -1909,6 +2613,7 @@ def _run_estimate(title: str, body: Optional[str]) -> dict:
 # Plugin config (read dashboard.kanban.* defaults from config.yaml)
 # ---------------------------------------------------------------------------
 
+
 @router.get("/config")
 def get_config():
     """Return kanban dashboard preferences from ~/.hermes/config.yaml.
@@ -1919,16 +2624,19 @@ def get_config():
     """
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config() or {}
     except Exception:
         cfg = {}
-    dash_cfg = (cfg.get("dashboard") or {})
+    dash_cfg = cfg.get("dashboard") or {}
     # dashboard.kanban may itself be a dict; fall back to {}.
     k_cfg = dash_cfg.get("kanban") or {}
     return {
         "default_tenant": k_cfg.get("default_tenant") or "",
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
-        "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
+        "include_archived_by_default": bool(
+            k_cfg.get("include_archived_by_default", False)
+        ),
         "render_markdown": bool(k_cfg.get("render_markdown", True)),
     }
 
@@ -1984,6 +2692,7 @@ def _active_profile_name() -> str:
     """Return the current Hermes profile name for notify-sub ownership."""
     try:
         from hermes_cli.profiles import get_active_profile_name
+
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
@@ -2045,8 +2754,8 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         raise HTTPException(
             status_code=404,
             detail=f"No home channel configured for platform {platform!r}. "
-                   f"Set one from the messenger via /sethome, or configure "
-                   f"gateway.platforms.{platform}.home_channel in config.yaml.",
+            f"Set one from the messenger via /sethome, or configure "
+            f"gateway.platforms.{platform}.home_channel in config.yaml.",
         )
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -2096,6 +2805,7 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
 # Stats (per-profile / per-status counts + oldest-ready age)
 # ---------------------------------------------------------------------------
 
+
 @router.get("/stats")
 def get_stats(board: Optional[str] = Query(None)):
     """Per-status + per-assignee counts + oldest-ready age.
@@ -2132,6 +2842,7 @@ def get_assignees(board: Optional[str] = Query(None)):
 # ---------------------------------------------------------------------------
 # Worker log (read-only; file written by _default_spawn)
 # ---------------------------------------------------------------------------
+
 
 @router.get("/tasks/{task_id}/log")
 def get_task_log(
@@ -2173,6 +2884,7 @@ def get_task_log(
 # Dispatch nudge (optional quick-path so the UI doesn't wait 60 s)
 # ---------------------------------------------------------------------------
 
+
 @router.post("/dispatch")
 def dispatch(
     dry_run: bool = Query(False),
@@ -2183,7 +2895,10 @@ def dispatch(
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:
@@ -2197,6 +2912,7 @@ def dispatch(
 # ---------------------------------------------------------------------------
 # Model options (the board's per-task model-override dropdown)
 # ---------------------------------------------------------------------------
+
 
 @router.get("/model-options")
 def model_options():
@@ -2240,6 +2956,7 @@ def model_options():
 # ---------------------------------------------------------------------------
 # Boards CRUD (multi-project support)
 # ---------------------------------------------------------------------------
+
 
 class CreateBoardBody(BaseModel):
     slug: str
@@ -2361,7 +3078,7 @@ def list_boards(include_archived: bool = Query(False)):
     current = kanban_db.get_current_board()
     proj_map = _projects_by_id()
     for b in boards:
-        b["is_current"] = (b["slug"] == current)
+        b["is_current"] = b["slug"] == current
         b["counts"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default
         # board view, so advertising them in the switcher badge makes the
@@ -2471,7 +3188,9 @@ def rename_board(slug: str, payload: RenameBoardBody):
 
 
 @router.delete("/boards/{slug}")
-def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
+def delete_board(
+    slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")
+):
     """Archive (default) or hard-delete a board."""
     try:
         res = kanban_db.remove_board(slug, archive=not delete)
@@ -2512,6 +3231,7 @@ _EVENT_POLL_SECONDS = 0.3
 # Profile metadata & description editing (consumed by the kanban orchestrator)
 # ---------------------------------------------------------------------------
 
+
 class DescribeBody(BaseModel):
     description: Optional[str] = None  # explicit user-authored text
 
@@ -2531,6 +3251,7 @@ def list_profile_roster():
     """
     try:
         from hermes_cli import profiles as profiles_mod
+
         profiles = profiles_mod.list_profiles()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"failed to list profiles: {exc}")
@@ -2561,15 +3282,19 @@ def update_profile_description(profile_name: str, payload: DescribeBody):
     """
     try:
         from hermes_cli import profiles as profiles_mod
+
         canon = profiles_mod.normalize_profile_name(profile_name)
         if canon == "default":
             from hermes_constants import get_hermes_home  # type: ignore
             from pathlib import Path as _Path
+
             profile_dir = _Path(get_hermes_home())
         else:
             profile_dir = profiles_mod.get_profile_dir(canon)
         if not profile_dir.is_dir():
-            raise HTTPException(status_code=404, detail=f"profile '{profile_name}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"profile '{profile_name}' not found"
+            )
         text = (payload.description or "").strip()
         profiles_mod.write_profile_meta(
             profile_dir,
@@ -2597,6 +3322,7 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
     """
     try:
         from hermes_cli import profile_describer  # noqa: WPS433 (intentional)
+
         outcome = profile_describer.describe_profile(
             profile_name,
             overwrite=bool(payload.overwrite),
@@ -2614,6 +3340,7 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
 # ---------------------------------------------------------------------------
 # Decompose endpoint (built-in decomposer fan-out)
 # ---------------------------------------------------------------------------
+
 
 class DecomposeBody(BaseModel):
     author: Optional[str] = None
@@ -2643,6 +3370,7 @@ def decompose_task_endpoint(
     # different boards race and cross-write (issue #38323).
     with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
         from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
+
         outcome = kanban_decompose.decompose_task(
             task_id,
             author=(payload.author or None),
@@ -2663,6 +3391,7 @@ def decompose_task_endpoint(
 # auto_decompose) — surfaced to the dashboard's settings panel
 # ---------------------------------------------------------------------------
 
+
 class OrchestrationSettingsBody(BaseModel):
     orchestrator_profile: Optional[str] = None
     default_assignee: Optional[str] = None
@@ -2676,6 +3405,7 @@ def get_orchestration_settings():
     plus the resolved effective values (filling in fallbacks)."""
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config() or {}
     except Exception:
         cfg = {}
@@ -2690,6 +3420,7 @@ def get_orchestration_settings():
     resolved_default = explicit_default
     try:
         from hermes_cli import profiles as profiles_mod
+
         active_default = profiles_mod.get_active_profile_name() or "default"
         if not resolved_orch or not profiles_mod.profile_exists(resolved_orch):
             resolved_orch = active_default
@@ -2724,6 +3455,7 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     """
     try:
         from hermes_cli.config import load_config, save_config
+
         cfg = load_config() or {}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"failed to load config: {exc}")
@@ -2808,7 +3540,9 @@ async def stream_events(ws: WebSocket):
         # board change.
         ws_board_raw = ws.query_params.get("board")
         try:
-            ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
+            ws_board = (
+                kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
+            )
         except ValueError:
             ws_board = None
 
