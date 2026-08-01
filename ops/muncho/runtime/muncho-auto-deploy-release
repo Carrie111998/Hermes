@@ -28,6 +28,7 @@ SYSTEM_SETPRIV="/usr/bin/setpriv"
 DEPLOY_LOCK_PATH="/run/muncho-auto-deploy-release.lock"
 CUTOVER_ACTIVATION_LOCK_PATH="/run/muncho-writer-activation.lock"
 CUTOVER_ACTIVATION_LOCK_FD_ENV="MUNCHO_WRITER_ACTIVATION_LOCK_FD"
+CUTOVER_UNIT_INPUTS_FD_ENV="MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
 AGENT_BROWSER_CONFIG_RELATIVE_PATH="ops/muncho/runtime/dependencies/agent-browser.json"
@@ -406,6 +407,7 @@ run_cutover_artifact_step() {
     "$SYSTEM_SETPRIV" \
     "$CUTOVER_ACTIVATION_LOCK_PATH" \
     "$CUTOVER_ACTIVATION_LOCK_FD_ENV" \
+    "$CUTOVER_UNIT_INPUTS_FD_ENV" \
     "$CUTOVER_UNIT_INPUTS_PATH" <<'PY'
 import fcntl
 import os
@@ -425,6 +427,7 @@ from pathlib import Path
     setpriv_raw,
     lock_raw,
     lock_fd_env,
+    unit_inputs_fd_env,
     unit_inputs_raw,
 ) = sys.argv[1:]
 release = Path(release_raw)
@@ -452,6 +455,7 @@ if (
     or not setpriv.is_file()
     or lock_path != Path("/run/muncho-writer-activation.lock")
     or lock_fd_env != "MUNCHO_WRITER_ACTIVATION_LOCK_FD"
+    or unit_inputs_fd_env != "MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
     or unit_inputs
     != Path(
         "/var/lib/muncho-production-legacy-cutover/staged/"
@@ -539,6 +543,7 @@ try:
         os.fsync(parent_descriptor)
 finally:
     os.close(parent_descriptor)
+unit_inputs_descriptor = None
 try:
     lock_state = lock_path.lstat()
     opened = os.fstat(descriptor)
@@ -558,6 +563,70 @@ try:
         raise SystemExit("BLOCKED_CUTOVER_PACKAGING_LOCK_CHANGED")
     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.set_inheritable(descriptor, True)
+    unit_inputs_parent = unit_inputs.parent
+    unit_inputs_parent_state = unit_inputs_parent.lstat()
+    if (
+        unit_inputs_parent.resolve(strict=True) != unit_inputs_parent
+        or stat.S_ISLNK(unit_inputs_parent_state.st_mode)
+        or not stat.S_ISDIR(unit_inputs_parent_state.st_mode)
+        or unit_inputs_parent_state.st_uid != 0
+        or unit_inputs_parent_state.st_gid != 0
+        or stat.S_IMODE(unit_inputs_parent_state.st_mode) != 0o700
+        or os.listxattr(unit_inputs_parent, follow_symlinks=False)
+    ):
+        raise SystemExit("BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_PARENT_INVALID")
+    unit_inputs_parent_descriptor = os.open(
+        unit_inputs_parent,
+        parent_flags,
+    )
+    try:
+        opened_unit_inputs_parent = os.fstat(unit_inputs_parent_descriptor)
+        if identity(opened_unit_inputs_parent) != identity(
+            unit_inputs_parent_state
+        ):
+            raise SystemExit(
+                "BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_PARENT_INVALID"
+            )
+        unit_inputs_descriptor = os.open(
+            unit_inputs.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=unit_inputs_parent_descriptor,
+        )
+        unit_inputs_state = os.stat(
+            unit_inputs.name,
+            dir_fd=unit_inputs_parent_descriptor,
+            follow_symlinks=False,
+        )
+        opened_unit_inputs = os.fstat(unit_inputs_descriptor)
+        input_identity = lambda item: (
+            *identity(item),
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if (
+            unit_inputs.resolve(strict=True) != unit_inputs
+            or stat.S_ISLNK(unit_inputs_state.st_mode)
+            or not stat.S_ISREG(opened_unit_inputs.st_mode)
+            or fcntl.fcntl(unit_inputs_descriptor, fcntl.F_GETFL)
+            & os.O_ACCMODE
+            != os.O_RDONLY
+            or opened_unit_inputs.st_nlink != 1
+            or opened_unit_inputs.st_uid != 0
+            or opened_unit_inputs.st_gid != 0
+            or stat.S_IMODE(opened_unit_inputs.st_mode) != 0o444
+            or not 0 < opened_unit_inputs.st_size <= 128 * 1024
+            or input_identity(opened_unit_inputs) != input_identity(
+                unit_inputs_state
+            )
+            or os.listxattr(unit_inputs, follow_symlinks=False)
+        ):
+            raise SystemExit("BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_INVALID")
+    finally:
+        os.close(unit_inputs_parent_descriptor)
+    os.set_inheritable(unit_inputs_descriptor, True)
     environment = {
         "HOME": "/opt/adventico-ai-platform/canonical-brain",
         "LANG": "C.UTF-8",
@@ -566,6 +635,7 @@ try:
         "PATH": "/usr/bin:/bin",
         "USER": "ai-platform-brain",
         lock_fd_env: str(descriptor),
+        unit_inputs_fd_env: str(unit_inputs_descriptor),
     }
     completed = subprocess.run(
         (
@@ -593,11 +663,17 @@ try:
         ),
         stdin=subprocess.DEVNULL,
         env=environment,
-        pass_fds=(descriptor,),
+        pass_fds=(descriptor, unit_inputs_descriptor),
         close_fds=True,
         check=False,
     )
+    if input_identity(os.fstat(unit_inputs_descriptor)) != input_identity(
+        opened_unit_inputs
+    ):
+        raise SystemExit("BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_CHANGED")
 finally:
+    if unit_inputs_descriptor is not None:
+        os.close(unit_inputs_descriptor)
     os.close(descriptor)
 raise SystemExit(completed.returncode)
 PY
