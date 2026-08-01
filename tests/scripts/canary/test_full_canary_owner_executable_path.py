@@ -70,3 +70,15 @@ def test_exact_executable_byte_change_remains_fail_closed(tmp_path: Path) -> Non
         match="test_executable_changed",
     ):
         pinned.absolute_path()
+
+
+def test_non_sticky_writable_ancestor_remains_invalid(tmp_path: Path) -> None:
+    writable = tmp_path / "writable"
+    _trusted, executable = _executable_tree(writable)
+    writable.chmod(0o777)
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="test_executable_invalid",
+    ):
+        _pinned(executable)
