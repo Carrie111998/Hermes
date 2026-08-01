@@ -33,6 +33,19 @@
   src: url('../../../node_modules/@nous-research/ui/dist/fonts/Collapse-Bold.woff2') format('woff2');
 }
 
+/* Dimitri Swank Normal — the Douglas Agent wordmark font, used only for the
+   chat intro banner (components/chat/intro.tsx's WORDMARK). Separate from
+   Space Grotesk (headings/brand header) and Collapse (unused for the
+   wordmark now, kept above for whatever else in the upstream UI still
+   references it). */
+@font-face {
+  font-family: 'Dimitri Swank';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/DimitriSwank-Normal.ttf') format('truetype');
+}
+
 /* Space Grotesk — Douglas Agent's display font for headings and the brand
    header (SIL OFL 1.1, see ./fonts/SpaceGrotesk-OFL.txt). Variable font: one
    file covers the whole 300-700 weight range via font-weight, no separate
