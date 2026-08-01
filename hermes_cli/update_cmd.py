@@ -3860,8 +3860,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # not the helpers' return values: missing npm is a soft skip in
             # _update_node_dependencies(), and _build_web_ui() may serve a
             # stale dist after a failed build.
+            from hermes_constants import get_default_hermes_root
+
             node_failures = _update_node_dependencies()
-            node_refresh_pending = _npm_lockfile_changed(_m().PROJECT_ROOT)
+            node_refresh_pending = _npm_lockfile_changed(
+                get_default_hermes_root()
+            )
             web_refresh_pending = False
             if not node_failures and not node_refresh_pending:
                 _m()._build_web_ui(_m().PROJECT_ROOT / "web")

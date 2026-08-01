@@ -256,13 +256,17 @@ class TestCmdUpdateBranchFallback:
         from hermes_cli import update_cmd
 
         mock_run.side_effect = _make_run_side_effect(commit_count="0")
+        shared_hermes_root = PROJECT_ROOT / ".test-hermes-root"
         with patch.object(
             hm, "_get_origin_url", return_value="https://github.com/NousResearch/hermes-agent.git"
+        ), patch(
+            "hermes_constants.get_default_hermes_root",
+            return_value=shared_hermes_root,
         ), patch.object(
             update_cmd, "_update_node_dependencies", return_value=[]
         ) as refresh_node, patch.object(
             update_cmd, "_npm_lockfile_changed", return_value=False
-        ), patch.object(
+        ) as refresh_pending, patch.object(
             hm, "_build_web_ui", return_value=True
         ) as build_web, patch.object(
             hm, "_web_ui_build_needed", return_value=False
@@ -272,6 +276,7 @@ class TestCmdUpdateBranchFallback:
             cmd_update(mock_args)
 
         refresh_node.assert_called_once_with()
+        refresh_pending.assert_called_once_with(shared_hermes_root)
         build_web.assert_called_once_with(PROJECT_ROOT / "web")
         assert "Already up to date!" in capsys.readouterr().out
 
