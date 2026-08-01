@@ -2038,7 +2038,7 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
     )
 
 
-def test_resolve_api_key_provider_skips_unconfigured_copilot_with_generic_github_token(
+def test_unconfigured_copilot_does_not_call_generic_github_token_resolver(
     monkeypatch,
 ):
     """GITHUB_TOKEN is often present for git/CI and must not trigger Copilot probing."""
@@ -2077,7 +2077,7 @@ def test_resolve_api_key_provider_skips_unconfigured_copilot_with_generic_github
     assert called == []
 
 
-def test_resolve_api_key_provider_allows_explicit_copilot_token_env(monkeypatch):
+def test_explicit_copilot_token_env_invokes_provider_resolver(monkeypatch):
     """COPILOT_GITHUB_TOKEN is a provider-specific opt-in and should still be probed."""
     from collections import OrderedDict
     from hermes_cli.auth import ProviderConfig

@@ -262,7 +262,7 @@ def test_api_auth_me_requires_auth(gated_app):
     assert r.status_code == 401
 
 
-def test_gated_plugin_hub_accepts_cookie_session_without_legacy_token(gated_app, monkeypatch):
+def test_gated_plugin_hub_cookie_session_returns_plugin_payload(gated_app, monkeypatch):
     def fake_hub():
         return {"plugins": [{"id": "stub-plugin"}]}
 
@@ -281,7 +281,7 @@ def test_gated_plugin_hub_accepts_cookie_session_without_legacy_token(gated_app,
     assert r.json() == {"plugins": [{"id": "stub-plugin"}]}
 
 
-def test_gated_plugin_hub_still_requires_cookie_session(gated_app, monkeypatch):
+def test_gated_plugin_hub_unauthenticated_request_does_not_call_handler(gated_app, monkeypatch):
     called = False
 
     def fake_hub():
