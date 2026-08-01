@@ -613,7 +613,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   })
 
   // The popped-out pet overlay's bridge back into the app.
-  usePetBridge({ requestGateway, resumeSession, submitText })
+  usePetBridge({ navigate, requestGateway, resumeSession, submitText })
 
   // The global-hotkey Quick Entry window's bridge: its captured text rides the
   // SAME submit machinery the normal composer uses (current chat / picked

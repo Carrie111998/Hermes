@@ -32,6 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { avatarPacksFolderPath, listAvatarPacks, resolveAvatarPacks } from './avatar-pack-loader'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -995,11 +996,13 @@ app.setAboutPanelOptions({
 // range-aware playback. Must be registered before the app is ready.
 const MEDIA_PROTOCOL = 'hermes-media'
 
-// Only audio/video may be streamed. Without this the handler would read any
+// Only media may be streamed. Without this the handler would read any
 // non-blocklisted local file (no size cap) for any `fetch(hermes-media://…)`.
+// P1: Added image formats (.gif, .png, .webp, .svg) for avatar pack assets.
 const STREAMABLE_MEDIA_EXTS = new Set([
   '.avi',
   '.flac',
+  '.gif',
   '.m4a',
   '.mkv',
   '.mov',
@@ -1007,8 +1010,11 @@ const STREAMABLE_MEDIA_EXTS = new Set([
   '.mp4',
   '.ogg',
   '.opus',
+  '.png',
+  '.svg',
   '.wav',
-  '.webm'
+  '.webm',
+  '.webp'
 ])
 
 protocol.registerSchemesAsPrivileged([
@@ -3196,7 +3202,10 @@ function preflightStateDb(hermesHome, rememberLog) {
       // Emergency timestamped backup, separate from the Python-level snapshot.
       const ts = new Date().toISOString().replace(/[:.]/g, '-')
 
-      const emergencyPath = path.join(hermesHome, `state.db.pre-update-emergency-${ts}.bak`)
+      const emergencyPath = path.join(
+        hermesHome,
+        `state.db.pre-update-emergency-${ts}.bak`
+      )
 
       try {
         fs.copyFileSync(stateDbPath, emergencyPath)
@@ -8844,11 +8853,52 @@ function petOverlayUrl() {
 }
 
 function spawnPetOverlayWindow(bounds) {
+  // Off-screen guard: clamp bounds to a visible region of the primary display.
+  // The renderer does its own check, but the main process has authoritative
+  // screen geometry via screen.getAllDisplays(), so this is the definitive guard.
+  let x = Number.isFinite(bounds?.x) ? Math.round(bounds.x) : undefined
+  let y = Number.isFinite(bounds?.y) ? Math.round(bounds.y) : undefined
+
+  try {
+    const displays = screen.getAllDisplays()
+
+    if (x !== undefined && y !== undefined && displays.length > 0) {
+      // Find the display that contains the most overlap with the target point.
+      let bestDisplay = displays[0]
+      let bestDist = Infinity
+
+      for (const display of displays) {
+        const { x: dx, y: dy, width: dw, height: dh } = display.bounds
+        const cx = Math.max(dx, Math.min(x, dx + dw))
+        const cy = Math.max(dy, Math.min(y, dy + dh))
+        const dist = Math.hypot(x - cx, y - cy)
+
+        if (dist < bestDist) {
+          bestDist = dist
+          bestDisplay = display
+        }
+      }
+
+      const { x: dx, y: dy, width: dw, height: dh } = bestDisplay.bounds
+      const w = Math.max(80, Math.round(bounds?.width || 220))
+      const h = Math.max(80, Math.round(bounds?.height || 220))
+
+      // If the point is outside this display, clamp to the bottom-right corner.
+      if (x < dx || x > dx + dw || y < dy || y > dy + dh) {
+        x = Math.round(dx + dw - w - 24)
+        y = Math.round(dy + dh - h - 24)
+        console.info(`[pet-overlay] spawn: bounds off-screen, clamped to display (${x},${y})`)
+      }
+    }
+  } catch {
+    // Best effort — if screen API fails, proceed with original bounds.
+  }
+
   const win = new BrowserWindow({
     width: Math.max(80, Math.round(bounds?.width || 220)),
     height: Math.max(80, Math.round(bounds?.height || 220)),
-    x: Number.isFinite(bounds?.x) ? Math.round(bounds.x) : undefined,
-    y: Number.isFinite(bounds?.y) ? Math.round(bounds.y) : undefined,
+    x,
+    y,
     frame: false,
     transparent: true,
     resizable: false,
@@ -8920,6 +8970,22 @@ function spawnPetOverlayWindow(bounds) {
     }
   })
 
+  // Fallback show: if the renderer never fires 'ready-to-show' (e.g. the
+  // overlay URL fails to load, or a bundled asset is missing), show the window
+  // after 4s so at least an empty transparent window exists — the renderer can
+  // still mount late and push state. Without this, a load failure makes the
+  // overlay permanently invisible with no diagnostic.
+  setTimeout(() => {
+    if (!win.isDestroyed() && !win.isVisible()) {
+      console.warn('[pet-overlay] ready-to-show timeout — forcing show as fallback')
+      win.showInactive()
+    }
+  }, 4000)
+
+  win.webContents.on('did-fail-load', (_e, errorCode, errorDescription) => {
+    console.error(`[pet-overlay] did-fail-load: ${errorCode} ${errorDescription}`)
+  })
+
   win.on('closed', () => {
     if (petOverlayWindow === win) {
       petOverlayWindow = null
@@ -8939,6 +9005,8 @@ function spawnPetOverlayWindow(bounds) {
 }
 
 function openPetOverlay(bounds) {
+  console.info('[pet-overlay] openPetOverlay called', bounds)
+
   if (petOverlayWindow && !petOverlayWindow.isDestroyed()) {
     if (bounds) {
       petOverlayWindow.setBounds({
@@ -11109,6 +11177,32 @@ ipcMain.handle('hermes:fs:writeText', async (_event, filePath, content) => {
   await fs.promises.writeFile(resolved, text, 'utf8')
 
   return { path: resolved }
+})
+
+// ── Avatar Pack IPC handlers (P1) ───────────────────────────────────────────
+// Scans ~/.hermes/avatar-packs/ for pack.json manifests, resolves per-state
+// asset paths, and returns them with hermes-media:// URLs for streaming.
+// All paths are guarded by resolveReadableFileForIpc (path traversal, symlink).
+
+ipcMain.handle('hermes:avatar-packs:list', async () => {
+  return listAvatarPacks(HERMES_HOME)
+})
+
+ipcMain.handle('hermes:avatar-packs:resolve', async () => {
+  return resolveAvatarPacks(HERMES_HOME)
+})
+
+ipcMain.handle('hermes:avatar-packs:open', async () => {
+  const dir = avatarPacksFolderPath(HERMES_HOME)
+
+  try {
+    await fs.promises.mkdir(dir, { recursive: true })
+    const error = await shell.openPath(path.normalize(dir))
+
+    return error ? { ok: false, error } : { ok: true }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
 })
 
 // Move a file/folder to the OS trash (recoverable) — the VS Code "Delete"

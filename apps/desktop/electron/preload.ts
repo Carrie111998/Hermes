@@ -151,6 +151,14 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   },
   revealLogs: () => ipcRenderer.invoke('hermes:logs:reveal'),
   getRecentLogs: () => ipcRenderer.invoke('hermes:logs:recent'),
+  // Avatar Pack system (P1): scan/resolve local avatar packs from
+  // ~/.hermes/avatar-packs/. Renderer uses these to switch between
+  // Petdex sprite and Avatar Pack rendering.
+  avatarPacks: {
+    list: () => ipcRenderer.invoke('hermes:avatar-packs:list'),
+    resolve: () => ipcRenderer.invoke('hermes:avatar-packs:resolve'),
+    open: () => ipcRenderer.invoke('hermes:avatar-packs:open')
+  },
   readDir: dirPath => ipcRenderer.invoke('hermes:fs:readDir', dirPath),
   gitRoot: startPath => ipcRenderer.invoke('hermes:fs:gitRoot', startPath),
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
