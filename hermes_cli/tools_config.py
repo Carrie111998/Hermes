@@ -2456,8 +2456,16 @@ def _get_platform_tools(
     # globally suppress specific toolsets (e.g. "memory") across all
     # platforms without per-platform toolset configuration.  This runs
     # last so it overrides everything above.
+    # A string value here must be repaired rather than iterated: `hermes config
+    # set agent.disabled_toolsets web` writes the bare scalar `web` (the setter
+    # only auto-coerces bool/int/float), and iterating that subtracts
+    # {'w','e','b'} — matching no toolset, so the globally disabled toolset
+    # stays enabled. That is the same denylist bypass #25752 closed, arriving
+    # through the CLI instead of a per-job override (#61264, #61265).
+    from toolsets import normalize_toolset_spec
+
     agent_cfg = config.get("agent") or {}
-    disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
+    disabled_toolsets = normalize_toolset_spec(agent_cfg.get("disabled_toolsets")) or []
     if disabled_toolsets:
         disabled_set = {str(ts) for ts in disabled_toolsets}
         enabled_toolsets -= disabled_set
