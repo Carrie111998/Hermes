@@ -541,6 +541,56 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
   )
 }
 
+interface CodeBlockProps {
+  children: ReactNode[]
+  cols?: number
+  compact?: boolean
+  lang: string
+  t: Theme
+}
+
+const CODE_PANEL_MIN_WIDTH = 20
+
+function CodeBlock({ children, cols, compact, lang, t }: CodeBlockProps) {
+  // A full outline costs two border cells plus two padding cells. Below this
+  // threshold (and in compact mode), keep only the left accent so code retains
+  // useful width and the border cannot dominate short wrapped lines.
+  const narrow = compact || (cols != null && cols < CODE_PANEL_MIN_WIDTH)
+  const content = children.length ? children : [<Text key="empty"> </Text>]
+
+  if (narrow) {
+    return (
+      <Box
+        borderBottom={false}
+        borderColor={t.color.border}
+        borderRight={false}
+        borderStyle="single"
+        borderTop={false}
+        flexDirection="column"
+        paddingLeft={1}
+        {...(cols ? { width: cols } : {})}
+      >
+        {lang ? <Text color={t.color.muted}>{lang}</Text> : null}
+        {content}
+      </Box>
+    )
+  }
+
+  return (
+    <Box
+      borderColor={t.color.border}
+      borderDimColor
+      borderStyle="round"
+      borderText={lang ? { align: 'start', content: ` ${lang} `, offset: 1, position: 'top' } : undefined}
+      flexDirection="column"
+      paddingX={1}
+      {...(cols ? { width: cols } : {})}
+    >
+      {content}
+    </Box>
+  )
+}
+
 // `color` anchors the prose runs to a palette tone. Block callers that
 // already wrap MdInline in a colored <Text> (headings, quotes, footnotes)
 // leave it unset and inherit that parent; body-prose callers pass
@@ -809,43 +859,44 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
         const isDiff = lang === 'diff'
         const highlighted = !isDiff && isHighlightable(lang)
 
+        const codeChildren = block.map((l, j) => {
+          if (highlighted) {
+            return (
+              <Text key={j} wrap="wrap-char">
+                {highlightLine(l, lang, t).map(([color, text], kk) =>
+                  color ? (
+                    <Text color={color} key={kk}>
+                      {text}
+                    </Text>
+                  ) : (
+                    <Text key={kk}>{text}</Text>
+                  )
+                )}
+              </Text>
+            )
+          }
+
+          const add = isDiff && l.startsWith('+')
+          const del = isDiff && l.startsWith('-')
+          const hunk = isDiff && l.startsWith('@@')
+
+          return (
+            <Text
+              backgroundColor={add ? t.color.diffAdded : del ? t.color.diffRemoved : undefined}
+              color={add ? t.color.diffAddedWord : del ? t.color.diffRemovedWord : hunk ? t.color.muted : undefined}
+              dimColor={isDiff && !add && !del && !hunk && l.startsWith(' ')}
+              key={j}
+              wrap="wrap-char"
+            >
+              {l}
+            </Text>
+          )
+        })
+
         nodes.push(
-          <Box flexDirection="column" key={key} paddingLeft={2}>
-            {lang && !isDiff && <Text color={t.color.muted}>{'─ ' + lang}</Text>}
-
-            {block.map((l, j) => {
-              if (highlighted) {
-                return (
-                  <Text key={j}>
-                    {highlightLine(l, lang, t).map(([color, text], kk) =>
-                      color ? (
-                        <Text color={color} key={kk}>
-                          {text}
-                        </Text>
-                      ) : (
-                        <Text key={kk}>{text}</Text>
-                      )
-                    )}
-                  </Text>
-                )
-              }
-
-              const add = isDiff && l.startsWith('+')
-              const del = isDiff && l.startsWith('-')
-              const hunk = isDiff && l.startsWith('@@')
-
-              return (
-                <Text
-                  backgroundColor={add ? t.color.diffAdded : del ? t.color.diffRemoved : undefined}
-                  color={add ? t.color.diffAddedWord : del ? t.color.diffRemovedWord : hunk ? t.color.muted : undefined}
-                  dimColor={isDiff && !add && !del && !hunk && l.startsWith(' ')}
-                  key={j}
-                >
-                  {l}
-                </Text>
-              )
-            })}
-          </Box>
+          <CodeBlock cols={cols} compact={compact} key={key} lang={lang} t={t}>
+            {codeChildren}
+          </CodeBlock>
         )
 
         continue

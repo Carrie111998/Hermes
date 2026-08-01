@@ -1,6 +1,6 @@
 import { PassThrough } from 'stream'
 
-import { Box, renderSync } from '@hermes/ink'
+import { Box, renderSync, stringWidth } from '@hermes/ink'
 import chalk from 'chalk'
 import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -37,13 +37,13 @@ const ESC = String.fromCharCode(27)
 const CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, 'g')
 const OSC_RE = new RegExp(`${ESC}\\][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
 
-const renderPlain = (node: React.ReactNode) => {
+const renderPlain = (node: React.ReactNode, columns = 80) => {
   const stdout = new PassThrough()
   const stdin = new PassThrough()
   const stderr = new PassThrough()
   let output = ''
 
-  Object.assign(stdout, { columns: 80, isTTY: false, rows: 24 })
+  Object.assign(stdout, { columns, isTTY: false, rows: 24 })
   Object.assign(stdin, { isTTY: false })
   Object.assign(stderr, { isTTY: false })
   stdout.on('data', chunk => {
@@ -57,10 +57,12 @@ const renderPlain = (node: React.ReactNode) => {
     stdout: stdout as NodeJS.WriteStream
   })
 
+  const frame = output
+
   instance.unmount()
   instance.cleanup()
 
-  return output
+  return frame
     .replace(OSC_RE, '')
     .split('\n')
     .map(line => stripAnsi(line).replace(CSI_RE, '').trimEnd())
@@ -215,6 +217,72 @@ describe('protocol sentinels', () => {
     expect(AUDIO_DIRECTIVE_RE.test('[[audio_as_voice]]')).toBe(true)
     expect(AUDIO_DIRECTIVE_RE.test('  [[audio_as_voice]]  ')).toBe(true)
     expect(AUDIO_DIRECTIVE_RE.test('audio_as_voice')).toBe(false)
+  })
+})
+
+describe('fenced code panels', () => {
+  const renderCode = (text: string, width = 40, compact = false) =>
+    renderPlain(
+      React.createElement(
+        Box,
+        { width },
+        React.createElement(Md, { cols: width, compact, t: DEFAULT_THEME, text })
+      ),
+      width
+    )
+
+  it('separates highlighted fenced code with a theme-aware language header', () => {
+    const lines = renderCode('```python\ndef hello():\n    print("hello")\n```')
+
+    expect(lines[0]).toMatch(/^╭─ python ─+╮$/)
+    expect(lines.some(line => /^│ def hello\(\):\s+│$/.test(line))).toBe(true)
+    expect(lines.some(line => /^│ {5}print\("hello"\)\s+│$/.test(line))).toBe(true)
+    expect(lines.some(line => /^╰─+╯$/.test(line))).toBe(true)
+  })
+
+  it('renders language-less, diff, and empty fences as panels', () => {
+    expect(renderCode('```\nplain\n```')[0]).toMatch(/^╭─+╮$/)
+
+    const diff = renderCode('```diff\n@@ -1 +1 @@\n-old\n+new\n```')
+    expect(diff[0]).toMatch(/^╭─ diff ─+╮$/)
+    expect(diff.some(line => /^│ @@ -1 \+1 @@\s+│$/.test(line))).toBe(true)
+    expect(diff.some(line => /^│ -old\s+│$/.test(line))).toBe(true)
+    expect(diff.some(line => /^│ \+new\s+│$/.test(line))).toBe(true)
+
+    const empty = renderCode('```\n```')
+    expect(empty[0]).toMatch(/^╭─+╮$/)
+    expect(empty.some(line => /^│\s+│$/.test(line))).toBe(true)
+    expect(empty.some(line => /^╰─+╯$/.test(line))).toBe(true)
+  })
+
+  it('wraps long and wide-Unicode code within the inner panel width', () => {
+    const lines = renderCode('```text\n한국어🙂 abcdefghijklmnopqrstuvwxyz\n```', 24)
+
+    expect(lines[0]).toBe('╭─ text ───────────────╮')
+    expect(lines).toContain('│ 한국어🙂 abcdefghijk │')
+    expect(lines).toContain('│ lmnopqrstuvwxyz      │')
+    expect(lines.some(line => line === '╰──────────────────────╯')).toBe(true)
+    expect(lines.every(line => stringWidth(line) <= 24)).toBe(true)
+  })
+
+  it('falls back to a compact left accent in narrow terminals and compact mode', () => {
+    const narrow = renderCode('```python\nprint("hello world")\n```', 12)
+    expect(narrow).toEqual(expect.arrayContaining(['│ python', '│ print("hel', '│ lo world")']))
+    expect(narrow.some(line => line.includes('╭'))).toBe(false)
+    expect(narrow.every(line => stringWidth(line) <= 12)).toBe(true)
+
+    const compact = renderCode('```python\nprint(1)\n```', 40, true)
+    expect(compact).toEqual(expect.arrayContaining(['│ python', '│ print(1)']))
+    expect(compact.some(line => line.includes('╭'))).toBe(false)
+  })
+
+  it('keeps unsupported language labels, tabs, and consecutive blocks isolated', () => {
+    const lines = renderCode('```brainfuck\n\t++>\n```\n\n```\nsecond\n```')
+
+    expect(lines.filter(line => line.startsWith('╭')).length).toBe(2)
+    expect(lines[0]).toMatch(/^╭─ brainfuck ─+╮$/)
+    expect(lines.join('\n')).toContain('++>')
+    expect(lines.join('\n')).toContain('second')
   })
 })
 
