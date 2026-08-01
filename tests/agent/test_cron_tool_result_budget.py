@@ -32,6 +32,7 @@ def test_cron_agent_uses_cron_tool_result_budget():
 
 
 def test_default_config_preserves_existing_budget_behavior():
+    assert DEFAULT_CONFIG["cron"]["api_max_retries"] is None
     assert DEFAULT_CONFIG["cron"]["tool_result_budget"] == {
         "max_result_chars": None,
         "max_turn_chars": None,

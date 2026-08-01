@@ -504,6 +504,20 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert mock_agent_cls.call_args.kwargs["max_iterations"] == 10
 
+    def test_cron_api_retries_override_interactive_agent_limit(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: test-model\nagent:\n  api_max_retries: 5\ncron:\n  api_max_retries: 1\n",
+            encoding="utf-8",
+        )
+        job = {"id": "single-attempt", "name": "single", "prompt": "hello"}
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.return_value._api_max_retries == 1
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
@@ -1913,4 +1927,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-

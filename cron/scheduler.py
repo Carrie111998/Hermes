@@ -3317,6 +3317,7 @@ def run_job(
             or _cfg.get("max_turns")
             or 500
         )
+        cron_api_max_retries = cron_cfg.get("api_max_retries")
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3562,6 +3563,15 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if cron_api_max_retries is not None:
+            try:
+                agent._api_max_retries = max(int(cron_api_max_retries), 1)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Job '%s': invalid cron.api_max_retries=%r; using agent default",
+                    job_id,
+                    cron_api_max_retries,
+                )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

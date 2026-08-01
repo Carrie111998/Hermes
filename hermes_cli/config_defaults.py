@@ -2152,6 +2152,10 @@ DEFAULT_CONFIG = {
         # Maximum tool-calling iterations for LLM-backed cron jobs. When unset,
         # agent.max_turns remains the fallback for backward compatibility.
         "max_turns": None,
+        # Total app-level model attempts per cron turn. 1 means a single
+        # attempt; provider routers may still rotate their own credential pool.
+        # null retains agent.api_max_retries for backward compatibility.
+        "api_max_retries": None,
         # Optional cron-only artifact-spill budgets for tool results. These
         # preserve full output on disk while limiting what returns to the model.
         # null values retain the context-scaled interactive defaults.
