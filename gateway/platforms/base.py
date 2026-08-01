@@ -4084,7 +4084,7 @@ class BasePlatformAdapter(ABC):
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
             text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+            return re.sub(r'[*_`#\[\]()]', '', text)[:10000].strip()
 
     async def play_tts(
         self,

@@ -1705,7 +1705,7 @@ def _play_audio_file_impl(file_path: str) -> bool:
                 )
                 with _playback_lock:
                     _active_playback = proc
-                proc.wait(timeout=300)
+                proc.wait(timeout=7200)
                 rc = proc.returncode
                 with _playback_lock:
                     _active_playback = None
