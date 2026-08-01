@@ -970,6 +970,36 @@ export interface Translations {
     importedBadge: string
     resetToMine: string
   }
+  learningInbox: {
+    title: string
+    subtitle: string
+    loading: string
+    refresh: string
+    emptyTitle: string
+    emptyDesc: string
+    approvalOff: string
+    approvalHint: string
+    enableApprovals: string
+    approvalsEnabled: string
+    memory: string
+    skill: string
+    automation: string
+    approve: string
+    dismiss: string
+    viewDetails: string
+    detail: string
+    evidence: string
+    source: string
+    origin: string
+    noSessionEvidence: string
+    loadFailed: string
+    actionFailed: string
+    approved: string
+    dismissed: string
+    openGraph: string
+    openSkills: string
+    candidateCount: (count: number) => string
+  }
   agents: {
     close: string
     title: string

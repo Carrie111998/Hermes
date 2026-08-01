@@ -3458,6 +3458,59 @@ async def get_learning_graph(profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Failed to build learning graph")
 
 
+@app.get("/api/learning/inbox")
+async def get_learning_inbox(profile: Optional[str] = None):
+    """Unified, consent-first proposals from memory, skills, and cron."""
+    try:
+        from agent.learning_inbox import inbox_payload
+
+        with _profile_scope(profile):
+            return inbox_payload()
+    except Exception:
+        _log.exception("GET /api/learning/inbox failed")
+        raise HTTPException(status_code=500, detail="Failed to load learning inbox")
+
+
+@app.get("/api/learning/inbox/{kind}/{item_id}")
+async def get_learning_inbox_item(kind: str, item_id: str, profile: Optional[str] = None):
+    """Full review detail for one learning candidate."""
+    try:
+        from agent.learning_inbox import get_item
+
+        with _profile_scope(profile):
+            item = get_item(kind, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/learning/inbox/%s/%s failed", kind, item_id)
+        raise HTTPException(status_code=500, detail="Failed to load learning candidate")
+    if item is None:
+        raise HTTPException(status_code=404, detail="Learning candidate not found")
+    return item
+
+
+@app.post("/api/learning/inbox/{kind}/{item_id}/{action}")
+async def resolve_learning_inbox_item(
+    kind: str, item_id: str, action: str, profile: Optional[str] = None
+):
+    """Approve or dismiss one candidate using its existing write path."""
+    if action not in {"approve", "dismiss"}:
+        raise HTTPException(status_code=400, detail="Action must be approve or dismiss")
+    try:
+        from agent.learning_inbox import approve, dismiss
+
+        with _profile_scope(profile):
+            result = approve(kind, item_id) if action == "approve" else dismiss(kind, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/learning/inbox/%s/%s/%s failed", kind, item_id, action)
+        raise HTTPException(status_code=500, detail="Failed to resolve learning candidate")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Resolution failed"))
+    return result
+
+
 @app.get("/api/learning/node")
 async def get_learning_node(id: str, profile: Optional[str] = None):
     """Current content of a journey node (skill SKILL.md or memory chunk), for an edit prefill."""

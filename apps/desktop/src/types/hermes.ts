@@ -681,6 +681,50 @@ export interface StarmapGraph {
   stats: Record<string, unknown>
 }
 
+export type LearningInboxKind = 'automation' | 'memory' | 'skill'
+
+export interface LearningInboxItem {
+  action: string
+  actions: Array<'approve' | 'dismiss'>
+  created_at: null | string
+  id: string
+  kind: LearningInboxKind
+  preview: string
+  source: string
+  summary: string
+  target?: unknown
+  title: string
+}
+
+export interface LearningInboxDetail extends LearningInboxItem {
+  detail: string
+  evidence: {
+    dedup_key?: null | string
+    note?: null | string
+    origin?: null | string
+    session_id?: null | string
+    source?: null | string
+  }
+}
+
+export interface LearningInboxResponse {
+  count: number
+  counts: Record<LearningInboxKind, number>
+  generated_at: string
+  items: LearningInboxItem[]
+  settings: {
+    memory_write_approval: boolean
+    skills_write_approval: boolean
+  }
+}
+
+export interface LearningInboxActionResponse {
+  error?: string
+  id: string
+  kind: LearningInboxKind
+  ok: boolean
+}
+
 export interface ContextUsageCategory {
   color: string
   id: string

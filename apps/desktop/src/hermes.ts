@@ -24,6 +24,9 @@ import type {
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
+  LearningInboxActionResponse,
+  LearningInboxDetail,
+  LearningInboxResponse,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -925,6 +928,49 @@ export function getStarmapGraph(): Promise<StarmapGraph> {
     // Backend REST contract — stays /api/learning even though the UI feature is
     // now "star map". Renaming this would break against an un-upgraded backend.
     path: '/api/learning/graph'
+  })
+}
+
+export function getLearningInbox(): Promise<LearningInboxResponse> {
+  return window.hermesDesktop.api<LearningInboxResponse>({
+    ...profileScoped(),
+    path: '/api/learning/inbox'
+  })
+}
+
+export function getLearningInboxItem(id: string): Promise<LearningInboxDetail> {
+  const separator = id.indexOf(':')
+
+  if (separator <= 0) {
+    return Promise.reject(new Error('Invalid learning candidate id'))
+  }
+
+  const kind = id.slice(0, separator)
+  const itemId = id.slice(separator + 1)
+
+  return window.hermesDesktop.api<LearningInboxDetail>({
+    ...profileScoped(),
+    path: `/api/learning/inbox/${encodeURIComponent(kind)}/${encodeURIComponent(itemId)}`
+  })
+}
+
+export function resolveLearningInboxItem(
+  id: string,
+  action: 'approve' | 'dismiss'
+): Promise<LearningInboxActionResponse> {
+  const separator = id.indexOf(':')
+
+  if (separator <= 0) {
+    return Promise.reject(new Error('Invalid learning candidate id'))
+  }
+
+  const kind = id.slice(0, separator)
+  const itemId = id.slice(separator + 1)
+
+  return window.hermesDesktop.api<LearningInboxActionResponse>({
+    ...profileScoped(),
+    path: `/api/learning/inbox/${encodeURIComponent(kind)}/${encodeURIComponent(itemId)}/${action}`,
+    method: 'POST'
   })
 }
 

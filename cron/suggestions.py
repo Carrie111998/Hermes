@@ -33,8 +33,11 @@ import os
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -47,6 +50,50 @@ logger = logging.getLogger(__name__)
 # shared default root. See cron/jobs.py for the full rationale.
 CRON_DIR = get_hermes_home().resolve() / "cron"
 SUGGESTIONS_FILE = CRON_DIR / "suggestions.json"
+
+
+@dataclass(frozen=True)
+class _SuggestionStorePaths:
+    cron_dir: Path
+    suggestions_file: Path
+
+
+_IMPORT_STORE = _SuggestionStorePaths(CRON_DIR, SUGGESTIONS_FILE)
+_suggestions_store_override: ContextVar[Optional[_SuggestionStorePaths]] = ContextVar(
+    "suggestions_store_override",
+    default=None,
+)
+
+
+def _current_store() -> _SuggestionStorePaths:
+    """Resolve the suggestion store for the active profile/request context."""
+    override = _suggestions_store_override.get()
+    if override is not None:
+        return override
+
+    live_constants = _SuggestionStorePaths(CRON_DIR, SUGGESTIONS_FILE)
+    if live_constants != _IMPORT_STORE:
+        return live_constants
+
+    home = get_hermes_home().resolve()
+    if home == _IMPORT_STORE.cron_dir.parent:
+        return live_constants
+    cron_dir = home / "cron"
+    return _SuggestionStorePaths(cron_dir, cron_dir / "suggestions.json")
+
+
+@contextmanager
+def use_suggestions_store(home: Union[str, Path]):
+    """Route suggestion storage to a profile without mutating module globals."""
+    home_path = Path(home).expanduser().resolve()
+    cron_dir = home_path / "cron"
+    token = _suggestions_store_override.set(
+        _SuggestionStorePaths(cron_dir, cron_dir / "suggestions.json")
+    )
+    try:
+        yield
+    finally:
+        _suggestions_store_override.reset(token)
 
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).
@@ -70,14 +117,15 @@ def _secure_file(path: Path) -> None:
 
 
 def _ensure_dir() -> None:
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
+    _current_store().cron_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _load_raw() -> Dict[str, Any]:
-    if not SUGGESTIONS_FILE.exists():
+    suggestions_file = _current_store().suggestions_file
+    if not suggestions_file.exists():
         return {"suggestions": []}
     try:
-        with open(SUGGESTIONS_FILE, "r", encoding="utf-8") as f:
+        with open(suggestions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("suggestions.json unreadable (%s); starting empty", e)
@@ -91,8 +139,9 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
+    suggestions_file = _current_store().suggestions_file
     _ensure_dir()
-    fd, tmp_path = tempfile.mkstemp(dir=str(SUGGESTIONS_FILE.parent), suffix=".tmp", prefix=".sugg_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(suggestions_file.parent), suffix=".tmp", prefix=".sugg_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
@@ -102,8 +151,8 @@ def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
             )
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, SUGGESTIONS_FILE)
-        _secure_file(SUGGESTIONS_FILE)
+        atomic_replace(tmp_path, suggestions_file)
+        _secure_file(suggestions_file)
     except BaseException:
         try:
             os.unlink(tmp_path)
