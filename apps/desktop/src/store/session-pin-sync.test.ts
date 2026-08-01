@@ -13,7 +13,7 @@ vi.mock('@/hermes', () => ({
 import { $pinnedSessionIds } from '@/store/layout'
 import { $sessions } from '@/store/session'
 
-import { watchSessionPins } from './session-pin-sync'
+import { __resetPinSyncForTests, watchSessionPins } from './session-pin-sync'
 
 const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
@@ -127,6 +127,53 @@ describe('watchSessionPins remote pull', () => {
     await flush()
 
     expect($pinnedSessionIds.get()).not.toContain('gone')
+  })
+
+  it('honours a local unpin while the server page still says pinned', async () => {
+    // Real backend rows carry pinned: true once our mirror write lands. The
+    // pull pass runs before the push pass — reading the stale true as
+    // "pinned elsewhere" would resurrect the pin the user just removed, and
+    // the unpin PATCH would never be sent.
+    $sessions.set([row('sticky', { pinned: true })])
+    await flush()
+    expect($pinnedSessionIds.get()).toContain('sticky')
+    patch.mockClear()
+
+    // The user unpins; the server row still says true until our write lands.
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('sticky')
+    expect(patch).toHaveBeenCalledWith('sticky', false, undefined)
+  })
+
+  it('keeps a brand-new pin the server has not heard about yet', async () => {
+    // Real backend rows carry an explicit `pinned: false` for unpinned
+    // sessions. The pull pass must not read "never heard of this pin" as
+    // "removed elsewhere" — that undoes the pin in the same reconcile that
+    // created it, before the push pass ever PATCHes.
+    $sessions.set([row('new-pin', { pinned: false })])
+    $pinnedSessionIds.set(['new-pin'])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toContain('new-pin')
+    expect(patch).toHaveBeenCalledWith('new-pin', true, undefined)
+  })
+
+  it('drops a stored pin at boot when the server row says false (restart after a remote unpin)', async () => {
+    // App restart: the pin is restored from localStorage with no in-process
+    // intent behind it (__resetPinSyncForTests wipes mirror/intent state and
+    // re-anchors the baseline). The present server row says false — the
+    // cross-app contract makes it authoritative: another Desktop app unpinned
+    // this while we were stopped, so boot must not resurrect it (nor PATCH
+    // it back to true).
+    $pinnedSessionIds.set(['stored'])
+    __resetPinSyncForTests()
+    $sessions.set([row('stored', { pinned: false })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('stored')
+    expect(patch).not.toHaveBeenCalled()
   })
 
   it('leaves the local set alone when the backend omits the flag', async () => {
