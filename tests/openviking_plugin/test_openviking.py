@@ -141,9 +141,32 @@ class _FailClosedClient:
         raise RuntimeError("session create unsupported")
 
 
+class _PolicyAwareClient:
+    """Fake client with a session registry so ensure/create/rotate run for real."""
+
+    def __init__(self, *args, **kwargs):
+        self.calls = []  # (method, path, payload)
+        self.sessions = {}  # sid -> memory_policy
+
+    def get(self, path, params=None, **kwargs):
+        self.calls.append(("get", path, params))
+        prefix = "/api/v1/sessions/"
+        if path.startswith(prefix):
+            sid = path[len(prefix):]
+            if sid in self.sessions:
+                return {"result": {"session_id": sid, "memory_policy": self.sessions[sid]}}
+        raise RuntimeError("404 not found")
+
+    def post(self, path, payload=None, **kwargs):
+        payload = payload or {}
+        self.calls.append(("post", path, payload))
+        if path == "/api/v1/sessions":
+            self.sessions[payload["session_id"]] = payload.get("memory_policy")
+        return {"result": {}}
+
+
 class TestPeerOnlySessionGuard:
-    def test_sync_turn_fail_closed_when_session_cannot_be_ensured(self, monkeypatch):
-        client = _FailClosedClient()
+    def _provider(self, monkeypatch, client, sid):
         monkeypatch.setattr(openviking_plugin, "_VikingClient", lambda *a, **k: client)
         provider = OpenVikingMemoryProvider()
         provider._client = cast(Any, client)
@@ -152,7 +175,12 @@ class TestPeerOnlySessionGuard:
         provider._account = "default"
         provider._user = "default"
         provider._agent = "hermes"
-        provider._session_id = "session-x"
+        provider._session_id = sid
+        return provider
+
+    def test_sync_turn_fail_closed_when_session_cannot_be_ensured(self, monkeypatch):
+        client = _FailClosedClient()
+        provider = self._provider(monkeypatch, client, "session-x")
 
         provider.sync_turn("hello", "hi")
         assert provider._drain_writers("session-x", timeout=5.0)
@@ -161,6 +189,55 @@ class TestPeerOnlySessionGuard:
         # default-policy session.
         assert "session-x" not in provider._ensured_peer_sessions
         assert not any("messages/batch" in p for p in client.posts)
+
+        # And the accounting must not have happened either: on_session_end
+        # must not /commit the unverified session (regression test for the
+        # fail-closed-too-late review finding).
+        provider.on_session_end([])
+        assert not any("commit" in p for p in client.posts)
+
+    def test_sync_turn_creates_peer_only_session_then_commits_it(self, monkeypatch):
+        client = _PolicyAwareClient()
+        provider = self._provider(monkeypatch, client, "session-new")
+
+        provider.sync_turn("hello", "hi")
+        assert provider._drain_writers("session-new", timeout=5.0)
+        provider.on_session_end([])
+
+        posts = [(p, pl) for (m, p, pl) in client.calls if m == "post"]
+        paths = [p for p, _ in posts]
+        create_idx = paths.index("/api/v1/sessions")
+        batch_idx = paths.index("/api/v1/sessions/session-new/messages/batch")
+        commit_idx = paths.index("/api/v1/sessions/session-new/commit")
+        assert create_idx < batch_idx < commit_idx
+        assert posts[create_idx][1]["memory_policy"] == provider._PEER_ONLY_POLICY
+
+    def test_sync_turn_rotates_wrong_policy_session_and_commits_effective(self, monkeypatch):
+        client = _PolicyAwareClient()
+        # Pre-existing session with the server-default policy must be rotated.
+        client.sessions["session-rot"] = {
+            "self": {"enabled": True},
+            "peer": {"enabled": True},
+        }
+        provider = self._provider(monkeypatch, client, "session-rot")
+
+        provider.sync_turn("hello", "hi")
+        rotated = "hermes-p2-session-rot"
+        assert provider._drain_writers(rotated, timeout=5.0)
+        provider.on_session_end([])
+
+        paths = [p for (m, p, _) in client.calls if m == "post"]
+        assert "/api/v1/sessions" in paths
+        create_payload = next(
+            pl for (m, p, pl) in client.calls if m == "post" and p == "/api/v1/sessions"
+        )
+        assert create_payload["session_id"] == rotated
+        assert create_payload["memory_policy"] == provider._PEER_ONLY_POLICY
+        # Writes and the commit target the rotated effective session only —
+        # the wrong-policy original stays untouched.
+        assert f"/api/v1/sessions/{rotated}/messages/batch" in paths
+        assert f"/api/v1/sessions/{rotated}/commit" in paths
+        assert not any(p.startswith("/api/v1/sessions/session-rot/") for p in paths)
 
 
 class TestOpenVikingSummaryUriNormalization:

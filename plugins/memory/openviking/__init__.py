@@ -3117,6 +3117,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
             thread.start()
 
     def _session_needs_commit(self, sid: str, turn_count: int) -> bool:
+        # Fail-closed: only sessions confirmed peer-only may be committed.
+        # Committing an unverified sid via a bare POST could auto-create it
+        # with the server-default memory policy.
+        with self._session_state_lock:
+            ensured = sid in self._ensured_peer_sessions
+        if not ensured:
+            if turn_count > 0:
+                logger.warning(
+                    "OpenViking refusing to commit session %s: not peer-only ensured",
+                    sid,
+                )
+            return False
         # Already-committed sessions never need a second commit, regardless of
         # the turn counter — a racing sync_turn can re-increment _turn_count
         # after a commit+reset, so the committed-guard must win over turn_count.
@@ -4130,22 +4142,33 @@ class OpenVikingMemoryProvider(MemoryProvider):
             sid = str(session_id or self._session_id).strip()
             if not sid:
                 return
+
+        # Fail-closed BEFORE any accounting: a session that cannot be
+        # confirmed peer-only must not accumulate turn count or pending
+        # markers — otherwise on_session_end would still /commit the
+        # unverified session, and a bare commit POST can auto-create it with
+        # the server-default policy (leaking extraction into the shared root).
+        ensured_sid = self._ensure_peer_session(sid)
+        if not ensured_sid:
+            logger.warning(
+                "OpenViking sync_turn skipped: session %s is not peer-only ensured "
+                "(refusing to write into a default-policy session)",
+                sid,
+            )
+            return
+        if ensured_sid != sid:
+            # Rotated: attribute the turn (and the eventual commit) to the
+            # effective peer-only session, mirroring on_session_switch.
+            with self._session_state_lock:
+                if self._session_id == sid:
+                    self._session_id = ensured_sid
+
+        with self._session_state_lock:
             self._turn_count += 1
 
-        self._mark_session_pending(sid)
+        self._mark_session_pending(ensured_sid)
 
         def _sync():
-            # Fail-closed: never write into a session that isn't confirmed
-            # peer-only — a bare messages POST would auto-create it with the
-            # server default policy and leak extraction into the shared root.
-            ensured_sid = self._ensure_peer_session(sid)
-            if not ensured_sid:
-                logger.warning(
-                    "OpenViking sync_turn skipped: session %s is not peer-only ensured "
-                    "(refusing to write into a default-policy session)",
-                    sid,
-                )
-                return
             next_batch_index = 0
 
             def _post_unsent_messages_individually(client: _VikingClient) -> None:
@@ -4235,7 +4258,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                             return
                     logger.warning("OpenViking sync_turn failed: %s", retry_error)
 
-        self._spawn_writer(sid, _sync, name="openviking-sync")
+        self._spawn_writer(ensured_sid, _sync, name="openviking-sync")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Commit the session to trigger memory extraction.
