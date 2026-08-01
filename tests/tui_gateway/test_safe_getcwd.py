@@ -111,6 +111,10 @@ def test_slash_worker_spawns_with_fallback_cwd_and_preserves_contract(monkeypatc
     (#40677), UTF-8 lossy decode (#53137), windows_hide_flags() or
     start_new_session=True that this block has accumulated."""
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    # Deliberately NOT tmp_path: that is the expected fallback cwd, so reusing
+    # it would let the HERMES_HOME assertion pass without the override firing.
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
     with patch.dict("sys.modules", {
         "hermes_constants": MagicMock(
             get_hermes_home=MagicMock(return_value=str(tmp_path))
@@ -120,13 +124,15 @@ def test_slash_worker_spawns_with_fallback_cwd_and_preserves_contract(monkeypatc
             mock_popen.return_value.stdout = MagicMock()
             mock_popen.return_value.stderr = MagicMock()
             with patch("os.getcwd", _getcwd_raises()):
-                server._SlashWorker(session_key="k", model="m")
+                server._SlashWorker(
+                    session_key="k", model="m", profile_home=str(profile_home)
+                )
 
     assert mock_popen.called, "Popen was not invoked"
     kwargs = mock_popen.call_args[1]
     assert kwargs["cwd"] == str(tmp_path)
     # preservation guarantee, asserted rather than promised
-    assert kwargs["env"] is not None
+    assert kwargs["env"]["HERMES_HOME"] == str(profile_home)
     assert kwargs["start_new_session"] is True
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"

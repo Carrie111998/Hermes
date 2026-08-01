@@ -1366,15 +1366,24 @@ def _safe_getcwd() -> str:
     ``os.getcwd()`` raises FileNotFoundError when the process's working
     directory has been removed out from under it (e.g. the folder Hermes was
     launched in was deleted, rebuilt, or ``git worktree remove``'d mid-session).
-    Every ``os.getcwd()`` in this package is a *fallback* on a path that has
-    already exhausted its explicit sources, so a raise here is never recoverable
-    locally — ``session.create``/``session.resume`` run inline (they are not in
-    ``_LONG_HANDLERS``) and ``tui_gateway/entry.py`` does not guard
-    ``dispatch()``, so the stdio gateway process exits.
+    This guards the seven *fallback* sites that resolve a cwd only after their
+    explicit sources are exhausted — ``_SlashWorker``, ``_default_session_cwd``
+    and both ``_completion_cwd`` returns here, plus ``cli.exec``,
+    ``config.show`` and ``shell.exec`` in ``methods_tools.py`` — where a raise
+    is never recoverable locally: ``session.create``/``session.resume`` run
+    inline (they are not in ``_LONG_HANDLERS``) and ``tui_gateway/entry.py``
+    does not guard ``dispatch()``, so the stdio gateway process exits.
 
-    Mirrors :func:`tools.terminal_tool._safe_getcwd` (added in #39491) exactly,
-    including the TERMINAL_CWD -> home fallback chain, so the two surfaces
-    cannot drift.
+    ``compute_host.py`` (:520, :752) still calls ``os.getcwd()`` directly, by
+    design: ``host_supervisor.py`` starts that child with ``cwd=str(self.cwd)``
+    (:328), which defaults to ``_repo_root()`` (:150), so the compute host
+    cannot observe the deleted launch directory — ``Popen`` would fail first if
+    it could.
+
+    The body is identical to :func:`tools.terminal_tool._safe_getcwd` (added in
+    #39491), including the TERMINAL_CWD -> home fallback chain, but they are
+    two independent copies with nothing enforcing the mirror — change both
+    together.
     """
     try:
         return os.getcwd()
