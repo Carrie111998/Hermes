@@ -145,11 +145,15 @@ _PRODUCTION_OPERATIONAL_EDGE_DOMAINS = (
     "canonical",
     "github",
     "infrastructure",
-    "skyvision_backup",
     "skyvision_db",
     "skyvision_email",
     "skyvision_gitlab",
     "skyvision_panel",
+    # Identity allocation is append-only.  These two domains were added after
+    # the production 2100..2108 / 2200..2208 ranges were already live, so they
+    # must not be inserted into the historical sequence and renumber existing
+    # principals.
+    "skyvision_backup",
     "skyvision_seo",
 )
 _PRODUCTION_RUNTIME_USER_NAMES = (

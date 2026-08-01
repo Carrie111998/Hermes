@@ -654,6 +654,42 @@ def test_production_identities_reserve_exact_cutover_catalog_before_creation(
     )
 
 
+def test_operational_edge_identity_allocation_extends_existing_ranges() -> None:
+    legacy_domains = (
+        "adventico_email",
+        "bitrix",
+        "canonical",
+        "github",
+        "infrastructure",
+        "skyvision_db",
+        "skyvision_email",
+        "skyvision_gitlab",
+        "skyvision_panel",
+    )
+
+    for index, domain in enumerate(legacy_domains):
+        principal = f"muncho-edge-{domain}"
+        assert promoter._PRODUCTION_RUNTIME_UID_BY_NAME[principal] == 2100 + index
+        assert promoter._PRODUCTION_RUNTIME_GID_BY_NAME[principal] == 2100 + index
+        assert (
+            promoter._PRODUCTION_RUNTIME_GID_BY_NAME[f"{principal}-c"]
+            == 2200 + index
+        )
+
+    assert promoter._PRODUCTION_RUNTIME_UID_BY_NAME[
+        "muncho-edge-skyvision_backup"
+    ] == 2109
+    assert promoter._PRODUCTION_RUNTIME_GID_BY_NAME[
+        "muncho-edge-skyvision_backup-c"
+    ] == 2209
+    assert promoter._PRODUCTION_RUNTIME_UID_BY_NAME[
+        "muncho-edge-skyvision_seo"
+    ] == 2110
+    assert promoter._PRODUCTION_RUNTIME_GID_BY_NAME[
+        "muncho-edge-skyvision_seo-c"
+    ] == 2210
+
+
 def test_production_identity_reservation_rejects_uid_collision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
