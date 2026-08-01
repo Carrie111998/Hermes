@@ -71,10 +71,6 @@ export function startEmailOAuth({
 
   async function poll() {
     if (settled || polling) return;
-    if (popup.closed) {
-      finish('cancelled');
-      return;
-    }
     polling = true;
     try {
       const result = await listIntegrations();
@@ -82,6 +78,7 @@ export function startEmailOAuth({
         item => item.provider === provider && item.status === 'connected',
       );
       if (connected) finish('connected', undefined, { closePopup: true });
+      else if (popup.closed) finish('cancelled');
     } catch {
       // A transient list failure must not abort an authorization in progress.
     } finally {

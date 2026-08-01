@@ -34,12 +34,24 @@ OpenAPI is available at `/openapi.json` and interactive API docs at `/docs`.
 
 ## Connect Gmail and Microsoft 365
 
-Configure the public origin, credential-encryption key, and provider-issued
-OAuth credentials in the deployment environment:
+Generate the Fernet credential-encryption key once, outside the runtime start
+command:
+
+```bash
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Store the printed value in a durable deployment secret manager. Every restart
+and every replica must load the same stable `INTERFAZE_CREDENTIAL_KEY`.
+Replacing it without first re-encrypting stored credentials makes existing
+integrations unreadable.
+
+At runtime, load that stable key together with the public origin and
+provider-issued OAuth credentials:
 
 ```bash
 export INTERFAZE_PUBLIC_BASE_URL='https://interfaze.example.com'
-export INTERFAZE_CREDENTIAL_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+export INTERFAZE_CREDENTIAL_KEY="${INTERFAZE_CREDENTIAL_KEY:?load the stable Fernet key from the deployment secret manager}"
 
 export GOOGLE_OAUTH_CLIENT_ID="${GOOGLE_OAUTH_CLIENT_ID:?load the provider-issued id from the deployment secret manager}"
 export GOOGLE_OAUTH_CLIENT_SECRET="${GOOGLE_OAUTH_CLIENT_SECRET:?load the provider-issued secret from the deployment secret manager}"

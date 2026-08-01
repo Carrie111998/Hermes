@@ -49,6 +49,53 @@ def _configured_client(**overrides):
     )
 
 
+def _seed_pre_oauth_email_rows(app, company_id: str) -> dict[str, dict]:
+    rows = {
+        "legacy_google": {
+            "id": "int_legacy_google",
+            "provider": "google",
+            "credentials": None,
+            "stamp": 50.0,
+        },
+        "legacy_microsoft": {
+            "id": "int_legacy_microsoft",
+            "provider": "microsoft",
+            "credentials": "",
+            "stamp": 40.0,
+        },
+        "valid_google": {
+            "id": "int_valid_google",
+            "provider": "google",
+            "credentials": app.state.cipher.encrypt({"refresh_token": "google-valid"}),
+            "stamp": 30.0,
+        },
+        "valid_microsoft": {
+            "id": "int_valid_microsoft",
+            "provider": "microsoft",
+            "credentials": app.state.cipher.encrypt({"refresh_token": "microsoft-valid"}),
+            "stamp": 20.0,
+        },
+        "unrelated": {
+            "id": "int_unrelated_smtp",
+            "provider": "smtp",
+            "credentials": None,
+            "stamp": 10.0,
+        },
+    }
+    with app.state.db.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO integrations VALUES(?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    row["id"], company_id, "email", row["provider"], "connected",
+                    row["credentials"], "{}", row["stamp"], row["stamp"],
+                )
+                for row in rows.values()
+            ],
+        )
+    return rows
+
+
 @pytest.mark.parametrize("provider", ["google", "microsoft"])
 @pytest.mark.parametrize("payload", [None, {}])
 def test_legacy_direct_connect_requires_oauth_and_creates_no_integration(provider, payload):
@@ -116,6 +163,32 @@ def test_legacy_direct_connect_rejects_cross_company_user(provider):
     )
 
     assert res.status_code == 403
+
+
+def test_email_list_hides_only_credentialless_legacy_hosted_rows():
+    app, client = _configured_client()
+    _admin, headers, company_id = chat_tenant(client)
+    rows = _seed_pre_oauth_email_rows(app, company_id)
+
+    res = client.get("/api/v1/integrations/email", headers=headers)
+
+    assert res.status_code == 200
+    assert [item["id"] for item in res.json()] == [
+        rows["valid_google"]["id"],
+        rows["valid_microsoft"]["id"],
+        rows["unrelated"]["id"],
+    ]
+
+
+def test_outreach_selector_skips_credentialless_legacy_hosted_rows():
+    app, client = _configured_client()
+    _admin, _headers, company_id = chat_tenant(client)
+    rows = _seed_pre_oauth_email_rows(app, company_id)
+
+    integration, credentials = app.state.outreach._integration(company_id, "email")
+
+    assert integration["id"] == rows["valid_google"]["id"]
+    assert credentials == {"refresh_token": "google-valid"}
 
 
 def _callback(client, provider: str, state: str, **query):

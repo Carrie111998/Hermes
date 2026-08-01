@@ -78,7 +78,9 @@ def _connect(kind: str, provider: str, body: IntegrationConnect, request: Reques
 def email_integrations(request: Request, principal: Principal = Depends(current_principal),
                        x_company_id: str | None = Header(default=None)):
     return [_integration(row) for row in request.app.state.db.all(
-        "SELECT * FROM integrations WHERE company_id=? AND kind='email' ORDER BY created_at DESC",
+        "SELECT * FROM integrations WHERE company_id=? AND kind='email' "
+        "AND (provider NOT IN ('google','microsoft') "
+        "OR COALESCE(encrypted_credentials,'')<>'') ORDER BY created_at DESC",
         (_scope(principal, x_company_id),),
     )]
 

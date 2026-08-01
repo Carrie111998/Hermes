@@ -280,6 +280,8 @@ class OutreachService:
     def _integration(self, company_id: str, kind: str):
         row = self.db.one(
             "SELECT * FROM integrations WHERE company_id=? AND kind=? AND status='connected' "
+            "AND (kind<>'email' OR provider NOT IN ('google','microsoft') "
+            "OR COALESCE(encrypted_credentials,'')<>'') "
             "ORDER BY updated_at DESC LIMIT 1", (company_id, kind),
         )
         if not row:

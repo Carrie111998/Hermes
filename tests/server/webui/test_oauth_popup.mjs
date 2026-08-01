@@ -171,6 +171,53 @@ test('polling fallback completes once and ignores a later message race', async (
   assert.deepEqual(h.timers.counts(), { intervals: 0, timeouts: 0 });
 });
 
+test('closed popup polls the stored connection before cancelling a missed message', async () => {
+  const h = harness();
+  const attempt = startEmailOAuth(h.options);
+  await attempt.ready;
+  h.setListResult({ items: [{ provider: 'google', status: 'connected' }] });
+  h.popup.closed = true;
+
+  await h.timers.tickIntervals();
+  h.message({
+    origin: h.windowRef.location.origin,
+    source: h.popup,
+    data: { type: 'interfaze:oauth', provider: 'google', status: 'connected' },
+  });
+
+  assert.equal(h.connectedCount(), 1);
+  assert.deepEqual(h.statuses, []);
+  assert.equal(h.listeners.has('message'), false);
+  assert.deepEqual(h.timers.counts(), { intervals: 0, timeouts: 0 });
+});
+
+test('closed popup retries a transient list failure before settling', async () => {
+  let lists = 0;
+  const h = harness({
+    listIntegrations: async () => {
+      lists += 1;
+      if (lists === 1) throw new Error('temporary');
+      return { items: [{ provider: 'google', status: 'connected' }] };
+    },
+  });
+  const attempt = startEmailOAuth(h.options);
+  await attempt.ready;
+  h.popup.closed = true;
+
+  await h.timers.tickIntervals();
+  assert.equal(lists, 1);
+  assert.equal(h.connectedCount(), 0);
+  assert.deepEqual(h.statuses, []);
+  assert.deepEqual(h.timers.counts(), { intervals: 1, timeouts: 1 });
+
+  await h.timers.tickIntervals();
+  assert.equal(lists, 2);
+  assert.equal(h.connectedCount(), 1);
+  assert.deepEqual(h.statuses, []);
+  assert.equal(h.listeners.has('message'), false);
+  assert.deepEqual(h.timers.counts(), { intervals: 0, timeouts: 0 });
+});
+
 test('transient polling failures do not abort the bounded attempt', async () => {
   const h = harness({ listIntegrations: async () => { throw new Error('temporary'); } });
   const attempt = startEmailOAuth(h.options);
@@ -395,33 +442,42 @@ test('Google Connect starts provider OAuth and refreshes Integrations once on su
   const originalDocument = globalThis.document;
   const originalWindow = globalThis.window;
   const originalFetch = globalThis.fetch;
-  const originalSetTimeout = globalThis.setTimeout;
-  const originalSetInterval = globalThis.setInterval;
+  const originalTimers = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    setInterval: globalThis.setInterval,
+    clearInterval: globalThis.clearInterval,
+  };
   const documentRef = fakeDocument();
   const windowRef = fakeBrowserWindow();
   const webuiModules = copyWebuiModulePackage();
+  const timers = fakeTimers();
   const requests = [];
   let emailLists = 0;
   let dispose;
 
   globalThis.document = documentRef;
   globalThis.window = windowRef;
-  globalThis.setTimeout = (...args) => {
-    const timer = originalSetTimeout(...args);
-    timer.unref?.();
-    return timer;
-  };
-  globalThis.setInterval = (...args) => {
-    const timer = originalSetInterval(...args);
-    timer.unref?.();
-    return timer;
-  };
+  globalThis.setTimeout = timers.api.setTimeout;
+  globalThis.clearTimeout = timers.api.clearTimeout;
+  globalThis.setInterval = timers.api.setInterval;
+  globalThis.clearInterval = timers.api.clearInterval;
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url, method: options.method || 'GET' });
     if (url === '/health') return Response.json({ agent_runs_enabled: false });
     if (url === '/api/v1/integrations/email') {
       emailLists += 1;
-      return Response.json([]);
+      if (emailLists === 1) return Response.json([]);
+      return Response.json([{
+        id: 'int_google',
+        company_id: 'cmp_test',
+        kind: 'email',
+        provider: 'google',
+        status: 'connected',
+        data: { mailbox: 'owner@example.test' },
+        created_at: 1,
+        updated_at: 2,
+      }]);
     }
     if (url === '/api/v1/integrations/whatsapp'
         || url === '/api/v1/linkedin/actions'
@@ -463,20 +519,50 @@ test('Google Connect starts provider OAuth and refreshes Integrations once on su
       provider: 'google',
       status: 'connected',
     });
-    await flushUntil(() => emailLists === 2, 'Integrations did not refresh after OAuth success');
+    await flushUntil(
+      () => nodesMatching(
+        root,
+        node => node.className.split(/\s+/).includes('ifz-integration-card')
+          && node.textContent.includes('Google Workspace')
+          && nodesMatching(node, child => child.tagName === 'BUTTON')
+            .some(child => child.textContent === 'Test'),
+      ).length === 1,
+      'Google card did not render its connected state after OAuth success',
+    );
 
     assert.equal(emailLists, 2);
+    const googleCard = nodesMatching(
+      root,
+      node => node.className.split(/\s+/).includes('ifz-integration-card')
+        && node.textContent.includes('Google Workspace'),
+    )[0];
+    assert.equal(nodesMatching(
+      googleCard,
+      node => node.className.split(/\s+/).includes('ifz-badge')
+        && node.textContent === 'connected',
+    ).length, 1);
+    assert.deepEqual(
+      nodesMatching(googleCard, node => node.tagName === 'BUTTON')
+        .map(node => node.textContent),
+      ['Test', 'Disconnect'],
+    );
     assert.equal(nodesMatching(
       documentRef.body,
       node => node.tagName === 'SPAN' && node.textContent === 'Google Workspace connected',
     ).length, 1);
+    assert.deepEqual(timers.counts(), { intervals: 0, timeouts: 1 });
+    await timers.fireTimeouts();
+    await timers.fireTimeouts();
+    assert.deepEqual(timers.counts(), { intervals: 0, timeouts: 0 });
   } finally {
     dispose?.();
     globalThis.document = originalDocument;
     globalThis.window = originalWindow;
     globalThis.fetch = originalFetch;
-    globalThis.setTimeout = originalSetTimeout;
-    globalThis.setInterval = originalSetInterval;
+    globalThis.setTimeout = originalTimers.setTimeout;
+    globalThis.clearTimeout = originalTimers.clearTimeout;
+    globalThis.setInterval = originalTimers.setInterval;
+    globalThis.clearInterval = originalTimers.clearInterval;
     webuiModules.remove();
   }
 });
