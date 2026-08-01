@@ -267,20 +267,93 @@ _CRON_CLARIFY_PLATFORM_HINT = (
 )
 
 
-def _build_cron_clarify_callback(job: dict, adapters, loop, session_id):
+def _cron_clarify_reply_session_key(job: dict, target: dict, platform, gw_config):
+    """Session key a text reply in the delivery chat will resolve to.
+
+    The gateway intercepts typed clarify answers by the INBOUND chat's
+    session key (``GatewayRunner._maybe_intercept_clarify_text`` →
+    ``build_session_key``), so a cron clarify must register under the key the
+    user's reply produces — the cron job's own session id never matches, and
+    typed answers (open-ended clarifies, text fallback, the native-button
+    "Other" path) would hang until timeout. Key rules mirror
+    ``_seed_cron_channel_session`` / ``_seed_cron_thread_session``:
+
+      * thread targets — participant-shared (``chat_type="thread"``), no user;
+      * DM targets     — key on chat_id alone (``chat_type="dm"``);
+      * group/channel  — user-isolated: bind to the job's origin user, only
+        when the delivery target IS the origin conversation (a fan-out target
+        cannot predict who will reply).
+
+    Returns None when no deterministic key exists (fan-out group target with
+    per-user sessions): the caller falls back to the cron session id and
+    typed replies simply don't resolve — buttons and the timeout path are
+    unaffected.
+    """
+    from gateway.session import SessionSource, build_session_key
+
+    origin = _resolve_origin(job) or {}
+    chat_id = str(target.get("chat_id") or "")
+    thread_id = target.get("thread_id")
+    if thread_id:
+        chat_type = "thread"
+        user_id = None
+    else:
+        target_is_origin = _target_matches_origin(
+            origin, str(target.get("platform", "")).lower(), chat_id, None,
+        )
+        origin_chat_type = (
+            str(origin.get("chat_type") or "").lower() if target_is_origin else ""
+        )
+        is_dm = origin_chat_type == "dm" or (
+            not origin_chat_type and chat_id.startswith("D")
+        )
+        chat_type = "dm" if is_dm else "group"
+        user_id = None
+        if not is_dm and target_is_origin and origin.get("user_id"):
+            user_id = str(origin["user_id"])
+    group_sessions = getattr(gw_config, "group_sessions_per_user", True)
+    if chat_type == "group" and group_sessions and not user_id:
+        return None
+    source = SessionSource(
+        platform=platform,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=user_id,
+        thread_id=str(thread_id) if thread_id else None,
+    )
+    return build_session_key(
+        source,
+        group_sessions_per_user=group_sessions,
+        thread_sessions_per_user=getattr(gw_config, "thread_sessions_per_user", False),
+    )
+
+
+def _build_cron_clarify_callback(job: dict, adapters, loop):
     """Build a clarify_callback for a cron-spawned agent.
 
     Renders the clarify prompt through the live gateway adapter for the job's
     first delivery target (e.g. Discord buttons in the delivery channel) and
     blocks until the user answers or ``agent.clarify_timeout`` elapses.
 
-    Mirrors gateway/run.py's ``_clarify_callback_sync``; the cron-specific
-    difference is that the target chat comes from the job's delivery config,
-    not an inbound message event (a cron session has no attached chat). The
-    wait reuses clarify_gateway.wait_for_response, which polls in 1-second
-    slices and heartbeats the activity tracker, so the cron inactivity
-    watchdog (HERMES_CRON_TIMEOUT, default 600s) does not kill the run while
-    the user is deciding.
+    Mirrors gateway/run.py's ``_clarify_callback_sync`` with two cron-specific
+    differences:
+
+      * the target chat comes from the job's delivery config, not an inbound
+        message event (a cron session has no attached chat);
+      * the pending entry registers under the DELIVERY CHAT's gateway session
+        key (see ``_cron_clarify_reply_session_key``) so typed answers from
+        that chat — open-ended clarifies, text fallback, the native-button
+        "Other" path — resolve through the same inbound text intercept the
+        interactive path uses. Button clicks resolve by clarify_id either
+        way. When the target is a relay-fronted platform the send stamps the
+        logical platform via the ``_relay_logical_platform`` metadata escape
+        hatch (same convention as cron delivery), since a scheduled send has
+        no inbound event to populate the relay's per-chat platform map.
+
+    The wait reuses clarify_gateway.wait_for_response, which polls in
+    1-second slices and heartbeats the activity tracker, so the cron
+    inactivity watchdog (HERMES_CRON_TIMEOUT, default 600s) does not kill the
+    run while the user is deciding.
 
     Returns None when no live adapter with ``send_clarify`` exists for the
     job's delivery targets — the caller then leaves clarify_callback unset
@@ -301,24 +374,43 @@ def _build_cron_clarify_callback(job: dict, adapters, loop, session_id):
         return None
 
     adapter = None
+    platform = None
     chat_id = None
     thread_id = None
+    is_relay = False
+    chosen_target = None
     for target in targets:
         try:
-            platform = Platform(str(target.get("platform", "")).lower())
+            candidate_platform = Platform(str(target.get("platform", "")).lower())
         except (ValueError, KeyError):
             continue
-        transport = resolve_delivery_transport(platform, gw_config, adapters)
+        transport = resolve_delivery_transport(candidate_platform, gw_config, adapters)
         candidate = transport.adapter if transport is not None else None
         if candidate is not None and callable(getattr(candidate, "send_clarify", None)):
             adapter = candidate
+            platform = candidate_platform
             chat_id = str(target.get("chat_id") or "")
             thread_id = target.get("thread_id")
+            is_relay = bool(getattr(transport, "is_relay", False))
+            chosen_target = target
             break
     if adapter is None or not chat_id:
         return None
 
     job_id = job["id"]
+
+    reply_key = _cron_clarify_reply_session_key(job, chosen_target, platform, gw_config)
+    if reply_key is not None:
+        logger.info(
+            "Job '%s': clarify text replies bind to session key %s",
+            job_id, reply_key,
+        )
+
+    send_metadata = {}
+    if thread_id:
+        send_metadata["thread_id"] = thread_id
+    if is_relay:
+        send_metadata["_relay_logical_platform"] = platform.value
 
     def _cron_clarify_callback(question, choices, multi_select=False):
         import asyncio
@@ -327,7 +419,7 @@ def _build_cron_clarify_callback(job: dict, adapters, loop, session_id):
         from tools import clarify_gateway as _clarify_mod
 
         clarify_id = _uuid.uuid4().hex[:10]
-        sess_key = session_id or f"cron:{job_id}"
+        sess_key = reply_key or f"cron:{job_id}"
         _clarify_mod.register(
             clarify_id=clarify_id,
             session_key=sess_key,
@@ -345,7 +437,7 @@ def _build_cron_clarify_callback(job: dict, adapters, loop, session_id):
                     choices=list(choices) if choices else None,
                     clarify_id=clarify_id,
                     session_key=sess_key,
-                    metadata={"thread_id": thread_id} if thread_id else None,
+                    metadata=send_metadata or None,
                 ),
                 loop,
             )
@@ -3649,7 +3741,7 @@ def run_job(
                 and adapters is not None and loop is not None
             ):
                 _clarify_cb = _build_cron_clarify_callback(
-                    job, adapters, loop, _cron_session_id,
+                    job, adapters, loop,
                 )
                 if _clarify_cb is not None:
                     agent.clarify_callback = _clarify_cb

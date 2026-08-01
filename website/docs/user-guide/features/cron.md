@@ -123,6 +123,13 @@ Notes:
 
 - The job's `deliver` must target a gateway-connected messaging platform
   whose adapter supports interactive clarify prompts (Discord, Telegram, …).
+  Relay-fronted platforms work too — the send carries the job's logical
+  delivery platform explicitly.
+- Typed answers (open-ended questions, or picking "Other" and typing) resolve
+  when the delivery chat's session can be determined: always for threads and
+  DMs; for group/channel deliveries only when the job was created from that
+  chat (the clarify binds to the member who scheduled it). Otherwise answer
+  with the buttons.
 - Standalone `hermes cron run` fires have no live messaging adapter, so
   `clarify` keeps reporting that it is unavailable in that context.
 - The wait heartbeats the scheduler's activity tracker, so the cron
