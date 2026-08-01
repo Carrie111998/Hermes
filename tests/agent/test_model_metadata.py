@@ -514,6 +514,41 @@ class TestGetModelContextLength:
 
 
 
+    @patch("agent.model_metadata.fetch_model_metadata", return_value={})
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={})
+    def test_qwen3_7_max_specific_fallback_wins_after_metadata_miss(
+        self, mock_endpoint_fetch, mock_fetch
+    ):
+        """A Token Plan metadata miss must prefer the specific family fallback."""
+        base_url = (
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/"
+            "compatible-mode/v1"
+        )
+
+        with (
+            patch(
+                "agent.model_metadata._resolve_endpoint_context_length",
+                return_value=None,
+            ),
+            patch(
+                "agent.model_metadata._query_ollama_api_show",
+                return_value=None,
+            ),
+            patch(
+                "agent.model_metadata.is_local_endpoint",
+                return_value=False,
+            ),
+        ):
+            specific = get_model_context_length(
+                "qwen3.7-max", base_url=base_url, api_key="test-key"
+            )
+            generic = get_model_context_length(
+                "qwen-unknown", base_url=base_url, api_key="test-key"
+            )
+
+        assert specific == 1048576
+        assert generic == 131072
+        assert specific > generic
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_api_missing_context_length_key(self, mock_fetch):
@@ -1076,4 +1111,3 @@ class TestMoAContextLength:
         assert compressor.context_length == configured_context
         assert compressor.threshold_tokens == configured_context // 2
         endpoint_probe.assert_not_called()
-
