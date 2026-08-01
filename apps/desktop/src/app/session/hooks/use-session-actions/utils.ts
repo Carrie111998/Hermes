@@ -13,12 +13,12 @@ import {
   releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
   setCurrentBranch,
-  setCurrentCwdTransient,
-  setCurrentFastMode,
-  setCurrentModel,
+  setCurrentCwd,
+  setCurrentFastModeTransient,
+  setCurrentModelTransient,
   setCurrentPersonality,
-  setCurrentProvider,
-  setCurrentReasoningEffort,
+  setCurrentProviderTransient,
+  setCurrentReasoningEffortTransient,
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
@@ -954,11 +954,11 @@ interface ApplyRuntimeInfoOptions {
  *  renders from. Foreground sessions only — see ApplyRuntimeInfoOptions. */
 function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   if (state.model !== undefined) {
-    setCurrentModel(state.model)
+    setCurrentModelTransient(state.model)
   }
 
   if (state.provider !== undefined) {
-    setCurrentProvider(state.provider)
+    setCurrentProviderTransient(state.provider)
   }
 
   if (state.cwd !== undefined) {
@@ -983,7 +983,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.reasoningEffort !== undefined) {
-    setCurrentReasoningEffort(state.reasoningEffort)
+    setCurrentReasoningEffortTransient(state.reasoningEffort)
   }
 
   if (state.serviceTier !== undefined) {
@@ -991,7 +991,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.fast !== undefined) {
-    setCurrentFastMode(state.fast)
+    setCurrentFastModeTransient(state.fast)
   }
 
   if (state.yolo !== undefined) {
@@ -1073,15 +1073,12 @@ export function applyRuntimeInfo(
   return sessionState
 }
 
-export function applyStoredSessionPreviewRuntimeInfo(
-  stored: { cwd?: null | string; model?: null | string } | undefined,
-  storedSessionId: null | string
-) {
-  setCurrentModel(stored?.model || '')
-  setCurrentProvider('')
-  setCurrentReasoningEffort('')
+export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
+  setCurrentModelTransient(stored?.model || '')
+  setCurrentProviderTransient('')
+  setCurrentReasoningEffortTransient('')
   setCurrentServiceTier('')
-  setCurrentFastMode(false)
+  setCurrentFastModeTransient(false)
   setYoloActive(false)
   setCurrentPersonality('')
 
