@@ -8,7 +8,7 @@
     "memory": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory@0.6.3"]
+      "args": ["-y", "@modelcontextprotocol/server-memory@0.6.2"]
     }
   },
   "hooks": {
