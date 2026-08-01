@@ -187,6 +187,38 @@ class TestPatchReplace:
         assert Path(path).read_text() == "line1\nREPLACED\nline3\n"
 
 
+# ── patch_multi_edit ────────────────────────────────────────────────────
+
+class TestPatchMultiEdit:
+    def test_real_roundtrip_with_cross_platform_filenames(self, ops, tmp_path):
+        """Exercise path quoting and the real atomic-write path end to end."""
+        names = [
+            "file with spaces.py",
+            "café-東京.py",
+            "apostrophe's file.py",
+            "[draft] (final) $file.py",
+        ]
+        original = "def greet():\n    return 'hello'\n"
+        expected = "def greet(name):\n    return f'hello {name}'\n"
+
+        for name in names:
+            target = tmp_path / name
+            target.write_text(original, encoding="utf-8")
+
+            result = ops.patch_multi_edit(str(target), [
+                {"old_string": "def greet():", "new_string": "def greet(name):"},
+                {
+                    "old_string": "return 'hello'",
+                    "new_string": "return f'hello {name}'",
+                },
+            ])
+
+            assert result.error is None, f"{name}: {result.error}"
+            assert result.success
+            assert [item["status"] for item in result.edit_results] == ["ok", "ok"]
+            assert target.read_text(encoding="utf-8") == expected
+
+
 # ── search ───────────────────────────────────────────────────────────────
 
 class TestSearch:

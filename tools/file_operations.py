@@ -205,6 +205,7 @@ class PatchResult:
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
+    edit_results: Optional[List[Dict[str, Any]]] = None
     
     def to_dict(self) -> dict:
         result = {"success": self.success}
@@ -222,6 +223,8 @@ class PatchResult:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
+        if self.edit_results:
+            result["edit_results"] = self.edit_results
         return result
 
 
@@ -463,6 +466,15 @@ class FileOperations(ABC):
     @abstractmethod
     def patch_v4a(self, patch_content: str) -> PatchResult:
         """Apply a V4A format patch."""
+        ...
+
+    @abstractmethod
+    def patch_multi_edit(self, path: str, edits: List[Dict[str, Any]]) -> PatchResult:
+        """Apply a list of ``{old_string, new_string}`` replacements to one file.
+
+        Each edit is applied sequentially against the running content using
+        fuzzy matching; all per-edit outcomes are reported together.
+        """
         ...
 
     @abstractmethod
@@ -1719,6 +1731,134 @@ class ShellFileOperations(FileOperations):
         result = apply_v4a_operations(operations, self)
         return result
     
+    def patch_multi_edit(self, path: str, edits: List[Dict[str, Any]]) -> PatchResult:
+        """Apply a list of ``{old_string, new_string}`` replacements to one file.
+
+        Each edit is applied sequentially against the *evolving* content
+        (edit N's ``old_string`` is matched against the result of edits
+        0..N-1), using the same fuzzy-matching chain as ``patch_replace``.
+        All per-edit outcomes are reported together in ``edit_results``;
+        a failed edit simply doesn't alter the content and the remaining
+        edits still run.
+
+        Write behavior: the merged content is written exactly once if at
+        least one edit succeeded. Successful edits are committed in one atomic 
+        final write, but failed edits are reported and do not roll back successful 
+        edits.
+
+        Args:
+            path: File path to modify
+            edits: List of ``{"old_string": str, "new_string": str}`` dicts.
+                Each ``old_string`` must be unique within the current content
+                at the time it is applied.
+
+        Returns:
+            PatchResult with the merged diff, per-edit ``edit_results``, and
+            a single lint result for the final content.
+        """
+        path = self._expand_path(path)
+
+        denied = get_write_denied_error(path)
+        if denied:
+            return PatchResult(error=denied)
+
+        if not edits or not isinstance(edits, list):
+            return PatchResult(error="edits list is required and must not be empty")
+
+        read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+        read_result = self._exec(read_cmd)
+
+        if read_result.exit_code != 0:
+            return PatchResult(error=f"Failed to read file: {path}")
+
+        content = read_result.stdout
+        # Strip a leading UTF-8 BOM before matching (see patch_replace for the
+        # rationale). write_file restores the marker on the way back out.
+        content, _ = _strip_bom(content)
+
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        current = content
+        edit_results: List[Dict[str, Any]] = []
+        succeeded = 0
+
+        for i, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                edit_results.append({"index": i, "status": "error",
+                                     "error": "edit is not an object; expected {old_string, new_string}"})
+                continue
+            old_s = edit.get("old_string")
+            new_s = edit.get("new_string")
+            if old_s is None or new_s is None:
+                edit_results.append({"index": i, "status": "error",
+                                     "error": f"edit {i} requires both 'old_string' and 'new_string'"})
+                continue
+            if not isinstance(old_s, str) or not isinstance(new_s, str):
+                edit_results.append({
+                    "index": i,
+                    "status": "error",
+                    "error": f"edit {i} old_string and new_string must both be strings",
+                })
+                continue
+
+            new_current, match_count, strategy, error = fuzzy_find_and_replace(
+                current, old_s, new_s, False
+            )
+            if error or match_count == 0:
+                err_msg = error or f"Could not find match for old_string (edit {i}) in {path}"
+                try:
+                    from tools.fuzzy_match import format_no_match_hint
+                    err_msg += format_no_match_hint(err_msg, match_count, old_s, current)
+                except Exception:
+                    pass
+                edit_results.append({"index": i, "status": "error", "error": err_msg})
+                continue
+
+            current = new_current
+            succeeded += 1
+            edit_results.append({"index": i, "status": "ok", "strategy": strategy})
+
+        if succeeded == 0:
+            return PatchResult(error="None of the edits could be applied", edit_results=edit_results)
+
+        file_ending = _detect_line_ending(content)
+        if file_ending:
+            current = _normalize_line_endings(current, file_ending)
+
+        write_result = self.write_file(path, current)
+        if write_result.error:
+            return PatchResult(error=f"Failed to write changes: {write_result.error}",
+                               edit_results=edit_results)
+
+        verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+        verify_result = self._exec(verify_cmd)
+        if verify_result.exit_code != 0:
+            return PatchResult(error=f"Post-write verification failed: could not re-read {path}",
+                               edit_results=edit_results)
+
+        _verify_bomless, _ = _strip_bom(verify_result.stdout)
+        _verify_stdout_normalized = _verify_bomless.replace("\r\n", "\n").replace("\r", "\n")
+        _new_content_normalized = current.replace("\r\n", "\n").replace("\r", "\n")
+        if _verify_stdout_normalized != _new_content_normalized:
+            return PatchResult(error=(
+                f"Post-write verification failed for {path}: on-disk content "
+                f"differs from intended write "
+                f"(wrote {len(_new_content_normalized)} chars, read back "
+                f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
+                "The patch did not persist. Re-read the file and try again."
+            ), edit_results=edit_results)
+
+        diff = self._unified_diff(content, current, path)
+
+        return PatchResult(
+            success=True,
+            diff=diff,
+            files_modified=[path],
+            lint=write_result.lint,
+            lsp_diagnostics=write_result.lsp_diagnostics,
+            edit_results=edit_results,
+        )
+
     def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:
         """
         Run syntax check on a file after editing.

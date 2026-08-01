@@ -9,6 +9,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
@@ -1647,9 +1648,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
+               edits: List[Dict[str, Any]] = None,
                task_id: str = "default", cross_profile: bool = False,
                session_id: str | None = None) -> str:
-    """Patch a file using replace mode or V4A patch format.
+    """Patch a file using replace mode, V4A patch format, or multi-edit.
+
+    ``mode="replace"``: single find-and-replace (``old_string`` →
+    ``new_string``).
+    ``mode="patch"``: V4A multi-file patch content.
+    ``mode="multi_edit"``: apply a list of ``{"old_string", "new_string"}``
+    edits sequentially against one file's evolving content, reporting all
+    per-edit outcomes together and running a single syntax check at the end.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
     targets under another profile's skills/plugins/cron/memories
@@ -1769,6 +1778,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if not patch:
                     return tool_error("patch content required")
                 result = file_ops.patch_v4a(patch)
+            elif mode == "multi_edit":
+                if not path:
+                    return tool_error("path required")
+                result = file_ops.patch_multi_edit(_path_to_resolved.get(path) or path, edits or [])
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -1976,20 +1989,25 @@ PATCH_SCHEMA = {
         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
         "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
         "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "
-        "REQUIRED PARAMETERS: mode, patch."
+        "REQUIRED PARAMETERS: mode, patch.\n"
+        "MULTI_EDIT MODE (mode='multi_edit'): apply several find-and-replace edits to ONE file "
+        "in a single call. REQUIRED PARAMETERS: mode, path, edits (a list of "
+        "{old_string, new_string} objects). Each edit is applied sequentially against the "
+        "file's evolving content with fuzzy matching; all per-edit results are returned "
+        "together in 'edit_results', and a single syntax check runs once at the end."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["replace", "patch"],
-                "description": "Edit mode. 'replace' (default): requires path + old_string + new_string. 'patch': requires patch content only.",
+                "enum": ["replace", "patch", "multi_edit"],
+                "description": "Edit mode. 'replace' (default): requires path + old_string + new_string. 'patch': requires patch content only. 'multi_edit': requires path + a list of edits, applied sequentially to one file.",
                 "default": "replace",
             },
             "path": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. File path to edit.",
+                "description": "REQUIRED when mode='replace' or mode='multi_edit'. File path to edit.",
             },
             "old_string": {
                 "type": "string",
@@ -2007,6 +2025,18 @@ PATCH_SCHEMA = {
             "patch": {
                 "type": "string",
                 "description": "REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
+            },
+            "edits": {
+                "type": "array",
+                "description": "REQUIRED when mode='multi_edit'. List of {old_string, new_string} objects to apply sequentially to one file. Each old_string must be unique in the file's content at the time it is applied. All per-edit outcomes are reported together in the result's 'edit_results' field.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_string": {"type": "string", "description": "Text to find. Must be unique in the current content."},
+                        "new_string": {"type": "string", "description": "Replacement text. Pass '' to delete the matched text."},
+                    },
+                    "required": ["old_string", "new_string"],
+                },
             },
             "cross_profile": {
                 "type": "boolean",
@@ -2075,7 +2105,8 @@ def _handle_patch(args, **kw):
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
+        replace_all=args.get("replace_all", False), patch=args.get("patch"),
+        edits=args.get("edits"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
     )
