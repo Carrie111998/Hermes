@@ -250,3 +250,91 @@ texto de ayuda es correcto tal cual está. No se tocó nada aquí.
   que el fallo de descifrado realmente ocurre en macOS/Linux tras el
   rebrand — ver `douglas/README.md`, "Verificar en hardware real" #1.
 - **Commit:** *(pendiente)*
+
+## Investigación — "el gateway no arranca" (no era el gateway)
+
+Reporte del usuario: al abrir la app, pantalla de error "Douglas Agent
+couldn't start / Desktop IPC bridge is unavailable", app se cierra
+sola. Investigado a fondo antes de tocar nada, como se pidió.
+
+**Causa raíz confirmada:** ninguna relación con el rebranding ni con el
+backend Python. `apps/desktop/dist/` (el build de producción del
+renderer) llevaba desde el **27 de julio** sin regenerarse — seis días
+de antigüedad respecto al código fuente actual — y el bundle
+`index-Apv7o_hR.js` referenciaba una variable `emptySessionsText` que
+ya no existe en el código fuente actual (`ReferenceError:
+emptySessionsText is not defined`, capturado en
+`AppData/Local/hermes/logs/desktop.log`, dentro del error boundary de
+la lista de sesiones). El crash del renderer ocurre milisegundos
+*después* de que el backend reporta "ready" — el gateway sí arranca;
+lo que se rompe es la UI intentando pintar sobre un bundle obsoleto.
+
+Confirmado con `npm run build` (regenera `dist/` desde el código
+actual) + relanzamiento: mismo arranque, mismo backend, sin el
+`ReferenceError`. Verificado también por separado que la lógica de
+resolución del backend (`resolveHermesHome()`, `resolveHermesBackend()`,
+`ensureRuntime()`) no cambió una sola línea de comportamiento entre
+`80d358dd8` y `HEAD` — el diff completo de esas funciones son
+únicamente los dos textos corregidos en el commit de typos, nada de
+lógica.
+
+Entorno Python en esta máquina: totalmente configurado desde el 19 de
+julio (`%LOCALAPPDATA%\hermes\hermes-agent\venv`, `config.yaml`,
+`auth.json`, sesiones reales) — no es un clon nuevo sin configurar.
+`HERMES_HOME` resuelve consistentemente a esa ruta vía un valor de
+registro de Windows heredado de un `install.ps1` antiguo
+(`HKCU\Environment\HERMES_HOME`), que gana antes de que la lógica de
+existencia de directorio (`%LOCALAPPDATA%\douglas` vs `\hermes`)
+llegue a evaluarse. `%LOCALAPPDATA%\douglas` también existe en esta
+máquina (config/auth/sesiones propios, sin `hermes-agent/` — probablemente
+de un uso separado del entrypoint `douglas` instalado vía pip) pero
+nunca entra en juego aquí por el registro; **queda como riesgo teórico
+real para una máquina nueva sin ese registro heredado**, no descartado,
+solo no es lo que pasó en esta sesión.
+
+**No es un problema del código de este repo — es un artefacto local de
+esta máquina de desarrollo.** No se abre ninguna acción de código para
+esto; documentado aquí para que quede claro qué se investigó y qué se
+descartó.
+
+## apps/desktop/src — huecos de branding que el Paso 3 no cubrió
+
+- **Qué:** cuatro strings más, encontrados con una búsqueda dirigida
+  tras entender el patrón (ver "por qué" abajo): `WORDMARK = 'HERMES
+  AGENT'` en `components/chat/intro.tsx` (el banner grande de la
+  pantalla de nueva sesión — cambiado a `'DOUGLAS AGENT'`, con fuente
+  Dimitri Swank nueva vía `@font-face` en `styles.css` y color
+  `text-emerald-600 dark:text-emerald-400` en vez del `text-midground`
+  genérico); dos `<DecodeText text="HERMES" />` (mismo componente
+  reutilizado en `app/contrib/context.tsx` y
+  `components/pane-shell/tree/renderer/tree-group.tsx`, el estado
+  vacío de un panel — cambiados a `'DOUGLAS AGENT'`); y `<p>Uninstall
+  Hermes</p>` en `app/settings/uninstall-section.tsx` (cambiado a
+  `Uninstall Douglas Agent`).
+- **Por qué se escaparon del Paso 3:** el commit de i18n
+  (`cdbf73000`) rebrandeó `apps/desktop/src/i18n/*.ts` — el
+  diccionario de strings traducibles. Estos cuatro son literales de
+  JS/JSX **fuera** de ese diccionario: una `const` de módulo
+  (`WORDMARK`), texto pasado directo a un prop (`text="HERMES"`), y
+  texto JSX inline (`<p>Uninstall Hermes</p>`). Una búsqueda con
+  alcance en los archivos de i18n nunca los habría visto.
+- **Barrido con el patrón corregido:** `grep` de "Hermes" en
+  `apps/desktop/src/**/*.{ts,tsx}` fuera de `i18n/`, filtrando
+  identificadores (`window.hermesDesktop`, eventos `hermes:*`,
+  `HERMES_PATHS_MIME`, tipos, imports — todo correcto sin tocar) y
+  comentarios de código (no visibles al usuario, no tocados). Dos
+  strings visibles quedaron **intencionalmente sin cambiar** por ser
+  referencias reales a algo externo, mismo criterio que "Hermes
+  Cloud" en el Paso 3 original:
+  - `app/settings/billing/errors.ts:64` — "the portal's Hermes Agent
+    page" — nombra una página real en `portal.nousresearch.com`.
+  - `app/settings/constants.ts:45` — "Hosted Hermes & Nous-trained
+    models" — descripción real del grupo de proveedores `NOUS_` (ese
+    mismo portal).
+- **Riesgo de merge:** bajo — cinco cambios de texto/estilo aislados
+  más un `@font-face` nuevo, ningún cambio de lógica.
+- **Verificado:** `tsc --build tsconfig.json` (0 errores) + `npm run
+  build` + relanzamiento real de la app — capturado visualmente:
+  "DOUGLAS AGENT" en verde esmeralda, fuente Dimitri Swank, en la
+  pantalla de nueva sesión.
+- **Commit:** *(pendiente)*

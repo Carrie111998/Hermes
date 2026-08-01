@@ -50,6 +50,67 @@ intérprete de Python, no lo toques.
 8. Si una decisión admite más de una opción razonable, se presentan las
    opciones con sus trade-offs. No se elige unilateralmente.
 
+## Procedimiento seguro para worktrees de verificación
+
+Incidente (2026-08-01): al comparar el comportamiento de un commit base
+contra `HEAD` en un `git worktree` temporal, 44 archivos rastreados de
+`apps/bootstrap-installer/` y `ui-tui/packages/hermes-ink/` aparecieron
+como borrados en el checkout **principal** tras limpiar el worktree
+(`git worktree remove --force` + `rm -rf`). Recuperados sin pérdida
+(`git restore`), verificado con `git diff --stat HEAD` completo contra
+todo el repo.
+
+**Causa raíz: no confirmada.** Se investigó activamente, dos intentos de
+reproducción fiel y aislada (clon desechable, misma secuencia exacta de
+comandos) en un directorio disponible no reprodujeron el borrado. Lo que
+sí se confirmó, de forma reproducible:
+
+- `ln -s` en este entorno (Windows + Git Bash/MSYS) **no crea symlinks
+  POSIX reales** — crea junctions/reparse points de NTFS. `stat` los
+  reporta como `directory`, no como `symlink`; `rm -f` se niega a
+  tocarlos ("Is a directory"); el comportamiento de `git worktree
+  remove` sobre ellos fue inconsistente entre intentos (un error
+  "Directory not empty" en la ejecución real, éxito silencioso en la
+  reproducción aislada).
+- El propio checkout estaba siendo usado activamente en paralelo
+  (`npm ci`, pruebas de arranque) mientras ocurrió el incidente — una
+  causa externa concurrente no puede descartarse y es tan plausible
+  como el mecanismo de symlinks.
+
+Dado que no se pudo aislar la causa exacta pero el mecanismo de symlink
+es demostrablemente poco fiable (comportamiento distinto según la
+herramienta que lo toque) independientemente de si fue la causa real
+aquí:
+
+**Prohibición:** no crear symlinks (`ln -s`) para compartir
+`node_modules` — ni entre worktrees, ni entre clones, ni de ningún
+tipo — en este repositorio en Windows. Si dos checkouts necesitan el
+mismo `node_modules`, cada uno instala el suyo (`npm ci`), o se usa
+`NODE_PATH` para apuntar Node a una instalación externa sin crear
+ningún enlace en el sistema de archivos.
+
+**Procedimiento para verificar un commit base (p. ej. antes/después de
+un rebrand) sin worktree, cuando alcanza:**
+1. `git show <commit>:<ruta>` / `git diff <base> <head> -- <ruta>` para
+   comparar código fuente línea por línea — cubre la mayoría de
+   preguntas de "¿esto cambió?" sin tocar el filesystem en absoluto.
+2. Si hace falta *ejecutar* código del commit base (no solo leerlo):
+   `git clone` a un directorio nuevo y desechable (no un worktree del
+   mismo repo) e instalar dependencias ahí de forma independiente
+   (`npm ci` completo, sin symlinks). Es más lento pero no comparte
+   nada con el checkout principal — un error de limpieza ahí no puede
+   tocar el repo real.
+3. Verificar `git status --short` y `git diff --stat HEAD` en el
+   checkout **principal** inmediatamente después de cualquier operación
+   de worktree o clon temporal, antes de continuar con cualquier otra
+   cosa — para detectar un problema como este de inmediato, no varios
+   pasos después.
+4. `git worktree add`/`remove` siguen permitidos para uso de **solo
+   lectura** (inspeccionar archivos, `git diff` dentro del worktree) —
+   la prohibición es específicamente sobre symlinks hacia
+   `node_modules` y sobre ejecutar builds/tests dentro de un worktree
+   compartiendo estado con el checkout principal.
+
 ## Limitaciones conocidas
 
 Cosas explícitamente pendientes — no silenciadas, documentadas aquí a propósito
