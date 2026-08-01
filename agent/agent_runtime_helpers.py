@@ -1475,6 +1475,12 @@ def restore_primary_runtime(agent) -> bool:
             "use_native_cache_layout",
             agent.api_mode == "anthropic_messages" and agent.provider == "anthropic",
         )
+        # If the operator has disabled caching via config (cache_ttl is
+        # falsy → _cache_disabled flag is set), the disable must survive
+        # runtime snapshot restoration (#33555).
+        if getattr(agent, "_cache_disabled", False):
+            agent._use_prompt_caching = False
+            agent._use_native_cache_layout = False
 
         # ── Rebuild client for the primary provider ──
         if agent.provider == "moa":
@@ -1834,6 +1840,23 @@ def dump_api_request_debug(
 
 
 
+def _direct_native_anthropic_tool_cache_capability(
+    agent,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    model: Optional[str] = None,
+) -> bool:
+    """Return whether this resolved destination accepts native tool markers."""
+    eff_base_url = base_url if base_url is not None else (agent.base_url or "")
+    eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
+    return (
+        eff_api_mode == "anthropic_messages"
+        and base_url_hostname(eff_base_url) == "api.anthropic.com"
+    )
+
+
 def anthropic_prompt_cache_policy(
     agent,
     *,
@@ -1866,7 +1889,19 @@ def anthropic_prompt_cache_policy(
     documented this for opencode-go Qwen; #24617 reports the same gateway
     contract for DeepSeek. Without markers these providers serve zero cache
     hits, re-billing the full prompt on every turn.
+
+    If the operator has set ``prompt_caching.cache_ttl`` to a falsy value
+    (``false``, ``null``, ``"off"``, etc.) in config.yaml, prompt caching
+    is fully disabled — this early return ensures the disable survives
+    ``/model`` switches, fallback re-derivation, and runtime snapshot
+    restoration (#33555). We check ``"_cache_disabled"`` (set by
+    init_agent when the disable is detected) rather than ``_cache_ttl``
+    directly, because ``_cache_ttl`` is not yet set when the policy runs
+    during the initial ``init_agent`` call.
     """
+    if getattr(agent, "_cache_disabled", False):
+        return (False, False)
+
     eff_provider = (provider if provider is not None else agent.provider) or ""
     eff_base_url = base_url if base_url is not None else (agent.base_url or "")
     eff_api_mode = api_mode if api_mode is not None else (agent.api_mode or "")
