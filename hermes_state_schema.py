@@ -598,6 +598,36 @@ class SessionSchemaMixin:
                 if fts5_available and self._db_has_legacy_inline_fts(cursor):
                     self.set_meta("fts_optimize_available", "1", cursor=cursor)
 
+            if current_version < 24:
+                # v24: backfill sessions.cwd from model_config.cwd for legacy
+                # ACP rows. Before v24, ACP sessions wrote cwd only inside
+                # model_config JSON; the top-level sessions.cwd column was
+                # NULL. Desktop project_tree reads sessions.cwd directly and
+                # never inspects model_config, so every legacy ACP session
+                # landed in Home. This migration heals those rows idempotently:
+                # only source='acp', only when top-level cwd is NULL or empty,
+                # only when model_config is valid JSON with a non-empty string
+                # cwd. Never overwrites an existing non-empty cwd.
+                try:
+                    cursor.execute(
+                        """UPDATE sessions
+                           SET cwd = json_extract(model_config, '$.cwd')
+                           WHERE source = 'acp'
+                             AND (cwd IS NULL OR cwd = '')
+                             AND json_valid(model_config)
+                             AND json_type(model_config, '$.cwd') = 'text'
+                             AND json_extract(model_config, '$.cwd') IS NOT NULL
+                             AND LENGTH(TRIM(json_extract(model_config, '$.cwd'))) > 0"""
+                    )
+                    healed = cursor.rowcount
+                    if healed:
+                        logger.info(
+                            "v24 migration: backfilled cwd for %d legacy ACP sessions",
+                            healed,
+                        )
+                except sqlite3.OperationalError:
+                    pass
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at

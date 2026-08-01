@@ -102,7 +102,7 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the

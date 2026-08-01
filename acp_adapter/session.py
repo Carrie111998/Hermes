@@ -321,14 +321,18 @@ class SessionManager:
             message_count = int(row.get("message_count") or 0)
             if message_count <= 0:
                 continue
-            # Extract cwd from model_config JSON.
-            session_cwd = "."
-            mc = row.get("model_config")
-            if mc:
-                try:
-                    session_cwd = json.loads(mc).get("cwd", ".")
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            # Prefer the canonical top-level sessions.cwd column; fall back
+            # to model_config.cwd for legacy ACP rows that haven't been healed.
+            session_cwd = (row.get("cwd") or "").strip() or None
+            if not session_cwd:
+                mc = row.get("model_config")
+                if mc:
+                    try:
+                        session_cwd = json.loads(mc).get("cwd", ".")
+                    except (json.JSONDecodeError, TypeError):
+                        session_cwd = "."
+                else:
+                    session_cwd = "."
             if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
                 continue
             results.append({
@@ -442,6 +446,7 @@ class SessionManager:
                     source="acp",
                     model=model_str,
                     model_config={"cwd": state.cwd},
+                    cwd=state.cwd,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -449,6 +454,13 @@ class SessionManager:
                     db.update_session_meta(state.session_id, cwd_json, model_str)
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
+                # Also keep the top-level sessions.cwd column in sync so
+                # project_tree and other consumers that read sessions.cwd
+                # (not model_config.cwd) see the current workspace.
+                try:
+                    db.update_session_cwd(state.session_id, state.cwd)
+                except Exception:
+                    logger.debug("Failed to update ACP session cwd", exc_info=True)
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
@@ -515,8 +527,11 @@ class SessionManager:
         if row.get("source") != "acp":
             return None
 
-        # Extract cwd from model_config.
-        cwd = "."
+        # Extract cwd: prefer the canonical top-level sessions.cwd column.
+        # Legacy ACP rows may have NULL sessions.cwd with a valid cwd in
+        # model_config — backfill the top-level column when that happens.
+        cwd = (row.get("cwd") or "").strip() or None
+        model_config_cwd = None
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
@@ -525,12 +540,25 @@ class SessionManager:
             try:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
-                    cwd = meta.get("cwd", ".")
+                    model_config_cwd = meta.get("cwd")
+                    if not cwd and model_config_cwd:
+                        cwd = model_config_cwd
+                        # Heal the legacy row: backfill top-level cwd so
+                        # project_tree and other consumers see it.
+                        try:
+                            db.update_session_cwd(session_id, cwd)
+                        except Exception:
+                            logger.debug(
+                                "Failed to backfill ACP session cwd for %s",
+                                session_id, exc_info=True,
+                            )
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
                 pass
+        if not cwd:
+            cwd = "."
 
         model = row.get("model") or None
 
