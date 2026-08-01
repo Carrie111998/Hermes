@@ -261,6 +261,7 @@ export const en: Translations = {
       'view.toggleReview': 'Toggle review pane',
       'view.toggleStatusbar': 'Toggle status bar',
       'view.showFiles': 'Show file browser',
+      'view.toggleHiddenFiles': 'Show / hide hidden files',
       'view.showTerminal': 'Toggle terminal',
       'view.newTerminal': 'New terminal',
       'view.nextTerminal': 'Next terminal',
@@ -432,6 +433,10 @@ export const en: Translations = {
     appearance: {
       title: 'Appearance',
       intro: 'Desktop-only. Mode is brightness; theme is palette and chat chrome.',
+      fileBrowserTitle: 'File Browser',
+      showHiddenFilesTitle: 'Show Hidden Files',
+      showHiddenFilesDesc:
+        'Include dotfiles such as .env and .github. Ctrl+H toggles this while the file tree is focused.',
       colorMode: 'Color Mode',
       colorModeDesc: 'Pick a fixed mode or let Hermes follow your system setting.',
       toolViewTitle: 'Tool Call Display',

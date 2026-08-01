@@ -229,6 +229,7 @@ export const ar = defineLocale({
       'view.toggleRightSidebar': 'تبديل متصفح الملفات',
       'view.toggleReview': 'تبديل لوحة المراجعة',
       'view.showFiles': 'إظهار متصفح الملفات',
+      'view.toggleHiddenFiles': 'إظهار / إخفاء الملفات المخفية',
       'view.showTerminal': 'إظهار الطرفية',
       'view.closeTab': 'إغلاق علامة التبويب',
       'view.reopenTab': 'إعادة فتح علامة التبويب المغلقة',
@@ -391,6 +392,10 @@ export const ar = defineLocale({
     appearance: {
       title: 'المظهر',
       intro: 'خصص مظهر Hermes Desktop.',
+      fileBrowserTitle: 'متصفح الملفات',
+      showHiddenFilesTitle: 'إظهار الملفات المخفية',
+      showHiddenFilesDesc:
+        'يتضمن الملفات النقطية مثل .env و.github. يبدّل Ctrl+H هذا الخيار عندما يكون التركيز على شجرة الملفات.',
       colorMode: 'نمط الألوان',
       colorModeDesc: 'اختر الوضع الفاتح أو الداكن أو اتبع النظام.',
       toolViewTitle: 'عرض الأدوات',

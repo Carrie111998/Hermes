@@ -342,6 +342,9 @@ export interface Translations {
     appearance: {
       title: string
       intro: string
+      fileBrowserTitle: string
+      showHiddenFilesTitle: string
+      showHiddenFilesDesc: string
       colorMode: string
       colorModeDesc: string
       toolViewTitle: string

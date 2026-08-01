@@ -234,6 +234,7 @@ export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
   { id: 'composer.history', category: 'composer', keys: ['up', 'down'] },
   { id: 'composer.cancel', category: 'composer', keys: ['escape'] },
   // Fixed, context-local shortcuts surfaced for discoverability.
+  { id: 'view.toggleHiddenFiles', category: 'view', keys: ['ctrl+h'] },
   { id: 'view.terminalSelection', category: 'view', keys: ['mod+l'] },
   // Terminal clipboard. ⌘C/⌘V on macOS, Ctrl+Shift+C/V elsewhere — matching VS
   // Code. Plain Ctrl+C also copies when text is selected (Windows Terminal /
