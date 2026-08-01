@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+# Guards scan_skill_commands() against concurrent startup scans (gateway
+# run loop, webhook platform, tool-registry scan all call it at boot).
+# Without it two threads race: seen_names is call-local while
+# _skill_commands is process-global and gets reset+repopulated, so the
+# second scanner logs "already claimed by itself" for every skill.
+_scan_lock = threading.RLock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -377,6 +384,17 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
+    with _scan_lock:
+        return _scan_skill_commands_locked()
+
+
+def _scan_skill_commands_locked() -> Dict[str, Dict[str, Any]]:
+    """Scan skill dirs and rebuild the slash-command map.
+
+    Caller MUST hold ``_scan_lock``. Kept separate from
+    ``scan_skill_commands`` so ``get_skill_commands`` can check-then-scan
+    atomically without recursive locking surprises.
+    """
     global _skill_commands, _skill_commands_platform
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
@@ -474,11 +492,12 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536).
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
+    with _scan_lock:
+        if (
+            not _skill_commands
+            or _skill_commands_platform != _resolve_skill_commands_platform()
+        ):
+            _scan_skill_commands_locked()
     return _skill_commands
 
 
