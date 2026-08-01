@@ -33,6 +33,12 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
+
+# RecursiveIntell stack auto-loader — registers PyO3 native extensions
+try:
+    import agent.transports.ri_autoload  # noqa: F401
+except ImportError:
+    pass
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
