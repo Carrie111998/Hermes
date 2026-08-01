@@ -25361,6 +25361,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                    if first_response and not _intentional_silence:
+                        _queued_delivery_event = MessageEvent(
+                            text="",
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=event_message_id,
+                        )
+                        await self._deliver_media_from_response(
+                            first_response,
+                            _queued_delivery_event,
+                            adapter,
+                        )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
 
 
@@ -25,6 +25,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
         self.sent = []
+        self.documents = []
         self.edits = []
         self.typing = []
 
@@ -37,6 +38,19 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         self.sent.append({"chat_id": chat_id, "content": content})
         return SendResult(success=True, message_id="progress-1")
+
+    async def send_document(
+        self,
+        chat_id,
+        file_path,
+        caption=None,
+        file_name=None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ) -> SendResult:
+        self.documents.append(str(file_path))
+        return SendResult(success=True, message_id="document-1")
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         self.edits.append({"message_id": message_id, "content": content})
@@ -153,7 +167,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
+async def _run_once(monkeypatch, tmp_path, agent_cls, session_id, setup=None):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -179,13 +193,16 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
         chat_type="group",
         thread_id="17585",
     )
+    session_key = "agent:main:telegram:group:-1001:17585"
+    if setup is not None:
+        setup(adapter, source, session_key)
     result = await runner._run_agent(
         message="hi",
         context_prompt="",
         history=[],
         source=source,
         session_id=session_id,
-        session_key="agent:main:telegram:group:-1001:17585",
+        session_key=session_key,
     )
     return adapter, result
 
@@ -216,6 +233,54 @@ async def test_partial_empty_agent_response_is_normalized(monkeypatch, tmp_path)
     assert result["final_response"] != "⚠️ Response truncated due to output length limit"
     assert result["partial"] is True
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_queued_follow_up_delivers_explicit_media(monkeypatch, tmp_path):
+    """A queued notification must not drop MEDIA from the completed turn."""
+    toolkit = tmp_path / "toolkit.md"
+    toolkit.write_text("complete toolkit", encoding="utf-8")
+    state = {}
+
+    class QueuedMediaAgent:
+        calls = 0
+
+        def __init__(self, **kwargs):
+            self.tools = []
+            self._interrupt_requested = False
+
+        @property
+        def is_interrupted(self) -> bool:
+            return self._interrupt_requested
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                state["adapter"]._pending_messages[state["session_key"]] = MessageEvent(
+                    text="background ready",
+                    message_type=MessageType.TEXT,
+                    source=state["source"],
+                    message_id="follow-up-1",
+                )
+                return {
+                    "final_response": f"Toolkit ready\nMEDIA:{toolkit}",
+                    "messages": [],
+                    "api_calls": 1,
+                }
+            return {"final_response": "follow-up handled", "messages": [], "api_calls": 1}
+
+    def setup(adapter, source, session_key):
+        state.update(adapter=adapter, source=source, session_key=session_key)
+
+    adapter, _ = await _run_once(
+        monkeypatch,
+        tmp_path,
+        QueuedMediaAgent,
+        "sess-queued-media",
+        setup=setup,
+    )
+
+    assert adapter.documents == [str(toolkit)]
 
 
 @pytest.mark.asyncio
