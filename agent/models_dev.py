@@ -24,7 +24,6 @@ rather than parsing the raw JSON themselves.
 
 import json
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass

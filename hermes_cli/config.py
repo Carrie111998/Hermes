@@ -2926,7 +2926,11 @@ def offline_mode_enabled() -> bool:
     cold-cache models.dev fetch (``agent/models_dev.py``) and the banner
     update check (``hermes_cli/banner.py``) are suppressed and the process
     lives entirely off disk/memory caches. User-invoked network calls
-    (provider APIs, web tools, skills hub) are unaffected.
+    (provider APIs, web tools, skills hub) are unaffected, but explicit
+    refresh paths that hit these two sources are suppressed too:
+    ``fetch_models_dev(force_refresh=True)`` and the ``/version`` update
+    check (which routes through ``check_for_updates()``) both no-op — in
+    an air-gapped environment they can only fail.
 
     Read live from config.yaml (cached on file mtime by the underlying
     loader) so a long-lived gateway picks up an edit without a restart.

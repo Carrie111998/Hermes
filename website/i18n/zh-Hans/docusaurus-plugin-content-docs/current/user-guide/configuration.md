@@ -707,7 +707,7 @@ agent:
   offline: true   # 除非用户主动发起，否则不触碰网络（默认：false）
 ```
 
-用户主动发起的网络活动不受影响：provider API 调用、web 搜索/抓取工具、skills hub，以及显式执行的 `hermes config refresh` 都照常工作 —— `offline` 只拦截*自动*出站路径。该设置从 `config.yaml` 实时读取，长驻 gateway 修改后无需重启即可生效。
+这两个数据源的显式刷新同样会被抑制 —— `fetch_models_dev(force_refresh=True)` 和 `/version` 更新检查都会直接跳过，因为在气隙环境中它们必然失败。其他用户主动发起的网络活动不受影响：provider API 调用、web 搜索/抓取工具、skills hub 都照常工作。该设置从 `config.yaml` 实时读取，长驻 gateway 修改后无需重启即可生效。
 
 ### API 超时
 

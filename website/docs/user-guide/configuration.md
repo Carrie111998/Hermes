@@ -920,7 +920,7 @@ agent:
   offline: true   # Never touch the network unless the user asked for it (default: false)
 ```
 
-User-invoked network activity is unaffected: provider API calls, web search/extract tools, the skills hub, and explicit `hermes config refresh` all still work — `offline` only gates the *automatic* egress paths. The setting is read live from `config.yaml`, so a long-lived gateway picks up an edit without a restart.
+Explicit refreshes of these two sources are suppressed as well — `fetch_models_dev(force_refresh=True)` and the `/version` update check both no-op, since in an air-gapped environment they can only fail. Other user-invoked network activity is unaffected: provider API calls, web search/extract tools, and the skills hub all still work. The setting is read live from `config.yaml`, so a long-lived gateway picks up an edit without a restart.
 
 ## Verify-on-Stop (coding verification)
 
