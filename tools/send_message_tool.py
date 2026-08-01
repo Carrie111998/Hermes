@@ -688,13 +688,15 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    skip_live_adapter=False,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
 
     Order of attempts:
       1. Live in-process adapter via ``_gateway_runner_ref()`` (the path that
-         existed before this change).
+         existed before this change), unless ``skip_live_adapter`` is true
+         because the caller already tried that adapter.
       2. The plugin's ``standalone_sender_fn`` registered on its
          ``PlatformEntry`` (used when the gateway is not in this process, so
          the runner weakref is ``None``).
@@ -708,7 +710,7 @@ async def _send_via_adapter(
     except Exception:
         runner = None
 
-    if runner is not None:
+    if runner is not None and not skip_live_adapter:
         try:
             adapter = runner.adapters.get(platform)
         except Exception:
@@ -774,12 +776,23 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    skip_live_adapter=False,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
     using the same smart-splitting algorithm as the gateway adapters
-    (preserves code-block boundaries, adds part indicators).
+    (preserves code-block boundaries, adds part indicators). Set
+    ``skip_live_adapter`` when the caller has already tried the live gateway
+    adapter and needs the registry standalone sender directly.
     """
     from gateway.config import Platform
 
@@ -1091,6 +1104,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                skip_live_adapter=skip_live_adapter,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1145,6 +1159,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                skip_live_adapter=skip_live_adapter,
             )
 
         if isinstance(result, dict) and result.get("error"):

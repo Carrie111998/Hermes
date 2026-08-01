@@ -17398,6 +17398,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 str(home.chat_id),
                                 message,
                                 thread_id=str(home.thread_id) if home.thread_id else None,
+                                skip_live_adapter=True,
                             )
                             if not (isinstance(fallback, dict) and fallback.get("error")):
                                 delivered.add(target)

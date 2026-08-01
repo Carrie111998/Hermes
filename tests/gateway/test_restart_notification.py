@@ -504,29 +504,46 @@ async def test_send_home_channel_startup_notification_falls_back_when_live_send_
 ):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
-    import tools.send_message_tool as send_message_tool
+    from gateway.platform_registry import PlatformEntry, platform_registry
 
-    standalone_send = AsyncMock(return_value={"message_id": "standalone-home"})
-    monkeypatch.setattr(send_message_tool, "_send_to_platform", standalone_send)
+    standalone_send = AsyncMock(return_value={"success": True, "message_id": "standalone-home"})
+    monkeypatch.setitem(
+        platform_registry._entries,
+        "slack",
+        PlatformEntry(
+            name="slack",
+            label="Slack",
+            adapter_factory=lambda _cfg: None,
+            check_fn=lambda: True,
+            standalone_sender_fn=standalone_send,
+        ),
+    )
 
     runner, adapter = make_restart_runner()
-    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
-        platform=Platform.TELEGRAM,
-        chat_id="home-42",
-        name="Ops Home",
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.SLACK,
+            chat_id="home-42",
+            name="Ops Home",
+        ),
     )
+    runner.adapters[Platform.SLACK] = adapter
     adapter.send = AsyncMock(return_value=SendResult(success=False, error="send_path_degraded"))
 
     delivered = await runner._send_home_channel_startup_notifications()
 
-    assert delivered == {("telegram", "home-42", None)}
+    assert delivered == {("slack", "home-42", None)}
     adapter.send.assert_called_once()
     standalone_send.assert_awaited_once_with(
-        Platform.TELEGRAM,
-        runner.config.platforms[Platform.TELEGRAM],
+        runner.config.platforms[Platform.SLACK],
         "home-42",
         "♻️ Gateway online — Hermes is back and ready.",
         thread_id=None,
+        media_files=[],
+        force_document=False,
     )
 
 
