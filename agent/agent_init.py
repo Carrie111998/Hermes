@@ -1221,16 +1221,20 @@ def init_agent(
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
                     for _fb in _fb_entries:
-                        _fb_explicit_key = (_fb.get("api_key") or "").strip() or None
-                        if not _fb_explicit_key:
-                            _fb_key_env = (_fb.get("key_env") or _fb.get("api_key_env") or "").strip()
-                            if _fb_key_env:
-                                _fb_explicit_key = os.getenv(_fb_key_env, "").strip() or None
-                        _fb_client, _fb_model = resolve_provider_client(
-                            _fb["provider"], model=_fb["model"], raw_codex=True,
-                            explicit_base_url=_fb.get("base_url"),
-                            explicit_api_key=_fb_explicit_key,
-                        )
+                        try:
+                            from hermes_cli.fallback_config import resolve_entry_api_key
+                            _fb_explicit_key = resolve_entry_api_key(_fb)
+                            _fb_client, _fb_model = resolve_provider_client(
+                                _fb["provider"], model=_fb["model"], raw_codex=True,
+                                explicit_base_url=_fb.get("base_url"),
+                                explicit_api_key=_fb_explicit_key,
+                            )
+                        except Exception as _fb_exc:
+                            logger.debug(
+                                "Init-time fallback entry %s failed: %s",
+                                _fb.get("provider"), _fb_exc,
+                            )
+                            continue
                         if _fb_client is not None:
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
@@ -1465,7 +1469,17 @@ def init_agent(
 
         set_current_session_id(agent.session_id)
     except Exception:
-        os.environ["HERMES_SESSION_ID"] = agent.session_id
+        # Preserve the root-agent legacy fallback, but never let delegated
+        # construction publish a child ID process-wide even if the ContextVar
+        # bridge itself failed to import.
+        try:
+            from agent.delegation_context import is_delegated_child_context
+
+            delegated_child = is_delegated_child_context()
+        except Exception:
+            delegated_child = False
+        if not delegated_child:
+            os.environ["HERMES_SESSION_ID"] = agent.session_id
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
@@ -1963,6 +1977,31 @@ def init_agent(
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=True
     )
+    # Opt-in (default False): a micro-compaction pass rewrites already-sent
+    # history every turn, which breaks the provider prompt-cache prefix on a
+    # per-turn cadence rather than at an episodic boundary. That is the cost
+    # `proactive_prune_min_reclaim_tokens` exists to amortize, so the feature
+    # stays off until an operator opts in and accepts the tradeoff.
+    compression_micro_compact = is_truthy_value(
+        _compression_cfg.get("micro_compact"), default=False
+    )
+    # How often a pass runs, in completed turns. Each pass rewrites
+    # already-sent history and costs one prompt-cache break, so this is the
+    # dial for how often that cost is paid: 1 = every turn (most aggressive
+    # reclaim), 5 = one break per five turns. Clamped to >= 1.
+    compression_micro_compact_every_n_turns = max(
+        1,
+        _parse_prune_int(_compression_cfg.get("micro_compact_every_n_turns", 1), 1),
+    )
+    # Rolling-summary defrag threshold, in tokens. Lived on the compressor as
+    # a hardcoded attribute with no path from config until now.
+    compression_micro_compact_defrag_tokens = max(
+        1,
+        _parse_prune_int(
+            _compression_cfg.get("micro_compact_defrag_threshold_tokens", 2000),
+            2000,
+        ),
+    )
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"
     ).lower()
@@ -2418,6 +2457,16 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    # Apply micro-compaction settings to the compressor (feature is opt-in)
+    _cc = getattr(agent, "context_compressor", None)
+    if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):
+        _cc._micro_compact_enabled = compression_micro_compact
+    if _cc is not None and hasattr(_cc, "_micro_compact_every_n_turns"):
+        _cc._micro_compact_every_n_turns = compression_micro_compact_every_n_turns
+    if _cc is not None and hasattr(_cc, "_micro_compact_defrag_threshold_tokens"):
+        _cc._micro_compact_defrag_threshold_tokens = (
+            compression_micro_compact_defrag_tokens
+        )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
