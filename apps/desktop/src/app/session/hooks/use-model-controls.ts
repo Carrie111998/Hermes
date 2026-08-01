@@ -1,7 +1,6 @@
 import { type QueryClient } from '@tanstack/react-query'
 import { useCallback, useRef } from 'react'
 
-import type { ModelSelection } from '@/app/shell/model-menu-panel'
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
@@ -21,6 +20,7 @@ import {
 } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
+import type { ModelSelection } from '@/types/model-selection'
 
 interface ModelControlsOptions {
   queryClient: QueryClient

@@ -41,7 +41,7 @@ plugin, and fail to resolve in a disk plugin). Capability comes in tiers:
 - **`host.state.*`** — readonly views over the app's live state (nanostore
   atoms): active session, cwd, gateway status, model, profile, viewport.
 - **`host.*` actions** — curated safe verbs: toast, navigate, tail logs,
-  restart the gateway, subscribe to the gateway event stream.
+  restart the gateway, switch the model, subscribe to the gateway event stream.
 - **`host.request`** — the gateway JSON-RPC door: sessions, config, skills,
   cron — everything the app itself calls.
 - **`ctx.rest` / `ctx.socket`** — your plugin's own backend namespace
@@ -375,6 +375,7 @@ host.onEvent(type, fn)                     // gateway event stream ('*' = all); 
 host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot
 host.restartGateway()                      // restart the backend gateway
+host.selectModel({ provider, model, sessionId? })  // switch model like the in-app picker
 host.request<T>(method, params?)           // gateway JSON-RPC — the real power
 ```
 
@@ -384,6 +385,26 @@ session lifecycle, tool activity). Listeners are isolated — a throw in your
 listener can't affect app dispatch. Every `host` door is async-safe: a sync throw
 from an internal helper (e.g. no desktop bridge in a plain browser) becomes a
 rejection your `.catch()` sees, never an error-boundary crash.
+
+### `host.selectModel({ provider, model, sessionId? })`
+
+Switches the model with the exact semantics of the in-app model picker.
+Resolves `Promise<boolean>` — `true` when the switch is accepted; `false`
+when the controller is unavailable or the controller rejects/rolls back
+the switch; unexpected handler exceptions reject the promise.
+
+- **Fresh draft (no live session):** updates the composer model/provider state,
+  which is what the next `session.create` ships. No config is written.
+- **Live session:** applies a session-scoped switch via the backend
+  (`config.set --session`). Mid-turn picks are deferred and applied at the next
+  turn start; a failed switch rolls the composer state back.
+- **`sessionId`** is the runtime session id. Omit it to target the active
+  session; pass one to target a specific session tile.
+- **Never writes the profile default** — that stays owned by Settings → Model.
+- Because the composer atoms are updated through the same controller action the
+  picker uses, a plugin-triggered switch is treated as an explicit user
+  selection, not runtime synchronization (and is unaffected by the composer
+  atom sync changes in PR #75518).
 
 ## Data layer — React Query + nanostores
 
