@@ -82,6 +82,23 @@ def test_cronjob_tool_create_no_agent_without_script_errors(hermes_env):
     assert "no_agent=True requires a script" in result.get("error", "")
 
 
+def test_cronjob_script_error_names_active_profile_directory(
+    hermes_env, monkeypatch
+):
+    from hermes_constants import display_hermes_home
+    from tools.cronjob_tools import _validate_cron_script_path
+
+    profile_home = hermes_env / "profiles" / "seozavod"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    error = _validate_cron_script_path("/tmp/poll.py")
+
+    assert error is not None
+    assert f"{display_hermes_home()}/scripts/" in error
+    assert "~/.hermes/scripts/" not in error
+
+
 # ---------------------------------------------------------------------------
 # scheduler.run_job: short-circuit behavior
 # ---------------------------------------------------------------------------

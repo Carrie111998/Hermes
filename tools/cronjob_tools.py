@@ -507,23 +507,24 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     if not script or not script.strip():
         return None  # empty/None = clearing the field, always OK
 
-    from hermes_constants import get_hermes_home
+    from hermes_constants import display_hermes_home, get_hermes_home
 
     raw = script.strip()
+    scripts_dir = get_hermes_home() / "scripts"
+    scripts_display = f"{display_hermes_home()}/scripts"
 
     # Reject absolute paths and ~ expansion at the API boundary.
-    # Only relative paths within ~/.hermes/scripts/ are allowed.
+    # Only relative paths within the active profile's scripts dir are allowed.
     if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
         return (
-            f"Script path must be relative to ~/.hermes/scripts/. "
+            f"Script path must be relative to {scripts_display}/. "
             f"Got absolute or home-relative path: {raw!r}. "
-            f"Place scripts in ~/.hermes/scripts/ and use just the filename."
+            f"Place scripts in {scripts_display}/ and use just the filename."
         )
 
     # Validate containment after resolution
     from tools.path_security import validate_within_dir
 
-    scripts_dir = get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
     if containment_error:
