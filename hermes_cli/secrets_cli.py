@@ -547,7 +547,10 @@ def cmd_op_setup(args: argparse.Namespace) -> int:
             ver = op.install_onepassword_sdk()
             console.print(f"  [green]✓[/green] Installed onepassword-sdk  ({ver})")
         except Exception as exc:  # noqa: BLE001
-            console.print(f"  [red]✗ Could not install SDK: {exc}[/red]")
+            # Category only, not str(exc) — same convention as every other
+            # exception display in this module (see cmd_op_setup's Step 5
+            # comment below).
+            console.print(f"  [red]✗ Could not install SDK: {type(exc).__name__}[/red]")
             console.print(
                 f"  Manual install:  [cyan]pip install '{op.OP_SDK_REQUIREMENT}'[/cyan]"
             )
@@ -874,5 +877,7 @@ def cmd_op_install(args: argparse.Namespace) -> int:
         console.print(f"[green]✓[/green] onepassword-sdk  ({ver})")
         return 0
     except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]Install failed: {exc}[/red]")
+        # Category only, not str(exc) — same convention as cmd_op_setup's
+        # Step 1 above.
+        console.print(f"[red]Install failed: {type(exc).__name__}[/red]")
         return 1
