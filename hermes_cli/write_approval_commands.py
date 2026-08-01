@@ -152,6 +152,8 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             if ok:
                 if wa.discard_pending(subsystem, rec["id"]):
                     applied += 1
+                elif subsystem != wa.SKILLS:
+                    applied += 1
                 else:
                     failed.append(f"{rec['id']}: no longer pending")
             else:
@@ -186,10 +188,11 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
     if target.lower() == "all":
-        n = 0
-        for rec in wa.list_pending(subsystem):
-            if wa.discard_pending(subsystem, rec["id"]):
-                n += 1
+        with wa.pending_operation_lock(subsystem):
+            n = 0
+            for rec in wa.list_pending(subsystem):
+                if wa.discard_pending(subsystem, rec["id"]):
+                    n += 1
         return f"Rejected {n} pending {subsystem} write(s)."
     if wa.discard_pending(subsystem, target):
         return f"Rejected pending {subsystem} write '{target}'."
