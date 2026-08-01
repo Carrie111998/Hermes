@@ -281,6 +281,13 @@ class _Runtime:
                 parent_handle = task.handle
             else:
                 parent_handle = session.relay_session.handle
+            # Seed the stored context itself before executing through a copy.
+            # NeMo Relay keeps its mutable scope stack in a ContextVar; if the
+            # first get_scope_stack() happens only inside _run_in_context(),
+            # that stack belongs to the temporary copy and a later copy cannot
+            # inherit it. Initializing here makes start and end copies share
+            # one per-model stack while preserving task/session isolation.
+            model_context.run(self.relay.get_scope_stack)
             handle = self._run_in_context(
                 model_context,
                 self.relay.llm.call,

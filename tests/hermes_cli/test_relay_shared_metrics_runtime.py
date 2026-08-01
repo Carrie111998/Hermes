@@ -584,6 +584,18 @@ def test_real_binding_closes_overlapping_metric_calls_out_of_order(
         metrics.start_model_call(second)
         metrics.end_model_call(first, "success")
         metrics.end_model_call(second, "success")
+        metrics.relay.subscribers.flush()
+
+        model_counters = [
+            counter
+            for counter in metrics.subscriber.store.counter_snapshot()
+            if counter["metric_name"] == "hermes.model_call.count"
+        ]
+        assert sum(counter["value"] for counter in model_counters) == 2
+        assert {
+            counter["dimensions"]["outcome"] for counter in model_counters
+        } == {"success"}
+
         metrics.finish_task(base_event)
         relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
 
@@ -1078,8 +1090,6 @@ def test_failed_flush_keeps_daily_export_open_for_later_task(
     assert metrics["hermes.task_run.finished"]["value"] == 2
     assert flush_attempts == 2
     assert "Hermes shared-metrics task flush failed" in caplog.text
-
-
 
 
 
