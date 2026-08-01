@@ -273,7 +273,7 @@ class TestKanbanCli:
         sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
         create = sub.choices["create"]
 
-        for bad in ("2.5", "-0.1", "hot"):
+        for bad in ("2.5", "-0.1", "hot", "nan", "NaN", "inf", "-inf"):
             with pytest.raises(SystemExit):
                 create.parse_args(["t", "--model-temperature", bad])
 

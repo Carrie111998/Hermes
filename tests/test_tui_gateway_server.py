@@ -3444,6 +3444,12 @@ def test_startup_temperature_rejects_non_numeric(monkeypatch):
     assert server._resolve_startup_temperature() is None
 
 
+def test_startup_temperature_rejects_non_finite(monkeypatch):
+    for bad in ("nan", "NaN", "inf", "-inf", "1e999"):
+        monkeypatch.setenv("HERMES_TUI_TEMPERATURE", bad)
+        assert server._resolve_startup_temperature() is None
+
+
 def test_startup_temperature_accepts_boundary_values(monkeypatch):
     monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "0.0")
     assert server._resolve_startup_temperature() == 0.0
