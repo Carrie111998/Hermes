@@ -113,11 +113,13 @@ export const AvatarEditorDialog: FC<AvatarEditorDialogProps> = ({ onClose, open 
     // Flush pending name changes to the store
     for (const role of ['user', 'assistant'] as AvatarRole[]) {
       const pending = pendingNames[role]
+
       if (pending !== undefined) {
         const trimmed = pending.trim()
         setAvatarName(role, trimmed || names[role] || DEFAULT_NAMES[role])
       }
     }
+
     onClose()
   }, [onClose, pendingNames, names])
 
@@ -127,7 +129,7 @@ export const AvatarEditorDialog: FC<AvatarEditorDialogProps> = ({ onClose, open 
   }, [onClose])
 
   return (
-    <Dialog onOpenChange={nextOpen => { if (!nextOpen) onClose(); }} open={open}>
+    <Dialog onOpenChange={nextOpen => { if (!nextOpen) { onClose() } }} open={open}>
       <DialogContent className="max-w-sm" showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>{ae.title}</DialogTitle>

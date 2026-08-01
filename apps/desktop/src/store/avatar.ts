@@ -7,7 +7,7 @@
 
 import { atom } from 'nanostores'
 
-import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
+import { persistStringRecord, storedStringRecord } from '@/lib/storage'
 
 // ---------------------------------------------------------------------------
 // Keys
@@ -35,8 +35,13 @@ function loadImages(): Record<AvatarRole, string> {
   const raw = storedStringRecord(IMAGE_KEY)
   const images: Record<string, string> = { assistant: '', user: '' }
 
-  if (raw.assistant) images.assistant = raw.assistant
-  if (raw.user) images.user = raw.user
+  if (raw.assistant) {
+    images.assistant = raw.assistant
+  }
+
+  if (raw.user) {
+    images.user = raw.user
+  }
 
   return images
 }
@@ -59,8 +64,13 @@ function loadNames(): Record<AvatarRole, string> {
   const raw = storedStringRecord(NAME_KEY)
   const names = { ...DEFAULT_NAMES }
 
-  if (raw.assistant) names.assistant = raw.assistant
-  if (raw.user) names.user = raw.user
+  if (raw.assistant) {
+    names.assistant = raw.assistant
+  }
+
+  if (raw.user) {
+    names.user = raw.user
+  }
 
   return names
 }

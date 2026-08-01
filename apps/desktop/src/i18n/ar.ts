@@ -2304,6 +2304,13 @@ export const ar = defineLocale({
       sendEdited: 'إرسال التعديل',
       attachingFile: 'جار إرفاق الملف'
     },
+    avatarEditor: {
+      title: 'تعديل الصور الرمزية',
+      description: 'تخصيص أسماء وصور المشاركين.',
+      youLabel: 'أنت (مستخدم)',
+      hermesLabel: 'Hermes (مساعد)',
+      placeholder: 'أدخل الاسم'
+    },
     approval: {
       gatewayDisconnected: 'البوابة غير متصلة',
       sendFailed: 'فشل الإرسال',

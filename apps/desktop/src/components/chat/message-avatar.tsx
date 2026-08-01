@@ -1,8 +1,8 @@
 import { useStore } from '@nanostores/react'
 import { type FC, useCallback, useRef } from 'react'
 
-import { $avatarImages, $avatarNames, DEFAULT_NAMES, openAvatarEditor, type AvatarRole } from '@/store/avatar'
 import { cn } from '@/lib/utils'
+import { $avatarImages, $avatarNames, type AvatarRole, DEFAULT_NAMES, openAvatarEditor } from '@/store/avatar'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -36,6 +36,7 @@ function resizeImageToDataUrl(file: File, maxSize: number, onDataUrl: (url: stri
     URL.revokeObjectURL(url)
 
     let { width, height } = img
+
     if (width > maxSize || height > maxSize) {
       const ratio = Math.min(maxSize / width, maxSize / height)
       width = Math.round(width * ratio)
@@ -46,6 +47,7 @@ function resizeImageToDataUrl(file: File, maxSize: number, onDataUrl: (url: stri
     canvas.width = width
     canvas.height = height
     const ctx = canvas.getContext('2d')
+
     if (!ctx) {
       return
     }
@@ -56,12 +58,15 @@ function resizeImageToDataUrl(file: File, maxSize: number, onDataUrl: (url: stri
         if (!blob) {
           return
         }
+
         const reader = new FileReader()
+
         reader.onload = () => {
           if (typeof reader.result === 'string') {
             onDataUrl(reader.result)
           }
         }
+
         reader.readAsDataURL(blob)
       },
       'image/jpeg',
@@ -86,6 +91,7 @@ function acceptImageFiles(event: React.ChangeEvent<HTMLInputElement>, onDataUrl:
 
   // Reject files larger than 10 MB (before any resize)
   const MAX_FILE_SIZE = 10 * 1024 * 1024
+
   if (file.size > MAX_FILE_SIZE) {
     return
   }
@@ -95,11 +101,13 @@ function acceptImageFiles(event: React.ChangeEvent<HTMLInputElement>, onDataUrl:
 
   if (file.size <= DIRECT_THRESHOLD) {
     const reader = new FileReader()
+
     reader.onload = () => {
       if (typeof reader.result === 'string') {
         onDataUrl(reader.result)
       }
     }
+
     reader.readAsDataURL(file)
   } else {
     resizeImageToDataUrl(file, 128, onDataUrl)

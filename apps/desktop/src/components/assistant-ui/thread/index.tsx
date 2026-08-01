@@ -1,5 +1,5 @@
-import { memo, useCallback, useMemo, useRef, useState } from 'react'
 import { useStore } from '@nanostores/react'
+import { memo, useCallback, useMemo, useRef, useState } from 'react'
 
 import { AssistantMessage } from '@/components/assistant-ui/thread/assistant-message'
 import { ThreadMessageList } from '@/components/assistant-ui/thread/list'
@@ -14,8 +14,8 @@ import { Intro, type IntroProps } from '@/components/chat/intro'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { notifyError } from '@/store/notifications'
 import { $avatarEditorOpen, closeAvatarEditor } from '@/store/avatar'
+import { notifyError } from '@/store/notifications'
 
 type ThreadLoadingState = 'response' | 'session'
 

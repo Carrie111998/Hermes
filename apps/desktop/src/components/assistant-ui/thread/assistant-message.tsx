@@ -33,8 +33,8 @@ import { formatAgo } from '@/lib/time'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
-import { notifyError } from '@/store/notifications'
 import { $avatarNames, DEFAULT_NAMES } from '@/store/avatar'
+import { notifyError } from '@/store/notifications'
 import { $voicePlayback } from '@/store/voice-playback'
 
 // Stable empty identity for the settled-parts selector — a fresh [] per render
@@ -119,10 +119,6 @@ export const AssistantMessage: FC<{
   const onDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
 
   const assistantName = useNanostore($avatarNames).assistant || DEFAULT_NAMES.assistant
-
-  if (isPlaceholder) {
-    return null
-  }
 
   return (
     <div className="message-row message-row-assistant flex w-full min-w-0 items-start justify-start gap-2" data-slot="message-row">
