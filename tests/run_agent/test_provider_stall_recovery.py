@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -267,6 +268,138 @@ def test_second_zero_chunk_stall_is_typed_without_generic_retry(
 
     assert caught.value.attempt == 2
     assert agent._create_request_openai_client.call_count == 2
+
+
+def test_second_zero_chunk_stall_switches_to_configured_fallback(
+    agent, monkeypatch
+):
+    _install_policy(monkeypatch, retries=1)
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "5")
+    first_aborted = threading.Event()
+    second_aborted = threading.Event()
+    primary_clients = [
+        _client(_BlockingStream(first_aborted)),
+        _client(_BlockingStream(second_aborted)),
+    ]
+    fallback_client = _client(
+        iter([_chunk("completed by fallback", finish_reason="stop")])
+    )
+    clients = [*primary_clients, fallback_client]
+    agent._create_request_openai_client = MagicMock(side_effect=clients)
+
+    def abort(client, reason):
+        primary_clients[clients.index(client)].chat.completions.create.return_value.aborted.set()
+
+    agent._abort_request_openai_client = MagicMock(side_effect=abort)
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers.probe_provider_endpoint",
+        lambda **kwargs: ProbeOutcome(status="reachable", http_status=200),
+    )
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+    ]
+    agent._fallback_index = 0
+    agent._consecutive_stale_streams = 0
+    logical_history_before_fallback: list[dict] = []
+    fallback_history: list[dict] = []
+
+    def activate(reason=None):
+        assert reason is not None and reason.value == "provider_stalled"
+        logical_history_before_fallback.extend(
+            deepcopy(
+                primary_clients[-1]
+                .chat.completions.create.call_args.kwargs["messages"]
+            )
+        )
+        assert agent._consecutive_stale_streams >= 2
+        agent._fallback_index = 1
+        agent._fallback_activated = True
+        agent.provider = "openrouter"
+        agent.model = "anthropic/claude-sonnet-4"
+        agent._cached_system_prompt = "fallback system prompt"
+        agent._consecutive_stale_streams = 0
+        return True
+
+    def capture_fallback(**kwargs):
+        fallback_history.extend(deepcopy(kwargs["messages"]))
+        return iter([_chunk("completed by fallback", finish_reason="stop")])
+
+    fallback_client.chat.completions.create.side_effect = capture_fallback
+
+    with (
+        patch.object(agent, "_try_activate_fallback", side_effect=activate) as fallback,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.conversation_loop.jittered_backoff") as generic_backoff,
+    ):
+        result = agent.run_conversation("continue the task")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "completed by fallback"
+    assert sum(client.chat.completions.create.call_count for client in primary_clients) == 2
+    assert fallback_client.chat.completions.create.call_count == 1
+    assert agent._create_request_openai_client.call_count == 3
+    fallback.assert_called_once()
+    generic_backoff.assert_not_called()
+    assert logical_history_before_fallback[1:] == fallback_history[1:]
+    assert (
+        logical_history_before_fallback[0]["content"]
+        != fallback_history[0]["content"]
+    )
+    assert agent._consecutive_stale_streams == 0
+
+
+def test_second_stall_without_fallback_reports_probe_diagnosis(
+    agent, monkeypatch
+):
+    _install_policy(monkeypatch, retries=1)
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "5")
+    agent.provider = "primary-provider"
+    agent.model = "primary/model"
+    aborted = [threading.Event(), threading.Event()]
+    clients = [
+        _client(_BlockingStream(aborted[0])),
+        _client(_BlockingStream(aborted[1])),
+    ]
+    agent._create_request_openai_client = MagicMock(side_effect=clients)
+
+    def abort(client, reason):
+        aborted[clients.index(client)].set()
+
+    agent._abort_request_openai_client = MagicMock(side_effect=abort)
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers.probe_provider_endpoint",
+        lambda **kwargs: ProbeOutcome(
+            status="reachable",
+            http_status=200,
+            detail="https://user:secret@provider.invalid/private?token=secret",
+        ),
+    )
+    agent._fallback_chain = []
+    agent._fallback_index = 0
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.conversation_loop.jittered_backoff") as generic_backoff,
+    ):
+        result = agent.run_conversation("continue the task")
+
+    assert result["completed"] is False
+    assert sum(client.chat.completions.create.call_count for client in clients) == 2
+    assert "primary-provider" in result["error"]
+    assert "primary/model" in result["error"]
+    assert "2 attempts" in result["error"]
+    assert "s silent" in result["error"]
+    assert "endpoint reachable but request wedged" in result["error"]
+    assert "fallback_providers" in result["error"]
+    assert "HTTP None" not in result["error"]
+    assert "provider.invalid" not in result["error"]
+    assert "secret" not in result["error"]
+    assert "Traceback" not in result["error"]
+    generic_backoff.assert_not_called()
 
 
 def test_recovery_disabled_preserves_generic_transient_retry_behavior(

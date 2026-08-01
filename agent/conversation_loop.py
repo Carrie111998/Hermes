@@ -902,6 +902,26 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _format_provider_stall_error(api_error: Exception) -> str:
+    """Format the bounded Task 5 diagnosis for a repeated stream stall."""
+    probe_status = getattr(getattr(api_error, "probe", None), "status", "unavailable")
+    diagnosis = {
+        "reachable": "endpoint reachable but request wedged",
+        "unreachable": "endpoint unreachable",
+        "disabled": "probe disabled",
+        "unavailable": "probe unavailable",
+    }.get(probe_status, "probe unavailable")
+    provider = str(getattr(api_error, "provider", "") or "unknown")
+    model = str(getattr(api_error, "model", "") or "unknown")
+    attempts = int(getattr(api_error, "attempt", 0) or 0)
+    silent_seconds = float(getattr(api_error, "silent_seconds", 0.0) or 0.0)
+    return (
+        f"Provider {provider} model {model} stalled after {attempts} attempts "
+        f"({silent_seconds:g}s silent): {diagnosis}. "
+        "Configure fallback_providers to continue on another provider."
+    )
+
+
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     """Rebuild ``_cached_system_prompt_static`` when caching becomes active.
 
@@ -3763,6 +3783,31 @@ def run_conversation(
                     retryable=classified.retryable,
                     reason=classified.reason.value,
                 )
+
+                if classified.reason == FailoverReason.provider_stalled:
+                    stall_error = _format_provider_stall_error(api_error)
+                    agent._buffer_status(stall_error)
+                    if agent._try_activate_fallback(
+                        reason=FailoverReason.provider_stalled
+                    ):
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt
+                        )
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+                    agent._flush_status_buffer()
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": stall_error,
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": stall_error,
+                        "failed": True,
+                        "failure_reason": classified.reason.value,
+                    }
 
                 if (
                     classified.reason == FailoverReason.billing
