@@ -27,10 +27,16 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+    get_provider_stall_recovery_config,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
+from agent.provider_health_probe import ProbeOutcome, probe_provider_endpoint
+from agent.provider_stall import ProviderStalledError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -2744,6 +2750,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     result = {"response": None, "error": None, "partial_tool_names": []}
 
+    # Resolve once for the whole logical streaming call.  In particular, do
+    # not reload config between the request-local reconnect attempts below.
+    stall_recovery_config = get_provider_stall_recovery_config()
+
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
     # threshold instead of burning another stale-timeout×retries cycle.
@@ -2876,8 +2886,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     stream_attempt_state = {
         "current": 0,
         "cancelled": set(),
+        "real_chunks": {},
+        "zero_chunk_stalls": {},
         "discarded_chunks": 0,
         "discarded_bytes": 0,
+    }
+    stall_recovery = {
+        "zero_chunk_stalls": 0,
+        "last_probe": ProbeOutcome(
+            status="disabled", detail="health probe disabled"
+        ),
     }
     managed_stream_holder = {"stream": None}
 
@@ -2900,6 +2918,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
+            stream_attempt_state["real_chunks"][attempt_id] = 0
         provider_tool_in_flight["yes"] = False
         return attempt_id
 
@@ -2925,6 +2944,33 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _stream_attempt_was_cancelled(stream_attempt_id: int) -> bool:
         with stream_attempt_lock:
             return stream_attempt_id in stream_attempt_state["cancelled"]
+
+    def _record_real_stream_chunk(stream_attempt_id: int) -> None:
+        with stream_attempt_lock:
+            stream_attempt_state["real_chunks"][stream_attempt_id] = (
+                int(
+                    stream_attempt_state["real_chunks"].get(stream_attempt_id, 0)
+                )
+                + 1
+            )
+
+    def _stream_attempt_has_real_chunks(stream_attempt_id: int) -> bool:
+        with stream_attempt_lock:
+            return bool(stream_attempt_state["real_chunks"].get(stream_attempt_id, 0))
+
+    def _current_stream_attempt_id() -> int:
+        with stream_attempt_lock:
+            return int(stream_attempt_state.get("current") or 0)
+
+    def _mark_zero_chunk_stall(stream_attempt_id: int, silent_seconds: float) -> None:
+        with stream_attempt_lock:
+            stream_attempt_state["zero_chunk_stalls"][stream_attempt_id] = (
+                float(silent_seconds), stall_recovery["last_probe"]
+            )
+
+    def _zero_chunk_stall_for_attempt(stream_attempt_id: int):
+        with stream_attempt_lock:
+            return stream_attempt_state["zero_chunk_stalls"].get(stream_attempt_id)
 
     def _discard_stale_stream_chunk(stream_attempt_id: int, chunk) -> None:
         try:
@@ -3092,6 +3138,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # an interceptor or codec is still handling an already-received
             # event.
             last_chunk_time["t"] = time.time()
+            _record_real_stream_chunk(stream_attempt_id)
             return True
 
         def _relay_final_response() -> dict[str, Any]:
@@ -3493,7 +3540,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             usage=usage_obj,
         )
 
-    def _call_anthropic(request_client):
+    def _call_anthropic(request_client, stream_attempt_id: int):
         """Stream an Anthropic Messages API response.
 
         Fires delta callbacks for real-time token delivery, but returns
@@ -3556,8 +3603,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_anthropic_event(_event: Any) -> bool:
+            if not _stream_attempt_is_active(stream_attempt_id):
+                return False
             token = _writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
+                last_chunk_time["t"] = time.time()
+                _record_real_stream_chunk(stream_attempt_id)
                 return True
             logger.warning(
                 "Anthropic streaming attempt superseded by a newer stream; "
@@ -3681,7 +3732,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
 
         try:
-            for _stream_attempt in range(_max_stream_retries + 1):
+            _stream_attempt = 0  # Generic transient-retry index only.
+            while _stream_attempt <= _max_stream_retries:
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
@@ -3703,12 +3755,43 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        result["response"] = _call_anthropic(
+                            request_client, stream_attempt_id
+                        )
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
                     return  # success
                 except Exception as e:
                     _close_managed_stream()
+                    _stall = _zero_chunk_stall_for_attempt(stream_attempt_id)
+                    if stall_recovery_config.enabled and _stall is not None:
+                        _silent_seconds, _probe = _stall
+                        if (
+                            stall_recovery["zero_chunk_stalls"]
+                            <= stall_recovery_config.same_provider_retries
+                        ):
+                            # This retry budget is deliberately independent of
+                            # HERMES_STREAM_RETRIES.  The watchdog already
+                            # socket-aborted this request-local transport; the
+                            # worker-owned cleanup below releases it before the
+                            # next attempt creates a fresh client.
+                            _close_request_client_once(
+                                "provider_zero_chunk_stall_retry_cleanup"
+                            )
+                            continue
+                        result["error"] = ProviderStalledError(
+                            provider=str(
+                                getattr(agent, "provider", "") or "unknown"
+                            ),
+                            model=str(
+                                getattr(agent, "model", "")
+                                or api_kwargs.get("model", "unknown")
+                            ),
+                            silent_seconds=_silent_seconds,
+                            attempt=stall_recovery["zero_chunk_stalls"],
+                            probe=_probe,
+                        )
+                        return
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
                     # expected consequence of our own close — NOT a transient
@@ -3837,6 +3920,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # #70773: same FD-recycle corruption vector for OpenAI.
                         # The shared client will be replaced lazily by
                         # _ensure_primary_openai_client on the next attempt.
+                        _stream_attempt += 1
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -3898,6 +3982,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # #70773: same FD-recycle corruption vector for OpenAI.
                             # The shared client will be replaced lazily by
                             # _ensure_primary_openai_client on the next attempt.
+                            _stream_attempt += 1
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -4110,11 +4195,77 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
                 )
 
-        # Detect stale streams: connections kept alive by SSE pings
-        # but delivering no real chunks.  Kill the client so the
-        # inner retry loop can start a fresh connection.
+        # Detect stale streams: connections kept alive by SSE pings but
+        # delivering no real chunks. Zero-real-chunk boundaries optionally
+        # get the dedicated bounded probe/reconnect policy. Mid-stream stalls
+        # retain the pre-existing generic safety policy and are never probed.
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
+            _stale_attempt_id = _current_stream_attempt_id()
+            _zero_real_chunks = not _stream_attempt_has_real_chunks(
+                _stale_attempt_id
+            )
+            if stall_recovery_config.enabled and _zero_real_chunks:
+                _probe_snapshot = last_chunk_time["t"]
+                if stall_recovery_config.health_probe_enabled:
+                    try:
+                        _probe = probe_provider_endpoint(
+                            base_url=str(getattr(agent, "base_url", "") or ""),
+                            timeout_seconds=(
+                                stall_recovery_config.health_probe_timeout_seconds
+                            ),
+                        )
+                    except Exception as _probe_exc:
+                        logger.warning(
+                            "Provider health probe failed safely: %s",
+                            type(_probe_exc).__name__,
+                        )
+                        _probe = ProbeOutcome(
+                            status="unavailable", detail=type(_probe_exc).__name__
+                        )
+                else:
+                    _probe = ProbeOutcome(
+                        status="disabled", detail="health probe disabled"
+                    )
+
+                # A provider chunk can race the bounded probe. Recheck the
+                # exact real-chunk timestamp before touching cancellation or
+                # transport state; the recovered original request must win.
+                if last_chunk_time["t"] != _probe_snapshot:
+                    logger.info(
+                        "Provider probe completed but stream attempt %s recovered",
+                        _stale_attempt_id,
+                    )
+                    continue
+
+                stall_recovery["zero_chunk_stalls"] += 1
+                stall_recovery["last_probe"] = _probe
+                _mark_zero_chunk_stall(_stale_attempt_id, _stale_elapsed)
+                _probe_diagnosis = {
+                    "reachable": (
+                        "Provider endpoint reachable but generation produced no chunks"
+                    ),
+                    "unreachable": (
+                        "Provider endpoint unreachable while generation produced no chunks"
+                    ),
+                    "disabled": (
+                        "Provider health probe disabled; generation produced no chunks"
+                    ),
+                    "unavailable": (
+                        "Provider health probe unavailable; generation produced no chunks"
+                    ),
+                }.get(
+                    _probe.status,
+                    "Provider health probe unavailable; generation produced no chunks",
+                )
+                if (
+                    stall_recovery["zero_chunk_stalls"]
+                    <= stall_recovery_config.same_provider_retries
+                ):
+                    agent._buffer_status(f"{_probe_diagnosis}; reconnecting once.")
+                else:
+                    agent._buffer_status(f"{_probe_diagnosis}; provider stalled.")
+
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
@@ -4122,12 +4273,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _stale_elapsed, _stream_stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
-            agent._buffer_status(
-                f"⚠️ No response from provider for {int(_stale_elapsed)}s "
-                f"(model: {api_kwargs.get('model', 'unknown')}, "
-                f"context: ~{_est_ctx:,} tokens). "
-                f"Reconnecting..."
-            )
+            if not (stall_recovery_config.enabled and _zero_real_chunks):
+                agent._buffer_status(
+                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}, "
+                    f"context: ~{_est_ctx:,} tokens). "
+                    f"Reconnecting..."
+                )
             try:
                 _cancel_current_stream_attempt("stale_stream_kill")
                 _close_request_client_once("stale_stream_kill")
