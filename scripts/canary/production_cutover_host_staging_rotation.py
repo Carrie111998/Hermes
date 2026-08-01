@@ -40,6 +40,14 @@ class HostStagingRotationError(RuntimeError):
     """Stable, secret-free host-staging rotation failure."""
 
 
+def _effective_identity() -> tuple[int, int] | None:
+    geteuid = getattr(os, "geteuid", None)
+    getegid = getattr(os, "getegid", None)
+    if not callable(geteuid) or not callable(getegid):
+        return None
+    return int(geteuid()), int(getegid())
+
+
 def _canonical(value: Any) -> bytes:
     try:
         raw = json.dumps(
@@ -524,17 +532,20 @@ def _rotate_locked(
         raise HostStagingRotationError(
             "host_staging_rotation_revision_invalid"
         )
+    identity = _effective_identity()
     if require_root and (
         not sys.platform.startswith("linux")
-        or os.geteuid() != 0
-        or os.getegid() != 0
+        or identity != (0, 0)
         or filesystem_root != Path("/")
     ):
         raise HostStagingRotationError(
             "host_staging_rotation_requires_linux_root"
         )
-    uid = 0 if require_root else os.geteuid()
-    gid = 0 if require_root else os.getegid()
+    if identity is None:
+        raise HostStagingRotationError(
+            "host_staging_rotation_posix_identity_unavailable"
+        )
+    uid, gid = (0, 0) if require_root else identity
     _require_pre_freeze(filesystem_root=filesystem_root)
     for directory in (
         ROTATION_ROOT.parent,
