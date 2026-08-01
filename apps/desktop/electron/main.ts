@@ -75,7 +75,6 @@ import {
   profileRemoteOverride,
   profileSshOverride,
   resolveAuthMode,
-  resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview,
@@ -162,9 +161,6 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
-import { fetchPrimaryProfileSessions } from './profile-session-routing'
-import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import {
   type BackendRouteIdentity,
   connectionApplyAffectsPoolProfile,
@@ -179,6 +175,8 @@ import {
   requestJsonForProfileRoute,
   selectBackendSelection
 } from './profile-request-routing'
+import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -8064,6 +8062,7 @@ function profileRouteOptions(profile) {
 // An empty/unknown profile resolves to the primary, preserving legacy callers.
 async function ensureBackend(profile, options: EnsureBackendOptions = {}) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+
   return ensureBackendLifecycle(key, options, {
     ensurePool: ensurePoolBackend,
     resolveCurrentSelection: desiredBackendSelection,

@@ -456,6 +456,7 @@ function createAppliedConnectionConfig<T>(initialConfig: T) {
       return appliedConfig
     }
   }
+}
 
 /**
  * The one place that answers "which backend serves profile P, and does its

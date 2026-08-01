@@ -112,6 +112,7 @@ export function KanbanSettings({ gatewayId }: KanbanSettingsProps = {}) {
     }
   }, [copy.boardsLoadFailed, gatewayId])
 
+  // eslint-disable-next-line no-restricted-syntax -- initial async load and request cancellation are external effects, not reactive state mirroring
   useEffect(() => {
     void loadBoards()
 
@@ -156,6 +157,7 @@ export function KanbanSettings({ gatewayId }: KanbanSettingsProps = {}) {
     [copy.boardLoadFailed, gatewayId]
   )
 
+  // eslint-disable-next-line no-restricted-syntax -- selected-board fetching is an external effect guarded against stale responses
   useEffect(() => {
     if (boardsStatus === 'ready') {
       void loadBoard(selectedBoard)
