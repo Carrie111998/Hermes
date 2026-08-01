@@ -145,10 +145,12 @@ _PRODUCTION_OPERATIONAL_EDGE_DOMAINS = (
     "canonical",
     "github",
     "infrastructure",
+    "skyvision_backup",
     "skyvision_db",
     "skyvision_email",
     "skyvision_gitlab",
     "skyvision_panel",
+    "skyvision_seo",
 )
 _PRODUCTION_RUNTIME_USER_NAMES = (
     _PRODUCTION_BASE_IDENTITY_NAMES
@@ -165,8 +167,8 @@ _PRODUCTION_RUNTIME_GROUP_NAMES = (
         for domain in _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
     )
 )
-_EXPECTED_RUNTIME_UID_COUNT = 17
-_EXPECTED_RUNTIME_GID_COUNT = 28
+_EXPECTED_RUNTIME_UID_COUNT = 19
+_EXPECTED_RUNTIME_GID_COUNT = 32
 _PRODUCTION_RUNTIME_UID_BY_NAME = {
     "ai-platform-brain": 999,
     "muncho-canonical-writer": 2000,

@@ -181,7 +181,8 @@ MAC_OPS_UNIT = "muncho-mac-ops-edge.service"
 BROWSER_UNIT = "muncho-capability-browser.service"
 OPERATIONAL_EDGE_DOMAINS = frozenset({
     "adventico_email", "bitrix", "canonical", "github", "infrastructure",
-    "skyvision_db", "skyvision_email", "skyvision_gitlab", "skyvision_panel",
+    "skyvision_backup", "skyvision_db", "skyvision_email",
+    "skyvision_gitlab", "skyvision_panel", "skyvision_seo",
 })
 OPERATIONAL_EDGE_UNITS = tuple(
     f"muncho-operational-edge-{domain}.service"
@@ -989,7 +990,7 @@ def _validate_cron_continuity_authority(
             is not False
             or collector_execution_readiness.get(
                 "scoped_execution_edge_required_count"
-            ) != 14
+            ) != 19
             or collector_execution_readiness.get(
                 "scoped_execution_edge_packaged"
             ) is not False
@@ -1019,7 +1020,7 @@ def _validate_cron_continuity_authority(
                 operational_edge_requirements.get("requirements_sha256")
                 or ""
             )) is None
-            or operational_edge_requirements.get("required_job_count") != 14
+            or operational_edge_requirements.get("required_job_count") != 19
             or operational_edge_requirements.get(
                 "fresh_runtime_readiness_required"
             ) is not True
@@ -1035,8 +1036,8 @@ def _validate_cron_continuity_authority(
             is not False
             or operational_edge_requirements.get("secret_digest_recorded")
             is not False
-            or len(required_edge_ids) != 14
-            or len(set(required_edge_ids)) != 14
+            or len(required_edge_ids) != 19
+            or len(set(required_edge_ids)) != 19
             or required_edge_ids != sorted(required_edge_ids)
             or execution_edge_ids != required_edge_ids
             or any(
@@ -1049,7 +1050,7 @@ def _validate_cron_continuity_authority(
                 for row in required_edges
             )
             or not isinstance(collector_package.get("units"), Mapping)
-            or len(collector_package["units"]) != 21
+            or len(collector_package["units"]) != 26
             or plan.get("collector_package_manifest_sha256")
             != collector_package.get("manifest_sha256")
             or plan.get("mechanical_job_package_manifest_sha256")
@@ -1061,12 +1062,12 @@ def _validate_cron_continuity_authority(
             or plan.get("source_store_sha256")
             != inventory.get("source_store_sha256")
             or plan.get("inventory_sha256") != inventory.get("inventory_sha256")
-            or plan.get("enabled_count") != 28
-            or plan.get("replacement_record_count") != 24
+            or plan.get("enabled_count") != 32
+            or plan.get("replacement_record_count") != 28
             or not isinstance(records, list)
-            or len(records) != 28
+            or len(records) != 32
             or len({row.get("job_id") for row in records if isinstance(row, Mapping)})
-            != 28
+            != 32
             or any(
                 not isinstance(row, Mapping)
                 or row.get("owner_input_required") is not False
@@ -1075,11 +1076,11 @@ def _validate_cron_continuity_authority(
             or dispositions
             != {
                 "keep_compatible": 1,
-                "migrate_primary_agent": 5,
-                "migrate_trusted_collector": 21,
+                "migrate_primary_agent": 4,
+                "migrate_trusted_collector": 26,
                 "preserve_inert": 1,
             }
-            or len(collector_rows) != 21
+            or len(collector_rows) != 26
             or any(
                 not isinstance(row.get("target"), Mapping)
                 or row["target"].get("semantic_judgment_allowed_in_collector")
@@ -7693,7 +7694,7 @@ def _operational_required_jobs(plan: Mapping[str, Any]) -> list[Mapping[str, Any
     )
     if (
         not isinstance(rows, list)
-        or len(rows) != 14
+        or len(rows) != 19
         or any(
             not isinstance(row, Mapping)
             or set(row) != {"source_job_id", "operation_id"}

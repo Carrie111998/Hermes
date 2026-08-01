@@ -25,6 +25,12 @@ RELEASE_REVISION = "a" * 40
 EDGE_BOOT_ID_SHA256 = "c" * 64
 EDGE_OBSERVED_AT_UNIX = int(time.time())
 EDGE_COLLECTOR_NONCE = "12345678-1234-4123-8123-123456789abc"
+COLLECTOR_COUNT = len(runtime.collector_rail.COLLECTOR_SPECS)
+SCOPED_COLLECTOR_COUNT = sum(
+    spec.execution_boundary
+    == runtime.collector_rail.EXECUTION_BOUNDARY_SCOPED
+    for spec in runtime.collector_rail.COLLECTOR_SPECS
+)
 
 
 def _cutover_plan() -> dict:
@@ -73,8 +79,8 @@ def _runtime_readiness(_context: runtime.RuntimeContext) -> tuple[dict, dict]:
             "observed_at_unix": EDGE_OBSERVED_AT_UNIX,
             "maximum_age_seconds": 120,
             "collector_nonce": EDGE_COLLECTOR_NONCE,
-            "required_job_count": 14,
-            "job_count": 14,
+            "required_job_count": SCOPED_COLLECTOR_COUNT,
+            "job_count": SCOPED_COLLECTOR_COUNT,
         },
         {
             "readiness_sha256": "b" * 64,
@@ -89,7 +95,7 @@ def _runtime_readiness(_context: runtime.RuntimeContext) -> tuple[dict, dict]:
             "scoped_service_gid": 2004,
             "unit_namespace_readiness_packaged": True,
             "unit_namespace_readiness_receipt_sha256": "d" * 64,
-            "unit_namespace_readiness_job_count": 21,
+            "unit_namespace_readiness_job_count": COLLECTOR_COUNT,
             "unit_namespace_readiness_boot_id_sha256": (
                 EDGE_BOOT_ID_SHA256
             ),
@@ -99,7 +105,9 @@ def _runtime_readiness(_context: runtime.RuntimeContext) -> tuple[dict, dict]:
             "unit_namespace_readiness_maximum_age_seconds": 120,
             "direct_dependencies_ready": True,
             "scoped_execution_edge_receipt_sha256": "a" * 64,
-            "scoped_execution_edge_meaningful_packet_count": 14,
+            "scoped_execution_edge_meaningful_packet_count": (
+                SCOPED_COLLECTOR_COUNT
+            ),
         },
     )
 
@@ -114,7 +122,7 @@ def _preflight_receipt() -> dict:
             "artifact_index_sha256": "3" * 64,
             "source_store_sha256": "4" * 64,
             "expected_target_store_sha256": "5" * 64,
-            "collector_timer_count": 21,
+            "collector_timer_count": COLLECTOR_COUNT,
             "gateway_writer_connector_stopped": True,
             "artifacts_valid": True,
             "source_store_unchanged": True,
@@ -132,7 +140,9 @@ def _preflight_receipt() -> dict:
             "operational_edge_observed_at_unix": EDGE_OBSERVED_AT_UNIX,
             "operational_edge_maximum_age_seconds": 120,
             "operational_edge_collector_nonce": EDGE_COLLECTOR_NONCE,
-            "operational_edge_meaningful_packet_count": 14,
+            "operational_edge_meaningful_packet_count": (
+                SCOPED_COLLECTOR_COUNT
+            ),
             "collector_execution_ready": True,
             "recovery_evidence_persisted": True,
             "runtime_target_mutation_performed": False,
@@ -156,7 +166,9 @@ def test_receipt_validator_is_exact_self_digesting_and_semantic_free() -> None:
     for mutate in (
         lambda value: value.update(extra=True),
         lambda value: value.update(provider_or_model_invoked=True),
-        lambda value: value.update(collector_timer_count=20),
+        lambda value: value.update(
+            collector_timer_count=COLLECTOR_COUNT - 1
+        ),
         lambda value: value.update(source_store_sha256="f" * 64),
     ):
         drifted = copy.deepcopy(receipt)
@@ -233,7 +245,7 @@ def test_runtime_readiness_collects_and_publishes_live_instead_of_loading_stale(
         execution,
     )
     assert len(calls) == 1
-    assert len(calls[0][1]) == 14
+    assert len(calls[0][1]) == SCOPED_COLLECTOR_COUNT
 
 
 def test_runtime_readiness_pair_rejects_stale_namespace_or_edge() -> None:
@@ -385,7 +397,9 @@ def test_collector_identity_keeps_projector_primary_and_gateway_reader(
     assert stat.S_IMODE(
         runtime.collector_rail.VOICE_ROOT.stat().st_mode
     ) == 0o750
-    assert len(list(runtime.collector_rail.PACKET_ROOT.iterdir())) == 21
+    assert len(list(runtime.collector_rail.PACKET_ROOT.iterdir())) == (
+        COLLECTOR_COUNT
+    )
     runtime._restore_spool_prestate(spool_prestate)
     assert not runtime.collector_rail.STATE_ROOT.exists()
 

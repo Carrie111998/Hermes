@@ -92,7 +92,8 @@ TARGET_FIELDS = frozenset({
 })
 OPERATIONAL_EDGE_DOMAINS = frozenset({
     "adventico_email", "bitrix", "canonical", "github", "infrastructure",
-    "skyvision_db", "skyvision_email", "skyvision_gitlab", "skyvision_panel",
+    "skyvision_backup", "skyvision_db", "skyvision_email",
+    "skyvision_gitlab", "skyvision_panel", "skyvision_seo",
 })
 SPKI_ED25519_PREFIX = bytes.fromhex("302a300506032b6570032100")
 CANONICAL_FD = re.compile(r"^(?:[3-9]|[1-9][0-9]+)$")

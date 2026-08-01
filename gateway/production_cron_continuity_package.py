@@ -98,6 +98,51 @@ REVIEWED_GUILD_TARGETS: Mapping[str, Mapping[str, Any]] = {
         "target_type": "guild_thread",
         "authorization_source": "exact_reviewed_job_guild_acl_projection",
     },
+    "2b8fbfcf9699": {
+        "platform": "discord",
+        "guild_id": SKYVISION_GUILD_ID,
+        "channel_id": "1531301995078750502",
+        "parent_channel_id": "1507239177350283274",
+        "thread_id": "1531301995078750502",
+        "target_type": "guild_thread",
+        "authorization_source": "exact_reviewed_job_guild_acl_projection",
+    },
+    "ded5510a72ec": {
+        "platform": "discord",
+        "guild_id": SKYVISION_GUILD_ID,
+        "channel_id": "1531765777735090207",
+        "parent_channel_id": "1504852355588423801",
+        "thread_id": "1531765777735090207",
+        "target_type": "guild_thread",
+        "authorization_source": "exact_reviewed_job_guild_acl_projection",
+    },
+    "9af26dbf2361": {
+        "platform": "discord",
+        "guild_id": SKYVISION_GUILD_ID,
+        "channel_id": "1531765777735090207",
+        "parent_channel_id": "1504852355588423801",
+        "thread_id": "1531765777735090207",
+        "target_type": "guild_thread",
+        "authorization_source": "exact_reviewed_job_guild_acl_projection",
+    },
+    "4f6ea4a310b6": {
+        "platform": "discord",
+        "guild_id": SKYVISION_GUILD_ID,
+        "channel_id": "1531991176952021033",
+        "parent_channel_id": "1505499746939174993",
+        "thread_id": "1531991176952021033",
+        "target_type": "guild_thread",
+        "authorization_source": "exact_reviewed_job_guild_acl_projection",
+    },
+    "7c2bed784dfd": {
+        "platform": "discord",
+        "guild_id": SKYVISION_GUILD_ID,
+        "channel_id": "1531991176952021033",
+        "parent_channel_id": "1505499746939174993",
+        "thread_id": "1531991176952021033",
+        "target_type": "guild_thread",
+        "authorization_source": "exact_reviewed_job_guild_acl_projection",
+    },
 }
 _DYNAMIC_FIELDS = frozenset(
     {
@@ -118,6 +163,45 @@ _DYNAMIC_FIELDS = frozenset(
 
 class ProductionCronContinuityPackageError(RuntimeError):
     """Stable, non-secret package-plan failure."""
+
+
+def _expected_plan_shape() -> tuple[int, int, dict[str, int]]:
+    """Derive cardinalities from the exact catalogs instead of snapshots."""
+
+    review_ids = {item.job_id for item in review.REVIEW_CATALOG}
+    collector_ids = {item.source_job_id for item in collector_rail.COLLECTOR_SPECS}
+    keep_ids = {
+        item.job_id
+        for item in review.REVIEW_CATALOG
+        if item.disposition == review.DISPOSITION_KEEP
+    }
+    agent_ids = {
+        item.job_id
+        for item in review.REVIEW_CATALOG
+        if item.disposition == review.DISPOSITION_AGENT
+    }
+    preserve_ids = {OWNER_JOB_ID}
+    if (
+        len(review_ids) != len(review.REVIEW_CATALOG)
+        or len(collector_ids) != len(collector_rail.COLLECTOR_SPECS)
+        or review_ids != keep_ids | agent_ids | collector_ids | preserve_ids
+        or any((keep_ids & group) for group in (agent_ids, collector_ids, preserve_ids))
+        or any((agent_ids & group) for group in (collector_ids, preserve_ids))
+        or collector_ids & preserve_ids
+    ):
+        raise ProductionCronContinuityPackageError(
+            "production_cron_continuity_catalog_invalid"
+        )
+    counts = {
+        DISPOSITION_KEEP: len(keep_ids),
+        DISPOSITION_AGENT: len(agent_ids),
+        DISPOSITION_COLLECTOR: len(collector_ids),
+        DISPOSITION_PRESERVE: len(preserve_ids),
+    }
+    replacements = len(agent_ids) + sum(
+        item.model_review_required for item in collector_rail.COLLECTOR_SPECS
+    )
+    return len(review_ids), replacements, counts
 
 
 @dataclass(frozen=True)
@@ -265,7 +349,15 @@ def _collector_prompt(source: Mapping[str, Any], spec: collector_rail.CollectorS
             "route_back.sent event all exist for the exact packet. On any "
             "problem append route_back.blocked; never claim sent."
         )
-    return (
+    source_prompt = ""
+    if spec.preserve_source_prompt:
+        prompt = source.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ProductionCronContinuityPackageError(
+                "production_cron_replacement_prompt_invalid"
+            )
+        source_prompt = prompt.rstrip() + "\n\n"
+    return source_prompt + (
         "You are the pinned production GPT-5.6-sol agent for one reviewed "
         "scheduled task. Read the exact self-digesting raw packet at "
         f"{_source_packet_path(spec.source_job_id)} with the file tool. Verify "
@@ -751,6 +843,7 @@ def validate_packaged_continuity_plan(
         raise ProductionCronContinuityPackageError(
             "production_cron_packaged_plan_readiness_invalid"
         ) from exc
+    expected_enabled, expected_replacements, expected_counts = _expected_plan_shape()
     if (
         embedded_execution_readiness[
             "unit_namespace_readiness_packaged"
@@ -863,11 +956,11 @@ def validate_packaged_continuity_plan(
         )
         != value.get("plan_sha256")
         or type(value.get("enabled_count")) is not int
-        or value.get("enabled_count") != 28
+        or value.get("enabled_count") != expected_enabled
         or type(value.get("replacement_record_count")) is not int
-        or value.get("replacement_record_count") != 24
+        or value.get("replacement_record_count") != expected_replacements
         or not isinstance(value.get("records"), list)
-        or len(value["records"]) != 28
+        or len(value["records"]) != expected_enabled
         or value.get("catalog_complete") is not True
         or value.get("review_complete") is not True
         or value.get("cutover_executable") is not True
@@ -1075,16 +1168,10 @@ def validate_packaged_continuity_plan(
             raise ProductionCronContinuityPackageError(
                 "production_cron_packaged_plan_not_exhaustive"
             )
-    if observed != expected_job_ids or len(observed_indexes) != 28:
+    if observed != expected_job_ids or len(observed_indexes) != expected_enabled:
         raise ProductionCronContinuityPackageError(
             "production_cron_packaged_plan_not_exhaustive"
         )
-    expected_counts = {
-        DISPOSITION_KEEP: 1,
-        DISPOSITION_AGENT: 5,
-        DISPOSITION_COLLECTOR: 21,
-        DISPOSITION_PRESERVE: 1,
-    }
     if value.get("disposition_counts") != expected_counts:
         raise ProductionCronContinuityPackageError(
             "production_cron_packaged_plan_invalid"
@@ -1499,7 +1586,8 @@ def validate_packaged_continuity_artifacts(
         or not isinstance(artifact_index.get("files"), list)
         or type(artifact_index.get("file_count")) is not int
         or artifact_index.get("file_count") != len(artifact_index["files"])
-        or artifact_index.get("file_count") != 45
+        or artifact_index.get("file_count")
+        != 3 + 2 * len(collector_rail.COLLECTOR_SPECS)
         or any(
             artifact_index.get(field) is not False
             for field in (

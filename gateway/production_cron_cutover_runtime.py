@@ -504,13 +504,22 @@ def validate_cutover_receipt(
         raise ProductionCronCutoverRuntimeError(
             "production_cron_cutover_receipt_invalid"
         )
+    _enabled, replacement_count, _counts = continuity._expected_plan_shape()
+    collector_count = len(collector_rail.COLLECTOR_SPECS)
+    collector_only_count = sum(
+        not item.model_review_required for item in collector_rail.COLLECTOR_SPECS
+    )
+    scoped_count = sum(
+        item.execution_boundary == collector_rail.EXECUTION_BOUNDARY_SCOPED
+        for item in collector_rail.COLLECTOR_SPECS
+    )
     expected_values: dict[str, Any] = {
-        "collector_timer_count": 21,
-        "replacement_agent_record_count": 24,
-        "collector_only_inert_record_count": 2,
+        "collector_timer_count": collector_count,
+        "replacement_agent_record_count": replacement_count,
+        "collector_only_inert_record_count": collector_only_count,
         "preserved_inert_record_count": 1,
-        "collector_unit_file_count": 42,
-        "operational_edge_meaningful_packet_count": 14,
+        "collector_unit_file_count": 2 * collector_count,
+        "operational_edge_meaningful_packet_count": scoped_count,
         "provider_or_model_invoked": False,
         "discord_delivery_attempted": False,
         "secret_material_recorded": False,
@@ -1900,10 +1909,15 @@ def apply(
             "jobs_archive_sha256": _sha256(source),
             "host_snapshot_path": str(snapshot_path),
             "host_snapshot_sha256": snapshot["snapshot_sha256"],
-            "replacement_agent_record_count": 24,
-            "collector_only_inert_record_count": 2,
+            "replacement_agent_record_count": context.replacement_bundle[
+                "record_count"
+            ],
+            "collector_only_inert_record_count": sum(
+                not item.model_review_required
+                for item in collector_rail.COLLECTOR_SPECS
+            ),
             "preserved_inert_record_count": 1,
-            "collector_unit_file_count": 42,
+            "collector_unit_file_count": 2 * len(collector_rail.COLLECTOR_SPECS),
             "collector_timer_count": len(_timer_names(context)),
             "collector_manifest_installed": True,
             "collector_timers_disabled": True,

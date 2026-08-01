@@ -2158,6 +2158,9 @@ def _validate_cron_continuity_stage_receipt(
         )
         for relative, raw in unit_files.items()
     })
+    expected_file_count = 3 + 2 * len(
+        trusted_cron_collector_rail.COLLECTOR_SPECS
+    )
     files = value.get("files")
     if (
         set(value) != fields
@@ -2180,9 +2183,9 @@ def _validate_cron_continuity_stage_receipt(
         or value.get("cutover_entrypoint_sha256")
         != continuity_plan["cutover_entrypoint_sha256"]
         or not isinstance(files, list)
-        or value.get("file_count") != 45
+        or value.get("file_count") != expected_file_count
         or value.get("file_count") != len(files)
-        or len(expected_rows) != 45
+        or len(expected_rows) != expected_file_count
         or tuple(
             item.get("relative_path")
             for item in files

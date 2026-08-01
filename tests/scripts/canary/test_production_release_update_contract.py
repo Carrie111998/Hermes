@@ -72,8 +72,12 @@ def _plan_values() -> dict[str, object]:
             "gid": 29104,
         },
         "release_owner": {"uid": 0, "gid": 0},
-        "reserved_runtime_uids": list(range(1001, 1018)),
-        "reserved_runtime_gids": list(range(2001, 2029)),
+        "reserved_runtime_uids": list(
+            range(1001, 1001 + contract.EXPECTED_RUNTIME_UID_COUNT)
+        ),
+        "reserved_runtime_gids": list(
+            range(2001, 2001 + contract.EXPECTED_RESERVED_GID_COUNT)
+        ),
         "created_at_unix": NOW - 30,
     }
     return values

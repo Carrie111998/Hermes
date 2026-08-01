@@ -646,8 +646,12 @@ def test_production_identities_reserve_exact_cutover_catalog_before_creation(
     assert identities.reserved_runtime_gids == tuple(
         sorted(promoter._PRODUCTION_RUNTIME_GID_BY_NAME.values())
     )
-    assert len(identities.reserved_runtime_uids) == 17
-    assert len(identities.reserved_runtime_gids) == 28
+    assert len(identities.reserved_runtime_uids) == (
+        promoter._EXPECTED_RUNTIME_UID_COUNT
+    )
+    assert len(identities.reserved_runtime_gids) == (
+        promoter._EXPECTED_RUNTIME_GID_COUNT
+    )
 
 
 def test_production_identity_reservation_rejects_uid_collision(

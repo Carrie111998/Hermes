@@ -1120,9 +1120,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list) -> dict:
+def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    tools_for_api = agent.tools
+    if tools_for_api is None:
+        tools_for_api = agent.tools
     todo_store = getattr(agent, "_todo_store", None)
     plan_tool_choice = (
         "required"
@@ -1131,7 +1132,6 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         and todo_store.has_active_items()
         else None
     )
-
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)

@@ -63,6 +63,13 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
 
 
 def _dirty(repo: Path) -> set[str]:
+    subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "update-index", "--really-refresh"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     out = subprocess.run(
         ["git", "-c", "core.autocrlf=false", "diff", "--name-only"],
         cwd=repo,

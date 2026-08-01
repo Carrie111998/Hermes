@@ -128,8 +128,8 @@ def test_package_is_exact_credential_isolated_and_never_activates() -> None:
     contract = rail.catalog_public_contract()
 
     assert rail.validate_package_manifest(package) == package
-    assert len(contract) == 21
-    assert len(units) == 42
+    assert len(contract) == len(rail.COLLECTOR_SPECS)
+    assert len(units) == 2 * len(rail.COLLECTOR_SPECS)
     assert package["isolated_service_user"] == "ai-platform-brain"
     assert package["isolated_service_group"] == "ai-platform-brain"
     assert package["scoped_service_user"] == "muncho-projector"
@@ -384,11 +384,11 @@ def test_collect_unit_namespace_readiness_runs_all_jobs_and_cleans_temp(
         expected_boot_id_sha256=EDGE_BOOT_ID_SHA256,
         now_unix=EDGE_OBSERVED_AT_UNIX,
     ) == receipt
-    assert receipt["job_count"] == 21
+    assert receipt["job_count"] == len(rail.COLLECTOR_SPECS)
     assert receipt["all_jobs_ready"] is True
     assert receipt["safe_read_probes_only"] is True
     assert receipt["job_mutation_executed"] is False
-    assert len(calls) == 21
+    assert len(calls) == len(rail.COLLECTOR_SPECS)
     assert all("probe" in call for call in calls)
     assert all(
         "run" not in call[call.index("--") + 1 :]
@@ -758,7 +758,9 @@ def test_readiness_requires_exact_meaningful_operational_edge_receipt() -> None:
     assert readiness["unit_namespace_readiness_receipt_sha256"] == namespace[
         "receipt_sha256"
     ]
-    assert readiness["unit_namespace_readiness_job_count"] == 21
+    assert readiness["unit_namespace_readiness_job_count"] == len(
+        rail.COLLECTOR_SPECS
+    )
     assert (
         readiness["unit_namespace_readiness_boot_id_sha256"]
         == EDGE_BOOT_ID_SHA256
