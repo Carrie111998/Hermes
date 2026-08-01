@@ -301,6 +301,31 @@ def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     return [bin_dir] + dirs
 
 
+def _probe_file(candidate: Path) -> bool | None:
+    """Three-state ``is_file()``: True, False, or ``None`` for unstattable.
+
+    ``Path.is_file()`` only swallows the Windows errors listed in
+    ``pathlib._IGNORED_WINERRORS`` (21, 123, 1921). ``ERROR_CANT_ACCESS_FILE``
+    (1920) is not among them, so an unresolvable reparse point raises
+    ``OSError`` instead of reporting "not a file" — e.g. a POSIX Node tarball
+    unpacked into a Windows ``HERMES_HOME`` leaves ``node/bin/npm`` as a symlink
+    Windows cannot traverse. Every probe below scans directories that can
+    contain exactly that, and the raise escapes far enough to abort
+    ``hermes dashboard``.
+
+    ``None`` is deliberately distinct from ``False``. A directory entry that
+    raises is *present* — it just cannot be inspected — so managed-tree callers
+    must read it as broken-and-heal-me, not as absent. Collapsing the two would
+    let a present-but-broken tree fall through to system npm, reversing
+    65be0061e ("heal broken managed Node tree instead of PATH fallback"). PATH
+    scanning wants the opposite: skip the entry and keep looking.
+    """
+    try:
+        return candidate.is_file()
+    except OSError:
+        return None
+
+
 def _candidate_node_command_names(command: str) -> list[str]:
     base = Path(command).name
     if sys.platform != "win32" or "." in base:
@@ -338,7 +363,8 @@ def node_tool_runnable(path: str | None) -> bool:
         return False
     candidate = Path(path)
     if sys.platform == "win32":
-        if not candidate.is_file():
+        # Unstattable (None) is not runnable either — only a plain True passes.
+        if _probe_file(candidate) is not True:
             return False
     elif not os.path.exists(path) or not os.access(path, os.X_OK):
         return False
@@ -361,14 +387,22 @@ def node_tool_runnable(path: str | None) -> bool:
 
 
 def hermes_managed_node_tree_present(home: Path | None = None) -> bool:
-    """Return True when any Hermes-managed node/npm/npx shim exists on disk."""
+    """Return True when any Hermes-managed node/npm/npx shim exists on disk.
+
+    An unstattable entry counts as present: the shim is on disk, it just cannot
+    be inspected, and the caller's job is to keep such a tree out of the PATH
+    fallback so it gets healed instead.
+    """
     names = set()
     for command in ("node", "npm", "npx"):
         names.update(_candidate_node_command_names(command))
     for directory in iter_hermes_node_dirs(home):
         for name in names:
             candidate = directory / name
-            if candidate.is_file() and (
+            probe = _probe_file(candidate)
+            if probe is None:
+                return True
+            if probe and (
                 sys.platform == "win32" or os.access(candidate, os.X_OK)
             ):
                 return True
@@ -483,7 +517,13 @@ def find_hermes_node_executable(command: str) -> str | None:
     for directory in iter_hermes_node_dirs():
         for name in names:
             candidate = directory / name
-            if candidate.is_file() and (
+            probe = _probe_file(candidate)
+            if probe is None:
+                # Present but unstattable — the managed tree is damaged, so ask
+                # for a heal rather than letting the caller reach for PATH.
+                broken_present = True
+                continue
+            if probe and (
                 sys.platform == "win32" or os.access(candidate, os.X_OK)
             ):
                 resolved = str(candidate)
@@ -494,7 +534,7 @@ def find_hermes_node_executable(command: str) -> str | None:
         for directory in iter_hermes_node_dirs():
             for name in names:
                 candidate = directory / name
-                if candidate.is_file() and (
+                if _probe_file(candidate) is True and (
                     sys.platform == "win32" or os.access(candidate, os.X_OK)
                 ):
                     resolved = str(candidate)
@@ -510,6 +550,11 @@ def find_node_executable_on_path(command: str) -> str | None:
     ``.cmd`` shim on Windows. Python's CreateProcess cannot execute that shim
     directly, so prefer the launchable variants explicitly for Hermes-owned
     subprocesses.
+
+    Unstattable entries are skipped rather than treated as a find: one bad
+    reparse point on PATH must not stop the scan or be handed back as an
+    executable. This is the opposite reading from the managed-tree probes,
+    which need such an entry to mean "damaged, heal it".
     """
     if sys.platform != "win32":
         return shutil.which(command)
@@ -519,14 +564,14 @@ def find_node_executable_on_path(command: str) -> str | None:
         sep and sep in command_str for sep in (os.sep, os.altsep, "/", "\\")
     )
     if has_path_separator:
-        return command_str if Path(command_str).is_file() else None
+        return command_str if _probe_file(Path(command_str)) is True else None
 
     for name in _candidate_node_command_names(command_str):
         for directory in os.environ.get("PATH", "").split(os.pathsep):
             if not directory:
                 continue
             candidate = Path(directory) / name
-            if candidate.is_file():
+            if _probe_file(candidate) is True:
                 return str(candidate)
     return None
 
