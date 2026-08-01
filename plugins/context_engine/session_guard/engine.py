@@ -3,12 +3,13 @@
 架构：代理模式。所有压缩逻辑委托给内置 ContextCompressor，
 仅在 compress() 返回后检查是否需要注入会话守卫提醒。
 
-三段策略：
-    1-2 次自动压缩 → 不提醒（正常监测）
-    3+ 次自动压缩 → 强制提醒（每次压缩后注入提醒消息）
+三层预警体系：
+    层1 哨兵: should_compress 连续3轮True → 预判集中爆发 → 提前快速模式
+    层2 间隔: 两次压缩间隔<15条消息 → 快速模式 → 第2次就提醒
+    层3 上限: 压缩≥3次 → 每次强制提醒+存档
 
 配置（通过实例属性）：
-    guard_remind_after: int = 3   # 第 N 次压缩后开始强制提醒
+    guard_remind_after: int = 3   # 正常模式下第 N 次压缩后开始提醒
 """
 
 from __future__ import annotations
@@ -39,6 +40,9 @@ class SessionGuardEngine(ContextEngine):
         super().__init__()
         self._real = None                 # 内部 ContextCompressor（延迟创建）
         self._guard_compress_count = 0    # 本次会话自动压缩计数
+        self._guard_rapid_mode = False    # 快速连续压缩模式（提前提醒）
+        self._guard_last_msg_count = 0    # 上次压缩时的消息数（检测快速连续）
+        self._guard_imminent_turns = 0    # 连续"即将压缩"轮次（哨兵预警）
         self._guard_model = ""
         self._guard_context_length = 0
 
@@ -53,8 +57,14 @@ class SessionGuardEngine(ContextEngine):
             self._real.update_from_response(usage)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
+        """代理压缩判断 + 哨兵预警：跟踪连续"即将压缩"轮次。"""
         if self._real is not None:
-            return self._real.should_compress(prompt_tokens)
+            result = self._real.should_compress(prompt_tokens)
+            if result:
+                self._guard_imminent_turns += 1
+            else:
+                self._guard_imminent_turns = 0
+            return result
         return False
 
     # ── v2.3: 显式委托所有 ContextCompressor 覆盖的方法 ──────
@@ -103,6 +113,9 @@ class SessionGuardEngine(ContextEngine):
 
     def on_session_reset(self) -> None:
         self._guard_compress_count = 0
+        self._guard_rapid_mode = False
+        self._guard_last_msg_count = 0
+        self._guard_imminent_turns = 0
         if self._real is not None:
             self._real.on_session_reset()
 
@@ -156,7 +169,24 @@ class SessionGuardEngine(ContextEngine):
         #  window 时会 no-op 返回原样，compression_count 不变）
         if not force and self._real.compression_count > before_count:
             self._guard_compress_count += 1
+            current_msg_count = len(messages)
+
+            # 快速连续压缩检测：两次压缩间隔 < 15 条消息 → 开启快速模式
+            if (self._guard_compress_count >= 2
+                    and not self._guard_rapid_mode
+                    and self._guard_last_msg_count > 0
+                    and current_msg_count - self._guard_last_msg_count < 15):
+                self._guard_rapid_mode = True
+
+            self._guard_last_msg_count = current_msg_count
+
+            # 哨兵预警：压缩前 should_compress 已连续返回 True ≥ 3 轮
+            # → 说明上下文持续超阈值，接下来可能集中爆发
+            if self._guard_imminent_turns >= 3 and self._guard_compress_count >= 2:
+                self._guard_rapid_mode = True  # 提前触发强制提醒
+
             if self._should_inject_reminder():
+                self._guard_imminent_turns = 0  # 压缩已发生，重置哨兵
                 reminder = self._build_reminder()
                 # 角色交替安全：避免 user→user 连续消息
                 # 如果结果最后已是 user 角色，合并提醒到该消息末尾；
@@ -188,11 +218,11 @@ class SessionGuardEngine(ContextEngine):
     def _should_inject_reminder(self) -> bool:
         n = self._guard_compress_count
 
-        # 三段策略：
-        #   第 1-2 次压缩 → 不提醒（蓝色→黄色期，正常监测）
-        #   第 3 次压缩   → 强制提醒（红色期已达上限）
-        #   第 4+ 次压缩  → 每次都强制提醒
-        if n >= self.guard_remind_after:
+        # 快速连续模式：第 2 次压缩就开始提醒
+        # 正常模式：第 3 次压缩开始提醒
+        threshold = 2 if self._guard_rapid_mode else self.guard_remind_after
+
+        if n >= threshold:
             return True
 
         return False
@@ -200,14 +230,17 @@ class SessionGuardEngine(ContextEngine):
     def _build_reminder(self) -> Dict[str, Any]:
         n = self._guard_compress_count
         content = (
-            f"🔴 [会话守卫强制提醒 - 第 {n} 次压缩] "
-            "当前会话已超过建议的压缩上限，早期对话细节大量丢失。"
-            "你必须严格执行以下操作：\n"
-            "1) 先正常完成用户当前问题的回复；\n"
-            "2) 在回复末尾用 Markdown 引用块(>)和醒目格式，"
-            "提醒用户：⚠️ 会话已达压缩上限，建议立即执行总结并新建会话；\n"
-            "3) 主动引导用户输入「总结」或「/clear」来新建会话；\n"
-            "4) 不要跳过，不要以任何理由推迟 - 这是强制级的。"
+            f"🚨 [会话守卫 CRITICAL - 第 {n} 次压缩]\n\n"
+            "本消息不是建议、不是提示，是必须在本次回复末尾执行的强制指令。\n\n"
+            "你的本次回复必须分三部分：\n"
+            "A) 正文：正常回复用户最后一个问题\n"
+            "B) 存档：立即调用 handoff 技能创建交接文档（含文件清单+关键决策+排除方案+运行状态）\n"
+            "C) 末尾：附加以下提醒块（逐字复制）：\n\n"
+            "=== 会话守卫提醒 ===\n"
+            "> ⚠️ 会话已达压缩上限（第 N 次压缩）\n"
+            "> 已自动保存交接文档至临时目录\n"
+            "> 建议立即：输入「总结」→ 复制 → /clear 新建会话\n\n"
+            "B 和 C 缺一不可。跳过 B 将导致关键决策在后续压缩中永久丢失。"
         )
         return {"role": "user", "content": content}
 

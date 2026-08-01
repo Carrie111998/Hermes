@@ -110,7 +110,7 @@ def test_compress_without_force_increments_count_and_injects():
 
     assert e._guard_compress_count == 3
     assert len(result) == 2  # compressed + reminder
-    assert "会话守卫强制提醒" in result[-1]["content"]
+    assert "会话守卫 CRITICAL" in result[-1]["content"]
 
 
 def test_compress_with_force_does_not_count():
@@ -151,7 +151,7 @@ def test_force_reminder_at_3():
 
     assert e._guard_compress_count == 3
     assert len(result) == 2
-    assert "会话守卫强制提醒" in result[-1]["content"]
+    assert "会话守卫 CRITICAL" in result[-1]["content"]
 
 
 def test_compress_noop_does_not_count():
@@ -199,7 +199,7 @@ def test_compress_user_ended_safely_merges():
     # 应该只有 2 条消息（system + user），提醒合并到最后一条 user
     assert len(result) == 2
     assert result[-1]["role"] == "user"
-    assert "会话守卫强制提醒" in result[-1]["content"]
+    assert "会话守卫 CRITICAL" in result[-1]["content"]
     assert "original user" in result[-1]["content"]
 
 
@@ -219,7 +219,42 @@ def test_compress_non_user_ended_appends():
     # 原结果 (system) + 新追加 (user)
     assert len(result) == 2
     assert result[-1]["role"] == "user"
-    assert "会话守卫强制提醒" in result[-1]["content"]
+    assert "会话守卫 CRITICAL" in result[-1]["content"]
+
+
+def test_rapid_consecutive_compressions_trigger_early():
+    """快速连续压缩（间隔 < 15 条消息）→ 快速模式 → 第 2 次压缩就提醒。"""
+    e, mock = _engine_with_mock_real()
+    e._guard_compress_count = 1
+    e._guard_last_msg_count = 100
+
+    # 第 2 次压缩：间隔仅 10 条消息（< 15）→ 应触发快速模式 + 提醒
+    result = e.compress(
+        [{"role": "user", "content": "x"}] * 110,
+        force=False,
+    )
+
+    assert e._guard_compress_count == 2
+    assert e._guard_rapid_mode is True  # 检测到快速连续
+    assert len(result) == 2  # 提醒已注入
+    assert "会话守卫 CRITICAL" in result[-1]["content"]
+
+
+def test_slow_compressions_do_not_trigger_rapid_mode():
+    """间隔足够的压缩不会触发快速模式，仍按正常阈值（3 次）提醒。"""
+    e, mock = _engine_with_mock_real()
+    e._guard_compress_count = 1
+    e._guard_last_msg_count = 100
+
+    # 第 2 次压缩：间隔 30 条消息（> 15）→ 不触发快速模式
+    result = e.compress(
+        [{"role": "user", "content": "x"}] * 130,
+        force=False,
+    )
+
+    assert e._guard_compress_count == 2
+    assert e._guard_rapid_mode is False  # 未触发快速模式
+    assert len(result) == 1  # 未注入提醒（正常模式需 3 次）
 
 
 # ── __getattr__ 兜底测试 ─────────────────────────────────────
@@ -429,7 +464,7 @@ def test_real_compress_counts_and_safe_injection():
     )
     # 结果中注入了提醒
     reminder_found = any(
-        "会话守卫强制提醒" in (m.get("content", "") or "")
+        "会话守卫 CRITICAL" in (m.get("content", "") or "")
         for m in result
     )
     assert reminder_found, (
