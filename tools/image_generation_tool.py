@@ -57,6 +57,7 @@ def _load_fal_client() -> Any:
 
 
 from tools.debug_helpers import DebugSession
+from tools.tool_log import truncate_for_log
 from tools.fal_common import (
     _ManagedFalSyncClient,
     _extract_http_status,
@@ -713,7 +714,7 @@ def _upscale_image(image_url: str, original_prompt: str) -> Optional[Dict[str, A
         return None
 
     except Exception as e:
-        logger.error("Error upscaling image: %s", e, exc_info=True)
+        logger.error("Error upscaling image: %s", truncate_for_log(str(e)))
         return None
 
 
@@ -1020,7 +1021,7 @@ def image_generate_tool(
     except Exception as e:
         generation_time = (datetime.datetime.now() - start_time).total_seconds()
         error_msg = f"Error generating image: {str(e)}"
-        logger.error("%s", error_msg, exc_info=True)
+        logger.error("%s", truncate_for_log(error_msg))
 
         response_data = {
             "success": False,

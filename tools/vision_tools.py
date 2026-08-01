@@ -64,6 +64,7 @@ def _load_auxiliary_client() -> None:
 
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
+from tools.tool_log import truncate_for_log
 from tools.website_policy import check_website_access
 import sys
 
@@ -496,10 +497,10 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
             # and ValueError (too-large / SSRF redirect) are also terminal.
             if not _is_retryable_download_error(e) or attempt >= max_retries - 1:
                 logger.error(
-                    "Image download failed after %s attempt(s): %s",
-                    attempt + 1,
-                    str(e)[:100],
-                    exc_info=True,
+                    "%s",
+                    truncate_for_log(
+                        f"Image download failed after {attempt + 1} attempt(s): {e}"
+                    ),
                 )
                 raise
             wait_time = 2 ** (attempt + 1)  # 2s, 4s, 8s
@@ -1323,7 +1324,7 @@ async def vision_analyze_tool(
         
     except Exception as e:
         error_msg = f"Error analyzing image: {str(e)}"
-        logger.error("%s", error_msg, exc_info=True)
+        logger.error("%s", truncate_for_log(error_msg))
         
         # Detect vision capability errors — give the model a clear message
         # so it can inform the user instead of a cryptic API error.
@@ -1643,8 +1644,10 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(
-                    "Video download failed after %s attempts: %s",
-                    max_retries, str(e)[:100], exc_info=True,
+                    "%s",
+                    truncate_for_log(
+                        f"Video download failed after {max_retries} attempts: {e}"
+                    ),
                 )
 
     if last_error is None:
@@ -1806,7 +1809,7 @@ async def video_analyze_tool(
 
     except Exception as e:
         error_msg = f"Error analyzing video: {str(e)}"
-        logger.error("%s", error_msg, exc_info=True)
+        logger.error("%s", truncate_for_log(error_msg))
 
         err_str = str(e).lower()
         if any(hint in err_str for hint in (

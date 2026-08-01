@@ -90,6 +90,7 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
     return resolve_provider_secret(env_var, provider_id, env_getter=get_env_value)
 
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.tool_log import truncate_for_log
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
@@ -2045,7 +2046,7 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
     except ValueError:
         raise
     except Exception as e:
-        logger.error("Mistral TTS failed: %s", e, exc_info=True)
+        logger.error("Mistral TTS failed: %s", truncate_for_log(str(e)))
         raise RuntimeError(f"Mistral TTS failed: {type(e).__name__}") from e
 
     with open(output_path, "wb") as f:
@@ -3142,17 +3143,17 @@ def text_to_speech_tool(
     except ValueError as e:
         # Configuration errors (missing API keys, etc.)
         error_msg = f"TTS configuration error ({provider}): {e}"
-        logger.error("%s", error_msg)
+        logger.error("%s", truncate_for_log(error_msg))
         return tool_error(error_msg, success=False)
     except FileNotFoundError as e:
         # Missing dependencies or files
         error_msg = f"TTS dependency missing ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
+        logger.error("%s", truncate_for_log(error_msg))
         return tool_error(error_msg, success=False)
     except Exception as e:
         # Unexpected errors
         error_msg = f"TTS generation failed ({provider}): {e}"
-        logger.error("%s", error_msg, exc_info=True)
+        logger.error("%s", truncate_for_log(error_msg))
         return tool_error(error_msg, success=False)
 
 
