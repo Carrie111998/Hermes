@@ -83,6 +83,7 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
+            "conversation_id": key,
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
@@ -94,6 +95,8 @@ def _(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
+            "mobile_sync": _new_session_event_stream(),
+            "mobile_sync_retention": False,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -124,39 +127,33 @@ def _(rid, params: dict) -> dict:
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-    return _ok(
-        rid,
-        {
-            "session_id": sid,
-            "stored_session_id": key,
-            "message_count": len(history),
-            "messages": _history_to_messages(history),
-            "info": {
-                # Reflect the per-session model override (desktop composer pick)
-                # in the immediate response so the client doesn't briefly clobber
-                # its sticky pick with the global default before the deferred
-                # build's session.info lands.
-                "model": (
-                    session_model_override.get("model")
-                    if session_model_override
-                    else _resolve_model()
-                ),
-                **(
-                    {"provider": session_model_override["provider"]}
-                    if session_model_override and session_model_override.get("provider")
-                    else {}
-                ),
-                "tools": {},
-                "skills": {},
-                "cwd": _sessions[sid]["cwd"],
-                "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
-                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
-                "lazy": True,
-                "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                "profile_name": _response_profile_name(profile),
-            },
+    payload = {
+        "session_id": sid,
+        "stored_session_id": key,
+        "message_count": len(history),
+        "messages": _history_to_messages(history),
+        "info": {
+            "model": (
+                session_model_override.get("model")
+                if session_model_override
+                else _resolve_model()
+            ),
+            **(
+                {"provider": session_model_override["provider"]}
+                if session_model_override and session_model_override.get("provider")
+                else {}
+            ),
+            "tools": {},
+            "skills": {},
+            "cwd": _sessions[sid]["cwd"],
+            "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
+            "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+            "lazy": True,
+            "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+            "profile_name": _response_profile_name(profile),
         },
-    )
+    }
+    return _ok(rid, _attach_synchronization(payload, sid, _sessions[sid]))
 
 
 @method("session.list")
@@ -306,6 +303,7 @@ def _(rid, params: dict) -> dict:
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
+    cursor = params.get("cursor")
     if not target:
         return _err(rid, 4006, "session_id required")
     try:
@@ -380,6 +378,7 @@ def _(rid, params: dict) -> dict:
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            cursor=cursor,
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -432,6 +431,7 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             lazy=True,
         )
+        record["conversation_id"] = _conversation_root(db, target)
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
         # A delegated child mid-run emits no session events of its own — report
@@ -451,9 +451,7 @@ def _(rid, params: dict) -> dict:
             logger.debug("child-watch display projection read failed", exc_info=True)
             display_history = history
         messages = _history_to_messages(display_history)
-        return _ok(
-            rid,
-            {
+        payload = {
                 "session_id": sid,
                 "resumed": target,
                 "message_count": len(messages),
@@ -464,8 +462,8 @@ def _(rid, params: dict) -> dict:
                 "session_key": target,
                 "started_at": record["created_at"],
                 "status": "streaming" if child_running else "idle",
-            },
-        )
+            }
+        return _ok(rid, _attach_synchronization(payload, sid, record, cursor))
 
     # Cold resume default: register the live session and read its stored
     # transcript, but build the agent OFF the response path. _make_agent can
@@ -523,6 +521,7 @@ def _(rid, params: dict) -> dict:
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
         )
+        record["conversation_id"] = _conversation_root(db, target)
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
@@ -550,7 +549,7 @@ def _(rid, params: dict) -> dict:
         }
         if auto_continue is not None:
             payload["auto_continue"] = auto_continue
-        return _ok(rid, payload)
+        return _ok(rid, _attach_synchronization(payload, sid, record, cursor))
 
     # Build the agent OUTSIDE the lock — _make_agent can block for seconds
     # (MCP discovery, prompt/skill build, AIAgent construction). Holding
@@ -632,6 +631,7 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                cursor=cursor,
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -663,6 +663,7 @@ def _(rid, params: dict) -> dict:
                 if init_secret_token is not None:
                     reset_secret_scope(init_secret_token)
             if sid in _sessions:
+                _sessions[sid]["conversation_id"] = _conversation_root(db, target)
                 if stored_runtime_overrides.get("model_override") is not None:
                     _sessions[sid]["model_override"] = stored_runtime_overrides[
                         "model_override"
@@ -696,7 +697,7 @@ def _(rid, params: dict) -> dict:
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
-    return _ok(rid, payload)
+    return _ok(rid, _attach_synchronization(payload, sid, session, cursor))
 
 
 @method("session.cwd.set")
@@ -782,6 +783,7 @@ def _(rid, params: dict) -> dict:
             session,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            cursor=params.get("cursor"),
         ),
     )
 
@@ -2312,6 +2314,7 @@ def _(rid, params: dict) -> dict:
             removed = len(history) - last_user_idx
             del history[last_user_idx:]
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
     return _ok(rid, {"removed": removed})
 
 
@@ -2752,6 +2755,7 @@ def _(rid, params: dict) -> dict:
             if session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+                _mark_snapshot_mutation(session)
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,

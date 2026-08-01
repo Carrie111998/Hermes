@@ -737,6 +737,7 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["history"] = history[:last_user_idx]
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
         return _ok(rid, {"type": "send", "message": content})
 
     if name == "steer":
@@ -887,6 +888,7 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["history"] = list(active)
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
         # Notify memory providers — same hook /branch fires, plus the
         # rewound flag so providers caching per-turn document state
         # know to invalidate. See #6672 + #21910.
@@ -1309,6 +1311,7 @@ def _(rid, params: dict) -> dict:
                         session["history_version"] = (
                             int(session.get("history_version", 0)) + 1
                         )
+                        _mark_snapshot_mutation(session)
                 result["history_removed"] = removed
             return result
 
