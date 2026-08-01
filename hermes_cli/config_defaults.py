@@ -1459,7 +1459,14 @@ DEFAULT_CONFIG = {
         # auto-detect, or to your language code ("es", "zh", "uk", ...).
         "language": "en",
         "local": {
-            "model": "base",  # tiny, base, small, medium, large-v3
+            "model": "medium",  # tiny, base, small, medium, large-v3
+            # Worker mode launches one bounded child per transcription. The
+            # child exits after inference so native model memory is not held by
+            # an idle gateway. Set to "in_process" only as an explicit
+            # compatibility opt-in for operators who accept resident memory.
+            "mode": "worker",
+            "worker_timeout_seconds": 300,
+            "worker_max_audio_bytes": 25 * 1024 * 1024,
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
             "initial_prompt": "",
             # Anti-hallucination hardening (faster-whisper decodes junk tokens

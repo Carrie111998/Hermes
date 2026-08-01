@@ -1152,7 +1152,10 @@ stt:
   enabled: true
   # provider: "local"          # auto-detected if omitted
   local:
-    model: "base"              # tiny | base | small | medium | large-v3 | turbo
+    model: "medium"            # tiny | base | small | medium | large-v3 | turbo
+    mode: "worker"             # worker (safe default) | in_process (explicit resident-memory opt-in)
+    worker_timeout_seconds: 300 # hard upper bound for one child transcription
+    worker_max_audio_bytes: 26214400 # input bound; capped at 512 MiB
     # language: ""             # auto-detect; set to "en", "es", "fr", etc. to force
     # initial_prompt: ""       # Optional faster-whisper prompt, e.g. bias Chinese output to simplified Chinese
     # --- Anti-hallucination hardening (whisper decodes junk from silence without these) ---
@@ -1175,6 +1178,14 @@ stt:
   #   # by the `stt` surface tag — leave `model` blank to take the first
   #   # live result. Pin only when you need a specific Whisper variant.
   #   model: ""
+
+# Local worker mode launches one fixed Hermes child process per local
+# faster-whisper transcription. The child receives only a bounded JSON request
+# in a private temporary directory, never a user-controlled command, and exits
+# after the result so native Whisper/CTranslate2 memory is not retained by the
+# gateway. Existing in-process behavior is available only with
+# stt.local.mode: "in_process". Changing this config affects new gateway
+# processes; apply it on a later controlled restart, not during a live run.
 
 # Text-to-speech. Only the deepinfra block is documented here — the
 # remaining providers (edge, openai, xai, minimax, mistral, gemini,

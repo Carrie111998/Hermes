@@ -12179,7 +12179,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _voice_stt_model(self) -> Optional[str]:
         """STT model override from config, or None for the provider default.
 
-        For the local provider, prefer stt.local.model (default ``base``) so the
+        For the local provider, prefer stt.local.model (default ``medium``) so the
         CLI passes a real model name into the local STT backend.
         """
         try:
@@ -12192,7 +12192,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 local_config = stt_config.get("local") or {}
                 if not isinstance(local_config, dict):
                     local_config = {}
-                return local_config.get("model") or "base"
+                return local_config.get("model") or "medium"
             return stt_config.get("model")
         except Exception:
             return None

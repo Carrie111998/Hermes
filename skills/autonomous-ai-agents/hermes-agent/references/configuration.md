@@ -69,8 +69,20 @@ stt:
   enabled: true
   provider: local   # local (faster-whisper, free) | groq | openai | mistral | elevenlabs | deepinfra
   local:
-    model: base     # tiny, base, small, medium, large-v3
+    model: medium   # tiny, base, small, medium, large-v3
+    mode: worker    # one child per transcription; exits to release native model memory
+    # mode: in_process  # explicit compatibility opt-in; retains model memory in the gateway
+    worker_timeout_seconds: 300
+    worker_max_audio_bytes: 26214400
 ```
+
+Local worker mode uses a fixed Python module and private JSON files for IPC; it
+does not execute a user-controlled shell command. The audio size and runtime
+limits are bounded, and a timed-out child is terminated before its temporary
+directory is removed. Existing gateway processes do not reload this setting
+automatically. Roll out the code/config first, then restart each gateway later
+through the normal controlled lifecycle; this change itself never restarts a
+gateway.
 
 Auto-detect priority: local faster-whisper (`pip install faster-whisper`) → Groq (`GROQ_API_KEY`, free tier) → OpenAI (`VOICE_TOOLS_OPENAI_KEY`) → Mistral Voxtral (`MISTRAL_API_KEY`).
 

@@ -5,7 +5,8 @@ Transcription Tools Module
 Provides speech-to-text transcription with six providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
-    Auto-downloads the model (~150 MB for ``base``) on first use.
+    The default ``medium`` model runs in a transient child worker so native
+    model memory is reclaimed after each transcription.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
@@ -27,7 +28,9 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
+import math
 import os
 import platform
 import queue
@@ -35,6 +38,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -107,7 +111,7 @@ _HAS_PILK = _safe_find_spec("pilk")
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROVIDER = "local"
-DEFAULT_LOCAL_MODEL = "base"
+DEFAULT_LOCAL_MODEL = "medium"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
@@ -126,6 +130,22 @@ ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elev
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".opus", ".aac", ".flac", ".caf"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+
+# Local faster-whisper defaults to a short-lived worker so native model memory
+# is released when the child exits.  The in-process cache remains available as
+# an explicit opt-in for installations that accept retaining model memory.
+LOCAL_STT_MODE_WORKER = "worker"
+LOCAL_STT_MODE_IN_PROCESS = "in_process"
+DEFAULT_LOCAL_STT_WORKER_TIMEOUT_SECONDS = 300.0
+MIN_LOCAL_STT_WORKER_TIMEOUT_SECONDS = 1.0
+MAX_LOCAL_STT_WORKER_TIMEOUT_SECONDS = 3600.0
+DEFAULT_LOCAL_STT_WORKER_MAX_AUDIO_BYTES = MAX_FILE_SIZE
+MIN_LOCAL_STT_WORKER_AUDIO_BYTES = 1
+MAX_LOCAL_STT_WORKER_AUDIO_BYTES = 512 * 1024 * 1024
+LOCAL_STT_WORKER_PROTOCOL_VERSION = 1
+LOCAL_STT_WORKER_MAX_REQUEST_BYTES = 64 * 1024
+LOCAL_STT_WORKER_MAX_RESPONSE_BYTES = 1024 * 1024
+LOCAL_STT_WORKER_MODULE = "tools.local_stt_worker"
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"}
@@ -382,6 +402,67 @@ def _get_stt_section(stt_config: Dict[str, Any], name: str) -> Dict[str, Any]:
         return {}
     section = stt_config.get(name)
     return section if isinstance(section, dict) else {}
+
+
+def _get_local_stt_mode(stt_config: Dict[str, Any]) -> str:
+    """Return the validated local faster-whisper execution mode.
+
+    ``worker`` is intentionally the default.  ``in_process`` is retained only
+    as an explicit compatibility escape hatch for operators who accept a
+    resident native model in the gateway process.
+    """
+    raw_mode = _get_stt_section(stt_config, "local").get("mode", LOCAL_STT_MODE_WORKER)
+    mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else ""
+    if mode in {LOCAL_STT_MODE_WORKER, LOCAL_STT_MODE_IN_PROCESS}:
+        return mode
+    if raw_mode not in (None, ""):
+        logger.warning("Invalid stt.local.mode=%r; using safe worker mode", raw_mode)
+    return LOCAL_STT_MODE_WORKER
+
+
+def _get_local_stt_worker_limits(stt_config: Dict[str, Any]) -> tuple[float, int]:
+    """Return bounded ``(timeout_seconds, max_audio_bytes)`` worker limits."""
+    local_config = _get_stt_section(stt_config, "local")
+
+    raw_timeout = local_config.get(
+        "worker_timeout_seconds", DEFAULT_LOCAL_STT_WORKER_TIMEOUT_SECONDS
+    )
+    try:
+        timeout = float(raw_timeout)
+        if isinstance(raw_timeout, bool) or not math.isfinite(timeout):
+            raise ValueError
+    except (TypeError, ValueError):
+        timeout = DEFAULT_LOCAL_STT_WORKER_TIMEOUT_SECONDS
+    if timeout < MIN_LOCAL_STT_WORKER_TIMEOUT_SECONDS:
+        timeout = DEFAULT_LOCAL_STT_WORKER_TIMEOUT_SECONDS
+    timeout = min(timeout, MAX_LOCAL_STT_WORKER_TIMEOUT_SECONDS)
+
+    raw_max_audio = local_config.get(
+        "worker_max_audio_bytes", DEFAULT_LOCAL_STT_WORKER_MAX_AUDIO_BYTES
+    )
+    try:
+        if isinstance(raw_max_audio, bool):
+            raise ValueError
+        max_audio_bytes = int(raw_max_audio)
+    except (TypeError, ValueError, OverflowError):
+        max_audio_bytes = DEFAULT_LOCAL_STT_WORKER_MAX_AUDIO_BYTES
+    if max_audio_bytes < MIN_LOCAL_STT_WORKER_AUDIO_BYTES:
+        max_audio_bytes = DEFAULT_LOCAL_STT_WORKER_MAX_AUDIO_BYTES
+    max_audio_bytes = min(max_audio_bytes, MAX_LOCAL_STT_WORKER_AUDIO_BYTES)
+    return timeout, max_audio_bytes
+
+
+def _local_stt_worker_result(error: str) -> Dict[str, Any]:
+    """Build a stable failure envelope for parent/worker protocol errors."""
+    return {"success": False, "transcript": "", "provider": "local", "error": error}
+
+
+def _release_local_model_cache() -> None:
+    """Drop any model left by a prior explicit in-process configuration."""
+    global _local_model, _local_model_name
+    with _local_model_lock:
+        _local_model = None
+        _local_model_name = None
 
 
 def _get_named_stt_provider_config(
@@ -652,6 +733,190 @@ def _terminate_command_stt_process_tree(proc: subprocess.Popen) -> None:
         return
     except Exception:
         proc.kill()
+
+
+def _terminate_local_stt_worker_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a transient local-STT worker and wait for it to exit."""
+    _terminate_command_stt_process_tree(proc)
+    if proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def _write_private_worker_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Write a small worker request with restrictive permissions where possible."""
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > LOCAL_STT_WORKER_MAX_REQUEST_BYTES:
+        raise ValueError("local STT worker request is too large")
+    path.write_bytes(encoded)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # Windows ACLs inherit from the private TemporaryDirectory instead.
+        pass
+
+
+def _read_local_stt_worker_response(path: Path) -> Dict[str, Any]:
+    """Read and validate the bounded JSON response from a worker child."""
+    try:
+        if not path.is_file():
+            return _local_stt_worker_result("Local STT worker produced no response")
+        if path.stat().st_size > LOCAL_STT_WORKER_MAX_RESPONSE_BYTES:
+            return _local_stt_worker_result("Local STT worker response is too large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return _local_stt_worker_result(f"Invalid local STT worker response: {exc}")
+    if not isinstance(payload, dict):
+        return _local_stt_worker_result("Invalid local STT worker response")
+    if not isinstance(payload.get("success"), bool):
+        return _local_stt_worker_result("Invalid local STT worker response: missing success")
+    transcript = payload.get("transcript", "")
+    if not isinstance(transcript, str):
+        return _local_stt_worker_result("Invalid local STT worker response: transcript is not text")
+
+    result: Dict[str, Any] = {
+        "success": payload["success"],
+        "transcript": transcript,
+        "provider": "local",
+    }
+    for key in ("error", "no_speech"):
+        if key in payload and isinstance(payload[key], (str, bool)):
+            result[key] = payload[key]
+    return result
+
+
+def _run_local_stt_worker_process(
+    request_path: Path,
+    response_path: Path,
+    timeout: float,
+) -> Dict[str, Any]:
+    """Run one fixed-command local STT worker through private file IPC.
+
+    This deliberately does not reuse command-provider execution: the child
+    executable and module are fixed, the argv is constructed internally, and
+    ``shell=False`` is unconditional.
+    """
+    from agent.delegation_context import delegated_child_subprocess_env
+    from tools.environments.local import hermes_subprocess_env
+
+    command = [
+        sys.executable,
+        "-m",
+        LOCAL_STT_WORKER_MODULE,
+        "--request",
+        str(request_path),
+        "--response",
+        str(response_path),
+    ]
+    child_env = hermes_subprocess_env(inherit_credentials=False)
+    delegated_env = delegated_child_subprocess_env(child_env)
+    if delegated_env is not None:
+        child_env = delegated_env
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(Path(__file__).resolve().parent.parent),
+        "env": child_env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "shell": False,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = windows_hide_flags() | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    process: Optional[subprocess.Popen] = None
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_local_stt_worker_process_tree(process)
+            raise
+
+        returncode = process.returncode
+        if returncode:
+            return _local_stt_worker_result(
+                f"Local STT worker exited with code {returncode}"
+            )
+        return _read_local_stt_worker_response(response_path)
+    except subprocess.TimeoutExpired:
+        raise
+    except Exception as exc:
+        if process is not None and process.poll() is None:
+            _terminate_local_stt_worker_process_tree(process)
+        return _local_stt_worker_result(f"Local STT worker failed: {exc}")
+
+
+def _transcribe_local_worker(
+    file_path: str,
+    model_name: str,
+    stt_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Transcribe through a short-lived faster-whisper child process."""
+    timeout, max_audio_bytes = _get_local_stt_worker_limits(stt_config)
+    audio_path = Path(file_path)
+    try:
+        audio_size = audio_path.stat().st_size
+    except OSError as exc:
+        return _local_stt_worker_result(f"Local STT worker input is unavailable: {exc}")
+    if audio_size > max_audio_bytes:
+        return _local_stt_worker_result(
+            f"Local STT worker input exceeds {max_audio_bytes} bytes"
+        )
+
+    local_config = _get_stt_section(stt_config, "local")
+    device = local_config.get("device", "auto")
+    compute_type = local_config.get("compute_type", "auto")
+    if not isinstance(device, str) or not device.strip():
+        device = "auto"
+    if not isinstance(compute_type, str) or not compute_type.strip():
+        compute_type = "auto"
+    request = {
+        "protocol_version": LOCAL_STT_WORKER_PROTOCOL_VERSION,
+        "input_path": str(audio_path),
+        "model": str(model_name),
+        "device": device,
+        "compute_type": compute_type,
+        "transcribe_kwargs": build_local_transcribe_kwargs(stt_config),
+        "local_config": {
+            "no_speech_prob_threshold": local_config.get(
+                "no_speech_prob_threshold", _NO_SPEECH_PROB_THRESHOLD_DEFAULT
+            ),
+            "logprob_threshold": local_config.get(
+                "logprob_threshold", _LOGPROB_THRESHOLD_DEFAULT
+            ),
+        },
+    }
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-local-stt-worker-") as work_dir:
+            request_path = Path(work_dir) / "request.json"
+            response_path = Path(work_dir) / "response.json"
+            _write_private_worker_json(request_path, request)
+            try:
+                return _run_local_stt_worker_process(
+                    request_path,
+                    response_path,
+                    timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return _local_stt_worker_result(
+                    f"Local STT worker timed out after {timeout:g}s"
+                )
+    except Exception as exc:
+        logger.error("Transient local STT worker failed: %s", exc, exc_info=True)
+        return _local_stt_worker_result(f"Local STT worker failed: {exc}")
 
 
 def _command_stt_env_passthrough(config: Dict[str, Any]) -> list:
@@ -1614,8 +1879,13 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
     try:
-        local_cfg = _load_stt_config().get("local") or {}
-        # Lazy-load the model (downloads on first use, ~150 MB for 'base').
+        stt_config = _load_stt_config()
+        if _get_local_stt_mode(stt_config) == LOCAL_STT_MODE_WORKER:
+            _release_local_model_cache()
+            return _transcribe_local_worker(file_path, model_name, stt_config)
+
+        local_cfg = stt_config.get("local") or {}
+        # Lazy-load the model (downloads on first use; ``medium`` is the default).
         # Double-checked lock: concurrent voice messages must not both
         # download/load the model (#24767).
         if _local_model is None or _local_model_name != model_name:

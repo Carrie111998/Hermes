@@ -359,6 +359,7 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"mode": "in_process"}}), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None):
             from tools.transcription_tools import _transcribe_local
@@ -388,6 +389,7 @@ class TestTranscribeLocalExtended:
 
         fake_config = {
             "local": {
+                "mode": "in_process",
                 "device": "cpu",
                 "compute_type": "float32",
             }
@@ -414,6 +416,7 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"mode": "in_process"}}), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None):
             from tools.transcription_tools import _transcribe_local
@@ -1057,7 +1060,7 @@ class TestLocalModelLock:
             return model
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
-             patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"mode": "in_process"}}), \
              patch("tools.transcription_tools._load_local_whisper_model", side_effect=slow_load), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None):

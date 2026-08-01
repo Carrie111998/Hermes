@@ -127,6 +127,7 @@ class TestTranscribeLocal:
         fake_fw = _fake_faster_whisper_module(mock_model)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch.dict("sys.modules", {"faster_whisper": fake_fw}), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"mode": "in_process"}}), \
              patch("tools.transcription_tools._local_model", None):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio_file), "base")
@@ -272,7 +273,7 @@ class TestNormalizeLocalModel:
                  patch("tools.transcription_tools._load_stt_config", return_value={
                      "enabled": True,
                      "provider": "local",
-                     "local": {"model": "whisper-1"},
+                     "local": {"model": "whisper-1", "mode": "in_process"},
                  }), \
                  patch("tools.transcription_tools._local_model", None), \
                  patch("tools.transcription_tools._local_model_name", None), \

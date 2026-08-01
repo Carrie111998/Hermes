@@ -726,7 +726,7 @@ class TestConfigSupportFloor:
         "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
         "model_catalog": {"ttl_hours": 1},
         "plugins": {"enabled": []},
-        "stt": {"provider": "local"},
+        "stt": {"provider": "local", "local": {"model": "base"}},
     }
 
     _V20_FIXTURE = {

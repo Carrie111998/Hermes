@@ -204,7 +204,7 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
                     local_cfg = stt.setdefault("local", {})
                     local_cfg["model"] = legacy_model
             # else: drop it — it was an OpenAI model name, local section
-            # already defaults to "base" via DEFAULT_CONFIG
+            # already defaults to "medium" via DEFAULT_CONFIG
         else:
             # Cloud provider — put it in that provider's section only
             # if user didn't already set a nested model

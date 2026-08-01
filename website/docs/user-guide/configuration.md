@@ -1771,7 +1771,10 @@ stt:
   provider: "local"            # "local" | "groq" | "openai" | "mistral" | "xai" | "elevenlabs" | "deepinfra" | ...
   language: "en"               # GLOBAL language hint for every provider (per-provider language wins); set "" for auto-detect
   local:
-    model: "base"              # tiny, base, small, medium, large-v3
+    model: "medium"            # tiny, base, small, medium, large-v3
+    mode: "worker"             # transient child per transcription (default) | "in_process" compatibility mode
+    worker_timeout_seconds: 300  # bounded child runtime; capped at 3600 seconds
+    worker_max_audio_bytes: 26214400  # bounded input size; capped at 512 MiB
     language: ""               # per-provider override of stt.language
     initial_prompt: ""         # optional whisper prompt to bias vocabulary/script (e.g. Simplified Chinese)
     vad: true                  # Silero VAD filter (default on) — silence never reaches whisper; false = raw behavior (music/ambient)
@@ -1792,11 +1795,16 @@ Set `stt.echo_transcripts: false` when the gateway should transcribe voice notes
 
 Provider behavior:
 
-- `local` uses `faster-whisper` running on your machine. Install it separately with `pip install faster-whisper`. Silence-hallucination hardening is on by default: a Silero VAD filter keeps silence/noise from ever reaching Whisper, cross-window conditioning is disabled, and segments the model itself flags as probably-not-speech *and* low-confidence are dropped. Set `stt.local.vad: false` to transcribe non-speech audio (music, ambient) with the raw behavior.
+- `local` uses `faster-whisper` running on your machine. Install it separately with `pip install faster-whisper`. The default `medium` model runs in one fixed, bounded child process per transcription and exits after writing a small JSON result through a private temporary directory. This keeps Whisper/CTranslate2/PyTorch native allocations out of the idle gateway process. The child uses no shell interpolation or user-controlled executable. `worker_timeout_seconds` and `worker_max_audio_bytes` bound runtime and input size; a timeout terminates the child/process tree and cleans its request/response files. Set `stt.local.mode: "in_process"` only as an explicit compatibility opt-in when resident model memory is acceptable. Silence-hallucination hardening is on by default: a Silero VAD filter keeps silence/noise from ever reaching Whisper, cross-window conditioning is disabled, and segments the model itself flags as probably-not-speech *and* low-confidence are dropped. Set `stt.local.vad: false` to transcribe non-speech audio (music, ambient) with the raw behavior.
 - `groq` uses Groq's Whisper-compatible endpoint and reads `GROQ_API_KEY`. Pass `stt.groq.language` (or the global `HERMES_LOCAL_STT_LANGUAGE` env var) to skip auto-detection and reduce latency.
 - `openai` uses the OpenAI speech API and reads `VOICE_TOOLS_OPENAI_KEY`.
 
 If the requested provider is unavailable, Hermes falls back automatically in this order: `local` → `groq` → `openai`.
+
+The worker-mode default is read when the gateway starts. Updating `config.yaml`
+or installing code does not change an already-running gateway; apply the new
+behavior only during a later, controlled restart window. This change does not
+restart gateways automatically.
 
 Groq and OpenAI model overrides are environment-driven:
 

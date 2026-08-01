@@ -77,6 +77,11 @@ class TestTranscribeLocalWiring:
     def _run(self, monkeypatch, stt_config, segments=None):
         import tools.transcription_tools as tt
 
+        stt_config = {
+            **stt_config,
+            "local": {**stt_config.get("local", {}), "mode": "in_process"},
+        }
+
         captured = {}
 
         class FakeModel:
