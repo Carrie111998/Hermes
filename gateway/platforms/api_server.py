@@ -3389,6 +3389,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            # `_handle_create_session` stores `body.get("model") or
+            # self._model_name`, so a session created without an explicit model
+            # persists the *advertised* model name — a virtual id, not something
+            # any provider can serve. Treat it as "no session model", mirroring
+            # the `model != self._model_name` guard that already exists on the
+            # per-request path. Without this the virtual id reaches the provider
+            # as a real model and every turn on such a session fails.
+            if stored_model == self._model_name:
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
@@ -3499,6 +3508,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            # `_handle_create_session` stores `body.get("model") or
+            # self._model_name`, so a session created without an explicit model
+            # persists the *advertised* model name — a virtual id, not something
+            # any provider can serve. Treat it as "no session model", mirroring
+            # the `model != self._model_name` guard that already exists on the
+            # per-request path. Without this the virtual id reaches the provider
+            # as a real model and every turn on such a session fails.
+            if stored_model == self._model_name:
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
