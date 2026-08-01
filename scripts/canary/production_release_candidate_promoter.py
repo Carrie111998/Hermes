@@ -29,6 +29,7 @@ import json
 import os
 import pwd
 import re
+import resource
 import stat
 import subprocess
 import sys
@@ -110,6 +111,7 @@ _ROOT_FILE_MODES = frozenset({0o400, 0o440, 0o444})
 _ROOT_EXECUTABLE_MODES = frozenset({0o500, 0o550, 0o555, 0o755})
 _BUILDER_DIRECTORY_MODES = frozenset({0o555})
 _BUILDER_FILE_MODES = frozenset({0o444, 0o555})
+_INPUT_DESCRIPTOR_HEADROOM = 64
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
 _SYSTEMD_PROPERTY_NAMES = (
@@ -490,6 +492,59 @@ def _assert_no_xattrs(
         _fail("candidate_promoter_xattr_inspection_unavailable")
     if names:
         _fail("candidate_promoter_xattrs_or_acl_present")
+
+
+def _reserve_input_descriptor_capacity(
+    *,
+    source_blob_count: int,
+    runtime_wheel_count: int,
+) -> None:
+    """Keep every verified root input inode held without exhausting nofile."""
+
+    if (
+        type(source_blob_count) is not int
+        or not 0 < source_blob_count <= phase.MAX_SOURCE_BLOBS
+        or type(runtime_wheel_count) is not int
+        or not 0 < runtime_wheel_count <= phase.MAX_WHEELS
+    ):
+        _fail("candidate_promoter_descriptor_capacity_invalid")
+    required = (
+        source_blob_count
+        + runtime_wheel_count
+        + _INPUT_DESCRIPTOR_HEADROOM
+    )
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:
+        _fail("candidate_promoter_descriptor_capacity_unavailable", exc)
+    if (
+        type(soft) is not int
+        or type(hard) is not int
+        or (soft < 0 and soft != resource.RLIM_INFINITY)
+        or (hard < 0 and hard != resource.RLIM_INFINITY)
+    ):
+        _fail("candidate_promoter_descriptor_capacity_unavailable")
+    if hard != resource.RLIM_INFINITY and hard < required:
+        _fail("candidate_promoter_descriptor_capacity_insufficient")
+    if soft == resource.RLIM_INFINITY or soft >= required:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (required, hard))
+        confirmed_soft, confirmed_hard = resource.getrlimit(
+            resource.RLIMIT_NOFILE
+        )
+    except (OSError, ValueError) as exc:
+        _fail("candidate_promoter_descriptor_capacity_unavailable", exc)
+    if (
+        type(confirmed_soft) is not int
+        or type(confirmed_hard) is not int
+        or (
+            confirmed_soft != resource.RLIM_INFINITY
+            and confirmed_soft < required
+        )
+        or confirmed_hard != hard
+    ):
+        _fail("candidate_promoter_descriptor_capacity_unavailable")
 
 
 def _open_directory(
@@ -895,6 +950,10 @@ def _load_inputs(
         str(item["object_id"]): dict(item)
         for item in source_manifest["blobs"]
     }
+    _reserve_input_descriptor_capacity(
+        source_blob_count=len(blobs),
+        runtime_wheel_count=len(runtime_manifest["wheels"]),
+    )
     if (
         set(blobs) != {entry.object_id for entry in entries}
         or blob_directory.names()

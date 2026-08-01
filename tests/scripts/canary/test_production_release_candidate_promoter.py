@@ -302,6 +302,65 @@ def _promote(
     )
 
 
+def test_input_descriptor_capacity_is_raised_for_large_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = [1024, 1_048_576]
+    updates: list[tuple[int, tuple[int, int]]] = []
+
+    def getrlimit(kind: int) -> tuple[int, int]:
+        assert kind == promoter.resource.RLIMIT_NOFILE
+        return limits[0], limits[1]
+
+    def setrlimit(kind: int, value: tuple[int, int]) -> None:
+        assert kind == promoter.resource.RLIMIT_NOFILE
+        updates.append((kind, value))
+        limits[:] = value
+
+    monkeypatch.setattr(promoter.resource, "getrlimit", getrlimit)
+    monkeypatch.setattr(promoter.resource, "setrlimit", setrlimit)
+
+    promoter._reserve_input_descriptor_capacity(
+        source_blob_count=8_676,
+        runtime_wheel_count=4,
+    )
+
+    assert updates == [
+        (
+            promoter.resource.RLIMIT_NOFILE,
+            (8_744, 1_048_576),
+        )
+    ]
+
+
+def test_input_descriptor_capacity_fails_before_opening_when_hard_limit_is_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        promoter.resource,
+        "getrlimit",
+        lambda _kind: (1024, 4096),
+    )
+    called = False
+
+    def setrlimit(_kind: int, _value: tuple[int, int]) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(promoter.resource, "setrlimit", setrlimit)
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="descriptor_capacity_insufficient",
+    ):
+        promoter._reserve_input_descriptor_capacity(
+            source_blob_count=8_676,
+            runtime_wheel_count=4,
+        )
+
+    assert called is False
+
+
 def _rewrite_canonical(path: Path, value: Mapping[str, Any]) -> None:
     path.chmod(0o644)
     path.write_bytes(promoter.canonical_bytes(value) + b"\n")
