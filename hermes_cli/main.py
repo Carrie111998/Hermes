@@ -9041,8 +9041,72 @@ def cmd_update(args):
         format_docker_update_message,
         is_managed,
         managed_error,
+        read_raw_config,
         recommended_update_command_for_method,
+        save_config,
     )
+    from hermes_cli.update_approval_commands import (
+        handle_pending_subcommand,
+        resolve_approve_target,
+    )
+    from tools import update_approval as ua
+
+    action = getattr(args, "update_action", None)
+    value = getattr(args, "update_value", None)
+
+    def _set_apply_approval(enabled: bool) -> None:
+        cfg = read_raw_config()
+        updates = cfg.get("updates")
+        if not isinstance(updates, dict):
+            updates = {}
+        updates["apply_approval"] = bool(enabled)
+        cfg["updates"] = updates
+        save_config(cfg, merge_existing=True)
+
+    if action in {"pending", "reject", "deny", "drop", "approval", "mode"}:
+        out = handle_pending_subcommand(
+            [action] + ([value] if value is not None else []),
+            set_mode_fn=_set_apply_approval,
+        )
+        print(out or "Unknown update subcommand.")
+        return
+
+    if action in {"approve", "apply"}:
+        target, err = resolve_approve_target([value] if value is not None else [])
+        if err or target is None:
+            print(err or "Usage: hermes update approve <id>")
+            return
+        rec = ua.get_pending(target)
+        if not rec:
+            print(f"No pending update with id '{target}'.")
+            return
+        payload = rec.get("payload", {}) if isinstance(rec, dict) else {}
+        replay_args = argparse.Namespace(
+            gateway=bool(getattr(args, "gateway", False)),
+            check=False,
+            no_backup=bool(payload.get("no_backup", False)),
+            backup=bool(payload.get("backup", False)),
+            yes=bool(getattr(args, "yes", False)),
+            branch=payload.get("branch"),
+            force=bool(payload.get("force", False)),
+            force_venv=bool(payload.get("force_venv", False)),
+            update_action=None,
+            update_value=None,
+        )
+        prior = os.environ.get(ua.BYPASS_ENV)
+        os.environ[ua.BYPASS_ENV] = "1"
+        try:
+            cmd_update(replay_args)
+        except BaseException:
+            raise
+        else:
+            ua.discard_pending(target)
+        finally:
+            if prior is None:
+                os.environ.pop(ua.BYPASS_ENV, None)
+            else:
+                os.environ[ua.BYPASS_ENV] = prior
+        return
 
     if is_managed():
         managed_error("update Hermes Agent")
@@ -9071,6 +9135,20 @@ def cmd_update(args):
             branch=branch,
             branch_explicit=bool(getattr(args, "branch", None)),
         )
+        return
+
+    if ua.apply_approval_enabled() and not ua.approval_bypass_active():
+        record = ua.stage_update(
+            ua.payload_from_args(args),
+            summary=ua.update_summary(ua.payload_from_args(args)),
+        )
+        print("⚕ Update staged for approval.")
+        print(f"  Pending id: {record['id']}")
+        print("  Review:     /update pending")
+        print(f"  Approve:    /update approve {record['id']}")
+        print(f"  Reject:     /update reject {record['id']}")
+        print()
+        print("No changes were applied yet.")
         return
 
     gateway_mode = getattr(args, "gateway", False)

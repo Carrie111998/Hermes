@@ -1654,7 +1654,13 @@ hermes completion fish > ~/.config/fish/completions/hermes.fish
 
 ```bash
 hermes update [--gateway] [--check] [--no-backup] [--backup] [--yes]
+hermes update pending
+hermes update approve <id>
+hermes update reject <id>
+hermes update approval <on|off>
 ```
+
+With the default `updates.apply_approval: true`, a mutating `hermes update` stages a pending request under `<HERMES_HOME>/pending/updates/` instead of pulling immediately. Use `pending` to list staged requests, `approve <id>` to execute one, `reject <id>` to discard one, or `approval <on|off>` to toggle the gate.
 
 Pulls the latest `hermes-agent` code and reinstalls dependencies in the managed venv, then re-runs the post-install hooks (MCP servers, skills sync, completion install). Safe to run on a live install. Use `--check` to see whether your checkout is behind `origin/main` without installing.
 

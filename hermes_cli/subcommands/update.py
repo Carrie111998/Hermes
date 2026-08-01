@@ -73,4 +73,15 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+    update_parser.add_argument(
+        "update_action",
+        nargs="?",
+        choices=["pending", "approve", "apply", "reject", "deny", "drop", "approval", "mode"],
+        help="Review or control pending approved updates: pending | approve <id> | reject <id> | approval <on|off>",
+    )
+    update_parser.add_argument(
+        "update_value",
+        nargs="?",
+        help="Value for update_action (pending id or on/off toggle)",
+    )
     update_parser.set_defaults(func=cmd_update)

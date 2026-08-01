@@ -9880,7 +9880,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "debug":
             self._handle_debug_command(cmd_original)
         elif canonical == "update":
-            if self._handle_update_command():
+            if self._handle_update_command(cmd_original):
                 return False
         elif canonical == "version":
             from hermes_cli.main import _print_version_info
