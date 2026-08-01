@@ -20,7 +20,10 @@ import type { Msg, Usage } from '../types.js'
 import { scrollbarColors } from './overlayPrimitives.js'
 
 const FACE_TICK_MS = 2500
+const SUBAGENT_PULSE_MS = 700
 const HEART_COLORS = ['#ff5fa2', '#ff4d6d']
+
+export const subagentPulseColor = (tick: number, t: Theme) => (tick % 2 === 0 ? t.color.muted : t.color.accent)
 
 // Keep verb segment width stable so status-bar content to the right doesn't
 // jitter when the ticker rotates between short/long verbs.
@@ -432,6 +435,18 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   return <Text color={color}>♥</Text>
 }
 
+function SubagentPulse({ children, t }: { children: ReactNode; t: Theme }) {
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    const id = setInterval(() => setTick(n => n + 1), SUBAGENT_PULSE_MS)
+
+    return () => clearInterval(id)
+  }, [])
+
+  return <Text color={subagentPulseColor(tick, t)}>{children}</Text>
+}
+
 export function StatusRule({
   battery,
   focusView,
@@ -692,7 +707,8 @@ export function StatusRule({
         ) : null}
         {showSubagents ? (
           <Text color={t.color.muted} wrap="truncate-end">
-            {' │ '}⛓ {subagentCount}
+            {' │ '}
+            <SubagentPulse t={t}>⛓</SubagentPulse> {subagentCount}
           </Text>
         ) : null}
         {showResumeHint ? (

@@ -1,7 +1,7 @@
 import React from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { StatusRule } from '../components/appChrome.js'
+import { StatusRule, subagentPulseColor } from '../components/appChrome.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 type ReactNodeLike = React.ReactNode
@@ -105,6 +105,12 @@ const baseProps = {
 }
 
 describe('StatusRule background-subagent indicator', () => {
+  it('alternates the pulse between muted and accent colors', () => {
+    expect(subagentPulseColor(0, DEFAULT_THEME)).toBe(DEFAULT_THEME.color.muted)
+    expect(subagentPulseColor(1, DEFAULT_THEME)).toBe(DEFAULT_THEME.color.accent)
+    expect(subagentPulseColor(2, DEFAULT_THEME)).toBe(DEFAULT_THEME.color.muted)
+  })
+
   it('renders ⛓ N on a wide terminal when subagents are running', () => {
     const element = StatusRule({
       ...baseProps,
