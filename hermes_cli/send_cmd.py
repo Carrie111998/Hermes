@@ -260,19 +260,24 @@ def _load_hermes_env() -> None:
         return
 
     try:
-        import yaml  # type: ignore[import-not-found]
-    except Exception:
-        return
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+        # Presence-sensitive env bridge: raw read is deliberate — only keys
+        # the user actually wrote get bridged. Overlay + expansion below.
+        from hermes_cli.config import read_user_config_raw
+        raw = read_user_config_raw(config_path)
     except Exception:
         return
 
     try:
         from hermes_cli.config import _expand_env_vars
         raw = _expand_env_vars(raw)
+    except Exception:
+        pass
+
+    # Managed scope: overlay administrator-pinned values before bridging to env,
+    # so a managed top-level scalar wins here too. Fail-open via the helper.
+    try:
+        from hermes_cli import managed_scope
+        raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
     except Exception:
         pass
 
