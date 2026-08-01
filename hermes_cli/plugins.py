@@ -171,6 +171,19 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Kanban dispatcher spawn gate. Fired once per candidate ready task on
+    # each dispatcher tick, BEFORE the task is claimed. Plugins may return
+    # a dict to defer the spawn:
+    #   {"action": "defer", "reason": "..."}  -> leave the task ready this
+    #                                            tick (re-evaluated next tick)
+    #   {"action": "allow"}  /  None           -> normal claim + spawn
+    # Kwargs: task (ready-row dict: id, title, assignee, priority, ...),
+    # board (slug). Fail-open at every layer: hook errors never stall the
+    # board. Policy examples: provider budget windows (defer spawns while a
+    # subscription quota window is exhausted), maintenance freezes,
+    # cost-aware pacing. Complements the static ``kanban.max_in_progress``
+    # cap with dynamic, plugin-defined policy.
+    "kanban_pre_spawn",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

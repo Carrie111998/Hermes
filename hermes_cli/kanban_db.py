@@ -6726,6 +6726,12 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    deferred_by_gate: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks deferred this tick by the ``spawn_gate`` policy callback
+    (``kanban_pre_spawn`` plugin hook at the gateway layer). Each entry is
+    ``(task_id, reason)``. NOT a failure — the task stays ``ready`` and is
+    re-evaluated on the next tick, once the gate's policy (budget window,
+    maintenance freeze, priority ordering, …) lets it through."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8111,6 +8117,7 @@ def dispatch_once(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    spawn_gate=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -8145,6 +8152,7 @@ def dispatch_once(
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            spawn_gate=spawn_gate,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -8161,6 +8169,7 @@ def dispatch_once(
         result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            spawn_gate=spawn_gate,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -8181,6 +8190,7 @@ def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    spawn_gate=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -8218,6 +8228,16 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+
+    ``spawn_gate`` is an optional policy callback consulted per candidate
+    ready task BEFORE it is claimed: ``spawn_gate(task_row_dict) ->
+    Optional[dict]``. Returning ``{"action": "defer", "reason": "..."}``
+    leaves the task in ``ready`` for a later tick (recorded in
+    ``DispatchResult.deferred_by_gate``); any other return proceeds. The
+    gate is fail-open: exceptions are swallowed and the task spawns. This
+    is the dependency-injection seam for the gateway's ``kanban_pre_spawn``
+    plugin hook (budget windows, maintenance freezes, priority policies)
+    — kanban_db itself stays plugin-free.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -8322,6 +8342,18 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if spawn_gate is not None:
+            try:
+                _gate_verdict = spawn_gate(dict(row))
+            except Exception:
+                # Fail-open: a broken policy gate must never stall the board.
+                _gate_verdict = None
+            if (isinstance(_gate_verdict, dict)
+                    and _gate_verdict.get("action") == "defer"):
+                result.deferred_by_gate.append(
+                    (row["id"], str(_gate_verdict.get("reason") or ""))
+                )
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
