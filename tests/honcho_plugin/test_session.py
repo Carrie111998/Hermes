@@ -310,6 +310,7 @@ class TestConcludeToolDispatch:
             "who are you",
             reasoning_level=None,
             peer="hermes",
+            apply_injection_cap=False,
         )
 
     def test_honcho_conclude_missing_both_params_returns_error(self):
@@ -323,7 +324,7 @@ class TestConcludeToolDispatch:
         result = provider.handle_tool_call("honcho_conclude", {})
 
         parsed = json.loads(result)
-        assert parsed == {"error": "Exactly one of conclusion or delete_id must be provided."}
+        assert parsed == {"error": "Exactly one of conclusion, delete_id, or list must be provided."}
         provider._manager.create_conclusion.assert_not_called()
         provider._manager.delete_conclusion.assert_not_called()
 
@@ -339,7 +340,7 @@ class TestConcludeToolDispatch:
             {"conclusion": "User prefers dark mode", "delete_id": "conc-123"},
         )
         parsed = json.loads(result)
-        assert parsed == {"error": "Exactly one of conclusion or delete_id must be provided."}
+        assert parsed == {"error": "Exactly one of conclusion, delete_id, or list must be provided."}
         provider._manager.create_conclusion.assert_not_called()
         provider._manager.delete_conclusion.assert_not_called()
 
@@ -352,7 +353,7 @@ class TestConcludeToolDispatch:
         provider._manager = MagicMock()
         result = provider.handle_tool_call("honcho_conclude", {"conclusion": "   "})
         parsed = json.loads(result)
-        assert parsed == {"error": "Exactly one of conclusion or delete_id must be provided."}
+        assert parsed == {"error": "Exactly one of conclusion, delete_id, or list must be provided."}
         provider._manager.create_conclusion.assert_not_called()
 
     def test_honcho_conclude_rejects_whitespace_only_delete_id(self):
@@ -364,7 +365,7 @@ class TestConcludeToolDispatch:
         provider._manager = MagicMock()
         result = provider.handle_tool_call("honcho_conclude", {"delete_id": "  "})
         parsed = json.loads(result)
-        assert parsed == {"error": "Exactly one of conclusion or delete_id must be provided."}
+        assert parsed == {"error": "Exactly one of conclusion, delete_id, or list must be provided."}
         provider._manager.delete_conclusion.assert_not_called()
 
     def test_sync_turn_strips_leaked_memory_context_before_honcho_ingest(self):
