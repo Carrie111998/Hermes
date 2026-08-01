@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import hashlib
 import importlib.machinery
@@ -39,6 +40,7 @@ RELEASE_OWNER_GID = os.getegid()
 PRODUCTION_RELEASE = Path(
     "/opt/adventico-ai-platform/hermes-agent-releases/hermes-agent-aaaaaaaaaaaa"
 )
+HAS_FCNTL = importlib.util.find_spec("fcntl") is not None
 
 
 def _operational_receipt_key_ids() -> dict[str, str]:
@@ -1307,6 +1309,204 @@ def test_clean_host_bootstraps_owner_approved_inputs_before_package_and_freeze(
         plan=freeze,
         now_unix=1_800_000_000,
     ).sha256
+
+
+@pytest.mark.skipif(
+    not HAS_FCNTL,
+    reason="inherited descriptors require POSIX fcntl",
+)
+def test_fixed_inputs_load_from_one_inherited_descriptor_without_path_access(
+    tmp_path,
+):
+    staged = (tmp_path / "staged").resolve()
+    staged.mkdir(mode=0o700)
+    inputs_path = staged / "production-unit-inputs.json"
+    plan, approval = _unit_input_authority()
+    fixed = package._unit_inputs_from_authority(plan, approval)
+    inputs_path.write_bytes(package._canonical_bytes(fixed) + b"\n")
+    inputs_path.chmod(package.FIXED_UNIT_INPUTS_MODE)
+    descriptor = os.open(inputs_path, os.O_RDONLY)
+    os.set_inheritable(descriptor, True)
+    os.lseek(descriptor, 7, os.SEEK_SET)
+    staged.rename(tmp_path / "root-only-staged")
+    try:
+        observed = package.load_fixed_unit_inputs(
+            inputs_path,
+            revision=REVISION,
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+            inherited_descriptor=descriptor,
+        )
+        descriptor_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+    finally:
+        os.close(descriptor)
+
+    assert observed == fixed
+    assert descriptor_offset == 7
+    with pytest.raises(
+        package.PackagingError,
+        match="cutover_unit_inputs_staging_unavailable",
+    ):
+        package.load_fixed_unit_inputs(
+            inputs_path,
+            revision=REVISION,
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
+
+
+@pytest.mark.skipif(
+    not HAS_FCNTL,
+    reason="inherited descriptors require POSIX fcntl",
+)
+def test_fixed_inputs_reject_noninheritable_descriptor(tmp_path):
+    inputs_path = tmp_path / "production-unit-inputs.json"
+    plan, approval = _unit_input_authority()
+    fixed = package._unit_inputs_from_authority(plan, approval)
+    inputs_path.write_bytes(package._canonical_bytes(fixed) + b"\n")
+    inputs_path.chmod(package.FIXED_UNIT_INPUTS_MODE)
+    descriptor = os.open(inputs_path, os.O_RDONLY)
+    try:
+        assert os.get_inheritable(descriptor) is False
+        with pytest.raises(
+            package.PackagingError,
+            match="cutover_unit_inputs_descriptor_invalid",
+        ):
+            package.load_fixed_unit_inputs(
+                inputs_path,
+                revision=REVISION,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+                inherited_descriptor=descriptor,
+            )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(
+    not HAS_FCNTL,
+    reason="inherited descriptors require POSIX fcntl",
+)
+def test_fixed_inputs_reject_hardlinked_inherited_descriptor(tmp_path):
+    inputs_path = tmp_path / "production-unit-inputs.json"
+    plan, approval = _unit_input_authority()
+    fixed = package._unit_inputs_from_authority(plan, approval)
+    inputs_path.write_bytes(package._canonical_bytes(fixed) + b"\n")
+    inputs_path.chmod(package.FIXED_UNIT_INPUTS_MODE)
+    os.link(inputs_path, tmp_path / "unexpected-alias.json")
+    descriptor = os.open(inputs_path, os.O_RDONLY)
+    os.set_inheritable(descriptor, True)
+    try:
+        with pytest.raises(
+            package.PackagingError,
+            match="cutover_unit_inputs_descriptor_invalid",
+        ):
+            package.load_fixed_unit_inputs(
+                inputs_path,
+                revision=REVISION,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+                inherited_descriptor=descriptor,
+            )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(
+    not HAS_FCNTL,
+    reason="inherited descriptors require POSIX fcntl",
+)
+def test_fixed_inputs_reject_descriptor_opened_for_writing_before_seal(
+    tmp_path,
+):
+    inputs_path = tmp_path / "production-unit-inputs.json"
+    plan, approval = _unit_input_authority()
+    fixed = package._unit_inputs_from_authority(plan, approval)
+    inputs_path.write_bytes(package._canonical_bytes(fixed) + b"\n")
+    descriptor = os.open(inputs_path, os.O_RDWR)
+    inputs_path.chmod(package.FIXED_UNIT_INPUTS_MODE)
+    os.set_inheritable(descriptor, True)
+    try:
+        with pytest.raises(
+            package.PackagingError,
+            match="cutover_unit_inputs_descriptor_invalid",
+        ):
+            package.load_fixed_unit_inputs(
+                inputs_path,
+                revision=REVISION,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+                inherited_descriptor=descriptor,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def test_packager_main_passes_exact_inherited_descriptor_to_loader(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from scripts.canary import production_cutover_activation_lock as authority_lock
+
+    release = tmp_path / "release"
+    fixed_path = tmp_path / "production-unit-inputs.json"
+    fixed_path.write_bytes(b"{}\n")
+    descriptor = os.open(fixed_path, os.O_RDONLY)
+    observed = {}
+
+    def load_inputs(path, *, inherited_descriptor):
+        observed["path"] = path
+        observed["descriptor"] = inherited_descriptor
+        return {"release_revision": REVISION}
+
+    def build(
+        release_root,
+        revision,
+        *,
+        release_address,
+        unit_inputs,
+    ):
+        observed["release_root"] = release_root
+        observed["revision"] = revision
+        observed["release_address"] = release_address
+        observed["unit_inputs"] = unit_inputs
+        return {"ok": True}
+
+    monkeypatch.setattr(package, "FIXED_UNIT_INPUTS_PATH", fixed_path)
+    monkeypatch.setattr(package, "load_fixed_unit_inputs", load_inputs)
+    monkeypatch.setattr(package, "build_release_artifacts", build)
+    monkeypatch.setattr(
+        authority_lock,
+        "authority_activation_lock",
+        lambda *, require_root: contextlib.nullcontext(),
+    )
+    monkeypatch.setenv(package.INHERITED_UNIT_INPUTS_FD_ENV, str(descriptor))
+    try:
+        return_code = package.main(
+            [
+                "build",
+                "--release-root",
+                str(release),
+                "--revision",
+                REVISION,
+                "--unit-inputs",
+                str(fixed_path),
+            ]
+        )
+    finally:
+        os.close(descriptor)
+
+    assert return_code == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert observed == {
+        "path": fixed_path,
+        "descriptor": descriptor,
+        "release_root": release,
+        "revision": REVISION,
+        "release_address": None,
+        "unit_inputs": {"release_revision": REVISION},
+    }
 
 
 def test_bootstrap_rejects_unapproved_unit_input_authority(tmp_path):
@@ -3049,9 +3249,11 @@ def test_deploy_packages_and_verifies_before_release_activation():
     install_wheel = run_deploy.index(
         'install_target_release_wheel "$tmp" "$active"'
     )
-    build = run_deploy.index("package_production_cutover_artifacts.py\" build")
-    verify = run_deploy.index("package_production_cutover_artifacts.py\" verify")
-    publish = run_deploy.index('mv -T "$tmp" "$new"')
+    build = run_deploy.index('"build" "$tmp" "$new" "$sha"')
+    verify = run_deploy.index('"verify" "$tmp" "$new" "$sha"')
+    publish = run_deploy.index(
+        'publish_release_staging_directory "$tmp" "$new" "$short"'
+    )
     release_identity = run_deploy.index(
         'release_identity_matches "$new" "$sha"'
     )
@@ -3093,7 +3295,14 @@ def test_deploy_packages_and_verifies_before_release_activation():
         < cutover_attest
         < activate
     )
-    assert run_deploy.count('--unit-inputs "$CUTOVER_UNIT_INPUTS_PATH"') >= 2
+    assert run_deploy.count("run_cutover_artifact_step \\\n") == 2
+    delegated_step = source[
+        source.index("run_cutover_artifact_step() {") : source.index(
+            "prepare_release_staging_directory() {"
+        )
+    ]
+    assert '"$CUTOVER_UNIT_INPUTS_PATH"' in delegated_step
+    assert '"--unit-inputs",' in delegated_step
     assert 'cutover_artifacts_match "$new" "$sha"' in run_deploy
     assert 'blocked_target_cutover_artifacts_invalid' in run_deploy
     install = source[

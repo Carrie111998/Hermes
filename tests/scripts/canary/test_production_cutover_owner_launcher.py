@@ -3508,13 +3508,37 @@ def test_production_transport_exposes_fixed_unit_input_rotation_edge() -> None:
         "rotate-unit-input-authority",
     )
 
-    assert remote[-4:] == (
-        "-B",
-        "-I",
-        "-m",
-        "scripts.canary.production_cutover_unit_input_rotation",
+    assert remote[-3:] == (
+        owner.ProductionCutoverTransport._ROTATION_STAGER_WRAPPER,
+        REVISION,
+        "rotate-unit-input-authority",
     )
     assert "muncho-canary-v2-01" not in " ".join(remote)
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        "prepare-release-unit-inputs",
+        "preauthorize-release-unit-inputs",
+    ),
+)
+def test_production_transport_release_rotation_phases_use_fixed_stager(
+    action: str,
+) -> None:
+    remote = owner.ProductionCutoverTransport._remote_command(
+        REVISION,
+        action,
+    )
+
+    assert remote[-3:] == (
+        owner.ProductionCutoverTransport._ROTATION_STAGER_WRAPPER,
+        REVISION,
+        action,
+    )
+    assert not any(
+        item.endswith("/.venv/bin/python") for item in remote
+    )
 
 
 def test_production_transport_full_argv_is_sealed_away_from_canary() -> None:
@@ -3761,6 +3785,36 @@ def test_production_transport_performs_identity_preflight_before_mutation() -> N
         "postflight",
         "identity",
     ]
+
+
+def test_production_transport_invoke_uses_supported_remote_bounds() -> None:
+    transport = _production_transport()
+    captured: dict[str, object] = {}
+
+    def run_remote_input(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b'{"ok":true}\n',
+            stderr=b"",
+        )
+
+    transport._run_remote_input = run_remote_input
+
+    assert transport.invoke(
+        REVISION,
+        "stage-publication",
+        publication={"action": "unit-input-authority"},
+    ) == {"ok": True}
+    assert captured["maximum_input_bytes"] == (
+        canary_transport._STOPPED_RELEASE_REMOTE_INPUT_MAX_BYTES
+    )
+    assert captured["maximum_output_bytes"] == (
+        canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+    )
+    assert len(captured["input_bytes"]) < captured["maximum_input_bytes"]
 
 
 def test_stopped_release_transport_accepts_opt_in_live_sized_iam_response() -> None:

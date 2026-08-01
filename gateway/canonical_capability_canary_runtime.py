@@ -3286,6 +3286,10 @@ def render_gateway_config(plan: CapabilityCanaryPlan) -> bytes:
         "agent": {
             "reasoning_effort": "high",
             "max_turns": 90,
+            # The production capability canary is an exact reviewed allowlist.
+            # Explicitly suppress newly backfilled general-product toolsets so
+            # an upstream release cannot widen this sealed surface implicitly.
+            "disabled_toolsets": ["bfl"],
             "adaptive_reasoning": {"enabled": True, "max_effort": "max"},
             "tool_use_enforcement": True,
             "task_completion_guidance": True,
@@ -3410,6 +3414,7 @@ def validate_capability_gateway_config(raw: Mapping[str, Any]) -> None:
     if agent != {
         "reasoning_effort": "high",
         "max_turns": 90,
+        "disabled_toolsets": ["bfl"],
         "adaptive_reasoning": {"enabled": True, "max_effort": "max"},
         "tool_use_enforcement": True,
         "task_completion_guidance": True,

@@ -94,11 +94,12 @@ set -eu
 
 exec /usr/bin/flock --exclusive --no-fork \\
   /run/lock/muncho-release-builder-promotion.lock \\
-  /usr/bin/python3 -I -c \\
+  /usr/bin/python3 -B -I -c \\
   'import runpy,sys; sys.path.insert(0,"/usr/lib/muncho-release-updater"); sys.argv=sys.argv[1:]; runpy.run_module("scripts.canary.production_release_builder_phase",run_name="__main__")' \\
   muncho-release-builder-phase "$@"
 """
 EXPECTED_BUILDER_TMPFILES = (
+    b"d /var/lib/muncho-release-updates 0755 root root -\n"
     b"f /run/lock/muncho-release-builder-promotion.lock "
     b"0440 root muncho-release-builder -\n"
 )
@@ -140,8 +141,19 @@ def _sha256(path: Path) -> str:
 def _fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    rotation_stager: bool = False,
 ) -> Fixture:
     build = build_test._fixture(tmp_path, monkeypatch)
+    if rotation_stager:
+        build_test._rewrite_request(
+            build,
+            schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+            purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+            entrypoint_relative_path=(
+                phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+            ),
+        )
     terminal = phase._run_builder_phase_for_test(
         build.request_path,
         production=False,
@@ -233,6 +245,9 @@ def _fixture(
 def _promote(
     fixture: Fixture,
     *,
+    binding: promoter._PromotionBinding = (
+        promoter._RELEASE_UPDATER_PROMOTION_BINDING
+    ),
     checkpoint: Callable[[str], None] | None = None,
     rename_no_replace: Callable[[Path, Path], None] | None = None,
     xattr_reader=None,
@@ -245,6 +260,7 @@ def _promote(
             fixture.terminal["receipt_sha256"]
         ),
         roots=fixture.roots,
+        binding=binding,
         production=False,
         checkpoint=checkpoint,
         rename_no_replace=rename_no_replace,
@@ -284,6 +300,65 @@ def _promote(
         test_fragment_sha256=fixture.fragment_sha256,
         test_wrapper_sha256=fixture.wrapper_sha256,
     )
+
+
+def test_input_descriptor_capacity_is_raised_for_large_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = [1024, 1_048_576]
+    updates: list[tuple[int, tuple[int, int]]] = []
+
+    def getrlimit(kind: int) -> tuple[int, int]:
+        assert kind == promoter.resource.RLIMIT_NOFILE
+        return limits[0], limits[1]
+
+    def setrlimit(kind: int, value: tuple[int, int]) -> None:
+        assert kind == promoter.resource.RLIMIT_NOFILE
+        updates.append((kind, value))
+        limits[:] = value
+
+    monkeypatch.setattr(promoter.resource, "getrlimit", getrlimit)
+    monkeypatch.setattr(promoter.resource, "setrlimit", setrlimit)
+
+    promoter._reserve_input_descriptor_capacity(
+        source_blob_count=8_676,
+        runtime_wheel_count=4,
+    )
+
+    assert updates == [
+        (
+            promoter.resource.RLIMIT_NOFILE,
+            (8_744, 1_048_576),
+        )
+    ]
+
+
+def test_input_descriptor_capacity_fails_before_opening_when_hard_limit_is_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        promoter.resource,
+        "getrlimit",
+        lambda _kind: (1024, 4096),
+    )
+    called = False
+
+    def setrlimit(_kind: int, _value: tuple[int, int]) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(promoter.resource, "setrlimit", setrlimit)
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="descriptor_capacity_insufficient",
+    ):
+        promoter._reserve_input_descriptor_capacity(
+            source_blob_count=8_676,
+            runtime_wheel_count=4,
+        )
+
+    assert called is False
 
 
 def _rewrite_canonical(path: Path, value: Mapping[str, Any]) -> None:
@@ -355,6 +430,111 @@ def test_public_promoter_has_no_authority_or_test_seams() -> None:
         "revision",
         "expected_builder_terminal_receipt_sha256",
     )
+    assert tuple(
+        inspect.signature(
+            promoter.promote_rotation_stager_candidate
+        ).parameters
+    ) == (
+        "revision",
+        "expected_builder_terminal_receipt_sha256",
+    )
+
+
+def test_public_promoters_are_bound_to_disjoint_exact_receipt_purposes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[promoter._PromotionBinding] = []
+
+    def capture(**kwargs: Any) -> Mapping[str, Any]:
+        observed.append(kwargs["binding"])
+        return {"binding": kwargs["binding"]}
+
+    monkeypatch.setattr(promoter, "_promote_candidate_for_test", capture)
+
+    updater = promoter.promote_candidate(
+        revision=REVISION,
+        expected_builder_terminal_receipt_sha256="1" * 64,
+    )
+    stager = promoter.promote_rotation_stager_candidate(
+        revision=REVISION,
+        expected_builder_terminal_receipt_sha256="2" * 64,
+    )
+
+    assert updater["binding"] is (
+        promoter._RELEASE_UPDATER_PROMOTION_BINDING
+    )
+    assert stager["binding"] is (
+        promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING
+    )
+    assert observed == [
+        promoter._RELEASE_UPDATER_PROMOTION_BINDING,
+        promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
+    ]
+    assert observed[0].request_purpose is None
+    assert observed[0].terminal_receipt_purpose is None
+    assert observed[1].request_purpose == (
+        phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    )
+    assert observed[1].terminal_receipt_purpose == (
+        phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    )
+
+
+def test_rotation_stager_is_published_only_through_stager_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch, rotation_stager=True)
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="candidate_promoter_request_purpose_invalid",
+    ):
+        _promote(fixture)
+    assert not fixture.hidden.exists()
+    assert not fixture.final.exists()
+
+    result = _promote(
+        fixture,
+        binding=promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
+    )
+
+    assert result["completed"] is True
+    terminal = json.loads(
+        (fixture.final / phase.TERMINAL_RECEIPT_NAME).read_text(
+            encoding="ascii"
+        )
+    )
+    assert terminal["schema"] == (
+        phase.UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA
+    )
+    assert terminal["purpose"] == phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    assert terminal["entrypoint_relative_path"] == (
+        phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+    )
+    assert fixture.final.is_dir()
+    assert not fixture.final.is_symlink()
+
+
+def test_updater_candidate_is_rejected_by_rotation_stager_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="candidate_promoter_request_purpose_invalid",
+    ):
+        _promote(
+            fixture,
+            binding=(
+                promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING
+            ),
+        )
+
+    assert not fixture.hidden.exists()
+    assert not fixture.final.exists()
 
 
 def test_production_builder_assets_and_embedded_digests_are_exact() -> None:
@@ -445,43 +625,53 @@ def test_systemd_collector_executes_only_the_exact_fixed_show(
     ]
 
 
-def test_production_identities_are_derived_from_exact_nss_catalog(
+def test_production_identities_reserve_exact_cutover_catalog_before_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gid_by_name = {
-        name: 41000 + index
-        for index, name in enumerate(
-            promoter._PRODUCTION_RUNTIME_GROUP_NAMES
-        )
-    }
-    uid_by_name = {
-        name: 31000 + index
-        for index, name in enumerate(
-            promoter._PRODUCTION_RUNTIME_USER_NAMES
-        )
-    }
     monkeypatch.setattr(promoter.os, "geteuid", lambda: 0)
 
+    def absent(_value: Any) -> Any:
+        raise KeyError
+
     identities = promoter._derive_production_release_identities(
-        user_lookup=lambda name: SimpleNamespace(
-            pw_name=name,
-            pw_uid=uid_by_name[name],
-            pw_gid=gid_by_name[name],
-        ),
-        group_lookup=lambda name: SimpleNamespace(
-            gr_name=name,
-            gr_gid=gid_by_name[name],
-        ),
+        user_lookup=absent,
+        user_id_lookup=absent,
+        group_lookup=absent,
+        group_id_lookup=absent,
     )
 
     assert identities.reserved_runtime_uids == tuple(
-        sorted(uid_by_name.values())
+        sorted(promoter._PRODUCTION_RUNTIME_UID_BY_NAME.values())
     )
     assert identities.reserved_runtime_gids == tuple(
-        sorted(gid_by_name.values())
+        sorted(promoter._PRODUCTION_RUNTIME_GID_BY_NAME.values())
     )
     assert len(identities.reserved_runtime_uids) == 17
     assert len(identities.reserved_runtime_gids) == 28
+
+
+def test_production_identity_reservation_rejects_uid_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(promoter.os, "geteuid", lambda: 0)
+
+    def absent(_value: Any) -> Any:
+        raise KeyError
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="identity_contract_invalid",
+    ):
+        promoter._derive_production_release_identities(
+            user_lookup=absent,
+            user_id_lookup=lambda uid: SimpleNamespace(
+                pw_name="collision",
+                pw_uid=uid,
+                pw_gid=uid,
+            ),
+            group_lookup=absent,
+            group_id_lookup=absent,
+        )
 
 
 def test_rehashed_terminal_tamper_is_rejected_against_root_inputs(
@@ -702,6 +892,45 @@ def test_changed_systemd_invocation_between_observations_blocks_publication(
         _promote(fixture, systemd_reader=systemd_reader)
     assert observations == 2
     assert not (fixture.final / builder.MANIFEST_NAME).exists()
+
+
+def test_latched_completed_v3_builder_promotes_without_a_live_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    unit = f"muncho-release-builder-v3@{REVISION}.service"
+    fixture.roots = promoter.PromoterRoots(
+        job_root=fixture.roots.job_root,
+        release_parent=fixture.roots.release_parent,
+        builder_unit_fragment=fixture.roots.builder_unit_fragment,
+        builder_wrapper=fixture.roots.builder_wrapper,
+        promotion_interlock=fixture.roots.promotion_interlock,
+        builder_unit_prefix="muncho-release-builder-v3@",
+        cgroup_root=fixture.roots.cgroup_root,
+        proc_root=fixture.roots.proc_root,
+    )
+    fixture.systemd_properties = {
+        **fixture.systemd_properties,
+        "Id": unit,
+        "ActiveState": "active",
+        "SubState": "exited",
+        "ExecMainPID": "526717",
+        "ExecMainCode": "1",
+        "ControlGroup": f"/system.slice/{unit}",
+    }
+
+    result = _promote(fixture)
+
+    assert result["completed"] is True
+    assert fixture.final.is_dir()
+    evidence = json.loads(
+        (fixture.final / builder.RECEIPT_NAME).read_text(encoding="utf-8")
+    )["process_free_evidence"]
+    assert evidence["initial"]["systemd_state"]["active"] == "active"
+    assert evidence["final"]["systemd_state"]["sub"] == "exited"
+    assert evidence["initial"]["systemd_state"]["exec_main_pid"] == 526717
+    assert evidence["final"]["systemd_state"]["exec_main_code"] == "1"
 
 
 def test_root_input_change_after_staging_blocks_publication(

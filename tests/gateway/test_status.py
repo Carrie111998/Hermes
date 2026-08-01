@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway import status
 
 
@@ -1932,6 +1934,73 @@ class TestActiveAgentsTurnBoundaryWrite:
         rec = status.read_runtime_status()
         assert rec["active_agents"] == 0
         assert rec["active_session_keys"] == []
+
+    def test_external_drain_ack_round_trips_and_explicit_none_clears(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        acknowledgment = {
+            "marker_sha256": "a" * 64,
+            "transaction_sha256": "b" * 64,
+            "mutation_capability_sha256": "c" * 64,
+            "epoch": "boot-id:123",
+            "process_start_ticks": "4242",
+            "systemd_invocation_id": "d" * 32,
+            "ack_sequence": 2,
+        }
+
+        status.write_runtime_status(
+            gateway_state="draining",
+            active_agents=0,
+            external_drain_ack=acknowledgment,
+        )
+        assert status.read_runtime_status()["external_drain_ack"] == acknowledgment
+
+        status.write_runtime_status(active_agents=0)
+        assert status.read_runtime_status()["external_drain_ack"] == acknowledgment
+
+        status.write_runtime_status(external_drain_ack=None)
+        assert "external_drain_ack" not in status.read_runtime_status()
+
+    @pytest.mark.parametrize(
+        "mutate",
+        (
+            lambda ack: ack.pop("marker_sha256"),
+            lambda ack: ack.update(marker_sha256="A" * 64),
+            lambda ack: ack.update(process_start_ticks="not-digits"),
+            lambda ack: ack.update(systemd_invocation_id="d" * 31),
+            lambda ack: ack.update(ack_sequence=0),
+            lambda ack: ack.update(extra=True),
+        ),
+    )
+    def test_external_drain_ack_rejects_noncanonical_shape(
+        self,
+        tmp_path,
+        monkeypatch,
+        mutate,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        acknowledgment = {
+            "marker_sha256": "a" * 64,
+            "transaction_sha256": "b" * 64,
+            "mutation_capability_sha256": "c" * 64,
+            "epoch": "boot-id:123",
+            "process_start_ticks": "4242",
+            "systemd_invocation_id": "d" * 32,
+            "ack_sequence": 1,
+        }
+        mutate(acknowledgment)
+
+        with pytest.raises(
+            ValueError,
+            match="invalid external drain acknowledgment",
+        ):
+            status.write_runtime_status(
+                gateway_state="draining",
+                external_drain_ack=acknowledgment,
+            )
 
 
 class TestGatewayBusyDerivation:

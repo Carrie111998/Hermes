@@ -117,6 +117,8 @@ STAGED_UNIT_INPUT_APPROVAL_PATH = (
 )
 FIXED_UNIT_INPUTS_PATH = CUTOVER_STAGED_ROOT / "production-unit-inputs.json"
 FIXED_UNIT_INPUTS_MODE = 0o444
+INHERITED_UNIT_INPUTS_FD_ENV = "MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
+_INHERITED_DESCRIPTOR = re.compile(r"^(?:[3-9]|[1-9][0-9]+)$")
 _TEMPORARY_SUFFIX = re.compile(r"^[1-9][0-9]*$")
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
@@ -780,6 +782,71 @@ def _read_trusted_staged_file(
     return bytes(payload)
 
 
+def _read_trusted_staged_descriptor(
+    descriptor: int,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    mode: int,
+    maximum: int,
+) -> bytes:
+    """Read one root-opened immutable staging capability.
+
+    The production input directory is intentionally root-searchable only.
+    A privileged launcher therefore opens and validates the exact fixed input
+    before dropping privilege, then delegates only that already-open file
+    descriptor.  The child revalidates the complete descriptor identity and
+    canonical payload without broadening its filesystem access.
+    """
+
+    if type(descriptor) is not int or descriptor < 3:
+        raise PackagingError("cutover_unit_inputs_descriptor_invalid")
+    try:
+        import fcntl as descriptor_fcntl
+
+        before = os.fstat(descriptor)
+        if (
+            not os.get_inheritable(descriptor)
+            or descriptor_fcntl.fcntl(
+                descriptor,
+                descriptor_fcntl.F_GETFL,
+            )
+            & os.O_ACCMODE
+            != os.O_RDONLY
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != expected_uid
+            or before.st_gid != expected_gid
+            or stat.S_IMODE(before.st_mode) != mode
+            or not 0 < before.st_size <= maximum
+        ):
+            raise PackagingError("cutover_unit_inputs_descriptor_invalid")
+        payload = bytearray()
+        offset = 0
+        while len(payload) <= maximum:
+            chunk = os.pread(
+                descriptor,
+                min(64 * 1024, maximum + 1 - len(payload)),
+                offset,
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+    except PackagingError:
+        raise
+    except (ImportError, OSError, ValueError) as exc:
+        raise PackagingError("cutover_unit_inputs_descriptor_unavailable") from exc
+    if (
+        len(payload) != before.st_size
+        or len(payload) > maximum
+        or _file_identity(before) != _file_identity(after)
+    ):
+        raise PackagingError("cutover_unit_inputs_descriptor_changed")
+    return bytes(payload)
+
+
 def _decode_canonical_json(
     payload: bytes,
     *,
@@ -819,15 +886,26 @@ def load_fixed_unit_inputs(
     revision: str | None = None,
     expected_uid: int = 0,
     expected_gid: int = 0,
+    inherited_descriptor: int | None = None,
 ) -> Mapping[str, Any]:
     """Load the one root-owned, non-secret input artifact used by build/verify."""
 
-    payload = _read_trusted_staged_file(
-        path,
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
-        mode=FIXED_UNIT_INPUTS_MODE,
-        maximum=128 * 1024,
+    payload = (
+        _read_trusted_staged_file(
+            path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            mode=FIXED_UNIT_INPUTS_MODE,
+            maximum=128 * 1024,
+        )
+        if inherited_descriptor is None
+        else _read_trusted_staged_descriptor(
+            inherited_descriptor,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            mode=FIXED_UNIT_INPUTS_MODE,
+            maximum=128 * 1024,
+        )
     )
     return _unit_inputs(
         _decode_canonical_json(
@@ -2430,8 +2508,17 @@ def main(argv: list[str] | None = None) -> int:
             or args.unit_inputs != FIXED_UNIT_INPUTS_PATH
         ):
             raise PackagingError("cutover_packaging_unit_inputs_path_invalid")
+        inherited_raw = os.environ.get(INHERITED_UNIT_INPUTS_FD_ENV)
+        inherited_descriptor = None
+        if inherited_raw is not None:
+            if _INHERITED_DESCRIPTOR.fullmatch(inherited_raw) is None:
+                raise PackagingError("cutover_unit_inputs_descriptor_invalid")
+            inherited_descriptor = int(inherited_raw)
         with authority_lock.authority_activation_lock(require_root=True):
-            unit_inputs = load_fixed_unit_inputs(args.unit_inputs)
+            unit_inputs = load_fixed_unit_inputs(
+                args.unit_inputs,
+                inherited_descriptor=inherited_descriptor,
+            )
             result = (
                 build_release_artifacts(
                     args.release_root,

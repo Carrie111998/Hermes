@@ -85,7 +85,11 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
 
 @pytest.mark.parametrize(
     "sealed_build",
-    ["canonical-writer-release-v1", "owner-runtime-v1"],
+    [
+        "canonical-writer-release-v1",
+        "muncho-legacy-production-release-v1",
+        "owner-runtime-v1",
+    ],
 )
 def test_wheel_build_allows_exact_sealed_release_roles(sealed_build, tmp_path):
     result = _build_artifact(
@@ -114,8 +118,10 @@ def test_wheel_build_allows_exact_sealed_release_roles(sealed_build, tmp_path):
     [
         ("wheel", "owner-runtime-v1-near-miss"),
         ("wheel", "canonical-writer-release-v1-near-miss"),
+        ("wheel", "muncho-legacy-production-release-v1-near-miss"),
         ("sdist", "owner-runtime-v1"),
         ("sdist", "canonical-writer-release-v1"),
+        ("sdist", "muncho-legacy-production-release-v1"),
     ],
 )
 def test_sealed_wheel_role_is_exact_and_never_authorizes_sdist(

@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -490,12 +491,17 @@ def test_build_constraints_are_exact_and_hash_pinned(tmp_path):
         / writer_release.BUILD_CONSTRAINTS_RELATIVE_PATH
     )
     expected = (
-        "setuptools==81.0.0 "
+        "setuptools==83.0.0 "
         "--hash=sha256:"
-        "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6\n"
+        "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3\n"
     ).encode("ascii")
 
     assert constraints.read_bytes() == expected
+    project = tomllib.loads(
+        (Path(writer_release.__file__).resolve().parents[2] / "pyproject.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert project["build-system"]["requires"] == ["setuptools==83.0.0"]
 
     spec = _spec(tmp_path)
     spec.build_constraints.parent.mkdir(parents=True)
@@ -517,7 +523,7 @@ def test_build_constraints_are_exact_and_hash_pinned(tmp_path):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(writer_release.os, "lstat", root_lstat)
         writer_release._validate_build_constraints(spec)
-        spec.build_constraints.write_bytes(expected.replace(b"81.0.0", b"81.0.1"))
+        spec.build_constraints.write_bytes(expected.replace(b"83.0.0", b"83.0.1"))
         with pytest.raises(PermissionError, match="constraints"):
             writer_release._validate_build_constraints(spec)
 
@@ -595,7 +601,7 @@ def test_real_uv_build_dirties_only_tracked_index_scratch(tmp_path):
     source.mkdir()
     (source / "pyproject.toml").write_text(
         "[build-system]\n"
-        "requires = ['setuptools>=77.0,<83']\n"
+        "requires = ['setuptools==83.0.0']\n"
         "build-backend = 'setuptools.build_meta'\n"
         "[project]\n"
         "name = 'scratch-proof'\n"

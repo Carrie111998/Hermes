@@ -23,7 +23,12 @@ SYSTEM_PYTHON="/usr/bin/python3"
 SYSTEM_GIT="/usr/bin/git"
 SYSTEM_ID="/usr/bin/id"
 SYSTEM_FLOCK="/usr/bin/flock"
+SYSTEM_ENV="/usr/bin/env"
+SYSTEM_SETPRIV="/usr/bin/setpriv"
 DEPLOY_LOCK_PATH="/run/muncho-auto-deploy-release.lock"
+CUTOVER_ACTIVATION_LOCK_PATH="/run/muncho-writer-activation.lock"
+CUTOVER_ACTIVATION_LOCK_FD_ENV="MUNCHO_WRITER_ACTIVATION_LOCK_FD"
+CUTOVER_UNIT_INPUTS_FD_ENV="MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
 AGENT_BROWSER_CONFIG_RELATIVE_PATH="ops/muncho/runtime/dependencies/agent-browser.json"
@@ -373,6 +378,396 @@ PY
 
 acquire_deploy_lock() {
   acquire_deploy_lock_at "$1" "$2" "$DEPLOY_LOCK_PATH" "/run" 0 0
+}
+
+run_cutover_artifact_step() {
+  local action="$1"
+  local release="$2"
+  local release_address="$3"
+  local revision="$4"
+  local owner_uid=""
+  local owner_gid=""
+
+  case "$action" in
+    build|verify)
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+  owner_uid="$("$SYSTEM_ID" -u "$OWNER")"
+  owner_gid="$("$SYSTEM_ID" -g "$OWNER")"
+  "$SYSTEM_PYTHON" -I -S - \
+    "$action" \
+    "$release" \
+    "$release_address" \
+    "$revision" \
+    "$owner_uid" \
+    "$owner_gid" \
+    "$SYSTEM_SETPRIV" \
+    "$CUTOVER_ACTIVATION_LOCK_PATH" \
+    "$CUTOVER_ACTIVATION_LOCK_FD_ENV" \
+    "$CUTOVER_UNIT_INPUTS_FD_ENV" \
+    "$CUTOVER_UNIT_INPUTS_PATH" <<'PY'
+import fcntl
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+(
+    action,
+    release_raw,
+    release_address_raw,
+    revision,
+    owner_uid_raw,
+    owner_gid_raw,
+    setpriv_raw,
+    lock_raw,
+    lock_fd_env,
+    unit_inputs_fd_env,
+    unit_inputs_raw,
+) = sys.argv[1:]
+release = Path(release_raw)
+release_address = Path(release_address_raw)
+setpriv = Path(setpriv_raw)
+lock_path = Path(lock_raw)
+unit_inputs = Path(unit_inputs_raw)
+owner_uid = int(owner_uid_raw)
+owner_gid = int(owner_gid_raw)
+release_parent = Path("/opt/adventico-ai-platform/hermes-agent-releases")
+expected_address = release_parent / f"hermes-agent-{revision[:12]}"
+staging_name = re.fullmatch(
+    rf"\.hermes-agent-{re.escape(revision[:12])}\.tmp\.[1-9][0-9]*",
+    release.name,
+)
+if (
+    action not in {"build", "verify"}
+    or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+    or release.parent != release_parent
+    or release_address != expected_address
+    or (release not in {expected_address} and staging_name is None)
+    or release.resolve(strict=True) != release
+    or release_address.parent.resolve(strict=True) != release_parent
+    or setpriv != Path("/usr/bin/setpriv")
+    or not setpriv.is_file()
+    or lock_path != Path("/run/muncho-writer-activation.lock")
+    or lock_fd_env != "MUNCHO_WRITER_ACTIVATION_LOCK_FD"
+    or unit_inputs_fd_env != "MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
+    or unit_inputs
+    != Path(
+        "/var/lib/muncho-production-legacy-cutover/staged/"
+        "production-unit-inputs.json"
+    )
+    or owner_uid <= 0
+    or owner_gid <= 0
+):
+    raise SystemExit("BLOCKED_CUTOVER_PACKAGING_DELEGATION_INVALID")
+release_state = release.lstat()
+if (
+    stat.S_ISLNK(release_state.st_mode)
+    or not stat.S_ISDIR(release_state.st_mode)
+    or release_state.st_uid != owner_uid
+    or release_state.st_gid != owner_gid
+):
+    raise SystemExit("BLOCKED_CUTOVER_PACKAGING_RELEASE_IDENTITY_INVALID")
+interpreter = release / ".venv/bin/python"
+packager = release / "scripts/canary/package_production_cutover_artifacts.py"
+interpreter_state = interpreter.lstat()
+interpreter_target = interpreter.resolve(strict=True)
+interpreter_target_state = interpreter_target.lstat()
+packager_state = packager.lstat()
+if (
+    not stat.S_ISLNK(interpreter_state.st_mode)
+    or interpreter_state.st_uid != owner_uid
+    or interpreter_state.st_gid != owner_gid
+    or not interpreter_target.is_absolute()
+    or not stat.S_ISREG(interpreter_target_state.st_mode)
+    or interpreter_target_state.st_uid != 0
+    or interpreter_target_state.st_gid != 0
+    or interpreter_target_state.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    or not interpreter_target_state.st_mode & stat.S_IXUSR
+    or stat.S_ISLNK(packager_state.st_mode)
+    or not stat.S_ISREG(packager_state.st_mode)
+    or packager_state.st_uid != owner_uid
+    or packager_state.st_gid != owner_gid
+    or packager_state.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    or packager_state.st_size <= 0
+):
+    raise SystemExit("BLOCKED_CUTOVER_PACKAGING_EXECUTABLE_INVALID")
+lock_parent = lock_path.parent
+lock_parent_state = lock_parent.lstat()
+if (
+    lock_parent.resolve(strict=True) != lock_parent
+    or stat.S_ISLNK(lock_parent_state.st_mode)
+    or not stat.S_ISDIR(lock_parent_state.st_mode)
+    or lock_parent_state.st_uid != 0
+    or lock_parent_state.st_gid != 0
+    or stat.S_IMODE(lock_parent_state.st_mode) & 0o022
+    or os.listxattr(lock_parent, follow_symlinks=False)
+):
+    raise SystemExit("BLOCKED_CUTOVER_PACKAGING_LOCK_IDENTITY_INVALID")
+flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+parent_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+parent_descriptor = os.open(lock_parent, parent_flags)
+try:
+    opened_parent = os.fstat(parent_descriptor)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+    )
+    if identity(opened_parent) != identity(lock_parent_state):
+        raise SystemExit("BLOCKED_CUTOVER_PACKAGING_LOCK_IDENTITY_INVALID")
+    created = False
+    try:
+        descriptor = os.open(
+            lock_path.name,
+            flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(lock_path.name, flags, dir_fd=parent_descriptor)
+    if created:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.fsync(parent_descriptor)
+finally:
+    os.close(parent_descriptor)
+unit_inputs_descriptor = None
+try:
+    lock_state = lock_path.lstat()
+    opened = os.fstat(descriptor)
+    reached = lock_path.lstat()
+    if (
+        lock_path.resolve(strict=True) != lock_path
+        or stat.S_ISLNK(lock_state.st_mode)
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != 0
+        or opened.st_gid != 0
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or identity(opened) != identity(lock_state)
+        or identity(opened) != identity(reached)
+        or os.listxattr(lock_path, follow_symlinks=False)
+    ):
+        raise SystemExit("BLOCKED_CUTOVER_PACKAGING_LOCK_CHANGED")
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.set_inheritable(descriptor, True)
+    unit_inputs_parent = unit_inputs.parent
+    unit_inputs_parent_state = unit_inputs_parent.lstat()
+    if (
+        unit_inputs_parent.resolve(strict=True) != unit_inputs_parent
+        or stat.S_ISLNK(unit_inputs_parent_state.st_mode)
+        or not stat.S_ISDIR(unit_inputs_parent_state.st_mode)
+        or unit_inputs_parent_state.st_uid != 0
+        or unit_inputs_parent_state.st_gid != 0
+        or stat.S_IMODE(unit_inputs_parent_state.st_mode) != 0o700
+        or os.listxattr(unit_inputs_parent, follow_symlinks=False)
+    ):
+        raise SystemExit("BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_PARENT_INVALID")
+    unit_inputs_parent_descriptor = os.open(
+        unit_inputs_parent,
+        parent_flags,
+    )
+    try:
+        opened_unit_inputs_parent = os.fstat(unit_inputs_parent_descriptor)
+        if identity(opened_unit_inputs_parent) != identity(
+            unit_inputs_parent_state
+        ):
+            raise SystemExit(
+                "BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_PARENT_INVALID"
+            )
+        unit_inputs_descriptor = os.open(
+            unit_inputs.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=unit_inputs_parent_descriptor,
+        )
+        unit_inputs_state = os.stat(
+            unit_inputs.name,
+            dir_fd=unit_inputs_parent_descriptor,
+            follow_symlinks=False,
+        )
+        opened_unit_inputs = os.fstat(unit_inputs_descriptor)
+        input_identity = lambda item: (
+            *identity(item),
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if (
+            unit_inputs.resolve(strict=True) != unit_inputs
+            or stat.S_ISLNK(unit_inputs_state.st_mode)
+            or not stat.S_ISREG(opened_unit_inputs.st_mode)
+            or fcntl.fcntl(unit_inputs_descriptor, fcntl.F_GETFL)
+            & os.O_ACCMODE
+            != os.O_RDONLY
+            or opened_unit_inputs.st_nlink != 1
+            or opened_unit_inputs.st_uid != 0
+            or opened_unit_inputs.st_gid != 0
+            or stat.S_IMODE(opened_unit_inputs.st_mode) != 0o444
+            or not 0 < opened_unit_inputs.st_size <= 128 * 1024
+            or input_identity(opened_unit_inputs) != input_identity(
+                unit_inputs_state
+            )
+            or os.listxattr(unit_inputs, follow_symlinks=False)
+        ):
+            raise SystemExit("BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_INVALID")
+    finally:
+        os.close(unit_inputs_parent_descriptor)
+    os.set_inheritable(unit_inputs_descriptor, True)
+    environment = {
+        "HOME": "/opt/adventico-ai-platform/canonical-brain",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "LOGNAME": "ai-platform-brain",
+        "PATH": "/usr/bin:/bin",
+        "USER": "ai-platform-brain",
+        lock_fd_env: str(descriptor),
+        unit_inputs_fd_env: str(unit_inputs_descriptor),
+    }
+    completed = subprocess.run(
+        (
+            str(setpriv),
+            f"--reuid={owner_uid}",
+            f"--regid={owner_gid}",
+            "--clear-groups",
+            "--no-new-privs",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--bounding-set=-all",
+            str(interpreter),
+            "-I",
+            "-B",
+            str(packager),
+            action,
+            "--release-root",
+            str(release),
+            "--release-address",
+            str(release_address),
+            "--revision",
+            revision,
+            "--unit-inputs",
+            str(unit_inputs),
+        ),
+        stdin=subprocess.DEVNULL,
+        env=environment,
+        pass_fds=(descriptor, unit_inputs_descriptor),
+        close_fds=True,
+        check=False,
+    )
+    if input_identity(os.fstat(unit_inputs_descriptor)) != input_identity(
+        opened_unit_inputs
+    ):
+        raise SystemExit("BLOCKED_CUTOVER_PACKAGING_UNIT_INPUTS_CHANGED")
+finally:
+    if unit_inputs_descriptor is not None:
+        os.close(unit_inputs_descriptor)
+    os.close(descriptor)
+raise SystemExit(completed.returncode)
+PY
+}
+
+prepare_release_staging_directory() {
+  local staging="$1"
+  local expected_short="$2"
+  local owner_uid=""
+  local owner_gid=""
+  case "$staging" in
+    "$RELEASES"/".hermes-agent-$expected_short.tmp."[1-9][0-9]*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [ -e "$staging" ] || [ -L "$staging" ]; then
+    return 1
+  fi
+  owner_uid="$("$SYSTEM_ID" -u "$OWNER")"
+  owner_gid="$("$SYSTEM_ID" -g "$OWNER")"
+  if ! "$SYSTEM_PYTHON" -I -S - \
+    "$RELEASES" "$staging" "$owner_uid" "$owner_gid" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+parent = Path(sys.argv[1])
+staging = Path(sys.argv[2])
+owner_uid = int(sys.argv[3])
+owner_gid = int(sys.argv[4])
+if (
+    not parent.is_absolute()
+    or not staging.is_absolute()
+    or staging.parent != parent
+    or parent.resolve(strict=True) != parent
+):
+    raise SystemExit("BLOCKED_RELEASE_STAGING_PATH_INVALID")
+parent_state = parent.lstat()
+if (
+    stat.S_ISLNK(parent_state.st_mode)
+    or not stat.S_ISDIR(parent_state.st_mode)
+    or parent_state.st_uid != 0
+    or parent_state.st_gid != 0
+    or stat.S_IMODE(parent_state.st_mode) != 0o755
+):
+    raise SystemExit("BLOCKED_RELEASE_PARENT_IDENTITY_INVALID")
+try:
+    os.mkdir(staging, 0o700)
+except FileExistsError:
+    raise SystemExit("BLOCKED_RELEASE_STAGING_ALREADY_EXISTS") from None
+try:
+    os.chown(staging, owner_uid, owner_gid)
+    os.chmod(staging, 0o700)
+    state = staging.lstat()
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISDIR(state.st_mode)
+        or state.st_uid != owner_uid
+        or state.st_gid != owner_gid
+        or stat.S_IMODE(state.st_mode) != 0o700
+    ):
+        raise RuntimeError("release staging identity invalid")
+except BaseException:
+    try:
+        os.rmdir(staging)
+    except OSError:
+        pass
+    raise
+PY
+  then
+    return 1
+  fi
+}
+
+publish_release_staging_directory() {
+  local staging="$1"
+  local release="$2"
+  local expected_short="$3"
+  case "$staging" in
+    "$RELEASES"/".hermes-agent-$expected_short.tmp."[1-9][0-9]*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [ "$release" != "$RELEASES/hermes-agent-$expected_short" ] \
+    || [ -e "$release" ] \
+    || [ -L "$release" ]; then
+    return 1
+  fi
+  mv -T -- "$staging" "$release"
 }
 
 gateway_deploy_topology_json() {
@@ -2177,7 +2572,9 @@ install_target_release_wheel() {
   release_venv_site_boundary \
     prepare "$release" "$inherited_release" >/dev/null \
     || return 1
-  sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -P -s -m pip \
+  sudo -n -u "$OWNER" "$SYSTEM_ENV" \
+    HERMES_SEALED_RELEASE_BUILD=muncho-legacy-production-release-v1 \
+    "$release/.venv/bin/python" -I -P -s -m pip \
     --isolated install \
     --no-index \
     --no-deps \
@@ -2355,11 +2752,8 @@ cutover_artifacts_match() {
     "$release/scripts/canary/package_production_runtime_dependencies.py" verify \
     --release-root "$release" \
     --revision "$expected_head" >/dev/null \
-    && sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -B \
-    "$release/scripts/canary/package_production_cutover_artifacts.py" verify \
-    --release-root "$release" \
-    --revision "$expected_head" \
-    --unit-inputs "$CUTOVER_UNIT_INPUTS_PATH" >/dev/null
+    && run_cutover_artifact_step \
+    "verify" "$release" "$release" "$expected_head" >/dev/null
 }
 
 cleanup_old_releases() {
@@ -2489,6 +2883,63 @@ fail_after_activation() {
   return 10
 }
 
+record_release_packaging_failure() {
+  local stage="$1"
+  local sha="$2"
+  local pr="$3"
+  local tmp="$4"
+  local command_rc="$5"
+  local cleanup_succeeded="true"
+  local expected_tmp_prefix="$RELEASES/.hermes-agent-${sha:0:12}.tmp."
+  local tmp_suffix=""
+
+  case "$stage" in
+    runtime_dependency_prepare|agent_browser_config_seal|runtime_dependency_manifest|cutover_artifact_build|runtime_dependency_verify|cutover_artifact_verify|python_compile_smoke|routeback_import_smoke)
+      ;;
+    *)
+      stage="invalid_packaging_stage"
+      ;;
+  esac
+  if [[ "$tmp" == "$expected_tmp_prefix"* ]]; then
+    tmp_suffix="${tmp:${#expected_tmp_prefix}}"
+  fi
+  if [[ ! "$tmp_suffix" =~ ^[0-9]+$ ]]; then
+    stage="invalid_staging_address"
+    cleanup_succeeded="false"
+  elif ! rm -rf -- "$tmp"; then
+    cleanup_succeeded="false"
+  fi
+  write_status "blocked_target_release_packaging_failed" "$sha" "$pr" \
+    "{\"stage\": \"$stage\", \"command_exit_code\": $command_rc, \"staging_cleanup_succeeded\": $cleanup_succeeded}"
+  return 5
+}
+
+run_release_packaging_step() {
+  local stage="$1"
+  local sha="$2"
+  local pr="$3"
+  local tmp="$4"
+  shift 4
+  local command_rc=0
+
+  if "$@"; then
+    return 0
+  else
+    command_rc=$?
+  fi
+  record_release_packaging_failure "$stage" "$sha" "$pr" "$tmp" "$command_rc"
+}
+
+run_routeback_context_import_smoke() {
+  local release="$1"
+  sudo -n -u "$OWNER" bash -lc "cd '$release' && .venv/bin/python - <<'PY'
+from gateway.canonical_brain_routeback_context import RouteBackCaseContext, build_routeback_context_prompt
+ctx = RouteBackCaseContext(case_id='case:auto-sync-deploy-smoke', source_thread_id='source-thread')
+assert 'concrete next-action artifact' in build_routeback_context_prompt([ctx])
+print('routeback_context_import_smoke=ok')
+PY"
+}
+
 run_deploy() {
   local sha="$1"
   local pr="$2"
@@ -2543,7 +2994,15 @@ run_deploy() {
       write_status "blocked_active_venv_missing" "$sha" "$pr" "{}"
       exit 4
     fi
-    sudo -n -u "$OWNER" git clone --depth 1 --branch main "$REPO_URL" "$tmp"
+    if ! prepare_release_staging_directory "$tmp" "$short"; then
+      write_status "blocked_release_staging_prepare_failed" "$sha" "$pr" "{}"
+      exit 5
+    fi
+    if ! sudo -n -u "$OWNER" git clone --depth 1 --branch main "$REPO_URL" "$tmp"; then
+      rm -rf "$tmp"
+      write_status "blocked_release_clone_failed" "$sha" "$pr" "{}"
+      exit 5
+    fi
     local clone_head
     clone_head="$(sudo -n -u "$OWNER" git -C "$tmp" rev-parse HEAD)"
     if [ "$clone_head" != "$sha" ]; then
@@ -2571,48 +3030,52 @@ run_deploy() {
         "{\"stage\": \"pre_release_packaging\"}"
       exit 5
     fi
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "runtime_dependency_prepare" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_runtime_dependencies.py" prepare \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" >/dev/null
-    seal_agent_browser_config "$tmp" "$sha" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "agent_browser_config_seal" "$sha" "$pr" "$tmp" \
+      seal_agent_browser_config "$tmp" "$sha" >/dev/null
+    run_release_packaging_step \
+      "runtime_dependency_manifest" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_runtime_dependencies.py" build-manifest \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
-      "$tmp/scripts/canary/package_production_cutover_artifacts.py" build \
-      --release-root "$tmp" \
-      --release-address "$new" \
-      --revision "$sha" \
-      --unit-inputs "$CUTOVER_UNIT_INPUTS_PATH" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "cutover_artifact_build" "$sha" "$pr" "$tmp" \
+      run_cutover_artifact_step \
+      "build" "$tmp" "$new" "$sha" >/dev/null
+    run_release_packaging_step \
+      "runtime_dependency_verify" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_runtime_dependencies.py" verify \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
-      "$tmp/scripts/canary/package_production_cutover_artifacts.py" verify \
-      --release-root "$tmp" \
-      --release-address "$new" \
-      --revision "$sha" \
-      --unit-inputs "$CUTOVER_UNIT_INPUTS_PATH" >/dev/null
-    sudo -n -u "$OWNER" bash -lc "cd '$tmp' && .venv/bin/python -m py_compile gateway/run.py hermes_cli/main.py scripts/run_tests_parallel.py"
-    sudo -n -u "$OWNER" bash -lc "cd '$tmp' && .venv/bin/python - <<'PY'
-from gateway.canonical_brain_routeback_context import RouteBackCaseContext, build_routeback_context_prompt
-ctx = RouteBackCaseContext(case_id='case:auto-sync-deploy-smoke', source_thread_id='source-thread')
-assert 'concrete next-action artifact' in build_routeback_context_prompt([ctx])
-print('routeback_context_import_smoke=ok')
-PY"
+    run_release_packaging_step \
+      "cutover_artifact_verify" "$sha" "$pr" "$tmp" \
+      run_cutover_artifact_step \
+      "verify" "$tmp" "$new" "$sha" >/dev/null
+    run_release_packaging_step \
+      "python_compile_smoke" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" bash -lc \
+      "cd '$tmp' && .venv/bin/python -m py_compile gateway/run.py hermes_cli/main.py scripts/run_tests_parallel.py"
+    run_release_packaging_step \
+      "routeback_import_smoke" "$sha" "$pr" "$tmp" \
+      run_routeback_context_import_smoke "$tmp"
     require_inactive_target_with_unchanged_active \
       "$sha" "$pr" "$active" "$new" "pre_release_publish" || {
       publish_rc=$?
       rm -rf "$tmp"
       return "$publish_rc"
     }
-    if [ -e "$new" ] || ! sudo -n -u "$OWNER" mv -T "$tmp" "$new"; then
+    if ! publish_release_staging_directory "$tmp" "$new" "$short"; then
       rm -rf "$tmp"
       write_status "blocked_target_release_publish_failed" "$sha" "$pr" "{}"
       exit 5

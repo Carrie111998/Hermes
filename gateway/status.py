@@ -990,6 +990,7 @@ def write_runtime_status(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    external_drain_ack: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -1018,6 +1019,59 @@ def write_runtime_status(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if external_drain_ack is not _UNSET:
+        if external_drain_ack is None:
+            payload.pop("external_drain_ack", None)
+        else:
+            expected_ack_fields = {
+                "marker_sha256",
+                "transaction_sha256",
+                "mutation_capability_sha256",
+                "epoch",
+                "process_start_ticks",
+                "systemd_invocation_id",
+                "ack_sequence",
+            }
+            sha_fields = (
+                "marker_sha256",
+                "transaction_sha256",
+                "mutation_capability_sha256",
+            )
+            if (
+                not isinstance(external_drain_ack, dict)
+                or set(external_drain_ack) != expected_ack_fields
+                or any(
+                    not isinstance(external_drain_ack.get(name), str)
+                    or len(external_drain_ack[name]) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in external_drain_ack[name]
+                    )
+                    for name in sha_fields
+                )
+                or not isinstance(external_drain_ack.get("epoch"), str)
+                or not external_drain_ack["epoch"]
+                or not isinstance(
+                    external_drain_ack.get("process_start_ticks"),
+                    str,
+                )
+                or not external_drain_ack["process_start_ticks"].isdigit()
+                or not isinstance(
+                    external_drain_ack.get("systemd_invocation_id"),
+                    str,
+                )
+                or len(external_drain_ack["systemd_invocation_id"]) != 32
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in external_drain_ack[
+                        "systemd_invocation_id"
+                    ]
+                )
+                or type(external_drain_ack.get("ack_sequence")) is not int
+                or external_drain_ack["ack_sequence"] <= 0
+            ):
+                raise ValueError("invalid external drain acknowledgment")
+            payload["external_drain_ack"] = dict(external_drain_ack)
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})

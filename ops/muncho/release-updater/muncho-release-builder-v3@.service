@@ -1,0 +1,68 @@
+[Unit]
+Description=Muncho latched revision-qualified pinned release builder boundary (%i)
+Documentation=man:systemd.exec(5)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=muncho-release-builder
+Group=muncho-release-builder
+SupplementaryGroups=
+ExecStart=/usr/libexec/muncho-release-foundation-exec-v3 %i builder-phase --request /var/lib/muncho-release-updates/%i/input/request.json
+WorkingDirectory=/var/lib/muncho-release-updates/%i/output
+Environment=HOME=/nonexistent
+Environment=PATH=/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=TZ=UTC
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONINSPECT PYTHONSTARTUP PYTHONWARNINGS PYTHONBREAKPOINT PYTHONUSERBASE VIRTUAL_ENV
+UnsetEnvironment=PIP_CONFIG_FILE PIP_INDEX_URL PIP_EXTRA_INDEX_URL UV_CONFIG_FILE UV_INDEX_URL UV_EXTRA_INDEX_URL
+UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
+UnsetEnvironment=SSLKEYLOGFILE SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE OPENSSL_CONF OPENSSL_MODULES
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
+UnsetEnvironment=OPENAI_API_KEY ANTHROPIC_API_KEY DISCORD_BOT_TOKEN GH_TOKEN GITHUB_TOKEN GOOGLE_APPLICATION_CREDENTIALS
+UMask=0077
+TimeoutStartSec=3600s
+TimeoutStopSec=30s
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged @resources @reboot @swap
+IPAddressDeny=any
+ReadOnlyPaths=/usr/lib/muncho-release-updater-releases/%i
+ReadOnlyPaths=/usr/libexec/muncho-release-foundation-exec-v3
+ReadOnlyPaths=/run/lock/muncho-release-builder-promotion.lock
+ReadOnlyPaths=/var/lib/muncho-release-updates/%i/input
+ReadWritePaths=/var/lib/muncho-release-updates/%i/output
+InaccessiblePaths=-/opt/adventico-ai-platform/hermes-home/.env
+InaccessiblePaths=-/opt/adventico-ai-platform/hermes-home/auth.json
+InaccessiblePaths=-/var/lib/hermes-gateway/.hermes/auth.json
+InaccessiblePaths=-/etc/muncho/discord-connector-credentials
+InaccessiblePaths=-/etc/muncho/discord-edge-credentials
+InaccessiblePaths=-/etc/muncho/mac-ops-edge-credentials
+InaccessiblePaths=-/run/credentials

@@ -166,6 +166,68 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 )
 
 
+def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
+    """Persist a session-hygiene compression-failure cooldown to the state DB.
+
+    Uses the same ``compression_failure_cooldown_until`` column and
+    ``record_compression_failure_cooldown`` method that the in-conversation
+    compression path (``agent/context_compressor.py``) already uses, so the
+    cooldown survives gateway restarts (#74136).
+    """
+    import time as _time
+    session_db = getattr(gateway, "_session_db", None)
+    if session_db is None:
+        return
+    session_db = getattr(session_db, "_db", session_db)
+    recorder = getattr(session_db, "record_compression_failure_cooldown", None)
+    if recorder is None:
+        return
+    try:
+        recorder(session_id, _time.time() + cooldown_seconds)
+    except Exception as exc:
+        logger.debug("session hygiene cooldown persist failed: %s", exc)
+
+
+def _status_template_to_regex(template: str) -> str:
+    """Compile a compression status template constant into a regex source.
+
+    Literal text is escaped verbatim (so wording drift in
+    agent/conversation_compression.py cannot silently diverge from this
+    matcher — the constants ARE the wording) and each ``{field}`` format
+    placeholder is replaced with a numeric-ish pattern covering every value
+    the emit sites format in (ints, ``{:,}`` thousands separators).
+    """
+    parts = re.split(r"\{[^{}]*\}", template)
+    return r"[\d,]+".join(re.escape(part) for part in parts)
+
+
+# ROUTINE compression progress statuses, derived from the SAME template
+# constants the emit sites format (agent/conversation_compression.py, #69550)
+# — never re-inlined wording. Used ONLY by the opt-in
+# ``compression.progress_notices`` gate below (#52995) to decide which of the
+# noisy statuses matched by _TELEGRAM_NOISY_STATUS_RE are compression
+# progress (deliverable when the user opted in) versus unrelated aux/retry
+# chatter (always suppressed on chat surfaces). Failure notices and manual
+# /compress feedback never match _TELEGRAM_NOISY_STATUS_RE in the first
+# place, so they are unaffected by this gate.
+_COMPRESSION_PROGRESS_STATUS_RE = re.compile(
+    "|".join(
+        _status_template_to_regex(_template)
+        for _template in (
+            COMPACTION_STATUS,
+            PRE_API_COMPRESSION_STATUS_TEMPLATE,
+            PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+            IDLE_COMPACTION_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
 def _gateway_compression_progress_notices_enabled() -> bool:
     """True when the user opted into routine compression progress notices.
 
@@ -1791,6 +1853,7 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech",
     "text_to_speech_tool",
     "image_generate",
+    "bfl_flux3_get_result",
 }
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
@@ -2507,6 +2570,7 @@ if not _REQUIRED_CANONICAL_IMPORT_QUARANTINE and _config_path.exists():
                 "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
                 "docker_env": "TERMINAL_DOCKER_ENV",
                 "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+                "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
                 "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
                 "docker_network": "TERMINAL_DOCKER_NETWORK",
                 "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
@@ -7272,8 +7336,17 @@ class TurnRunner:
                         )
                     )
                 elif self._runner._is_discord_auto_thread_lane(ctx.source) or (
-                    self._runner._relay_auto_thread_info(ctx.source) is not None
+                    self._runner._is_relay_discord_channel_lane(ctx.source)
                 ):
+                    # Relay note: the second predicate is shape-only (relay
+                    # Discord channel event). Whether the connector actually
+                    # auto-threaded our reply is only knowable AFTER delivery
+                    # (send-result feedback), which on the non-streaming lane
+                    # happens after this registration runs — so the callback
+                    # must be registered eagerly and the rename lane performs
+                    # the cache lookup at fire time (staging repro 2026-07-31:
+                    # gating registration on the cache read meant it never
+                    # registered and no thread_rename op was ever sent).
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
                         ctx.source,
                         effective_session_id,
@@ -7381,6 +7454,7 @@ class TurnRunner:
             ),
         }
 
+_EXTERNAL_DRAIN_ACK_UNSET = object()
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -7399,6 +7473,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _external_drain_ack_marker_sha256: str = ""
+    _external_drain_ack_sequence: int = 0
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -7998,6 +8074,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._external_drain_ack_marker_sha256 = ""
+        self._external_drain_ack_sequence = 0
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -10013,17 +10091,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
     def _update_runtime_status(
-        self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None
+        self,
+        gateway_state: Optional[str] = None,
+        exit_reason: Optional[str] = None,
+        *,
+        external_drain_ack: Any = _EXTERNAL_DRAIN_ACK_UNSET,
     ) -> None:
         try:
             from gateway.status import write_runtime_status
 
+            values: Dict[str, Any] = {
+                "gateway_state": gateway_state,
+                "exit_reason": exit_reason,
+                "restart_requested": self._restart_requested,
+                "active_agents": self._active_work_count(),
+                "active_session_keys": self._active_session_keys_for_status(),
+            }
+            if external_drain_ack is not _EXTERNAL_DRAIN_ACK_UNSET:
+                values["external_drain_ack"] = external_drain_ack
             write_runtime_status(
-                gateway_state=gateway_state,
-                exit_reason=exit_reason,
-                restart_requested=self._restart_requested,
-                active_agents=self._active_work_count(),
-                active_session_keys=self._active_session_keys_for_status(),
+                **values,
             )
         except Exception:
             pass
@@ -10036,7 +10123,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 keys.append(session_key)
         return sorted(keys)
 
-    def _persist_active_agents(self) -> None:
+    def _persist_active_agents(
+        self,
+        *,
+        external_drain_ack: Any = _EXTERNAL_DRAIN_ACK_UNSET,
+    ) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.
 
         Called at every turn boundary (a running-agent slot is claimed or
@@ -10056,10 +10147,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.status import write_runtime_status
 
-            write_runtime_status(
-                active_agents=self._active_work_count(),
-                active_session_keys=self._active_session_keys_for_status(),
-            )
+            values: Dict[str, Any] = {
+                "active_agents": self._active_work_count(),
+                "active_session_keys": self._active_session_keys_for_status(),
+            }
+            if external_drain_ack is not _EXTERNAL_DRAIN_ACK_UNSET:
+                values["external_drain_ack"] = external_drain_ack
+            write_runtime_status(**values)
         except Exception:
             pass
 
@@ -10129,6 +10223,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read-merge keeps the live count); only the state changes.
         self._update_runtime_status("draining")
 
+    def _build_external_drain_ack(
+        self,
+        observation: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        marker_sha256 = observation.get("marker_sha256")
+        invocation_id = os.environ.get("INVOCATION_ID", "")
+        try:
+            process_stat = Path(
+                f"/proc/{os.getpid()}/stat"
+            ).read_text(encoding="utf-8")
+            process_start_ticks = (
+                process_stat.rsplit(")", 1)[1].split()[19]
+            )
+        except (OSError, IndexError):
+            return None
+        if (
+            not isinstance(marker_sha256, str)
+            or len(marker_sha256) != 64
+            or not process_start_ticks.isdigit()
+            or len(invocation_id) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in invocation_id
+            )
+        ):
+            return None
+        if marker_sha256 != self._external_drain_ack_marker_sha256:
+            self._external_drain_ack_marker_sha256 = marker_sha256
+            self._external_drain_ack_sequence = 0
+        self._external_drain_ack_sequence += 1
+        return {
+            **dict(observation),
+            "process_start_ticks": process_start_ticks,
+            "systemd_invocation_id": invocation_id,
+            "ack_sequence": self._external_drain_ack_sequence,
+        }
+
     def _exit_external_drain(self) -> None:
         """Cancel external drain: revert state, re-accept new turns.
 
@@ -10139,6 +10270,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        self._external_drain_ack_marker_sha256 = ""
+        self._external_drain_ack_sequence = 0
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
@@ -10151,7 +10284,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
         )
-        self._update_runtime_status("running")
+        self._update_runtime_status(
+            "running",
+            external_drain_ack=None,
+        )
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -10167,16 +10303,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the gateway into drain. Best-effort: any tick error is logged and the
         loop continues (a transient stat() failure must not wedge the gateway).
         """
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import (
+            active_drain_observation,
+            drain_requested,
+        )
 
         while self._running:
             try:
                 if drain_requested():
                     self._enter_external_drain()
+                    observation = active_drain_observation()
+                    acknowledgment = (
+                        self._build_external_drain_ack(observation)
+                        if observation is not None
+                        else None
+                    )
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
                     # external caller polls this reversible drain state.
-                    self._persist_active_agents()
+                    self._persist_active_agents(
+                        external_drain_ack=acknowledgment,
+                    )
                 else:
                     self._exit_external_drain()
             except asyncio.CancelledError:
@@ -13959,9 +14106,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
+        # Start background kanban notifier — each gateway delivers events for
+        # subscriptions owned by the profiles whose adapters it hosts, even
+        # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
@@ -16802,7 +16949,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
-                adapter._pending_messages[quick_key] = queued_event
+                self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -16825,7 +16972,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
-            adapter._pending_messages[quick_key] = queued_event
+            self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -19641,20 +19788,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
-                    _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
-                    if _cooldowns is None:
-                        _cooldowns = {}
-                        self._hygiene_compression_failure_cooldowns = _cooldowns
-                    _cooldown_key = session_entry.session_id
-                    _cooldown_until = float(_cooldowns.get(_cooldown_key) or 0.0)
-                    if _cooldown_until > time.time():
-                        logger.info(
-                            "Session hygiene: skipping compression for %s; "
-                            "previous failure cooldown active for %.1fs",
-                            _cooldown_key,
-                            max(0.0, _cooldown_until - time.time()),
-                        )
-                        _needs_compress = False
+                    # Use the persistent DB-backed cooldown (same as the
+                    # in-conversation compression path in context_compressor.py)
+                    # so the cooldown survives gateway restarts. The in-memory
+                    # dict was reset on every restart, re-triggering the same
+                    # failing compression and wedging session storage (#74136).
+                    _session_db = getattr(self, "_session_db", None)
+                    if _session_db is not None:
+                        _session_db = getattr(_session_db, "_db", _session_db)
+                        _getter = getattr(_session_db, "get_compression_failure_cooldown", None)
+                        if _getter is not None:
+                            try:
+                                _cooldown_state = _getter(session_entry.session_id)
+                            except Exception:
+                                _cooldown_state = None
+                            if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
+                                logger.info(
+                                    "Session hygiene: skipping compression for %s; "
+                                    "previous failure cooldown active for %.1fs",
+                                    session_entry.session_id,
+                                    _cooldown_state["remaining_seconds"],
+                                )
+                                _needs_compress = False
 
                 if _needs_compress:
                     logger.info(
@@ -19837,9 +19992,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                self._hygiene_compression_failure_cooldowns[
-                                                    session_entry.session_id
-                                                ] = time.time() + _hyg_failure_cooldown_seconds
+                                                _record_hygiene_cooldown(
+                                                    self, session_entry.session_id,
+                                                    _hyg_failure_cooldown_seconds,
+                                                )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
@@ -20059,9 +20215,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         if _hyg_failure_cooldown_seconds >= 0:
-                                            self._hygiene_compression_failure_cooldowns[
-                                                session_entry.session_id
-                                            ] = time.time() + _hyg_failure_cooldown_seconds
+                                            _record_hygiene_cooldown(
+                                                self, session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
+                                            )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
@@ -24657,6 +24814,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and bool(getattr(source, "auto_thread_initial_name", None))
         )
 
+    def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:
+        """Shape-only check: a relay-delivered Discord CHANNEL event whose
+        reply the connector MAY auto-thread (title-turn registration gate).
+
+        Deliberately does NOT consult the send-result cache: at registration
+        time (before delivery) the feedback can't exist yet. The rename lane
+        polls the cache at fire time instead."""
+        return (
+            source.platform == Platform.DISCORD
+            and bool(source.chat_id)
+            and not source.thread_id
+            and source.chat_type in ("group", "channel")
+            and getattr(source, "delivered_via_upstream_relay", False) is True
+        )
+
     def _relay_auto_thread_info(
         self, source: SessionSource
     ) -> Optional[Tuple[str, str]]:
@@ -24726,7 +24898,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if relay_info is None and not await asyncio.to_thread(
             self._is_discord_auto_thread_lane, source
         ):
-            return
+            # Relay title turn with no feedback captured at schedule time:
+            # the auto-title thread races the delivery that produces the
+            # connector's send-result feedback (thread_id + initial name).
+            # Poll the adapter cache briefly before giving up — delivery is
+            # typically milliseconds-to-seconds behind the title.
+            if not self._is_relay_discord_channel_lane(source):
+                return
+            for _ in range(20):  # up to ~10s
+                relay_info = self._relay_auto_thread_info(source)
+                if relay_info is not None:
+                    break
+                await asyncio.sleep(0.5)
+            if relay_info is None:
+                # True miss: the connector did not auto-thread this reply
+                # (policy off, DM, already-threaded, or send failed).
+                return
         adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
         if adapter is None:
             return
@@ -24765,9 +24952,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._is_discord_auto_thread_lane(source):
             # Relay title turn: the source is the PARENT channel event (the
             # thread didn't exist at ingest, so no auto-thread markers). The
-            # connector's send-result feedback tells us where the reply landed.
+            # connector's send-result feedback tells us where the reply
+            # landed — but the auto-title thread races the delivery that
+            # produces it, so a cache miss HERE is not a verdict. Schedule
+            # whenever the SHAPE matches; the async rename lane polls the
+            # cache (with a bounded wait) and no-ops on a true miss.
             relay_info = self._relay_auto_thread_info(source)
-            if relay_info is None:
+            if relay_info is None and not self._is_relay_discord_channel_lane(
+                source
+            ):
                 return
         try:
             loop = asyncio.get_running_loop()
@@ -25374,6 +25567,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "User opted out of destructive slash confirm (session=%s)",
                             session_key,
                         )
+                    else:
+                        if always_blocked_by_pin:
+                            logger.info(
+                                "Could not persist destructive_slash_confirm=false "
+                                "because the effective production config is pinned "
+                                "(session=%s)",
+                                session_key,
+                            )
+                        else:
+                            logger.warning(
+                                "Could not persist destructive_slash_confirm=false "
+                                "(session=%s); config.yaml is not writable",
+                                session_key,
+                            )
                 except Exception as exc:
                     logger.warning(
                         "Failed to persist destructive_slash_confirm=false: %s",
@@ -25394,8 +25601,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     note = (
-                        "\n\nThe action ran once; the confirmation setting could "
-                        "not be changed."
+                        "\n\n⚠️ Could not save that preference (config.yaml is not "
+                        "writable), so /clear, /new, /reset, and /undo will ask "
+                        "again next time. To silence it permanently, set "
+                        "`approvals.destructive_slash_confirm: false` in config.yaml."
                     )
                 if isinstance(result, EphemeralReply):
                     return EphemeralReply(
