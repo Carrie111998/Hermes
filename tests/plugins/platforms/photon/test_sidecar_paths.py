@@ -18,7 +18,14 @@ import plugins.platforms.photon.sidecar_paths as sidecar_paths
 
 def _seed_source(source: Path, *, with_node_modules: bool = False) -> None:
     source.mkdir(parents=True, exist_ok=True)
-    for name in sidecar_paths._MIRROR_FILES:
+    for name in (
+        "index.mjs",
+        "package.json",
+        "package-lock.json",
+        "patch-spectrum-mixed-attachments.mjs",
+        "send-format.mjs",
+        "stream-staleness.mjs",
+    ):
         (source / name).write_text(f"// {name}\n", encoding="utf-8")
     if with_node_modules:
         (source / "node_modules").mkdir()
@@ -88,8 +95,32 @@ def test_mirror_refresh_updates_changed_files_and_keeps_node_modules(
     assert (mirror / "node_modules" / "installed.txt").exists()
 
 
+def test_readonly_source_mirrors_new_top_level_modules(tmp_path, monkeypatch) -> None:
+    """A newly extracted sidecar module is runnable without a mirror allowlist edit."""
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "src"
+    _seed_source(source)
+    (source / "future-helper.mjs").write_text(
+        "export const ready = true;\n", encoding="utf-8"
+    )
+    _freeze_writability(monkeypatch, writable=False)
+
+    mirror = sidecar_paths.resolve_sidecar_dir(source)
+
+    assert (mirror / "future-helper.mjs").read_text(encoding="utf-8") == (
+        "export const ready = true;\n"
+    )
+    assert {path.name for path in mirror.glob("*.mjs")} == {
+        path.name for path in source.glob("*.mjs")
+    }
+
+
 def test_dir_writable_probe(tmp_path) -> None:
     assert sidecar_paths.dir_writable(tmp_path) is True
+    if not hasattr(os, "geteuid"):
+        pytest.skip("POSIX directory permission semantics required")
     ro = tmp_path / "ro"
     ro.mkdir()
     ro.chmod(0o555)

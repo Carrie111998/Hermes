@@ -45,15 +45,17 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
-# The files that define the sidecar. Mirrored into the writable runtime dir
-# when the install tree is read-only. node_modules is deliberately absent —
-# it is either baked (managed image) or installed by npm in the mirror.
-_MIRROR_FILES = (
-    "index.mjs",
-    "package.json",
-    "package-lock.json",
-    "patch-spectrum-mixed-attachments.mjs",
-)
+# npm metadata plus every top-level JavaScript module define the sidecar.
+# Discover modules at resolve time so a newly extracted ``*.mjs`` helper cannot
+# be omitted from the writable mirror. node_modules is deliberately absent — it
+# is either baked (managed image) or installed by npm in the mirror.
+_MIRROR_METADATA_FILES = ("package.json", "package-lock.json")
+
+
+def _mirror_source_files(source: Path) -> tuple[Path, ...]:
+    metadata = (source / name for name in _MIRROR_METADATA_FILES)
+    modules = sorted(source.glob("*.mjs"), key=lambda path: path.name)
+    return tuple(path for path in (*metadata, *modules) if path.is_file())
 
 
 def dir_writable(path: Path) -> bool:
@@ -122,11 +124,8 @@ def resolve_sidecar_dir(source_dir: Optional[Path] = None) -> Path:
     mirror = get_hermes_home() / "photon" / "sidecar"
     try:
         mirror.mkdir(parents=True, exist_ok=True)
-        for name in _MIRROR_FILES:
-            src = source / name
-            if not src.exists():
-                continue
-            dst = mirror / name
+        for src in _mirror_source_files(source):
+            dst = mirror / src.name
             if not dst.exists() or not filecmp.cmp(str(src), str(dst), shallow=False):
                 shutil.copy2(str(src), str(dst))
         return mirror
