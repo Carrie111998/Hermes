@@ -153,6 +153,28 @@ def test_cli_promote_bulk_rejects_cas_before_any_mutation(kanban_home, capsys):
         assert _task_status(conn, second) == "todo"
 
 
+def test_cli_promote_rejects_duplicate_bulk_syntax_with_cas(kanban_home, capsys):
+    with kb.connect() as conn:
+        task, _ = _stuck_todo(conn)
+        event_id = _latest_event_id(conn, task)
+
+    rc = kb_cli._cmd_promote(
+        _promote_ns(
+            task,
+            ids=[task],
+            as_json=True,
+            expect_latest_event_id=event_id,
+        )
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["task_id"] == task
+    assert payload["code"] == "cas_expectations_require_single_task"
+    with kb.connect() as conn:
+        assert _task_status(conn, task) == "todo"
+
+
 def _latest_event_id(conn, task_id):
     row = conn.execute(
         "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",

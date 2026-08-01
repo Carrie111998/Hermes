@@ -2415,7 +2415,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     )
 
     results: list[dict[str, object]] = []
-    if len(ids) > 1 and has_expectations:
+    if extra_ids and has_expectations:
         message = "CAS expectations require exactly one task"
         results = [
             {
