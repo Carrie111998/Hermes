@@ -436,7 +436,7 @@ def test_cua_fleet_release_reports_claim_delete_failure_without_deleting_pool() 
 def test_cua_fleet_sdk_package_is_lazy_installable() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-fleet==0.0.5",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-fleet==0.0.6",)
 
 
 def test_cua_fleet_environment_cleanup_releases_sdk_resources() -> None:
