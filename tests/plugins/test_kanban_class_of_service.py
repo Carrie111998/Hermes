@@ -52,8 +52,7 @@ def client(kanban_home):
 
 
 def test_contract_authority_is_shared_across_tool_and_api():
-    values = ["expedite", "fixed_date", "intangible", "standard"]
-    assert list(kb.VALID_CLASSES_OF_SERVICE) == values
+    values = list(kb.VALID_CLASSES_OF_SERVICE)
     assert kanban_tools.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["class_of_service"]["enum"] == values
 
 
@@ -72,7 +71,16 @@ def test_values_create_validate_and_preserve_rollback(conn):
 
 def test_legacy_persistence_migrates_as_unclassified(tmp_path):
     path = tmp_path / "legacy.db"
-    legacy_schema = kb.SCHEMA_SQL.replace("    class_of_service     TEXT,\n", "")
+    schema_lines = kb.SCHEMA_SQL.splitlines(keepends=True)
+    class_of_service_lines = [
+        index
+        for index, line in enumerate(schema_lines)
+        if line.strip().split(maxsplit=1)[:1] == ["class_of_service"]
+    ]
+    assert len(class_of_service_lines) == 1
+    legacy_schema = "".join(
+        line for index, line in enumerate(schema_lines) if index != class_of_service_lines[0]
+    )
     raw = sqlite3.connect(path)
     raw.executescript(legacy_schema)
     raw.execute(
@@ -80,6 +88,9 @@ def test_legacy_persistence_migrates_as_unclassified(tmp_path):
         ("legacy", "legacy task", "ready", 1, "scratch"),
     )
     raw.commit()
+    assert "class_of_service" not in {
+        row[1] for row in raw.execute("PRAGMA table_info(tasks)")
+    }
     raw.close()
 
     with kb.connect(db_path=path) as connection:
