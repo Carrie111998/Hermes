@@ -4165,10 +4165,27 @@ class _PinnedExecutablePath:
                     break
                 final_component = index == len(parts) - 1
                 if not final_component:
-                    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & (
+                    writable_by_others = metadata.st_mode & (
                         stat.S_IWGRP | stat.S_IWOTH
+                    )
+                    root_owned_sticky_directory = (
+                        metadata.st_uid == 0
+                        and bool(metadata.st_mode & stat.S_ISVTX)
+                    )
+                    if not stat.S_ISDIR(metadata.st_mode) or (
+                        writable_by_others and not root_owned_sticky_directory
                     ):
                         raise OwnerLauncherError(self._invalid_code)
+                    # Directory mtime/ctime changes when an unrelated sibling is
+                    # created or when an idempotent chmod reapplies the existing
+                    # mode.  Neither changes resolution of this exact component.
+                    # A root-owned sticky ancestor such as /tmp is also safe:
+                    # unprivileged users may create siblings but cannot replace
+                    # this caller-owned path component.  Writable non-sticky
+                    # ancestors remain invalid.
+                    # Pin its identity and security-relevant metadata instead;
+                    # replacement is still detected by (st_dev, st_ino), while
+                    # mode/owner drift remains fail-closed.
                     chain.append((
                         "directory",
                         prefix,
@@ -4177,8 +4194,6 @@ class _PinnedExecutablePath:
                         metadata.st_gid,
                         metadata.st_dev,
                         metadata.st_ino,
-                        metadata.st_mtime_ns,
-                        metadata.st_ctime_ns,
                     ))
                     continue
                 if (

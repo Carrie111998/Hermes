@@ -581,6 +581,7 @@ def _validate_request(
     fields = {
         "schema", "phase", "collected_at_unix", "plan_sha256",
         "production_ingress_observation_sha256",
+        "terminal_receipt_sha256",
         "cloud_install_receipt", *_SIGNER_LINEAGE_FIELDS,
         "observation_binding_sha256", "request_sha256",
     }
@@ -606,6 +607,10 @@ def _validate_request(
         or type(request.get("production_ingress_observation_sha256")) is not str
         or _SHA256.fullmatch(
             str(request.get("production_ingress_observation_sha256", ""))
+        )
+        is None
+        or _SHA256.fullmatch(
+            str(request.get("terminal_receipt_sha256", ""))
         )
         is None
         or any(
@@ -1418,6 +1423,7 @@ def _host_release_facts(
         "resource_ancestor_chain": package["resource_ancestor_chain"],
         "install_receipt_sha256": install["receipt_sha256"],
         "install_receipt_file_sha256": hashlib.sha256(_canonical(install)).hexdigest(),
+        "terminal_receipt_sha256": request["terminal_receipt_sha256"],
         **{name: request[name] for name in _SIGNER_LINEAGE_FIELDS},
         "attached_sa_permission_probe_report_sha256": attached_sa_probe[
             "report_sha256"
@@ -1452,7 +1458,8 @@ def _validate_attached_probe(
         "attached_request_sha256",
         "source_tree_oid", "package_sha256", "package_inventory_sha256",
         *_LINEAGE_FIELDS, "resource_ancestor_chain",
-        "install_receipt_sha256", *_SIGNER_LINEAGE_FIELDS,
+        "install_receipt_sha256", "terminal_receipt_sha256",
+        *_SIGNER_LINEAGE_FIELDS,
         "runtime_instance_numeric_id",
         "runtime_service_account_email", "runtime_service_account_unique_id",
         "metadata_scopes", "effective_permission_probe",
@@ -1516,6 +1523,8 @@ def _validate_attached_probe(
         or any(probe.get(name) != package[name] for name in _LINEAGE_FIELDS)
         or probe.get("resource_ancestor_chain") != package["resource_ancestor_chain"]
         or probe.get("install_receipt_sha256") != install["receipt_sha256"]
+        or probe.get("terminal_receipt_sha256")
+        != request["terminal_receipt_sha256"]
         or any(probe.get(name) != request[name] for name in _SIGNER_LINEAGE_FIELDS)
         or probe.get("runtime_instance_numeric_id")
         != direct_identity["owner_gate_vm_numeric_id"]
@@ -2172,6 +2181,7 @@ def build_attached_sa_permission_probe(
         **{name: package[name] for name in _LINEAGE_FIELDS},
         "resource_ancestor_chain": package["resource_ancestor_chain"],
         "install_receipt_sha256": install["receipt_sha256"],
+        "terminal_receipt_sha256": request["terminal_receipt_sha256"],
         **{name: request[name] for name in _SIGNER_LINEAGE_FIELDS},
         "runtime_instance_numeric_id": facts["runtime_instance_numeric_id"],
         "runtime_service_account_email": facts["runtime_service_account_email"],

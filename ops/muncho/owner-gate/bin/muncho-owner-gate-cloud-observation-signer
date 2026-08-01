@@ -25,6 +25,7 @@ def _validated_release(
     executable = Path(sys.executable) if executable is None else Path(executable)
     flags = sys.flags if flags is None else flags
     try:
+        supplementary_groups = getgroups_fn()
         entrypoint_state = lstat_fn(entrypoint)
         resolved_entrypoint = entrypoint.resolve(strict=True)
         release = resolved_entrypoint.parents[1]
@@ -70,7 +71,11 @@ def _validated_release(
         or geteuid_fn() != expected_uid
         or getgid_fn() != expected_uid
         or getegid_fn() != expected_uid
-        or getgroups_fn() != []
+        # sudo/initgroups may repeat the primary GID in the supplementary
+        # vector.  It grants no authority beyond the already-validated
+        # effective GID; every other or duplicated entry remains forbidden.
+        or type(supplementary_groups) is not list
+        or supplementary_groups not in ([], [expected_uid])
         or flags.isolated != 1
         or flags.ignore_environment != 1
         or flags.no_user_site != 1

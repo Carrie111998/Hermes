@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import inspect
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -542,17 +543,69 @@ def test_valid_ingress_envelope_digest_is_forwarded_to_host_stage0(
         "_reject_ambient_network_environment",
         lambda: None,
     )
+    token = SimpleNamespace(_raw=bytearray(b"token"))
+    monkeypatch.setattr(
+        author.direct_iam_author,
+        "acquire_access_token",
+        lambda **_kwargs: token,
+    )
+
+    host_failed = threading.Event()
+    cloud_worker_exited = threading.Event()
+    cloud_connections_closed = threading.Event()
+
+    def wipe_after_workers_joined(value: Any) -> None:
+        assert host_failed.is_set()
+        assert cloud_worker_exited.is_set()
+        assert cloud_connections_closed.is_set()
+        value._raw[:] = b"\0" * len(value._raw)
+
+    monkeypatch.setattr(
+        author.direct_iam_author,
+        "wipe_access_token",
+        wipe_after_workers_joined,
+    )
+    lock = threading.Lock()
+    worker_ids: set[int] = set()
+
+    def record_worker() -> None:
+        with lock:
+            worker_ids.add(threading.get_ident())
+
+    def collect_cloud_after_host_failure() -> dict[str, object]:
+        record_worker()
+        assert host_failed.wait(timeout=10)
+        cloud_connections_closed.set()
+        cloud_worker_exited.set()
+        return {}
+
+    monkeypatch.setattr(
+        author,
+        "_FixedCloudFactsReader",
+        lambda **_kwargs: SimpleNamespace(
+            collect=collect_cloud_after_host_failure
+        ),
+    )
     final_network_evidence = cast(foundation.ProductionNetworkEvidence, object())
     final_network_collector_public_key = cast(Ed25519PublicKey, object())
     forwarded: list[dict[str, object]] = []
 
+    preparation = object()
+    monkeypatch.setattr(
+        stage0_iap.OwnerGateStage0IapTransport,
+        "prepare_owner_gate_host_observation",
+        lambda _self, **_kwargs: preparation,
+    )
+
     def stop_after_capture(_self: object, **kwargs: object) -> None:
+        record_worker()
         forwarded.append(kwargs)
+        host_failed.set()
         raise author.launcher.OwnerLauncherError("captured")
 
     monkeypatch.setattr(
         stage0_iap.OwnerGateStage0IapTransport,
-        "collect_owner_gate_host_observation",
+        "collect_owner_gate_host_observation_fresh_tail",
         stop_after_capture,
     )
     chain = SimpleNamespace(
@@ -582,6 +635,9 @@ def test_valid_ingress_envelope_digest_is_forwarded_to_host_stage0(
             bundle_stream=stable_stream,
         )
     assert len(forwarded) == 1
+    assert len(worker_ids) == 2
+    assert not any(token._raw)
+    assert forwarded[0]["preparation"] is preparation
     assert forwarded[0]["final_network_evidence"] is final_network_evidence
     assert (
         forwarded[0]["final_network_collector_public_key"]
@@ -591,6 +647,51 @@ def test_valid_ingress_envelope_digest_is_forwarded_to_host_stage0(
         forwarded[0]["production_ingress_observation_sha256"]
         == envelope["envelope_sha256"]
     )
+
+
+def test_terminal_is_rechecked_at_exact_signer_boundary() -> None:
+    terminal = {"terminal_receipt_sha256": "a" * 64, "value": "exact"}
+    preparation = SimpleNamespace(_terminal=copy.deepcopy(terminal))
+    handoff = SimpleNamespace(
+        terminal_receipt=copy.deepcopy(terminal),
+        host_observation={"report_sha256": "b" * 64},
+    )
+    snapshot = foundation.canonical_json_bytes({
+        "terminal_receipt": handoff.terminal_receipt,
+        "host_observation": handoff.host_observation,
+    })
+    calls: list[dict[str, Any]] = []
+
+    def signer(_transport: object, **kwargs: Any) -> Mapping[str, Any]:
+        calls.append(kwargs)
+        return {"signed": True}
+
+    assert author._sign_with_stable_terminal(
+        signer_method=signer,
+        stage0_transport=object(),
+        phase="inert",
+        unsigned_observation={"plan_sha256": "c" * 64},
+        preparation=preparation,
+        handoff=handoff,
+        handoff_snapshot=snapshot,
+    ) == {"signed": True}
+    assert len(calls) == 1
+
+    preparation._terminal["value"] = "changed"
+    with pytest.raises(
+        author.OwnerGateCloudObservationAuthorError,
+        match="owner_gate_cloud_observation_terminal_changed",
+    ):
+        author._sign_with_stable_terminal(
+            signer_method=signer,
+            stage0_transport=object(),
+            phase="inert",
+            unsigned_observation={"plan_sha256": "c" * 64},
+            preparation=preparation,
+            handoff=handoff,
+            handoff_snapshot=snapshot,
+        )
+    assert len(calls) == 1
 
 
 def _final_release_transition(
@@ -917,7 +1018,7 @@ def _raw(
         author._url(f"{compute}/projects/{project}"),
         {
             "name": project,
-            "id": PROJECT_NUMBER,
+            "id": foundation.COMPUTE_PROJECT_ID,
             "commonInstanceMetadata": {
                 "items": [
                     {"key": "block-project-ssh-keys", "value": "true"},
@@ -990,7 +1091,7 @@ def _raw(
                 "source": (
                     f"{compute_resource}/zones/{zone}/disks/{foundation.VM_NAME}"
                 ),
-                "deviceName": foundation.VM_NAME,
+                "deviceName": foundation.OWNER_GATE_BOOT_DEVICE,
                 "boot": True,
                 "autoDelete": True,
                 "mode": "READ_WRITE",
@@ -1224,6 +1325,7 @@ def _raw(
         author._url(
             f"{compute}/projects/{project}/zones/{zone}/instances/"
             f"{foundation.VM_NAME}/getEffectiveFirewalls"
+            f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
         ),
         {"firewalls": [iap, private_web]},
     )
@@ -1412,6 +1514,61 @@ def test_realistic_fixed_rest_fixture_authors_validator_compatible_observation(
     )
 
 
+def test_compute_project_id_is_distinct_from_resource_manager_project_number() -> None:
+    assert foundation.COMPUTE_PROJECT_ID == "3798016304160181927"
+    assert foundation.COMPUTE_PROJECT_ID != PROJECT_NUMBER
+
+
+def test_resource_manager_project_number_is_rejected_as_compute_project_id() -> None:
+    def mutate(raw, _plan) -> None:
+        key = next(
+            key
+            for key in raw
+            if key.endswith(f"/compute/v1/projects/{foundation.PROJECT}")
+        )
+        raw[key]["id"] = PROJECT_NUMBER
+
+    _reject(mutate, match="project_invalid")
+
+
+def test_omitted_subnet_route_type_is_normalized() -> None:
+    plan, ancestry, _cloud_key = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    routes_key = next(key for key in raw if key.endswith("/global/routes"))
+    route = next(
+        item
+        for item in raw[routes_key]["items"]
+        if item["destRange"] == foundation.OWNER_GATE_SUBNET_CIDR
+    )
+    route.pop("routeType")
+
+    observation = author._unsigned_from_raw(
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        raw=raw,
+        collected_at_unix=NOW,
+        package_sha256="3" * 64,
+        foundation_identities=_identities(plan, ancestry),
+        verified_probe=_verified_probe("inert"),
+    )
+
+    assert observation["subnet"]["cidr"] == foundation.OWNER_GATE_SUBNET_CIDR
+
+
+def test_explicit_non_subnet_route_type_is_rejected() -> None:
+    def mutate(raw, _plan) -> None:
+        routes_key = next(key for key in raw if key.endswith("/global/routes"))
+        route = next(
+            item
+            for item in raw[routes_key]["items"]
+            if item["destRange"] == foundation.OWNER_GATE_SUBNET_CIDR
+        )
+        route["routeType"] = "STATIC"
+
+    _reject(mutate, match="network_invalid")
+
+
 def _reject(mutator, *, phase: str = "inert", match: str | None = None) -> None:
     plan, ancestry, _cloud_key = _context()
     raw = _raw(plan, ancestry, phase=phase)
@@ -1513,6 +1670,45 @@ def test_public_owner_gate_firewall_is_rejected() -> None:
     _reject(mutate, match="firewall_invalid")
 
 
+def test_source_tag_limited_effective_firewall_is_not_public() -> None:
+    plan, ancestry, _cloud_key = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    connector_rule = {
+        "name": "vpc-connector-source-tag",
+        "direction": "INGRESS",
+        "disabled": False,
+        "sourceTags": ["vpc-connector"],
+        "allowed": [{"IPProtocol": "tcp"}],
+    }
+    inventory_key = next(
+        key for key in raw if key.endswith("/global/firewalls")
+    )
+    effective_key = next(
+        key
+        for key in raw
+        if "/getEffectiveFirewalls?networkInterface=" in key
+    )
+    cast(dict[str, Any], raw[inventory_key])["items"].append(
+        copy.deepcopy(connector_rule)
+    )
+    cast(dict[str, Any], raw[effective_key])["firewalls"].append(
+        connector_rule
+    )
+
+    observation = author._unsigned_from_raw(
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        raw=raw,
+        collected_at_unix=NOW,
+        package_sha256="3" * 64,
+        foundation_identities=_identities(plan, ancestry),
+        verified_probe=_verified_probe("inert"),
+    )
+
+    assert observation["firewalls"]["public_owner_gate_rules"] == []
+
+
 def test_target_numeric_id_drift_is_rejected() -> None:
     def mutate(raw, _plan) -> None:
         key = next(
@@ -1571,11 +1767,28 @@ def test_owner_boot_disk_attachment_drift_is_rejected() -> None:
     _reject(mutate, match="instance_invalid")
 
 
+def test_owner_boot_device_is_not_conflated_with_disk_resource_name() -> None:
+    def mutate(raw, _plan) -> None:
+        key = next(
+            key for key in raw if key.endswith(f"/instances/{foundation.VM_NAME}")
+        )
+        raw[key]["disks"][0]["deviceName"] = foundation.VM_NAME
+
+    _reject(mutate, match="instance_invalid")
+
+
 @pytest.mark.parametrize("effective", [False, True])
 def test_mixed_firewall_source_selectors_are_rejected(effective: bool) -> None:
     def mutate(raw, _plan) -> None:
         if effective:
-            key = next(key for key in raw if key.endswith("/getEffectiveFirewalls"))
+            key = next(
+                key
+                for key in raw
+                if key.endswith(
+                    "/getEffectiveFirewalls"
+                    f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
+                )
+            )
             rule = next(
                 item
                 for item in raw[key]["firewalls"]
@@ -1791,11 +2004,13 @@ class _FakeCloudHttp:
         corrupt_key: str | None = None,
         corrupt_kind: str | None = None,
         unstable_key: str | None = None,
+        reorder_key: str | None = None,
     ) -> None:
         self.raw = raw
         self.corrupt_key = corrupt_key
         self.corrupt_kind = corrupt_kind
         self.unstable_key = unstable_key
+        self.reorder_key = reorder_key
         self.calls: list[tuple[str, str, bytes | None, dict[str, str]]] = []
         self.counts: dict[str, int] = {}
 
@@ -1820,6 +2035,9 @@ class _FakeCloudHttp:
                 value = parent.raw[key]
                 if key == parent.unstable_key and parent.counts[key] >= 2:
                     value = {**cast(Mapping[str, Any], value), "unstable": True}
+                if key == parent.reorder_key and parent.counts[key] >= 2:
+                    value = copy.deepcopy(value)
+                    cast(dict[str, Any], value)["firewalls"].reverse()
                 body = foundation.canonical_json_bytes(value)
                 if key != parent.corrupt_key:
                     return _FakeResponse(body)
@@ -1909,6 +2127,23 @@ def test_fixed_http_reader_rejects_second_snapshot_drift() -> None:
         direct_iam_author.wipe_access_token(token)
 
 
+def test_fixed_http_reader_normalizes_effective_firewall_order() -> None:
+    plan, ancestry, _ = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    effective_key = next(
+        key
+        for key in raw
+        if "/getEffectiveFirewalls?networkInterface=" in key
+    )
+    fake = _FakeCloudHttp(raw, reorder_key=effective_key)
+    reader, token = _http_reader(plan, ancestry, raw, fake)
+    try:
+        assert reader.collect() == raw
+        assert fake.counts[effective_key] == 2
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
 @pytest.mark.parametrize("kind", ["redirect", "content-type", "status"])
 def test_fixed_http_reader_rejects_http_boundary_drift(kind: str) -> None:
     plan, ancestry, _ = _context()
@@ -1942,5 +2177,335 @@ def test_fixed_http_reader_enforces_aggregate_snapshot_budget(
             match="http_invalid",
         ):
             reader.collect()
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
+def test_injected_factory_defaults_to_caller_thread_and_canonical_order() -> None:
+    plan, ancestry, _ = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    token = direct_iam_author._GcloudAccessToken(
+        bytearray(b"opaque-owner-token-value-that-is-long-enough"),
+        marker=direct_iam_author._TOKEN_MARKER,
+    )
+    caller_thread = threading.get_ident()
+    factory_threads: list[int] = []
+    request_threads: list[int] = []
+    request_keys: list[str] = []
+
+    def factory(host: str):
+        factory_threads.append(threading.get_ident())
+
+        class Connection:
+            def request(
+                self,
+                method: str,
+                target: str,
+                *,
+                body: bytes | None,
+                headers: dict[str, str],
+            ) -> None:
+                del body, headers
+                self.key = f"{method} https://{host}{target}"
+                request_threads.append(threading.get_ident())
+                request_keys.append(self.key)
+
+            def getresponse(self) -> _FakeResponse:
+                return _FakeResponse(
+                    foundation.canonical_json_bytes(raw[self.key])
+                )
+
+            def close(self) -> None:
+                pass
+
+        return Connection()
+
+    reader = author._FixedCloudFactsReader(
+        token=token,
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        _connection_factories={
+            host: (lambda host=host: factory(host))
+            for host in author._ALLOWED_HOSTS
+        },
+    )
+    try:
+        assert reader._snapshot_workers == 1
+        expected_keys = [
+            author._request_key(request)
+            for request in reader._requests
+        ]
+        assert reader._collect_once() == {
+            key: raw[key]
+            for key in expected_keys
+        }
+        assert request_keys == expected_keys
+        assert factory_threads == [caller_thread] * len(expected_keys)
+        assert request_threads == [caller_thread] * len(expected_keys)
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
+def test_snapshot_worker_policy_is_bounded_and_production_parallel() -> None:
+    plan, ancestry, _ = _context()
+    token = direct_iam_author._GcloudAccessToken(
+        bytearray(b"opaque-owner-token-value-that-is-long-enough"),
+        marker=direct_iam_author._TOKEN_MARKER,
+    )
+    try:
+        production_reader = author._FixedCloudFactsReader(
+            token=token,
+            plan=plan,
+            ancestry_evidence=ancestry,
+            phase="inert",
+        )
+        assert production_reader._snapshot_workers == author.MAX_SNAPSHOT_WORKERS
+
+        injected_reader = author._FixedCloudFactsReader(
+            token=token,
+            plan=plan,
+            ancestry_evidence=ancestry,
+            phase="inert",
+            _connection_factories={},
+        )
+        assert injected_reader._snapshot_workers == 1
+
+        for invalid in (0, author.MAX_SNAPSHOT_WORKERS + 1, True, 1.0):
+            with pytest.raises(
+                author.OwnerGateCloudObservationAuthorError,
+                match="^owner_gate_cloud_observation_capability_invalid$",
+            ):
+                author._FixedCloudFactsReader(
+                    token=token,
+                    plan=plan,
+                    ancestry_evidence=ancestry,
+                    phase="inert",
+                    _snapshot_workers=invalid,  # type: ignore[arg-type]
+                )
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
+def test_parallel_snapshot_uses_first_canonical_failure_after_all_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, ancestry, _ = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    token = direct_iam_author._GcloudAccessToken(
+        bytearray(b"opaque-owner-token-value-that-is-long-enough"),
+        marker=direct_iam_author._TOKEN_MARKER,
+    )
+    lock = threading.Lock()
+    later_failure_completed = threading.Event()
+    connections: list[object] = []
+    request_counts: dict[int, int] = {}
+    close_counts: dict[int, int] = {}
+    canonical_indices: dict[str, int] = {}
+
+    def factory(host: str):
+        class Connection:
+            def request(
+                self,
+                method: str,
+                target: str,
+                *,
+                body: bytes | None,
+                headers: dict[str, str],
+            ) -> None:
+                del body, headers
+                self.key = f"{method} https://{host}{target}"
+                with lock:
+                    request_counts[id(self)] = (
+                        request_counts.get(id(self), 0) + 1
+                    )
+
+            def getresponse(self) -> _FakeResponse:
+                index = canonical_indices[self.key]
+                if index == 0:
+                    assert later_failure_completed.wait(timeout=10)
+                if index == 1:
+                    later_failure_completed.set()
+                    return _FakeResponse(b"{}", status=503)
+                return _FakeResponse(
+                    foundation.canonical_json_bytes(raw[self.key])
+                )
+
+            def close(self) -> None:
+                with lock:
+                    close_counts[id(self)] = close_counts.get(id(self), 0) + 1
+
+        connection = Connection()
+        with lock:
+            connections.append(connection)
+        return connection
+
+    reader = author._FixedCloudFactsReader(
+        token=token,
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        _connection_factories={
+            host: (lambda host=host: factory(host))
+            for host in author._ALLOWED_HOSTS
+        },
+        _snapshot_workers=author.MAX_SNAPSHOT_WORKERS,
+    )
+    canonical_indices.update({
+        author._request_key(request): index
+        for index, request in enumerate(reader._requests)
+    })
+    monkeypatch.setattr(author, "MAX_SNAPSHOT_BYTES", 1)
+    try:
+        with pytest.raises(
+            author.OwnerGateCloudObservationAuthorError,
+            match="^owner_gate_cloud_observation_http_invalid$",
+        ):
+            reader._collect_once()
+        connection_ids = {id(connection) for connection in connections}
+        assert len(connections) == author.MAX_SNAPSHOT_WORKERS
+        assert len(connection_ids) == len(connections)
+        assert set(request_counts) == connection_ids
+        assert set(close_counts) == connection_ids
+        assert set(request_counts.values()) == {1}
+        assert set(close_counts.values()) == {1}
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
+def test_parallel_snapshot_uses_distinct_connections_and_canonical_request_order() -> (
+    None
+):
+    plan, ancestry, _ = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    token = direct_iam_author._GcloudAccessToken(
+        bytearray(b"opaque-owner-token-value-that-is-long-enough"),
+        marker=direct_iam_author._TOKEN_MARKER,
+    )
+    lock = threading.Lock()
+    first_batch = threading.Barrier(author.MAX_SNAPSHOT_WORKERS)
+    connections: list[object] = []
+    request_counts: dict[int, int] = {}
+    close_counts: dict[int, int] = {}
+    active = 0
+    maximum_active = 0
+    response_calls = 0
+
+    def factory(host: str):
+        nonlocal active, maximum_active, response_calls
+
+        class Connection:
+            def request(
+                self,
+                method: str,
+                target: str,
+                *,
+                body: bytes | None,
+                headers: dict[str, str],
+            ) -> None:
+                del body, headers
+                self.key = f"{method} https://{host}{target}"
+                with lock:
+                    request_counts[id(self)] = (
+                        request_counts.get(id(self), 0) + 1
+                    )
+
+            def getresponse(self) -> _FakeResponse:
+                nonlocal active, maximum_active, response_calls
+                with lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                    response_calls += 1
+                    call_index = response_calls
+                try:
+                    if call_index <= author.MAX_SNAPSHOT_WORKERS:
+                        first_batch.wait(timeout=10)
+                    return _FakeResponse(
+                        foundation.canonical_json_bytes(raw[self.key])
+                    )
+                finally:
+                    with lock:
+                        active -= 1
+
+            def close(self) -> None:
+                with lock:
+                    close_counts[id(self)] = close_counts.get(id(self), 0) + 1
+
+        connection = Connection()
+        with lock:
+            connections.append(connection)
+        return connection
+
+    reader = author._FixedCloudFactsReader(
+        token=token,
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        _connection_factories={
+            host: (lambda host=host: factory(host))
+            for host in author._ALLOWED_HOSTS
+        },
+        _snapshot_workers=author.MAX_SNAPSHOT_WORKERS,
+    )
+    try:
+        result = reader._collect_once()
+        assert tuple(result) == tuple(
+            author._request_key(request)
+            for request in reader._requests
+        )
+        assert result == {
+            key: raw[key]
+            for key in result
+        }
+        assert maximum_active == author.MAX_SNAPSHOT_WORKERS
+        assert active == 0
+        connection_ids = {id(connection) for connection in connections}
+        assert len(connections) == len(reader._requests)
+        assert len(connection_ids) == len(connections)
+        assert set(request_counts) == connection_ids
+        assert set(close_counts) == connection_ids
+        assert set(request_counts.values()) == {1}
+        assert set(close_counts.values()) == {1}
+    finally:
+        direct_iam_author.wipe_access_token(token)
+
+
+def test_parallel_full_snapshots_remain_strictly_sequential() -> None:
+    plan, ancestry, _ = _context()
+    raw = _raw(plan, ancestry, phase="inert")
+    fake = _FakeCloudHttp(raw)
+    token = direct_iam_author._GcloudAccessToken(
+        bytearray(b"opaque-owner-token-value-that-is-long-enough"),
+        marker=direct_iam_author._TOKEN_MARKER,
+    )
+    reader = author._FixedCloudFactsReader(
+        token=token,
+        plan=plan,
+        ancestry_evidence=ancestry,
+        phase="inert",
+        _connection_factories={
+            host: (lambda host=host: fake.factory(host))
+            for host in author._ALLOWED_HOSTS
+        },
+        _snapshot_workers=author.MAX_SNAPSHOT_WORKERS,
+    )
+    events: list[str] = []
+    original = reader._collect_once
+
+    def observed_collect_once():
+        events.append("start")
+        result = original()
+        events.append("complete")
+        return result
+
+    reader._collect_once = observed_collect_once
+    try:
+        assert reader.collect() == raw
+        assert events == [
+            "start",
+            "complete",
+            "start",
+            "complete",
+        ]
     finally:
         direct_iam_author.wipe_access_token(token)

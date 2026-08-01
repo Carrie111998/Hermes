@@ -3003,6 +3003,128 @@ def _assert_contract_owner_available(
         _error("owner_gate_deferred_mutation_iam_journal_invalid", exc)
 
 
+def _validated_successful_unremoved_activation(
+    *,
+    artifacts: Mapping[str, Mapping[str, Any]],
+    transaction_id: str,
+    release_revision: str,
+    frozen: inert_observation._FrozenInertEvidence,
+    authority: _DeferredMutationIamAuthority,
+    expected_descriptor: _ActivationAttemptDescriptor,
+) -> bytes:
+    """Validate the exact successful IAM activation bound to ``frozen``."""
+
+    descriptor = _basic_activation_attempt_descriptor(
+        artifacts=artifacts,
+        transaction_id=transaction_id,
+        release_revision=release_revision,
+    )
+    if (
+        descriptor is None
+        or descriptor != expected_descriptor
+        or descriptor.success is None
+        or descriptor.failure is not None
+        or authority.transaction_id != transaction_id
+        or authority.lineage.get("final_release_revision")
+        != release_revision
+        or authority.lineage.get("inert_evidence_set_sha256")
+        != frozen.receipt.get("evidence_set_sha256")
+        or descriptor.intent.get("inert_evidence_set_sha256")
+        != frozen.receipt.get("evidence_set_sha256")
+        or any(name.startswith("remove-") for name in artifacts)
+    ):
+        _error("owner_gate_deferred_mutation_iam_activation_not_authoritative")
+    intent = _validate_intent(
+        descriptor.intent,
+        authority=authority,
+        action=ACTION_ACTIVATE,
+    )
+    operation_raw = artifacts.get(
+        _operation_artifact_name(ACTION_ACTIVATE, descriptor.index)
+    )
+    operation = (
+        _validate_operation(operation_raw, intent=intent)
+        if operation_raw is not None
+        else None
+    )
+    success = _validate_success(
+        descriptor.success,
+        authority=authority,
+        action=ACTION_ACTIVATE,
+        operation=operation,
+    )
+    if not _terminal_matches_intent(success, intent):
+        _error("owner_gate_deferred_mutation_iam_journal_invalid")
+    return _canonical(artifacts)
+
+
+@contextmanager
+def _successful_activation_evidence_context(
+    *,
+    release_revision: str,
+    now_unix: int,
+    journal: DeferredMutationIamJournal | None = None,
+) -> Iterator[inert_observation._FrozenInertEvidence]:
+    """Hold the IAM contract and exact R-bound inert evidence for staging.
+
+    Lock order is intentionally global IAM contract, inert evidence lease,
+    then any caller-owned activation-evidence journal.
+    """
+
+    if (
+        _REVISION.fullmatch(release_revision or "") is None
+        or type(now_unix) is not int
+        or now_unix <= 0
+    ):
+        _error("owner_gate_deferred_mutation_iam_boundary_invalid")
+    selected_journal = journal or DeferredMutationIamJournal()
+    if not isinstance(selected_journal, DeferredMutationIamJournal):
+        _error("owner_gate_deferred_mutation_iam_boundary_invalid")
+    try:
+        with selected_journal.contract_lease():
+            transaction_id = _release_transaction_id(release_revision)
+            _assert_contract_owner_available(
+                current_transaction_id=transaction_id,
+                journal=selected_journal,
+                now_unix=now_unix,
+            )
+            with _historical_remove_authority(
+                release_revision=release_revision,
+                journal=selected_journal,
+                now_unix=now_unix,
+            ) as (frozen, authority, descriptor):
+                artifacts = selected_journal.list(transaction_id)
+                snapshot = _validated_successful_unremoved_activation(
+                    artifacts=artifacts,
+                    transaction_id=transaction_id,
+                    release_revision=release_revision,
+                    frozen=frozen,
+                    authority=authority,
+                    expected_descriptor=descriptor,
+                )
+                try:
+                    yield frozen
+                finally:
+                    selected_journal.require_contract_lease()
+                    current = selected_journal.list(transaction_id)
+                    if _canonical(current) != snapshot:
+                        _error(
+                            "owner_gate_deferred_mutation_iam_journal_invalid"
+                        )
+                    _validated_successful_unremoved_activation(
+                        artifacts=current,
+                        transaction_id=transaction_id,
+                        release_revision=release_revision,
+                        frozen=frozen,
+                        authority=authority,
+                        expected_descriptor=descriptor,
+                    )
+    except OwnerGateDeferredMutationIamError:
+        raise
+    except (OSError, PermissionError, RuntimeError) as exc:
+        _error("owner_gate_deferred_mutation_iam_journal_invalid", exc)
+
+
 @contextmanager
 def _fresh_activation_authority_context(
     *,

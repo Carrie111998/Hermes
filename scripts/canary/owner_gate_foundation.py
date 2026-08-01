@@ -31,6 +31,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
 PROJECT = "adventico-ai-platform"
+# Compute Engine's ``projects.get.id`` is a stable Compute resource identity,
+# not the Cloud Resource Manager project number.  Keep both identities pinned
+# and validate each only against the API contract that owns it.
+COMPUTE_PROJECT_ID = "3798016304160181927"
 REGION = "europe-west3"
 ZONE = "europe-west3-a"
 VM_NAME = "muncho-owner-gate-01"
@@ -71,16 +75,18 @@ PRODUCTION_SOURCE_SERVICE_ACCOUNT = (
 OWNER_GATE_NETWORK_TAG = "muncho-owner-gate"
 IAP_NETWORK_TAG = "iap-ssh"
 IAP_SOURCE_RANGE = "35.235.240.0/20"
+OWNER_GATE_NETWORK_INTERFACE = "nic0"
 PRIVATE_GOOGLE_API_VIP_RANGE = "199.36.153.8/30"
 WEB_LISTEN_PORT = 8080
 MACHINE_TYPE = "e2-small"
 BOOT_DISK_SIZE_GB = 20
 BOOT_DISK_TYPE = "pd-balanced"
+OWNER_GATE_BOOT_DEVICE = "persistent-disk-0"
 
 TARGET_INSTANCE = "muncho-canary-v2-01"
 TARGET_INSTANCE_ID = "9153645328899914617"
 TARGET_DISK = "muncho-canary-v2-01"
-TARGET_BOOT_DEVICE = "persistent-disk-0"
+TARGET_BOOT_DEVICE = OWNER_GATE_BOOT_DEVICE
 TARGET_DISK_ID = "4195397669213846393"
 TARGET_DISK_SELF_LINK = (
     f"projects/{PROJECT}/zones/{ZONE}/disks/{TARGET_DISK}"

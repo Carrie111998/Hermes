@@ -361,7 +361,11 @@ def read_only_cloud_requests(
         f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.PRODUCTION_SOURCE_VM}",
         f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.VM_NAME}",
         f"{compute}/projects/{project}/zones/{zone}/disks/{foundation.VM_NAME}",
-        f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.VM_NAME}/getEffectiveFirewalls",
+        (
+            f"{compute}/projects/{project}/zones/{zone}/instances/"
+            f"{foundation.VM_NAME}/getEffectiveFirewalls"
+            f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
+        ),
         f"{compute}/projects/{project}/zones/{zone}/instances/{foundation.TARGET_INSTANCE}",
         f"{compute}/projects/{project}/zones/{zone}/disks/{foundation.TARGET_DISK}",
         f"{compute}/projects/{project}/aggregated/subnetworks",
@@ -908,6 +912,7 @@ def _validate_host(
         "project_ancestry_evidence_sha256", "project_ancestry_chain_sha256",
         "resource_ancestor_chain",
         "install_receipt_sha256", "install_receipt_file_sha256",
+        "terminal_receipt_sha256",
         "cloud_signer_provisioning_receipt_sha256",
         "cloud_signer_readiness_sha256",
         "host_signer_provisioning_receipt_sha256",
@@ -939,6 +944,7 @@ def _validate_host(
                 "project_ancestry_chain_sha256",
                 "install_receipt_sha256",
                 "install_receipt_file_sha256",
+                "terminal_receipt_sha256",
                 "cloud_signer_provisioning_receipt_sha256",
                 "cloud_signer_readiness_sha256",
                 "host_signer_provisioning_receipt_sha256",
@@ -1169,6 +1175,7 @@ def _validate_cross_observation_binding(
             "project_ancestry_chain_sha256",
         ),
         ("resource_ancestor_chain", "resource_ancestor_chain"),
+        ("terminal_receipt_sha256", "terminal_receipt_sha256"),
         (
             "attached_sa_permission_probe_report_sha256",
             "attached_sa_permission_probe_report_sha256",

@@ -268,6 +268,46 @@ def test_runtime_entrypoint_rejects_wrong_effective_identity(
         )
 
 
+def test_cloud_signer_accepts_primary_gid_only_supplementary_vector(
+    tmp_path: Path,
+) -> None:
+    name = "muncho-owner-gate-cloud-observation-signer"
+    uid = 29103
+    releases, release, entrypoint, interpreter = _layout(tmp_path, name)
+
+    assert _call(
+        _validator(name),
+        releases=releases,
+        entrypoint=entrypoint,
+        interpreter=interpreter,
+        uid=uid,
+        getgroups_fn=lambda: [uid],
+    ) == release
+
+
+@pytest.mark.parametrize(
+    "groups",
+    ([29104], [29103, 29104], [29103, 29103]),
+)
+def test_cloud_signer_rejects_additional_supplementary_authority(
+    tmp_path: Path,
+    groups: list[int],
+) -> None:
+    name = "muncho-owner-gate-cloud-observation-signer"
+    uid = 29103
+    releases, _, entrypoint, interpreter = _layout(tmp_path, name)
+
+    with pytest.raises(SystemExit, match="cloud_signer_runtime_invalid"):
+        _call(
+            _validator(name),
+            releases=releases,
+            entrypoint=entrypoint,
+            interpreter=interpreter,
+            uid=uid,
+            getgroups_fn=lambda: groups,
+        )
+
+
 @pytest.mark.parametrize("case", ["symlink", "hardlink", "mode", "owner"])
 def test_runtime_entrypoint_rejects_file_identity_drift(
     tmp_path: Path,

@@ -23,6 +23,7 @@ import socket
 import ssl
 import stat
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, NoReturn, Sequence
 from urllib.parse import urlsplit
@@ -50,6 +51,7 @@ MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
 MAX_REQUESTS = 160
 MAX_ITEMS = 10_000
+MAX_SNAPSHOT_WORKERS = 4
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -324,6 +326,7 @@ class _FixedCloudFactsReader:
         ancestry_evidence: project_ancestry.ProjectAncestryEvidence,
         phase: str,
         _connection_factories: Mapping[str, Callable[[], Any]] | None = None,
+        _snapshot_workers: int | None = None,
     ) -> None:
         if (
             type(token) is not direct_iam_author._GcloudAccessToken
@@ -350,6 +353,7 @@ class _FixedCloudFactsReader:
             or len(keys) != len(set(keys))
         ):
             _error("owner_gate_cloud_observation_request_inventory_invalid")
+        injected_factories = _connection_factories is not None
         supplied = dict(_connection_factories or {})
         if set(supplied) - _ALLOWED_HOSTS or any(
             not callable(factory) for factory in supplied.values()
@@ -359,6 +363,16 @@ class _FixedCloudFactsReader:
             host: supplied.get(host, lambda host=host: _default_connection(host))
             for host in _ALLOWED_HOSTS
         }
+        workers = (
+            1 if injected_factories else MAX_SNAPSHOT_WORKERS
+        ) if _snapshot_workers is None else _snapshot_workers
+        if (
+            type(workers) is not int
+            or workers < 1
+            or workers > MAX_SNAPSHOT_WORKERS
+        ):
+            _error("owner_gate_cloud_observation_capability_invalid")
+        self._snapshot_workers = workers
 
     def _request_exact(
         self, request: Mapping[str, str]
@@ -418,17 +432,59 @@ class _FixedCloudFactsReader:
         finally:
             bearer = ""
             connection.close()
-        return _decode_json(response_body), len(response_body)
+        decoded = _decode_json(response_body)
+        if parsed.path.endswith("/getEffectiveFirewalls"):
+            decoded = _normalized_effective_firewalls(decoded)
+        return decoded, len(response_body)
 
     def _collect_once(self) -> Mapping[str, Any]:
         result: dict[str, Any] = {}
         total = 0
-        for request in self._requests:
-            value, size = self._request_exact(request)
-            total += size
-            if total > MAX_SNAPSHOT_BYTES:
-                _error("owner_gate_cloud_observation_http_invalid")
-            result[_request_key(request)] = value
+        if self._snapshot_workers == 1:
+            for request in self._requests:
+                value, size = self._request_exact(request)
+                total += size
+                if total > MAX_SNAPSHOT_BYTES:
+                    _error("owner_gate_cloud_observation_http_invalid")
+                result[_request_key(request)] = value
+            return result
+        batches = tuple(
+            self._requests[index : index + self._snapshot_workers]
+            for index in range(0, len(self._requests), self._snapshot_workers)
+        )
+        with ThreadPoolExecutor(
+            max_workers=self._snapshot_workers,
+            thread_name_prefix="owner-gate-cloud-snapshot",
+        ) as pool:
+            for batch in batches:
+                futures = tuple(
+                    pool.submit(self._request_exact, request)
+                    for request in batch
+                )
+                values: list[
+                    tuple[Mapping[str, Any], int] | None
+                ] = [None] * len(batch)
+                failures: list[BaseException | None] = [None] * len(batch)
+                for index, future in enumerate(futures):
+                    try:
+                        values[index] = future.result()
+                    except BaseException as exc:
+                        failures[index] = exc
+                for request, item, failure in zip(
+                    batch,
+                    values,
+                    failures,
+                    strict=True,
+                ):
+                    if failure is not None:
+                        raise failure
+                    if item is None:
+                        _error("owner_gate_cloud_observation_http_invalid")
+                    value, size = item
+                    total += size
+                    if total > MAX_SNAPSHOT_BYTES:
+                        _error("owner_gate_cloud_observation_http_invalid")
+                    result[_request_key(request)] = value
         return result
 
     @staticmethod
@@ -763,9 +819,11 @@ def _subnet_projection(
         for prefix in _RESOURCE_PREFIXES:
             next_hop_network = next_hop_network.removeprefix(prefix)
         if destination == target:
+            # Compute may omit routeType for its provider-generated local
+            # subnet route; an explicit non-SUBNET value still fails closed.
             if (
                 next_hop_network != network
-                or route.get("routeType") != "SUBNET"
+                or route.get("routeType", "SUBNET") != "SUBNET"
                 or route.get("priority") != 0
             ):
                 _error("owner_gate_cloud_observation_network_invalid")
@@ -947,7 +1005,7 @@ def _owner_instance_projection(
         != str(expected_identity.get("boot_disk_numeric_id"))
         or str(boot_disk.get("sizeGb"))
         != str(expected_identity.get("boot_disk_size_gb"))
-        or attachment.get("deviceName") != expected_identity.get("boot_disk_name")
+        or attachment.get("deviceName") != foundation.OWNER_GATE_BOOT_DEVICE
         or attachment.get("boot") is not expected_identity.get("boot_disk_boot")
         or attachment.get("autoDelete")
         is not expected_identity.get("boot_disk_auto_delete")
@@ -1275,13 +1333,14 @@ def _public_owner_gate_rule(rule: Mapping[str, Any], *, owner_sa: str) -> bool:
     source_tags = rule.get("sourceTags", [])
     if not isinstance(source_sas, list) or not isinstance(source_tags, list):
         _error("owner_gate_cloud_observation_firewall_invalid")
-    if (
-        source_sas == [foundation.PRODUCTION_SOURCE_SERVICE_ACCOUNT]
-        and not source_tags
-        and not rule.get("sourceRanges", [])
-    ):
-        return False
-    ranges = rule.get("sourceRanges", ["0.0.0.0/0"])
+    ranges = rule.get("sourceRanges")
+    if ranges is None:
+        # GCE omits sourceRanges for source-tag and source-service-account
+        # rules.  Only a rule with no source selector at all receives the
+        # implicit public IPv4 range.
+        if source_sas or source_tags:
+            return False
+        ranges = ["0.0.0.0/0"]
     if not isinstance(ranges, list) or any(
         not isinstance(item, str) for item in ranges
     ):
@@ -1291,6 +1350,35 @@ def _public_owner_gate_rule(rule: Mapping[str, Any], *, owner_sa: str) -> bool:
     except ValueError:
         _error("owner_gate_cloud_observation_firewall_invalid")
     return any(not network.is_private for network in networks)
+
+
+def _normalized_effective_firewalls(
+    value: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Normalize the unordered effective-firewall API collection.
+
+    Compute Engine requires an exact networkInterface selector for this
+    endpoint and does not promise rule ordering between identical reads.
+    Firewall names are project-unique, so sorting by that immutable identity
+    removes projection-only drift without changing any rule content.
+    """
+
+    rules = value.get("firewalls")
+    if (
+        not isinstance(rules, list)
+        or len(rules) > MAX_ITEMS
+        or any(not isinstance(rule, Mapping) for rule in rules)
+    ):
+        _error("owner_gate_cloud_observation_firewall_invalid")
+    names = [str(rule.get("name") or "") for rule in rules]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        _error("owner_gate_cloud_observation_firewall_invalid")
+    normalized = dict(value)
+    normalized["firewalls"] = sorted(
+        (dict(rule) for rule in rules),
+        key=lambda rule: str(rule["name"]),
+    )
+    return normalized
 
 
 def _exact_selectors(
@@ -1815,7 +1903,7 @@ def _build_unsigned(
     project_fact = facts.get("GET", _url(f"{compute}/projects/{project}"))
     if (
         project_fact.get("name") != project
-        or str(project_fact.get("id")) != ancestry_evidence.project_number
+        or str(project_fact.get("id")) != foundation.COMPUTE_PROJECT_ID
     ):
         _error("owner_gate_cloud_observation_project_invalid")
     project_metadata = _instance_metadata(project_fact.get("commonInstanceMetadata"))
@@ -1934,6 +2022,7 @@ def _build_unsigned(
             _url(
                 f"{compute}/projects/{project}/zones/{foundation.ZONE}/instances/"
                 f"{foundation.VM_NAME}/getEffectiveFirewalls"
+                f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
             ),
         ),
         expected_private_identity=foundation_identities.private_web_firewall,
@@ -2460,7 +2549,45 @@ def consume_bound_observation_pair(
     return cloud_observation, host_observation
 
 
-def _collect_and_author_components(
+def _sign_with_stable_terminal(
+    *,
+    signer_method: Any,
+    stage0_transport: Any,
+    phase: str,
+    unsigned_observation: Mapping[str, Any],
+    preparation: Any,
+    handoff: Any,
+    handoff_snapshot: bytes,
+) -> Mapping[str, Any]:
+    """Recheck the exact prepared terminal at the signer call boundary."""
+
+    prepared_terminal = getattr(preparation, "_terminal", None)
+    current_terminal = getattr(handoff, "terminal_receipt", None)
+    host_observation = getattr(handoff, "host_observation", None)
+    if (
+        not callable(signer_method)
+        or not isinstance(prepared_terminal, Mapping)
+        or not isinstance(current_terminal, Mapping)
+        or not isinstance(host_observation, Mapping)
+        or current_terminal.get("terminal_receipt_sha256")
+        != prepared_terminal.get("terminal_receipt_sha256")
+        or _canonical(current_terminal) != _canonical(prepared_terminal)
+        or handoff_snapshot
+        != _canonical({
+            "terminal_receipt": current_terminal,
+            "host_observation": host_observation,
+        })
+    ):
+        _error("owner_gate_cloud_observation_terminal_changed")
+    return signer_method(
+        stage0_transport,
+        phase=phase,
+        unsigned_observation=unsigned_observation,
+        terminal_binding=handoff,
+    )
+
+
+def _collect_and_author_components_with_preparation(
     *,
     plan: foundation.OwnerGateFoundationPlan,
     foundation_apply_chain: Any,
@@ -2475,6 +2602,7 @@ def _collect_and_author_components(
     stage0_transport: Any,
     kit_stream: Any,
     bundle_stream: Any,
+    host_preparation: Any | None,
 ) -> tuple[Mapping[str, Any], Any]:
     """Collect and remotely sign one inert or post-IAM observation."""
 
@@ -2558,13 +2686,20 @@ def _collect_and_author_components(
         != plan.spec.interpreter_sha256
     ):
         _error("owner_gate_cloud_observation_capability_invalid")
-    composite_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
-        "collect_owner_gate_host_observation"
+    prepare_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
+        "prepare_owner_gate_host_observation"
+    )
+    fresh_tail_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
+        "collect_owner_gate_host_observation_fresh_tail"
     )
     signer_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
         "_sign_owner_gate_cloud_observation_on_target"
     )
-    if not callable(composite_method) or not callable(signer_method):
+    if (
+        not callable(prepare_method)
+        or not callable(fresh_tail_method)
+        or not callable(signer_method)
+    ):
         _error("owner_gate_cloud_observation_host_composite_unavailable")
     cloud_public_before = _public_signer_snapshot(
         plan.spec.release_revision,
@@ -2594,23 +2729,112 @@ def _collect_and_author_components(
     handoff_snapshot: bytes | None = None
     try:
         _reject_ambient_network_environment()
+        preparation = host_preparation
+        if preparation is None:
+            try:
+                preparation = prepare_method(
+                    stage0_transport,
+                    phase=phase,
+                    kit_stream=kit_stream,
+                    bundle_stream=bundle_stream,
+                )
+            except launcher.OwnerLauncherError as exc:
+                _error(
+                    "owner_gate_cloud_observation_host_composite_failed",
+                    exc,
+                )
         try:
-            handoff = composite_method(
-                stage0_transport,
-                phase=phase,
-                plan=plan,
-                final_network_evidence=final_network_evidence,
-                final_network_collector_public_key=(
-                    final_network_collector_public_key
-                ),
-                production_ingress_observation_sha256=(
-                    production_ingress_observation_sha256
-                ),
-                kit_stream=kit_stream,
-                bundle_stream=bundle_stream,
+            token = direct_iam_author.acquire_access_token(
+                token_provider=owner_identity
             )
-        except launcher.OwnerLauncherError as exc:
-            _error("owner_gate_cloud_observation_host_composite_failed", exc)
+        except direct_iam_author.DirectIamIdentityAuthorError as exc:
+            _error("owner_gate_cloud_observation_token_unavailable", exc)
+
+        def collect_cloud_facts() -> tuple[int, Mapping[str, Any]]:
+            observed_at = (
+                int(time.time())
+                if collected_at_unix is None
+                else collected_at_unix
+            )
+            if type(observed_at) is not int or observed_at <= 0:
+                _error("owner_gate_cloud_observation_time_invalid")
+            raw = _FixedCloudFactsReader(
+                token=token,
+                plan=plan,
+                ancestry_evidence=identities.ancestry_evidence,
+                phase=phase,
+            ).collect()
+            return observed_at, raw
+
+        cloud_value: tuple[int, Mapping[str, Any]] | None = None
+        cloud_failure: BaseException | None = None
+        host_failure: BaseException | None = None
+        pool_failure: BaseException | None = None
+        wipe_failure: BaseException | None = None
+        try:
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="owner-gate-observation",
+                ) as pool:
+                    cloud_future = pool.submit(collect_cloud_facts)
+                    host_future = pool.submit(
+                        fresh_tail_method,
+                        stage0_transport,
+                        preparation=preparation,
+                        plan=plan,
+                        final_network_evidence=final_network_evidence,
+                        final_network_collector_public_key=(
+                            final_network_collector_public_key
+                        ),
+                        production_ingress_observation_sha256=(
+                            production_ingress_observation_sha256
+                        ),
+                    )
+                    try:
+                        cloud_value = cloud_future.result()
+                    except BaseException as exc:
+                        cloud_failure = exc
+                    try:
+                        handoff = host_future.result()
+                    except BaseException as exc:
+                        host_failure = exc
+            except BaseException as exc:
+                pool_failure = exc
+        finally:
+            try:
+                direct_iam_author.wipe_access_token(token)
+            except BaseException as exc:
+                wipe_failure = exc
+        if wipe_failure is not None or any(token._raw):
+            _error("owner_gate_cloud_observation_token_wipe_failed")
+        try:
+            gcloud_configuration.assert_stable()
+            owner_identity.require_stable()
+        except BaseException as exc:
+            _error("owner_gate_cloud_observation_capability_changed", exc)
+        if pool_failure is not None or (
+            cloud_failure is not None and host_failure is not None
+        ):
+            _error("owner_gate_cloud_observation_concurrent_collection_failed")
+        if host_failure is not None:
+            _error(
+                "owner_gate_cloud_observation_host_composite_failed",
+                host_failure,
+            )
+        if cloud_failure is not None:
+            if isinstance(
+                cloud_failure,
+                OwnerGateCloudObservationAuthorError,
+            ):
+                raise cloud_failure
+            _error(
+                "owner_gate_cloud_observation_cloud_collection_failed",
+                cloud_failure,
+            )
+        if cloud_value is None or handoff is None:
+            _error("owner_gate_cloud_observation_concurrent_collection_failed")
+        observed_at, raw = cloud_value
         verified_probe = _verified_probe_from_host_handoff(
             handoff,
             plan=plan,
@@ -2628,26 +2852,6 @@ def _collect_and_author_components(
             "terminal_receipt": handoff.terminal_receipt,
             "host_observation": handoff.host_observation,
         })
-        observed_at = (
-            int(time.time()) if collected_at_unix is None else collected_at_unix
-        )
-        if type(observed_at) is not int or observed_at <= 0:
-            _error("owner_gate_cloud_observation_time_invalid")
-        try:
-            token = direct_iam_author.acquire_access_token(
-                token_provider=owner_identity
-            )
-        except direct_iam_author.DirectIamIdentityAuthorError as exc:
-            _error("owner_gate_cloud_observation_token_unavailable", exc)
-        raw = _FixedCloudFactsReader(
-            token=token,
-            plan=plan,
-            ancestry_evidence=identities.ancestry_evidence,
-            phase=phase,
-        ).collect()
-        direct_iam_author.wipe_access_token(token)
-        if any(token._raw):
-            _error("owner_gate_cloud_observation_token_wipe_failed")
         unsigned = _unsigned_from_raw(
             plan=plan,
             ancestry_evidence=identities.ancestry_evidence,
@@ -2659,11 +2863,14 @@ def _collect_and_author_components(
             verified_probe=verified_probe,
         )
         try:
-            result = signer_method(
-                stage0_transport,
+            result = _sign_with_stable_terminal(
+                signer_method=signer_method,
+                stage0_transport=stage0_transport,
                 phase=phase,
                 unsigned_observation=unsigned,
-                terminal_binding=handoff,
+                preparation=preparation,
+                handoff=handoff,
+                handoff_snapshot=handoff_snapshot,
             )
         except launcher.OwnerLauncherError as exc:
             _error("owner_gate_cloud_observation_remote_signer_failed", exc)
@@ -2769,6 +2976,44 @@ def _collect_and_author_components(
     return result, handoff
 
 
+def _collect_and_author_components(
+    *,
+    plan: foundation.OwnerGateFoundationPlan,
+    foundation_apply_chain: Any,
+    final_network_evidence: foundation.ProductionNetworkEvidence,
+    final_network_collector_public_key: Ed25519PublicKey,
+    production_ingress_observation: Mapping[str, Any],
+    phase: str,
+    collected_at_unix: int | None,
+    gcloud_executable: launcher.TrustedGcloudExecutable,
+    gcloud_configuration: launcher.PinnedGcloudConfiguration,
+    owner_identity: launcher.GcloudOwnerAccessToken,
+    stage0_transport: Any,
+    kit_stream: Any,
+    bundle_stream: Any,
+) -> tuple[Mapping[str, Any], Any]:
+    """Preserve the established internal composite entry shape."""
+
+    return _collect_and_author_components_with_preparation(
+        plan=plan,
+        foundation_apply_chain=foundation_apply_chain,
+        final_network_evidence=final_network_evidence,
+        final_network_collector_public_key=(
+            final_network_collector_public_key
+        ),
+        production_ingress_observation=production_ingress_observation,
+        phase=phase,
+        collected_at_unix=collected_at_unix,
+        gcloud_executable=gcloud_executable,
+        gcloud_configuration=gcloud_configuration,
+        owner_identity=owner_identity,
+        stage0_transport=stage0_transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        host_preparation=None,
+    )
+
+
 def collect_and_author(
     *,
     plan: foundation.OwnerGateFoundationPlan,
@@ -2850,6 +3095,82 @@ def collect_and_author_bound_pair(
         host_observation=host_observation,
         plan_sha256=plan.sha256,
         phase=phase,
+    )
+
+
+def _collect_and_author_bound_pair_from_preparation(
+    *,
+    plan: foundation.OwnerGateFoundationPlan,
+    foundation_apply_chain: Any,
+    final_network_evidence: foundation.ProductionNetworkEvidence,
+    final_network_collector_public_key: Ed25519PublicKey,
+    production_ingress_observation: Mapping[str, Any],
+    phase: str,
+    collected_at_unix: int | None,
+    gcloud_executable: launcher.TrustedGcloudExecutable,
+    gcloud_configuration: launcher.PinnedGcloudConfiguration,
+    owner_identity: launcher.GcloudOwnerAccessToken,
+    stage0_transport: Any,
+    kit_stream: Any,
+    bundle_stream: Any,
+    host_preparation: Any,
+) -> tuple[BoundObservationPair, Mapping[str, Any]]:
+    """Internal release flow with all long work before fresh evidence."""
+
+    cloud_observation, handoff = (
+        _collect_and_author_components_with_preparation(
+            plan=plan,
+            foundation_apply_chain=foundation_apply_chain,
+            final_network_evidence=final_network_evidence,
+            final_network_collector_public_key=(
+                final_network_collector_public_key
+            ),
+            production_ingress_observation=production_ingress_observation,
+            phase=phase,
+            collected_at_unix=collected_at_unix,
+            gcloud_executable=gcloud_executable,
+            gcloud_configuration=gcloud_configuration,
+            owner_identity=owner_identity,
+            stage0_transport=stage0_transport,
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+            host_preparation=host_preparation,
+        )
+    )
+    host_observation = getattr(handoff, "host_observation", None)
+    terminal_receipt = getattr(handoff, "terminal_receipt", None)
+    release_binding = cloud_observation.get("release_binding")
+    host_release = (
+        host_observation.get("release")
+        if isinstance(host_observation, Mapping)
+        else None
+    )
+    terminal_sha256 = (
+        terminal_receipt.get("terminal_receipt_sha256")
+        if isinstance(terminal_receipt, Mapping)
+        else None
+    )
+    if (
+        not isinstance(host_observation, Mapping)
+        or not isinstance(terminal_receipt, Mapping)
+        or not isinstance(release_binding, Mapping)
+        or not isinstance(host_release, Mapping)
+        or _SHA256.fullmatch(str(terminal_sha256 or "")) is None
+        or release_binding.get("terminal_receipt_sha256")
+        != terminal_sha256
+        or host_release.get("terminal_receipt_sha256")
+        != terminal_sha256
+    ):
+        _error("owner_gate_bound_observation_pair_invalid")
+    terminal_copy = _decode_json(_canonical(terminal_receipt))
+    return (
+        BoundObservationPair._create(
+            cloud_observation=cloud_observation,
+            host_observation=host_observation,
+            plan_sha256=plan.sha256,
+            phase=phase,
+        ),
+        terminal_copy,
     )
 
 

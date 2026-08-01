@@ -521,6 +521,7 @@ def _host(plan, key, *, iam: bool) -> dict:
             "resource_ancestor_chain": [plan.spec.organization_resource],
             "install_receipt_sha256": "c" * 64,
             "install_receipt_file_sha256": "d" * 64,
+            "terminal_receipt_sha256": "e" * 64,
             "cloud_signer_provisioning_receipt_sha256": "f" * 64,
             "cloud_signer_readiness_sha256": "0" * 64,
             "host_signer_provisioning_receipt_sha256": "1" * 64,
@@ -1064,13 +1065,24 @@ def test_public_ingress_or_wrong_disk_id_is_rejected() -> None:
         )
 
 
-def test_read_only_inventory_uses_post_for_iam_and_effective_firewalls() -> None:
+def test_read_only_inventory_uses_post_for_iam_and_exact_effective_firewalls() -> None:
     requests = preflight.read_only_cloud_requests()
     assert requests[-1]["method"] == "POST"
     assert requests[-1]["url"].endswith(":getIamPolicy")
     assert requests[-1]["body"] == '{"options":{"requestedPolicyVersion":3}}'
     assert not any("testIamPermissions" in item["url"] for item in requests)
-    assert any("getEffectiveFirewalls" in item["url"] for item in requests)
+    effective = [
+        item for item in requests if "getEffectiveFirewalls" in item["url"]
+    ]
+    assert effective == [{
+        "method": "GET",
+        "url": (
+            "https://compute.googleapis.com/compute/v1/projects/"
+            f"{foundation.PROJECT}/zones/{foundation.ZONE}/instances/"
+            f"{foundation.VM_NAME}/getEffectiveFirewalls"
+            f"?networkInterface={foundation.OWNER_GATE_NETWORK_INTERFACE}"
+        ),
+    }]
     assert all("gcloud" not in repr(item) for item in requests)
 
 

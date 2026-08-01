@@ -33,6 +33,7 @@ def _lineage_request(*, phase: str = "inert") -> dict[str, Any]:
         "production_ingress_observation_sha256": (
             PRODUCTION_INGRESS_OBSERVATION_SHA256
         ),
+        "terminal_receipt_sha256": "d" * 64,
         "cloud_install_receipt": {"fixture": "signed-install-receipt"},
         "cloud_signer_provisioning_receipt_sha256": "3" * 64,
         "cloud_signer_readiness_sha256": "4" * 64,

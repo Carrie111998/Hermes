@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import inspect
 import os
@@ -29,6 +31,160 @@ def _owner_directory(path: Path) -> None:
     path.mkdir()
     os.chown(path, -1, os.getegid())
     path.chmod(0o700)
+
+
+def _terminal_receipt(
+    *,
+    binding: inert._ReleaseBinding,
+    loaded: SimpleNamespace,
+) -> dict[str, Any]:
+    ancestry = loaded.chain.foundation_a.ancestry_evidence
+    install_unsigned = {
+        "schema": "muncho-owner-gate-offline-install-receipt.v1",
+        "release_revision": binding.release_revision,
+        "package_sha256": binding.package["package_sha256"],
+        "source_tree_oid": binding.source_tree_oid,
+        "pre_foundation_authority_sha256": (
+            loaded.chain.pre_foundation_authority_sha256
+        ),
+        "foundation_apply_receipt_sha256": (
+            loaded.chain.foundation_apply_receipt_sha256
+        ),
+        "project_ancestry_evidence_sha256": (
+            ancestry.signed_evidence_sha256
+        ),
+        "project_ancestry_chain_sha256": ancestry.value[
+            "stable_chain_sha256"
+        ],
+        "resource_ancestor_chain": [
+            item["resource_name"] for item in ancestry.ordered_chain[1:]
+        ],
+        "installed_at_unix": preflight_fixture.NOW - 10,
+        "release_path": str(
+            inert.stage0_iap.cloud_stage0.RELEASE_BASE
+            / binding.release_revision
+        ),
+        "release_tree_sha256": "1" * 64,
+        "transaction_prefix_sha256": "2" * 64,
+        "phase_evidence_sha256": {
+            name: f"{index:x}" * 64
+            for index, name in enumerate(
+                inert.stage0_iap._INSTALL_PHASES_WITHOUT_RECEIPT,
+                start=1,
+            )
+        },
+        "authority_receipt_public_key_sha256": "3" * 64,
+        "authority_receipt_public_key_id": "4" * 64,
+        "credential_id_sha256": "5" * 64,
+        "executor_hosts_receipt_sha256": "6" * 64,
+        "current_release_selected": False,
+        "systemd_units_enabled": [],
+        "activation_performed": False,
+        "activation_seal_created": False,
+        "iam_binding_created": False,
+        "cloud_mutation_performed": False,
+        "caddy_cutover_performed": False,
+    }
+    install_receipt = {
+        **install_unsigned,
+        "receipt_sha256": foundation.sha256_json(install_unsigned),
+        "signer_key_id": "4" * 64,
+        "signature_ed25519_b64url": base64.urlsafe_b64encode(
+            b"s" * 64
+        )
+        .rstrip(b"=")
+        .decode("ascii"),
+    }
+    terminal_unsigned = {
+        "schema": inert.stage0_iap.INERT_CLOUD_BUNDLE_TERMINAL_SCHEMA,
+        "release_sha": binding.release_revision,
+        "source_tree_oid": binding.source_tree_oid,
+        "package_sha256": binding.package["package_sha256"],
+        "kit_release_id": KIT_RELEASE_ID,
+        "trusted_runner_path": str(
+            outer.RELEASE_BASE / KIT_RELEASE_ID / outer.TRUSTED_RUNNER
+        ),
+        "bundle_path": str(
+            outer.BUNDLE_INCOMING_BASE / binding.release_revision
+        ),
+        "pre_foundation_authority_sha256": (
+            loaded.chain.pre_foundation_authority_sha256
+        ),
+        "foundation_apply_receipt_sha256": (
+            loaded.chain.foundation_apply_receipt_sha256
+        ),
+        "project_ancestry_evidence_sha256": (
+            ancestry.signed_evidence_sha256
+        ),
+        "project_ancestry_chain_sha256": ancestry.value[
+            "stable_chain_sha256"
+        ],
+        "resource_ancestor_chain": [
+            item["resource_name"] for item in ancestry.ordered_chain[1:]
+        ],
+        "operation_order": [
+            "transport_exact_stage0_and_bundle",
+            "cloud-verify",
+            "cloud-preflight",
+            "cloud-install",
+        ],
+        "transport_receipt_sha256": "7" * 64,
+        "cloud_verify_receipt_sha256": "8" * 64,
+        "cloud_preflight_receipt_sha256": "9" * 64,
+        "cloud_install_receipt_sha256": install_receipt[
+            "receipt_sha256"
+        ],
+        "cloud_install_receipt_file_sha256": hashlib.sha256(
+            inert._canonical(install_receipt)
+        ).hexdigest(),
+        "cloud_install_receipt": install_receipt,
+        "cloud_install_signature_framing_validated": True,
+        "cloud_install_signature_cryptographically_verified": False,
+        "inert_cloud_bundle_installed": True,
+        "host_filesystem_materialization_performed": True,
+        "current_release_selected": False,
+        "systemd_units_enabled": [],
+        "service_activation_performed": False,
+        "activation_performed": False,
+        "activation_seal_created": False,
+        "iam_binding_created": False,
+        "caddy_cutover_performed": False,
+        "cloud_mutation_performed": False,
+        "cloud_control_plane_mutation_performed": False,
+    }
+    return {
+        **terminal_unsigned,
+        "terminal_receipt_sha256": foundation.sha256_json(
+            terminal_unsigned
+        ),
+    }
+
+
+def _attest_with_terminal(
+    observation: Mapping[str, Any],
+    *,
+    key: Ed25519PrivateKey,
+    terminal_receipt_sha256: str,
+    host_observation_report_sha256: str | None = None,
+) -> dict[str, Any]:
+    body = {
+        name: copy.deepcopy(item)
+        for name, item in observation.items()
+        if name not in {"report_sha256", "attestation"}
+    }
+    if "release_binding" in body:
+        body["release_binding"]["terminal_receipt_sha256"] = (
+            terminal_receipt_sha256
+        )
+        if host_observation_report_sha256 is not None:
+            body["release_binding"]["host_observation_report_sha256"] = (
+                host_observation_report_sha256
+            )
+    else:
+        body["release"]["terminal_receipt_sha256"] = (
+            terminal_receipt_sha256
+        )
+    return preflight_fixture._attest(body, key)
 
 
 def _stream_source(path: Path, payload: bytes) -> Path:
@@ -298,27 +454,29 @@ def _fixed_evidence_store(
         network_collector_public_key=network_key.public_key(),
         now_unix=network_collected_at,
     )
-    cloud_observation = preflight_fixture._cloud(plan, cloud_key, iam=False)
-    host_observation = preflight_fixture._host(plan, host_key, iam=False)
     production_ingress_observation = (
         preflight_fixture._production_ingress_envelope(plan, iam=False)
     )
-    report = inert.preflight.build_preflight_report(
-        plan=plan,
-        production_ingress_observation=production_ingress_observation,
-        release_public_key=preflight_fixture.RELEASE_KEY.public_key(),
-        cloud_observation=cloud_observation,
-        host_observation=host_observation,
-        cloud_collector_public_key=cloud_key.public_key(),
-        host_collector_public_key=host_key.public_key(),
-        now_unix=preflight_fixture.NOW,
+    inputs = SimpleNamespace(
+        pins={
+            "pins_sha256": "d" * 64,
+            "kit_release_id": KIT_RELEASE_ID,
+        }
     )
-    inputs = SimpleNamespace(pins={"pins_sha256": "d" * 64})
+    ancestry = SimpleNamespace(
+        signed_evidence_sha256="9" * 64,
+        value={"stable_chain_sha256": "a" * 64},
+        ordered_chain=(
+            {"resource_name": f"projects/{foundation.PROJECT}"},
+            {"resource_name": plan.spec.organization_resource},
+        ),
+    )
     chain = SimpleNamespace(
         foundation_source_revision=FOUNDATION_REVISION,
         foundation_source_tree_oid=FOUNDATION_TREE,
         pre_foundation_authority_sha256="7" * 64,
         foundation_apply_receipt_sha256="8" * 64,
+        foundation_a=SimpleNamespace(ancestry_evidence=ancestry),
     )
     loaded = SimpleNamespace(chain=chain)
     package = {
@@ -345,6 +503,37 @@ def _fixed_evidence_store(
         foundation_source_tree_oid=FOUNDATION_TREE,
         release_public_key=preflight_fixture.RELEASE_KEY.public_key(),
     )
+    terminal_receipt = _terminal_receipt(
+        binding=binding,
+        loaded=loaded,
+    )
+    host_observation = _attest_with_terminal(
+        preflight_fixture._host(plan, host_key, iam=False),
+        key=host_key,
+        terminal_receipt_sha256=terminal_receipt[
+            "terminal_receipt_sha256"
+        ],
+    )
+    cloud_observation = _attest_with_terminal(
+        preflight_fixture._cloud(plan, cloud_key, iam=False),
+        key=cloud_key,
+        terminal_receipt_sha256=terminal_receipt[
+            "terminal_receipt_sha256"
+        ],
+        host_observation_report_sha256=host_observation[
+            "report_sha256"
+        ],
+    )
+    report = inert.preflight.build_preflight_report(
+        plan=plan,
+        production_ingress_observation=production_ingress_observation,
+        release_public_key=preflight_fixture.RELEASE_KEY.public_key(),
+        cloud_observation=cloud_observation,
+        host_observation=host_observation,
+        cloud_collector_public_key=cloud_key.public_key(),
+        host_collector_public_key=host_key.public_key(),
+        now_unix=preflight_fixture.NOW,
+    )
     receipt, payloads = inert._build_receipt(
         binding=binding,
         inputs=inputs,  # type: ignore[arg-type]
@@ -352,6 +541,7 @@ def _fixed_evidence_store(
         network_evidence=network_mapping,
         plan=plan,
         production_ingress_observation=production_ingress_observation,
+        terminal_receipt=terminal_receipt,
         cloud_observation=cloud_observation,
         host_observation=host_observation,
         report=report,
@@ -371,6 +561,7 @@ def _fixed_evidence_store(
         production_ingress_observation=production_ingress_observation,
         cloud_observation=cloud_observation,
         host_observation=host_observation,
+        terminal_receipt=terminal_receipt,
         report=report,
         receipt=receipt,
         payloads=payloads,
@@ -388,6 +579,52 @@ def _load_fixed_transaction(fixed: SimpleNamespace, *, now_unix: int):
         cloud_key=fixed.cloud_key.public_key(),
         host_key=fixed.host_key.public_key(),
         now_unix=now_unix,
+    )
+
+
+def _frozen_fixed_transaction(fixed: SimpleNamespace) -> inert._FrozenInertEvidence:
+    inert._publish_evidence(
+        phase_root=fixed.phase_root,
+        receipt=fixed.receipt,
+        payloads=fixed.payloads,
+    )
+    transaction_root = (
+        fixed.phase_root / fixed.receipt["evidence_set_sha256"]
+    )
+    evidence_raw: dict[str, bytes] = {}
+    evidence_identities: dict[str, tuple[Any, ...]] = {}
+    evidence: dict[str, Mapping[str, Any]] = {}
+    for name in inert._TRANSACTION_EVIDENCE_NAMES:
+        identity, raw = inert._read_pinned_file(
+            transaction_root / name,
+            maximum=inert.MAX_EVIDENCE_BYTES,
+            code="test_invalid",
+        )
+        evidence_identities[name] = identity
+        evidence_raw[name] = raw
+        evidence[name] = inert._decode_document(raw, code="test_invalid")
+    fixed.inputs.assert_stable = lambda: None
+    return inert._FrozenInertEvidence(
+        phase_root=fixed.phase_root,
+        transaction_root=transaction_root,
+        transaction_identity=inert._require_directory(
+            transaction_root,
+            parent=fixed.phase_root,
+            code="test_invalid",
+            mode=0o500,
+        ),
+        evidence_identities=evidence_identities,
+        evidence_raw=evidence_raw,
+        evidence=evidence,
+        receipt=fixed.receipt,
+        inputs=fixed.inputs,
+        binding=fixed.binding,
+        loaded=fixed.loaded,
+        network_key=fixed.network_key.public_key(),
+        cloud_key=fixed.cloud_key.public_key(),
+        host_key=fixed.host_key.public_key(),
+        network_evidence=fixed.network_evidence,
+        plan=fixed.plan,
     )
 
 
@@ -410,17 +647,22 @@ def test_evidence_publish_is_exact_durable_activation_named_and_compact(
     assert set(os.listdir(transaction)) == inert._TRANSACTION_NAMES
     assert stat_mode(fixed.phase_root) == 0o700
     assert stat_mode(transaction) == 0o500
-    assert {
-        inert.NETWORK_EVIDENCE_NAME,
-        inert.INERT_CLOUD_OBSERVATION_NAME,
-        inert.INERT_HOST_OBSERVATION_NAME,
-        inert.INERT_PREFLIGHT_NAME,
-    } == {
+    assert tuple(inert._EVIDENCE_NAMES) == (
         activation_seal.NETWORK_EVIDENCE_NAME,
+        activation_seal.INERT_PRODUCTION_INGRESS_OBSERVATION_NAME,
         activation_seal.INERT_CLOUD_OBSERVATION_NAME,
         activation_seal.INERT_HOST_OBSERVATION_NAME,
         activation_seal.INERT_PREFLIGHT_NAME,
-    }
+    )
+    assert len(inert._EVIDENCE_NAMES) == 5
+    assert (
+        inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+        not in inert._EVIDENCE_NAMES
+    )
+    assert tuple(inert._TRANSACTION_EVIDENCE_NAMES) == (
+        *inert._EVIDENCE_NAMES,
+        inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME,
+    )
     for name in inert._TRANSACTION_NAMES:
         path = transaction / name
         assert stat_mode(path) == 0o400
@@ -432,6 +674,25 @@ def test_evidence_publish_is_exact_durable_activation_named_and_compact(
     )
     assert fresh is True
     assert persisted == fixed.receipt
+    assert persisted["schema"] == (
+        "muncho-owner-gate-inert-observation-receipt.v3"
+    )
+    assert inert.EVIDENCE_SET_ID_SCHEMA == (
+        "muncho-owner-gate-inert-observation-set-id.v3"
+    )
+    assert set(persisted["evidence_files"]) == set(
+        inert._TRANSACTION_EVIDENCE_NAMES
+    )
+    assert len(persisted["evidence_files"]) == 6
+    assert persisted[
+        "inert_cloud_bundle_terminal_receipt_sha256"
+    ] == fixed.terminal_receipt["terminal_receipt_sha256"]
+    assert inert._decode_document(
+        fixed.payloads[
+            inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+        ],
+        code="test",
+    ) == fixed.terminal_receipt
     assert not {
         "cloud_observation",
         "host_observation",
@@ -579,6 +840,10 @@ def test_stale_final_network_history_is_retained_while_preflight_is_fresh(
         "cloud_symlink",
         "host_hardlink",
         "preflight_mode",
+        "terminal_omission",
+        "terminal_substitution",
+        "terminal_self_hash",
+        "nested_install_hash",
         "receipt_tamper",
         "transaction_mode",
         "transaction_substitution",
@@ -615,6 +880,76 @@ def test_persisted_evidence_rejects_alias_mode_owner_and_substitution(
         )
     elif attack == "preflight_mode":
         (transaction / inert.INERT_PREFLIGHT_NAME).chmod(0o600)
+    elif attack == "terminal_omission":
+        (
+            transaction
+            / inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+        ).unlink()
+    elif attack == "terminal_substitution":
+        terminal = copy.deepcopy(fixed.terminal_receipt)
+        install = terminal["cloud_install_receipt"]
+        terminal["release_sha"] = "d" * 40
+        terminal["source_tree_oid"] = "e" * 40
+        install["release_revision"] = terminal["release_sha"]
+        install["source_tree_oid"] = terminal["source_tree_oid"]
+        install["release_path"] = str(
+            inert.stage0_iap.cloud_stage0.RELEASE_BASE
+            / terminal["release_sha"]
+        )
+        install_unsigned = {
+            name: item
+            for name, item in install.items()
+            if name
+            not in {
+                "receipt_sha256",
+                "signer_key_id",
+                "signature_ed25519_b64url",
+            }
+        }
+        install["receipt_sha256"] = foundation.sha256_json(
+            install_unsigned
+        )
+        terminal["cloud_install_receipt_sha256"] = install[
+            "receipt_sha256"
+        ]
+        terminal["cloud_install_receipt_file_sha256"] = hashlib.sha256(
+            inert._canonical(install)
+        ).hexdigest()
+        terminal["terminal_receipt_sha256"] = foundation.sha256_json({
+            name: item
+            for name, item in terminal.items()
+            if name != "terminal_receipt_sha256"
+        })
+        _rewrite(
+            transaction
+            / inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME,
+            inert._canonical(terminal),
+        )
+    elif attack == "terminal_self_hash":
+        terminal = copy.deepcopy(fixed.terminal_receipt)
+        terminal["transport_receipt_sha256"] = "f" * 64
+        _rewrite(
+            transaction
+            / inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME,
+            inert._canonical(terminal),
+        )
+    elif attack == "nested_install_hash":
+        terminal = copy.deepcopy(fixed.terminal_receipt)
+        install = terminal["cloud_install_receipt"]
+        install["release_tree_sha256"] = "f" * 64
+        terminal["cloud_install_receipt_file_sha256"] = hashlib.sha256(
+            inert._canonical(install)
+        ).hexdigest()
+        terminal["terminal_receipt_sha256"] = foundation.sha256_json({
+            name: item
+            for name, item in terminal.items()
+            if name != "terminal_receipt_sha256"
+        })
+        _rewrite(
+            transaction
+            / inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME,
+            inert._canonical(terminal),
+        )
     elif attack == "receipt_tamper":
         path = transaction / inert.RECEIPT_NAME
         _rewrite(path, path.read_bytes() + b"\n")
@@ -643,6 +978,42 @@ def test_persisted_evidence_rejects_alias_mode_owner_and_substitution(
             cloud_key=fixed.cloud_key.public_key(),
             host_key=fixed.host_key.public_key(),
             now_unix=preflight_fixture.NOW,
+        )
+
+
+@pytest.mark.parametrize("side", ("cloud", "host"))
+def test_terminal_receipt_rejects_observation_cross_binding(
+    side: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed = _fixed_evidence_store(tmp_path, monkeypatch)
+    cloud_observation = copy.deepcopy(fixed.cloud_observation)
+    host_observation = copy.deepcopy(fixed.host_observation)
+    if side == "cloud":
+        cloud_observation["release_binding"][
+            "terminal_receipt_sha256"
+        ] = "f" * 64
+    else:
+        host_observation["release"]["terminal_receipt_sha256"] = "f" * 64
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_inert_observation_evidence_invalid",
+    ):
+        inert._build_receipt(
+            binding=fixed.binding,
+            inputs=fixed.inputs,
+            loaded=fixed.loaded,
+            network_evidence=fixed.network_mapping,
+            plan=fixed.plan,
+            production_ingress_observation=(
+                fixed.production_ingress_observation
+            ),
+            terminal_receipt=fixed.terminal_receipt,
+            cloud_observation=cloud_observation,
+            host_observation=host_observation,
+            report=fixed.report,
         )
 
 
@@ -721,6 +1092,77 @@ def test_interrupted_publish_leaves_pending_for_manual_reconciliation(
         )
 
 
+def test_activation_guards_skip_only_expired_inert_host_short_ttl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed = _fixed_evidence_store(tmp_path, monkeypatch)
+    frozen = _frozen_fixed_transaction(fixed)
+    after_host_short_ttl = preflight_fixture.NOW + 400
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_inert_observation_stale",
+    ):
+        frozen.assert_stable(now_unix=after_host_short_ttl)
+    frozen.assert_activation_collection_window_stable(
+        now_unix=after_host_short_ttl
+    )
+    frozen.assert_activation_staging_window_stable(
+        now_unix=after_host_short_ttl
+    )
+
+
+def test_activation_guard_network_clock_ends_only_after_fresh_pair_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed = _fixed_evidence_store(
+        tmp_path,
+        monkeypatch,
+        network_collected_at=(
+            preflight_fixture.NOW - foundation.PREFLIGHT_MAX_AGE_SECONDS
+        ),
+    )
+    frozen = _frozen_fixed_transaction(fixed)
+    after_network_expiry = preflight_fixture.NOW + 100
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_inert_observation_stale",
+    ):
+        frozen.assert_activation_collection_window_stable(
+            now_unix=after_network_expiry
+        )
+    frozen.assert_activation_staging_window_stable(
+        now_unix=after_network_expiry
+    )
+
+
+@pytest.mark.parametrize("expired", ("preflight", "ingress"))
+def test_activation_staging_guard_keeps_seal_operational_clocks(
+    expired: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed = _fixed_evidence_store(tmp_path, monkeypatch)
+    frozen = _frozen_fixed_transaction(fixed)
+    now_unix = (
+        preflight_fixture.NOW + foundation.PREFLIGHT_MAX_AGE_SECONDS + 1
+        if expired == "preflight"
+        else int(
+            fixed.production_ingress_observation["fresh_through_unix"]
+        )
+        + 1
+    )
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_inert_observation_stale",
+    ):
+        frozen.assert_activation_staging_window_stable(now_unix=now_unix)
+
+
 def test_production_orchestration_resamples_time_after_remote_collection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -748,30 +1190,37 @@ def test_production_orchestration_resamples_time_after_remote_collection(
         expected_public_key_id=plan.spec.network_collector_public_key_id,
         now_unix=preflight_fixture.NOW,
     )
-    cloud_observation = preflight_fixture._cloud(plan, cloud_key, iam=False)
-    host_observation = preflight_fixture._host(plan, host_key, iam=False)
     production_ingress_observation = (
         preflight_fixture._production_ingress_envelope(plan, iam=False)
     )
     pair = object()
+    host_preparation = object()
     executable = cast(launcher.TrustedGcloudExecutable, object())
     configuration = cast(launcher.PinnedGcloudConfiguration, object())
     owner_identity = cast(launcher.GcloudOwnerAccessToken, object())
     raw_artifacts = object()
     kit_stream = object()
     bundle_stream = object()
-    transport = object()
     phase_root = object()
     package = {
         "package_sha256": "3" * 64,
         "package_inventory_sha256": "5" * 64,
         "interpreter_sha256": "6" * 64,
     }
+    ancestry = SimpleNamespace(
+        signed_evidence_sha256="9" * 64,
+        value={"stable_chain_sha256": "a" * 64},
+        ordered_chain=(
+            {"resource_name": f"projects/{foundation.PROJECT}"},
+            {"resource_name": plan.spec.organization_resource},
+        ),
+    )
     chain = SimpleNamespace(
         foundation_source_revision=FOUNDATION_REVISION,
         foundation_source_tree_oid=FOUNDATION_TREE,
         pre_foundation_authority_sha256="7" * 64,
         foundation_apply_receipt_sha256="8" * 64,
+        foundation_a=SimpleNamespace(ancestry_evidence=ancestry),
     )
     binding = inert._ReleaseBinding(
         release_revision=REVISION,
@@ -792,9 +1241,27 @@ def test_production_orchestration_resamples_time_after_remote_collection(
     events: list[str] = []
     published: dict[str, Any] = {}
 
+    class Transport:
+        def prepare_owner_gate_host_observation(
+            self,
+            **kwargs: object,
+        ) -> object:
+            assert kwargs == {
+                "phase": "inert",
+                "kit_stream": kit_stream,
+                "bundle_stream": bundle_stream,
+            }
+            events.append("prepare")
+            return host_preparation
+
+    transport = Transport()
+
     class Inputs:
         def __init__(self) -> None:
-            self.pins = {"pins_sha256": "d" * 64}
+            self.pins = {
+                "pins_sha256": "d" * 64,
+                "kit_release_id": KIT_RELEASE_ID,
+            }
             self.kit_stream = kit_stream
             self.bundle_stream = bundle_stream
 
@@ -803,6 +1270,27 @@ def test_production_orchestration_resamples_time_after_remote_collection(
 
     inputs = Inputs()
     loaded = SimpleNamespace(chain=chain, raw_artifacts=raw_artifacts)
+    terminal_receipt = _terminal_receipt(
+        binding=binding,
+        loaded=loaded,
+    )
+    host_observation = _attest_with_terminal(
+        preflight_fixture._host(plan, host_key, iam=False),
+        key=host_key,
+        terminal_receipt_sha256=terminal_receipt[
+            "terminal_receipt_sha256"
+        ],
+    )
+    cloud_observation = _attest_with_terminal(
+        preflight_fixture._cloud(plan, cloud_key, iam=False),
+        key=cloud_key,
+        terminal_receipt_sha256=terminal_receipt[
+            "terminal_receipt_sha256"
+        ],
+        host_observation_report_sha256=host_observation[
+            "report_sha256"
+        ],
+    )
 
     def load_inputs(release_revision: str) -> Inputs:
         assert release_revision == REVISION
@@ -907,9 +1395,10 @@ def test_production_orchestration_resamples_time_after_remote_collection(
             "stage0_transport": transport,
             "kit_stream": kit_stream,
             "bundle_stream": bundle_stream,
+            "host_preparation": host_preparation,
         }
         events.append("collect")
-        return pair
+        return pair, terminal_receipt
 
     consumes = 0
 
@@ -1009,7 +1498,7 @@ def test_production_orchestration_resamples_time_after_remote_collection(
     )
     monkeypatch.setattr(
         inert.cloud_author,
-        "collect_and_author_bound_pair",
+        "_collect_and_author_bound_pair_from_preparation",
         collect_pair,
     )
     monkeypatch.setattr(
@@ -1047,13 +1536,14 @@ def test_production_orchestration_resamples_time_after_remote_collection(
         "key-host",
         "lease",
         "scan",
+        "transport",
+        "prepare",
         "network",
         "plan",
         "release-key",
         "production-transport",
         "ingress-transport",
         "ingress",
-        "transport",
         "collect",
         "consume",
         "preflight",
@@ -1085,6 +1575,12 @@ def test_production_orchestration_resamples_time_after_remote_collection(
         persisted_payloads[inert.INERT_HOST_OBSERVATION_NAME],
         code="test",
     ) == host_observation
+    assert inert._decode_document(
+        persisted_payloads[
+            inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+        ],
+        code="test",
+    ) == terminal_receipt
     persisted_preflight = inert._decode_document(
         persisted_payloads[inert.INERT_PREFLIGHT_NAME],
         code="test",
@@ -1100,6 +1596,9 @@ def test_production_orchestration_resamples_time_after_remote_collection(
     assert receipt["source_tree_oid"] == RELEASE_TREE
     assert receipt["foundation_source_revision"] == FOUNDATION_REVISION
     assert receipt["foundation_source_tree_oid"] == FOUNDATION_TREE
+    assert receipt[
+        "inert_cloud_bundle_terminal_receipt_sha256"
+    ] == terminal_receipt["terminal_receipt_sha256"]
     unsigned_receipt = {
         key: value for key, value in receipt.items() if key != "receipt_sha256"
     }

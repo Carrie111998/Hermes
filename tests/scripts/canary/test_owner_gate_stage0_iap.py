@@ -46,6 +46,7 @@ class _HostRequestValues(TypedDict):
     phase: str
     plan_sha256: str
     production_ingress_observation_sha256: str
+    terminal_receipt_sha256: str
     collected_at_unix: int
     cloud_install_receipt: Mapping[str, Any]
     cloud_receipt: Mapping[str, Any]
@@ -148,6 +149,8 @@ def _attached_sa_probe_fixture(
         source_tree_oid=TREE,
         package_sha256="3" * 64,
         interpreter_sha256="8" * 64,
+        cloud_collector_public_key_id=plan.spec.cloud_collector_public_key_id,
+        host_collector_public_key_id=plan.spec.host_collector_public_key_id,
         bootstrap_pip_version="25.1.1",
         bootstrap_pip_sha256="b" * 64,
         kit_release_id="c" * 64,
@@ -166,6 +169,7 @@ def _attached_sa_probe_fixture(
         production_ingress_observation_sha256=(
             PRODUCTION_INGRESS_OBSERVATION_SHA256
         ),
+        terminal_receipt_sha256="7" * 64,
         collected_at_unix=preflight_fixture.NOW,
         cloud_install_receipt=install_receipt,
         cloud_receipt=cloud_receipt,
@@ -207,6 +211,7 @@ def _attached_sa_probe_fixture(
             projection.resource_ancestor_chain
         ),
         "install_receipt_sha256": install_receipt["receipt_sha256"],
+        "terminal_receipt_sha256": "7" * 64,
         "cloud_signer_provisioning_receipt_sha256": cloud_receipt[
             "receipt_sha256"
         ],
@@ -463,6 +468,11 @@ def _package_manifest(
         "project_ancestry_evidence_sha256": "9" * 64,
         "project_ancestry_chain_sha256": "a" * 64,
         "resource_ancestor_chain": ["organizations/123456789012"],
+        "collector_public_key_ids": {
+            "network": "b" * 64,
+            "cloud": "c" * 64,
+            "host": "d" * 64,
+        },
         "direct_iam_identity_authority_sha256": hashlib.sha256(
             _direct_iam_authority_raw()
         ).hexdigest(),
@@ -927,6 +937,117 @@ def test_composite_uses_exact_cloud_order_argv_and_returns_inert_terminal(
     })
 
 
+def test_post_iam_resume_revalidates_exact_install_without_retransmission(
+    tmp_path: Path,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    receipts = _cloud_receipts()
+    events: list[str] = []
+
+    transport.transport_exact_stage0_and_bundle = lambda **_kwargs: pytest.fail(
+        "resume must not retransmit either exact stream"
+    )
+    transport.transport_and_install_inert_cloud_bundle = (
+        lambda **_kwargs: pytest.fail(
+            "resume must not rerun the transfer/install composite"
+        )
+    )
+    transport._run_cloud_verify = lambda _binding: (
+        events.append("verify") or receipts["cloud-verify"]
+    )
+    transport._run_cloud_preflight = lambda _binding: (
+        events.append("preflight") or receipts["cloud-preflight"]
+    )
+    transport._run_cloud_install = lambda _binding: (
+        events.append("install") or receipts["cloud-install"]
+    )
+    transport._run_host_runtime_install = lambda binding: (
+        events.append("host-runtime")
+        or {"package_sha256": binding.package_sha256}
+    )
+
+    def provision(
+        *,
+        role: str,
+        package_sha256: str,
+        expected_key_id: str,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        assert package_sha256 == terminal["package_sha256"]
+        assert expected_key_id in {"c" * 64, "d" * 64}
+        events.append(f"signer-{role}")
+        return (
+            {"receipt_sha256": f"{1 if role == 'cloud' else 3}" * 64},
+            {"readiness_sha256": f"{2 if role == 'cloud' else 4}" * 64},
+        )
+
+    transport._provision_signer = provision
+
+    preparation = transport.resume_owner_gate_host_observation_preparation(
+        phase="post_iam",
+        terminal_receipt=terminal,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+
+    assert (
+        type(preparation)
+        is transport_module.OwnerGateHostObservationPreparation
+    )
+    assert preparation._terminal == terminal
+    assert events == [
+        "verify",
+        "preflight",
+        "install",
+        "host-runtime",
+        "signer-cloud",
+        "signer-host",
+    ]
+
+
+def test_post_iam_resume_rejects_rehashed_foundation_drift_before_remote_work(
+    tmp_path: Path,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = dict(
+        transport.transport_and_install_inert_cloud_bundle(
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+        )
+    )
+    terminal["foundation_apply_receipt_sha256"] = "f" * 64
+    terminal["terminal_receipt_sha256"] = outer.sha256_json({
+        name: item
+        for name, item in terminal.items()
+        if name != "terminal_receipt_sha256"
+    })
+    transport._run_cloud_verify = lambda _binding: pytest.fail(
+        "invalid durable lineage must fail before remote replay"
+    )
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_host_observation_resume_invalid",
+    ):
+        transport.resume_owner_gate_host_observation_preparation(
+            phase="post_iam",
+            terminal_receipt=terminal,
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+        )
+
+
 @pytest.mark.parametrize(
     ("case", "expected"),
     (
@@ -1294,6 +1415,12 @@ def test_owner_gate_observation_composite_and_target_signer_surfaces_are_exact()
     composite = transport_module.OwnerGateStage0IapTransport.__dict__[
         "collect_owner_gate_host_observation"
     ]
+    prepare = transport_module.OwnerGateStage0IapTransport.__dict__[
+        "prepare_owner_gate_host_observation"
+    ]
+    fresh_tail = transport_module.OwnerGateStage0IapTransport.__dict__[
+        "collect_owner_gate_host_observation_fresh_tail"
+    ]
     signer = transport_module.OwnerGateStage0IapTransport.__dict__[
         "_sign_owner_gate_cloud_observation_on_target"
     ]
@@ -1314,7 +1441,21 @@ def test_owner_gate_observation_composite_and_target_signer_surfaces_are_exact()
         "unsigned_observation",
         "terminal_binding",
     )
-    for method in (composite, signer):
+    assert tuple(inspect.signature(prepare).parameters) == (
+        "self",
+        "phase",
+        "kit_stream",
+        "bundle_stream",
+    )
+    assert tuple(inspect.signature(fresh_tail).parameters) == (
+        "self",
+        "preparation",
+        "plan",
+        "final_network_evidence",
+        "final_network_collector_public_key",
+        "production_ingress_observation_sha256",
+    )
+    for method in (composite, prepare, fresh_tail, signer):
         parameters = inspect.signature(method).parameters
         assert all(
             parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -1339,6 +1480,11 @@ def test_host_observation_handoff_is_opaque_and_factory_bound() -> None:
         host_observation={"host": True},
     )
     assert value._marker is transport_module._HOST_OBSERVATION_HANDOFF_MARKER
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_host_observation_preparation_factory_required",
+    ):
+        transport_module.OwnerGateHostObservationPreparation()
 
 
 def test_mutable_observation_frame_is_explicitly_wiped() -> None:
@@ -1429,6 +1575,7 @@ def test_host_request_variants_share_one_exact_observation_binding() -> None:
         "production_ingress_observation_sha256": (
             PRODUCTION_INGRESS_OBSERVATION_SHA256
         ),
+        "terminal_receipt_sha256": "7" * 64,
         "collected_at_unix": 1_800_000_000,
         "cloud_install_receipt": {"receipt_sha256": "2" * 64},
         "cloud_receipt": {"receipt_sha256": "3" * 64},
@@ -1457,6 +1604,7 @@ def test_host_request_variants_share_one_exact_observation_binding() -> None:
         "collected_at_unix",
         "plan_sha256",
         "production_ingress_observation_sha256",
+        "terminal_receipt_sha256",
         "cloud_install_receipt",
         "cloud_signer_provisioning_receipt_sha256",
         "cloud_signer_readiness_sha256",
@@ -1477,6 +1625,7 @@ def test_host_request_rejects_malformed_production_ingress_digest() -> None:
             phase="inert",
             plan_sha256="1" * 64,
             production_ingress_observation_sha256="not-a-digest",
+            terminal_receipt_sha256="7" * 64,
             collected_at_unix=1_800_000_000,
             cloud_install_receipt={"receipt_sha256": "2" * 64},
             cloud_receipt={"receipt_sha256": "3" * 64},
@@ -1573,6 +1722,162 @@ def test_cloud_observation_signer_uses_only_fixed_target_executor_command() -> N
             transport._sign_owner_gate_cloud_observation_on_target
         ).parameters
     )
+
+
+@pytest.mark.parametrize("exchange_fails", (False, True))
+def test_cloud_signer_always_runs_mandatory_post_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exchange_fails: bool,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    plan_sha256 = "1" * 64
+    ingress_sha256 = "2" * 64
+    host_report_sha256 = "3" * 64
+    host_binding_sha256 = "4" * 64
+    attached_sha256 = "5" * 64
+    cloud_receipt = {"receipt_sha256": "6" * 64}
+    cloud_readiness = {"readiness_sha256": "7" * 64}
+    host_receipt = {"receipt_sha256": "8" * 64}
+    host_readiness = {"readiness_sha256": "9" * 64}
+    cloud_key = Ed25519PrivateKey.generate()
+    cloud_key_id = preflight_fixture._key_id(cloud_key)
+    host_key_id = "d" * 64
+    host_release = {
+        "attached_sa_permission_probe_report_sha256": attached_sha256,
+        "cloud_signer_provisioning_receipt_sha256": cloud_receipt[
+            "receipt_sha256"
+        ],
+        "cloud_signer_readiness_sha256": cloud_readiness[
+            "readiness_sha256"
+        ],
+        "host_signer_provisioning_receipt_sha256": host_receipt[
+            "receipt_sha256"
+        ],
+        "host_signer_readiness_sha256": host_readiness[
+            "readiness_sha256"
+        ],
+    }
+    host = {
+        "phase": "inert",
+        "plan_sha256": plan_sha256,
+        "report_sha256": host_report_sha256,
+        "observation_binding_sha256": host_binding_sha256,
+        "production_ingress_observation_sha256": ingress_sha256,
+        "release": host_release,
+        "attestation": {"public_key_id": host_key_id},
+    }
+    release_binding = {
+        "phase": "inert",
+        "release_revision": REVISION,
+        "source_tree_oid": terminal["source_tree_oid"],
+        "package_sha256": terminal["package_sha256"],
+        "terminal_receipt_sha256": terminal[
+            "terminal_receipt_sha256"
+        ],
+        "host_observation_report_sha256": host_report_sha256,
+        "host_observation_binding_sha256": host_binding_sha256,
+        "production_ingress_observation_sha256": ingress_sha256,
+        "attached_sa_permission_probe_report_sha256": attached_sha256,
+        "cloud_signer_provisioning_receipt_sha256": cloud_receipt[
+            "receipt_sha256"
+        ],
+        "cloud_signer_readiness_sha256": cloud_readiness[
+            "readiness_sha256"
+        ],
+        "host_signer_provisioning_receipt_sha256": host_receipt[
+            "receipt_sha256"
+        ],
+        "host_signer_readiness_sha256": host_readiness[
+            "readiness_sha256"
+        ],
+    }
+    unsigned = {
+        "schema": owner_preflight.CLOUD_OBSERVATION_SCHEMA,
+        "phase": "inert",
+        "plan_sha256": plan_sha256,
+        "release_binding": release_binding,
+    }
+    handoff = transport_module.OwnerGateHostObservationHandoff._create(
+        terminal_receipt=terminal,
+        host_observation=host,
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        transport_module,
+        "_local_signer_public_identity",
+        lambda *_args, **_kwargs: (
+            cloud_key.public_key(),
+            cloud_key_id,
+        ),
+    )
+
+    def exchange(_reader: object, *, maximum_input_bytes: int):
+        assert maximum_input_bytes > 0
+        events.append("exchange")
+        if exchange_fails:
+            raise launcher.OwnerLauncherError("fixture-exchange-failed")
+        return {
+            **unsigned,
+            "report_sha256": "a" * 64,
+            "attestation": {"public_key_id": cloud_key_id},
+        }
+
+    transport._exchange_cloud_observation_signer = exchange
+
+    def provision(
+        *,
+        role: str,
+        package_sha256: str,
+        expected_key_id: str,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        assert package_sha256 == terminal["package_sha256"]
+        events.append(f"post-readiness-{role}")
+        if role == "cloud":
+            assert expected_key_id == cloud_key_id
+            return cloud_receipt, cloud_readiness
+        assert expected_key_id == host_key_id
+        return host_receipt, host_readiness
+
+    transport._provision_signer = provision
+    monkeypatch.setattr(
+        owner_preflight,
+        "_validate_cloud",
+        lambda *_args, **_kwargs: None,
+    )
+
+    if exchange_fails:
+        with pytest.raises(
+            launcher.OwnerLauncherError,
+            match="owner_gate_cloud_observation_signer_failed",
+        ):
+            transport._sign_owner_gate_cloud_observation_on_target(
+                phase="inert",
+                unsigned_observation=unsigned,
+                terminal_binding=handoff,
+            )
+    else:
+        result = transport._sign_owner_gate_cloud_observation_on_target(
+            phase="inert",
+            unsigned_observation=unsigned,
+            terminal_binding=handoff,
+        )
+        assert result["report_sha256"] == "a" * 64
+
+    assert events == [
+        "exchange",
+        "post-readiness-cloud",
+        "post-readiness-host",
+    ]
 
 
 def test_fixed_iap_transport_rejects_remote_receipt_drift(tmp_path: Path) -> None:
