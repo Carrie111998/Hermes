@@ -149,21 +149,25 @@ test('copy failure is reported, not swallowed -- legacy data is never lost', () 
   const { appDataPath, newUserDataPath } = makeSandbox()
   const legacy = writeLegacyFixture(appDataPath)
 
-  const failingFs: typeof fs = Object.create(fs)
-  failingFs.copyFileSync = ((src: string) => {
+  // Object.create(fs) (no type annotation -- TS infers `any` from the
+  // single-arg Object.create overload) rather than `: typeof fs`: `fs` is an
+  // imported module binding, and TS treats every property of `typeof fs` as
+  // readonly to match real ES module namespace semantics, so assigning to
+  // failingFs.copyFileSync below would fail to typecheck (TS2540) even
+  // though it works fine at runtime against Node's actual (mutable, CJS)
+  // fs module. Every other fs method needed by the migration walk
+  // (readdirSync, statSync, mkdirSync, existsSync, writeFileSync,
+  // chmodSync) already resolves through the prototype chain unchanged --
+  // only copyFileSync needs overriding here.
+  const failingFs = Object.create(fs)
+
+  failingFs.copyFileSync = (src: string, dest: string) => {
     if (String(src).endsWith('native-oauth-tokens.json')) {
       throw new Error('EACCES: permission denied (simulated)')
     }
 
-    return fs.copyFileSync(src, src) // unreachable for our fixture; real calls go through fs.* below
-  }) as typeof fs.copyFileSync
-  // Delegate everything else to the real fs so the directory walk still works.
-  failingFs.readdirSync = fs.readdirSync.bind(fs) as typeof fs.readdirSync
-  failingFs.statSync = fs.statSync.bind(fs) as typeof fs.statSync
-  failingFs.mkdirSync = fs.mkdirSync.bind(fs) as typeof fs.mkdirSync
-  failingFs.existsSync = fs.existsSync.bind(fs) as typeof fs.existsSync
-  failingFs.writeFileSync = fs.writeFileSync.bind(fs) as typeof fs.writeFileSync
-  failingFs.chmodSync = fs.chmodSync.bind(fs) as typeof fs.chmodSync
+    return fs.copyFileSync(src, dest)
+  }
 
   const result = migrateUserDataFromLegacyHermes({ appDataPath, newUserDataPath, fs: failingFs })
 
