@@ -106,3 +106,68 @@ class TestDispatcherExceptionPropagation:
 
         # Verify the lock handle was cleared before re-raising
         assert mixin._kanban_dispatcher_lock_handle is None
+    @pytest.mark.asyncio
+    async def test_cancelled_error_releases_lock_and_reraises(self):
+        """When the dispatcher watcher is cancelled during _kanban_dispatcher_loop,
+        it must release the singleton lock and re-raise CancelledError so
+        _spawn_supervised can handle cancellation properly."""
+        from unittest.mock import MagicMock, patch
+        import asyncio
+
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        mixin = MagicMock()
+        mixin._kanban_dispatcher_lock_handle = MagicMock()
+
+        async def fake_loop(_kb, kanban_cfg):
+            raise asyncio.CancelledError("dispatcher cancelled")
+
+        mixin._kanban_dispatcher_loop = fake_loop
+
+        with patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(MagicMock(), "held"),
+        ), patch(
+            "gateway.kanban_watchers._release_singleton_lock",
+        ) as mock_release, patch.dict(
+            "sys.modules",
+            {"hermes_cli": MagicMock(kanban_db=MagicMock())},
+        ):
+            with pytest.raises(asyncio.CancelledError, match="dispatcher cancelled"):
+                await GatewayKanbanWatchersMixin._kanban_dispatcher_watcher(mixin)
+
+        # Verify lock was released and handle cleared
+        mock_release.assert_called_once()
+        assert mixin._kanban_dispatcher_lock_handle is None
+
+    @pytest.mark.asyncio
+    async def test_lock_release_idempotent_when_none(self):
+        """When _kanban_dispatcher_loop raises and _kanban_dispatcher_lock_handle
+        is already None (lock never acquired or already released),
+        the exception handler must still re-raise without crashing."""
+        from unittest.mock import MagicMock, patch
+
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        mixin = MagicMock()
+        mixin._kanban_dispatcher_lock_handle = None  # Already None
+
+        async def fake_loop(_kb, kanban_cfg):
+            raise RuntimeError("crash before lock acquired")
+
+        mixin._kanban_dispatcher_loop = fake_loop
+
+        with patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(MagicMock(), "held"),
+        ), patch(
+            "gateway.kanban_watchers._release_singleton_lock",
+        ) as mock_release, patch.dict(
+            "sys.modules",
+            {"hermes_cli": MagicMock(kanban_db=MagicMock())},
+        ):
+            with pytest.raises(RuntimeError, match="crash before lock acquired"):
+                await GatewayKanbanWatchersMixin._kanban_dispatcher_watcher(mixin)
+
+        # _release_singleton_lock should still be called (with None)
+        mock_release.assert_called_once_with(None)
