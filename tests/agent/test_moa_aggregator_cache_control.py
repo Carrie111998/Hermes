@@ -115,6 +115,41 @@ def test_aggregator_synthesis_untouched_on_non_caching_route(
     assert isinstance(synth_message["content"], str), "must stay undecorated (plain string content)"
 
 
+def test_aggregator_synthesis_untouched_when_agent_disables_cache(
+    captured_calls, monkeypatch
+):
+    """``prompt_caching.cache_ttl: off`` on the live agent must block markers
+    on the one-shot synthesis call even though its route (native Anthropic)
+    would otherwise honor cache_control (#76085)."""
+    from agent import moa_loop
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "anthropic",
+            "model": "claude-opus-4.8",
+            "base_url": "",
+            "api_mode": "anthropic_messages",
+        },
+    )
+
+    moa_loop.aggregate_moa_context(
+        user_prompt="what should I do next?",
+        api_messages=[{"role": "user", "content": "help me plan"}],
+        reference_models=[{"provider": "openrouter", "model": "openai/gpt-5.5"}],
+        aggregator={"provider": "anthropic", "model": "claude-opus-4.8"},
+        agent=SimpleNamespace(_cache_disabled=True),
+    )
+
+    agg_kwargs = _aggregator_kwargs(captured_calls)
+    synth_message = agg_kwargs["messages"][0]
+    assert isinstance(synth_message["content"], str), (
+        "agent._cache_disabled must keep the synthesis message undecorated "
+        "(plain string content) even on a cache-honoring route"
+    )
+
+
 def test_prepared_aggregator_plans_tools_without_decorating_prepared_state(monkeypatch):
     from agent import moa_loop
 
