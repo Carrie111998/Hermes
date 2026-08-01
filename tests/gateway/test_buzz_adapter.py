@@ -243,6 +243,53 @@ class TestMentionGating:
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_exact_self_ptag_dispatches_group_message(self, adapter):
+        adapter._channel_meta[CHANNEL] = {
+            "channel_id": CHANNEL,
+            "name": "general",
+            "description": "General conversation and community updates.",
+        }
+        await self._poll_with(
+            adapter,
+            _tagged_event("e1", CHANNEL, content="please take this", p=SELF_PUBKEY, created_at=10),
+        )
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+        assert adapter._dispatched[0]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_exact_control_text_fallback_without_ptags_dispatches(self, adapter):
+        adapter._display_name = "Control"
+        await self._poll_with(adapter, _event("e1", content="hey @Control can you help?", created_at=10))
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_bare_display_name_without_ptags_does_not_dispatch(self, adapter):
+        adapter._display_name = "Control"
+        await self._poll_with(adapter, _event("e1", content="Control is currently unhealthy", created_at=10))
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_ptagged_other_hyphenated_name_does_not_dispatch(self, adapter):
+        adapter._display_name = "Control"
+        control_deepseek_pubkey = "b" * 64
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "e1",
+                CHANNEL,
+                content="@Control-Deepseek please take this",
+                p=control_deepseek_pubkey,
+                created_at=10,
+            ),
+        )
+        assert adapter._dispatched == []
+
+    def test_leading_hyphenated_longer_name_not_stripped(self, adapter):
+        adapter._display_name = "Control"
+        assert adapter._strip_mention("@Control /whoami") == "/whoami"
+        assert adapter._strip_mention("Control /whoami") == "Control /whoami"
+        assert adapter._strip_mention("@Control-Deepseek /whoami") == "@Control-Deepseek /whoami"
 
     @pytest.mark.asyncio
     async def test_allowlist_blocks_unauthorized(self, adapter):
@@ -346,9 +393,10 @@ class TestDmClassification:
 
 
     @pytest.mark.asyncio
-    async def test_channel_like_metadata_blocks_latch_even_without_mention(self, adapter):
+    async def test_channel_like_metadata_blocks_latch_but_self_ptag_dispatches(self, adapter):
         """Second guard on its own: even a p-tagged, un-mentioned message
-        cannot reclassify a conversation whose metadata says real channel."""
+        cannot reclassify a conversation whose metadata says real channel.
+        The exact p-tag still addresses this gateway as a group message."""
         adapter._channel_meta[CHANNEL]["description"] = ""
         adapter._channel_meta[CHANNEL]["name"] = "announcements"
         await self._poll_with(
@@ -356,7 +404,7 @@ class TestDmClassification:
             _tagged_event("e1", CHANNEL, content="fyi everyone", p=SELF_PUBKEY),
         )
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
-        assert adapter._dispatched == []
+        assert [d["chat_type"] for d in adapter._dispatched] == ["group"]
 
 
     @pytest.mark.asyncio
@@ -536,5 +584,4 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
 

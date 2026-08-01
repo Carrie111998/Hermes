@@ -1009,7 +1009,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        if not is_dm and self.require_mention and not self._is_mentioned(content, event):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
@@ -1090,17 +1090,10 @@ class BuzzAdapter(BasePlatformAdapter):
         tags = event.get("tags")
         if not isinstance(tags, list):
             return False
-        p_tagged_to_self = any(
-            isinstance(tag, (list, tuple))
-            and len(tag) > 1
-            and tag[0] == "p"
-            and str(tag[1]).lower() == self._self_pubkey
-            for tag in tags
-        )
-        if not p_tagged_to_self:
+        if not self._is_p_tagged_to_self(event):
             return False
         content = event.get("content")
-        return isinstance(content, str) and not self._is_mentioned(content)
+        return isinstance(content, str) and not self._is_textually_mentioned(content)
 
     def _maybe_latch_dm(self, channel_id: str, state: dict, event: dict) -> None:
         """Latch a group conversation to chat_type="dm" once any direct
@@ -1112,15 +1105,41 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_names.setdefault(channel_id, "DM")
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
 
-    def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+    def _p_tag_targets(self, event: Optional[dict]) -> set:
+        """Return usable p-tag targets normalized to hex pubkeys."""
+        if not isinstance(event, dict):
+            return set()
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return set()
+        targets = set()
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) <= 1 or tag[0] != "p":
+                continue
+            normalized = _normalize_user_ref(str(tag[1]))
+            if normalized:
+                targets.add(normalized)
+        return targets
+
+    def _is_p_tagged_to_self(self, event: dict) -> bool:
+        return bool(self._self_pubkey and self._self_pubkey in self._p_tag_targets(event))
+
+    def _is_mentioned(self, content: str, event: Optional[dict] = None) -> bool:
+        """True when the message addresses this agent (p-tag, npub, hex, or name)."""
+        p_targets = self._p_tag_targets(event)
+        if p_targets:
+            return bool(self._self_pubkey and self._self_pubkey in p_targets)
+        return self._is_textually_mentioned(content)
+
+    def _is_textually_mentioned(self, content: str) -> bool:
+        """Fallback mention matching for legacy events without usable p-tags."""
         lowered = content.lower()
         if self._self_pubkey and self._self_pubkey in lowered:
             return True
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@{re.escape(self._display_name.lower())}(?![\w-])"
             if re.search(pattern, lowered):
                 return True
         return False
@@ -1139,16 +1158,16 @@ class BuzzAdapter(BasePlatformAdapter):
         text = content.strip()
         candidates = []
         if self._display_name:
-            candidates.append(re.escape(self._display_name))
+            candidates.append(rf"@{re.escape(self._display_name)}")
         if self._self_npub:
-            candidates.append(re.escape(self._self_npub))
+            candidates.append(rf"@?{re.escape(self._self_npub)}")
         if self._self_pubkey:
-            candidates.append(re.escape(self._self_pubkey))
+            candidates.append(rf"@?{re.escape(self._self_pubkey)}")
         if not candidates:
             return text
-        # Optional leading '@', one of the identity forms, optional trailing
-        # ':' or ',' and surrounding whitespace.
-        pattern = rf"^@?(?:{'|'.join(candidates)})[\s:,]*"
+        # Display names require an explicit '@'. Raw pubkey/npub identity forms
+        # retain the optional prefix for backwards compatibility.
+        pattern = rf"^(?:{'|'.join(candidates)})(?![\w-])[\s:,]*"
         stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
         return stripped.strip()
 
