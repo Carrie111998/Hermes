@@ -4083,17 +4083,25 @@ class MatrixAdapter(BasePlatformAdapter):
             content = getattr(event, "content", None)
             if content is None and isinstance(event, dict):
                 content = event.get("content", {})
-            if not isinstance(content, dict):
-                content = dict(content) if hasattr(content, "items") else {}
             if not content:
                 return None
-            # Edits (m.replace) carry the latest text in m.new_content.
-            new_content = content.get("m.new_content")
-            if isinstance(new_content, dict):
-                content = new_content
-            body = str(content.get("body", "") or "")
+            # mautrix deserializes content into typed objects (e.g.
+            # TextMessageEventContent) with .body / .msgtype attributes.
+            body = ""
+            if isinstance(content, dict):
+                body = str(content.get("body", "") or "")
+            else:
+                body = str(getattr(content, "body", "") or "")
             if not body:
                 return None
+            # Edits (m.replace) carry the latest text in m.new_content.
+            new_content = None
+            if isinstance(content, dict):
+                new_content = content.get("m.new_content")
+            else:
+                new_content = getattr(content, "m.new_content", None)
+            if isinstance(new_content, dict):
+                body = str(new_content.get("body", "") or "") or body
             # Strip the leading "* " edit marker.
             if body.startswith("* "):
                 body = body[2:]
