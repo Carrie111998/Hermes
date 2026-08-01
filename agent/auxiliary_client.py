@@ -3470,6 +3470,9 @@ def _is_rate_limit_error(exc: Exception) -> bool:
             "balance_depleted", "no usable credits",
             "model_not_supported_on_free_tier",
             "not available on the free tier",
+            # Mirror _is_payment_error entitlement phrases so z.ai 429/1311
+            # plan-blocks are not dual-classified as rate limits.
+            "subscription plan", "does not yet include", "plan does not include",
         )):
             return True
     return False
