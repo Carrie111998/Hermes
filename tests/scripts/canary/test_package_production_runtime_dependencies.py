@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import os
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -60,6 +63,10 @@ def test_exact_release_local_node_browser_and_ddgs_contract() -> None:
     assert package.NODE_ARCHIVE_SHA256 == (
         "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
     )
+    assert package.NPM_VERSION == "11.9.0"
+    assert package.NPM_ARCHIVE_SHA256 == (
+        "5a172e3228e59d44cb9f44d5e83977178323bba3cc506016cae8e40b92ad418f"
+    )
     assert package.CHROME_VERSION == "150.0.7871.114"
     assert package.CHROME_ARCHIVE_SHA256 == (
         "03963c0dd9bf91e9b0e760cff37680f9b92ff42758182286382787622323cf9d"
@@ -76,6 +83,64 @@ def test_exact_release_local_node_browser_and_ddgs_contract() -> None:
     assert package.AGENT_BROWSER_CONFIG_BYTES == b"{}\n"
     assert package.DDGS_LOCKED_DISTRIBUTIONS["ddgs"] == "9.14.4"
     assert len(package.DDGS_LOCKED_DISTRIBUTIONS) == 17
+
+
+def _npm_archive(*, version: str, member_name: str = "package/package.json") -> bytes:
+    payload = json.dumps({"name": "npm", "version": version}).encode("utf-8")
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as bundle:
+        member = tarfile.TarInfo(member_name)
+        member.size = len(payload)
+        member.mode = 0o444
+        bundle.addfile(member, io.BytesIO(payload))
+    return output.getvalue()
+
+
+def test_compatible_npm_is_exactly_pinned_and_replaces_bundled_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "release"
+    target = release / package.NPM_ROOT
+    target.mkdir(parents=True)
+    (target / "stale").write_text("bundled npm", encoding="utf-8")
+    archive = _npm_archive(version=package.NPM_VERSION)
+
+    monkeypatch.setattr(package, "NPM_ARCHIVE_SIZE", len(archive))
+    monkeypatch.setattr(package, "NPM_ARCHIVE_SHA256", hashlib.sha256(archive).hexdigest())
+    monkeypatch.setattr(package.urllib.request, "urlopen", lambda *_args, **_kwargs: io.BytesIO(archive))
+
+    package._install_compatible_npm(release)
+
+    assert not (target / "stale").exists()
+    assert json.loads((target / "package.json").read_text(encoding="utf-8")) == {
+        "name": "npm",
+        "version": package.NPM_VERSION,
+    }
+    assert not (release / f"ops/muncho/runtime/dependencies/npm-{package.NPM_VERSION}.tgz").exists()
+
+
+def test_compatible_npm_archive_cannot_escape_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    archive = _npm_archive(
+        version=package.NPM_VERSION,
+        member_name="package/../escaped",
+    )
+    monkeypatch.setattr(package, "NPM_ARCHIVE_SIZE", len(archive))
+    monkeypatch.setattr(package, "NPM_ARCHIVE_SHA256", hashlib.sha256(archive).hexdigest())
+    monkeypatch.setattr(package.urllib.request, "urlopen", lambda *_args, **_kwargs: io.BytesIO(archive))
+
+    with pytest.raises(
+        package.RuntimeDependencyError,
+        match="runtime_dependency_npm_archive_invalid",
+    ):
+        package._install_compatible_npm(release)
+
+    assert not (release / "escaped").exists()
 
 
 def test_committed_locks_close_every_ddgs_wheel_and_agent_browser() -> None:

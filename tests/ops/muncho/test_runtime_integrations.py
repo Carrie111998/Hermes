@@ -950,6 +950,51 @@ def test_deploy_staging_dependency_package_is_final_address_bound():
     assert syntax.returncode == 0, syntax.stderr
 
 
+def test_deploy_packaging_failure_is_terminal_and_cleans_inactive_staging(
+    tmp_path,
+):
+    helper = RUNTIME / "muncho-auto-deploy-release"
+    staging = tmp_path / ".hermes-agent-aaaaaaaaaaaa.tmp.123"
+    staging.mkdir()
+    (staging / "partial-install").write_text("inert", encoding="utf-8")
+    status_log = tmp_path / "status.log"
+    script = r'''
+set -euo pipefail
+source "$1"
+STATUS_LOG="$2"
+RELEASES="$(dirname "$3")"
+write_status() {
+  printf 'status=%s sha=%s pr=%s extra=%s\n' "$1" "$2" "$3" "$4" > "$STATUS_LOG"
+}
+set +e
+run_release_packaging_step \
+  "runtime_dependency_prepare" \
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  "217" \
+  "$3" \
+  bash -c 'exit 23'
+rc=$?
+set -e
+printf 'rc=%s\n' "$rc"
+'''
+    completed = subprocess.run(
+        ["bash", "-c", script, "packaging-failure", str(helper), str(status_log), str(staging)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "rc=5"
+    assert not staging.exists()
+    status = status_log.read_text(encoding="utf-8")
+    assert "status=blocked_target_release_packaging_failed" in status
+    assert '"stage": "runtime_dependency_prepare"' in status
+    assert '"command_exit_code": 23' in status
+    assert '"staging_cleanup_succeeded": true' in status
+
+
 def test_deploy_reinstalls_and_attests_entrypoints_at_final_address():
     helper = RUNTIME / "muncho-auto-deploy-release"
     source = helper.read_text(encoding="utf-8")

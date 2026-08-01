@@ -2583,6 +2583,63 @@ fail_after_activation() {
   return 10
 }
 
+record_release_packaging_failure() {
+  local stage="$1"
+  local sha="$2"
+  local pr="$3"
+  local tmp="$4"
+  local command_rc="$5"
+  local cleanup_succeeded="true"
+  local expected_tmp_prefix="$RELEASES/.hermes-agent-${sha:0:12}.tmp."
+  local tmp_suffix=""
+
+  case "$stage" in
+    runtime_dependency_prepare|agent_browser_config_seal|runtime_dependency_manifest|cutover_artifact_build|runtime_dependency_verify|cutover_artifact_verify|python_compile_smoke|routeback_import_smoke)
+      ;;
+    *)
+      stage="invalid_packaging_stage"
+      ;;
+  esac
+  if [[ "$tmp" == "$expected_tmp_prefix"* ]]; then
+    tmp_suffix="${tmp:${#expected_tmp_prefix}}"
+  fi
+  if [[ ! "$tmp_suffix" =~ ^[0-9]+$ ]]; then
+    stage="invalid_staging_address"
+    cleanup_succeeded="false"
+  elif ! rm -rf -- "$tmp"; then
+    cleanup_succeeded="false"
+  fi
+  write_status "blocked_target_release_packaging_failed" "$sha" "$pr" \
+    "{\"stage\": \"$stage\", \"command_exit_code\": $command_rc, \"staging_cleanup_succeeded\": $cleanup_succeeded}"
+  return 5
+}
+
+run_release_packaging_step() {
+  local stage="$1"
+  local sha="$2"
+  local pr="$3"
+  local tmp="$4"
+  shift 4
+  local command_rc=0
+
+  if "$@"; then
+    return 0
+  else
+    command_rc=$?
+  fi
+  record_release_packaging_failure "$stage" "$sha" "$pr" "$tmp" "$command_rc"
+}
+
+run_routeback_context_import_smoke() {
+  local release="$1"
+  sudo -n -u "$OWNER" bash -lc "cd '$release' && .venv/bin/python - <<'PY'
+from gateway.canonical_brain_routeback_context import RouteBackCaseContext, build_routeback_context_prompt
+ctx = RouteBackCaseContext(case_id='case:auto-sync-deploy-smoke', source_thread_id='source-thread')
+assert 'concrete next-action artifact' in build_routeback_context_prompt([ctx])
+print('routeback_context_import_smoke=ok')
+PY"
+}
+
 run_deploy() {
   local sha="$1"
   local pr="$2"
@@ -2673,41 +2730,53 @@ run_deploy() {
         "{\"stage\": \"pre_release_packaging\"}"
       exit 5
     fi
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "runtime_dependency_prepare" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_runtime_dependencies.py" prepare \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" >/dev/null
-    seal_agent_browser_config "$tmp" "$sha" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "agent_browser_config_seal" "$sha" "$pr" "$tmp" \
+      seal_agent_browser_config "$tmp" "$sha" >/dev/null
+    run_release_packaging_step \
+      "runtime_dependency_manifest" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_runtime_dependencies.py" build-manifest \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "cutover_artifact_build" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_cutover_artifacts.py" build \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" \
       --unit-inputs "$CUTOVER_UNIT_INPUTS_PATH" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "runtime_dependency_verify" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_runtime_dependencies.py" verify \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" >/dev/null
-    sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
+    run_release_packaging_step \
+      "cutover_artifact_verify" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" "$tmp/.venv/bin/python" -I \
       "$tmp/scripts/canary/package_production_cutover_artifacts.py" verify \
       --release-root "$tmp" \
       --release-address "$new" \
       --revision "$sha" \
       --unit-inputs "$CUTOVER_UNIT_INPUTS_PATH" >/dev/null
-    sudo -n -u "$OWNER" bash -lc "cd '$tmp' && .venv/bin/python -m py_compile gateway/run.py hermes_cli/main.py scripts/run_tests_parallel.py"
-    sudo -n -u "$OWNER" bash -lc "cd '$tmp' && .venv/bin/python - <<'PY'
-from gateway.canonical_brain_routeback_context import RouteBackCaseContext, build_routeback_context_prompt
-ctx = RouteBackCaseContext(case_id='case:auto-sync-deploy-smoke', source_thread_id='source-thread')
-assert 'concrete next-action artifact' in build_routeback_context_prompt([ctx])
-print('routeback_context_import_smoke=ok')
-PY"
+    run_release_packaging_step \
+      "python_compile_smoke" "$sha" "$pr" "$tmp" \
+      sudo -n -u "$OWNER" bash -lc \
+      "cd '$tmp' && .venv/bin/python -m py_compile gateway/run.py hermes_cli/main.py scripts/run_tests_parallel.py"
+    run_release_packaging_step \
+      "routeback_import_smoke" "$sha" "$pr" "$tmp" \
+      run_routeback_context_import_smoke "$tmp"
     require_inactive_target_with_unchanged_active \
       "$sha" "$pr" "$active" "$new" "pre_release_publish" || {
       publish_rc=$?

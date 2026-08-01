@@ -3,10 +3,11 @@
 
 The production release is deliberately self-contained: it does not resolve
 ``agent-browser`` through PATH/npx, import an arbitrary DDGS installation, or
-download a browser after activation.  This packager installs npm bytes from the
-committed package lock, Python wheels from the committed uv lock with hash
-checking, and one fixed Chrome-for-Testing archive whose URL and digest are
-part of this source contract.
+download a browser after activation.  This packager installs one fixed,
+engine-compatible npm before resolving bytes from the committed package lock,
+Python wheels from the committed uv lock with hash checking, and one fixed
+Chrome-for-Testing archive whose URL and digest are part of this source
+contract.
 
 The implementation is packaged in the Hermes wheel so an immutable release
 executes the code it just installed, rather than a source-tree helper.  The
@@ -71,6 +72,11 @@ NODE_ARCHIVE_SIZE = 31_511_588
 NODE_ROOT = Path("ops/muncho/runtime/dependencies/node-linux-x64")
 NODE_EXECUTABLE = NODE_ROOT / "bin/node"
 NPM_EXECUTABLE = NODE_ROOT / "bin/npm"
+NPM_VERSION = "11.9.0"
+NPM_URL = f"https://registry.npmjs.org/npm/-/npm-{NPM_VERSION}.tgz"
+NPM_ARCHIVE_SHA256 = "5a172e3228e59d44cb9f44d5e83977178323bba3cc506016cae8e40b92ad418f"
+NPM_ARCHIVE_SIZE = 2_413_625
+NPM_ROOT = NODE_ROOT / "lib/node_modules/npm"
 NPM_CACHE_RELATIVE_PATH = RUNTIME_DEPENDENCY_NPM_CACHE_RELATIVE_PATH
 NPM_CACHE_MAX_ENTRIES = 50_000
 NPM_CACHE_MAX_BYTES = 512 * 1024 * 1024
@@ -681,6 +687,95 @@ def _install_node_runtime(release: Path) -> None:
     archive.unlink()
 
 
+def _install_compatible_npm(release: Path) -> None:
+    """Replace Node's bundled npm with the exact engine-compatible release."""
+
+    archive = release / f"ops/muncho/runtime/dependencies/npm-{NPM_VERSION}.tgz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(NPM_URL, timeout=60) as response, archive.open("wb") as output:
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > NPM_ARCHIVE_SIZE:
+                    raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except (OSError, RuntimeDependencyError) as exc:
+        archive.unlink(missing_ok=True)
+        if isinstance(exc, RuntimeDependencyError):
+            raise
+        raise RuntimeDependencyError("runtime_dependency_npm_download_failed") from exc
+    if size != NPM_ARCHIVE_SIZE or digest.hexdigest() != NPM_ARCHIVE_SHA256:
+        archive.unlink(missing_ok=True)
+        raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+
+    target = release / NPM_ROOT
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, mode=0o755)
+    try:
+        with tarfile.open(archive, mode="r:gz") as bundle:
+            members = bundle.getmembers()
+            if not 1 <= len(members) <= 5_000:
+                raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+            total = 0
+            for member in members:
+                path = Path(member.name)
+                if not path.parts or path.parts[0] != "package" or ".." in path.parts:
+                    raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+                relative = Path(*path.parts[1:])
+                if not relative.parts:
+                    continue
+                destination = target / relative
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    destination.chmod(0o755)
+                    continue
+                if not member.isfile() or member.size > 16 * 1024 * 1024:
+                    raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+                total += member.size
+                if total > 64 * 1024 * 1024:
+                    raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with source, destination.open("xb") as output:
+                    copied = 0
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        output.write(chunk)
+                    if copied != member.size:
+                        raise RuntimeDependencyError("runtime_dependency_npm_archive_invalid")
+                destination.chmod(0o555 if member.mode & 0o111 else 0o444)
+    except (OSError, tarfile.TarError) as exc:
+        raise RuntimeDependencyError("runtime_dependency_npm_extract_failed") from exc
+    finally:
+        archive.unlink(missing_ok=True)
+
+    package = target / "package.json"
+    try:
+        metadata = json.loads(
+            _read_regular(package, maximum=1024 * 1024).decode(
+                "utf-8", errors="strict"
+            )
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeDependencyError("runtime_dependency_npm_package_invalid") from exc
+    if not isinstance(metadata, Mapping) or metadata.get("version") != NPM_VERSION:
+        raise RuntimeDependencyError("runtime_dependency_npm_version_invalid")
+
+
 def _install_chrome(release: Path) -> None:
     archive = release / "ops/muncho/runtime/dependencies/chrome-linux64.zip"
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -885,6 +980,8 @@ def _manifest_value(
         raise RuntimeDependencyError("runtime_dependency_chrome_version_invalid")
     if node_version.stdout.decode("ascii", errors="strict").strip() != f"v{NODE_VERSION}":
         raise RuntimeDependencyError("runtime_dependency_node_version_invalid")
+    if npm_version.stdout.decode("ascii", errors="strict").strip() != NPM_VERSION:
+        raise RuntimeDependencyError("runtime_dependency_npm_version_invalid")
     unsigned = {
         "schema": MANIFEST_SCHEMA,
         "release_revision": revision,
@@ -904,6 +1001,9 @@ def _manifest_value(
             "node_url": NODE_URL,
             "node_archive_sha256": NODE_ARCHIVE_SHA256,
             "node_archive_size": NODE_ARCHIVE_SIZE,
+            "npm_url": NPM_URL,
+            "npm_archive_sha256": NPM_ARCHIVE_SHA256,
+            "npm_archive_size": NPM_ARCHIVE_SIZE,
         },
         "agent_browser": {
             "version": AGENT_BROWSER_VERSION,
@@ -1058,6 +1158,7 @@ def prepare_release_dependencies(
     _validate_node_lock(release)
     _install_python(release, requirements)
     _install_node_runtime(release)
+    _install_compatible_npm(release)
     _install_node(release)
     _install_chrome(release)
     _install_agent_browser_config(release)
@@ -1121,7 +1222,8 @@ def _main(argv: list[str] | None = None) -> int:
                 args.revision,
                 release_address=release_address,
             )
-    except (OSError, RuntimeDependencyError):
+    except (OSError, RuntimeDependencyError) as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     digest_name = (
         "preparation_sha256"
