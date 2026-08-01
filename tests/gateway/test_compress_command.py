@@ -1,6 +1,8 @@
 """Tests for gateway /compress user-facing messaging."""
 
+import asyncio
 from datetime import datetime
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -56,6 +58,113 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store._save = MagicMock()
     runner._session_db = None
     return runner
+
+
+@pytest.mark.asyncio
+async def test_compress_command_constructs_agent_off_event_loop():
+    """Manual compression must isolate the same context-engine start hook."""
+    history = _make_history()
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+    agent_instance._compression_skipped_due_to_lock = False
+    constructor_threads = []
+
+    def _construct_agent(**_kwargs):
+        constructor_threads.append(threading.get_ident())
+        return agent_instance
+
+    loop_thread = threading.get_ident()
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", side_effect=_construct_agent),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    assert constructor_threads
+    assert all(thread_id != loop_thread for thread_id in constructor_threads)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_temporary_agent_construction_cleans_eventual_agent():
+    """Cancellation cannot orphan an agent still constructing in the executor."""
+    runner = _make_runner(_make_history())
+    construction_started = threading.Event()
+    release_construction = threading.Event()
+    agent_instance = MagicMock()
+    agent_instance._end_session_on_close = True
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+
+    def _construct_agent():
+        construction_started.set()
+        assert release_construction.wait(timeout=3)
+        return agent_instance
+
+    try:
+        construction_task = asyncio.create_task(
+            runner._construct_temporary_agent_off_loop(
+                _construct_agent,
+                context="cancelled construction test",
+            )
+        )
+        assert await asyncio.to_thread(construction_started.wait, 1)
+        construction_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await construction_task
+
+        deferred_tasks = list(runner._deferred_agent_cleanup_tasks)
+        assert len(deferred_tasks) == 1
+        release_construction.set()
+        await asyncio.gather(*deferred_tasks)
+
+        assert agent_instance._end_session_on_close is False
+        agent_instance.shutdown_memory_provider.assert_called_once()
+        agent_instance.close.assert_called_once()
+    finally:
+        release_construction.set()
+        runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_reports_noop_without_success_banner():
+    history = _make_history()
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    def _estimate(messages, **_kwargs):
+        assert messages == history
+        return 100
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "No changes from compression" in result
+    assert "Compressed:" not in result
+    assert "Approx request size: ~100 tokens (unchanged)" in result
+    agent_instance.shutdown_memory_provider.assert_called_once()
+    agent_instance.close.assert_called_once()
 
 
 @pytest.mark.asyncio

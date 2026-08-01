@@ -55,7 +55,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -1244,6 +1244,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Standalone adapters (primarily tests/embedders without a GatewayRunner)
+        # retain late cleanup tasks when executor-backed construction outlives a
+        # cancelled /v1/runs wrapper.
+        self._deferred_run_agent_cleanup_tasks: set["asyncio.Task"] = set()
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -1296,6 +1300,95 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return 0
+
+    def _defer_run_agent_cleanup_until_construction_done(
+        self,
+        future: "asyncio.Future[Any]",
+    ) -> None:
+        """Clean up a run agent whose worker constructor outlived cancellation."""
+
+        async def _cleanup_when_constructed() -> None:
+            try:
+                agent = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Deferred API run agent construction finished with an error: %s",
+                    exc,
+                )
+                return
+
+            try:
+                agent._end_session_on_close = False
+            except Exception:
+                pass
+
+            runner = getattr(self, "gateway_runner", None)
+            cleanup_candidate = getattr(
+                runner,
+                "_cleanup_agent_resources_off_loop",
+                None,
+            )
+            if callable(cleanup_candidate) and asyncio.iscoroutinefunction(
+                cleanup_candidate
+            ):
+                cleanup = cast(Callable[..., Awaitable[None]], cleanup_candidate)
+                await cleanup(
+                    agent,
+                    context="API run construction cancellation",
+                )
+                return
+
+            def _cleanup_without_runner() -> None:
+                try:
+                    shutdown = getattr(agent, "shutdown_memory_provider", None)
+                    if callable(shutdown):
+                        shutdown()
+                except Exception:
+                    pass
+                try:
+                    close = getattr(agent, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    pass
+
+            await asyncio.to_thread(_cleanup_without_runner)
+
+        task = asyncio.create_task(_cleanup_when_constructed())
+        self._deferred_run_agent_cleanup_tasks.add(task)
+        task.add_done_callback(self._deferred_run_agent_cleanup_tasks.discard)
+
+    async def _construct_run_agent_off_loop(
+        self,
+        factory: Callable[[], Any],
+    ) -> Any:
+        """Construct a /v1/runs agent off-loop and retain cleanup on cancellation."""
+        runner = getattr(self, "gateway_runner", None)
+        construct_candidate = getattr(
+            runner,
+            "_construct_temporary_agent_off_loop",
+            None,
+        )
+        if callable(construct_candidate) and asyncio.iscoroutinefunction(
+            construct_candidate
+        ):
+            construct = cast(Callable[..., Awaitable[Any]], construct_candidate)
+            return await construct(
+                factory,
+                context="API run construction cancellation",
+            )
+
+        # APIServerAdapter is also used standalone in tests and embedders. Keep
+        # that path context-preserving and cancellation-safe too; asyncio.to_thread
+        # copies the current Context and a shielded Task keeps the result reachable.
+        future = asyncio.create_task(asyncio.to_thread(factory))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            self._defer_run_agent_cleanup_until_construction_done(future)
+            raise
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -6234,16 +6327,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return
                 with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=agent_overrides.get("requested_model"),
-                        requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
+                    agent = await self._construct_run_agent_off_loop(
+                        lambda: self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=_text_cb,
+                            tool_progress_callback=event_cb,
+                            gateway_session_key=gateway_session_key,
+                            requested_model=agent_overrides.get("requested_model"),
+                            requested_provider=agent_overrides.get("requested_provider"),
+                            model_options=agent_overrides.get("model_options"),
+                            route=route,
+                        )
                     )
                 self._active_run_agents[run_id] = agent
 

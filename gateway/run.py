@@ -9173,6 +9173,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # loop is never blocked; mirrors the /new reset path's fix (#35994).
     _CLEANUP_TIMEOUT_S = 30.0
 
+    def _defer_agent_cleanup_until_construction_done(
+        self,
+        future: asyncio.Future,
+        *,
+        context: str,
+    ) -> None:
+        """Clean up an agent whose off-loop constructor outlived its caller.
+
+        Executor work cannot be cancelled once it has started. Keep the
+        shielded construction task alive, then apply the same temporary-agent
+        session and resource cleanup once the constructor really returns.
+        """
+
+        async def _cleanup_when_constructed() -> None:
+            try:
+                agent = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Loop shutdown can cancel this waiter. The executor is already
+                # shutting down independently, so do not block teardown here.
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Deferred agent construction%s finished with an error: %s",
+                    f" ({context})" if context else "",
+                    exc,
+                )
+                return
+            try:
+                agent._end_session_on_close = False
+            except Exception:
+                pass
+            await self._cleanup_agent_resources_off_loop(agent, context=context)
+
+        task = asyncio.create_task(_cleanup_when_constructed())
+        tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._deferred_agent_cleanup_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _construct_temporary_agent_off_loop(
+        self,
+        factory,
+        *,
+        context: str,
+    ) -> Any:
+        """Construct a temporary agent off-loop without leaking on cancellation."""
+        future = asyncio.ensure_future(self._run_in_executor_with_context(factory))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            self._defer_agent_cleanup_until_construction_done(
+                future,
+                context=context,
+            )
+            raise
+
     def _defer_agent_cleanup_until_future_done(
         self,
         future: asyncio.Future,
@@ -16116,15 +16174,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc_info=True,
                                     )
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_memory=True,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                    session_db=_hyg_session_db,
+                                # A context engine's synchronous lifecycle hook is
+                                # plugin code and may perform provider-backed work.
+                                # Construct the helper behind the same
+                                # context-propagating executor boundary as normal
+                                # gateway agents so it can never stall platform
+                                # heartbeats on the asyncio event loop.
+                                _hyg_agent = await self._construct_temporary_agent_off_loop(
+                                    lambda: AIAgent(
+                                        **_hyg_runtime,
+                                        model=_hyg_model,
+                                        max_iterations=4,
+                                        quiet_mode=True,
+                                        skip_memory=True,
+                                        enabled_toolsets=["memory"],
+                                        session_id=session_entry.session_id,
+                                        session_db=_hyg_session_db,
+                                    ),
+                                    context="session hygiene construction cancellation",
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -16161,15 +16228,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                    loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
-                                    _hyg_future = loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
-                                            _hyg_msgs, "",
-                                            approx_tokens=_approx_tokens,
-                                            commit_fence=_hyg_commit_fence,
-                                        ),
+                                    _hyg_future = asyncio.ensure_future(
+                                        self._run_in_executor_with_context(
+                                            lambda: _hyg_agent._compress_context(
+                                                _hyg_msgs,
+                                                "",
+                                                approx_tokens=_approx_tokens,
+                                                commit_fence=_hyg_commit_fence,
+                                            )
+                                        )
                                     )
                                     try:
                                         # Progress-aware wait: the timeout is an

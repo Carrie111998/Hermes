@@ -11,7 +11,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -144,6 +144,108 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_blocking_agent_construction_does_not_block_event_loop(
+        self, adapter
+    ):
+        """A blocking context-engine startup hook must not stall aiohttp."""
+        app = _create_runs_app(adapter)
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        loop_serviced = threading.Event()
+        callback_ran_before_release = []
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        def _construct_agent(**_kwargs):
+            construction_started.set()
+            assert release_construction.wait(timeout=3)
+            return mock_agent
+
+        loop = asyncio.get_running_loop()
+
+        def _release_after_loop_probe():
+            assert construction_started.wait(timeout=2)
+            loop.call_soon_threadsafe(loop_serviced.set)
+            callback_ran_before_release.append(loop_serviced.wait(timeout=1))
+            release_construction.set()
+
+        controller = threading.Thread(
+            target=_release_after_loop_probe,
+            daemon=True,
+        )
+        controller.start()
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", side_effect=_construct_agent):
+                    resp = await cli.post("/v1/runs", json={"input": "hello"})
+                    assert resp.status == 202
+        finally:
+            release_construction.set()
+            await asyncio.to_thread(controller.join, 2)
+
+        assert callback_ran_before_release == [True], (
+            "the API server event loop did not service a scheduled callback "
+            "while agent construction was blocked"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_run_agent_construction_cleans_eventual_agent(self, adapter):
+        """Cancellation cannot orphan an API agent still constructing off-loop."""
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        mock_agent = MagicMock()
+        mock_agent._end_session_on_close = True
+        mock_agent.shutdown_memory_provider = MagicMock()
+        mock_agent.close = MagicMock()
+
+        def _construct_agent():
+            construction_started.set()
+            assert release_construction.wait(timeout=3)
+            return mock_agent
+
+        construction_task = asyncio.create_task(
+            adapter._construct_run_agent_off_loop(_construct_agent)
+        )
+        try:
+            assert await asyncio.to_thread(construction_started.wait, 1)
+            construction_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await construction_task
+
+            deferred_tasks = list(adapter._deferred_run_agent_cleanup_tasks)
+            assert len(deferred_tasks) == 1
+            release_construction.set()
+            await asyncio.gather(*deferred_tasks)
+
+            assert mock_agent._end_session_on_close is False
+            mock_agent.shutdown_memory_provider.assert_called_once()
+            mock_agent.close.assert_called_once()
+        finally:
+            release_construction.set()
+
+    @pytest.mark.asyncio
+    async def test_run_agent_construction_reuses_gateway_boundary(self, adapter):
+        """Production adapters reuse the runner's proven construction boundary."""
+        expected_agent = MagicMock()
+        runner = MagicMock()
+        runner._construct_temporary_agent_off_loop = AsyncMock(
+            return_value=expected_agent
+        )
+        adapter.gateway_runner = runner
+        factory = MagicMock()
+
+        result = await adapter._construct_run_agent_off_loop(factory)
+
+        assert result is expected_agent
+        runner._construct_temporary_agent_off_loop.assert_awaited_once_with(
+            factory,
+            context="API run construction cancellation",
+        )
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -357,8 +459,8 @@ class TestRunEvents:
                 victim_run = (await victim_resp.json())["run_id"]
                 attacker_run = (await attacker_resp.json())["run_id"]
 
-                victim_ready.wait(timeout=3.0)
-                attacker_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(victim_ready.wait, 3.0)
+                assert await asyncio.to_thread(attacker_ready.wait, 3.0)
                 assert auth_adapter._run_approval_sessions[victim_run] == victim_run
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
@@ -424,7 +526,7 @@ class TestRunLifecycleSweep:
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
 
                 task = adapter._active_run_tasks[run_id]
                 assert isinstance(task, asyncio.Task)
@@ -503,7 +605,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
-                assert started.wait(timeout=3)
+                assert await asyncio.to_thread(started.wait, 3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
@@ -540,7 +642,7 @@ class TestStopRun:
                 run_id = data["run_id"]
 
                 # Wait for agent to start running in the thread
-                agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
                 await asyncio.sleep(0.1)
 
                 # Verify agent ref is stored
@@ -582,7 +684,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
                 await asyncio.sleep(0.1)
 
                 # Subscribe to events in background

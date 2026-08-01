@@ -896,3 +896,129 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     return runner, adapter, event
 
 
+@pytest.mark.asyncio
+async def test_session_hygiene_blocking_context_engine_start_does_not_block_loop(
+    monkeypatch, tmp_path
+):
+    """A synchronous context-engine startup hook must run off the gateway loop."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    init_started = threading.Event()
+    release_init = threading.Event()
+    loop_serviced = threading.Event()
+    callback_ran_before_release = []
+
+    class BlockingContextEngine:
+        def on_session_start(self):
+            init_started.set()
+            assert release_init.wait(timeout=3)
+
+    class BlockingLifecycleAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self._last_compaction_in_place = False
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            self.engine = BlockingContextEngine()
+            type(self).last_instance = self
+            # Mirrors AIAgent.__init__ invoking the selected context engine's
+            # synchronous lifecycle hook.
+            self.engine.on_session_start()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            return (messages, None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = BlockingLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-blocking-start",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(
+        6, content_size=400
+    )
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def release_after_loop_probe():
+        assert init_started.wait(timeout=2)
+        loop.call_soon_threadsafe(loop_serviced.set)
+        callback_ran_before_release.append(loop_serviced.wait(timeout=1))
+        release_init.set()
+
+    controller = threading.Thread(target=release_after_loop_probe, daemon=True)
+    controller.start()
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message(event)
+    controller.join(timeout=2)
+
+    assert result == "ok"
+    assert callback_ran_before_release == [True], (
+        "the gateway event loop did not service a scheduled callback while the "
+        "context engine's on_session_start hook was blocked"
+    )
+    assert BlockingLifecycleAgent.last_instance is not None
