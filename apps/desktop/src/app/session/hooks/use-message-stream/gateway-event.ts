@@ -10,7 +10,7 @@ import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
-import { playCompletionSound } from '@/lib/completion-sound'
+import { playApprovalSound, playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { modelOptionsQueryKey } from '@/lib/model-options'
@@ -938,6 +938,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId) {
           updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
         }
+
+        // OS notifications can be silently swallowed by macOS (ad-hoc signed
+        // builds never enter the notification registry), so a blocked approval
+        // may otherwise go completely unnoticed while the user is in another
+        // session or another app. The WebAudio cue and the in-app toast need no
+        // macOS permission, so they are the reliable attention channel. The
+        // native notification is still dispatched for builds where it works.
+        playApprovalSound(sessionId ?? undefined)
+        notify({
+          durationMs: 0,
+          kind: 'warning',
+          message: command || description,
+          title: translateNow('notifications.native.approvalTitle')
+        })
 
         dispatchNativeNotification({
           actions: [
