@@ -137,6 +137,7 @@ def test_builder_assets_preserve_debian_12_boundary_contract() -> None:
         ),
     ]
     assert _lines(TMPFILES) == [
+        "d /var/lib/muncho-release-updates 0755 root root -",
         (
             "f /run/lock/muncho-release-builder-promotion.lock "
             "0440 root muncho-release-builder -"

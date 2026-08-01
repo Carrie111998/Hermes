@@ -1,8 +1,44 @@
 # Pinned release updater foundation
 
-This directory currently contains only the isolated, unprivileged release
-builder boundary.  Nothing here installs, enables, starts, or schedules a
-production release update.
+This directory contains the isolated, unprivileged release-builder boundary
+and a deliberately inert bootstrap for a dedicated unit-input rotation
+stager.  Nothing here enables, starts, or schedules a production release
+update.
+
+The rotation-stager bootstrap is narrower than the dormant updater.  A
+root-only create-only author publishes one exact Git tree, one externally
+verified complete Linux/x86_64 wheelhouse, and digest-pinned ``uv`` and system
+Python inputs to the builder.  The output starts empty and builder-owned.  A
+separate installer may place the sysusers/tmpfiles contracts, builder unit,
+and fixed builder/promoter/stager wrappers, but it neither reloads systemd nor
+enables or starts any unit.  Promotion publishes an unreachable root-owned
+release; the stager wrapper verifies that whole release before using its
+pinned interpreter.  Neither authoring, installation, building, nor promotion
+changes a release symlink, gateway, application data, or credentials.
+
+Foundation code is revision-qualified.  Each exact source revision is
+published create-only below
+`/usr/lib/muncho-release-updater-releases/<40-hex-revision>/`; the shared v2
+wrapper and v2 builder template select only that exact directory through
+protocol enums.  A newer foundation therefore never overwrites or silently
+changes the bytes that built an older job.  The installer remains inert: a
+separate, explicit `systemctl daemon-reload` is required before a newly
+created template can be used, and installation still never enables or starts
+it.  The original fixed-v1 foundation remains immutable audit evidence and is
+not used by the v2 rotation-stager promotion path.
+
+The v3 template is the production promotion boundary.  It uses
+`RemainAfterExit=yes` so a completed oneshot remains `active/exited` with no
+process while systemd retains the trusted invocation ID.  Promotion still
+proves `MainPID=0`, `ExecMainPID=0`, an empty cgroup, no processes under the
+builder UID, and the same invocation and state in both observations.  The v2
+template remains immutable evidence of the earlier portability discovery and
+is never overwritten.
+
+Wheel resolution is intentionally not part of the privileged author.  It
+accepts only an already-verified, self-hashed manifest declaring a complete
+transitive closure for CPython 3.11 on Linux x86_64 and revalidates the exact
+closed directory inventory, sizes, and SHA-256 digests without network access.
 
 The Stage C transaction is deliberately fail-closed and is **not yet an
 operational updater**:
@@ -13,8 +49,9 @@ operational updater**:
 - the production host-action backend exposes only read-only validation and
   observation; every host mutation phase returns
   `production_release_host_action_primitive_unavailable`;
-- no production runner, recovery-gate unit, boot scanner, or installer is
-  shipped.
+- no production updater runner, recovery-gate unit, boot scanner, or updater
+  activation installer is shipped.  The inert rotation-stager foundation
+  above is not an updater activation path.
 
 One fixed-root recovery coordinator now exists as a dormant library boundary.
 It has no arguments and no activation surface.  While holding the global

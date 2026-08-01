@@ -29,6 +29,7 @@ import json
 import os
 import pwd
 import re
+import resource
 import stat
 import subprocess
 import sys
@@ -60,6 +61,30 @@ PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256 = (
 PRODUCTION_BUILDER_WRAPPER_SHA256 = (
     "6fcbeaf6a30ad5afee5b0beef3a22633c19d68a1758c2c02e33e627d395e2585"
 )
+PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT = Path(
+    "/etc/systemd/system/muncho-release-builder-v2@.service"
+)
+PRODUCTION_REVISION_BUILDER_WRAPPER = Path(
+    "/usr/libexec/muncho-release-foundation-exec-v2"
+)
+PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256 = (
+    "821bc34ffbdce9ff1d2c4631277eb154feaaf7bf8f57fc7824f19b4119589ab4"
+)
+PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256 = (
+    "5af9bc0826f436e2ae4951bc23dca4b0b90f55f0712c4c92a782d1744328861c"
+)
+PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT = Path(
+    "/etc/systemd/system/muncho-release-builder-v3@.service"
+)
+PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER = Path(
+    "/usr/libexec/muncho-release-foundation-exec-v3"
+)
+PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT_SHA256 = (
+    "1a2e1a99b76ce7f841d4db418d7337b812dca90d17de5d56d92dff944c75f338"
+)
+PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER_SHA256 = (
+    "5af9bc0826f436e2ae4951bc23dca4b0b90f55f0712c4c92a782d1744328861c"
+)
 SYSTEMCTL = Path("/usr/bin/systemctl")
 MAX_JSON_BYTES = 64 * 1024 * 1024
 MAX_SYSTEMCTL_BYTES = 1024 * 1024
@@ -83,9 +108,10 @@ _RESULT_FIELDS = frozenset({
 })
 _ROOT_DIRECTORY_MODES = frozenset({0o555, 0o700, 0o750, 0o755})
 _ROOT_FILE_MODES = frozenset({0o400, 0o440, 0o444})
-_ROOT_EXECUTABLE_MODES = frozenset({0o500, 0o550, 0o555})
+_ROOT_EXECUTABLE_MODES = frozenset({0o500, 0o550, 0o555, 0o755})
 _BUILDER_DIRECTORY_MODES = frozenset({0o555})
 _BUILDER_FILE_MODES = frozenset({0o444, 0o555})
+_INPUT_DESCRIPTOR_HEADROOM = 64
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
 _SYSTEMD_PROPERTY_NAMES = (
@@ -141,6 +167,46 @@ _PRODUCTION_RUNTIME_GROUP_NAMES = (
 )
 _EXPECTED_RUNTIME_UID_COUNT = 17
 _EXPECTED_RUNTIME_GID_COUNT = 28
+_PRODUCTION_RUNTIME_UID_BY_NAME = {
+    "ai-platform-brain": 999,
+    "muncho-canonical-writer": 2000,
+    "muncho-projector": 2004,
+    "muncho-discord-egress": 2002,
+    "muncho-discord-connector": 2001,
+    "muncho-mac-ops-edge": 2003,
+    "muncho-capability-browser": 2006,
+    "muncho-worker": 2007,
+    **{
+        f"muncho-edge-{domain}": 2100 + index
+        for index, domain in enumerate(
+            _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
+        )
+    },
+}
+_PRODUCTION_RUNTIME_GID_BY_NAME = {
+    "ai-platform-brain": 994,
+    "muncho-canonical-writer": 2000,
+    "muncho-projector": 2004,
+    "muncho-discord-egress": 2002,
+    "muncho-discord-connector": 2001,
+    "muncho-mac-ops-edge": 2003,
+    "muncho-capability-browser": 2006,
+    "muncho-worker": 2007,
+    "muncho-writer-client": 2005,
+    "muncho-worker-clients": 2008,
+    **{
+        f"muncho-edge-{domain}": 2100 + index
+        for index, domain in enumerate(
+            _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
+        )
+    },
+    **{
+        f"muncho-edge-{domain}-c": 2200 + index
+        for index, domain in enumerate(
+            _PRODUCTION_OPERATIONAL_EDGE_DOMAINS
+        )
+    },
+}
 
 
 class ProductionReleaseCandidatePromoterError(RuntimeError):
@@ -180,8 +246,38 @@ class PromoterRoots:
     builder_unit_fragment: Path
     builder_wrapper: Path
     promotion_interlock: Path
+    builder_unit_prefix: str = "muncho-release-builder@"
     cgroup_root: Path = Path("/sys/fs/cgroup")
     proc_root: Path = Path("/proc")
+
+
+@dataclass(frozen=True)
+class _PromotionBinding:
+    request_schema: str
+    request_purpose: str | None
+    terminal_receipt_schema: str
+    terminal_receipt_purpose: str | None
+    entrypoint_relative_path: str
+
+
+_RELEASE_UPDATER_PROMOTION_BINDING = _PromotionBinding(
+    request_schema=phase.REQUEST_SCHEMA,
+    request_purpose=None,
+    terminal_receipt_schema=phase.TERMINAL_RECEIPT_SCHEMA,
+    terminal_receipt_purpose=None,
+    entrypoint_relative_path=phase.ENTRYPOINT_RELATIVE_PATH,
+)
+_UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING = _PromotionBinding(
+    request_schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+    request_purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+    terminal_receipt_schema=(
+        phase.UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA
+    ),
+    terminal_receipt_purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+    entrypoint_relative_path=(
+        phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+    ),
+)
 
 
 def production_roots() -> PromoterRoots:
@@ -191,6 +287,30 @@ def production_roots() -> PromoterRoots:
         builder_unit_fragment=PRODUCTION_BUILDER_UNIT_FRAGMENT,
         builder_wrapper=PRODUCTION_BUILDER_WRAPPER,
         promotion_interlock=PRODUCTION_PROMOTION_INTERLOCK,
+    )
+
+
+def production_revision_roots() -> PromoterRoots:
+    return PromoterRoots(
+        job_root=phase.PRODUCTION_JOB_ROOT,
+        release_parent=PRODUCTION_RELEASE_PARENT,
+        builder_unit_fragment=PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT,
+        builder_wrapper=PRODUCTION_REVISION_BUILDER_WRAPPER,
+        promotion_interlock=PRODUCTION_PROMOTION_INTERLOCK,
+        builder_unit_prefix="muncho-release-builder-v2@",
+    )
+
+
+def production_latched_revision_roots() -> PromoterRoots:
+    return PromoterRoots(
+        job_root=phase.PRODUCTION_JOB_ROOT,
+        release_parent=PRODUCTION_RELEASE_PARENT,
+        builder_unit_fragment=(
+            PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT
+        ),
+        builder_wrapper=PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER,
+        promotion_interlock=PRODUCTION_PROMOTION_INTERLOCK,
+        builder_unit_prefix="muncho-release-builder-v3@",
     )
 
 
@@ -307,6 +427,7 @@ def _validate_roots(
             builder_unit_fragment=Path(roots.builder_unit_fragment),
             builder_wrapper=Path(roots.builder_wrapper),
             promotion_interlock=Path(roots.promotion_interlock),
+            builder_unit_prefix=str(roots.builder_unit_prefix),
             cgroup_root=Path(roots.cgroup_root),
             proc_root=Path(roots.proc_root),
         )
@@ -326,13 +447,27 @@ def _validate_roots(
         or "\x00" in str(path)
         or any(part in {"", ".", ".."} for part in path.parts[1:])
         for path in paths
-    ):
+    ) or normalized.builder_unit_prefix not in {
+        "muncho-release-builder@",
+        "muncho-release-builder-v2@",
+        "muncho-release-builder-v3@",
+    }:
         _fail("candidate_promoter_roots_invalid")
     if (
         production
-        and normalized != production_roots()
+        and normalized
+        not in {
+            production_roots(),
+            production_revision_roots(),
+            production_latched_revision_roots(),
+        }
         or not production
-        and normalized == production_roots()
+        and normalized
+        in {
+            production_roots(),
+            production_revision_roots(),
+            production_latched_revision_roots(),
+        }
     ):
         _fail("candidate_promoter_roots_invalid")
     return normalized
@@ -357,6 +492,59 @@ def _assert_no_xattrs(
         _fail("candidate_promoter_xattr_inspection_unavailable")
     if names:
         _fail("candidate_promoter_xattrs_or_acl_present")
+
+
+def _reserve_input_descriptor_capacity(
+    *,
+    source_blob_count: int,
+    runtime_wheel_count: int,
+) -> None:
+    """Keep every verified root input inode held without exhausting nofile."""
+
+    if (
+        type(source_blob_count) is not int
+        or not 0 < source_blob_count <= phase.MAX_SOURCE_BLOBS
+        or type(runtime_wheel_count) is not int
+        or not 0 < runtime_wheel_count <= phase.MAX_WHEELS
+    ):
+        _fail("candidate_promoter_descriptor_capacity_invalid")
+    required = (
+        source_blob_count
+        + runtime_wheel_count
+        + _INPUT_DESCRIPTOR_HEADROOM
+    )
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:
+        _fail("candidate_promoter_descriptor_capacity_unavailable", exc)
+    if (
+        type(soft) is not int
+        or type(hard) is not int
+        or (soft < 0 and soft != resource.RLIM_INFINITY)
+        or (hard < 0 and hard != resource.RLIM_INFINITY)
+    ):
+        _fail("candidate_promoter_descriptor_capacity_unavailable")
+    if hard != resource.RLIM_INFINITY and hard < required:
+        _fail("candidate_promoter_descriptor_capacity_insufficient")
+    if soft == resource.RLIM_INFINITY or soft >= required:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (required, hard))
+        confirmed_soft, confirmed_hard = resource.getrlimit(
+            resource.RLIMIT_NOFILE
+        )
+    except (OSError, ValueError) as exc:
+        _fail("candidate_promoter_descriptor_capacity_unavailable", exc)
+    if (
+        type(confirmed_soft) is not int
+        or type(confirmed_hard) is not int
+        or (
+            confirmed_soft != resource.RLIM_INFINITY
+            and confirmed_soft < required
+        )
+        or confirmed_hard != hard
+    ):
+        _fail("candidate_promoter_descriptor_capacity_unavailable")
 
 
 def _open_directory(
@@ -428,64 +616,70 @@ def _open_root_file(
 def _derive_production_release_identities(
     *,
     user_lookup: Callable[[str], Any] = pwd.getpwnam,
+    user_id_lookup: Callable[[int], Any] = pwd.getpwuid,
     group_lookup: Callable[[str], Any] = grp.getgrnam,
+    group_id_lookup: Callable[[int], Any] = grp.getgrgid,
 ) -> builder.ReleaseIdentities:
-    """Resolve the exact identity catalog owned by the cutover contracts."""
+    """Reserve the exact cutover identity catalog before host activation."""
 
-    try:
-        users = [user_lookup(name) for name in _PRODUCTION_RUNTIME_USER_NAMES]
-        groups = [
-            group_lookup(name) for name in _PRODUCTION_RUNTIME_GROUP_NAMES
-        ]
-    except (KeyError, OSError, TypeError, ValueError) as exc:
-        _fail("candidate_promoter_identity_contract_invalid", exc)
     if (
-        len(users) != _EXPECTED_RUNTIME_UID_COUNT
-        or len(groups) != _EXPECTED_RUNTIME_GID_COUNT
-        or any(
-            item.pw_name != name
-            or type(item.pw_uid) is not int
-            or item.pw_uid <= 0
-            for name, item in zip(
-                _PRODUCTION_RUNTIME_USER_NAMES,
-                users,
-                strict=True,
-            )
-        )
-        or any(
-            item.gr_name != name
-            or type(item.gr_gid) is not int
-            or item.gr_gid <= 0
-            for name, item in zip(
-                _PRODUCTION_RUNTIME_GROUP_NAMES,
-                groups,
-                strict=True,
-            )
-        )
+        set(_PRODUCTION_RUNTIME_UID_BY_NAME)
+        != set(_PRODUCTION_RUNTIME_USER_NAMES)
+        or set(_PRODUCTION_RUNTIME_GID_BY_NAME)
+        != set(_PRODUCTION_RUNTIME_GROUP_NAMES)
+        or len(_PRODUCTION_RUNTIME_UID_BY_NAME)
+        != _EXPECTED_RUNTIME_UID_COUNT
+        or len(_PRODUCTION_RUNTIME_GID_BY_NAME)
+        != _EXPECTED_RUNTIME_GID_COUNT
+        or len(set(_PRODUCTION_RUNTIME_UID_BY_NAME.values()))
+        != _EXPECTED_RUNTIME_UID_COUNT
+        or len(set(_PRODUCTION_RUNTIME_GID_BY_NAME.values()))
+        != _EXPECTED_RUNTIME_GID_COUNT
     ):
         _fail("candidate_promoter_identity_contract_invalid")
-    group_by_name = {
-        name: item
-        for name, item in zip(
-            _PRODUCTION_RUNTIME_GROUP_NAMES,
-            groups,
-            strict=True,
-        )
-    }
-    if any(
-        item.pw_gid != group_by_name[item.pw_name].gr_gid
-        for item in users
-    ):
-        _fail("candidate_promoter_identity_contract_invalid")
+    try:
+        for name in _PRODUCTION_RUNTIME_USER_NAMES:
+            expected_uid = _PRODUCTION_RUNTIME_UID_BY_NAME[name]
+            expected_gid = _PRODUCTION_RUNTIME_GID_BY_NAME[name]
+            try:
+                item = user_lookup(name)
+            except KeyError:
+                try:
+                    user_id_lookup(expected_uid)
+                except KeyError:
+                    continue
+                _fail("candidate_promoter_identity_contract_invalid")
+            if (
+                item.pw_name != name
+                or item.pw_uid != expected_uid
+                or item.pw_gid != expected_gid
+            ):
+                _fail("candidate_promoter_identity_contract_invalid")
+        for name in _PRODUCTION_RUNTIME_GROUP_NAMES:
+            expected_gid = _PRODUCTION_RUNTIME_GID_BY_NAME[name]
+            try:
+                item = group_lookup(name)
+            except KeyError:
+                try:
+                    group_id_lookup(expected_gid)
+                except KeyError:
+                    continue
+                _fail("candidate_promoter_identity_contract_invalid")
+            if item.gr_name != name or item.gr_gid != expected_gid:
+                _fail("candidate_promoter_identity_contract_invalid")
+    except ProductionReleaseCandidatePromoterError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("candidate_promoter_identity_contract_invalid", exc)
     identities = builder.ReleaseIdentities(
         builder_uid=phase.BUILDER_UID,
         builder_gid=phase.BUILDER_GID,
         reserved_runtime_uids=tuple(
-            sorted(item.pw_uid for item in users)
+            sorted(_PRODUCTION_RUNTIME_UID_BY_NAME.values())
         ),
         reserved_runtime_gids=tuple(
-            sorted(item.gr_gid for item in groups)
-        ),
+            sorted(_PRODUCTION_RUNTIME_GID_BY_NAME.values())
+        )
     )
     try:
         return builder.validate_release_identities(
@@ -645,6 +839,7 @@ def _load_inputs(
     *,
     revision: str,
     roots: PromoterRoots,
+    binding: _PromotionBinding,
     authority_uid: int,
     authority_gid: int,
     xattr_reader: Callable[[int], Sequence[str | bytes]],
@@ -675,6 +870,20 @@ def _load_inputs(
         _decode_document(_read_held(request_file)),
         expected_job_id=revision,
     )
+    if (
+        request.get("schema") != binding.request_schema
+        or request.get("entrypoint_relative_path")
+        != binding.entrypoint_relative_path
+        or (
+            binding.request_purpose is None
+            and "purpose" in request
+        )
+        or (
+            binding.request_purpose is not None
+            and request.get("purpose") != binding.request_purpose
+        )
+    ):
+        _fail("candidate_promoter_request_purpose_invalid")
     source_file = _open_root_file(
         stack,
         input_root / phase.SOURCE_MANIFEST_NAME,
@@ -741,6 +950,10 @@ def _load_inputs(
         str(item["object_id"]): dict(item)
         for item in source_manifest["blobs"]
     }
+    _reserve_input_descriptor_capacity(
+        source_blob_count=len(blobs),
+        runtime_wheel_count=len(runtime_manifest["wheels"]),
+    )
     if (
         set(blobs) != {entry.object_id for entry in entries}
         or blob_directory.names()
@@ -1066,9 +1279,20 @@ def _validate_candidate_documents(
     terminal: Mapping[str, Any],
     expected_terminal_receipt_sha256: str,
     inputs: _InputBundle,
+    binding: _PromotionBinding,
 ) -> None:
     if (
-        terminal["receipt_sha256"] != expected_terminal_receipt_sha256
+        terminal.get("schema") != binding.terminal_receipt_schema
+        or (
+            binding.terminal_receipt_purpose is None
+            and "purpose" in terminal
+        )
+        or (
+            binding.terminal_receipt_purpose is not None
+            and terminal.get("purpose")
+            != binding.terminal_receipt_purpose
+        )
+        or terminal["receipt_sha256"] != expected_terminal_receipt_sha256
         or terminal["release_revision"]
         != inputs.request["release_revision"]
         or terminal["source_tree_oid"] != inputs.request["source_tree_oid"]
@@ -1087,6 +1311,8 @@ def _validate_candidate_documents(
         or terminal["payload_manifest_sha256"] != payload["manifest_sha256"]
         or terminal["payload_manifest_file_sha256"] != payload_file_sha256
         or terminal["payload_tree_sha256"] != payload["payload_tree_sha256"]
+        or terminal["entrypoint_relative_path"]
+        != inputs.request["entrypoint_relative_path"]
         or payload["release_revision"] != inputs.request["release_revision"]
         or payload["source_tree_oid"] != inputs.request["source_tree_oid"]
         or terminal["command_environment_sha256"]
@@ -1097,7 +1323,7 @@ def _validate_candidate_documents(
         str(item["path"]): item for item in payload["payload_entries"]
     }
     interpreter = entries.get(phase.INTERPRETER_RELATIVE_PATH)
-    entrypoint = entries.get(phase.ENTRYPOINT_RELATIVE_PATH)
+    entrypoint = entries.get(binding.entrypoint_relative_path)
     retained_names = {
         f"{phase.RETAINED_WHEEL_DIRECTORY_NAME}/{item['filename']}"
         for item in inputs.runtime_manifest["wheels"]
@@ -1136,6 +1362,7 @@ def _load_and_validate_candidate(
     *,
     root: Path,
     inputs: _InputBundle,
+    binding: _PromotionBinding,
     expected_terminal_receipt_sha256: str,
     expected_uid: int,
     expected_gid: int,
@@ -1182,6 +1409,7 @@ def _load_and_validate_candidate(
                 expected_terminal_receipt_sha256
             ),
             inputs=inputs,
+            binding=binding,
         )
         records = _scan_candidate_tree(
             root,
@@ -1218,7 +1446,7 @@ def _load_and_validate_candidate(
         ):
             _fail("candidate_promoter_candidate_tree_invalid")
         interpreter = actual.get(phase.INTERPRETER_RELATIVE_PATH)
-        entrypoint = actual.get(phase.ENTRYPOINT_RELATIVE_PATH)
+        entrypoint = actual.get(binding.entrypoint_relative_path)
         if (
             not isinstance(interpreter, Mapping)
             or not isinstance(entrypoint, Mapping)
@@ -1825,7 +2053,7 @@ def _process_free_evidence(
     process_uid: Callable[[Path, os.stat_result], int | None] | None,
     xattr_reader: Callable[[int], Sequence[str | bytes]],
 ) -> Mapping[str, Any]:
-    unit = f"muncho-release-builder@{revision}.service"
+    unit = f"{roots.builder_unit_prefix}{revision}.service"
     control_group = f"/system.slice/{unit}"
     try:
         systemd_properties = systemd_reader(unit)
@@ -1906,6 +2134,7 @@ def _published_result(
     revision: str,
     expected_terminal_receipt_sha256: str,
     inputs: _InputBundle,
+    binding: _PromotionBinding,
     identities: builder.ReleaseIdentities,
     expected_uid: int,
     expected_gid: int,
@@ -1962,6 +2191,7 @@ def _published_result(
                 expected_terminal_receipt_sha256
             ),
             inputs=inputs,
+            binding=binding,
         )
     except phase.ProductionReleaseBuilderPhaseError as exc:
         _fail("candidate_promoter_published_binding_invalid", exc)
@@ -2038,6 +2268,7 @@ def _promote_candidate_for_test(
     revision: str,
     expected_builder_terminal_receipt_sha256: str,
     roots: PromoterRoots,
+    binding: _PromotionBinding,
     production: bool = True,
     checkpoint: Callable[[str], None] | None = None,
     rename_no_replace: Callable[[Path, Path], None] | None = None,
@@ -2107,8 +2338,19 @@ def _promote_candidate_for_test(
         rename = _rename_no_replace_linux
         validated_identities = _derive_production_release_identities()
         systemd_reader = _systemctl_show
-        fragment_sha256 = PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256
-        wrapper_sha256 = PRODUCTION_BUILDER_WRAPPER_SHA256
+        if normalized_roots == production_latched_revision_roots():
+            fragment_sha256 = (
+                PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT_SHA256
+            )
+            wrapper_sha256 = (
+                PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER_SHA256
+            )
+        elif normalized_roots == production_revision_roots():
+            fragment_sha256 = PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256
+            wrapper_sha256 = PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256
+        else:
+            fragment_sha256 = PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256
+            wrapper_sha256 = PRODUCTION_BUILDER_WRAPPER_SHA256
     else:
         authority_uid = (
             _read_posix_identity("geteuid")
@@ -2202,6 +2444,7 @@ def _promote_candidate_for_test(
             stack,
             revision=revision,
             roots=normalized_roots,
+            binding=binding,
             authority_uid=authority_uid,
             authority_gid=authority_gid,
             xattr_reader=xattr_reader,
@@ -2238,6 +2481,7 @@ def _promote_candidate_for_test(
                         expected_builder_terminal_receipt_sha256
                     ),
                     inputs=inputs,
+                    binding=binding,
                     identities=validated_identities,
                     expected_uid=publication_uid,
                     expected_gid=publication_gid,
@@ -2267,6 +2511,7 @@ def _promote_candidate_for_test(
             stack,
             root=inputs.candidate_root,
             inputs=inputs,
+            binding=binding,
             expected_terminal_receipt_sha256=(
                 expected_builder_terminal_receipt_sha256
             ),
@@ -2281,6 +2526,7 @@ def _promote_candidate_for_test(
                     stack,
                     root=final,
                     inputs=inputs,
+                    binding=binding,
                     expected_terminal_receipt_sha256=(
                         expected_builder_terminal_receipt_sha256
                     ),
@@ -2298,6 +2544,7 @@ def _promote_candidate_for_test(
                         stack,
                         root=hidden,
                         inputs=inputs,
+                        binding=binding,
                         expected_terminal_receipt_sha256=(
                             expected_builder_terminal_receipt_sha256
                         ),
@@ -2325,6 +2572,7 @@ def _promote_candidate_for_test(
                     stack,
                     root=hidden,
                     inputs=inputs,
+                    binding=binding,
                     expected_terminal_receipt_sha256=(
                         expected_builder_terminal_receipt_sha256
                     ),
@@ -2342,6 +2590,7 @@ def _promote_candidate_for_test(
             stack,
             root=final,
             inputs=inputs,
+            binding=binding,
             expected_terminal_receipt_sha256=(
                 expected_builder_terminal_receipt_sha256
             ),
@@ -2427,6 +2676,7 @@ def _promote_candidate_for_test(
                     source_candidate.terminal_receipt["receipt_sha256"]
                 ),
                 inputs=inputs,
+                binding=binding,
                 identities=validated_identities,
                 expected_uid=publication_uid,
                 expected_gid=publication_gid,
@@ -2467,6 +2717,25 @@ def promote_candidate(
             expected_builder_terminal_receipt_sha256
         ),
         roots=production_roots(),
+        binding=_RELEASE_UPDATER_PROMOTION_BINDING,
+        production=True,
+    )
+
+
+def promote_rotation_stager_candidate(
+    *,
+    revision: str,
+    expected_builder_terminal_receipt_sha256: str,
+) -> Mapping[str, Any]:
+    """Publish one exact unit-input rotation stager without activating it."""
+
+    return _promote_candidate_for_test(
+        revision=revision,
+        expected_builder_terminal_receipt_sha256=(
+            expected_builder_terminal_receipt_sha256
+        ),
+        roots=production_latched_revision_roots(),
+        binding=_UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
         production=True,
     )
 
@@ -2474,10 +2743,17 @@ def promote_candidate(
 __all__ = [
     "PROMOTION_RESULT_SCHEMA",
     "PRODUCTION_BUILDER_UNIT_FRAGMENT",
+    "PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT",
+    "PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER",
+    "PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT",
+    "PRODUCTION_REVISION_BUILDER_WRAPPER",
     "PRODUCTION_RELEASE_PARENT",
     "ProductionReleaseCandidatePromoterError",
     "canonical_bytes",
     "promote_candidate",
+    "promote_rotation_stager_candidate",
+    "production_latched_revision_roots",
+    "production_revision_roots",
     "sha256_bytes",
     "validate_promotion_result",
 ]
