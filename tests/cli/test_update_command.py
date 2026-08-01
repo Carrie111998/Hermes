@@ -43,6 +43,7 @@ def _make_self(modal_response):
         _app=None,
         _pending_relaunch=None,
         _prompt_text_input_modal=lambda **_kw: modal_response,
+        _save_update_approval=lambda enabled: None,
     )
     self_._normalize_slash_confirm_choice = _bound(
         HermesCLI._normalize_slash_confirm_choice, self_
@@ -68,6 +69,7 @@ def test_managed_install_refuses_and_does_not_set_pending_relaunch(capsys):
         _pending_relaunch=None,
         # Use pytest.fail so any unexpected modal invocation surfaces as a failure.
         _prompt_text_input_modal=lambda **_kw: pytest.fail("Modal should not be called"),
+        _save_update_approval=lambda enabled: None,
     )
     self_._normalize_slash_confirm_choice = _bound(
         HermesCLI._normalize_slash_confirm_choice, self_
@@ -148,3 +150,32 @@ def test_unrecognized_or_cancel_input_cancels(answer, capsys):
 
     assert self_._pending_relaunch is None
     assert not result
+
+
+def test_update_pending_subcommand_prints_inline_list(capsys):
+    from tools import update_approval as ua
+
+    rec = ua.stage_update({"branch": "main"}, summary="update main")
+    self_ = _make_self(modal_response=None)
+    self_._prompt_text_input_modal = lambda **_kw: pytest.fail("modal should not be called")
+
+    with patch("hermes_cli.config.is_managed", return_value=False):
+        result = HermesCLI._handle_update_command(self_, f"/update pending")
+
+    out = capsys.readouterr().out
+    assert rec["id"] in out
+    assert result is False
+    assert self_._pending_relaunch is None
+
+
+def test_update_approve_subcommand_sets_pending_relaunch_without_modal(capsys):
+    self_ = _make_self(modal_response=None)
+    self_._prompt_text_input_modal = lambda **_kw: pytest.fail("modal should not be called")
+
+    with patch("hermes_cli.config.is_managed", return_value=False):
+        result = HermesCLI._handle_update_command(self_, "/update approve deadbeef")
+
+    out = capsys.readouterr().out
+    assert "Applying approved update deadbeef" in out
+    assert result is True
+    assert self_._pending_relaunch == ["update", "approve", "deadbeef"]

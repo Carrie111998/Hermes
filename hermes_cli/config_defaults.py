@@ -2696,6 +2696,16 @@ DEFAULT_CONFIG = {
         # Values below 1 are floored to 1 — the backup just created is
         # always preserved. The quick snapshot always keeps exactly 1.
         "backup_keep": 5,
+        # Require explicit approval before APPLYING a Hermes self-update.
+        #
+        #   True  (default) — mutating `hermes update` runs stage a pending
+        #                     update under <HERMES_HOME>/pending/updates/
+        #                     instead of pulling immediately. Review with
+        #                     /update pending, /update approve <id>,
+        #                     /update reject <id>, or toggle with
+        #                     /update approval <on|off>.
+        #   False           — apply updates immediately (pre-gate behavior).
+        "apply_approval": True,
         # What `hermes update` does with uncommitted local changes to the
         # source tree when it runs NON-interactively — i.e. triggered from
         # the desktop/chat app or the gateway, where there's no TTY to answer

@@ -1857,6 +1857,11 @@ class CLICommandsMixin:
         from cli import save_config_value
         save_config_value(f"{subsystem}.write_approval", bool(enabled))
 
+    def _save_update_approval(self, enabled: bool):
+        """Persist updates.apply_approval to config (for /update approval)."""
+        from cli import save_config_value
+        save_config_value("updates.apply_approval", bool(enabled))
+
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
 
@@ -3177,19 +3182,50 @@ class CLICommandsMixin:
         )
         run_debug_share(args)
 
-    def _handle_update_command(self) -> bool:
-        """Handle /update — update Hermes Agent to the latest version.
+    def _handle_update_command(self, cmd: str = "/update") -> bool:
+        """Handle /update — update Hermes Agent or review staged update requests.
 
-        In the classic CLI this exits the session and relaunches as
-        ``hermes update`` so the user sees update output directly and gets
-        the new version on next launch.
+        Bare ``/update`` keeps the existing behavior: confirm, then exit the
+        current session and relaunch as ``hermes update`` so the user sees the
+        update output directly. Review subcommands are handled inline:
 
-        Returns ``True`` when the update was confirmed (caller should trigger
-        app exit so the relaunch is deferred to the main thread after
-        prompt_toolkit cleans up terminal modes).  Returns ``False`` / falsy
-        when cancelled.
+          /update pending
+          /update approve <id>
+          /update reject <id>
+          /update approval <on|off>
+
+        Returns ``True`` when the caller should trigger the main-thread relaunch
+        / exit path, otherwise ``False``.
         """
         from hermes_cli.config import is_managed, format_managed_message
+        from hermes_cli.update_approval_commands import (
+            handle_pending_subcommand,
+            resolve_approve_target,
+        )
+
+        parts = cmd.strip().split()
+        args = parts[1:] if len(parts) > 1 else []
+        if args:
+            sub = args[0].lower()
+            if sub in {"pending", "reject", "deny", "drop", "approval", "mode"}:
+                out = handle_pending_subcommand(
+                    args,
+                    set_mode_fn=self._save_update_approval,
+                )
+                print(out or "Unknown /update subcommand.")
+                return False
+            if sub in {"approve", "apply"}:
+                target, err = resolve_approve_target(args[1:])
+                if err or target is None:
+                    print(err or "Usage: /update approve <id>")
+                    return False
+                print()
+                print(f"  ⚕ Applying approved update {target}...")
+                print()
+                self._pending_relaunch = ["update", "approve", target]
+                return True
+            print("Unknown /update subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>.")
+            return False
 
         if is_managed():
             print(f"  ✗ {format_managed_message('update Hermes Agent')}")

@@ -105,8 +105,11 @@ Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERM
 updates:
   pre_update_backup: quick       # quick (state snapshot, default) | full (snapshot + HERMES_HOME zip) | off
   backup_keep: 5                 # Keep this many full pre-update backup zips
+  apply_approval: true           # Require explicit approval before applying a self-update
   non_interactive_local_changes: stash  # stash | discard
 ```
+
+`apply_approval` defaults to `true`: mutating `hermes update` runs stage a pending request under `<HERMES_HOME>/pending/updates/` instead of pulling immediately. Review with `hermes update pending` (or `/update pending` in the classic CLI), apply with `hermes update approve <id>`, reject with `hermes update reject <id>`, or toggle the gate with `hermes update approval <on|off>`.
 
 `pre_update_backup` is the single pre-update safety knob: `quick` (default) snapshots critical state files (pairing data, cron jobs, config, auth; files over 1 GiB are skipped) into `state-snapshots/`; `full` additionally zips all of `HERMES_HOME` into `backups/` and can add minutes on large homes; `off` disables both. Legacy booleans are honored (`true` → `full`, `false` → `off`).
 

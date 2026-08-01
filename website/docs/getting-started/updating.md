@@ -14,7 +14,9 @@ Update to the latest version with a single command:
 hermes update
 ```
 
-This pulls the latest code from `main`, updates dependencies, and prompts you to configure any new options that were added since your last update.
+By default, Hermes now stages self-updates for approval instead of applying them immediately. A mutating `hermes update` run creates a pending request under `<HERMES_HOME>/pending/updates/`; review with `hermes update pending`, apply with `hermes update approve <id>`, reject with `hermes update reject <id>`, or toggle the gate with `hermes update approval <on|off>`.
+
+This eventually pulls the latest code from `main`, updates dependencies, and prompts you to configure any new options that were added since your last update.
 
 :::tip
 `hermes update` automatically detects new configuration options and prompts you to add them. If you skipped that prompt, you can manually run `hermes config check` to see missing options, then `hermes config migrate` to interactively add them.
