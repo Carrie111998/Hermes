@@ -134,6 +134,35 @@ def test_narrow_inherited_root_replaced_for_scratch_workspace_write(
     assert target.read_text(encoding="utf-8") == "own"
 
 
+def test_task_safe_root_survives_profile_dotenv_override(monkeypatch, tmp_path):
+    root = tmp_path / "board"
+    workspace = root / "scratch-a"
+    inherited = tmp_path / "deployment-root"
+    workspace.mkdir(parents=True)
+    inherited.mkdir()
+    profile_home = tmp_path / ".hermes" / "profiles" / "w"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        f"HERMES_WRITE_SAFE_ROOT={inherited}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(inherited))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    child_root = os.path.realpath(workspace)
+    with mock.patch.dict(os.environ, captured["env"], clear=True):
+        load_hermes_dotenv(hermes_home=captured["env"]["HERMES_HOME"])
+        target = workspace / "dotenv-own.txt"
+        result = _shell_file_operations(workspace).write_file(str(target), "own")
+
+    assert result.error is None
+    assert captured["env"]["HERMES_WRITE_SAFE_ROOT"] == child_root
+    assert target.read_text(encoding="utf-8") == "own"
+
+
 def test_sibling_and_traversal_mutations_are_denied(monkeypatch, tmp_path):
     root = tmp_path / "board"
     workspace = root / "scratch-a"

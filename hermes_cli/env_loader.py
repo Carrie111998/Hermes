@@ -306,6 +306,9 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
+    kanban_worker = "HERMES_KANBAN_TASK" in os.environ
+    inherited_safe_root = os.environ.get("HERMES_WRITE_SAFE_ROOT")
+    had_safe_root = "HERMES_WRITE_SAFE_ROOT" in os.environ
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -341,6 +344,13 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+
+    # Task-scoped roots must outrank profile and managed env files.
+    if kanban_worker:
+        if had_safe_root:
+            os.environ["HERMES_WRITE_SAFE_ROOT"] = inherited_safe_root or ""
+        else:
+            os.environ.pop("HERMES_WRITE_SAFE_ROOT", None)
 
     return loaded
 
