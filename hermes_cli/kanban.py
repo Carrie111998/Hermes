@@ -133,6 +133,22 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
+def _parse_nullable_id(value: str) -> Optional[int]:
+    """Parse a positive row id or an explicit SQL-NULL expectation."""
+    normalized = value.strip().casefold()
+    if normalized in {"none", "null"}:
+        return None
+    try:
+        parsed = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a positive integer or 'none'"
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer or 'none'")
+    return parsed
+
+
 def _check_dispatcher_presence(
     hermes_home: Optional[Path] = None,
 ) -> tuple[bool, str]:
@@ -680,6 +696,36 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--dry-run",
         action="store_true",
         help="Validate the promotion without mutating state",
+    )
+    p_promote.add_argument(
+        "--expect-status",
+        choices=sorted(kb.VALID_STATUSES),
+        default=None,
+        help="Promote only if the task still has this exact status",
+    )
+    p_promote.add_argument(
+        "--expect-current-run-id",
+        type=_parse_nullable_id,
+        default=kb.PROMOTE_EXPECTATION_UNSET,
+        metavar="ID|none",
+        help="Promote only if current_run_id matches (use 'none' for NULL)",
+    )
+    p_promote.add_argument(
+        "--expect-latest-run-id",
+        type=_parse_nullable_id,
+        default=kb.PROMOTE_EXPECTATION_UNSET,
+        metavar="ID|none",
+        help=(
+            "Promote only if the latest task run id matches "
+            "(use 'none' for no run)"
+        ),
+    )
+    p_promote.add_argument(
+        "--expect-latest-event-id",
+        type=_parse_nullable_id,
+        default=kb.PROMOTE_EXPECTATION_UNSET,
+        metavar="ID|none",
+        help="Promote only if the latest task event id matches",
     )
     p_promote.add_argument(
         "--json",
@@ -2359,6 +2405,22 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 reason=reason,
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
+                expected_status=getattr(args, "expect_status", None),
+                expected_current_run_id=getattr(
+                    args,
+                    "expect_current_run_id",
+                    kb.PROMOTE_EXPECTATION_UNSET,
+                ),
+                expected_latest_run_id=getattr(
+                    args,
+                    "expect_latest_run_id",
+                    kb.PROMOTE_EXPECTATION_UNSET,
+                ),
+                expected_latest_event_id=getattr(
+                    args,
+                    "expect_latest_event_id",
+                    kb.PROMOTE_EXPECTATION_UNSET,
+                ),
             )
             results.append({
                 "task_id": tid,
@@ -2366,7 +2428,9 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
                 "reason": reason,
-                "error": err,
+                "error": str(err) if err is not None else None,
+                "code": getattr(err, "code", None),
+                "refusal_reason": str(err) if err is not None else None,
             })
 
     failed = [r for r in results if not r["promoted"]]

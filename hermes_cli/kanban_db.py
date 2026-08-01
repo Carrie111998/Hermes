@@ -5734,6 +5734,24 @@ def block_task(
 
 
 
+PROMOTE_EXPECTATION_UNSET = object()
+
+
+class PromoteRefusal(str):
+    """Backward-compatible promote error string with a stable refusal code."""
+
+    code: str
+
+    def __new__(cls, code: str, message: str) -> "PromoteRefusal":
+        refusal = super().__new__(cls, message)
+        refusal.code = code
+        return refusal
+
+
+def _promote_refusal(code: str, message: str) -> tuple[bool, PromoteRefusal]:
+    return False, PromoteRefusal(code, message)
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5742,58 +5760,117 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
-) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    expected_status: Optional[str] = None,
+    expected_current_run_id: object = PROMOTE_EXPECTATION_UNSET,
+    expected_latest_run_id: object = PROMOTE_EXPECTATION_UNSET,
+    expected_latest_event_id: object = PROMOTE_EXPECTATION_UNSET,
+) -> tuple[bool, Optional[PromoteRefusal]]:
+    """Manually promote a ``todo`` or ``blocked`` task to ``ready``.
 
-    Mirrors the automatic promotion done by ``recompute_ready`` but
-    drives it from a deliberate operator action with an audit-trail
-    entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    Optional ``expected_*`` values bind an operator's read-only observation to
+    the mutation. An omitted keyword means no precondition; for run ids, ``None``
+    explicitly expects SQL NULL / no run. Every precondition, dependency check,
+    and the CAS update runs under one ``BEGIN IMMEDIATE`` transaction. ``force``
+    only bypasses dependency gating and never bypasses an expectation.
+
+    Returns the legacy ``(ok, error)`` pair. Refusal errors remain strings but
+    carry a stable ``.code`` attribute for machine-readable CLI output.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return False, f"task {task_id} not found"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return _promote_refusal("task_not_found", f"task {task_id} not found")
 
-    cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+        cur_status = row["status"]
+        current_run_id = (
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None
+            else None
         )
-
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
+        latest_run_row = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
             (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
-        if unsatisfied:
-            return False, (
-                f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
+        ).fetchone()
+        latest_run_id = int(latest_run_row["id"]) if latest_run_row else None
+        latest_event_row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        latest_event_id = int(latest_event_row["id"]) if latest_event_row else None
+
+        if expected_status is not None and cur_status != expected_status:
+            return _promote_refusal(
+                "expected_status_mismatch",
+                f"expected status {expected_status!r}, found {cur_status!r}",
+            )
+        if (
+            expected_current_run_id is not PROMOTE_EXPECTATION_UNSET
+            and current_run_id != expected_current_run_id
+        ):
+            return _promote_refusal(
+                "expected_current_run_id_mismatch",
+                "expected current_run_id "
+                f"{expected_current_run_id!r}, found {current_run_id!r}",
+            )
+        if (
+            expected_latest_run_id is not PROMOTE_EXPECTATION_UNSET
+            and latest_run_id != expected_latest_run_id
+        ):
+            return _promote_refusal(
+                "expected_latest_run_id_mismatch",
+                "expected latest task run id "
+                f"{expected_latest_run_id!r}, found {latest_run_id!r}",
+            )
+        if (
+            expected_latest_event_id is not PROMOTE_EXPECTATION_UNSET
+            and latest_event_id != expected_latest_event_id
+        ):
+            return _promote_refusal(
+                "expected_latest_event_id_mismatch",
+                "expected latest task event id "
+                f"{expected_latest_event_id!r}, found {latest_event_id!r}",
             )
 
-    if dry_run:
-        return True, None
+        if cur_status not in ("todo", "blocked"):
+            return _promote_refusal(
+                "status_not_promotable",
+                f"task {task_id} is {cur_status!r}; promote only applies to "
+                "'todo' or 'blocked'",
+            )
 
-    with write_txn(conn):
+        if not force:
+            parents = conn.execute(
+                "SELECT t.id, t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            unsatisfied = [
+                p["id"]
+                for p in parents
+                if p["status"] not in ("done", "archived")
+            ]
+            if unsatisfied:
+                return _promote_refusal(
+                    "unsatisfied_dependencies",
+                    "unsatisfied parent dependencies: "
+                    f"{', '.join(unsatisfied)} (use --force to override)",
+                )
+
+        if dry_run:
+            return True, None
+
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = ?",
+            (task_id, cur_status),
         )
         if upd.rowcount != 1:
-            return False, f"task {task_id} status changed during promotion"
+            return _promote_refusal(
+                "promotion_conflict", f"task {task_id} changed during promotion"
+            )
         _append_event(
             conn,
             task_id,
