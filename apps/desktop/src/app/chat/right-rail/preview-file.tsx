@@ -10,7 +10,6 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { Streamdown } from 'streamdown'
 
 import { requestComposerFocus, requestComposerInsertRefs } from '@/app/chat/composer/focus'
-import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { HERMES_PATHS_MIME } from '@/app/chat/hooks/use-composer-actions'
 import { isAddSelectionShortcut } from '@/app/right-sidebar/terminal/selection'
 import { RichCodeBlock } from '@/components/assistant-ui/embeds'
@@ -19,6 +18,8 @@ import { FileDiffPanel } from '@/components/chat/diff-lines'
 import { chunkTextLines, useFixedRowWindow } from '@/components/chat/fixed-row-window'
 import { LazyShiki as ShikiHighlighter } from '@/components/chat/shiki-highlighter'
 import { PageLoader } from '@/components/page-loader'
+import { Button } from '@/components/ui/button'
+import { KbdCombo } from '@/components/ui/kbd'
 import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import {
@@ -28,6 +29,7 @@ import {
   readDesktopFileText,
   writeDesktopFileText
 } from '@/lib/desktop-fs'
+import { triggerHaptic } from '@/lib/haptics'
 import { Check, Pencil, X } from '@/lib/icons'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { cn } from '@/lib/utils'
@@ -35,6 +37,14 @@ import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
 import { $currentCwd } from '@/store/session'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
+
+import {
+  type LineSelection,
+  lineSelectionFromSelectedText,
+  readHostTextSelection,
+  retainPreviewAddShortcutClaim,
+  sourceLineSelectionRef
+} from './preview-add-to-chat'
 
 const SHIKI_THEME = { dark: 'github-dark-default', light: 'github-light-default' } as const
 const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
@@ -425,11 +435,6 @@ function EditControls({
   )
 }
 
-interface LineSelection {
-  end: number
-  start: number
-}
-
 function startLineDrag(event: ReactDragEvent<HTMLElement>, filePath: string, { end, start }: LineSelection) {
   const lineEnd = end > start ? end : undefined
   const label = lineEnd ? `${filePath}:${start}-${end}` : `${filePath}:${start}`
@@ -439,10 +444,358 @@ function startLineDrag(event: ReactDragEvent<HTMLElement>, filePath: string, { e
   event.dataTransfer.effectAllowed = 'copy'
 }
 
+/** Approx chip size for clamping so the floating action stays inside the frame. */
+const ADD_TO_CHAT_CHIP_W = 140
+const ADD_TO_CHAT_CHIP_H = 28
+const ADD_TO_CHAT_CHIP_GAP = 8
+
+function chipPosInFrame(
+  frame: HTMLElement,
+  clientX: number,
+  clientY: number
+): { left: number; top: number } {
+  const rect = frame.getBoundingClientRect()
+  const maxLeft = Math.max(0, rect.width - ADD_TO_CHAT_CHIP_W)
+  const maxTop = Math.max(0, rect.height - ADD_TO_CHAT_CHIP_H)
+  const left = Math.min(Math.max(0, clientX - rect.left + ADD_TO_CHAT_CHIP_GAP), maxLeft)
+  const top = Math.min(Math.max(0, clientY - rect.top + ADD_TO_CHAT_CHIP_GAP), maxTop)
+
+  return { left, top }
+}
+
+/** Non-scrolling chrome around preview body: floating Add to Chat stays visible
+ *  over rendered / source / diff, matching the terminal overlay pattern. */
+function PreviewAddToChatFrame({
+  children,
+  filePath,
+  getSourceText,
+  lineSelection = null,
+  onConsumeLineSelection
+}: {
+  children: ReactNode
+  filePath?: string
+  getSourceText?: () => string
+  lineSelection?: LineSelection | null
+  onConsumeLineSelection?: () => void
+}) {
+  const { t } = useI18n()
+  const frameRef = useRef<HTMLDivElement | null>(null)
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null)
+  const pointerGestureInFrameRef = useRef(false)
+  const [chipPos, setChipPos] = useState<{ left: number; top: number } | null>(null)
+  const [textLineSelection, setTextLineSelection] = useState<LineSelection | null>(null)
+  const showAddToChat = Boolean(filePath && (lineSelection || textLineSelection))
+
+  const placeChipAtClient = useCallback((clientX: number, clientY: number) => {
+    const frame = frameRef.current
+
+    if (!frame) {
+      return
+    }
+
+    lastPointerRef.current = { x: clientX, y: clientY }
+    setChipPos(chipPosInFrame(frame, clientX, clientY))
+  }, [])
+
+  const placeChipForKeyboardSelection = useCallback(() => {
+    const frame = frameRef.current
+    const live = frame ? readHostTextSelection(frame) : null
+
+    if (live) {
+      const rect = live.range.getBoundingClientRect()
+
+      placeChipAtClient(rect.right, rect.bottom)
+
+      return
+    }
+
+    const pointer = lastPointerRef.current
+
+    if (pointer) {
+      placeChipAtClient(pointer.x, pointer.y)
+    }
+  }, [placeChipAtClient])
+
+  const clearTextLineSelection = useCallback(() => {
+    setTextLineSelection(current => (current ? null : current))
+  }, [])
+
+  const publishTextLineSelection = useCallback(
+    (opts?: { fromKeyboard?: boolean }) => {
+      const frame = frameRef.current
+
+      if (!frame || !filePath) {
+        clearTextLineSelection()
+
+        return
+      }
+
+      const live = readHostTextSelection(frame)
+
+      if (!live) {
+        clearTextLineSelection()
+
+        return
+      }
+
+      const source = getSourceText?.() ?? ''
+
+      const preferOffset = (() => {
+        const pointer = lastPointerRef.current
+
+        if (!pointer || !source) {
+          return undefined
+        }
+
+        // Rough char offset near the pointer for duplicate-needle disambiguation.
+        const ratio = Math.min(
+          1,
+          Math.max(0, (pointer.y - frame.getBoundingClientRect().top) / Math.max(1, frame.clientHeight))
+        )
+
+        return Math.floor(ratio * source.length)
+      })()
+
+      const resolved = source ? lineSelectionFromSelectedText(source, live.text, preferOffset) : null
+
+      if (!resolved) {
+        clearTextLineSelection()
+
+        return
+      }
+
+      if (opts?.fromKeyboard) {
+        placeChipForKeyboardSelection()
+      }
+
+      setTextLineSelection(current =>
+        current?.start === resolved.start && current.end === resolved.end ? current : resolved
+      )
+    },
+    [clearTextLineSelection, filePath, getSourceText, placeChipForKeyboardSelection]
+  )
+
+  // Gutter line picks set `lineSelection` from the child; pin the chip to the
+  // latest pointer so it still follows the mouse. Clear when nothing is selected.
+  useEffect(() => {
+    if (!lineSelection && !textLineSelection) {
+      setChipPos(null)
+
+      return
+    }
+
+    if (!lineSelection) {
+      return
+    }
+
+    const pointer = lastPointerRef.current
+
+    if (pointer) {
+      placeChipAtClient(pointer.x, pointer.y)
+    }
+  }, [lineSelection, placeChipAtClient, textLineSelection])
+
+  // Pointer bookkeeping refs (gesture origin / last client point) — not atom mirrors.
+  // eslint-disable-next-line no-restricted-syntax -- DOM gesture refs written from listeners, not reactive state
+  useEffect(() => {
+    if (!filePath) {
+      clearTextLineSelection()
+      setChipPos(null)
+
+      return
+    }
+
+    // Publish only after the gesture settles — never on selectionchange — so the
+    // floating chip does not re-layout on every drag frame.
+    const onMouseDown = (event: MouseEvent) => {
+      const frame = frameRef.current
+      const target = event.target
+      const inFrame = Boolean(frame && target instanceof Node && frame.contains(target))
+
+      pointerGestureInFrameRef.current = inFrame
+
+      if (!inFrame) {
+        return
+      }
+
+      lastPointerRef.current = { x: event.clientX, y: event.clientY }
+
+      if (target instanceof Element && target.closest('button')) {
+        return
+      }
+
+      clearTextLineSelection()
+    }
+
+    const onMouseUp = (event: MouseEvent) => {
+      if (!pointerGestureInFrameRef.current) {
+        return
+      }
+
+      pointerGestureInFrameRef.current = false
+      // Pin to the release point — selection often ends outside the scrolled
+      // line/text node after a drag that started in the preview.
+      lastPointerRef.current = { x: event.clientX, y: event.clientY }
+      placeChipAtClient(event.clientX, event.clientY)
+      publishTextLineSelection()
+    }
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.shiftKey || event.key === 'Shift') {
+        publishTextLineSelection({ fromKeyboard: true })
+      }
+    }
+
+    document.addEventListener('mousedown', onMouseDown, true)
+    document.addEventListener('mouseup', onMouseUp, true)
+    document.addEventListener('keyup', onKeyUp, true)
+
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown, true)
+      document.removeEventListener('mouseup', onMouseUp, true)
+      document.removeEventListener('keyup', onKeyUp, true)
+    }
+  }, [clearTextLineSelection, filePath, placeChipAtClient, publishTextLineSelection])
+
+  const insertLineRef = useCallback(
+    (selection: LineSelection) => {
+      if (!filePath) {
+        return false
+      }
+
+      const ref = sourceLineSelectionRef(filePath, selection, $currentCwd.get())
+
+      if (!ref) {
+        return false
+      }
+
+      requestComposerInsertRefs([ref])
+      requestComposerFocus('active')
+      triggerHaptic('selection')
+
+      return true
+    },
+    [filePath]
+  )
+
+  const addLineSelectionToChat = useCallback(() => {
+    if (!lineSelection || !insertLineRef(lineSelection)) {
+      return false
+    }
+
+    onConsumeLineSelection?.()
+
+    return true
+  }, [insertLineRef, lineSelection, onConsumeLineSelection])
+
+  const addTextSelectionToChat = useCallback(() => {
+    const frame = frameRef.current
+    const live = frame ? readHostTextSelection(frame) : null
+    const source = getSourceText?.() ?? ''
+
+    const resolved =
+      textLineSelection || (live && source ? lineSelectionFromSelectedText(source, live.text) : null)
+
+    if (!resolved || !insertLineRef(resolved)) {
+      return false
+    }
+
+    window.getSelection()?.removeAllRanges()
+    clearTextLineSelection()
+
+    return true
+  }, [clearTextLineSelection, getSourceText, insertLineRef, textLineSelection])
+
+  const addSelectionToChat = useCallback(() => {
+    if (addLineSelectionToChat()) {
+      return
+    }
+
+    addTextSelectionToChat()
+  }, [addLineSelectionToChat, addTextSelectionToChat])
+
+  // Claim ⌘/Ctrl+L while a preview selection is live so the terminal's earlier
+  // capture listener does not also quote the same native selection.
+  useEffect(() => {
+    if (!filePath || (!lineSelection && !textLineSelection)) {
+      return
+    }
+
+    return retainPreviewAddShortcutClaim()
+  }, [filePath, lineSelection, textLineSelection])
+
+  useEffect(() => {
+    if (!filePath || (!lineSelection && !textLineSelection)) {
+      return
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!isAddSelectionShortcut(event)) {
+        return
+      }
+
+      if (lineSelection) {
+        if (!addLineSelectionToChat()) {
+          return
+        }
+      } else if (!addTextSelectionToChat()) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation()
+    }
+
+    window.addEventListener('keydown', onKeyDown, { capture: true })
+
+    return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
+  }, [addLineSelectionToChat, addTextSelectionToChat, filePath, lineSelection, textLineSelection])
+
+  return (
+    <div className="relative h-full min-h-0" ref={frameRef}>
+      {showAddToChat && chipPos && (
+        <div className="pointer-events-none absolute inset-0 z-50 overflow-hidden">
+          <div
+            className="pointer-events-auto absolute flex items-center gap-1"
+            style={{ left: chipPos.left, top: chipPos.top }}
+          >
+            <Button
+              className="h-6 rounded-md px-2 text-[0.68rem] shadow-md backdrop-blur-md"
+              onClick={event => event.preventDefault()}
+              onMouseDown={event => {
+                event.preventDefault()
+                event.stopPropagation()
+                addSelectionToChat()
+              }}
+              type="button"
+              variant="secondary"
+            >
+              {t.rightSidebar.addToChat}
+              <KbdCombo className="ml-1 opacity-70" combo="mod+l" size="sm" />
+            </Button>
+          </div>
+        </div>
+      )}
+      {children}
+    </div>
+  )
+}
+
 /** Windowed, Shiki-highlighted source. The gutter's line selection produces a
  *  `path:line` composer ref, so it is inert without a `filePath` (artifact
  *  content has no path to reference lines against). */
-export function SourceView({ filePath, language, text }: { filePath?: string; language: string; text: string }) {
+export function SourceView({
+  filePath,
+  language,
+  onLineSelectionChange,
+  text
+}: {
+  filePath?: string
+  language: string
+  onLineSelectionChange?: (selection: LineSelection | null) => void
+  text: string
+}) {
   const { t } = useI18n()
   const chunks = useMemo(() => chunkTextLines(text, SOURCE_CHUNK_LINES), [text])
   const lastChunk = chunks.at(-1)
@@ -458,6 +811,15 @@ export function SourceView({ filePath, language, text }: { filePath?: string; la
   const visibleChunks = chunks.slice(startChunk, endChunk + 1)
   const [selection, setSelection] = useState<LineSelection | null>(null)
   const inSelection = (line: number) => selection != null && line >= selection.start && line <= selection.end
+
+  useEffect(() => {
+    onLineSelectionChange?.(selection)
+  }, [onLineSelectionChange, selection])
+
+  // Clear gutter highlight when the previewed file changes (parent also resets).
+  useEffect(() => {
+    setSelection(null)
+  }, [filePath, text])
 
   const handleLineClick = (event: ReactMouseEvent, line: number) => {
     if (!filePath) {
@@ -486,40 +848,6 @@ export function SourceView({ filePath, language, text }: { filePath?: string; la
 
     startLineDrag(event, filePath, inSelection(line) && selection ? selection : { end: line, start: line })
   }
-
-  // ⌘/Ctrl+L with a line selection drops the same `@line:path:start-end` ref the
-  // gutter drag produces — so the keyboard path mirrors dragging the lines into
-  // the composer. Capture-phase + stopPropagation so it beats the terminal's
-  // global ⌘L handler (which would otherwise grab the native text selection).
-  useEffect(() => {
-    if (!selection || !filePath) {
-      return
-    }
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!isAddSelectionShortcut(event)) {
-        return
-      }
-
-      const lineEnd = selection.end > selection.start ? selection.end : undefined
-      const ref = droppedFileInlineRef({ line: selection.start, lineEnd, path: filePath }, $currentCwd.get())
-
-      if (!ref) {
-        return
-      }
-
-      event.preventDefault()
-      event.stopPropagation()
-      // Insert into and focus the SAME composer — 'active' — so a tile that owns
-      // focus keeps it instead of the ref landing in a tile but main stealing focus.
-      requestComposerInsertRefs([ref])
-      requestComposerFocus('active')
-    }
-
-    window.addEventListener('keydown', onKeyDown, { capture: true })
-
-    return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
-  }, [filePath, selection])
 
   return (
     <div className="h-full overflow-auto" onScroll={onScroll} ref={scrollerRef}>
@@ -596,6 +924,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   const [saveError, setSaveError] = useState<null | string>(null)
   const [conflict, setConflict] = useState(false)
   const [selfReload, setSelfReload] = useState(0)
+  const [lineSelection, setLineSelection] = useState<LineSelection | null>(null)
   // For the bare-`e` shortcut: the read-view root (to detect focus-within) and a
   // hover flag (no state — only the keydown handler reads it).
   const readViewRef = useRef<HTMLDivElement>(null)
@@ -611,6 +940,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     setSaving(false)
     setSaveError(null)
     setConflict(false)
+    setLineSelection(null)
     draftRef.current = ''
     baselineRef.current = ''
   }, [filePath, reloadKey])
@@ -868,14 +1198,18 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
           </div>
         )}
         <div className="min-h-0 flex-1 overflow-hidden">
-          <CodeEditor
-            filePath={filePath}
-            initialValue={baselineRef.current}
-            key={editorKey}
-            onCancel={cancelEdit}
-            onChange={handleEditorChange}
-            onSave={() => void saveEdit()}
-          />
+          <PreviewAddToChatFrame filePath={filePath} getSourceText={() => draftRef.current}>
+            <div className="h-full min-h-0" data-selectable-text="true">
+              <CodeEditor
+                filePath={filePath}
+                initialValue={baselineRef.current}
+                key={editorKey}
+                onCancel={cancelEdit}
+                onChange={handleEditorChange}
+                onSave={() => void saveEdit()}
+              />
+            </div>
+          </PreviewAddToChatFrame>
         </div>
       </div>
     )
@@ -958,7 +1292,10 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
         <PreviewModeSwitcher
           active={mode}
           modes={modes}
-          onSelect={setUserMode}
+          onSelect={next => {
+            setLineSelection(null)
+            setUserMode(next)
+          }}
           trailing={
             canEdit ? (
               <Tip label={`${t.preview.edit} (e)`}>
@@ -974,24 +1311,36 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
             ) : null
           }
         />
-        <div className="min-h-0 flex-1 overflow-auto">
-          {mode === 'rendered' ? (
-            <MarkdownPreview text={state.text} />
-          ) : mode === 'diff' ? (
-            <FileDiffPanel
-              className="mx-0 mb-0 h-full max-h-none"
-              diff={state.diff ?? ''}
-              fullText={state.text}
-              path={filePath}
-              showLineNumbers
-            />
-          ) : (
-            <SourceView
-              filePath={filePath}
-              language={shikiLanguageForFilename(filePath) || state.language || 'text'}
-              text={state.text}
-            />
-          )}
+        <div className="min-h-0 flex-1">
+          <PreviewAddToChatFrame
+            filePath={filePath}
+            getSourceText={() => state.text ?? ''}
+            lineSelection={mode === 'source' ? lineSelection : null}
+            onConsumeLineSelection={() => setLineSelection(null)}
+          >
+            {mode === 'rendered' ? (
+              <div className="h-full overflow-auto">
+                <MarkdownPreview text={state.text} />
+              </div>
+            ) : mode === 'diff' ? (
+              <div className="h-full overflow-auto" data-selectable-text="true">
+                <FileDiffPanel
+                  className="mx-0 mb-0 h-full max-h-none"
+                  diff={state.diff ?? ''}
+                  fullText={state.text}
+                  path={filePath}
+                  showLineNumbers
+                />
+              </div>
+            ) : (
+              <SourceView
+                filePath={filePath}
+                language={shikiLanguageForFilename(filePath) || state.language || 'text'}
+                onLineSelectionChange={setLineSelection}
+                text={state.text}
+              />
+            )}
+          </PreviewAddToChatFrame>
         </div>
       </div>
     )
