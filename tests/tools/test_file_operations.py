@@ -5,7 +5,7 @@ import re
 import pytest
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from tools.file_operations import (
     _is_write_denied,
@@ -615,3 +615,160 @@ class TestAtomicWriteNewFilePermissions:
         assert result.error is None, f"write failed: {result.error}"
         assert dest.read_text() == "#!/bin/sh\necho updated\n"
         assert dest.stat().st_mode & 0o777 == 0o755
+
+class TestPatchMultiEdit:
+    """Tests for patch_multi_edit — sequential fuzzy edits on evolving
+    content, all per-edit results reported together, a single write and a
+    single syntax check at the end."""
+
+    @pytest.fixture()
+    def ops(self):
+        obj = ShellFileOperations.__new__(ShellFileOperations)
+        obj._command_cache = {}
+        return obj
+
+    ORIGINAL = "def foo():\n    return None\n"
+    MERGED = "def foo(x):\n    return x\n"
+
+    def _exec(self, original, merged):
+        """Side effect for _exec: first cat returns original, verify cat returns merged."""
+        cat_calls = {"n": 0}
+
+        def fake_exec(command, **kwargs):
+            if command.startswith("cat "):
+                cat_calls["n"] += 1
+                out = original if cat_calls["n"] == 1 else merged
+                return MagicMock(exit_code=0, stdout=out)
+            return MagicMock(exit_code=0, stdout="")
+
+        return fake_exec
+
+    def test_applies_edits_sequentially_and_reports_all(self, ops):
+        """Two edits applied in order; both reported; single write of merged
+        content; single lint check at the end."""
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "_exec", side_effect=self._exec(self.ORIGINAL, self.MERGED)), \
+             patch.object(ops, "write_file", return_value=MagicMock(
+                 error=None, lsp_diagnostics=None, lint={"success": True}
+             )) as write, \
+             patch.object(ops, "_check_lint_delta") as lint, \
+             patch.object(ops, "_unified_diff", return_value="--- a/x\n+++ b/x\n") as diff:
+            result = ops.patch_multi_edit("/tmp/test/a.py", [
+                {"old_string": "def foo():", "new_string": "def foo(x):"},
+                {"old_string": "return None", "new_string": "return x"},
+            ])
+
+        assert result.success, f"expected success, got error={result.error}"
+        assert result.files_modified == ["/tmp/test/a.py"]
+        assert write.call_count == 1
+        assert write.call_args[0][1] == self.MERGED
+        assert [r["index"] for r in result.edit_results] == [0, 1]
+        assert [r["status"] for r in result.edit_results] == ["ok", "ok"]
+        lint.assert_not_called()
+        assert result.lint == {"success": True}
+        assert diff.call_count == 1
+
+    def test_partial_failure_reports_all_and_writes_successes(self, ops):
+        """Edit 0 succeeds, edit 1 has no match: both reported, only the
+        successful edit is applied and written (no partial write)."""
+        merged = "def foo(x):\n    return None\n"
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "_exec", side_effect=self._exec(self.ORIGINAL, merged)), \
+             patch.object(ops, "write_file", return_value=MagicMock(error=None, lsp_diagnostics=None)) as write, \
+             patch.object(ops, "_check_lint_delta", return_value=MagicMock(success=True, to_dict=lambda: {})), \
+             patch.object(ops, "_unified_diff", return_value=""):
+            result = ops.patch_multi_edit("/tmp/test/a.py", [
+                {"old_string": "def foo():", "new_string": "def foo(x):"},
+                {"old_string": "MISSING STRING", "new_string": "x"},
+            ])
+
+        assert result.success
+        assert [r["status"] for r in result.edit_results] == ["ok", "error"]
+        assert write.call_count == 1
+        assert write.call_args[0][1] == merged
+
+    def test_all_edits_fail_no_write(self, ops):
+        """If no edit can be applied, nothing is written and an error is returned."""
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "_exec", side_effect=self._exec(self.ORIGINAL, self.ORIGINAL)), \
+             patch.object(ops, "write_file", return_value=MagicMock(error=None, lsp_diagnostics=None)) as write, \
+             patch.object(ops, "_check_lint_delta", return_value=MagicMock(success=True, to_dict=lambda: {})), \
+             patch.object(ops, "_unified_diff", return_value=""):
+            result = ops.patch_multi_edit("/tmp/test/a.py", [
+                {"old_string": "NOPE 1", "new_string": "x"},
+                {"old_string": "NOPE 2", "new_string": "y"},
+            ])
+
+        assert result.error is not None
+        assert "None of the edits" in result.error
+        write.assert_not_called()
+        assert all(r["status"] == "error" for r in result.edit_results)
+
+    def test_empty_edits_rejected(self, ops):
+        """A missing/empty edits list is rejected without touching the file."""
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "write_file", return_value=MagicMock(error=None, lsp_diagnostics=None)) as write:
+            result = ops.patch_multi_edit("/tmp/test/a.py", [])
+
+        assert result.error is not None
+        assert "edits" in result.error
+        write.assert_not_called()
+
+    def test_malformed_edit_reported_but_valid_ones_still_apply(self, ops):
+        """A non-dict / missing-string edit is reported as an error while
+        valid edits still proceed and are written."""
+        merged = "def foo(x):\n    return None\n"
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "_exec", side_effect=self._exec(self.ORIGINAL, merged)), \
+             patch.object(ops, "write_file", return_value=MagicMock(error=None, lsp_diagnostics=None)) as write, \
+             patch.object(ops, "_check_lint_delta", return_value=MagicMock(success=True, to_dict=lambda: {})), \
+             patch.object(ops, "_unified_diff", return_value=""):
+            result = ops.patch_multi_edit("/tmp/test/a.py", [
+                "not-a-dict",
+                {"old_string": "def foo():", "new_string": "def foo(x):"},
+            ])
+
+        assert result.success
+        assert [r["status"] for r in result.edit_results] == ["error", "ok"]
+        assert write.call_count == 1
+        assert write.call_args[0][1] == merged
+
+    def test_non_string_edit_reported_but_valid_ones_still_apply(self, ops):
+        """Invalid value types are isolated to their edit result."""
+        merged = "def foo(x):\n    return None\n"
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "_exec", side_effect=self._exec(self.ORIGINAL, merged)), \
+             patch.object(ops, "write_file", return_value=MagicMock(
+                 error=None, lsp_diagnostics=None, lint=None
+             )) as write, \
+             patch.object(ops, "_unified_diff", return_value=""):
+            result = ops.patch_multi_edit("/tmp/test/a.py", [
+                {"old_string": 123, "new_string": "x"},
+                {"old_string": "def foo():", "new_string": "def foo(x):"},
+            ])
+
+        assert result.success
+        assert [r["status"] for r in result.edit_results] == ["error", "ok"]
+        assert "must both be strings" in result.edit_results[0]["error"]
+        assert write.call_args[0][1] == merged
+
+    def test_write_error_surfaces(self, ops):
+        """A write failure (write_file.error set) is surfaced, not swallowed."""
+        with patch("tools.file_operations.get_write_denied_error", return_value=None), \
+             patch.object(ops, "_expand_path", side_effect=lambda p: p), \
+             patch.object(ops, "_exec", side_effect=self._exec(self.ORIGINAL, self.MERGED)), \
+             patch.object(ops, "write_file", return_value=MagicMock(error="disk full", lsp_diagnostics=None)), \
+             patch.object(ops, "_unified_diff", return_value=""):
+            result = ops.patch_multi_edit("/tmp/test/a.py", [
+                {"old_string": "def foo():", "new_string": "def foo(x):"},
+                {"old_string": "return None", "new_string": "return x"},
+            ])
+
+        assert result.error is not None
+        assert "disk full" in result.error
