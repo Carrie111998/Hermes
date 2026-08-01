@@ -4727,18 +4727,22 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
-    # Session cost tracking — populated from the agent's running accumulator
+    # Session cost tracking — populated from the agent's running accumulator.
+    # When display.show_cost is enabled the usage contract always carries
+    # cost_usd (including zero) so the TUI can render $0.00 for a subscription
+    # session whose USD accumulator hasn't moved yet.  A separate show_cost flag
+    # lets the renderer gate on the user's opt-in independent of the numeric value.
     if agent is not None:
         cost = getattr(agent, "session_estimated_cost_usd", 0) or 0
-        if cost > 0:
-            # Respect display.show_cost config gate
-            try:
-                from hermes_cli.config import load_config
-                show = (load_config().get("display") or {}).get("show_cost", False)
-            except Exception:
-                show = False
-            if show:
-                usage["cost_usd"] = cost
+        # Respect display.show_cost config gate
+        try:
+            from hermes_cli.config import load_config
+            show = (load_config().get("display") or {}).get("show_cost", False)
+        except Exception:
+            show = False
+        if show:
+            usage["cost_usd"] = cost
+            usage["show_cost"] = True
         usage["cost_status"] = getattr(agent, "session_cost_status", "unknown") or "unknown"
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status

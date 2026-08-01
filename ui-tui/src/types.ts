@@ -195,6 +195,7 @@ export interface Usage {
   input: number
   output: number
   reasoning?: number
+  show_cost?: boolean
   total: number
 }
 

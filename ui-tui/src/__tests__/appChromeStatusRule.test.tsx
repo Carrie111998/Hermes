@@ -467,3 +467,50 @@ describe('StatusRule idle-since read-out', () => {
     expect(findComponentByName(element, 'IdleSince')).toBeNull()
   })
 })
+
+describe('StatusRule session cost display', () => {
+  it('renders $0.00 when show_cost is true and cost_usd is zero (subscription accumulator)', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { ...baseProps.usage, calls: 0, input: 0, output: 0, cost_usd: 0, show_cost: true }
+    })
+
+    expect(textContent(element)).toContain('$0.00')
+  })
+
+  it('renders the formatted cost when show_cost is true and cost_usd > 0', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { ...baseProps.usage, calls: 0, input: 0, output: 0, cost_usd: 5.23, show_cost: true }
+    })
+
+    expect(textContent(element)).toContain('$5.23')
+  })
+
+  it('uses one decimal place for cost >= 10', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { ...baseProps.usage, calls: 0, input: 0, output: 0, cost_usd: 125.5, show_cost: true }
+    })
+
+    expect(textContent(element)).toContain('$125.5')
+  })
+
+  it('omits the cost segment when show_cost is absent', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { ...baseProps.usage, calls: 0, input: 0, output: 0 }
+    })
+
+    expect(textContent(element)).not.toContain('$')
+  })
+
+  it('omits the cost segment when show_cost is false', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { ...baseProps.usage, calls: 0, input: 0, output: 0, cost_usd: 0, show_cost: false }
+    })
+
+    expect(textContent(element)).not.toContain('$')
+  })
+})
