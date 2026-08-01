@@ -43,9 +43,7 @@ def test_ensure_ssl_certs_keeps_existing_ssl_cert_file(monkeypatch, tmp_path):
     assert os.environ["SSL_CERT_FILE"] == str(cert_file)
 
 
-def test_ensure_ssl_certs_prefers_homebrew_bundle_for_problematic_darwin_default(
-    monkeypatch,
-):
+def test_ensure_ssl_certs_prefers_homebrew_bundle_for_problematic_darwin_default(monkeypatch):
     """A problematic macOS venv default uses the Homebrew trust bundle."""
     homebrew_bundle = "/opt/homebrew/etc/openssl@3/cert.pem"
     python_default = "/private/etc/ssl/cert.pem"
