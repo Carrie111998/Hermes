@@ -19,6 +19,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from gateway.runtime_skill_projection import (
+    RuntimeSkillProjection,
+    resolve_skill_projections,
+    view_skill,
+)
+
 from gateway.api_server_shared import (
     AIOHTTP_AVAILABLE,
     MAX_RUNTIME_ATTACHMENT_BYTES,
@@ -398,6 +404,10 @@ def _runtime_allowed_skill_digests(
     return digests
 
 
+def _runtime_skill_projections(skill_manifest: Any) -> dict[str, RuntimeSkillProjection]:
+    return resolve_skill_projections(skill_manifest, _NO_SKILL_MANIFEST)
+
+
 def _discover_skill_metadata() -> list[dict[str, Any]]:
     from gateway.ultrastudio_skill_routing import discover_skill_metadata
 
@@ -724,6 +734,11 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
         requested = str(args.get("name") or args.get("skill") or "").strip()
         if not session.is_skill_allowed(requested):
             return _skill_scope_error(requested)
+        projection = session.allowed_skill_projections.get(requested)
+        if projection is not None:
+            result = view_skill(requested, projection, args)
+            session.record_loaded_skill(args, result)
+            return result
     if tool_name == "image_analyze":
         for source in _image_analysis_sources(args):
             parsed = urlparse(source)
@@ -817,6 +832,7 @@ class RuntimeBridgeSession:
         deadline_ms: int,
         agent_session_id: str,
         allowed_skill_names: set[str] | None = None,
+        allowed_skill_projections: dict[str, RuntimeSkillProjection] | None = None,
         allowed_image_paths: set[str] | None = None,
         allowed_video_paths: set[str] | None = None,
     ) -> None:
@@ -831,6 +847,11 @@ class RuntimeBridgeSession:
             if allowed_skill_names is not None
             else _allowed_skill_names(definitions)
         )
+        self.allowed_skill_projections = {
+            name: projection
+            for name, projection in (allowed_skill_projections or {}).items()
+            if name in self.allowed_skill_names
+        }
         self.allowed_image_paths = {
             str(Path(path).resolve())
             for path in (allowed_image_paths or set())
@@ -1227,6 +1248,7 @@ class APIServerRuntimeMixin:
                 skill_manifest,
             )
             allowed_skill_names = set(allowed_skill_digests)
+            allowed_skill_projections = _runtime_skill_projections(skill_manifest)
             instructions = (
                 _replacement_system_prompt(system_context)
                 + _allowed_skills_prompt(allowed_skill_names)
@@ -1304,6 +1326,7 @@ class APIServerRuntimeMixin:
             int(body.get("deadline_ms") or 0),
             agent_session_id,
             allowed_skill_names=allowed_skill_names,
+            allowed_skill_projections=allowed_skill_projections,
             allowed_image_paths={str(path) for path in runtime_image_paths},
             allowed_video_paths={str(path) for path in runtime_video_paths},
         )

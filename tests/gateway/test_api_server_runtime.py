@@ -30,6 +30,7 @@ from gateway.api_server_runtime import (
     _runtime_allowed_skill_digests,
     _runtime_image_paths,
     _runtime_allowed_skill_names,
+    _runtime_skill_projections,
     _runtime_video_paths,
     _runtime_tool_middleware,
 )
@@ -186,20 +187,25 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "name": "media-qa",
             "task_id": "must-not-cross-runtime-boundary",
         })
-        skill_envelope = json.dumps({"success": True, "content": "workflow instructions"})
         skill_result = _runtime_tool_middleware(
             tool_name="skill_view",
             args={"name": "media-qa"},
             session_id=kwargs["session_id"],
             tool_call_id="skill_call",
-            next_call=lambda _args: skill_envelope,
+            next_call=lambda _args: pytest.fail("bound skill reached native skill_view"),
         )
-        assert skill_result == skill_envelope
+        skill_envelope = json.loads(skill_result)
+        assert skill_envelope["success"] is True
+        assert skill_envelope["content"] == "workflow instructions"
+        assert "skill_dir" not in skill_envelope
+        assert skill_envelope["linked_files"] == {
+            "references": ["references/guide.md"],
+        }
         kwargs["tool_complete_callback"](
             "skill_call",
             "skill_view",
             {"name": "media-qa"},
-            json.dumps({"success": True, "content": "workflow instructions"}),
+            skill_result,
         )
 
         denied = _runtime_tool_middleware(
@@ -665,6 +671,15 @@ async def test_runtime_bridge_exposes_scoped_video_analysis_and_cleans_source_fi
         await client.close()
 
 
+def _runtime_skill_file(path: str, body: bytes) -> dict[str, object]:
+    return {
+        "path": path,
+        "size_bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "content_base64": base64.b64encode(body).decode("ascii"),
+    }
+
+
 @pytest.mark.asyncio
 async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypatch):
     monkeypatch.setattr(runtime_module, "_discover_skill_metadata", lambda: [
@@ -709,10 +724,25 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "resolution_id": "resolution-test",
                 "manifest_digest": "sha256:test",
                 "skills": [
-                    {"runtime_alias": "media-qa", "content_digest": package_digest},
+                    {
+                        "runtime_alias": "media-qa",
+                        "content_digest": package_digest,
+                        "path": "/orchestrator-only/media-qa",
+                        "files": [
+                            _runtime_skill_file("SKILL.md", b"workflow instructions"),
+                            _runtime_skill_file(
+                                "references/guide.md",
+                                b"reference instructions",
+                            ),
+                        ],
+                    },
                     {
                         "runtime_alias": "planning-only",
                         "content_digest": "sha256:" + hashlib.sha256(b"planning bundle").hexdigest(),
+                        "path": "/orchestrator-only/planning-only",
+                        "files": [
+                            _runtime_skill_file("SKILL.md", b"planning instructions"),
+                        ],
                     },
                 ],
             },
@@ -849,6 +879,98 @@ def test_runtime_skill_manifest_is_visibility_source_of_truth():
         _runtime_allowed_skill_digests(definitions, {
             "skills": [{"runtime_alias": "tool-guided"}],
         })
+
+
+def test_runtime_skill_projections_require_verified_inline_files():
+    manifest = {
+        "skills": [{
+            "runtime_alias": "tool-guided",
+            "content_digest": "sha256:" + "a" * 64,
+            "path": "/orchestrator-only/tool-guided",
+            "files": [_runtime_skill_file("SKILL.md", b"instructions")],
+        }],
+    }
+    projections = _runtime_skill_projections(manifest)
+    assert projections["tool-guided"].files == {"SKILL.md": b"instructions"}
+
+    manifest["skills"][0]["files"][0]["sha256"] = "b" * 64
+    with pytest.raises(ValueError, match="differs from signed inventory for tool-guided"):
+        _runtime_skill_projections(manifest)
+
+    manifest["skills"][0]["files"] = [_runtime_skill_file("SKILL.md", b"instructions")]
+    manifest["skills"][0]["files"][0]["content_base64"] = "not-base64!"
+    with pytest.raises(ValueError, match="file content is invalid for tool-guided"):
+        _runtime_skill_projections(manifest)
+
+    manifest["skills"][0]["files"] = [_runtime_skill_file("../SKILL.md", b"outside")]
+    with pytest.raises(ValueError, match="file path is invalid for tool-guided"):
+        _runtime_skill_projections(manifest)
+
+    manifest["skills"][0]["files"] = [_runtime_skill_file("guide.md", b"guide")]
+    with pytest.raises(ValueError, match="root file is required for tool-guided"):
+        _runtime_skill_projections(manifest)
+
+    manifest["skills"][0].pop("files")
+    with pytest.raises(ValueError, match="files are required for tool-guided"):
+        _runtime_skill_projections(manifest)
+
+
+def test_bound_skill_view_rejects_traversal_and_binary_files(monkeypatch):
+    manifest = {
+        "skills": [{
+            "runtime_alias": "tool-guided",
+            "content_digest": "sha256:" + "a" * 64,
+            "path": "/orchestrator-only/tool-guided",
+            "files": [
+                _runtime_skill_file("SKILL.md", b"instructions"),
+                _runtime_skill_file("guide.md", b"guide"),
+                _runtime_skill_file("binary.dat", b"\xff"),
+            ],
+        }],
+    }
+    projections = _runtime_skill_projections(manifest)
+
+    session_loop = asyncio.new_event_loop()
+    session = RuntimeBridgeSession(
+        "run_test",
+        session_loop,
+        asyncio.Queue(),
+        [],
+        0,
+        "session_test",
+        allowed_skill_names={"tool-guided"},
+        allowed_skill_projections=projections,
+    )
+    monkeypatch.setitem(runtime_module._SESSIONS, "session_test", session)
+    try:
+        viewed = _runtime_tool_middleware(
+            tool_name="skill_view",
+            args={"name": "tool-guided", "file_path": "guide.md"},
+            session_id="session_test",
+            tool_call_id="guide_call",
+            next_call=lambda _args: pytest.fail("bound skill reached native skill_view"),
+        )
+        assert json.loads(viewed)["content"] == "guide"
+
+        traversal = _runtime_tool_middleware(
+            tool_name="skill_view",
+            args={"name": "tool-guided", "file_path": "../outside.md"},
+            session_id="session_test",
+            tool_call_id="traversal_call",
+            next_call=lambda _args: pytest.fail("bound skill reached native skill_view"),
+        )
+        assert json.loads(traversal)["success"] is False
+
+        binary = _runtime_tool_middleware(
+            tool_name="skill_view",
+            args={"name": "tool-guided", "file_path": "binary.dat"},
+            session_id="session_test",
+            tool_call_id="binary_call",
+            next_call=lambda _args: pytest.fail("bound skill reached native skill_view"),
+        )
+        assert json.loads(binary)["success"] is False
+    finally:
+        session_loop.close()
 
 
 def test_resume_history_continues_from_tool_result_without_synthetic_user():
