@@ -305,21 +305,22 @@ class TestPushedHashesPopulated:
 class TestSyncBackFileLock:
     """Verify that fcntl.flock is used during sync-back."""
 
-    @patch("tools.environments.file_sync.fcntl.flock")
-    def test_sync_back_file_lock(self, mock_flock, tmp_path):
+    def test_sync_back_file_lock(self, tmp_path):
+        # Skip before @patch: on Windows file_sync.fcntl is None and patching
+        # fcntl.flock would ERROR during decorator setup.
         fcntl = pytest.importorskip("fcntl")
         download_fn = _make_download_fn({})
         mgr = _make_manager(tmp_path, bulk_download_fn=download_fn)
 
-        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        with patch("tools.environments.file_sync.fcntl.flock") as mock_flock:
+            mgr.sync_back(hermes_home=tmp_path / ".hermes")
 
-        # flock should have been called at least twice: LOCK_EX to acquire, LOCK_UN to release
-        assert mock_flock.call_count >= 2
+            # flock should have been called at least twice: LOCK_EX to acquire, LOCK_UN to release
+            assert mock_flock.call_count >= 2
 
-        lock_calls = mock_flock.call_args_list
-        lock_ops = [c[0][1] for c in lock_calls]
-        assert fcntl.LOCK_EX in lock_ops
-        assert fcntl.LOCK_UN in lock_ops
+            lock_ops = [c[0][1] for c in mock_flock.call_args_list]
+            assert fcntl.LOCK_EX in lock_ops
+            assert fcntl.LOCK_UN in lock_ops
 
     def test_sync_back_skips_flock_when_fcntl_none(self, tmp_path):
         """On Windows (fcntl=None), sync_back should skip file locking."""
@@ -386,15 +387,43 @@ class TestSyncBackPosixRemotePaths:
         assert host_file.read_bytes() == remote_content
 
     def test_infer_host_path_uses_posix_remote_dirname(self, tmp_path):
+        """posixpath.dirname must win even if Path.parent stringifies like Windows."""
         host_file = tmp_path / "host" / "skills" / "a.py"
         _write_file(host_file, b"content")
         mapping = [(str(host_file), "/root/.hermes/skills/a.py")]
-
         mgr = _make_manager(tmp_path, file_mapping=mapping)
-        result = mgr._infer_host_path(
-            "/root/.hermes/skills/b.py",
-            file_mapping=mapping,
-        )
+
+        real_path = Path
+
+        class WindowsishPath:
+            def __init__(self, value):
+                self._raw = value if isinstance(value, str) else str(value)
+                self._p = value if isinstance(value, real_path) else real_path(value)
+
+            @property
+            def parent(self):
+                parent = self._p.parent
+                if self._raw.startswith("/root/") or self._raw.startswith("/home/"):
+                    return real_path(str(parent).replace("/", "\\"))
+                return parent
+
+            def __truediv__(self, other):
+                return self._p / other
+
+            def __str__(self):
+                return str(self._p)
+
+            def expanduser(self):
+                return self._p.expanduser()
+
+            def resolve(self):
+                return self._p.resolve()
+
+        with patch("tools.environments.file_sync.Path", WindowsishPath):
+            result = mgr._infer_host_path(
+                "/root/.hermes/skills/b.py",
+                file_mapping=mapping,
+            )
         assert result == str(tmp_path / "host" / "skills" / "b.py")
 
 
