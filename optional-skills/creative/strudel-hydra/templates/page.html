@@ -31,6 +31,10 @@
 <!-- Parent loads Strudel only; the iframe loads Hydra (see HYDRA_DOC below). -->
 <script src="https://unpkg.com/@strudel/web@1.0.3"></script>
 <script>
+  // Capability token the server injects when it serves this page; sent back on
+  // the telemetry write so the gated endpoint accepts it. Exported pages never
+  // reach the server, so the unreplaced placeholder there is harmless.
+  const TOKEN = "__SH_TOKEN__";
   const hudEl = document.getElementById('hud');
   const hud = (t) => { hudEl.textContent = 'strudel-hydra: ' + t; };
   const LIVE = !window.__SET__;   // exported pages carry a baked-in set instead of an SSE stream
@@ -186,7 +190,7 @@
         centroid = den ? +(num / den / (bands.length - 1)).toFixed(4) : 0;
       }
       const body = JSON.stringify({ level, bands, centroid });
-      try { await fetch('/telemetry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }); } catch (_) {}
+      try { await fetch('/telemetry', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SH-Token': TOKEN }, body }); } catch (_) {}
     }, 750);
   }
 

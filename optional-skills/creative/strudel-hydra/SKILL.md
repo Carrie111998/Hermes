@@ -1,6 +1,6 @@
 ---
 name: strudel-hydra
-description: Live-code and self-evolve synchronized Strudel audio + Hydra visuals.
+description: Live-code self-evolving Strudel audio + Hydra visuals.
 version: 1.0.0
 author: mrev-lab
 license: MIT
@@ -8,7 +8,7 @@ platforms: [linux, macos]
 metadata:
   hermes:
     tags: [strudel, hydra, live-coding, audio-visual, generative-audio, generative-visuals, creative-coding, sse, self-improving, evolution, tidalcycles, vj]
-    related_skills: [supercollider, pd-patching, songwriting-and-ai-music, darwinian-evolver]
+    related_skills: [songwriting-and-ai-music, darwinian-evolver]
 ---
 
 # Strudel + Hydra Skill
@@ -97,8 +97,8 @@ Helper scripts (all in `scripts/`, standard library only):
 
 | File | Purpose |
 |------|---------|
-| `sh_server.py` | HTTP host + SSE broker. Serves the page, fans the latest set out to every browser, retains it for late joiners. `--host`/`--port`. |
-| `sh_client.py` | Push a set (`--audio`/`--visual`/`--audio-file`/`--visual-file`/`--label`), `--hush`, `--status`, `--observe [--target … --wait …]`. Exposes `push_set()`, `observe()`, `score()`. |
+| `sh_server.py` | HTTP host + SSE broker. Serves the page, fans the latest set out to every browser, retains it for late joiners. `--host`/`--port`/`--allow-remote`; mints the capability token that gates `/push` + `/telemetry`. |
+| `sh_client.py` | Push a set (`--audio`/`--visual`/`--audio-file`/`--visual-file`/`--label`), `--hush`, `--status`, `--observe [--target … --wait …]`, `--token`. Exposes `push_set()`, `observe()`, `score()`. |
 | `sh_examples.py` | Gallery (`pulse`, `bells`, `drone`, `acid`) + `--list` and `--export FILE`. |
 | `sh_evolve.py` | Score + rank one generation of candidate sets against a fitness `--target` (the evaluation/selection step of the self-improving loop). |
 | `templates/page.html` | The host page: runs Strudel in the page and Hydra in an isolated iframe, opens the SSE stream, hot-swaps each set, and posts audio telemetry. Also the export scaffold. |
@@ -235,15 +235,26 @@ Two failure modes need active care — both have a one-command escape via
    relay without a browser.
 5. **Telemetry flowing:** with a browser on the page, `sh_client.py --observe`
    returns `data` (not null) with a small `age`; a null `data` means the page
-   is not posting (not started, or blocked). The endpoint itself round-trips
-   headlessly: `POST` a JSON body to `/telemetry`, then `--observe` echoes it.
+   is not posting (not started, or blocked). `--observe` is an open GET; the
+   write side is token-gated, so a raw `POST /telemetry` must carry
+   `X-SH-Token` (the server prints the token; clients read it automatically).
 6. **Export:** `sh_examples.py <name> --export out.html` writes a file
    containing `window.__SET__`; opening it plays the set with no server.
 
 ## Security
 
-The server binds `127.0.0.1` only — keep it there; do not bind `0.0.0.0`. The
-page **evaluates pushed code** (Strudel `evaluate`, and `eval` of Hydra code),
-so anything reaching `/push` runs in the browser: only push sets you author, and
-never expose the port beyond loopback. The CDN bundles are version-pinned in
+The page **evaluates pushed code** (Strudel `evaluate`, and `eval` of Hydra
+code), so anything reaching `/push` runs in the browser. The server therefore
+gates the write endpoints (`/push`, `/telemetry`):
+
+- **Loopback by default.** `sh_server.py` binds `127.0.0.1`; it refuses a
+  non-loopback `--host` unless you pass `--allow-remote`. Keep it on loopback.
+- **No wildcard CORS + same-origin only.** Cross-origin writes are rejected, so
+  a random page you have open in the same browser cannot push code to the port.
+- **Capability token.** Each run mints a token, injects it into the served page,
+  and writes it to `strudel-hydra-<port>.token` in the temp dir. The client
+  scripts read it automatically (override with `--token` or `$SH_TOKEN`); a
+  request without the token is refused. `--allow-remote` keeps this token gate.
+
+Still, only push sets you author. The CDN bundles are version-pinned in
 `templates/page.html`; review a bump before trusting it.

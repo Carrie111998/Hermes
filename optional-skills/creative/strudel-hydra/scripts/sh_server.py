@@ -10,17 +10,69 @@ library.
 
 Run it in the background, open http://127.0.0.1:8765 in a browser, then push
 sets with sh_client.py / sh_examples.py.
+
+Security: the write endpoints (`/push`, `/telemetry`) deliver code that the page
+evaluates, so they are gated — same-origin only (no wildcard CORS), JSON body
+required, and a per-run capability token. The token is generated at startup,
+injected into the served page, and written to a per-port file that the client
+scripts read automatically. The server refuses to bind a non-loopback address
+unless `--allow-remote` is passed.
 """
 import argparse
+import hmac
 import json
+import os
 import queue
+import secrets
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "page.html"
+TOKEN_PLACEHOLDER = "__SH_TOKEN__"
+
+# Hosts that keep the code-push transport on the local machine.
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "[::1]"}
+
+
+def is_loopback_host(host):
+    return host in LOOPBACK_HOSTS
+
+
+def validate_bind_host(host, allow_remote):
+    """Loopback binds freely; anything else needs an explicit opt-in because the
+    push transport is unauthenticated at the network layer beyond the token."""
+    if is_loopback_host(host) or allow_remote:
+        return host
+    raise SystemExit(
+        f"refusing to bind non-loopback host {host!r} without --allow-remote "
+        "(the code-push transport would be exposed on the network)"
+    )
+
+
+def token_file_path(port):
+    """Per-port file the client scripts read to discover the capability token."""
+    return Path(tempfile.gettempdir()) / f"strudel-hydra-{port}.token"
+
+
+def origin_allowed(origin, host_header):
+    """A missing Origin means a non-browser client (curl, urllib) — allowed; the
+    token still gates the write. A present Origin must match our own host, which
+    rejects cross-site requests a malicious page would carry."""
+    if not origin:
+        return True
+    return origin in ("http://" + host_header, "https://" + host_header)
+
+
+def content_type_is_json(ctype):
+    return ctype is not None and ctype.split(";")[0].strip().lower() == "application/json"
+
+
+def inject_token(html, token):
+    return html.replace(TOKEN_PLACEHOLDER, token)
 
 
 class Telemetry:
@@ -89,6 +141,7 @@ broker = Broker()
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    token = ""  # set per-process in main()
 
     def log_message(self, *_a):  # keep the terminal quiet
         pass
@@ -97,18 +150,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if body:
             self.wfile.write(body)
 
+    def _authorize_write(self):
+        """Guard the endpoints that deliver evaluable code. Returns True only for
+        a same-origin JSON request bearing the capability token; otherwise it
+        writes the rejection and returns False."""
+        if not origin_allowed(self.headers.get("Origin"), self.headers.get("Host", "")):
+            self._send(403, "application/json", b'{"error":"cross-origin forbidden"}')
+            return False
+        if not content_type_is_json(self.headers.get("Content-Type")):
+            self._send(415, "application/json", b'{"error":"content-type must be application/json"}')
+            return False
+        supplied = self.headers.get("X-SH-Token", "")
+        if not self.token or not hmac.compare_digest(supplied, self.token):
+            self._send(401, "application/json", b'{"error":"missing or invalid token"}')
+            return False
+        return True
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw or b"{}")
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             try:
-                body = TEMPLATE.read_bytes()
+                html = TEMPLATE.read_text(encoding="utf-8")
             except OSError as e:
                 self._send(500, "text/plain", f"template missing: {e}".encode())
                 return
+            body = inject_token(html, self.token).encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body)
             return
 
@@ -126,7 +200,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             q = broker.subscribe()
             try:
@@ -153,10 +226,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/push":
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length else b"{}"
+            if not self._authorize_write():
+                return
             try:
-                data = json.loads(raw or b"{}")
+                data = self._read_json()
             except json.JSONDecodeError:
                 self._send(400, "application/json", b'{"error":"bad json"}')
                 return
@@ -169,10 +242,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/telemetry":
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length else b"{}"
+            if not self._authorize_write():
+                return
             try:
-                data = json.loads(raw or b"{}")
+                data = self._read_json()
             except json.JSONDecodeError:
                 self._send(400, "application/json", b'{"error":"bad json"}')
                 return
@@ -187,11 +260,28 @@ def main():
     ap = argparse.ArgumentParser(description="strudel-hydra liveset server")
     ap.add_argument("--host", default="127.0.0.1", help="bind address (keep on loopback)")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="permit binding a non-loopback --host (exposes the token-gated push transport)",
+    )
     args = ap.parse_args()
+
+    validate_bind_host(args.host, args.allow_remote)
+
+    token = secrets.token_urlsafe(24)
+    Handler.token = token
+    tf = token_file_path(args.port)
+    tf.write_text(token, encoding="utf-8")
+    try:
+        os.chmod(tf, 0o600)
+    except OSError:
+        pass
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"strudel-hydra server on http://{args.host}:{args.port}  (open it in a browser)")
+    print(f"push token: {token}  (clients read it from {tf})")
     sys.stdout.flush()
     try:
         srv.serve_forever()
@@ -199,6 +289,10 @@ def main():
         pass
     finally:
         srv.server_close()
+        try:
+            tf.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

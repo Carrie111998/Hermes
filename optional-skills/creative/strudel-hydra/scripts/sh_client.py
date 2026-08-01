@@ -8,17 +8,46 @@ server relays it over SSE and every open browser hot-swaps to it.
 import argparse
 import json
 import math
+import os
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from pathlib import Path
 
 
-def post(base, path, data, timeout=5):
+def token_file_path(port):
+    """Where sh_server.py writes the capability token for this port."""
+    return Path(tempfile.gettempdir()) / f"strudel-hydra-{port}.token"
+
+
+def resolve_token(base):
+    """Discover the server's capability token: `SH_TOKEN` wins, else the per-port
+    file the server writes on startup. Returns None if neither is present."""
+    env = os.environ.get("SH_TOKEN")
+    if env:
+        return env
+    try:
+        port = urllib.parse.urlsplit(base).port or 8765
+    except ValueError:
+        port = 8765
+    try:
+        return token_file_path(port).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def post(base, path, data, timeout=5, token=None):
+    token = token if token is not None else resolve_token(base)
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-SH-Token"] = token
     req = urllib.request.Request(
         base + path,
         data=json.dumps(data).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -30,14 +59,14 @@ def get(base, path, timeout=5):
         return json.loads(r.read())
 
 
-def push_set(base, audio=None, visual=None, label="live"):
+def push_set(base, audio=None, visual=None, label="live", token=None):
     """Convenience used by sh_examples.py."""
     payload = {"label": label}
     if audio is not None:
         payload["audio"] = audio
     if visual is not None:
         payload["visual"] = visual
-    return post(base, "/push", payload)
+    return post(base, "/push", payload, token=token)
 
 
 def observe(base):
@@ -78,6 +107,7 @@ def main():
     ap.add_argument("--observe", action="store_true", help="print latest measured features")
     ap.add_argument("--target", help="JSON target vector; with --observe, adds a fitness score")
     ap.add_argument("--wait", type=float, default=0.0, help="seconds to sleep before observing")
+    ap.add_argument("--token", help="capability token (default: $SH_TOKEN or the server's per-port file)")
     args = ap.parse_args()
 
     try:
@@ -93,7 +123,7 @@ def main():
             print(json.dumps(resp))
             return
         if args.hush:
-            print(json.dumps(post(args.base, "/push", {"cmd": "hush"})))
+            print(json.dumps(post(args.base, "/push", {"cmd": "hush"}, token=args.token)))
             return
 
         audio = args.audio
@@ -105,7 +135,7 @@ def main():
         if audio is None and visual is None:
             ap.error("nothing to push: give --audio/--visual (or --hush)")
 
-        print(json.dumps(push_set(args.base, audio, visual, args.label)))
+        print(json.dumps(push_set(args.base, audio, visual, args.label, token=args.token)))
     except urllib.error.URLError as e:
         sys.exit(f"cannot reach {args.base}: {e.reason}  (is sh_server.py running?)")
 
