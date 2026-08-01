@@ -57,6 +57,7 @@ def _m():
 
 _UPDATE_RUNTIME_RELOAD_MODULES = (
     "hermes_constants",
+    "hermes_cli.managed_uv",
     "tools.environments.local",
     "tools.lazy_deps",
 )
@@ -879,6 +880,9 @@ def _update_via_zip(args):
             f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
         )
     _m()._record_bytecode_fingerprint()
+    # Same update-boundary reload as the git path — ZIP replace also leaves
+    # the pre-extract process holding stale ``sys.modules`` entries.
+    _m()._reload_updated_runtime_modules()
 
     # Reinstall Python dependencies. Prefer .[all], but if one optional extra
     # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -3834,6 +3838,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # uv can retain the same CPython patch while python-build-standalone
             # refreshes the embedded SQLite underneath it. Keep the existing
             # update-boundary hook active on this retry path too.
+            # Reload first so a process that started on an older checkout
+            # (or holds a stale hermes_constants) doesn't trip the repair
+            # path on a missing symbol that already exists on disk.
+            _m()._reload_updated_runtime_modules()
             from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
             runtime_repairs = []
@@ -4031,6 +4039,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
         _m()._record_bytecode_fingerprint()
+        # Refresh update-sensitive modules BEFORE managed-uv/runtime repair.
+        # ``update_managed_uv`` imports symbols (e.g. ``venv_python_path``)
+        # that may not exist on the pre-pull ``hermes_constants`` still
+        # parked in ``sys.modules`` — without this reload the repair path
+        # prints a scary "Managed Python runtime repair skipped" warning
+        # even though the live checkout is already current.
+        _m()._reload_updated_runtime_modules()
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":

@@ -103,6 +103,12 @@ def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(mon
     assert callable(hermes_constants.apply_subprocess_home_env)
 
 
+def test_reload_updated_runtime_modules_includes_managed_uv():
+    """managed_uv must be in the reload set — freshly needed right after pull."""
+    assert "hermes_cli.managed_uv" in hermes_main._UPDATE_RUNTIME_RELOAD_MODULES
+    assert "hermes_constants" in hermes_main._UPDATE_RUNTIME_RELOAD_MODULES
+
+
 
 
 

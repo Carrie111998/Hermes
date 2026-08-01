@@ -1,7 +1,13 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import path from "path";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Vite's native config loader does not inject CJS ``__dirname``. Prefer
+// ``import.meta.dirname`` (Node ≥ 20.11); fall back for older 20.x.
+const configDir =
+  import.meta.dirname ?? path.dirname(fileURLToPath(import.meta.url));
 
 const BACKEND = process.env.HERMES_DASHBOARD_URL ?? "http://127.0.0.1:9119";
 
@@ -61,8 +67,8 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), hermesDevToken()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
-      "@hermes/shared": path.resolve(__dirname, "../apps/shared/src"),
+      "@": path.resolve(configDir, "./src"),
+      "@hermes/shared": path.resolve(configDir, "../apps/shared/src"),
     },
     // When @nous-research/ui is symlinked via `file:../../design-language`,
     // Node's module resolution would pick up shared deps from
