@@ -74,6 +74,48 @@ def test_explicit_dispatch_respects_board_limit_after_cleanup(fresh_home):
         assert kb.get_task(conn, ready).status == "ready"
 
 
+def test_explicit_dispatch_composes_board_limit_with_existing_running_tasks(fresh_home):
+    kb.create_board("composed", wip_limit=3)
+    with kb.connect(board="composed") as conn:
+        running_ids = [
+            kb.create_task(conn, title=f"running-{index}", assignee="default")
+            for index in range(2)
+        ]
+        ready = kb.create_task(conn, title="ready", assignee="default")
+        for task_id in running_ids:
+            assert kb.claim_task(conn, task_id, claimer="default") is not None
+
+        result = kb.dispatch_once(
+            conn, board="composed", spawn_fn=_spawn, dry_run=True, max_spawn=8
+        )
+
+        assert [item[0] for item in result.spawned] == [ready]
+        assert result.skipped_wip_capped == []
+
+
+def test_dispatch_falls_back_after_malformed_board_selector(fresh_home, monkeypatch):
+    kb.create_board("fallback", wip_limit=2)
+    kb.set_current_board("fallback")
+    with kb.connect(board="fallback") as conn:
+        ready = kb.create_task(conn, title="ready", assignee="default")
+        normalize_board_slug = kb._normalize_board_slug
+        monkeypatch.setattr(
+            kb,
+            "_normalize_board_slug",
+            lambda slug: (
+                (_ for _ in ()).throw(ValueError("malformed"))
+                if slug == "malformed"
+                else normalize_board_slug(slug)
+            ),
+        )
+
+        result = kb.dispatch_once(
+            conn, board="malformed", spawn_fn=_spawn, dry_run=True
+        )
+
+        assert [item[0] for item in result.spawned] == [ready]
+
+
 def test_implicit_or_precedence_current_board(fresh_home, monkeypatch):
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
     kb.create_board("current", wip_limit=2)
@@ -104,6 +146,18 @@ def test_cli_create_show_set_list_and_clear(fresh_home, capsys):
         "kanban", "boards", "set-wip-limit", "cli-board", "4"
     ])) == 0
     assert kb.read_board_metadata("cli-board")["wip_limit"] == 4
+    assert kc.kanban_command(parser.parse_args([
+        "kanban", "boards", "list"
+    ])) == 0
+    assert "WIP=4" in capsys.readouterr().out
+    assert kc.kanban_command(parser.parse_args([
+        "kanban", "boards", "switch", "cli-board"
+    ])) == 0
+    capsys.readouterr()
+    assert kc.kanban_command(parser.parse_args([
+        "kanban", "boards", "show"
+    ])) == 0
+    assert "WIP limit:    4" in capsys.readouterr().out
     assert kc.kanban_command(parser.parse_args([
         "kanban", "boards", "set-wip-limit", "cli-board"
     ])) == 0

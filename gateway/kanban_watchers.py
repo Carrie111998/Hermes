@@ -1443,6 +1443,7 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
+                any_wip_capped = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
@@ -1459,9 +1460,16 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                    if res is not None and getattr(res, "skipped_wip_capped", None):
+                        any_wip_capped = True
+                        logger.info(
+                            "kanban dispatcher [%s]: deferred=%d due to board WIP limit",
+                            slug,
+                            len(res.skipped_wip_capped),
+                        )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                if ready_pending and not any_spawned and not any_wip_capped:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0

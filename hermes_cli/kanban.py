@@ -1259,7 +1259,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     if not boards:
         print("(no boards — create one with `hermes kanban boards create <slug>`)")
         return 0
-    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
+    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  WIP LIMIT  COUNTS")
     for b in boards:
         marker = "●" if b["is_current"] else " "
         counts = b["counts"] or {}
@@ -2541,6 +2541,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_wip_capped": res.skipped_wip_capped,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2573,6 +2574,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if res.skipped_wip_capped:
+        print(f"Deferred (board WIP limit): {', '.join(res.skipped_wip_capped)}")
     if res.skipped_per_profile_capped:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
@@ -2657,7 +2660,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        wip_capped = bool(res.skipped_wip_capped)
+        if ready_pending and not spawned_any and not wip_capped:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
@@ -2683,6 +2687,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
+            or res.skipped_wip_capped
         )
         if did_work:
             print(
@@ -2690,7 +2695,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} "
+                f"wip_capped={len(res.skipped_wip_capped)}",
                 flush=True,
             )
 

@@ -8272,7 +8272,11 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    resolved_board = _normalize_board_slug(board) or get_current_board()
+    try:
+        resolved_board = _normalize_board_slug(board)
+    except (TypeError, ValueError):
+        resolved_board = None
+    resolved_board = resolved_board or get_current_board()
     board_wip_limit = read_board_metadata(resolved_board).get("wip_limit")
     if board_wip_limit is not None:
         if (isinstance(max_in_progress, int) and not isinstance(max_in_progress, bool)
@@ -8315,10 +8319,10 @@ def _dispatch_once_locked(
             if board_wip_limit is not None and in_progress >= board_wip_limit:
                 result.skipped_wip_capped.extend(row["id"] for row in ready_rows)
             return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = effective_max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+        # max_spawn is a total concurrency cap, so keep the existing running
+        # count in the loop's comparison instead of subtracting it twice.
+        if max_spawn is None or max_spawn > effective_max_in_progress:
+            max_spawn = effective_max_in_progress
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
