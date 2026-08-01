@@ -424,6 +424,207 @@ def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monke
     assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
 
 
+def _write_openrouter_pool(hermes_home, api_keys=("pool-key",)):
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": f"daily-key-{index}",
+                            "label": f"daily-key-{index}",
+                            "auth_type": "api_key",
+                            "priority": index,
+                            "source": "manual",
+                            "access_token": api_key,
+                            "base_url": rp.OPENROUTER_BASE_URL,
+                        }
+                        for index, api_key in enumerate(api_keys)
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested", "config_text", "openai_base_url"),
+    [
+        pytest.param(
+            "openrouter",
+            "model:\n"
+            "  provider: custom\n"
+            "  base_url: https://litellm.example/v1\n"
+            "  api_key: custom-key\n",
+            None,
+            id="model-config",
+        ),
+        pytest.param(
+            "openrouter",
+            "{}\n",
+            "https://custom.example/v1",
+            id="environment",
+        ),
+        pytest.param(
+            "auto",
+            "{}\n",
+            "https://stale-openai.example/v1",
+            id="auto-ignores-stale-openai-environment",
+        ),
+        pytest.param(
+            "or",
+            "model:\n"
+            "  provider: custom\n"
+            "  base_url: https://litellm.example/v1\n"
+            "  api_key: custom-key\n",
+            None,
+            id="provider-alias",
+        ),
+    ],
+)
+def test_openrouter_pool_ignores_unrelated_custom_endpoint(
+    tmp_path,
+    monkeypatch,
+    requested,
+    config_text,
+    openai_base_url,
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if openai_base_url is None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_BASE_URL", openai_base_url)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+
+    resolved = rp.resolve_runtime_provider(requested=requested)
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "pool-key"
+    assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
+    assert resolved["credential_pool"].provider == "openrouter"
+
+
+def test_explicit_openrouter_daily_limit_402_rotates_resolved_pool(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom\n"
+        "  base_url: https://litellm.example/v1\n"
+        "  api_key: custom-key\n",
+        encoding="utf-8",
+    )
+    _write_openrouter_pool(hermes_home, ("first-pool-key", "second-pool-key"))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+    runtime = rp.resolve_runtime_provider(requested="openrouter")
+    pool = runtime["credential_pool"]
+    agent = SimpleNamespace(
+        _credential_pool=pool,
+        _credential_pool_entry_id=pool.current().id,
+        provider="openrouter",
+        api_key=runtime["api_key"],
+    )
+
+    def swap_credential(entry):
+        agent.api_key = entry.runtime_api_key
+        agent._credential_pool_entry_id = entry.id
+
+    agent._swap_credential = swap_credential
+
+    from agent.agent_runtime_helpers import recover_with_credential_pool
+
+    recovered, _ = recover_with_credential_pool(
+        agent,
+        status_code=402,
+        has_retried_429=False,
+        error_context={"message": "adjust the key's daily limit"},
+    )
+
+    assert recovered is True
+    assert agent.api_key == "second-pool-key"
+
+
+def test_explicit_openrouter_alias_honors_disabled_provider(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "providers:\n"
+        "  openrouter:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(ValueError, match=r"providers\.openrouter\.enabled: false"):
+        rp.resolve_runtime_provider(requested="or")
+
+
+@pytest.mark.parametrize(
+    ("requested", "base_url_env", "expected_api_key"),
+    [
+        pytest.param("openrouter", "OPENROUTER_BASE_URL", "fallback-key", id="openrouter-explicit"),
+        pytest.param("or", "OPENROUTER_BASE_URL", "fallback-key", id="openrouter-alias"),
+        pytest.param("auto", "OPENROUTER_BASE_URL", "fallback-key", id="openrouter-auto"),
+        pytest.param("openrouter", "CUSTOM_BASE_URL", "", id="custom-explicit"),
+        pytest.param("auto", "CUSTOM_BASE_URL", "", id="custom-auto"),
+    ],
+)
+def test_openrouter_base_url_override_skips_populated_pool(
+    tmp_path,
+    monkeypatch,
+    requested,
+    base_url_env,
+    expected_api_key,
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+    monkeypatch.setenv(base_url_env, "https://openrouter-proxy.example/v1")
+
+    resolved = rp.resolve_runtime_provider(requested=requested)
+
+    assert resolved["api_key"] == expected_api_key
+    assert resolved["base_url"] == "https://openrouter-proxy.example/v1"
+    assert resolved.get("credential_pool") is None
+
+
+def test_auto_custom_config_skips_populated_openrouter_pool(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: auto\n"
+        "  base_url: https://custom.example/v1\n",
+        encoding="utf-8",
+    )
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+
+    resolved = rp.resolve_runtime_provider(requested="auto")
+
+    assert resolved["api_key"] == ""
+    assert resolved["base_url"] == "https://custom.example/v1"
+    assert resolved.get("credential_pool") is None
+
+
 def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
     monkeypatch.setattr(
