@@ -1652,64 +1652,91 @@ def _apps_from_windows(windows: list) -> list:
     return apps
 
 
+def _x11_window_pid(window_id: int) -> Optional[int]:
+    """Read the verified window-to-process mapping from the X server.
+
+    ``_NET_WM_PID`` is set by the window's owner and read back through
+    the server, so a value here is authoritative for *this* window — not
+    a guess from process-name matching.  Tries ``xprop`` first, then
+    ``xdotool`` as a fallback reader for the same property.
+
+    Returns ``None`` when the window carries no ``_NET_WM_PID`` (or when
+    no reader tool is available), never a made-up PID.
+    """
+    import subprocess as _sp
+
+    readers = [
+        ["xprop", "-id", str(window_id), "_NET_WM_PID"],
+        ["xdotool", "getwindowpid", str(window_id)],
+    ]
+    for cmd in readers:
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            result = _sp.run(
+                cmd,
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, _sp.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        # xprop prints "  _NET_WM_PID(CARDINAL) = 12345"; xdotool prints
+        # just the PID.  Accept the trailing integer in either form.
+        numbers = re.findall(r"(\d+)\s*$", result.stdout.strip())
+        if numbers:
+            pid = int(numbers[-1])
+            if pid > 1:
+                return pid
+    return None
+
+
+def _proc_cmdline_matches(pid: int, app_name: str) -> bool:
+    """True when ``/proc/<pid>/cmdline`` mentions ``app_name``.
+
+    Used as a sanity cross-check on the PID the X server reported, so a
+    stale ``_NET_WM_PID`` (window owner already gone, PID reused by an
+    unrelated process) does not leak into PID-based actions.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return False
+    cmdline = raw.decode("utf-8", errors="replace").replace("\x00", " ")
+    return app_name.lower() in cmdline.lower()
+
+
 def _resolve_host_pid(window_id: int, app_name: str) -> Optional[int]:
-    """Try to find the host PID for a window that lacks ``_NET_WM_PID``.
+    """Find the host PID for a window cua-driver reported with ``pid: null``.
 
     Flatpak, Snap, and some containerised apps run in a PID namespace
-    separate from the X11 server, so cua-driver reports ``pid: null``.
-    The window still belongs to a real host process; we search for it
-    by matching the ``app_name`` against the command lines of running
-    processes, preferring the process whose X11 window maps include
-    *window_id* when ``/proc`` is available.
+    separate from the X11 server, so cua-driver reports ``pid: null``
+    for windows that actually own a real host process.
 
-    Returns the resolved PID or ``None`` when no match is found.
+    Unlike process-name scanning, this requires a *verified*
+    window-to-process mapping: the window's own ``_NET_WM_PID`` read
+    through the X server (``xprop``/``xdotool``), cross-checked against
+    ``/proc`` so a stale PID is rejected.  When no verified mapping is
+    available we return ``None`` — callers fall back to the ``pid=0``
+    sentinel and window_id-only transports rather than guessing a PID
+    that could target the wrong process.
+
+    Returns the resolved PID or ``None`` when no verified match exists.
     """
     if not window_id or window_id <= 0:
         return None
     if not app_name:
         return None
 
-    import subprocess as _sp
-
-    # Strategy 1: walk /proc/*/cmdline for exact app_name match.
-    # This is fast (no external deps) and catches most cases.
-    try:
-        import glob as _glob
-        for cmdline_path in _glob.iglob("/proc/*/cmdline"):
-            try:
-                with open(cmdline_path, "rb") as fh:
-                    raw = fh.read()
-                # /proc/<pid>/cmdline
-                pid_dir = os.path.dirname(cmdline_path)
-                pid_str = os.path.basename(pid_dir)
-                host_pid = int(pid_str)
-            except (OSError, ValueError):
-                continue
-            if host_pid <= 1:
-                continue
-            cmdline = raw.decode("utf-8", errors="replace").replace("\x00", " ")
-            # Match app_name as a whole word or path segment in the command line
-            if app_name.lower() in cmdline.lower():
-                return host_pid
-    except OSError:
-        pass
-
-    # Strategy 2: fall back to `pgrep` when /proc isn't enough.
-    try:
-        result = _sp.run(
-            ["pgrep", "-f", app_name],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                try:
-                    return int(line.strip())
-                except ValueError:
-                    continue
-    except (OSError, _sp.TimeoutExpired):
-        pass
-
-    return None
+    pid = _x11_window_pid(window_id)
+    if pid is None:
+        return None
+    if not _proc_cmdline_matches(pid, app_name):
+        # _NET_WM_PID is stale or belongs to another namespace; do not
+        # guess from /proc name matching.
+        return None
+    return pid
 
 
 def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

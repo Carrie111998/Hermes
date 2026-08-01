@@ -2019,7 +2019,7 @@ class TestCaptureAppFilterNoMatch:
         assert backend.click(x=1, y=2).ok is False
         session.call_tool.assert_not_called()
 
-    def test_list_windows_drops_nonpositive_and_boolean_identifiers(self):
+    def test_list_windows_keeps_window_id_only_and_drops_bad_identifiers(self):
         from tools.computer_use.cua_backend import CuaDriverBackend
 
         backend = CuaDriverBackend()
@@ -2039,10 +2039,19 @@ class TestCaptureAppFilterNoMatch:
         }
         backend._session = session
 
-        assert backend.list_windows() == [{
-            "app_name": "Good", "pid": 12, "window_id": 34,
-            "off_screen": False, "title": "", "z_index": 0,
-        }]
+        # pid=True is rejected as a boolean; pid=0 resolves through the
+        # verified path only — with no X reader available the window keeps
+        # the pid=0 sentinel (window_id-only flows still work). window_id=-1
+        # is unusable and dropped. Sorted by z_index descending (frontmost
+        # first), matching _load_windows.
+        assert backend.list_windows() == [
+            {"app_name": "Zero", "pid": 0, "window_id": 3,
+             "off_screen": False, "title": "", "z_index": 2},
+            {"app_name": "Bool", "pid": 0, "window_id": 2,
+             "off_screen": False, "title": "", "z_index": 1},
+            {"app_name": "Good", "pid": 12, "window_id": 34,
+             "off_screen": False, "title": "", "z_index": 0},
+        ]
 
     def test_capture_transport_exception_disarms_prior_target(self):
         from tools.computer_use.cua_backend import CuaDriverBackend
