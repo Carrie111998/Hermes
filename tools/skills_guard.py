@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v1"
+SCANNER_VERSION = "skills-guard-v2"
 
 
 
@@ -806,20 +806,16 @@ def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool,
     vi = VERDICT_INDEX.get(result.verdict, 2)
     decision = policy[vi]
 
-    if decision == "allow" and _concealed_decision(result) != "allow":
-        names = ", ".join(sorted({f.pattern_id for f in result.ignored_findings}))
-        decision = _concealed_decision(result)
-        return (None if decision == "ask" else False), (
-            f"{'Requires confirmation' if decision == 'ask' else 'Blocked'} "
-            f"({result.trust_level} source: .skillignore conceals "
-            f"{len(result.ignored_findings)} finding(s) rated "
-            f"{_determine_verdict(result.ignored_findings)}: {names})"
-        )
-
     if decision == "allow":
-        return True, f"Allowed ({result.trust_level} source, {result.verdict} verdict)"
-
-    if decision == "allow":
+        concealed = _concealed_decision(result)
+        if concealed != "allow":
+            names = ", ".join(sorted({f.pattern_id for f in result.ignored_findings}))
+            return (None if concealed == "ask" else False), (
+                f"{'Requires confirmation' if concealed == 'ask' else 'Blocked'} "
+                f"({result.trust_level} source: .skillignore conceals "
+                f"{len(result.ignored_findings)} finding(s) rated "
+                f"{_determine_verdict(result.ignored_findings)}: {names})"
+            )
         return True, f"Allowed ({result.trust_level} source, {result.verdict} verdict)"
 
     if force and not (result.verdict == "dangerous" and result.trust_level in ("community", "trusted")):
