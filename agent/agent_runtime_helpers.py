@@ -1678,29 +1678,33 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         Combined reasoning text, or None if no reasoning found
     """
     reasoning_parts = []
+    reasoning_seen: set[str] = set()
 
     def _append_reasoning_part(value) -> None:
-        if isinstance(value, str):
-            if value and value not in reasoning_parts:
-                reasoning_parts.append(value)
-            return
-        if isinstance(value, list):
-            for item in value:
-                _append_reasoning_part(item)
-            return
-        if isinstance(value, dict):
-            for key in ("summary", "thinking", "content", "text"):
-                _append_reasoning_part(value.get(key))
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                if item and item not in reasoning_seen:
+                    reasoning_seen.add(item)
+                    reasoning_parts.append(item)
+                continue
+            if isinstance(item, list):
+                pending.extend(reversed(item))
+                continue
+            if isinstance(item, dict):
+                pending.extend(
+                    item.get(key)
+                    for key in reversed(("summary", "thinking", "content", "text"))
+                )
     
     # Check direct reasoning field
     if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
-        reasoning_parts.append(assistant_message.reasoning)
+        _append_reasoning_part(assistant_message.reasoning)
     
     # Check reasoning_content field (alternative name used by some providers)
     if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
-        # Don't duplicate if same as reasoning
-        if assistant_message.reasoning_content not in reasoning_parts:
-            reasoning_parts.append(assistant_message.reasoning_content)
+        _append_reasoning_part(assistant_message.reasoning_content)
     
     # Check reasoning_details array (OpenRouter unified format)
     # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
@@ -1730,8 +1734,7 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
             if isinstance(block, dict) and block.get("type") == "thinking":
                 thinking_text = block.get("thinking") or block.get("text") or ""
                 thinking_text = thinking_text.strip()
-                if thinking_text and thinking_text not in reasoning_parts:
-                    reasoning_parts.append(thinking_text)
+                _append_reasoning_part(thinking_text)
     if not reasoning_parts and isinstance(content, str) and content:
         inline_patterns = (
             r"<think>(.*?)</think>",
@@ -1744,8 +1747,7 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
             flags = re.DOTALL | re.IGNORECASE
             for block in re.findall(pattern, content, flags=flags):
                 cleaned = block.strip()
-                if cleaned and cleaned not in reasoning_parts:
-                    reasoning_parts.append(cleaned)
+                _append_reasoning_part(cleaned)
     
     # Combine all reasoning parts
     if reasoning_parts:

@@ -388,6 +388,11 @@ class TestDbConnstrDialectDriver:
             "mssql+pyodbc://sa:s3cretpw@h/db",
             "oracle+oracledb://u:s3cretpw@h/service",
             "clickhouse+native://u:s3cretpw@h/default",
+            "cockroachdb+psycopg://u:s3cretpw@h/defaultdb",
+            "snowflake+connector://u:s3cretpw@account/db",
+            "trino://u:s3cretpw@h/catalog",
+            "db2+ibm_db://u:s3cretpw@h/db",
+            "mysqlx://u:s3cretpw@h/db",
             "mongodb+srv://u:s3cretpw@cluster0.mongodb.net/db",
             "rediss://default:s3cretpw@h:6380/0",
             "amqps://guest:s3cretpw@h:5671/",
@@ -418,6 +423,35 @@ class TestDbConnstrDialectDriver:
         assert "p%40ss%2Fword" not in result
         assert ":***@" in result
 
+    def test_percent_encoded_surrounding_punctuation_in_password_redacted(self):
+        text = "postgresql://user:p%2Cass%3Bword@db.example/app"
+        result = redact_sensitive_text(text)
+        assert "p%2Cass%3Bword" not in result
+        assert ":***@" in result
+
+    @pytest.mark.parametrize(
+        "password",
+        [
+            "pa,ss",
+            "pa;ss",
+            "pa(ss)",
+            "123,abc",
+            "123;abc",
+            "123(abc)",
+        ],
+    )
+    def test_raw_uri_punctuation_in_password_redacted(self, password):
+        text = f"postgresql://user:{password}@db.example/app"
+        result = redact_sensitive_text(text)
+        assert password not in result
+        assert ":***@" in result
+
+    def test_digit_leading_punctuation_password_with_explicit_port_redacted(self):
+        text = "postgresql://user:123,abc@db.example:5432"
+        result = redact_sensitive_text(text)
+        assert "123,abc" not in result
+        assert ":***@" in result
+
     @pytest.mark.parametrize(
         "text",
         [
@@ -426,6 +460,11 @@ class TestDbConnstrDialectDriver:
             "postgresql://host:5432/db/user@example.com",
             "postgresql://host:5432/db?email=user@example.com",
             "postgresql://host:5432/db#user@example.com",
+            'header {"dsn":"postgresql+psycopg://db:5432",'
+            '"email":"user@example.com"}',
+            "header {'dsn':'postgresql+psycopg://db:5432',"
+            "'email':'user@example.com'}",
+            "postgresql://host:5432; contact=user@example.com",
             "https://user:opaqueToken@host.example.com/path",
             "notpostgresql://user:opaqueToken@host.example.com/path",
             "custom+postgresql://user:opaqueToken@host.example.com/path",

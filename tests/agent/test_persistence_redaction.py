@@ -222,6 +222,44 @@ def test_native_gemini_reasoning_cannot_bypass_persistence_redaction(tmp_path):
             assert password_bytes not in path.read_bytes(), path.name
 
 
+def test_bedrock_reasoning_cannot_bypass_persistence_redaction(tmp_path):
+    from agent.bedrock_adapter import normalize_converse_response
+    from agent.transports import get_transport
+
+    response = normalize_converse_response(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "reasoningContent": {
+                                "text": f"Bedrock thought: {SECRET_URI}"
+                            }
+                        },
+                        {"text": "done"},
+                    ],
+                }
+            },
+            "stopReason": "end_turn",
+        }
+    )
+    normalized = get_transport("bedrock_converse").normalize_response(response)
+    built = _make_agent()._build_assistant_message(normalized, "stop")
+
+    assert SECRET_PASSWORD not in built["reasoning"]
+    assert SECRET_PASSWORD not in built["reasoning_content"]
+
+    persistence_agent, db = _make_real_persistence_agent(tmp_path)
+    persistence_agent._persist_session([built], conversation_history=[])
+    db.close()
+
+    password_bytes = SECRET_PASSWORD.encode()
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            assert password_bytes not in path.read_bytes(), path.name
+
+
 def test_provider_reasoning_details_are_preserved_for_next_turn(tmp_path):
     details = [
         {
@@ -344,6 +382,23 @@ def test_nested_summary_is_extracted_as_mutable_redacted_reasoning():
     assert built["reasoning"].startswith("summary: ")
     assert SECRET_PASSWORD not in built["reasoning"]
     assert built["reasoning_details"] == details
+
+
+def test_deep_reasoning_summary_is_extracted_without_recursion_failure():
+    nested = {"text": "deep summary"}
+    for _ in range(1_500):
+        nested = {"summary": [nested]}
+
+    built = _make_agent()._build_assistant_message(
+        _api_message(
+            reasoning_details=[
+                {"type": "reasoning.summary", "summary": [nested]}
+            ]
+        ),
+        "stop",
+    )
+
+    assert built["reasoning"] == "deep summary"
 
 
 def test_tool_call_arguments_remain_exact():

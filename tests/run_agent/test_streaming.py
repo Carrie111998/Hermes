@@ -552,6 +552,43 @@ class TestReasoningStreaming:
         assert message.reasoning == "ordinary thinking"
         assert message.reasoning_content is None
 
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_mixed_reasoning_fields_keep_distinct_provenance(
+        self, mock_close, mock_create
+    ):
+        """A chunk carrying both fields must preserve each field's origin."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(
+                reasoning="mutable reasoning",
+                reasoning_content="provider replay content",
+            ),
+            _make_stream_chunk(content="answer", finish_reason="stop"),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=lambda _text: None,
+        )
+        setattr(agent, "api_mode", "chat_completions")
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        message = response.choices[0].message
+        assert message.reasoning == "mutable reasoning"
+        assert message.reasoning_content == "provider replay content"
+
 
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
 
