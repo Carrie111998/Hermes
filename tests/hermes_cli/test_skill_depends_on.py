@@ -17,6 +17,61 @@ from tools.skills_hub import (
 )
 
 
+@pytest.fixture
+def console():
+    class _C:
+        def __init__(self):
+            self.out = []
+
+        def print(self, *a, **k):
+            self.out.append(" ".join(str(x) for x in a))
+
+        @property
+        def text(self):
+            return "\n".join(self.out)
+    return _C()
+
+
+@pytest.fixture()
+def served(tmp_path, monkeypatch):
+    """A minimal one-file skill served over loopback, per test_skill_bundle_provenance."""
+    import subprocess
+    from http.server import SimpleHTTPRequestHandler
+    import socketserver
+    import threading
+
+    monkeypatch.setattr("tools.url_safety._global_allow_private_urls", lambda: True)
+
+    def _make(depends_on_yaml: str):
+        repo = tmp_path / f"upstream{len(depends_on_yaml)}"
+        repo.mkdir()
+        (repo / "SKILL.md").write_text(
+            f"---\nname: needs-dep\ndescription: A test skill.\n{depends_on_yaml}---\n\n# Body\n"
+        )
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"],
+            cwd=repo, check=True,
+        )
+
+        class _Quiet(SimpleHTTPRequestHandler):
+            def log_message(self, *_a):
+                pass
+
+            def translate_path(self, path):
+                import os
+                rel = path.split("?", 1)[0].lstrip("/")
+                return os.path.join(str(repo), rel)
+
+        httpd = socketserver.TCPServer(("127.0.0.1", 0), _Quiet)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/SKILL.md"
+        return url, httpd
+
+    return _make
+
+
 class TestParsing:
     def test_bare_list_means_all_required(self):
         deps = parse_skill_dependencies({"depends_on": ["obsidian", "kanban"]})
@@ -177,26 +232,15 @@ def _bundle(depends_on_yaml: str, name: str = "chronicle"):
 class TestInstallEnforcement:
     """The gate itself: required blocks, optional warns, --force overrides."""
 
-    @pytest.fixture()
-    def console(self):
-        class _C:
-            def __init__(self):
-                self.out = []
-
-            def print(self, *a, **k):
-                self.out.append(" ".join(str(x) for x in a))
-
-            @property
-            def text(self):
-                return "\n".join(self.out)
-        return _C()
-
-    def _check(self, monkeypatch, bundle, console, *, installed=frozenset(), force=False):
+    def _check(self, monkeypatch, bundle, console, *, installed=frozenset(), force=False, with_optional=False, skip_confirm=False):
         import tools.skills_hub as hub
         from hermes_cli.skills_hub import _check_skill_dependencies
 
         monkeypatch.setattr(hub, "installed_skill_names", lambda: set(installed))
-        return _check_skill_dependencies(bundle, console, force=force)
+        blocked, _missing = _check_skill_dependencies(
+            bundle, console, force=force, with_optional=with_optional, skip_confirm=skip_confirm
+        )
+        return blocked
 
     def test_missing_required_blocks_and_names_the_fix(self, monkeypatch, console):
         b = _bundle("depends_on:\n  - name: obsidian\n    reason: reads vaults\n")
@@ -261,45 +305,6 @@ class TestDoInstallActuallyCallsTheGate:
     about. These drive the real install path instead.
     """
 
-    @pytest.fixture()
-    def served(self, tmp_path, monkeypatch):
-        """A minimal one-file skill served over loopback, per test_skill_bundle_provenance."""
-        import subprocess
-        from http.server import SimpleHTTPRequestHandler
-        import socketserver
-        import threading
-
-        monkeypatch.setattr("tools.url_safety._global_allow_private_urls", lambda: True)
-
-        def _make(depends_on_yaml: str):
-            repo = tmp_path / f"upstream{len(depends_on_yaml)}"
-            repo.mkdir()
-            (repo / "SKILL.md").write_text(
-                f"---\nname: needs-dep\ndescription: A test skill.\n{depends_on_yaml}---\n\n# Body\n"
-            )
-            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-            subprocess.run(["git", "add", "."], cwd=repo, check=True)
-            subprocess.run(
-                ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"],
-                cwd=repo, check=True,
-            )
-
-            class _Quiet(SimpleHTTPRequestHandler):
-                def log_message(self, *_a):
-                    pass
-
-                def translate_path(self, path):
-                    import os
-                    rel = path.split("?", 1)[0].lstrip("/")
-                    return os.path.join(str(repo), rel)
-
-            httpd = socketserver.TCPServer(("127.0.0.1", 0), _Quiet)
-            threading.Thread(target=httpd.serve_forever, daemon=True).start()
-            url = f"http://127.0.0.1:{httpd.server_address[1]}/SKILL.md"
-            return url, httpd
-
-        return _make
-
     def _run(self, monkeypatch, tmp_path, served, depends_on_yaml, *, installed=frozenset()):
         from io import StringIO
 
@@ -351,4 +356,266 @@ class TestDoInstallActuallyCallsTheGate:
         )
         assert "Installed: needs-dep" in out, (
             f"the install did not complete:\n{out}"
+        )
+
+
+class TestTransitiveDependencies:
+    """Recursive resolution: A → B → C means installing A reports both B and C."""
+
+    def _roots(self, monkeypatch, *roots):
+        import tools.skills_hub as hub
+        monkeypatch.setattr(hub.HubLockFile, "list_installed", lambda self: [])
+        monkeypatch.setattr(
+            "agent.skill_utils.get_all_skills_dirs", lambda: list(roots)
+        )
+        return hub
+
+    def _skill(self, root, rel, *, declared=None, depends_on=None):
+        d = root / rel
+        d.mkdir(parents=True, exist_ok=True)
+        name_line = f"name: {declared}\n" if declared else ""
+        dep_line = ""
+        if depends_on:
+            if isinstance(depends_on, list):
+                dep_items = "\n".join(f"  - name: {n}" for n in depends_on)
+                dep_line = f"depends_on:\n{dep_items}\n"
+            else:
+                dep_line = f"depends_on: [{depends_on}]\n"
+        (d / "SKILL.md").write_text(
+            f"---\n{name_line}description: x\n{dep_line}---\n"
+        )
+        return d
+
+    def test_transitive_missing_deps_are_reported(self, tmp_path, monkeypatch):
+        """A depends on B, B depends on C. Installing A should report C too."""
+        local = tmp_path / "skills"
+        self._skill(local, "b", depends_on="c")
+        self._skill(local, "c")  # installed
+
+        # Only 'c' is installed; 'b' is missing
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import _resolve_transitive
+
+        self._roots(monkeypatch, local)
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: {"c"})
+
+        out_req, out_opt, cycles = [], [], []
+        from tools.skills_hub import parse_skill_dependencies
+
+        b_fm = hub.parse_skill_frontmatter((local / "b" / "SKILL.md").read_text())
+        b_deps = parse_skill_dependencies(b_fm)
+
+        _resolve_transitive(
+            "a",
+            [hub.SkillDependency("b", True)],
+            {"c"},
+            out_req,
+            out_opt,
+            cycles,
+            _visited={"a"},
+            _path=["a"],
+            sources=None,
+        )
+
+        names = [d.name for d in out_req]
+        assert "b" in names, "direct missing dependency was not reported"
+
+    def test_cycle_detection(self, tmp_path, monkeypatch):
+        """A → B → A cycle must be detected, not infinite-loop."""
+        local = tmp_path / "skills"
+        self._skill(local, "a", depends_on="b")
+        self._skill(local, "b", depends_on="a")
+
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import _resolve_transitive
+
+        self._roots(monkeypatch, local)
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: set())
+
+        out_req, out_opt, cycles = [], [], []
+        from tools.skills_hub import parse_skill_dependencies
+
+        a_fm = hub.parse_skill_frontmatter((local / "a" / "SKILL.md").read_text())
+        a_deps = parse_skill_dependencies(a_fm)
+
+        _resolve_transitive(
+            "a",
+            a_deps,
+            set(),
+            out_req,
+            out_opt,
+            cycles,
+            _visited={"a"},
+            _path=["a"],
+            sources=None,
+        )
+
+        assert any("a" in c and "b" in c for c in cycles), (
+            f"circular dependency a→b→a not detected; cycles={cycles}"
+        )
+
+    def test_max_depth_capping(self, tmp_path, monkeypatch):
+        """Deep chains (>10) must be capped to avoid runaway recursion."""
+        local = tmp_path / "skills"
+        # Build a chain: d0 → d1 → d2 → ... → d12
+        for i in range(13):
+            dep = f"d{i + 1}" if i < 12 else None
+            self._skill(local, f"d{i}", depends_on=dep)
+
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import _resolve_transitive
+
+        self._roots(monkeypatch, local)
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: set())
+
+        out_req, out_opt, cycles = [], [], []
+        from tools.skills_hub import parse_skill_dependencies
+
+        d0_fm = hub.parse_skill_frontmatter((local / "d0" / "SKILL.md").read_text())
+        d0_deps = parse_skill_dependencies(d0_fm)
+
+        _resolve_transitive(
+            "root",
+            [hub.SkillDependency("d0", True)],
+            set(),
+            out_req,
+            out_opt,
+            cycles,
+            _visited={"root"},
+            _path=["root"],
+            sources=None,
+            max_depth=10,
+        )
+
+        assert any("max depth" in c for c in cycles), (
+            f"deep chain not capped; cycles={cycles}"
+        )
+
+    def test_optional_subtree_does_not_block(self, tmp_path, monkeypatch):
+        """root --optional--> bee --required--> cee
+
+        Without --with-optional, cee must NOT block root's install.
+        """
+        local = tmp_path / "skills"
+        self._skill(local, "bee", depends_on="cee")
+        self._skill(local, "cee")
+
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import _resolve_transitive
+
+        self._roots(monkeypatch, local)
+        # cee is installed, bee is NOT
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: {"cee"})
+
+        out_req, out_opt, cycles = [], [], []
+        from tools.skills_hub import parse_skill_dependencies
+
+        root_deps = [hub.SkillDependency("bee", False)]  # optional
+        _resolve_transitive(
+            "root",
+            root_deps,
+            {"cee"},
+            out_req,
+            out_opt,
+            cycles,
+            _visited={"root"},
+            _path=["root"],
+            sources=None,
+        )
+
+        req_names = [d.name for d in out_req]
+        opt_names = [d.name for d in out_opt]
+        assert "cee" not in req_names, (
+            f"cee (required child of optional bee) ended up in required set; "
+            f"req={req_names}, opt={opt_names}"
+        )
+        assert "bee" in opt_names, (
+            f"bee (direct optional dep) not in optional set; opt={opt_names}"
+        )
+
+
+class TestWithOptional:
+    """--with-optional treats optional dependencies as required."""
+
+    def _check(self, monkeypatch, bundle, console, *, with_optional=False, installed=frozenset()):
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import _check_skill_dependencies
+
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: set(installed))
+        return _check_skill_dependencies(
+            bundle, console, with_optional=with_optional, skip_confirm=True
+        )
+
+    def test_with_optional_blocks_on_missing_optional(self, monkeypatch, console):
+        b = _bundle("depends_on:\n  - name: kanban\n    required: false\n")
+        blocked, missing = self._check(monkeypatch, b, console, with_optional=True)
+        assert blocked is True, "--with-optional should block on missing optional deps"
+        assert "kanban" in missing
+
+    def test_without_optional_warns_on_missing_optional(self, monkeypatch, console):
+        b = _bundle("depends_on:\n  - name: kanban\n    required: false\n")
+        blocked, missing = self._check(monkeypatch, b, console, with_optional=False)
+        assert blocked is False, "optional deps should not block without --with-optional"
+        assert missing == []
+
+    def test_with_optional_satisfied_optional_is_silent(self, monkeypatch, console):
+        b = _bundle("depends_on:\n  - name: kanban\n    required: false\n")
+        blocked, missing = self._check(
+            monkeypatch, b, console, with_optional=True, installed={"kanban"}
+        )
+        assert blocked is False
+        assert missing == []
+
+
+class TestAutoInstall:
+    """Auto-install in non-interactive mode (skip_confirm=True).
+
+    Even with skip_confirm, missing required dependencies still block
+    unless auto_install is explicitly passed.
+    """
+
+    def test_skip_confirm_still_blocks(self, monkeypatch, console):
+        b = _bundle("depends_on:\n  - name: obsidian\n")
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import _check_skill_dependencies
+
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: set())
+        blocked, missing = _check_skill_dependencies(
+            b, console, skip_confirm=True
+        )
+        assert blocked is True
+        assert missing == ["obsidian"]
+        assert "Installation blocked" in console.text
+
+    def test_auto_install_enters_recursive_branch(self, monkeypatch, tmp_path, served):
+        """auto_install=True enters the recursive install branch instead of blocking."""
+        from io import StringIO
+        from rich.console import Console
+        import tools.skills_hub as hub
+        from hermes_cli.skills_hub import do_install
+        from tools.skills_hub import UrlSource
+
+        url, httpd = served("depends_on:\n  - name: obsidian\n")
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr("tools.skills_hub.is_safe_url", lambda _u: True)
+        monkeypatch.setattr("tools.skills_hub.check_website_access", lambda _u: None)
+        monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [UrlSource()])
+        monkeypatch.setattr(hub, "installed_skill_names", lambda: set())
+
+        sink = StringIO()
+        try:
+            do_install(url, console=Console(file=sink, force_terminal=False),
+                       skip_confirm=True, name_override="needs-dep", auto_install=True)
+        finally:
+            httpd.shutdown()
+
+        out = sink.getvalue()
+        # Must NOT be blocked at the dependency gate
+        assert "Installation blocked" not in out, (
+            "auto_install=True was blocked at the gate instead of entering recursive install"
+        )
+        # Must enter the auto-install branch
+        assert "Auto-installing" in out, (
+            f"auto_install=True did not enter the recursive install branch:\n{out}"
         )

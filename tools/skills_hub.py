@@ -3404,21 +3404,24 @@ def parse_skill_frontmatter(content) -> dict:
 
     Returns ``{}`` for anything unparseable rather than raising: front-matter
     that a human mistyped must not take a code path down with it. Accepts
-    ``str`` or ``bytes`` so callers can pass either a file read or a bundle
-    entry.
+    ``str``, ``bytes``, or a ``Path`` so callers can pass a file read, a
+    bundle entry, or a path object directly.
     """
-    if isinstance(content, bytes):
-        content = content.decode("utf-8", "replace")
-    elif not isinstance(content, str):
+    if isinstance(content, (str, bytes)):
+        text = content.decode("utf-8", "replace") if isinstance(content, bytes) else str(content)
+    else:
+        try:
+            text = content.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return {}
+    text = text.lstrip("\ufeff")
+    if not text.startswith("---"):
         return {}
-    content = content.lstrip("\ufeff")
-    if not content.startswith("---"):
-        return {}
-    match = re.search(r"\n---\s*\n", content[3:])
+    match = re.search(r"\n---\s*\n", text[3:])
     if not match:
         return {}
     try:
-        parsed = yaml.safe_load(content[3:match.start() + 3])
+        parsed = yaml.safe_load(text[3:match.start() + 3])
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
@@ -3436,11 +3439,20 @@ def _declared_skill_name(skill_md: "Path") -> str:
 def resolve_skill_dependencies(
     deps: List[SkillDependency],
     installed: Optional[set] = None,
+    *,
+    with_optional: bool = False,
 ) -> Tuple[List[SkillDependency], List[SkillDependency]]:
-    """Split *deps* into (missing_required, missing_optional)."""
+    """Split *deps* into (missing_required, missing_optional).
+
+    When *with_optional* is True, optional dependencies are treated as
+    required for the purpose of the gate (used by ``--with-optional``).
+    """
     have = installed_skill_names() if installed is None else installed
     missing_required = [d for d in deps if d.required and d.name not in have]
     missing_optional = [d for d in deps if not d.required and d.name not in have]
+    if with_optional:
+        missing_required = missing_required + missing_optional
+        missing_optional = []
     return missing_required, missing_optional
 
 
