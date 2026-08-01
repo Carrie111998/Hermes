@@ -102,6 +102,7 @@ export type PetOverlayControl =
   | { type: 'set-preview-state'; state: AvatarState | null }
   | { type: 'reload-packs' }
   | { type: 'open-packs-folder' }
+  | { type: 'set-voice-replies'; enabled: boolean }
 
 // ── Avatar size presets (P0) ─────────────────────────────────────────────────
 // Maps a named size to a sprite scale. The overlay window resizes to fit.
@@ -326,6 +327,7 @@ let openSettingsHandler: (() => void) | null = null
 let dockHandler: (() => void) | null = null
 let popOutHandler: (() => void) | null = null
 let setSizeHandler: ((size: AvatarSizePreset) => void) | null = null
+let setVoiceRepliesHandler: ((enabled: boolean) => void) | null = null
 
 /**
  * Walk the live message log backwards and return the most recent assistant
@@ -630,6 +632,11 @@ export function setPetOverlaySetSizeHandler(fn: ((size: AvatarSizePreset) => voi
   setSizeHandler = fn
 }
 
+/** P0.5: Register handler invoked when the overlay toggles voice replies. */
+export function setPetOverlaySetVoiceRepliesHandler(fn: ((enabled: boolean) => void) | null): void {
+  setVoiceRepliesHandler = fn
+}
+
 /**
  * Wire the overlay→renderer control channel once. Returns a disposer. Idempotent
  * — a second call while already wired is a no-op.
@@ -689,6 +696,11 @@ export function initPetOverlayBridge(): () => void {
       setAvatarPreviewState(payload.state)
     } else if (payload?.type === 'reload-packs') {
       reloadAvatarPacks()
+    } else if (payload?.type === 'set-voice-replies' && typeof payload.enabled === 'boolean') {
+      // P0.5: Overlay toggled voice replies — persist via $avatarVoiceReplies so
+      // the subscription fires pushNow with the updated value, keeping both
+      // surfaces in sync and surviving restart.
+      setVoiceRepliesHandler?.(payload.enabled)
     } else if (payload?.type === 'open-packs-folder') {
       void window.hermesDesktop?.avatarPacks?.open()
     }

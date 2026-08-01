@@ -288,7 +288,10 @@ export function FloatingPet() {
   // Primary window only; runs at most once per pet activation.
 
   // Mark restoration intent in render body — prevents stale-read lag and
-  // keeps the effect body free of ref writes.
+  // avoids the no-restricted-syntax rule against useEffect-based ref sync.
+  // The ref guards exactly one auto-pop per activation; idempotent when
+  // re-renders don't change active state.
+  // eslint-disable-next-line no-restricted-syntax -- intentional render-body sentinel
   if (!isSecondaryWindow() && !restoredRef.current && active) {
     restoredRef.current = true
   }

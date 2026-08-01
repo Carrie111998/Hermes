@@ -122,6 +122,17 @@ export function PetOverlayApp() {
   const [avatarPreviewState, setAvatarPreviewStateLocal] = useState<AvatarState | null>(null)
   const [avatarPackList, setAvatarPackListLocal] = useState<AvatarPackListResult | null>(null)
 
+  // P1.2: Natural dimensions of the current avatar pack asset (from the
+  // renderer's onNaturalSize callback). Used instead of Petdex frameW/frameH
+  // for the overlay OS window resize so pack content is never cropped.
+  const [packNaturalSize, setPackNaturalSize] = useState<{ w: number; h: number } | null>(null)
+
+  // Reset pack natural dimensions when the selected pack or renderer type
+  // changes, so the overlay resize always uses current asset dimensions.
+  useEffect(() => {
+    setPackNaturalSize(null)
+  }, [selectedAvatarPack?.id, avatarRendererType])
+
   // P1 Voice: Track the latest assistant reply for TTS auto-speak.
   // The main renderer pushes assistant messages via the 'submit'→gateway path,
   // but we can't see the reply directly. Instead, subscribe to busy transitions:
@@ -141,6 +152,10 @@ export function PetOverlayApp() {
 
   const handleVoiceRepliesChange = useCallback((enabled: boolean) => {
     setVoiceRepliesLocal(enabled)
+    // Send control to main renderer so the persisted $avatarVoiceReplies atom
+    // is updated — the subscription fires pushNow with the authoritative value,
+    // keeping both surfaces in sync and surviving restart.
+    window.hermesDesktop?.petOverlay?.control({ enabled, type: 'set-voice-replies' })
   }, [])
 
   // P1 Voice: The voice conversation loop.
@@ -346,9 +361,14 @@ export function PetOverlayApp() {
     }
   }, [])
 
-  // Keep refs current for callback access (render-body update — no stale-read lag).
+  // Keep refs current for callback access — render-body assignment is
+  // intentional here: useEffect-based ref sync lags one render and causes
+  // stale-read bugs in mousemove handlers that read these refs.
+  // eslint-disable-next-line no-restricted-syntax -- intentional render-body ref sync
   composerOpenRef.current = composerOpen
+  // eslint-disable-next-line no-restricted-syntax -- intentional render-body ref sync
   settingsOpenRef.current = settingsOpen
+  // eslint-disable-next-line no-restricted-syntax -- intentional render-body ref sync
   contextMenuRef.current = Boolean(contextMenu)
 
   // The whole window must stay interactive while the composer or settings are
@@ -561,6 +581,8 @@ export function PetOverlayApp() {
 
   // Grow/shrink the OS overlay window to fit the pet at its current scale.
   // Uses effectiveScale so size-preset changes also resize the window.
+  // In avatar-pack mode, prefers the pack asset's natural dimensions over the
+  // Petdex frame size — this prevents large pack assets from being cropped.
   useEffect(() => {
     // In avatar-pack mode, spritesheetBase64 is not required. The window
     // resize should fire as long as we have content to show.
@@ -571,11 +593,12 @@ export function PetOverlayApp() {
       return
     }
 
-    const { width, height } = overlayWindowSize(
-      info.frameW ?? DEFAULT_FRAME_W,
-      info.frameH ?? DEFAULT_FRAME_H,
-      effectiveScale
-    )
+    // Use pack natural dimensions when available (avatar-pack mode), falling
+    // back to Petdex frame defaults so the sprite path is unchanged.
+    const frameW = hasPack && packNaturalSize ? packNaturalSize.w : (info.frameW ?? DEFAULT_FRAME_W)
+    const frameH = hasPack && packNaturalSize ? packNaturalSize.h : (info.frameH ?? DEFAULT_FRAME_H)
+
+    const { width, height } = overlayWindowSize(frameW, frameH, effectiveScale)
 
     const curW = window.outerWidth
     const curH = window.outerHeight
@@ -601,7 +624,7 @@ export function PetOverlayApp() {
 
     window.hermesDesktop?.petOverlay?.setBounds(bounds)
     window.hermesDesktop?.petOverlay?.control({ bounds, type: 'bounds' })
-  }, [info.enabled, info.spritesheetBase64, effectiveScale, info.frameW, info.frameH, avatarRendererType, selectedAvatarPack])
+  }, [info.enabled, info.spritesheetBase64, effectiveScale, info.frameW, info.frameH, avatarRendererType, selectedAvatarPack, packNaturalSize])
 
   // Hidden state: return null but keep the window alive for re-show.
   if (avatarHidden) {
@@ -1247,6 +1270,7 @@ export function PetOverlayApp() {
           {/* P1: Render AvatarPackRenderer or PetSprite depending on the active renderer type. */}
           {avatarRendererType === 'avatar-pack' && selectedAvatarPack ? (
             <AvatarPackRenderer
+              onNaturalSize={(w, h) => setPackNaturalSize({ w, h })}
               opacity={opacityValue}
               pack={selectedAvatarPack}
               scale={effectiveScale}

@@ -19,6 +19,13 @@ import {
   type ResolvedAvatarPack
 } from '@/store/avatar-pack-types'
 
+// ── Renderer type guard ───────────────────────────────────────────────────────
+
+/** Validate that a string is an AvatarRendererType. */
+export function isValidRendererType(v: string): v is AvatarRendererType {
+  return v === 'petdex' || v === 'avatar-pack'
+}
+
 // ── Persisted preferences ────────────────────────────────────────────────────
 
 const RENDERER_TYPE_KEY = 'hermes.desktop.avatar-renderer-type.v1'
@@ -28,7 +35,7 @@ export const $avatarRendererType = atom<AvatarRendererType>(
   ((): AvatarRendererType => {
     const v = storedString(RENDERER_TYPE_KEY)
 
-    return v === 'petdex' || v === 'avatar-pack' ? v : 'petdex'
+    return v !== null && isValidRendererType(v) ? v : 'petdex'
   })()
 )
 

@@ -6,6 +6,7 @@ import {
   dockAvatar,
   setAvatarHidden,
   setAvatarSize,
+  setAvatarVoiceReplies,
   setPetOverlayDockHandler,
   setPetOverlayHideHandler,
   setPetOverlayOpenAppHandler,
@@ -14,6 +15,7 @@ import {
   setPetOverlayQuitHandler,
   setPetOverlayScaleHandler,
   setPetOverlaySetSizeHandler,
+  setPetOverlaySetVoiceRepliesHandler,
   setPetOverlaySubmitHandler
 } from '@/store/pet-overlay'
 import { $sessions } from '@/store/session'
@@ -92,6 +94,7 @@ export function usePetBridge({ navigate, requestGateway, resumeSession, submitTe
     // the new size on the next state push (confirming its local change) and
     // effectiveScale (derived from avatarSize) drives the sprite + window resize.
     setPetOverlaySetSizeHandler(size => setAvatarSize(size))
+    setPetOverlaySetVoiceRepliesHandler(enabled => setAvatarVoiceReplies(enabled))
 
     return () => {
       setPetOverlaySubmitHandler(null)

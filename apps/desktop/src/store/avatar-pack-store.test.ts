@@ -2,44 +2,17 @@
  * Behavioral tests for avatar pack contracts.
  *
  * Covers: activity→state mapping priority, asset extension validation,
- * store default fallback, renderer type guard, and path traversal
- * rejection in manifest filenames.
+ * renderer type guard against real production exports (no local copies).
  */
 
 import { describe, expect, it } from 'vitest'
 
-import { activityToAvatarState } from './avatar-pack-store'
+import { activityToAvatarState, isValidRendererType } from './avatar-pack-store'
 import {
-  type AvatarRendererType,
   isAssetExt,
   isImageExt,
   isVideoExt
 } from './avatar-pack-types'
-
-// ── Path traversal rejection (pure helper — mirrors electron-side isPathInside) ─
-
-const POSIX_SEP = '/'
-
-/** Reject filenames that would escape the pack folder. */
-function isFilenameSafe(filename: string): boolean {
-  // No absolute paths
-  if (filename.startsWith(POSIX_SEP)) {
-    return false
-  }
-
-  // No empty or degenerate paths
-  if (!filename || filename.includes('//')) {
-    return false
-  }
-
-  // Reject path traversal: any path segment that is exactly ".."
-  const segments = filename.split(POSIX_SEP)
-  if (segments.some(s => s === '..')) {
-    return false
-  }
-
-  return true
-}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -93,38 +66,29 @@ describe('activityToAvatarState priority chain', () => {
   })
 })
 
-describe('manifest filename path traversal rejection', () => {
-  it('accepts simple filenames in the pack folder', () => {
-    expect(isFilenameSafe('idle.png')).toBe(true)
-    expect(isFilenameSafe('talk.webm')).toBe(true)
-    expect(isFilenameSafe('assets/think.gif')).toBe(true)
-    expect(isFilenameSafe('subfolder/nested/idle.mp4')).toBe(true)
+describe('isValidRendererType (production export)', () => {
+  it('accepts petdex and avatar-pack', () => {
+    expect(isValidRendererType('petdex')).toBe(true)
+    expect(isValidRendererType('avatar-pack')).toBe(true)
   })
 
-  it('rejects absolute paths', () => {
-    expect(isFilenameSafe('/etc/passwd')).toBe(false)
-    expect(isFilenameSafe('/home/user/secret.png')).toBe(false)
+  it('rejects invalid values', () => {
+    expect(isValidRendererType('')).toBe(false)
+    expect(isValidRendererType('hchar')).toBe(false)
+    expect(isValidRendererType('unknown')).toBe(false)
   })
 
-  it('rejects parent directory traversal', () => {
-    expect(isFilenameSafe('../secret.png')).toBe(false)
-    expect(isFilenameSafe('../../etc/passwd')).toBe(false)
-    expect(isFilenameSafe('assets/../../../secret')).toBe(false)
-  })
-
-  it('rejects hidden files that start with traversal patterns', () => {
-    expect(isFilenameSafe('..hidden')).toBe(true) // ".." as prefix in filename is fine
-    expect(isFilenameSafe('...config')).toBe(true) // three dots is fine
-    expect(isFilenameSafe('..../escape')).toBe(true) // four dots is not traversal
-  })
-
-  it('rejects empty or degenerate paths', () => {
-    expect(isFilenameSafe('')).toBe(false)
-    expect(isFilenameSafe('dir//file.png')).toBe(false)
+  it('preserves the TypeScript type guard', () => {
+    const v: string = 'petdex'
+    if (isValidRendererType(v)) {
+      // If this compiles, the type guard narrows correctly.
+      const _check: 'petdex' | 'avatar-pack' = v
+      expect(_check).toBe('petdex')
+    }
   })
 })
 
-describe('asset extension validation', () => {
+describe('asset extension validation (production exports)', () => {
   it('recognizes video extensions', () => {
     expect(isVideoExt('.webm')).toBe(true)
     expect(isVideoExt('.mp4')).toBe(true)
@@ -156,21 +120,10 @@ describe('asset extension validation', () => {
     expect(isAssetExt('png')).toBe(false) // no dot
   })
 
-  it('validates all 7 supported formats', () => {
+  it('isAssetExt validates all 7 supported formats', () => {
     const supported = ['.webm', '.mp4', '.mov', '.gif', '.webp', '.png', '.svg']
     for (const ext of supported) {
       expect(isAssetExt(ext)).toBe(true)
     }
-  })
-})
-
-describe('avatar renderer type guard', () => {
-  it('accepts only petdex and avatar-pack', () => {
-    const valid = (v: string): v is AvatarRendererType => v === 'petdex' || v === 'avatar-pack'
-    expect(valid('petdex')).toBe(true)
-    expect(valid('avatar-pack')).toBe(true)
-    expect(valid('')).toBe(false)
-    expect(valid('hchar')).toBe(false)
-    expect(valid('unknown')).toBe(false)
   })
 })

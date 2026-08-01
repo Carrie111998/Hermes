@@ -27,6 +27,9 @@ export interface AvatarPackRendererProps {
   scale: number
   /** Opacity (0-1). */
   opacity: number
+  /** Called when the asset's natural dimensions are known, so the overlay
+   *  can resize its OS window to fit the pack content without cropping. */
+  onNaturalSize?: (w: number, h: number) => void
 }
 
 /**
@@ -62,7 +65,8 @@ function AvatarPackRendererImpl({
   pack,
   state,
   scale,
-  opacity
+  opacity,
+  onNaturalSize
 }: AvatarPackRendererProps) {
   const asset = useMemo(() => pickAsset(pack, state), [pack, state])
 
@@ -119,6 +123,7 @@ function AvatarPackRendererImpl({
 
     if (w && h && w > 0 && h > 0) {
       setNaturalSize({ h, w })
+      onNaturalSize?.(w, h)
     }
   }
 

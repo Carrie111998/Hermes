@@ -96,14 +96,25 @@ const MAX_SINGLE_ASSET_BYTES = 50 * 1024 * 1024 // 50 MB per asset
 /**
  * Security: check that a resolved file path is inside the given base directory.
  * Prevents symlinks or relative paths from escaping the pack folder.
+ *
+ * Uses segment-based checking (splits on path separator) to avoid false
+ * positives on legitimate filenames like `..hidden` that start with `..`
+ * but are not path traversal.
  * @param {string} filePath
  * @param {string} baseDir
  * @returns {boolean}
  */
-function isPathInside(filePath, baseDir) {
+export function isPathInside(filePath, baseDir) {
   const rel = path.relative(baseDir, filePath)
 
-  return rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+  if (!rel || path.isAbsolute(rel)) {
+    return false
+  }
+
+  // Reject only when a full path segment is exactly ".." — not when a segment
+  // merely *starts* with ".." (e.g. "..hidden" is a valid filename).
+  const segments = rel.split(path.sep)
+  return !segments.some(s => s === '..')
 }
 
 /**
@@ -128,9 +139,8 @@ function validateManifest(raw, packId) {
     throw new Error(`pack.json is not a valid object`)
   }
 
-  const obj = /** @type {Record<string, unknown>} */ (raw)
-
-  const id = String(obj.id || '').trim()
+  // Read required fields with runtime type checks instead of a broad cast.
+  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
 
   if (!id) {
     throw new Error(`pack.json missing required field: id`)
@@ -140,20 +150,20 @@ function validateManifest(raw, packId) {
     // Don't throw — just warn. The folder name is authoritative for path safety.
   }
 
-  const name = String(obj.name || id).trim()
+  const name = typeof raw.name === 'string' ? raw.name.trim() : id.trim()
 
   if (!name) {
     throw new Error(`pack.json missing required field: name`)
   }
 
-  const version = String(obj.version || '1.0.0').trim()
-  const type = String(obj.type || 'character').trim()
+  const version = typeof raw.version === 'string' ? raw.version.trim() : '1.0.0'
+  const type = typeof raw.type === 'string' ? raw.type.trim() : 'character'
 
   if (type !== 'character') {
     throw new Error(`pack.json type "${type}" is not supported (only "character")`)
   }
 
-  const states = obj.states
+  const states = raw.states
 
   if (!states || typeof states !== 'object') {
     throw new Error(`pack.json missing required field: states`)
@@ -171,22 +181,31 @@ function validateManifest(raw, packId) {
       continue
     }
 
-    // Security: reject absolute paths and path traversal
+    // Security: reject absolute paths and path traversal.
+    // Check each segment individually — a filename like "..hidden" is valid,
+    // but a segment exactly equal to ".." is traversal.
     const filename = value.trim()
 
-    if (path.isAbsolute(filename) || filename.includes('..')) {
+    if (path.isAbsolute(filename)) {
+      throw new Error(`pack.json state "${key}" has invalid path: ${filename}`)
+    }
+
+    if (filename.split(path.sep).some(s => s === '..')) {
       throw new Error(`pack.json state "${key}" has invalid path: ${filename}`)
     }
 
     validStates[key] = filename
   }
 
-  const render = obj.render && typeof obj.render === 'object' ? obj.render : {}
-  const defaultState = String(obj.defaultState || 'idle').trim()
+  const renderObj = raw.render && typeof raw.render === 'object' ? raw.render : {}
+  const defaultState = typeof raw.defaultState === 'string' ? raw.defaultState.trim() : 'idle'
 
   if (!VALID_STATES.has(defaultState)) {
     // Fall back to idle; don't throw
   }
+
+  const renderTransparent = typeof renderObj.transparent === 'boolean' ? renderObj.transparent : true
+  const renderLoop = typeof renderObj.loop === 'boolean' ? renderObj.loop : true
 
   return {
     id,
@@ -195,8 +214,8 @@ function validateManifest(raw, packId) {
     type: 'character',
     states: validStates,
     render: {
-      transparent: render.transparent !== false,
-      loop: render.loop !== false
+      transparent: renderTransparent,
+      loop: renderLoop
     },
     defaultState: VALID_STATES.has(defaultState) ? defaultState : 'idle'
   }
