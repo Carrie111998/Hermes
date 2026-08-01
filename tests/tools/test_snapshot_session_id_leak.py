@@ -50,6 +50,7 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
     assert "grep -vE" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -60,6 +61,24 @@ def test_export_snippet_shape():
     assert snippet.lstrip().startswith("{ ")
     assert "|| true; }" in snippet
     assert snippet.rstrip().endswith("> /tmp/snap.tmp.$BASHPID")
+
+
+def test_delegated_child_marker_excluded_from_snapshot():
+    """The delegated-child lineage marker must never persist in the snapshot.
+
+    Regression for the gateway kanban dispatcher failure: a desktop session
+    snapshot captured HERMES_DELEGATED_CHILD_CONTEXT=1, every later session
+    sourced it as a stale "delegated child" flag, and the gateway's own
+    kanban connect()/migration write_txn then tripped
+    _assert_not_delegated_child_mutation on every tick.
+    """
+    rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
+    line = 'declare -x HERMES_DELEGATED_CHILD_CONTEXT="1"'
+    assert rx.search(line), "delegated-child marker should be excluded from the snapshot"
+
+    snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
+    # Unset happens before export -p, so the marker cannot appear in the dump.
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
 
 
 # ---------------------------------------------------------------------------
