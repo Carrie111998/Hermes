@@ -370,6 +370,74 @@ class TestBlockingApprovalE2E:
         assert "timed out" in result_holder[0]["message"]
         unregister_gateway_notify(session_key)
 
+    def test_expiry_behavior_wait_never_times_out(self, monkeypatch):
+        """expiry_behavior=wait keeps the approval pending past the timeout.
+
+        Regression for #76235: with a zero/elapsed timeout the wait must NOT
+        be interpreted as a denial — the approval stays pending until the
+        user answers explicitly (or the session is interrupted).
+        """
+        from tools import approval as approval_module
+        from tools.approval import (
+            check_all_command_guards,
+            register_gateway_notify,
+            reset_current_session_key,
+            resolve_gateway_approval,
+            set_current_session_key,
+            unregister_gateway_notify,
+        )
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_expiry_behavior",
+            lambda: "wait",
+        )
+        session_key = "e2e-wait"
+        notified = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+
+        result_holder = [None]
+
+        def agent_thread():
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                # timeout=0 would expire instantly under expiry_behavior=deny;
+                # under "wait" the timeout must never fire.
+                with patch(
+                    "tools.approval._get_approval_config",
+                    return_value={"mode": "manual", "timeout": 0},
+                ):
+                    result_holder[0] = check_all_command_guards(
+                        "rm -rf /important", "local"
+                    )
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+
+        t = threading.Thread(target=agent_thread)
+        t.start()
+
+        # The approval must still be pending well past the 0s timeout — the
+        # wait loop keeps polling until an explicit answer.
+        assert _wait_until(lambda: len(notified) >= 1), \
+            "approval was never notified"
+        time.sleep(0.3)
+        assert t.is_alive(), "approval expired despite expiry_behavior=wait"
+        assert result_holder[0] is None, "guard returned before user answer"
+
+        # An explicit answer unblocks the thread.
+        assert resolve_gateway_approval(session_key, "once") == 1
+        t.join(timeout=5)
+        assert result_holder[0] is not None
+        assert result_holder[0]["approved"] is True
+        unregister_gateway_notify(session_key)
+
     def test_parallel_subagent_approvals(self):
         """Multiple threads can block concurrently and be resolved independently."""
         from tools.approval import (

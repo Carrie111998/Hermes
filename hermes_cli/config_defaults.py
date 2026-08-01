@@ -1972,9 +1972,22 @@ DEFAULT_CONFIG = {
     # Messaging approvals arrive as a push notification the user may not see
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
+    #
+    # expiry_behavior — what happens when ``timeout`` elapses with no answer:
+    #   deny — treat the timeout as an explicit denial and fail closed
+    #          (default; safe for unattended/cron contexts)
+    #   wait — never expire: keep the approval pending until the user answers
+    #          explicitly (or the session is interrupted).  Useful on
+    #          messaging platforms (Slack, Telegram) where the user may not
+    #          see the push notification for a long time — the timeout is
+    #          NOT interpreted as a denial, so a slow user can't cause a
+    #          wrong outcome.  Note: with ``wait`` the agent thread stays
+    #          blocked until an explicit answer, so timeouts effectively
+    #          never fire.
     "approvals": {
         "mode": "smart",
         "timeout": 300,
+        "expiry_behavior": "deny",
         "cron_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's

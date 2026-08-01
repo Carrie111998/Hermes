@@ -13150,6 +13150,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         with self._approval_lock:
             timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 300))
+            from tools.approval import _get_approval_expiry_behavior
             response_queue = queue.Queue()
 
             self._approval_state = {
@@ -13163,7 +13164,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "selected": 0,
                 "response_queue": response_queue,
             }
-            self._approval_deadline = _time.monotonic() + timeout
+            # expiry_behavior="wait" → never expire: a None deadline keeps
+            # the prompt up until an explicit answer (#76235), mirroring
+            # clarify's unlimited-timeout convention.
+            self._approval_deadline = (
+                None if _get_approval_expiry_behavior() == "wait"
+                else _time.monotonic() + timeout
+            )
 
             # Modal prompt — paint immediately, bypassing the throttle/resize
             # guard. A throttled paint here can be silently dropped (250ms
@@ -13191,6 +13198,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     return result
                 except queue.Empty:
+                    # None deadline = unlimited; keep polling (#76235).
+                    if self._approval_deadline is None:
+                        now = _time.monotonic()
+                        if now - _last_countdown_refresh >= 1.0:
+                            _last_countdown_refresh = now
+                            self._paint_now()
+                        continue
                     remaining = self._approval_deadline - _time.monotonic()
                     if remaining <= 0:
                         break
@@ -16388,6 +16402,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ]
 
             if cli_ref._approval_state:
+                # None deadline = approval never expires (expiry_behavior:
+                # wait) — show an open-ended countdown instead of seconds.
+                if cli_ref._approval_deadline is None:
+                    return [
+                        ('class:hint', '  ↑/↓ to select, Enter to confirm'),
+                        ('class:clarify-countdown', '  (no timeout)'),
+                    ]
                 remaining = max(0, int(cli_ref._approval_deadline - time.monotonic()))
                 return [
                     ('class:hint', '  ↑/↓ to select, Enter to confirm'),

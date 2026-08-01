@@ -33,6 +33,7 @@ The approval system supports three modes, configured via `approvals.mode` in `~/
 approvals:
   mode: smart                     # smart | manual | off
   timeout: 300                    # seconds to wait for user response (default: 300)
+  expiry_behavior: deny           # deny | wait — what happens when timeout elapses (default: deny)
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
@@ -44,6 +45,7 @@ The full set of keys:
 |---|---|---|
 | `mode` | `smart` | Approval policy for dangerous shell commands — see the table below. |
 | `timeout` | `300` | Seconds Hermes waits for an approval reply before timing out. |
+| `expiry_behavior` | `deny` | What happens when `timeout` elapses with no answer. `deny` treats the timeout as a denial (fail closed). `wait` never expires: the approval stays pending until the user answers explicitly (or the session is interrupted) — useful on messaging platforms like Slack where the user may not see the push notification for a long time, and a timeout must never be interpreted as a denial. Note that with `wait` the agent thread stays blocked until an explicit answer, so `timeout` effectively never fires. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |

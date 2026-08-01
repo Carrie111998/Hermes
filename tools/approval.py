@@ -2522,7 +2522,12 @@ def prompt_dangerous_approval(command: str, description: str,
 
             thread = threading.Thread(target=get_input, daemon=True)
             thread.start()
-            thread.join(timeout=timeout_seconds)
+            # expiry_behavior="wait" → never expire; block until the user
+            # answers explicitly (#76235).
+            if _get_approval_expiry_behavior() == "wait":
+                thread.join()
+            else:
+                thread.join(timeout=timeout_seconds)
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
@@ -2657,6 +2662,31 @@ def _get_approval_timeout() -> int:
         return int(_get_approval_config().get("timeout", 300))
     except (ValueError, TypeError):
         return 300
+
+
+def _get_approval_expiry_behavior() -> str:
+    """Read the approval expiry behavior from config.
+
+    Returns ``"deny"`` (default) or ``"wait"``.
+
+    - ``deny`` — when ``approvals.timeout`` elapses with no user answer the
+      approval is treated as an explicit denial (fail closed).  This is the
+      historical behavior.
+    - ``wait`` — approvals never expire: the wait stays pending until the
+      user answers explicitly (or the session is interrupted).  The timeout
+      is NOT interpreted as a denial, so a slow user can't cause a wrong
+      outcome — e.g. long-running coding tasks on Slack where the approval
+      message sits unseen on the phone (#76235).
+
+    Any unknown value falls back to ``"deny"`` (safe default).
+    """
+    try:
+        raw = str(_get_approval_config().get("expiry_behavior", "deny")).strip().lower()
+    except (ValueError, TypeError):
+        return "deny"
+    if raw in {"wait", "never", "block", "unlimited"}:
+        return "wait"
+    return "deny"
 
 
 def _get_cron_approval_mode() -> str:
@@ -3305,6 +3335,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
     timeout = _get_approval_timeout()
+    expiry_behavior = _get_approval_expiry_behavior()
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -3312,7 +3343,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    # With expiry_behavior="wait" approvals never expire — the user's answer
+    # (or an interrupt) is the only way out (#76235). A None deadline keeps
+    # the loop below polling until the event fires.
+    _deadline = None if expiry_behavior == "wait" else _now + max(timeout, 0)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
@@ -3333,7 +3367,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             entry.event.set()
             resolved = True
             break
-        _remaining = _deadline - time.monotonic()
+        _remaining = (
+            _deadline - time.monotonic() if _deadline is not None else float("inf")
+        )
         if _remaining <= 0:
             break
         if entry.event.wait(timeout=min(1.0, _remaining)):
