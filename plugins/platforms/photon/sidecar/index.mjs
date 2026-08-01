@@ -66,6 +66,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { patchSpectrumPollSchema } from "./patch-spectrum-poll-schema.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
 import {
   classifyProbeRejection,
@@ -286,6 +287,12 @@ try {
   if (patchResult.patched) {
     console.error(
       `photon-sidecar: spectrum mixed attachment patch applied: ${patchResult.file}`
+    );
+  }
+  const pollPatchResult = patchSpectrumPollSchema();
+  if (pollPatchResult.patched) {
+    console.error(
+      `photon-sidecar: spectrum poll schema patch applied: ${pollPatchResult.file}`
     );
   }
 } catch (e) {
