@@ -598,10 +598,10 @@ resolution and do not modify global configuration. The value must be a
 non-empty list of available toolsets, configured MCP server names, or the
 `no_mcp` sentinel. Unknown names leave the normal API-server tool selection in
 place. A bare `no_mcp` keeps the normal native tool selection while disabling
-MCP servers. Its
-`reasoning_effort` accepts the normal Hermes levels (`none`, `minimal`,
-`low`, `medium`, `high`, `xhigh`, `max`, `ultra`) and does not modify global
-configuration. A session-level `/model` selection takes precedence over a route.
+MCP servers. Its `reasoning_effort` accepts the normal Hermes levels (`none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) and does not modify
+global configuration. A session-level `/model` selection takes precedence over
+a route.
 
 ### Concurrent-run cap
 
