@@ -1493,53 +1493,156 @@ def clean_manifest_targets(targets, cfg):
     """Execute cleanup for FILESYSTEM.md manifest entries (source=='filesystem_md').
 
     Built-in targets are handled by clean(); this runs only the manifest-extended
-    entries, applying safe age-based deletion (mirrors clean_logs: never delete
-    anything younger than its max_age_days, always honor dry_run). `never_touch`
-    entries are excluded by the merge step, so they never reach here. Returns a
-    list of result dicts matching clean()'s shape.
+    entries. Behavior is governed by the manifest entry's own ``action``,
+    ``tier``, and optional ``requires_confirmation`` — never by age alone.
+
+    Safety enforcement:
+    - ``tier_limit`` (from ``cfg``) gates which tiers execute; entries above the
+      limit are skipped with a reason.
+    - ``never_touch`` entries are always skipped (defensive double-check even
+      though the merge step should have excluded them).
+    - ``requires_confirmation`` entries are skipped unless the caller has set
+      ``cfg["confirmed"]`` (the CLI never sets this; it is for programmatic
+      callers that have obtained explicit user consent).
+    - ``action`` semantics are respected: ``compress`` compresses, ``delete``
+      removes, ``delete_dir_contents`` empties a directory's contents (not the
+      dir itself), ``analyze_only`` / ``never_touch`` never mutate.
+    - Entries without a recognisable ``action`` are assessment-only (no deletion).
+
+    Returns a list of result dicts matching ``clean()``'s shape.
     """
     dry_run = cfg.get("dry_run", False)
+    tier_limit = int(cfg.get("tier_limit", 3))
+    confirmed = cfg.get("confirmed", False)
     results = []
+
+    # Defensive never-touch check on the actual path strings.
+    def _is_never_touch(path):
+        if not path:
+            return False
+        for nt in NEVER_TOUCH:
+            # Exact match or the never-touch entry is a path component.
+            if path == nt or path.startswith(nt.rstrip("/") + "/") or path.startswith(nt):
+                return True
+            # Also check if any path component matches (e.g., 'state.db' in '/root/.hermes/state.db').
+            parts = path.split(os.sep)
+            if any(part == nt or part.endswith(nt) for part in parts):
+                return True
+        return False
 
     for tid, t in sorted(targets.items()):
         if t.get("source") != "filesystem_md":
             continue
-        if t.get("action") == "never_touch":
+
+        tier = t.get("tier", 3)
+
+        # Tier limit enforcement.
+        if tier > tier_limit:
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": f"tier {tier} exceeds limit {tier_limit}"})
+            continue
+
+        action = t.get("action", "analyze_only")
+
+        # never_touch is always a no-op, even if it somehow survived the merge.
+        if action == "never_touch":
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": "never_touch"})
+            continue
+
+        # Analyze-only entries are read-only.
+        if action == "analyze_only":
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": "analyze_only"})
+            continue
+
+        # Confirmation requirement.
+        if t.get("requires_confirmation") and not confirmed:
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": "requires_confirmation"})
             continue
 
         path = t.get("path")
-        if not path or not os.path.exists(path):
+        if not path:
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": "no path"})
+            continue
+
+        # Never-touch path safety (defensive).
+        if _is_never_touch(path):
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": "path in never_touch"})
+            continue
+
+        if not os.path.exists(path):
             continue
 
         max_age = t.get("max_age_days")
-        if max_age is None:
-            # Manifest entry without an age threshold is assessment-only — skip
-            # deletion so we never act on an unbounded path.
-            results.append({"action": f"manifest:{tid}", "tier": t.get("tier", 3),
-                            "compressed": 0, "deleted": 0, "bytes_freed": 0,
-                            "errors": [], "skipped": "no max_age_days"})
-            continue
+        max_age_hours = t.get("max_age_hours")
 
-        result = {"action": f"manifest:{tid}", "tier": t.get("tier", 3),
+        result = {"action": f"manifest:{tid}", "tier": tier,
                   "compressed": 0, "deleted": 0, "bytes_freed": 0, "errors": []}
 
-        if os.path.isfile(path):
-            if age_days(path) > max_age:
-                size = os.path.getsize(path)
-                result["deleted"] += 1
-                result["bytes_freed"] += size
-                if not dry_run:
-                    try:
-                        os.remove(path)
-                    except Exception as e:
-                        result["errors"].append(f"remove {path}: {e}")
-        elif os.path.isdir(path):
-            for dp, _, filenames in os.walk(path):
-                for f in filenames:
-                    fp = os.path.join(dp, f)
-                    if not os.path.isfile(fp):
-                        continue
-                    if age_days(fp) > max_age:
+        if action == "compress":
+            # Compress files older than max_age_days (or max_age_hours).
+            if os.path.isfile(path):
+                if (max_age and age_days(path) > max_age) or \
+                   (max_age_hours and age_hours(path) > max_age_hours):
+                    saved = gzip_file(path, dry_run)
+                    result["compressed"] += 1
+                    result["bytes_freed"] += saved
+            elif os.path.isdir(path):
+                for dp, _, filenames in os.walk(path):
+                    for f in filenames:
+                        fp = os.path.join(dp, f)
+                        if not os.path.isfile(fp) or f.endswith(".gz"):
+                            continue
+                        if (max_age and age_days(fp) > max_age) or \
+                           (max_age_hours and age_hours(fp) > max_age_hours):
+                            saved = gzip_file(fp, dry_run)
+                            result["compressed"] += 1
+                            result["bytes_freed"] += saved
+
+        elif action in ("delete", "delete_files"):
+            # Delete files older than max_age_days (or max_age_hours).
+            if os.path.isfile(path):
+                if (max_age and age_days(path) > max_age) or \
+                   (max_age_hours and age_hours(path) > max_age_hours):
+                    size = os.path.getsize(path)
+                    result["deleted"] += 1
+                    result["bytes_freed"] += size
+                    if not dry_run:
+                        try:
+                            os.remove(path)
+                        except Exception as e:
+                            result["errors"].append(f"remove {path}: {e}")
+            elif os.path.isdir(path):
+                for dp, _, filenames in os.walk(path):
+                    for f in filenames:
+                        fp = os.path.join(dp, f)
+                        if not os.path.isfile(fp):
+                            continue
+                        if (max_age and age_days(fp) > max_age) or \
+                           (max_age_hours and age_hours(fp) > max_age_hours):
+                            size = os.path.getsize(fp)
+                            result["deleted"] += 1
+                            result["bytes_freed"] += size
+                            if not dry_run:
+                                try:
+                                    os.remove(fp)
+                                except Exception as e:
+                                    result["errors"].append(f"remove {fp}: {e}")
+
+        elif action == "delete_dir_contents":
+            # Remove the contents of a directory but keep the directory itself.
+            if os.path.isdir(path):
+                for dp, dirs, files in os.walk(path, topdown=False):
+                    for f in files:
+                        fp = os.path.join(dp, f)
+                        if not os.path.isfile(fp):
+                            continue
+                        if max_age is not None and age_days(fp) <= max_age:
+                            continue
                         size = os.path.getsize(fp)
                         result["deleted"] += 1
                         result["bytes_freed"] += size
@@ -1548,6 +1651,51 @@ def clean_manifest_targets(targets, cfg):
                                 os.remove(fp)
                             except Exception as e:
                                 result["errors"].append(f"remove {fp}: {e}")
+                    for d in dirs:
+                        dp2 = os.path.join(dp, d)
+                        if not os.path.isdir(dp2):
+                            continue
+                        # Only remove subdirectories older than max_age (if set).
+                        if max_age is not None and age_days(dp2) <= max_age:
+                            continue
+                        size = du(dp2)
+                        result["deleted"] += 1
+                        result["bytes_freed"] += size
+                        if not dry_run:
+                            try:
+                                shutil.rmtree(dp2)
+                            except Exception as e:
+                                result["errors"].append(f"rmtree {dp2}: {e}")
+
+        elif action == "delete_dirs":
+            # Delete entire directories older than max_age_days.
+            if not max_age and not max_age_hours:
+                results.append({"action": f"manifest:{tid}", "tier": tier,
+                                "skipped": "no max_age threshold for delete_dirs"})
+                continue
+            if os.path.isdir(path):
+                for dp, dirs, _ in os.walk(path, topdown=False):
+                    for d in dirs:
+                        dp2 = os.path.join(dp, d)
+                        if not os.path.isdir(dp2):
+                            continue
+                        age_ok = (max_age and age_days(dp2) > max_age) or \
+                                 (max_age_hours and age_hours(dp2) > max_age_hours)
+                        if age_ok:
+                            size = du(dp2)
+                            result["deleted"] += 1
+                            result["bytes_freed"] += size
+                            if not dry_run:
+                                try:
+                                    shutil.rmtree(dp2)
+                                except Exception as e:
+                                    result["errors"].append(f"rmtree {dp2}: {e}")
+
+        else:
+            # Unrecognised action — assessment only, never delete.
+            results.append({"action": f"manifest:{tid}", "tier": tier,
+                            "skipped": f"unknown action: {action}"})
+            continue
 
         results.append(result)
 

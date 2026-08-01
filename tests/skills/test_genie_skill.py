@@ -197,10 +197,116 @@ def test_clean_manifest_targets_executes(tmp_vps, monkeypatch):
     assert any(r.get("action") == "manifest:stale_t" for r in dry)
 
     # Real run: stale removed, young kept (young file is fresh).
-    real = g.clean_manifest_targets(targets, {"dry_run": False})
+    real = g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 3})
     assert not old.exists(), "stale manifest target must be deleted"
     assert (young / "new.txt").exists(), "young manifest target must be kept"
     assert any(r.get("action") == "manifest:stale_t" and r.get("deleted", 0) >= 1 for r in real)
+
+
+def test_clean_manifest_targets_tier_limit_enforced(tmp_vps, monkeypatch):
+    """Manifest targets above the configured tier_limit are skipped."""
+    import genie as g
+
+    old = tmp_vps / "old.txt"
+    old.write_text("delete me")
+    old_mtime = time.time() - 60 * 86400
+    os.utime(old, (old_mtime, old_mtime))
+
+    targets = {
+        "t3_target": {"source": "filesystem_md", "tier": 3, "path": str(old),
+                      "max_age_days": 7, "action": "delete"},
+    }
+
+    # Tier limit 2 → tier-3 manifest target is skipped, not deleted.
+    skipped = g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 2})
+    assert old.exists(), "Tier-3 target must not be deleted when limit is 2"
+    assert any(r.get("action") == "manifest:t3_target" and "skipped" in r for r in skipped)
+
+    # Tier limit 3 → target executes.
+    old.write_text("delete me")
+    os.utime(old, (old_mtime, old_mtime))
+    executed = g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 3})
+    assert not old.exists(), "Tier-3 target must be deleted when limit is 3"
+    assert any(r.get("action") == "manifest:t3_target" and r.get("deleted", 0) >= 1 for r in executed)
+
+
+def test_clean_manifest_targets_requires_confirmation(tmp_vps, monkeypatch):
+    """Manifest entries with requires_confirmation are skipped unless confirmed=True."""
+    import genie as g
+
+    old = tmp_vps / "old.txt"
+    old.write_text("delete me")
+    old_mtime = time.time() - 60 * 86400
+    os.utime(old, (old_mtime, old_mtime))
+
+    targets = {
+        "conf_target": {"source": "filesystem_md", "tier": 1, "path": str(old),
+                        "max_age_days": 7, "action": "delete",
+                        "requires_confirmation": True},
+    }
+
+    # Not confirmed → skipped, file preserved.
+    skipped = g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 3})
+    assert old.exists(), "requires_confirmation target must not be deleted without consent"
+    assert any(r.get("action") == "manifest:conf_target" and r.get("skipped") == "requires_confirmation" for r in skipped)
+
+    # Confirmed → executes.
+    old.write_text("delete me")
+    os.utime(old, (old_mtime, old_mtime))
+    executed = g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 3, "confirmed": True})
+    assert not old.exists()
+    assert any(r.get("action") == "manifest:conf_target" and r.get("deleted", 0) >= 1 for r in executed)
+
+
+def test_clean_manifest_targets_never_touch_safety(tmp_vps, monkeypatch):
+    """Manifest targets pointing at never-touch paths are skipped."""
+    import genie as g
+
+    # state.db is in NEVER_TOUCH.
+    targets = {
+        "evil": {"source": "filesystem_md", "tier": 1, "path": "/root/.hermes/state.db",
+                 "max_age_days": 7, "action": "delete"},
+    }
+
+    results = g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 3})
+    assert any(r.get("action") == "manifest:evil" and r.get("skipped") == "path in never_touch" for r in results)
+
+
+def test_clean_manifest_targets_action_semantics(tmp_vps, monkeypatch):
+    """Different manifest actions produce different outcomes: compress vs delete."""
+    import genie as g
+
+    # compress action should gzip (file exists as .gz, original removed)
+    compress_dir = tmp_vps / "compress_me"
+    compress_dir.mkdir()
+    old_file = compress_dir / "old.log"
+    old_file.write_text("some log content " * 100)
+    old_mtime = time.time() - 30 * 86400
+    os.utime(old_file, (old_mtime, old_mtime))
+
+    targets = {
+        "c_target": {"source": "filesystem_md", "tier": 1, "path": str(compress_dir),
+                     "max_age_days": 7, "action": "compress"},
+    }
+
+    g.clean_manifest_targets(targets, {"dry_run": False, "tier_limit": 3})
+    assert not old_file.exists(), "compress should remove original"
+    assert (compress_dir / "old.log.gz").exists(), "compress should create .gz"
+
+    # delete action should remove the file entirely
+    delete_dir = tmp_vps / "delete_me"
+    delete_dir.mkdir()
+    del_file = delete_dir / "to_delete.txt"
+    del_file.write_text("bye")
+    os.utime(del_file, (old_mtime, old_mtime))
+
+    targets2 = {
+        "d_target": {"source": "filesystem_md", "tier": 1, "path": str(del_file),
+                     "max_age_days": 7, "action": "delete"},
+    }
+
+    g.clean_manifest_targets(targets2, {"dry_run": False, "tier_limit": 3})
+    assert not del_file.exists(), "delete should remove the file"
 
 
 def test_skill_frontmatter():
