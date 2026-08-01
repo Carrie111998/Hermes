@@ -846,6 +846,8 @@ def test_latched_completed_v3_builder_promotes_without_a_live_process(
         "Id": unit,
         "ActiveState": "active",
         "SubState": "exited",
+        "ExecMainPID": "526717",
+        "ExecMainCode": "1",
         "ControlGroup": f"/system.slice/{unit}",
     }
 
@@ -858,6 +860,8 @@ def test_latched_completed_v3_builder_promotes_without_a_live_process(
     )["process_free_evidence"]
     assert evidence["initial"]["systemd_state"]["active"] == "active"
     assert evidence["final"]["systemd_state"]["sub"] == "exited"
+    assert evidence["initial"]["systemd_state"]["exec_main_pid"] == 526717
+    assert evidence["final"]["systemd_state"]["exec_main_code"] == "1"
 
 
 def test_root_input_change_after_staging_blocks_publication(

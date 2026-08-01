@@ -1254,6 +1254,10 @@ _SYSTEMD_EVIDENCE_FIELDS = frozenset({
     "ControlGroup",
 })
 
+_LATCHED_BUILDER_UNIT = re.compile(
+    r"muncho-release-builder-v3@[0-9a-f]{40}\.service"
+)
+
 
 def _normalized_systemd_properties(
     value: Mapping[str, Any],
@@ -1283,17 +1287,34 @@ def _normalized_systemd_properties(
         normalized["ActiveState"],
         normalized["SubState"],
     )
+    latched = _LATCHED_BUILDER_UNIT.fullmatch(expected_unit) is not None
+    exec_main_pid = normalized["ExecMainPID"]
+    if latched:
+        historical_exec_main_pid = (
+            int(exec_main_pid, 10)
+            if re.fullmatch(r"[1-9][0-9]{0,6}", exec_main_pid) is not None
+            else 0
+        )
+        execution_evidence_valid = (
+            completion_state == ("active", "exited")
+            and historical_exec_main_pid > 1
+            and historical_exec_main_pid <= 4_194_304
+            and normalized["ExecMainCode"] == "1"
+        )
+    else:
+        execution_evidence_valid = (
+            completion_state == ("inactive", "dead")
+            and exec_main_pid == "0"
+            and normalized["ExecMainCode"] == "exited"
+        )
     if (
         normalized["Id"] != expected_unit
         or normalized["FragmentPath"] != str(expected_fragment)
         or normalized["DropInPaths"] != ""
         or normalized["LoadState"] != "loaded"
-        or completion_state
-        not in {("inactive", "dead"), ("active", "exited")}
+        or not execution_evidence_valid
         or normalized["MainPID"] != "0"
-        or normalized["ExecMainPID"] != "0"
         or normalized["Result"] != "success"
-        or normalized["ExecMainCode"] != "exited"
         or normalized["ExecMainStatus"] != "0"
         or _INVOCATION_ID.fullmatch(normalized["InvocationID"]) is None
         or normalized["ControlGroup"] not in {"", expected_control_group}
@@ -1694,7 +1715,7 @@ def validate_process_free_evidence(
             "sub": normalized["SubState"],
             "result": normalized["Result"],
             "main_pid": 0,
-            "exec_main_pid": 0,
+            "exec_main_pid": int(normalized["ExecMainPID"], 10),
             "exec_main_code": normalized["ExecMainCode"],
             "exec_main_status": 0,
         },
@@ -1748,27 +1769,36 @@ def validate_process_free_evidence_record(
     unsigned = {name: item for name, item in value.items() if name != "evidence_sha256"}
     state = value.get("systemd_state")
     inspected = value.get("inspected_cgroups")
-    allowed_states = (
-        {
-            "load": "loaded",
-            "active": "inactive",
-            "sub": "dead",
-            "result": "success",
-            "main_pid": 0,
-            "exec_main_pid": 0,
-            "exec_main_code": "exited",
-            "exec_main_status": 0,
-        },
-        {
-            "load": "loaded",
-            "active": "active",
-            "sub": "exited",
-            "result": "success",
-            "main_pid": 0,
-            "exec_main_pid": 0,
-            "exec_main_code": "exited",
-            "exec_main_status": 0,
-        },
+    legacy_state = {
+        "load": "loaded",
+        "active": "inactive",
+        "sub": "dead",
+        "result": "success",
+        "main_pid": 0,
+        "exec_main_pid": 0,
+        "exec_main_code": "exited",
+        "exec_main_status": 0,
+    }
+    latched_unit = (
+        _LATCHED_BUILDER_UNIT.fullmatch(str(value.get("unit"))) is not None
+    )
+    latched_state_valid = (
+        latched_unit
+        and isinstance(state, Mapping)
+        and state.get("load") == "loaded"
+        and state.get("active") == "active"
+        and state.get("sub") == "exited"
+        and state.get("result") == "success"
+        and state.get("main_pid") == 0
+        and type(state.get("exec_main_pid")) is int
+        and state["exec_main_pid"] > 1
+        and state["exec_main_pid"] <= 4_194_304
+        and state.get("exec_main_code") == "1"
+        and state.get("exec_main_status") == 0
+        and set(state) == set(legacy_state)
+    )
+    systemd_state_valid = (
+        latched_state_valid if latched_unit else state == legacy_state
     )
     if (
         value.get("schema") != PROCESS_FREE_EVIDENCE_SCHEMA
@@ -1790,7 +1820,7 @@ def validate_process_free_evidence_record(
         or value.get("secret_material_recorded") is not False
         or value.get("secret_digest_recorded") is not False
         or not isinstance(state, Mapping)
-        or state not in allowed_states
+        or not systemd_state_valid
         or _SHA256.fullmatch(str(value.get("evidence_sha256"))) is None
         or value.get("evidence_sha256") != _sha256_bytes(_canonical(unsigned))
     ):

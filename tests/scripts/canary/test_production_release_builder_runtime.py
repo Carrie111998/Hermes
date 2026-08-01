@@ -205,6 +205,8 @@ def test_process_free_evidence_accepts_latched_completed_builder_unit(
         "Id": unit,
         "ActiveState": "active",
         "SubState": "exited",
+        "ExecMainPID": "526717",
+        "ExecMainCode": "1",
     }
 
     evidence = runtime.validate_process_free_evidence(
@@ -226,11 +228,71 @@ def test_process_free_evidence_accepts_latched_completed_builder_unit(
 
     assert evidence["systemd_state"]["active"] == "active"
     assert evidence["systemd_state"]["sub"] == "exited"
+    assert evidence["systemd_state"]["exec_main_pid"] == 526717
+    assert evidence["systemd_state"]["exec_main_code"] == "1"
     assert runtime.validate_process_free_evidence_record(
         evidence,
         builder_uid=BUILDER_UID,
         builder_gid=BUILDER_GID,
     ) == evidence
+
+
+@pytest.mark.parametrize(
+    ("exec_main_pid", "exec_main_code"),
+    (
+        ("0", "1"),
+        ("0526717", "1"),
+        ("4194305", "1"),
+        ("526717", "exited"),
+        ("not-a-pid", "1"),
+    ),
+)
+def test_latched_completed_builder_rejects_non_systemd_wait_evidence(
+    tmp_path: Path,
+    exec_main_pid: str,
+    exec_main_code: str,
+) -> None:
+    fragment = tmp_path / "muncho-release-builder-v3@.service"
+    fragment.write_bytes(b"[Service]\nType=oneshot\nRemainAfterExit=yes\n")
+    fragment.chmod(0o444)
+    wrapper = tmp_path / "muncho-release-foundation-exec-v3"
+    wrapper.write_bytes(b"#!/bin/sh\nexit 0\n")
+    wrapper.chmod(0o555)
+    cgroup_root = tmp_path / "cgroup"
+    (cgroup_root / "system.slice").mkdir(parents=True)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    unit = "muncho-release-builder-v3@" + "a" * 40 + ".service"
+    control_group = f"/system.slice/{unit}"
+    properties = {
+        **_systemd_properties(fragment, cgroup=control_group),
+        "Id": unit,
+        "ActiveState": "active",
+        "SubState": "exited",
+        "ExecMainPID": exec_main_pid,
+        "ExecMainCode": exec_main_code,
+    }
+
+    with pytest.raises(
+        runtime.ProductionReleaseBuilderError,
+        match="systemd_evidence_invalid",
+    ):
+        runtime.validate_process_free_evidence(
+            properties,
+            expected_unit=unit,
+            expected_fragment=fragment,
+            expected_fragment_sha256=_sha256(fragment),
+            expected_wrapper=wrapper,
+            expected_wrapper_sha256=_sha256(wrapper),
+            expected_control_group=control_group,
+            builder_uid=BUILDER_UID,
+            builder_gid=BUILDER_GID,
+            cgroup_root=cgroup_root,
+            proc_root=proc_root,
+            authority_uid=os.geteuid(),
+            authority_gid=_gid(fragment),
+            xattr_reader=_empty_xattrs,
+        )
 
 
 def test_parse_and_materialize_exact_git_tree(tmp_path: Path) -> None:
@@ -860,7 +922,7 @@ def test_process_evidence_set_binds_both_canonical_observations(
     )
     with pytest.raises(
         runtime.ProductionReleaseBuilderError,
-        match="process_evidence_changed",
+        match="process_evidence_invalid",
     ):
         runtime.build_process_free_evidence_set(
             evidence["initial"],
