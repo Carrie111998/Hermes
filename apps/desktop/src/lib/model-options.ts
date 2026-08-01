@@ -1,5 +1,18 @@
+import { useQuery } from '@tanstack/react-query'
+import { useMemo } from 'react'
+
 import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse } from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
+
+const MODEL_OPTIONS_CACHE_KEY = 'hermes.desktop.model-options.v1'
+const MODEL_OPTIONS_CACHE_LIMIT = 12
+
+export interface CachedModelOptions {
+  data: ModelOptionsResponse
+  updatedAt: number
+}
+
+type ModelOptionsCache = Record<string, CachedModelOptions>
 
 /**
  * True only when a persisted **manual** composer pick has been removed from the
@@ -48,6 +61,111 @@ export function modelOptionsQueryKey(profile: null | string | undefined, session
   const profileKey = (profile ?? '').trim() || 'default'
 
   return ['model-options', profileKey, sessionId || 'global'] as const
+}
+
+function modelOptionsCacheEntryKey(profile: null | string | undefined, sessionId?: null | string): string {
+  const profileKey = (profile ?? '').trim() || 'default'
+
+  return `${profileKey}:${sessionId || 'global'}`
+}
+
+/**
+ * Read the last successful catalog from the renderer's local cache. This is a
+ * display cache only: React Query still revalidates stale entries in the
+ * background, and no credentials are stored here.
+ *
+ * `model.options` is session-aware (a spawned agent owns the live
+ * provider/model/base_url), so the lookup is keyed by session: a concrete
+ * session id only ever reads its own catalog. The profile-global fallback is
+ * used exclusively for fresh sessions (no session id yet), so a cold new-chat
+ * open can paint immediately from the profile's latest catalog.
+ */
+export function readModelOptionsCache(
+  profile: null | string | undefined,
+  sessionId?: null | string
+): CachedModelOptions | undefined {
+  try {
+    const raw = localStorage.getItem(MODEL_OPTIONS_CACHE_KEY)
+
+    if (!raw) {
+      return undefined
+    }
+
+    const cache = JSON.parse(raw) as ModelOptionsCache
+
+    const entry = sessionId
+      ? cache[modelOptionsCacheEntryKey(profile, sessionId)]
+      : cache[modelOptionsCacheEntryKey(profile)]
+
+    if (!entry || !Array.isArray(entry.data?.providers) || !Number.isFinite(entry.updatedAt)) {
+      return undefined
+    }
+
+    return entry
+  } catch {
+    return undefined
+  }
+}
+
+/** Persist a successful catalog so a cold picker open can render immediately. */
+export function writeModelOptionsCache(
+  profile: null | string | undefined,
+  sessionId: null | string | undefined,
+  data: ModelOptionsResponse
+): void {
+  try {
+    const raw = localStorage.getItem(MODEL_OPTIONS_CACHE_KEY)
+    const cache: ModelOptionsCache = raw ? (JSON.parse(raw) as ModelOptionsCache) : {}
+    const key = modelOptionsCacheEntryKey(profile, sessionId)
+    cache[key] = { data, updatedAt: Date.now() }
+
+    const recent = Object.entries(cache)
+      .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
+      .slice(0, MODEL_OPTIONS_CACHE_LIMIT)
+
+    localStorage.setItem(MODEL_OPTIONS_CACHE_KEY, JSON.stringify(Object.fromEntries(recent)))
+  } catch {
+    // localStorage can be unavailable or full; the in-memory React Query cache
+    // remains the authoritative short-lived fallback.
+  }
+}
+
+interface ModelOptionsQueryArgs {
+  profile: null | string | undefined
+  sessionId?: null | string
+  gateway?: HermesGateway | null
+  enabled?: boolean
+}
+
+/**
+ * Single cache-aware catalog query for every Desktop consumer. Hydrates from
+ * the local cache on first paint (session-scoped; profile-global only for
+ * fresh sessions), then revalidates through the gateway in the background and
+ * persists the fresh catalog back to the cache.
+ */
+export function useModelOptionsQuery({
+  profile,
+  sessionId,
+  gateway,
+  enabled = true
+}: ModelOptionsQueryArgs) {
+  const cachedModelOptions = useMemo(
+    () => readModelOptionsCache(profile, sessionId),
+    [profile, sessionId]
+  )
+
+  return useQuery({
+    queryKey: modelOptionsQueryKey(profile, sessionId),
+    queryFn: async (): Promise<ModelOptionsResponse> => {
+      const next = await requestModelOptions({ gateway: gateway || undefined, sessionId })
+      writeModelOptionsCache(profile, sessionId, next)
+
+      return next
+    },
+    enabled,
+    initialData: cachedModelOptions?.data,
+    initialDataUpdatedAt: cachedModelOptions?.updatedAt
+  })
 }
 
 export function requestModelOptions({

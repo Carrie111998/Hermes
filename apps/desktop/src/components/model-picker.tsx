@@ -1,8 +1,7 @@
-import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { useModelOptionsQuery } from '@/lib/model-options'
 import { modelSearchText } from '@/lib/model-search-text'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
@@ -57,9 +56,10 @@ export function ModelPickerDialog({
   // the `hermes model` CLI picker, which shows the curated list verbatim.
   const [search, setSearch] = useState('')
 
-  const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
-    queryFn: () => requestModelOptions({ gateway: gw, sessionId }),
+  const modelOptions = useModelOptionsQuery({
+    profile,
+    sessionId,
+    gateway: gw,
     enabled: open
   })
 

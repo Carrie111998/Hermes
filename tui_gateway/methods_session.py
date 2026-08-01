@@ -53,6 +53,7 @@ def _(rid, params: dict) -> dict:
         if create_model
         else None
     )
+    startup_model, startup_provider = _config_model_target()
     create_reasoning_override = None
     if effort := str(params.get("reasoning_effort") or "").strip():
         try:
@@ -139,12 +140,12 @@ def _(rid, params: dict) -> dict:
                 "model": (
                     session_model_override.get("model")
                     if session_model_override
-                    else _resolve_model()
+                    else startup_model or _resolve_model()
                 ),
                 **(
                     {"provider": session_model_override["provider"]}
                     if session_model_override and session_model_override.get("provider")
-                    else {}
+                    else ({"provider": startup_provider} if startup_provider else {})
                 ),
                 "tools": {},
                 "skills": {},

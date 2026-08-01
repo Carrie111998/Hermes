@@ -1101,6 +1101,24 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+def test_session_create_immediately_reports_configured_provider(monkeypatch):
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("gpt-5.6-terra", "novacode"))
+    monkeypatch.setattr(server, "_resolve_model", lambda: "gpt-5.6-terra")
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.create", "params": {"cols": 80}}
+    )
+    assert isinstance(resp, dict)
+    result = resp.get("result")
+    assert isinstance(result, dict)
+    sid = result["session_id"]
+    try:
+        assert result["info"]["model"] == "gpt-5.6-terra"
+        assert result["info"]["provider"] == "novacode"
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_system_battery_returns_reading(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
@@ -3470,6 +3488,64 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     assert agent.model == "gpt-5.5"
     assert captured["fallback_model"] == fallback_chain
     assert captured["platform"] == "tui"
+
+
+def test_make_agent_preserves_named_custom_requested_provider(monkeypatch):
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(model=kwargs.get("model"))
+
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"model": {"default": "gpt-5.6-sol", "provider": "novacode"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None, target_model=None: {
+            "provider": "custom",
+            "requested_provider": "novacode",
+            "base_url": "https://novacode.example/v1",
+            "api_key": "token",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server._make_agent("sid", "session-key")
+
+    assert captured["provider"] == "custom"
+    assert captured["requested_provider"] == "novacode"
+
+
+def test_background_agent_kwargs_preserves_named_custom_requested_provider(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.6-sol",
+        provider="custom",
+        requested_provider="novacode",
+        base_url="https://novacode.example/v1",
+        api_key="token",
+        api_mode="chat_completions",
+        _fallback_chain=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+
+    assert kwargs["provider"] == "custom"
+    assert kwargs["requested_provider"] == "novacode"
 
 
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
@@ -7050,6 +7126,40 @@ def test_restore_agent_model_runtime_falls_back_to_switch_model():
     assert agent.base_url == "https://openrouter.ai/api/v1"
 
 
+def test_restore_agent_model_runtime_preserves_named_custom_requested_provider():
+    class Agent:
+        model = "temp/model"
+        provider = "anthropic"
+        requested_provider = "anthropic"
+        base_url = "https://api.anthropic.com"
+        api_key = "sk-temp"
+        api_mode = "anthropic_messages"
+
+        def switch_model(self, **kwargs):
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+            self.api_key = kwargs["api_key"]
+            self.base_url = kwargs["base_url"]
+            self.api_mode = kwargs["api_mode"]
+
+    agent = Agent()
+
+    server._restore_agent_model_runtime(
+        agent,
+        {
+            "model": "old/model",
+            "provider": "custom",
+            "requested_provider": "novacode",
+            "api_key": "sk-old",
+            "base_url": "https://novacode.example/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    assert agent.provider == "custom"
+    assert agent.requested_provider == "novacode"
+
+
 def test_config_set_personality_rejects_unknown_name(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -8537,6 +8647,24 @@ def test_session_info_includes_mcp_servers(monkeypatch):
 
     assert info["provider"] == "openai-codex"
     assert info["mcp_servers"] == fake_status
+
+
+def test_session_info_prefers_named_custom_provider_identity(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.canonical_custom_identity",
+        lambda **_kwargs: "custom:novacode",
+    )
+    agent = types.SimpleNamespace(
+        tools=[],
+        model="gpt-5.6-sol",
+        provider="custom",
+        requested_provider="novacode",
+        base_url="https://novacode.example/v1",
+    )
+
+    info = server._session_info(agent)
+
+    assert info["provider"] == "novacode"
 
 
 def test_session_info_includes_session_title(monkeypatch):
@@ -11333,6 +11461,31 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         config_provider="custom:local-ollama",
         model="qwen3.6:35b-65k",
     )
+
+
+def test_model_picker_context_prefers_named_custom_provider_slug(monkeypatch):
+    from hermes_cli.inventory import ConfigContext
+
+    agent = types.SimpleNamespace(
+        provider="custom",
+        requested_provider="novacode",
+        model="gpt-5.6-sol",
+        base_url="https://novacode.example/v1",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: ConfigContext(
+            current_provider="novacode",
+            current_model="gpt-5.6-sol",
+            current_base_url="https://novacode.example/v1",
+            user_providers={"novacode": {}},
+            custom_providers=[],
+        ),
+    )
+
+    ctx = server._model_picker_context(agent)
+
+    assert ctx.current_provider == "novacode"
 
 
 def test_model_save_key_uses_credential_lifecycle_and_picker_context(monkeypatch):

@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
@@ -21,7 +21,12 @@ import { usePointerQuiet } from '@/components/ui/keyboard-first'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import {
+  modelOptionsQueryKey,
+  requestModelOptions,
+  useModelOptionsQuery,
+  writeModelOptionsCache
+} from '@/lib/model-options'
 import { currentPickerSelection, displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
@@ -87,12 +92,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const visibleModels = useStore($visibleModels)
   const collapsedProviders = useStore($collapsedProviders)
 
-  const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, activeSessionId),
+  const modelOptions = useModelOptionsQuery({
+    profile,
+    sessionId: activeSessionId,
     // Gateway-first even with no session yet: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers like `moa`
     // that the local REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, sessionId: activeSessionId })
+    gateway
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
@@ -152,6 +158,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
       const next = await requestModelOptions({ gateway, refresh: true, sessionId: activeSessionId })
 
+      writeModelOptionsCache(profile, activeSessionId, next)
       queryClient.setQueryData<ModelOptionsResponse>(queryKey, next)
     } catch {
       // Network/backend hiccup — fall back to a plain invalidate so the next

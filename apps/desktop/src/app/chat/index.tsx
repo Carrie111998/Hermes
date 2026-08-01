@@ -1,6 +1,5 @@
 import { type AppendMessage, AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { useQuery } from '@tanstack/react-query'
 import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
 import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
@@ -21,7 +20,7 @@ import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { useModelOptionsQuery } from '@/lib/model-options'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
@@ -43,7 +42,6 @@ import {
   shouldMigrateComposerScope
 } from '@/store/session'
 import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
-import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
@@ -396,9 +394,10 @@ export function ChatView({
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
-  const modelOptionsQuery = useQuery<ModelOptionsResponse>({
-    queryKey: modelOptionsQueryKey(activeGatewayProfile, activeSessionId),
-    queryFn: () => requestModelOptions({ gateway: gateway || undefined, sessionId: activeSessionId }),
+  const modelOptionsQuery = useModelOptionsQuery({
+    profile: activeGatewayProfile,
+    sessionId: activeSessionId,
+    gateway: gateway || undefined,
     enabled: gatewayOpen
   })
 

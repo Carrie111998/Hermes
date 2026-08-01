@@ -4132,6 +4132,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     return {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
+        "requested_provider": getattr(agent, "requested_provider", ""),
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
@@ -4161,6 +4162,9 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+        requested_provider = str(snapshot.get("requested_provider") or "").strip()
+        if requested_provider:
+            agent.requested_provider = requested_provider
 
 
 def _apply_model_switch(
@@ -4826,6 +4830,49 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 
+def _provider_identity_for_ui(
+    agent,
+    *,
+    provider: str = "",
+    model: str = "",
+    base_url: str = "",
+    config_provider: str = "",
+) -> str:
+    """Return a user-facing provider identity, not a wire/billing class."""
+    resolved = str(provider or getattr(agent, "provider", "") or "").strip().lower()
+    if resolved != "custom":
+        return resolved
+
+    requested = str(getattr(agent, "requested_provider", "") or "").strip().lower()
+    if requested not in {"", "auto", "custom", "openrouter"}:
+        return requested
+
+    try:
+        from hermes_cli.runtime_provider import canonical_custom_identity
+
+        recovered = canonical_custom_identity(
+            base_url=base_url or getattr(agent, "base_url", "") or None,
+            config_provider=config_provider or None,
+            model=model or getattr(agent, "model", "") or None,
+        )
+        if not recovered:
+            return resolved
+        recovered = str(recovered).strip().lower()
+        if recovered.startswith("custom:"):
+            provider_slug = recovered.split(":", 1)[1]
+            try:
+                from hermes_cli.inventory import load_picker_context
+
+                if provider_slug in load_picker_context().user_providers:
+                    return provider_slug
+            except Exception:
+                pass
+        return recovered
+    except Exception:
+        logger.debug("custom provider identity recovery failed (UI)", exc_info=True)
+        return resolved
+
+
 def _project_info_for_cwd(cwd: str) -> dict | None:
     """Return the first-class Project owning ``cwd`` for UI status surfaces.
 
@@ -4880,6 +4927,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
         else:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    model = mirror.get("model", getattr(agent, "model", ""))
+    provider = mirror.get("provider", getattr(agent, "provider", ""))
+    provider = _provider_identity_for_ui(
+        agent,
+        provider=provider,
+        model=model,
+        base_url=mirror.get("base_url", getattr(agent, "base_url", "")),
+    )
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -4906,10 +4961,16 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    model = pending_model or mirror.get("model", getattr(agent, "model", ""))
+    provider = pending_provider or _provider_identity_for_ui(
+        agent,
+        provider=mirror.get("provider", getattr(agent, "provider", "")),
+        model=model,
+        base_url=mirror.get("base_url", getattr(agent, "base_url", "")),
+    )
     info: dict = {
-        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
-        "provider": pending_provider
-        or mirror.get("provider", getattr(agent, "provider", "")),
+        "model": model,
+        "provider": provider,
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -5794,6 +5855,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
+        "requested_provider": getattr(agent, "requested_provider", None) or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
@@ -6273,6 +6335,9 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=str(
+            runtime.get("requested_provider") or requested_provider or ""
+        ),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
@@ -11969,23 +12034,13 @@ def _model_picker_context(agent):
     provider = getattr(agent, "provider", "") if agent else ""
     base_url = getattr(agent, "base_url", "") if agent else ""
     if str(provider or "").strip().lower() == "custom":
-        try:
-            from hermes_cli.runtime_provider import canonical_custom_identity
-
-            provider = (
-                canonical_custom_identity(
-                    base_url=base_url or None,
-                    config_provider=ctx.current_provider,
-                    model=(getattr(agent, "model", "") if agent else "")
-                    or None,
-                )
-                or provider
-            )
-        except Exception:
-            logger.debug(
-                "custom provider identity recovery failed (model picker)",
-                exc_info=True,
-            )
+        provider = _provider_identity_for_ui(
+            agent,
+            provider=provider,
+            base_url=base_url,
+            config_provider=ctx.current_provider,
+            model=(getattr(agent, "model", "") if agent else ""),
+        )
 
     return ctx.with_overrides(
         current_provider=provider,
