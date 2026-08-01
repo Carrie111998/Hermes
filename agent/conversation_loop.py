@@ -4335,13 +4335,18 @@ def run_conversation(
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
                 # Z.AI backoff below. Detect the overload directly so its
-                # long-backoff schedule runs, and raise the retry ceiling so the
-                # long tier (30/60/90/120s) is reachable. See
-                # zai_coding_overload_retry_ceiling() for the ceiling rationale.
+                # long-backoff schedule runs. Configuration/default instances
+                # retain the legacy ceiling extension that makes the long tier
+                # (30/60/90/120s) reachable, but a positive constructor override
+                # is a strict per-instance total-attempt ceiling. See
+                # zai_coding_overload_retry_ceiling() for the extension rationale.
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
-                if _is_zai_coding_overload:
+                if (
+                    _is_zai_coding_overload
+                    and not getattr(agent, "_api_max_retries_is_explicit", False)
+                ):
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited

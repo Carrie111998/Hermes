@@ -688,12 +688,14 @@ context:
 ```yaml
 agent:
   max_turns: 500               # 每次对话轮次的最大迭代次数（默认：500）
-  api_max_retries: 3           # 回退启动前每个 provider 的重试次数（默认：3）
+  api_max_retries: 3           # 回退前的 provider 基础尝试次数（默认：3；最小：1）
 ```
 
 当迭代预算完全耗尽时，CLI 向用户显示通知：`⚠ Iteration budget reached (500/500) — response may be incomplete`。
 
-`agent.api_max_retries` 控制 Hermes 在回退 provider 切换启动**之前**对瞬时错误（速率限制、连接断开、5xx）重试 provider API 调用的次数。默认为 `3` —— 总共四次尝试。如果您配置了[回退 providers](/user-guide/features/fallback-providers) 并希望更快地故障转移，请将其降至 `0`，这样主 provider 上的第一个瞬时错误会立即切换到回退，而不是对不稳定的端点进行重试。
+`agent.api_max_retries` 是进入瞬时错误重试路径（例如连接断开和 5xx 响应）的 API 调用在耗尽处理前的应用层 provider 基础总尝试次数。在普通路径中，默认值 `3` 表示最多进行三次应用层 provider 尝试，而不是四次。有效最小值为 `1`：低于 `1` 的配置值（包括 `0`）会被提高到 `1`，因此 `0` 不会在进行一次 provider 尝试之前立即触发回退。
+
+仅对 Z.AI Coding Plan GLM-5.2 过载策略（HTTP 429 且错误码为 1305，或匹配的临时过载消息），当 Hermes 使用配置/默认路径时，可能扩展该尝试预算，以保证其自适应退避调度可达。显式传入的正整数 `AIAgent(api_max_retries=N)` 构造参数不同：它是该实例严格的 provider 总尝试上限，provider 特定的重试策略不能提高此上限。在适用的尝试预算耗尽后，现有回退行为保持不变。
 
 ### API 超时
 

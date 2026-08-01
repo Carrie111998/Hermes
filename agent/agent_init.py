@@ -530,9 +530,10 @@ def init_agent(
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
-        api_max_retries (int | None): Per-instance total provider-attempt
-            ceiling. None uses agent.api_max_retries from config or the legacy
-            default of 3.
+        api_max_retries (int | None): A positive explicit value is a strict
+            per-instance total provider-attempt ceiling. None uses
+            agent.api_max_retries from config or the legacy default of 3,
+            including existing provider-specific retry policies.
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
@@ -1814,7 +1815,8 @@ def init_agent(
     # App-level API attempt count (wraps each model API call). An explicit
     # constructor value is instance-local and takes precedence without
     # mutating shared config. None preserves the existing config/default path.
-    if api_max_retries is not None:
+    agent._api_max_retries_is_explicit = api_max_retries is not None
+    if agent._api_max_retries_is_explicit:
         agent._api_max_retries = api_max_retries
     else:
         try:

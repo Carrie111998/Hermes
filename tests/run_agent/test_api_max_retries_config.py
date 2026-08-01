@@ -61,8 +61,52 @@ def _run_retryable_failure(api_max_retries):
     return agent.client.chat.completions.create.call_count
 
 
+def _zai_overload_error():
+    error = Exception(
+        "The service may be temporarily overloaded, please try again later"
+    )
+    error.status_code = 429
+    error.body = {
+        "error": {
+            "code": "1305",
+            "message": "The service may be temporarily overloaded, please try again later",
+        }
+    }
+    return error
+
+
+def _run_zai_overload_failure(
+    *, api_max_retries=_UNSET, config_api_max_retries=_UNSET
+):
+    agent = _make_agent(
+        api_max_retries=api_max_retries,
+        config_api_max_retries=config_api_max_retries,
+    )
+    agent.base_url = "https://api.z.ai/api/coding/paas/v4"
+    agent.model = "glm-5.2"
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = _zai_overload_error()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+
+    with patch.object(agent, "_persist_session"), \
+         patch.object(agent, "_save_trajectory"), \
+         patch.object(agent, "_cleanup_task_resources"), \
+         patch.object(agent, "_try_recover_primary_transport", return_value=False), \
+         patch(
+             "agent.conversation_loop.adaptive_rate_limit_backoff",
+             return_value=(0.0, "zai_coding_overload_short"),
+         ) as adaptive_backoff:
+        result = agent.run_conversation("hello")
+
+    assert result["failed"] is True
+    return agent.client.chat.completions.create.call_count, adaptive_backoff.call_count
+
+
 def test_default_api_max_retries_is_three():
-    """No config override → legacy default of 3 retries preserved."""
+    """No config override → legacy base of three total attempts preserved."""
     agent = _make_agent()
     assert agent._api_max_retries == 3
 
@@ -127,6 +171,35 @@ def test_explicit_two_is_two_total_provider_attempts():
     assert _run_retryable_failure(2) == 2
 
 
+@pytest.mark.parametrize(("api_max_retries", "expected_calls"), [(1, 1), (2, 2)])
+def test_explicit_api_max_retries_is_strict_for_zai_overload(
+    api_max_retries, expected_calls
+):
+    provider_calls, backoff_calls = _run_zai_overload_failure(
+        api_max_retries=api_max_retries
+    )
+
+    assert provider_calls == expected_calls
+    assert backoff_calls == expected_calls - 1
+
+
+@pytest.mark.parametrize(
+    "api_max_retries",
+    [pytest.param(_UNSET, id="omitted"), pytest.param(None, id="none")],
+)
+def test_config_path_preserves_zai_overload_ceiling_extension(api_max_retries):
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+    provider_calls, backoff_calls = _run_zai_overload_failure(
+        api_max_retries=api_max_retries,
+        config_api_max_retries=1,
+    )
+    expected_ceiling = zai_coding_overload_retry_ceiling()
+
+    assert provider_calls == expected_ceiling
+    assert backoff_calls == expected_ceiling - 1
+
+
 def test_non_retryable_failure_remains_single_attempt():
     agent = _make_agent(api_max_retries=2)
     agent.client = MagicMock()
@@ -157,5 +230,3 @@ def test_retry_override_is_isolated_between_instances_and_non_persistent():
     assert agent_one._api_max_retries == 1
     assert agent_two._api_max_retries == 2
     assert cfg == original
-
-

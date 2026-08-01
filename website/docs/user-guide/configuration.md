@@ -901,12 +901,14 @@ Instead, when the budget is actually exhausted (500/500), Hermes injects one mes
 ```yaml
 agent:
   max_turns: 500               # Max iterations per conversation turn (default: 500)
-  api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  api_max_retries: 3           # Base provider attempts before fallback (default: 3; minimum: 1)
 ```
 
 When the iteration budget is fully exhausted, the CLI shows a notification to the user: `⚠ Iteration budget reached (500/500) — response may be incomplete`.
 
-`agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
+`agent.api_max_retries` is the app-level base total provider-attempt count for calls that enter the transient retry path (for example, connection drops and 5xx responses) before exhaustion handling. On the normal path, the default `3` means up to three app-level provider attempts, not four. The effective minimum is `1`: configuration values below `1`, including `0`, are floored to `1`, so `0` does not cause immediate failover before a provider attempt.
+
+The narrow Z.AI Coding Plan GLM-5.2 overload policy (HTTP 429 with code 1305 or the matching temporary-overload message) may extend this attempt budget when Hermes is using the configuration/default path so its adaptive backoff schedule remains reachable. A positive `AIAgent(api_max_retries=N)` constructor value is different: it is a strict per-instance total provider-attempt ceiling that provider-specific retry policies cannot raise. Existing fallback behavior after the applicable attempt budget is exhausted remains unchanged.
 
 ## Verify-on-Stop (coding verification)
 
