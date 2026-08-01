@@ -266,7 +266,7 @@ def _print_manual_fix(
         )
         if part
     )
-    install_cmd = f"npm install -g {shlex.quote(f'npm@{npm_range}')}"
+    install_cmd = _manual_install_command(npm_range, windows=os.name == "nt")
     print(
         "\n✗ This Node/npm toolchain does not satisfy the project's engine requirements.\n"
         + (f"  Current toolchain: {current}\n" if current else "")
@@ -280,6 +280,14 @@ def _print_manual_fix(
         + "  Do not disable engine-strict; npm releases do not support every Node major.",
         file=sys.stderr,
     )
+
+
+def _manual_install_command(npm_range: str, *, windows: bool) -> str:
+    """Render the copy/paste remediation for the user's command shell."""
+    argv = ["npm", "install", "-g", f"npm@{npm_range}"]
+    if windows:
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
 
 
 def maybe_repair_npm_engine(

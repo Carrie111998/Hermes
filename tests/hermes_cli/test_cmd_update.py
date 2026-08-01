@@ -366,6 +366,43 @@ class TestCmdUpdateBranchFallback:
         assert "Already up to date!" not in out
         assert "Node.js dependency recovery is still incomplete" in out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_up_to_date_rerun_reports_node_failure_while_repairing_venv(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """Python repair must not mask an independently incomplete Node refresh."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(commit_count="0")
+        with patch.object(
+            hm, "_get_origin_url", return_value="https://github.com/NousResearch/hermes-agent.git"
+        ), patch.object(
+            update_cmd, "_update_node_dependencies", return_value=["repo root"]
+        ), patch.object(
+            update_cmd, "_npm_lockfile_changed", return_value=True
+        ), patch.object(
+            hm, "_build_web_ui"
+        ) as build_web, patch.object(
+            update_cmd,
+            "_venv_core_imports_healthy",
+            side_effect=[(False, "missing imports"), (True, "ok")],
+        ), patch(
+            "hermes_cli.managed_uv.ensure_uv", return_value="/managed/uv"
+        ), patch.object(
+            update_cmd, "venv_python_path", return_value=PROJECT_ROOT / "venv" / "python"
+        ), patch.object(
+            hm, "_install_python_dependencies_with_optional_fallback"
+        ):
+            cmd_update(mock_args)
+
+        build_web.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Dependencies repaired!" in out
+        assert "Already up to date!" not in out
+        assert "Node.js dependency recovery is still incomplete" in out
+
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
         with patch("shutil.which", return_value=None), patch(

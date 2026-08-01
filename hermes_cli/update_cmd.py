@@ -3913,12 +3913,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            elif node_failures or node_refresh_pending or web_refresh_pending:
+            if node_failures or node_refresh_pending or web_refresh_pending:
                 print(
                     "⚠ Checkout is current, but Node.js dependency recovery is still incomplete."
                 )
                 print("  Fix the npm error above and re-run `hermes update`.")
-            else:
+            elif healthy:
                 print("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
                 print()

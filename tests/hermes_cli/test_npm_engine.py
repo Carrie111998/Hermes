@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.npm_engine import (
+    _manual_install_command,
     actual_node_version,
     actual_npm_version,
     is_ebadengine,
@@ -91,6 +92,21 @@ class TestDetection:
             "npm error notsup Required: {not json}\n"
         )
         assert required_npm_range(broken) is None
+
+    @pytest.mark.parametrize(
+        ("windows", "expected"),
+        [
+            (False, "npm install -g 'npm@<11.10.0 || >=12.0.0'"),
+            (True, 'npm install -g "npm@<11.10.0 || >=12.0.0"'),
+        ],
+    )
+    def test_manual_install_command_quotes_range_for_target_shell(
+        self, windows, expected
+    ):
+        assert (
+            _manual_install_command("<11.10.0 || >=12.0.0", windows=windows)
+            == expected
+        )
 
 
 class TestManagedDetection:
