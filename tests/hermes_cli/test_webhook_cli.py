@@ -94,11 +94,16 @@ class TestRemove:
 
 class TestPersistence:
 
-    def test_corrupted_file(self):
+    def test_corrupted_file_refused(self):
+        """Malformed JSON must exit with an error, not silently return {}."""
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("broken{{{")
-        assert _load_subscriptions() == {}
+        original = "broken{{{"
+        path.write_text(original)
+        with pytest.raises(SystemExit):
+            _load_subscriptions()
+        # File must be left untouched
+        assert path.read_text() == original
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
     def test_save_creates_secret_file_owner_only_under_permissive_umask(self):
