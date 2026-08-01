@@ -3462,10 +3462,39 @@ def _normalize_managed_eol(git_cmd, repo_root):
     # -c, not config: evaluate the tree as it WOULD look pinned, without
     # persisting anything we might not be able to follow through on.
     probe = git_cmd + ["-c", "core.autocrlf=false"]
+    index_path = None
 
-    def _dirty(*extra):
+    def _force_content_scan():
+        # Git skips re-hashing any file whose on-disk stat matches the index's
+        # cached stat, assuming it unchanged. The checkout that renormalized this
+        # tree wrote that cache, so with core.autocrlf flipped the CRLF worktree
+        # still reads clean and the churn stays hidden -- only "racily clean"
+        # entries (mtime >= the index timestamp) are re-hashed, which is why a
+        # large tree enumerates partially and nondeterministically. Backdating
+        # the index timestamp makes every entry racily clean, forcing a content
+        # scan so the churn is seen in full. Best-effort: failure only degrades
+        # to the old racy behavior, never blocks the update.
+        nonlocal index_path
+        try:
+            if index_path is None:
+                resolved = subprocess.run(
+                    git_cmd + ["rev-parse", "--git-path", "index"],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                if resolved.returncode != 0:
+                    return
+                candidate = Path(resolved.stdout.strip())
+                index_path = candidate if candidate.is_absolute() else Path(repo_root) / candidate
+            os.utime(index_path, (1, 1))
+        except OSError:
+            pass
+
+    def _dirty(autocrlf="false"):
+        _force_content_scan()
         out = subprocess.run(
-            probe + ["diff", "-z", "--name-only", *extra],
+            git_cmd + ["-c", f"core.autocrlf={autocrlf}", "diff", "-z", "--name-only"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3475,7 +3504,13 @@ def _normalize_managed_eol(git_cmd, repo_root):
         return {p for p in out.stdout.split("\0") if p}
 
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
+        # autocrlf=false exposes every file the flip would touch (churn plus any
+        # real edits); autocrlf=true compares normalized content, so pure churn
+        # reads clean and only genuine edits remain. The difference is the
+        # churn-only set. --ignore-cr-at-eol cannot stand in for the second probe:
+        # git's --name-only still lists a file whose only change the flag ignores,
+        # so it would swallow the churn and leave nothing to clean.
+        all_dirty, real_dirty = _dirty("false"), _dirty("true")
         if all_dirty is None or real_dirty is None:
             return None
         return all_dirty - real_dirty

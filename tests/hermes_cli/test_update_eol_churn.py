@@ -13,6 +13,7 @@ the whole tree as modified. These tests pin down that coupling.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -62,7 +63,20 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
     return repo
 
 
+def _force_content_scan(repo: Path) -> None:
+    """Backdate the index so git re-hashes content instead of trusting its stat
+    cache (the same race ``_normalize_managed_eol`` works around). Without this the
+    oracle below reads a settled checkout clean and the assertions go
+    nondeterministic: a plain diff only re-hashes "racily clean" entries, so
+    leftover CRLF churn can be invisible and a broken repair would read clean."""
+    try:
+        os.utime(repo / ".git" / "index", (1, 1))
+    except OSError:
+        pass
+
+
 def _dirty(repo: Path) -> set[str]:
+    _force_content_scan(repo)
     out = subprocess.run(
         ["git", "-c", "core.autocrlf=false", "diff", "--name-only"],
         cwd=repo,
