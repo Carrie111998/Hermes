@@ -27,7 +27,11 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    windows_detach_popen_kwargs,
+    windows_detach_flags_without_breakaway,
+    windows_hide_flags,
+)
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
@@ -791,11 +795,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     raise
                 logger.info(
                     "[%s] windows_detach_popen_kwargs failed (WinError 5), "
-                    "falling back to CREATE_NO_WINDOW",
+                    "falling back to CREATE_NO_WINDOW (no breakaway)",
                     self.name,
                 )
                 extra_kwargs = (
-                    {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+                    # Reuse the repo's canonical daemon fallback: drop only the
+                    # CREATE_BREAKAWAY_FROM_JOB bit while preserving the child's
+                    # own process group (CREATE_NEW_PROCESS_GROUP), so the
+                    # long-lived bridge survives the parent and ignores parent
+                    # Ctrl+C. windows_hide_flags() would drop the process group
+                    # too — wrong semantic for a daemon (see
+                    # gateway_windows.py::_spawn_detached).
+                    {"creationflags": windows_detach_flags_without_breakaway()}
+                    if _IS_WINDOWS else {}
                 )
                 self._bridge_process = subprocess.Popen(
                     node_cmd,

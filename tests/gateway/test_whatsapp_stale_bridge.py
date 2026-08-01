@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
+from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
 
 
 class _AsyncCM:
@@ -258,8 +259,11 @@ class TestWindowsDetachFallback:
             await adapter.connect()
 
         assert len(calls) == 2, "fallback Popen should be attempted after WinError 5"
-        # Second (fallback) call must use CREATE_NO_WINDOW via creationflags
+        # Second (fallback) call must use the canonical daemon fallback flags
+        # (drop only BREAKAWAY, keep the process group) — NOT windows_hide_flags().
         assert "creationflags" in calls[1]
+        assert calls[1]["creationflags"] == windows_detach_flags_without_breakaway(), \
+            "fallback must reuse windows_detach_flags_without_breakaway(), not windows_hide_flags()"
 
     @pytest.mark.asyncio
     async def test_fallback_does_not_run_on_non_winerror5(self, tmp_path):
