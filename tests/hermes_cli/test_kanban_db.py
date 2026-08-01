@@ -13410,3 +13410,100 @@ def test_reconcile_merge_after_green_ON_merges_one_standalone_per_pass(kanban_ho
         capture_output=True, text=True,
     )
     assert ancestor.returncode == 0, "reconcile must carry the story into main when opted in"
+
+
+def _set_human_escalation_profile(board: str, profile: str) -> None:
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})["human_escalation_profile"] = profile
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+
+def test_block_task_uses_connection_board_for_omitted_escalation(
+    kanban_home, monkeypatch
+):
+    board_a = "block-connection-a"
+    board_b = "block-connection-b"
+    kb.ensure_product_board_defaults(board_a)
+    kb.ensure_product_board_defaults(board_b)
+    _set_human_escalation_profile(board_a, "resolver")
+    _set_human_escalation_profile(board_b, "wrong-profile")
+    kb.set_current_board(board_b)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board_a)))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="connection-board escalation",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, task_id, board=board_a)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a human decision",
+            kind="needs_input",
+            attempted_resolutions=["checked the documented alternatives"],
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, task_id)
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+
+    assert task.assignee == "resolver"
+    assert preflight.payload["hermes_assignee"] == "resolver"
+
+
+def test_human_cli_block_uses_connection_board_for_omitted_escalation(
+    kanban_home, monkeypatch, capsys
+):
+    board_a = "cli-connection-a"
+    board_b = "cli-connection-b"
+    kb.ensure_product_board_defaults(board_a)
+    kb.ensure_product_board_defaults(board_b)
+    _set_human_escalation_profile(board_a, "resolver")
+    _set_human_escalation_profile(board_b, "wrong-profile")
+    kb.set_current_board(board_b)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board_a)))
+
+    with kb.connect(board=board_a) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="CLI connection-board escalation",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, task_id, board=board_a)
+        assert claimed is not None
+
+    from hermes_cli import kanban
+
+    args = types.SimpleNamespace(
+        task_id=task_id,
+        ids=[],
+        reason=["Need", "a", "human", "decision"],
+        kind="needs_input",
+    )
+    assert kanban._cmd_block(args) == 0
+    capsys.readouterr()
+
+    with kb.connect(board=board_a) as conn:
+        task = kb.get_task(conn, task_id)
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+
+    assert task.assignee == "resolver"
+    assert preflight.payload["hermes_assignee"] == "resolver"

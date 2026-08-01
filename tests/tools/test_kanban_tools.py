@@ -2664,6 +2664,204 @@ def test_worker_product_complete_uses_db_connection_board_for_handoff(
     assert task.current_step_key == "architecture"
 
 
+
+def test_worker_block_uses_connection_board_for_omitted_escalation(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board_a = "tool-connection-a"
+    board_b = "tool-connection-b"
+    kb.ensure_product_board_defaults(board_a)
+    kb.ensure_product_board_defaults(board_b)
+    for board, profile in ((board_a, "resolver"), (board_b, "wrong-profile")):
+        metadata = kb.read_board_metadata(board)
+        metadata.setdefault("product_workflow", {})[
+            "human_escalation_profile"
+        ] = profile
+        kb.board_metadata_path(board).write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+    kb.set_current_board(board_b)
+
+    with kb.connect(board=board_a) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="structured connection-board escalation",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, task_id, board=board_a)
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board_a)))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_block({
+        "reason": "Need a human decision",
+        "kind": "needs_input",
+        "attempted_resolutions": ["checked the documented alternatives"],
+    }))
+    assert out["ok"] is True, out
+
+    with kb.connect(board=board_a) as conn:
+        task = kb.get_task(conn, task_id)
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+
+    assert task.assignee == "resolver"
+    assert preflight.payload["hermes_assignee"] == "resolver"
+
+
+def test_resolver_show_is_bounded_and_returns_resolve_snapshot(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-test-model")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-bounded"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="retry-heavy resolver inspection",
+            body="task body " + ("b" * 9000),
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a decision about the deployment boundary",
+            kind="needs_input",
+            attempted_resolutions=[
+                "checked the deployment policy",
+                "reproduced the failure in the workspace",
+            ],
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+        for index in range(35):
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, profile, step_key, status, started_at, ended_at,
+                    outcome, summary, metadata, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    "developer",
+                    "development",
+                    "completed",
+                    index + 1,
+                    index + 2,
+                    "failed",
+                    "retry summary " + ("s" * 5000),
+                    json.dumps({"attempt": "m" * 5000}),
+                    "retry error " + ("e" * 5000),
+                ),
+            )
+        for index in range(40):
+            kb.add_comment(conn, task_id, "developer", "comment " + ("c" * 3000))
+        for index in range(70):
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, run_id, kind, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    resolver.current_run_id,
+                    "heartbeat",
+                    json.dumps({"noise": "n" * 3000, "index": index}),
+                    10000 + index,
+                ),
+            )
+        conn.commit()
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show) < 100_000
+    shown = json.loads(raw_show)
+    expected = shown["expected"]
+    assert set(expected) == set(kb._RESOLVER_EXPECTED_KEYS)
+    assert shown["unresolved_preflight"]["event_id"] == preflight.id
+    assert shown["unresolved_preflight"]["payload"] == preflight.payload
+    assert shown["unresolved_preflight"]["payload"]["reason"].startswith(
+        "Need a decision"
+    )
+    assert shown["unresolved_preflight"]["payload"]["attempted_resolutions"] == [
+        "checked the deployment policy",
+        "reproduced the failure in the workspace",
+    ]
+    assert shown["comments_omitted"] > 0
+    assert shown["runs_omitted"] > 0
+    assert shown["events_omitted"] > 0
+    assert len(shown["worker_context"]) < 500
+
+    request = {
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The deployment boundary is documented and recoverable.",
+        "reason": "Resume using the documented deployment boundary.",
+        "expected": expected,
+    }
+    resolved = json.loads(kt._handle_resolve(request))
+    assert resolved["ok"] is True, resolved
+
+    stale = json.loads(kt._handle_resolve(request))
+    assert "kanban_resolve conflict" in stale["error"]
+
+
 def test_resolver_tool_resumes_release_preflight(
     monkeypatch, tmp_path,
 ):

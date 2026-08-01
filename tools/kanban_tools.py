@@ -324,12 +324,20 @@ def _product_role_assignees_from_config() -> dict[str, str]:
     return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
 
 
-def _product_human_escalation_profile(board: Optional[str] = None) -> str:
-    """Prefer the active product board's routing policy over local config."""
+def _product_human_escalation_profile(
+    board: Optional[str] = None,
+    *,
+    conn=None,
+) -> str:
+    """Prefer the connected product board's policy over local config."""
     try:
         from hermes_cli import kanban_db as kb
 
-        active_board = board or os.environ.get("HERMES_KANBAN_BOARD")
+        active_board = board
+        if active_board is None and conn is not None:
+            active_board = kb._board_slug_for_connection(conn)
+        if active_board is None:
+            active_board = os.environ.get("HERMES_KANBAN_BOARD")
         meta = kb.product_board_metadata(active_board)
         workflow = meta.get("product_workflow") if isinstance(meta, dict) else None
         if isinstance(workflow, dict):
@@ -807,8 +815,7 @@ def _handle_review_target(args: dict, **kw) -> str:
 
 
 def _handle_show(args: dict, **kw) -> str:
-    """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    """Read a task's state, with a bounded view for task-scoped Resolver calls."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -828,10 +835,43 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
             epic_id = kb.epic_id_for_task(conn, tid)
             epic = kb.get_task(conn, epic_id) if epic_id else None
+            resolver_view = (
+                os.environ.get("HERMES_PROFILE") == "resolver"
+                and os.environ.get("HERMES_KANBAN_TASK") == tid
+            )
+
+            def _bounded_text(value, limit):
+                text = "" if value is None else str(value)
+                if len(text) <= limit:
+                    return text
+                return text[:limit] + f"… [truncated, {len(text) - limit} chars omitted]"
+
+            def _bounded_value(value, limit):
+                if value is None or isinstance(value, (bool, int, float)):
+                    return value
+                if isinstance(value, str):
+                    return _bounded_text(value, limit)
+                try:
+                    encoded = json.dumps(
+                        value, ensure_ascii=False, sort_keys=True, default=str
+                    )
+                except Exception:
+                    encoded = str(value)
+                if len(encoded) <= limit:
+                    return value
+                return {
+                    "truncated": True,
+                    "original_chars": len(encoded),
+                    "preview": encoded[:limit],
+                }
 
             def _task_dict(t):
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
+                    "id": t.id, "title": t.title,
+                    "body": (
+                        _bounded_text(t.body, 2048)
+                        if resolver_view else t.body
+                    ),
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
@@ -839,7 +879,10 @@ def _handle_show(args: dict, **kw) -> str:
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
-                    "result": t.result,
+                    "result": (
+                        _bounded_text(t.result, 2048)
+                        if resolver_view else t.result
+                    ),
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
@@ -856,45 +899,122 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": r.id, "profile": r.profile,
                     "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
+                    "summary": (
+                        _bounded_text(r.summary, 1024)
+                        if resolver_view else r.summary
+                    ),
+                    "error": (
+                        _bounded_text(r.error, 1024)
+                        if resolver_view else r.error
+                    ),
+                    "metadata": (
+                        _bounded_value(r.metadata, 2048)
+                        if resolver_view else r.metadata
+                    ),
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            response = {
-                "task": _task_dict(task),
-                "work_contract": kb.work_contract_view(
-                    conn, task.work_contract_id
-                ),
-                "epic": (
+            contract = kb.work_contract_view(conn, task.work_contract_id)
+            if resolver_view:
+                bounded_contract = (
                     {
-                        "id": epic_id,
-                        "title": epic.title if epic is not None else epic_id,
+                        key: _bounded_value(value, 2048)
+                        for key, value in contract.items()
                     }
-                    if epic_id
-                    else None
-                ),
-                "dependencies": parents,
-                "dependents": children,
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"id": e.id, "kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            }
+                    if isinstance(contract, dict)
+                    else _bounded_value(contract, 4096)
+                )
+                shown_comments = comments[-10:]
+                shown_events = events[-12:]
+                shown_runs = runs[-6:]
+                preflight = kb._latest_unresolved_product_preflight(conn, tid)
+                response = {
+                    "task": _task_dict(task),
+                    "work_contract": bounded_contract,
+                    "epic": (
+                        {
+                            "id": epic_id,
+                            "title": epic.title if epic is not None else epic_id,
+                        }
+                        if epic_id
+                        else None
+                    ),
+                    "dependencies": parents,
+                    "dependents": children,
+                    "parents": parents,
+                    "children": children,
+                    "comments": [
+                        {
+                            "author": c.author,
+                            "body": _bounded_text(c.body, 2048),
+                            "created_at": c.created_at,
+                        }
+                        for c in shown_comments
+                    ],
+                    "comments_omitted": max(0, len(comments) - len(shown_comments)),
+                    "comments_total": len(comments),
+                    "events": [
+                        {
+                            "id": e.id,
+                            "kind": e.kind,
+                            "payload": _bounded_value(e.payload, 1024),
+                            "created_at": e.created_at,
+                            "run_id": e.run_id,
+                        }
+                        for e in shown_events
+                    ],
+                    "events_omitted": max(0, len(events) - len(shown_events)),
+                    "events_total": len(events),
+                    "runs": [_run_dict(r) for r in shown_runs],
+                    "runs_omitted": max(0, len(runs) - len(shown_runs)),
+                    "runs_total": len(runs),
+                    "unresolved_preflight": (
+                        {
+                            "event_id": preflight[0],
+                            "payload": preflight[1],
+                        }
+                        if preflight is not None
+                        else None
+                    ),
+                    "expected": kb.resolver_expected_snapshot(conn, tid),
+                    "worker_context": (
+                        "Resolver view is bounded; use work_contract, comments, "
+                        "runs, events, unresolved_preflight, and expected."
+                    ),
+                }
+            else:
+                response = {
+                    "task": _task_dict(task),
+                    "work_contract": contract,
+                    "epic": (
+                        {
+                            "id": epic_id,
+                            "title": epic.title if epic is not None else epic_id,
+                        }
+                        if epic_id
+                        else None
+                    ),
+                    "dependencies": parents,
+                    "dependents": children,
+                    "parents": parents,
+                    "children": children,
+                    "comments": [
+                        {"author": c.author, "body": c.body,
+                         "created_at": c.created_at}
+                        for c in comments
+                    ],
+                    "events": [
+                        {"id": e.id, "kind": e.kind, "payload": e.payload,
+                         "created_at": e.created_at, "run_id": e.run_id}
+                        for e in events[-50:]   # cap; full log via CLI
+                    ],
+                    "runs": [_run_dict(r) for r in runs],
+                    # Also surface the worker's own context block so the
+                    # agent can include it directly if it wants. This is
+                    # the same string build_worker_context returns to the
+                    # dispatcher at spawn time.
+                    "worker_context": kb.build_worker_context(conn, tid),
+                }
             if task.work_item_kind == "epic":
                 response["members"] = kb.list_epic_members(conn, tid)
                 response["progress"] = kb.epic_progress(conn, tid)
@@ -1698,7 +1818,9 @@ def _handle_block(args: dict, **kw) -> str:
                 metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
                 board=board,
-                human_escalation_assignee=_product_human_escalation_profile(board),
+                human_escalation_assignee=_product_human_escalation_profile(
+                    board, conn=conn
+                ),
             )
             if not ok:
                 return tool_error(

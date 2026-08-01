@@ -2973,6 +2973,41 @@ def _latest_unresolved_product_preflight(
     return int(rows[0]["id"]), (payload if isinstance(payload, dict) else {})
 
 
+def resolver_expected_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the exact compare-and-swap object accepted by the Resolver."""
+    row = conn.execute(
+        """
+        SELECT status, assignee, project_id, workflow_template_id,
+               current_step_key, workspace_kind, workspace_path, branch_name,
+               running, blocked, current_run_id
+          FROM tasks
+         WHERE id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    preflight = _latest_unresolved_product_preflight(conn, task_id)
+    if row is None or preflight is None:
+        return None
+    preflight_event_id, _payload = preflight
+    return {
+        "run_id": row["current_run_id"],
+        "preflight_event_id": preflight_event_id,
+        "status": row["status"],
+        "phase": row["current_step_key"],
+        "assignee": row["assignee"],
+        "project_id": row["project_id"],
+        "workflow_template_id": row["workflow_template_id"],
+        "workspace_kind": row["workspace_kind"],
+        "workspace_path": row["workspace_path"],
+        "branch_name": row["branch_name"],
+        "running": bool(row["running"]),
+        "blocked": bool(row["blocked"]),
+    }
+
+
 def has_unresolved_product_preflight(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3595,7 +3630,7 @@ def _route_product_human_block_to_preflight(
     attempted_resolutions: Optional[Iterable[str]] = None,
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
-    human_escalation_assignee: Optional[str] = "default",
+    human_escalation_assignee: Optional[str] = None,
 ) -> Optional[tuple[bool, Optional[int], str]]:
     """Route the first product-board human block to Hermes instead of Slack.
 
@@ -3607,7 +3642,13 @@ def _route_product_human_block_to_preflight(
     meta = product_board_metadata(board)
     if meta is None:
         return None
-    hermes_assignee = str(human_escalation_assignee or "default").strip() or "default"
+    hermes_assignee = str(human_escalation_assignee or "").strip()
+    if not hermes_assignee:
+        workflow = _product_workflow_dict(meta)
+        hermes_assignee = (
+            str(workflow.get("human_escalation_profile") or "").strip()
+            or "default"
+        )
     attempts = [str(a).strip() for a in (attempted_resolutions or []) if str(a).strip()]
     with authorized_governance_write(), write_txn(conn):
         if _latest_unresolved_product_preflight(conn, task_id):
@@ -10930,7 +10971,7 @@ def block_task(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
     board: Optional[str] = None,
-    human_escalation_assignee: Optional[str] = "default",
+    human_escalation_assignee: Optional[str] = None,
     allow_todo: bool = False,
 ) -> bool:
     """Transition a blockable task to ``blocked`` (or route elsewhere).
