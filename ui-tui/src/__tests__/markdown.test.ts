@@ -284,6 +284,95 @@ describe('fenced code panels', () => {
     expect(lines.join('\n')).toContain('++>')
     expect(lines.join('\n')).toContain('second')
   })
+
+  // Width-safe label regressions. The previous implementation passed the raw
+  // `lang` string to Ink's `borderText`; Ink's border-embedding path
+  // (`packages/hermes-ink/src/ink/render-border.ts::embedTextInBorder`)
+  // truncates with JS `substring` when `stringWidth(text) >= borderLength - 2`,
+  // which corrupts a CJK / emoji label mid-glyph. Each of these cases used
+  // to either overflow the top border or produce broken cells. The fix
+  // pre-truncates by display width with `…` appended inside the budget.
+  it('truncates a long Korean language label to the safe border budget at the 20-col threshold', () => {
+    const lines = renderCode('```한국어 라벨 매우 깁니다 길어\nx\n```', 20)
+
+    // Every visible line must fit the panel width.
+    expect(lines.every(line => stringWidth(line) <= 20)).toBe(true)
+
+    // The header line is the first row. The exact format depends on
+    // whether Ink leaves a trailing dash before the `╮` corner; the
+    // invariants we care about are: corners present, ellipsis present,
+    // and the label fits inside the safe border budget.
+    const header = lines[0]!
+    expect(header.startsWith('╭─')).toBe(true)
+    expect(header.endsWith('╮')).toBe(true)
+    expect(header).toContain('…')
+
+    // The untruncated label is ~28 cells wide; 20-col panel can hold at
+    // most 15 cells in the label slot, so the visible label must fit.
+    // Strip the corners (`╭`/`╮`) and surrounding dashes/spaces, then
+    // measure what remains.
+    const label = header.slice(2, -1).replace(/^─\s+|\s+─$/g, '').trim()
+    expect(stringWidth(label)).toBeLessThanOrEqual(20 - 5)
+  })
+
+  it('truncates an emoji-containing language label without producing broken surrogate pairs', () => {
+    const width = 22
+    // The synthetic label mixes emoji, CJK, and ASCII and would overflow
+    // the 22-col budget. Pre-fix Ink's JS-substring cut could leave a
+    // `�` (U+FFFD) replacement char or a lone surrogate in the panel.
+    const text = '```python_emoji_😀_korean_한국어_superlong\nx\n```'
+    const rendered = renderCode(text, width)
+
+    expect(rendered.every(line => stringWidth(line) <= width)).toBe(true)
+    expect(rendered[0]).not.toMatch(/\uFFFD/)
+  })
+
+  it('truncates a mixed Korean/emoji/ASCII label that exceeds the panel width', () => {
+    const text = '```한국어_이모지_😀_ASCII_label_that_is_unreasonably_long\nx\n```'
+    const width = 24
+    const lines = renderCode(text, width)
+
+    expect(lines.every(line => stringWidth(line) <= width)).toBe(true)
+    expect(lines[0]).not.toMatch(/\uFFFD/)
+  })
+
+  it('truncates a label wider than the entire panel and still produces a closed top border', () => {
+    const text = '```' + 'A'.repeat(120) + '\nx\n```'
+    const width = 20
+    const lines = renderCode(text, width)
+
+    expect(lines[0]).toMatch(/^╭─.+╮$/)
+    expect(lines.every(line => stringWidth(line) <= width)).toBe(true)
+    // The label inside the top border must end with the ellipsis (truncated)
+    // and never include a U+FFFD replacement char.
+    expect(lines[0]).toContain('…')
+    expect(lines[0]).not.toMatch(/\uFFFD/)
+  })
+
+  it('keeps the full label in normal mode when it fits the budget', () => {
+    const lines = renderCode('```python\nx = 1\n```', 40)
+
+    // Short label, well within budget — should appear verbatim.
+    expect(lines[0]).toMatch(/python/)
+    expect(lines[0]).not.toMatch(/…/)
+  })
+
+  it('stays width-safe at the boundary widths 19 (narrow), 20 (normal threshold), 21 (normal)', () => {
+    // 19 cols: narrow left-accent view, single-line truncated label.
+    const narrow19 = renderCode('```python\nx\n```', 19)
+    expect(narrow19.every(line => stringWidth(line) <= 19)).toBe(true)
+    expect(narrow19.some(line => line.startsWith('╭'))).toBe(false)
+
+    // 20 cols: normal panel, full border, label truncated to safe width.
+    const normal20 = renderCode('```python_long_label\nx\n```', 20)
+    expect(normal20.every(line => stringWidth(line) <= 20)).toBe(true)
+    expect(normal20.some(line => line.startsWith('╭'))).toBe(true)
+
+    // 21 cols: normal panel, slightly more room.
+    const normal21 = renderCode('```python_long_label\nx\n```', 21)
+    expect(normal21.every(line => stringWidth(line) <= 21)).toBe(true)
+    expect(normal21.some(line => line.startsWith('╭'))).toBe(true)
+  })
 })
 
 describe('Md wrapping', () => {

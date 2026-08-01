@@ -1,6 +1,12 @@
 import { Box, Link, stringWidth, Text } from '@hermes/ink'
 import { Fragment, memo, type ReactNode, useMemo } from 'react'
 
+import {
+  borderLabelWidth,
+  innerContentWidth,
+  isNarrowPanel,
+  truncateToWidth
+} from '../lib/codeBlockLayout.js'
 import { ensureEmojiPresentation } from '../lib/emoji.js'
 import { normalizeExternalUrl, urlSlugTitleLabel, useLinkTitle } from '../lib/externalLink.js'
 import { BOX_CLOSE, BOX_OPEN, texToUnicode } from '../lib/mathUnicode.js'
@@ -549,14 +555,35 @@ interface CodeBlockProps {
   t: Theme
 }
 
-const CODE_PANEL_MIN_WIDTH = 20
-
 function CodeBlock({ children, cols, compact, lang, t }: CodeBlockProps) {
   // A full outline costs two border cells plus two padding cells. Below this
   // threshold (and in compact mode), keep only the left accent so code retains
   // useful width and the border cannot dominate short wrapped lines.
-  const narrow = compact || (cols != null && cols < CODE_PANEL_MIN_WIDTH)
+  const narrow = isNarrowPanel(cols ?? Infinity, compact ?? false)
   const content = children.length ? children : [<Text key="empty"> </Text>]
+
+  // `lang` is fed straight into the syntax-highlight detector (which is
+  // CJK- and emoji-safe by construction — it only inspects the string), but
+  // the same string is *displayed* inside `borderText` content. Ink's
+  // border-embedding path takes a JS-`substring` truncation when
+  // `stringWidth(text) >= borderLength - 2`, which corrupts a wide CJK /
+  // emoji label mid-glyph. Pre-truncate to a display-safe label that the
+  // existing border budget can absorb (and which the virtual-height
+  // estimator can also count as one line).
+  //
+  // `cols` is optional in `MdProps`; when it's undefined the panel sizes
+  // from its parent and there is no fixed budget to defend, so we leave the
+  // label alone. A future call site that wants strict width safety even
+  // without a `cols` value can pass one through.
+  const safeCols = cols ?? Infinity
+  const normalLabelBudget = borderLabelWidth(safeCols)
+  const narrowContentBudget = innerContentWidth(safeCols, true)
+
+  const displayLang = lang
+    ? narrow
+      ? truncateToWidth(lang, narrowContentBudget)
+      : truncateToWidth(lang, normalLabelBudget)
+    : ''
 
   if (narrow) {
     return (
@@ -570,7 +597,7 @@ function CodeBlock({ children, cols, compact, lang, t }: CodeBlockProps) {
         paddingLeft={1}
         {...(cols ? { width: cols } : {})}
       >
-        {lang ? <Text color={t.color.muted}>{lang}</Text> : null}
+        {displayLang ? <Text color={t.color.muted}>{displayLang}</Text> : null}
         {content}
       </Box>
     )
@@ -581,7 +608,11 @@ function CodeBlock({ children, cols, compact, lang, t }: CodeBlockProps) {
       borderColor={t.color.border}
       borderDimColor
       borderStyle="round"
-      borderText={lang ? { align: 'start', content: ` ${lang} `, offset: 1, position: 'top' } : undefined}
+      borderText={
+        displayLang
+          ? { align: 'start', content: ` ${displayLang} `, offset: 1, position: 'top' }
+          : undefined
+      }
       flexDirection="column"
       paddingX={1}
       {...(cols ? { width: cols } : {})}
