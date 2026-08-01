@@ -20,8 +20,7 @@ delegation:
   provider: nvidia
   model: nvidia/nemotron-3-super-120b-a12b
   reasoning_effort: none
-  max_concurrent_children: 3
-  max_async_children: 5
+  max_concurrent_children: 5
   max_spawn_depth: 2
   orchestrator_enabled: true
 

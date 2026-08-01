@@ -42,6 +42,16 @@ def test_gateway_overlap_overlay(strategy):
     assert item.action == "official_with_overlay"
 
 
+def test_config_defaults_overlap_overlay(strategy):
+    item = classify_path_with_context(
+        "hermes_cli/config_defaults.py",
+        strategy,
+        touched_upstream=True,
+        touched_custom=True,
+    )
+    assert item.action == "official_with_overlay"
+
+
 def test_upstream_only_defaults_upstream(strategy):
     item = classify_path_with_context(
         "agent/context_compressor.py",

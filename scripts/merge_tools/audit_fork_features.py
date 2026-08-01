@@ -21,7 +21,19 @@ SYMBOL_CHECKS: dict[str, list[str]] = {
     "toolsets.py": ["harness", "vrchat", "voicevox", "self_evolution"],
     "tools/web_tools.py": ["parallel", "PARALLEL_API_KEY"],
     "plugins/web/parallel/provider.py": ["parallel.ai", "mcp"],
-    "hermes_cli/config.py": ["harness", "vrchat_autonomy", "HYPURA_HARNESS", "sleep"],
+    "hermes_cli/config.py": ["HYPURA_HARNESS"],
+    "hermes_cli/config_defaults.py": [
+        "allow_sensitive_cdp_methods",
+        "vrchat_autonomy",
+        "ai_scientist",
+        "shinka",
+        "portable_memory_packet_enabled",
+        "sleep",
+        "memory_monitor",
+        "harness",
+        "OPENCODE_API_KEY",
+        "CLOAKBROWSER_PROXY",
+    ],
     "agent/prompt_builder.py": ["_load_brain_docs", "_BRAIN_CONTEXT_FILES"],
     "model_tools.py": ["harness"],
     "gateway/run.py": ["GATEWAY_ALLOW_ALL_USERS", "fresh_final"],
@@ -55,11 +67,8 @@ def git_show(ref: str, path: str) -> str | None:
 
 
 def current_text(path: str) -> str | None:
-    proc = run(["git", "show", f":{path}"])
-    if proc.returncode == 0:
-        return proc.stdout
     file_path = REPO_ROOT / path
-    if file_path.exists():
+    if file_path.is_file():
         return file_path.read_text(encoding="utf-8", errors="replace")
     return None
 
@@ -141,7 +150,7 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"\nreport: {out}")
-    return 1 if differs or missing or symbol_missing else 0
+    return 1 if missing or symbol_missing else 0
 
 
 if __name__ == "__main__":

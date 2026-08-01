@@ -308,9 +308,15 @@
       "context": "overlap_only"
     },
     {
+      "pattern": "hermes_cli/config_defaults.py",
+      "action": "official_with_overlay",
+      "note": "Merge the official pure-data configuration API with fork defaults for harness, VRChat, self-evolution, memory, providers, and extension metadata.",
+      "context": "overlap_only"
+    },
+    {
       "pattern": "hermes_cli/config.py",
       "action": "official_with_overlay",
-      "note": "Merge config schema: upstream defaults + fork OPTIONAL_ENV_VARS.",
+      "note": "Merge official configuration loaders and migrations with fork environment migration metadata.",
       "context": "overlap_only"
     },
     {

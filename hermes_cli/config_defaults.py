@@ -341,7 +341,7 @@ DEFAULT_CONFIG = {
     },
 
     "web": {
-        "backend": "",           # shared fallback — applies to both search and extract
+        "backend": "cloakbrowser",  # fork default: local stealth search/extract; explicit per-capability overrides still win
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
@@ -362,6 +362,7 @@ DEFAULT_CONFIG = {
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        "allow_sensitive_cdp_methods": False,  # Explicit opt-in for raw cookie/storage/permission/JS CDP methods
         "allow_unsafe_evaluate": False,  # Legacy override: when true, browser_console(expression=...) bypasses the restrict_evaluate denylist entirely
         "restrict_evaluate": False,  # Opt-in denylist blocking sensitive JS primitives (cookies/storage/clipboard/network/form values) in browser_console(expression=...)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
@@ -840,6 +841,33 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Fork-owned side task used by the gated VRChat autonomy loop.
+        "vrchat_autonomy": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 60,
+            "extra_body": {},
+            "reasoning_effort": "",
+        },
+        # Fork-owned AI-Scientist / ShinkaEvolve routing. Credentials remain
+        # in .env or the official provider auth stores.
+        "ai_scientist": {
+            "provider": "",
+            "provider_priority": [],
+            "model": "",
+            "nvidia_model": "meta/llama-3.1-70b-instruct",
+            "groq_model": "llama-3.1-8b-instant",
+            "openrouter_model": "meta-llama/llama-3.1-405b-instruct",
+            "gemini_model": "gemini-2.0-flash-lite",
+            "anthropic_model": "claude-3-5-sonnet-20241022",
+            "allow_ollama_fallback": False,
+            "ollama_model": "",
+        },
+        "shinka": {
+            "llm_models": [],
+        },
         "approval": {
             "provider": "auto",
             "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
@@ -1111,7 +1139,7 @@ DEFAULT_CONFIG = {
         # model — see hermes_cli/focus_view.py.
         "focus_view": False,
         "focus_saved_tool_progress": "all",
-        "skin": "default",
+        "skin": "hakua",
         # UI language for static user-facing messages (approval prompts, a
         # handful of gateway slash-command replies).  Does NOT affect agent
         # responses, log lines, tool outputs, or slash-command descriptions.
@@ -1589,6 +1617,21 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Fork memory packet for local and Grok-style models.
+        "portable_memory_packet_enabled": True,
+        # Optional idle Ebbinghaus cycle. Disabled unless the operator opts in.
+        "sleep": {
+            "enabled": False,
+            "idle_after_seconds": 300,
+            "wake_greeting": "おはよう！ボブにゃん。",
+            "sleep": {
+                "prune": True,
+                "rehearse_threshold": 0.45,
+                "forget_threshold": 0.08,
+                "salience_keep_threshold": 0.7,
+                "limit": 200,
+            },
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -2169,6 +2212,7 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        "script_timeout_seconds": 120,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that
@@ -2310,6 +2354,10 @@ DEFAULT_CONFIG = {
         "level": "INFO",       # Minimum level for agent.log: DEBUG, INFO, WARNING
         "max_size_mb": 5,      # Max size per log file before rotation
         "backup_count": 3,     # Number of rotated backup files to keep
+        "memory_monitor": {
+            "enabled": True,
+            "interval_seconds": 300,
+        },
     },
 
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
@@ -2984,6 +3032,14 @@ DEFAULT_CONFIG = {
         # cover OpenRouter, OpenAI, Anthropic, Google, xAI, Mistral, Groq,
         # Together, DeepSeek, Nous).  Wildcards (`*.foo.com`) are supported.
         "extra_allowed_hosts": [],
+    },
+
+    "harness": {
+        "enabled": True,
+        "auto_start": True,
+        "host": "127.0.0.1",
+        "port": 18794,
+        "script_path": "",
     },
 
     # Hermes Desktop (Electron app) launch options. These only affect
@@ -4219,5 +4275,90 @@ OPTIONAL_ENV_VARS = {
         "url": None,
         "password": False,
         "category": "setting",
+    },
+    "HYPURA_HARNESS_PORT": {
+        "description": "Port for the Hypura Harness daemon (default: 18794)",
+        "prompt": "Harness port",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "HYPURA_HARNESS_HOST": {
+        "description": "Host for the Hypura Harness daemon (default: 127.0.0.1)",
+        "prompt": "Harness host",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "OPENCODE_API_KEY": {
+        "description": "Shared OpenCode key used by Zen and Go providers",
+        "prompt": "OpenCode API key",
+        "url": "https://opencode.ai/auth",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "FREEBUFF_TOKEN": {
+        "description": "Upstream Freebuff bearer token",
+        "prompt": "Freebuff auth token",
+        "url": "https://freebuff.com/cli",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "FREEBUFF_PROXY_API_KEY": {
+        "description": "API key for the local Freebuff OpenAI-compatible proxy",
+        "prompt": "Freebuff local proxy API key",
+        "url": None,
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "WORLDMONITOR_API_KEY": {
+        "description": "World Monitor API key",
+        "prompt": "World Monitor API key",
+        "url": "https://www.worldmonitor.app/docs/usage-auth",
+        "password": True,
+        "category": "tool",
+    },
+    "WORLDMONITOR_API_BASE": {
+        "description": "World Monitor cloud or local sidecar API base URL",
+        "prompt": "World Monitor API base URL",
+        "url": "https://www.worldmonitor.app/docs/desktop-app",
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "WORLDMONITOR_LOCAL_PORT": {
+        "description": "Local World Monitor desktop sidecar port",
+        "prompt": "World Monitor sidecar port",
+        "url": None,
+        "password": False,
+        "category": "setting",
+        "advanced": True,
+    },
+    "SITDECK_EMAIL": {
+        "description": "SitDeck login email for the browser crawl integration",
+        "prompt": "SitDeck email",
+        "url": "https://app.sitdeck.com/#register",
+        "password": False,
+        "category": "tool",
+    },
+    "SITDECK_PASSWORD": {
+        "description": "SitDeck account password",
+        "prompt": "SitDeck password",
+        "url": "https://app.sitdeck.com/#login",
+        "password": True,
+        "category": "tool",
+    },
+    "CLOAKBROWSER_PROXY": {
+        "description": "Optional HTTP/S proxy for CloakBrowser search and extraction",
+        "prompt": "CloakBrowser proxy URL",
+        "url": "https://github.com/zapabob/CloakBrowser",
+        "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
     },
 }
