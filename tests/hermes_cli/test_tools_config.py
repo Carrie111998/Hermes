@@ -73,10 +73,27 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
 
 
 
+def test_agent_allowed_toolsets_is_a_hard_allowlist(monkeypatch):
+    """A service policy must win over platform, plugin, and MCP defaults."""
+    monkeypatch.delenv("HERMES_ALLOWED_TOOLSETS", raising=False)
+    config = {
+        "agent": {"allowed_toolsets": ["web", "vision"]},
+        "platform_toolsets": {"cli": ["all", "terminal", "web", "vision"]},
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert enabled == {"web", "vision"}
 
 
+def test_environment_allowed_toolsets_overrides_config(monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOWED_TOOLSETS", "web,vision")
+    config = {
+        "agent": {"allowed_toolsets": ["terminal"]},
+        "platform_toolsets": {"cli": ["all"]},
+    }
 
-
+    assert _get_platform_tools(config, "cli") == {"web", "vision"}
 
 
 def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_token_set(monkeypatch):

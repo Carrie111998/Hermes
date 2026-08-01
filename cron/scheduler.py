@@ -232,7 +232,12 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        from toolsets import get_allowed_toolsets, restrict_toolsets
+
+        return restrict_toolsets(
+            _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {}),
+            get_allowed_toolsets(cfg or {}),
+        )
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))

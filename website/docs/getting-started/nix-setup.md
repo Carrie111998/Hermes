@@ -141,6 +141,46 @@ services.hermes-agent.environmentFiles = [ "/var/lib/hermes/env" ];
 Setting `addToSystemPackages = true` does two things: puts the `hermes` CLI on your system PATH **and** sets `HERMES_HOME` system-wide so the interactive CLI shares state (sessions, skills, cron) with the gateway service. Without it, running `hermes` in your shell creates a separate `~/.hermes/` directory.
 :::
 
+### Multiple Isolated Instances
+
+The flake also exports `nixosModules.instances` for running independent native
+Hermes gateways on one host. Import it alongside `nixosModules.default` when
+you need both the singleton service and isolated instances:
+
+```nix
+modules = [
+  hermes-agent.nixosModules.default
+  hermes-agent.nixosModules.instances
+  ./configuration.nix
+];
+```
+
+```nix
+# configuration.nix
+{
+  services.hermes-agent.instances = {
+    research = {
+      enable = true;
+      settings.model.default = "anthropic/claude-sonnet-4";
+      allowedToolsets = [ "web" "file" ];
+      environmentFiles = [ "/run/secrets/hermes-research-env" ];
+    };
+
+    coding = {
+      enable = true;
+      settings.model.default = "google/gemini-3-flash";
+      allowedToolsets = [ "web" "file" "terminal" ];
+      environmentFiles = [ "/run/secrets/hermes-coding-env" ];
+    };
+  };
+}
+```
+
+Each enabled instance gets its own `hermes-agent-<name>.service`,
+`hermes-<name>` user/group, and `/var/lib/hermes-<name>` state directory.
+Instance names must contain lowercase letters, digits, and hyphens. The
+instances module is native-only; use the singleton module for container mode.
+
 ### Container-aware CLI
 
 :::info

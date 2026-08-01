@@ -23,7 +23,52 @@ Usage:
     all_tools = resolve_toolset("full_stack")
 """
 
+import os
 from typing import List, Dict, Any, Set, Optional
+
+
+def get_allowed_toolsets(config: Optional[Dict[str, Any]] = None) -> Optional[Set[str]]:
+    """Return the service/config toolset allowlist, or ``None`` if unrestricted."""
+    allowed_raw = os.getenv("HERMES_ALLOWED_TOOLSETS")
+    if allowed_raw is not None:
+        return {value.strip() for value in allowed_raw.split(",") if value.strip()}
+
+    agent_cfg = (config or {}).get("agent") or {}
+    configured = agent_cfg.get("allowed_toolsets")
+    if configured is None:
+        return None
+    if isinstance(configured, list):
+        return {
+            str(value).strip()
+            for value in configured
+            if str(value).strip()
+        }
+    return {
+        value.strip()
+        for value in str(configured).split(",")
+        if value.strip()
+    }
+
+
+def restrict_toolsets(
+    enabled_toolsets: Optional[List[str]],
+    allowed_toolsets: Optional[Set[str]],
+) -> Optional[List[str]]:
+    """Intersect requested toolsets with a hard allowlist without widening it."""
+    if allowed_toolsets is None:
+        return enabled_toolsets
+    if enabled_toolsets is None:
+        return sorted(allowed_toolsets)
+
+    restricted = []
+    seen = set()
+    for toolset_name in enabled_toolsets:
+        names = sorted(allowed_toolsets) if toolset_name in {"all", "*"} else [toolset_name]
+        for name in names:
+            if name in allowed_toolsets and name not in seen:
+                restricted.append(name)
+                seen.add(name)
+    return restricted
 
 
 # Shared tool list for CLI and all messaging platform toolsets.

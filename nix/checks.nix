@@ -10,6 +10,10 @@
       hermesVenv = hermes-agent.hermesVenv;
 
       configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
+      configMergeInput = pkgs.writeText "hermes-config-merge-input.json" (builtins.toJSON {
+        replace = "new";
+        added = true;
+      });
 
       # Auto-generated config key reference — always in sync with Python
       configKeys = pkgs.runCommand "hermes-config-keys" {} ''
@@ -36,6 +40,26 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
       packages.configKeys = configKeys;
 
       checks = {
+        config-merge = pkgs.runCommand "hermes-config-merge" { } ''
+          set -euo pipefail
+          work="$TMPDIR/config"
+          mkdir -p "$work"
+          printf '%s\n' 'keep: old' 'replace: old' > "$work/config.yaml"
+          ${configMergeScript} ${configMergeInput} "$work/config.yaml"
+          grep -Fqx 'keep: old' "$work/config.yaml"
+          grep -Fqx 'replace: new' "$work/config.yaml"
+          grep -Fqx 'added: true' "$work/config.yaml"
+
+          ln -s "$work/config.yaml" "$work/symlink.yaml"
+          if ${configMergeScript} ${configMergeInput} "$work/symlink.yaml"; then
+            echo "FAIL: config merge followed a symlink" >&2
+            exit 1
+          fi
+
+          mkdir -p "$out"
+          echo "ok" > "$out/result"
+        '';
+
         # Cross-platform evaluation — catches "not supported for interpreter"
         # errors (e.g. sphinx dropping python311) without needing a darwin builder.
         # Evaluation is pure and instant; it doesn't build anything.
@@ -91,6 +115,77 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           mkdir -p $out
           echo "ok" > $out/result
         '';
+
+        # Evaluate the shared lifecycle through the singleton, multi-instance,
+        # and container module paths so refactors cannot silently drop setup,
+        # users, or service hardening.
+        nixos-module-instances =
+          let
+            system = pkgs.stdenv.hostPlatform.system;
+            mkSystem = modules: inputs.nixpkgs.lib.nixosSystem { inherit system modules; };
+            testPackage = pkgs.writeShellScriptBin "hermes" "exit 0";
+            native = mkSystem [
+              inputs.self.nixosModules.default
+              inputs.self.nixosModules.instances
+              {
+                system.stateVersion = "24.11";
+                services.hermes-agent = {
+                  enable = true;
+                  package = testPackage;
+                  settings.model = "test";
+                };
+                services.hermes-agent.instances.iris = {
+                  enable = true;
+                  package = testPackage;
+                  settings.model = "iris";
+                };
+                services.hermes-agent.instances.argus = {
+                  enable = true;
+                  package = testPackage;
+                  settings.model = "argus";
+                };
+              }
+            ];
+            container = mkSystem [
+              inputs.self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+                services.hermes-agent = {
+                  enable = true;
+                  package = testPackage;
+                  container.enable = true;
+                  allowedToolsets = [ "web" ];
+                  readOnlyState = true;
+                  environment.TEST = "value";
+                };
+              }
+            ];
+            nativeSetupScript = pkgs.writeText "hermes-native-setup.sh"
+              native.config.system.activationScripts."hermes-agent-iris-setup".text;
+            containerPreStartScript = pkgs.writeText "hermes-container-pre-start.sh"
+              container.config.systemd.services.hermes-agent.preStart;
+          in
+          if !(lib.all (value: value) [
+            (native.config.systemd.services.hermes-agent.description == "Hermes Agent Gateway")
+            (native.config.systemd.services.hermes-agent.serviceConfig.ProtectHome == false)
+            (native.config.systemd.services.hermes-agent-iris.serviceConfig.User == "hermes-iris")
+            (native.config.systemd.services.hermes-agent-iris.serviceConfig.ProtectHome == "read-only")
+            (builtins.hasAttr "hermes-agent-iris-setup" native.config.system.activationScripts)
+            (container.config.systemd.services.hermes-agent.description == "Hermes Agent Gateway (container)")
+            (builtins.hasAttr "preStart" container.config.systemd.services.hermes-agent)
+            (builtins.hasAttr "hermes-agent-setup" container.config.system.activationScripts)
+            (lib.hasInfix "HERMES_ALLOWED_TOOLSETS" container.config.systemd.services.hermes-agent.preStart)
+            (lib.hasInfix ":ro" container.config.systemd.services.hermes-agent.preStart)
+          ]) then
+            throw "Hermes NixOS lifecycle fixture failed"
+          else
+            pkgs.runCommand "hermes-nixos-module-instances" { } ''
+              ${pkgs.bash}/bin/bash -n ${nativeSetupScript}
+              ${pkgs.bash}/bin/bash -n ${containerPreStartScript}
+              echo "PASS: singleton, instances, and container lifecycle paths evaluate"
+              mkdir -p $out
+              echo "ok" > $out/result
+            '';
 
         # Verify every pyproject.toml [project.scripts] entry has a wrapped binary
         entry-points-sync = pkgs.runCommand "hermes-entry-points-sync" { } ''

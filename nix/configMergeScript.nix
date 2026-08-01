@@ -5,7 +5,7 @@
 { pkgs }:
 pkgs.writeScript "hermes-config-merge" ''
   #!${pkgs.python3.withPackages (ps: [ ps.pyyaml ])}/bin/python3
-  import json, yaml, sys
+  import json, os, tempfile, yaml, sys
   from pathlib import Path
 
   nix_json, config_path = sys.argv[1], Path(sys.argv[2])
@@ -14,6 +14,8 @@ pkgs.writeScript "hermes-config-merge" ''
       nix = json.load(f)
 
   existing = {}
+  if config_path.is_symlink() or config_path.parent.is_symlink():
+      raise RuntimeError(f"refusing to follow symlink: {config_path}")
   if config_path.exists():
       with open(config_path) as f:
           existing = yaml.safe_load(f) or {}
@@ -28,6 +30,21 @@ pkgs.writeScript "hermes-config-merge" ''
       return result
 
   merged = deep_merge(existing, nix)
-  with open(config_path, "w") as f:
-      yaml.dump(merged, f, default_flow_style=False, sort_keys=False)
+  fd, temporary = tempfile.mkstemp(
+      dir=config_path.parent,
+      prefix=f".{config_path.name}.",
+      suffix=".tmp",
+  )
+  try:
+      with os.fdopen(fd, "w") as f:
+          yaml.dump(merged, f, default_flow_style=False, sort_keys=False)
+          f.flush()
+          os.fsync(f.fileno())
+      os.replace(temporary, config_path)
+  except BaseException:
+      try:
+          os.unlink(temporary)
+      except FileNotFoundError:
+          pass
+      raise
 ''

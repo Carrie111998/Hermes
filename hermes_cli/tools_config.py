@@ -2199,7 +2199,7 @@ def _get_platform_tools(
     include_default_mcp_servers: bool = True,
 ) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
-    from toolsets import resolve_toolset, TOOLSETS
+    from toolsets import get_allowed_toolsets, resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
@@ -2461,6 +2461,12 @@ def _get_platform_tools(
     if disabled_toolsets:
         disabled_set = {str(ts) for ts in disabled_toolsets}
         enabled_toolsets -= disabled_set
+
+    # A service-level allowlist is stronger than platform configuration,
+    # plugin discovery, MCP defaults, and user-disabled toolsets.
+    allowed_toolsets = get_allowed_toolsets(config)
+    if allowed_toolsets is not None:
+        enabled_toolsets &= allowed_toolsets
 
     # #38798: if this platform was explicitly configured but every toolset name
     # is invalid (e.g. a migration or hand-edit left `hermes` instead of
