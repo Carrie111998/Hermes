@@ -315,6 +315,15 @@ print(review)
 | `api_key` | `str` | `None` | API key (falls back to env vars) |
 | `base_url` | `str` | `None` | Custom API endpoint URL |
 | `platform` | `str` | `None` | Platform hint (`"discord"`, `"telegram"`, etc.) |
+| `api_max_retries` | `int \| None` | `None` | Per-instance total provider-attempt ceiling |
+
+`api_max_retries=None` (or omitting the parameter) preserves the existing
+`agent.api_max_retries` configuration behavior and legacy default. An explicit
+positive integer takes precedence for that `AIAgent` instance: `1` means one
+total provider attempt with no same-provider retry. The override is
+instance-local and is not written to configuration or environment state.
+Booleans, non-integers, zero, and negative values are rejected during
+initialization before a provider client is constructed.
 
 ---
 

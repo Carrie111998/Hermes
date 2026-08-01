@@ -517,6 +517,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    api_max_retries: int | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -529,6 +530,9 @@ def init_agent(
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
+        api_max_retries (int | None): Per-instance total provider-attempt
+            ceiling. None uses agent.api_max_retries from config or the legacy
+            default of 3.
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
@@ -567,6 +571,12 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    if api_max_retries is not None:
+        if isinstance(api_max_retries, bool) or not isinstance(api_max_retries, int):
+            raise TypeError("api_max_retries must be a positive integer or None")
+        if api_max_retries <= 0:
+            raise ValueError("api_max_retries must be a positive integer")
+
     _install_safe_stdio()
 
     agent.model = model
@@ -1801,15 +1811,19 @@ def init_agent(
         _platform_hints_cfg = {}
     agent._platform_hint_overrides = _platform_hints_cfg
 
-    # App-level API retry count (wraps each model API call).  Default 3,
-    # overridable via agent.api_max_retries in config.yaml.  See #11616.
-    try:
-        _raw_api_retries = _agent_section.get("api_max_retries", 3)
-        _api_retries = int(_raw_api_retries)
-        _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
-    except (TypeError, ValueError):
-        _api_retries = 3
-    agent._api_max_retries = _api_retries
+    # App-level API attempt count (wraps each model API call). An explicit
+    # constructor value is instance-local and takes precedence without
+    # mutating shared config. None preserves the existing config/default path.
+    if api_max_retries is not None:
+        agent._api_max_retries = api_max_retries
+    else:
+        try:
+            _raw_api_retries = _agent_section.get("api_max_retries", 3)
+            _api_retries = int(_raw_api_retries)
+            _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
+        except (TypeError, ValueError):
+            _api_retries = 3
+        agent._api_max_retries = _api_retries
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
