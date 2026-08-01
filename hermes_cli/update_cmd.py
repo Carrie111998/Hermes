@@ -3740,6 +3740,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
+        # If pytest owns this live checkout, skip the branch-switch entirely.
+        # A test that leaks into _cmd_update_impl (through a stale subprocess
+        # mock or a PROJECT_ROOT monkeypatch) would otherwise move the real
+        # HEAD and corrupt the running suite.  The sibling _write_marker_file
+        # path already uses this same guard.  See #76271.
+        if _m()._pytest_owns_live_checkout(_m().PROJECT_ROOT):
+            return
+
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
