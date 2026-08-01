@@ -77,6 +77,12 @@ from tools.tool_backend_helpers import (
     nous_tool_gateway_unavailable_message,
     resolve_modal_backend_state,
 )
+from tools.environments.execution_policy import (
+    ExecutionWritePolicy,
+    bind_policy_environment_key,
+    policy_environment_keys_for_session,
+    resolve_execution_write_policy,
+)
 
 
 def _safe_parse_import_env(
@@ -1199,6 +1205,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - execution_write_scope: str -- ``legacy`` or session-scoped ``workspace``
+        - workspace_root: str -- Immutable host workspace for workspace scope
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1222,8 +1230,21 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # so a CWD-only override (which collapses to "default") still finds and
         # updates the originating session's env.
         container_id = _resolve_container_task_id(task_id)
+        policy_key = None
+        try:
+            config = _get_env_config()
+            policy = _resolve_execution_policy_for_task(
+                config, task_id, env_type=config.get("env_type"), cwd=new_cwd
+            )
+            policy_key = _resolve_environment_key(task_id, policy)
+        except Exception:
+            logger.debug("Could not resolve override environment identity", exc_info=True)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = (
+                _active_environments.get(policy_key)
+                or _active_environments.get(task_id)
+                or _active_environments.get(container_id)
+            )
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1236,6 +1257,9 @@ def clear_task_env_overrides(task_id: str):
     """
     _task_env_overrides.pop(task_id, None)
     clear_session_cwd(task_id)
+    from tools.environments.execution_policy import clear_execution_workspace
+
+    clear_execution_workspace(task_id)
 
 
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
@@ -1293,6 +1317,67 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     )
 
 
+def _resolve_execution_policy_for_task(
+    config: Dict[str, Any],
+    task_id: Optional[str],
+    *,
+    env_type: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> ExecutionWritePolicy:
+    """Resolve the immutable execution policy before any environment lookup."""
+    raw_task_id = str(task_id or "default")
+    overrides = resolve_task_overrides(raw_task_id)
+    backend = str(env_type or config.get("env_type") or "local").lower()
+    configured_scope = overrides.get(
+        "execution_write_scope",
+        config.get("execution_write_scope", "legacy"),
+    )
+    host_cwd = overrides.get("host_cwd", config.get("host_cwd"))
+    if backend in _CONTAINER_BACKENDS and _is_container_namespace_path(host_cwd):
+        host_cwd = None
+    workspace_root = (
+        overrides.get("workspace_root")
+        or config.get("workspace_root")
+        or overrides.get("host_workspace_root")
+        or config.get("host_workspace_root")
+        or overrides.get("host_cwd")
+        or host_cwd
+        or get_session_cwd(raw_task_id)
+    )
+    if backend in _CONTAINER_BACKENDS and _is_container_namespace_path(workspace_root):
+        workspace_root = None
+    if not workspace_root:
+        if backend not in _CONTAINER_BACKENDS:
+            workspace_root = cwd or config.get("cwd")
+    if not workspace_root or (
+        backend in _CONTAINER_BACKENDS and _is_container_namespace_path(workspace_root)
+    ):
+        workspace_root = _safe_getcwd()
+    return resolve_execution_write_policy(
+        configured_scope,
+        session_id=raw_task_id,
+        workspace_root=workspace_root,
+        backend=backend,
+        docker_volumes=overrides.get("docker_volumes", config.get("docker_volumes", [])),
+        docker_extra_args=overrides.get("docker_extra_args", config.get("docker_extra_args", [])),
+        host_cwd=host_cwd,
+        docker_mount_cwd_to_workspace=overrides.get(
+            "docker_mount_cwd_to_workspace",
+            config.get("docker_mount_cwd_to_workspace", False),
+        ),
+    )
+
+
+def _resolve_environment_key(task_id: Optional[str], policy: ExecutionWritePolicy) -> str:
+    """Bind raw session provenance to the one backend cache identity."""
+    raw_task_id = str(task_id or "default")
+    return bind_policy_environment_key(
+        raw_task_id,
+        _resolve_container_task_id(raw_task_id),
+        policy,
+    )
+
+
 # Configuration from environment variables
 
 def _parse_env_var(name: str, default: str, converter: Any = int, type_label: str = "integer"):
@@ -1334,6 +1419,14 @@ _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
+def _is_container_namespace_path(path: Any) -> bool:
+    """Return whether a path is a container namespace, not host provenance."""
+    if not isinstance(path, str):
+        return False
+    normalized = path.rstrip("/") or "/"
+    return normalized == "/root" or normalized == "/workspace" or normalized.startswith("/workspace/")
+
+
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
     """Return True when *cwd* is a tilde path that the remote SSH shell must
     expand itself, so the Hermes host/container must NOT ``expanduser`` it.
@@ -1362,6 +1455,8 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     if not cwd:
         return False
     if any(cwd.startswith(p) for p in _HOST_CWD_PREFIXES):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", cwd):
         return True
     # Relative paths (".", "src/") can't be a container workdir either. Windows
     # drive paths are absolute on Windows but os.path.isabs() is False on a
@@ -1447,6 +1542,18 @@ def _get_env_config() -> Dict[str, Any]:
         docker_env = {}
         docker_extra_args = []
 
+    execution_write_scope = "legacy"
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        configured_terminal = load_config_readonly().get("terminal") or {}
+        if isinstance(configured_terminal, dict):
+            execution_write_scope = configured_terminal.get(
+                "execution_write_scope", execution_write_scope
+            )
+    except Exception:
+        logger.debug("Could not load execution_write_scope; using legacy", exc_info=True)
+
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, Vercel uses its documented workspace root, and everything
     # else starts in the backend's default root-like cwd.
@@ -1463,19 +1570,30 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    raw_cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    cwd = raw_cwd
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
-    if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+    docker_cwd_source = raw_cwd or _safe_getcwd()
+    if _is_container_namespace_path(docker_cwd_source):
+        docker_cwd_source = _safe_getcwd()
+    if env_type == "docker" and (
+        mount_docker_cwd or execution_write_scope == "workspace"
+    ):
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
-            or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
+            or re.match(r"^[A-Za-z]:[\\/]", candidate)
+            or (
+                os.path.isabs(candidate)
+                and os.path.isdir(candidate)
+                and not candidate.startswith(("/workspace", "/root"))
+            )
         ):
             host_cwd = candidate
-            cwd = "/workspace"
+            if mount_docker_cwd:
+                cwd = "/workspace"
     elif env_type in _CONTAINER_BACKENDS and cwd:
         # Host paths and relative paths that won't work inside containers
         if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
@@ -1486,6 +1604,7 @@ def _get_env_config() -> Dict[str, Any]:
 
     return {
         "env_type": env_type,
+        "execution_write_scope": execution_write_scope,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
         "docker_forward_env": docker_forward_env,
@@ -1495,6 +1614,7 @@ def _get_env_config() -> Dict[str, Any]:
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
+        "host_workspace_root": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
@@ -1573,6 +1693,25 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         Environment instance with execute() method
     """
     cc = container_config or {}
+    execution_policy = cc.get("execution_policy")
+    if execution_policy is None:
+        policy_config = dict(_get_env_config())
+        if host_cwd and not policy_config.get("host_workspace_root"):
+            policy_config["host_workspace_root"] = host_cwd
+        execution_policy = _resolve_execution_policy_for_task(
+            policy_config,
+            task_id,
+            env_type=env_type,
+            cwd=cwd,
+        )
+    from tools.environments.execution_policy import (
+        ExecutionWriteScopeError,
+        validate_execution_capability,
+    )
+
+    capability = validate_execution_capability(execution_policy, env_type)
+    if not capability.supported:
+        raise ExecutionWriteScopeError(capability)
     cpu = cc.get("container_cpu", 1)
     memory = cc.get("container_memory", 5120)
     disk = cc.get("container_disk", 51200)
@@ -1582,6 +1721,13 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_env = cc.get("docker_env", {})
     docker_extra_args = cc.get("docker_extra_args", [])
     docker_network = cc.get("docker_network", True)
+    auto_mount_cwd = cc.get("docker_mount_cwd_to_workspace", False)
+
+    if execution_policy is not None and execution_policy.is_workspace_scoped:
+        volumes = [mapping.spec for mapping in execution_policy.docker_mappings]
+        docker_extra_args = list(execution_policy.docker_extra_args)
+        host_cwd = None
+        auto_mount_cwd = False
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1600,13 +1746,14 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
             volumes=volumes,
             host_cwd=host_cwd,
-            auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
+            auto_mount_cwd=auto_mount_cwd,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            execution_policy=execution_policy,
         )
     
     elif env_type == "singularity":
@@ -1753,6 +1900,9 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
     # are not blocked while Modal/Docker sandboxes shut down.
     for task_id, env in envs_to_stop:
+        from tools.environments.execution_policy import forget_policy_environment_key
+
+        forget_policy_environment_key(task_id)
         # Invalidate stale file_ops cache entry (Bug fix: prevents
         # ShellFileOperations from referencing a dead sandbox)
         try:
@@ -1777,6 +1927,19 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
                 logger.info("Environment for task %s already cleaned up", task_id)
             else:
                 logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+
+
+def _resolve_cleanup_environment_keys(task_id: str | None) -> tuple[str, ...]:
+    """Resolve cleanup without collapsing a legacy session onto ``default``."""
+    raw_task_id = str(task_id or "default")
+    bounded_keys = policy_environment_keys_for_session(raw_task_id)
+    if bounded_keys:
+        return tuple(dict.fromkeys(key for key in bounded_keys if key))
+
+    # Legacy sessions intentionally share the collapsed container. Main only
+    # removed the raw lifecycle key, so closing one session must not tear down
+    # the shared ``default`` environment.
+    return (raw_task_id,)
 
 
 def _cleanup_thread_worker():
@@ -1818,9 +1981,20 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
-    lookup = _resolve_container_task_id(task_id)
+    raw_task_id = str(task_id or "default")
+    bounded_keys = policy_environment_keys_for_session(raw_task_id)
+    if bounded_keys:
+        lookup_keys = tuple(reversed(bounded_keys))
+    else:
+        # Legacy traffic is the common path. Keep it to the existing direct
+        # dict lookup and the in-memory raw-to-default mapping.
+        lookup_keys = (raw_task_id, _resolve_container_task_id(raw_task_id))
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        for key in dict.fromkeys(lookup_keys):
+            env = _active_environments.get(key)
+            if env is not None:
+                return env
+    return None
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1893,48 +2067,74 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
-    env = None
+    environment_keys = _resolve_cleanup_environment_keys(task_id)
+    envs = []
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        for environment_key in environment_keys:
+            env = _active_environments.pop(environment_key, None)
+            _last_activity.pop(environment_key, None)
+            if env is not None:
+                envs.append((environment_key, env))
+
+    from tools.environments.execution_policy import forget_policy_environment_key
+
+    forget_policy_environment_key(str(task_id or "default"))
+    for environment_key in environment_keys:
+        forget_policy_environment_key(environment_key)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        for environment_key in environment_keys:
+            _creation_locks.pop(environment_key, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
         clear_file_ops_cache(task_id)
+        for environment_key in environment_keys:
+            clear_file_ops_cache(environment_key)
     except ImportError:
         pass
 
-    if env is None:
+    # Workspace background and PTY processes use the bounded environment key,
+    # so session close/reset must target that same identity.
+    if any(environment_key.startswith("hermes-workspace-") for environment_key in environment_keys):
+        try:
+            from tools.process_registry import process_registry
+
+            for environment_key in environment_keys:
+                if environment_key.startswith("hermes-workspace-"):
+                    process_registry.kill_all(task_id=environment_key)
+        except Exception:
+            logger.debug("Could not clean workspace processes", exc_info=True)
+
+    if not envs:
         return
 
-    try:
-        if hasattr(env, 'cleanup'):
-            # Pass force_remove only if the env's cleanup() accepts it
-            # (DockerEnvironment after issue #20561; other backends don't).
-            import inspect
-            sig = inspect.signature(env.cleanup)
-            if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
+    for environment_key, env in envs:
+        try:
+            if hasattr(env, 'cleanup'):
+                # Pass force_remove only if the env's cleanup() accepts it
+                # (DockerEnvironment after issue #20561; other backends don't).
+                import inspect
+                sig = inspect.signature(env.cleanup)
+                if "force_remove" in sig.parameters:
+                    env.cleanup(force_remove=force_remove)
+                else:
+                    env.cleanup()
+            elif hasattr(env, 'stop'):
+                env.stop()
+            elif hasattr(env, 'terminate'):
+                env.terminate()
+
+            logger.info("Manually cleaned up environment for task: %s", environment_key)
+
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                logger.info("Environment for task %s already cleaned up", environment_key)
             else:
-                env.cleanup()
-        elif hasattr(env, 'stop'):
-            env.stop()
-        elif hasattr(env, 'terminate'):
-            env.terminate()
-
-        logger.info("Manually cleaned up environment for task: %s", task_id)
-
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
-        else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+                logger.warning("Error cleaning up environment for task %s: %s", environment_key, e)
 
 
 def _atexit_cleanup():
@@ -2268,6 +2468,7 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        policy_cwd = cwd
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
@@ -2287,6 +2488,20 @@ def terminal_tool(
                     cwd, env_type, config["cwd"],
                 )
             cwd = config["cwd"]
+        execution_policy = _resolve_execution_policy_for_task(
+            config, task_id, env_type=env_type, cwd=policy_cwd
+        )
+        if not execution_policy.capability.supported:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "status": "blocked",
+                    **execution_policy.capability.as_error(),
+                },
+                ensure_ascii=False,
+            )
+        environment_key = _resolve_environment_key(task_id, execution_policy)
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2326,8 +2541,12 @@ def terminal_tool(
             # sharing, yet an env may already be cached under the originating
             # task_id; honor it instead of spawning a duplicate.
             _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+                environment_key if environment_key in _active_environments
+                else (None if execution_policy.is_workspace_scoped else (
+                    effective_task_id
+                    if effective_task_id in _active_environments
+                    else (task_id if task_id and task_id in _active_environments else None)
+                ))
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -2339,16 +2558,20 @@ def terminal_tool(
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if environment_key not in _creation_locks:
+                    _creation_locks[environment_key] = threading.Lock()
+                task_lock = _creation_locks[environment_key]
 
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
                     _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
+                        environment_key if environment_key in _active_environments
+                        else (None if execution_policy.is_workspace_scoped else (
+                            effective_task_id
+                            if effective_task_id in _active_environments
+                            else (task_id if task_id and task_id in _active_environments else None)
+                        ))
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
@@ -2388,6 +2611,7 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "execution_policy": execution_policy,
                             }
 
                         local_config = None
@@ -2404,7 +2628,7 @@ def terminal_tool(
                             ssh_config=ssh_config,
                             container_config=container_config,
                             local_config=local_config,
-                            task_id=effective_task_id,
+                            task_id=environment_key,
                             host_cwd=config.get("host_cwd"),
                         )
                     except ImportError as e:
@@ -2414,10 +2638,25 @@ def terminal_tool(
                             "error": f"Terminal tool disabled: environment creation failed ({e})",
                             "status": "disabled"
                         }, ensure_ascii=False)
+                    except Exception as e:
+                        from tools.environments.execution_policy import ExecutionWriteScopeError
+
+                        if isinstance(e, ExecutionWriteScopeError):
+                            return json.dumps(
+                                {
+                                    "output": "",
+                                    "exit_code": -1,
+                                    "status": "blocked",
+                                    **e.result.as_error(),
+                                },
+                                ensure_ascii=False,
+                            )
+                        if not isinstance(e, ImportError):
+                            raise
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _active_environments[environment_key] = new_env
+                        _last_activity[environment_key] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
@@ -2535,6 +2774,9 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        process_task_id = (
+            environment_key if execution_policy.is_workspace_scoped else effective_task_id
+        )
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2552,7 +2794,7 @@ def terminal_tool(
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=process_task_id,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
@@ -2562,7 +2804,7 @@ def terminal_tool(
                         env=env,
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=process_task_id,
                         session_key=session_key,
                     )
 

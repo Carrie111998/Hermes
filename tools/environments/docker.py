@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Optional
 
 from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.execution_policy import (
+    ExecutionWriteScopeError,
+    validate_execution_capability,
+)
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
@@ -839,11 +843,25 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        execution_policy=None,
     ):
+        if execution_policy is not None:
+            capability = validate_execution_capability(execution_policy, "docker")
+            if not capability.supported:
+                raise ExecutionWriteScopeError(capability)
+            if execution_policy.is_workspace_scoped:
+                volumes = [mapping.spec for mapping in capability.mappings]
+                extra_args = list(capability.extra_args)
+                host_cwd = None
+                auto_mount_cwd = False
+        workspace_scoped = bool(
+            execution_policy is not None and execution_policy.is_workspace_scoped
+        )
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
         self._persistent = persistent_filesystem
+        self._workspace_scoped = workspace_scoped
         self._persist_across_processes = persist_across_processes
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
@@ -920,7 +938,7 @@ class DockerEnvironment(BaseEnvironment):
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
         writable_args = []
-        if self._persistent:
+        if self._persistent and not workspace_scoped:
             sandbox = get_sandbox_dir() / "docker" / task_id
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
@@ -934,6 +952,9 @@ class DockerEnvironment(BaseEnvironment):
                     "-v", f"{self._workspace_dir}:/workspace",
                 ])
         else:
+            # Workspace scope never persists host-backed /root or /workspace
+            # binds. These paths remain writable, but only as private container
+            # storage; explicit session mappings are the sole host write path.
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 writable_args.extend([
                     "--tmpfs", "/workspace:rw,exec,size=10g",

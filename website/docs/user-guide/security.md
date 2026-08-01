@@ -316,6 +316,12 @@ Do not ask the agent to `patch` `~/.hermes/cron/jobs.json` directly. Use the `cr
 Write guards apply to `write_file` and `patch` only. The `terminal` tool runs as the same OS user and can still `cat` or overwrite denied paths via shell commands. The denylist reduces accidental damage and gives models a clear stop signal; it does not sandbox a hostile or compromised agent.
 :::
 
+### Process write scope
+
+`terminal.execution_write_scope: workspace` is the opt-in process boundary for a session. Docker is the only supported adapter in this release. Hermes validates normalized writable host mappings beneath the session workspace before `docker run`; local, SSH, Singularity, Modal, Daytona, and Vercel Sandbox refuse the request before creating a process, connection, container, or PTY. Docker-private paths remain writable. Private container files are not broker-published output.
+
+This setting is separate from `HERMES_WRITE_SAFE_ROOT`. The environment variable remains the cooperative native-file-tool policy for `write_file` and `patch`; it is never interpreted as an execution boundary and has no effect on terminal or `execute_code` process confinement.
+
 ## User Authorization (Gateway)
 
 When running the messaging gateway, Hermes controls who can interact with the bot through a layered authorization system.

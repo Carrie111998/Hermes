@@ -48,6 +48,9 @@ _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
+from tools.environments.execution_policy import (
+    ExecutionWriteScopeError,
+)
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
@@ -725,33 +728,47 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _creation_locks, _creation_locks_lock,
+        _resolve_container_task_id, _resolve_environment_key,
+        _resolve_execution_policy_for_task,
+        resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
+    config = _get_env_config()
+    env_type = config["env_type"]
+    overrides = resolve_task_overrides(task_id)
+    try:
+        from tools.terminal_tool import get_session_cwd
+
+        recorded_cwd = get_session_cwd(task_id)
+    except Exception:
+        recorded_cwd = None
+    cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
+    policy = _resolve_execution_policy_for_task(
+        config, task_id, env_type=env_type, cwd=cwd
+    )
+    if not policy.capability.supported:
+        raise ExecutionWriteScopeError(policy.capability)
+    environment_key = _resolve_environment_key(task_id, policy)
 
     # Fast path: environment already exists
     with _env_lock:
-        if effective_task_id in _active_environments:
-            _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+        if environment_key in _active_environments:
+            _last_activity[environment_key] = time.time()
+            return _active_environments[environment_key], env_type
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
-        if effective_task_id not in _creation_locks:
-            _creation_locks[effective_task_id] = threading.Lock()
-        task_lock = _creation_locks[effective_task_id]
+        if environment_key not in _creation_locks:
+            _creation_locks[environment_key] = threading.Lock()
+        task_lock = _creation_locks[environment_key]
 
     with task_lock:
         with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
-
-        config = _get_env_config()
-        env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+            if environment_key in _active_environments:
+                _last_activity[environment_key] = time.time()
+                return _active_environments[environment_key], env_type
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -764,8 +781,6 @@ def _get_or_create_env(task_id: str):
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
-
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
             container_config = {
@@ -777,6 +792,8 @@ def _get_or_create_env(task_id: str):
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
+                "docker_extra_args": config.get("docker_extra_args", []),
+                "execution_policy": policy,
             }
 
         ssh_config = None
@@ -805,13 +822,13 @@ def _get_or_create_env(task_id: str):
             ssh_config=ssh_config,
             container_config=container_config,
             local_config=local_config,
-            task_id=effective_task_id,
+            task_id=environment_key,
             host_cwd=config.get("host_cwd"),
         )
 
         with _env_lock:
-            _active_environments[effective_task_id] = env
-            _last_activity[effective_task_id] = time.time()
+            _active_environments[environment_key] = env
+            _last_activity[environment_key] = time.time()
 
         _start_cleanup_thread()
         logger.info("%s environment ready for execute_code task %s",
@@ -1224,9 +1241,26 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import (
+        _get_env_config,
+        _docker_has_host_access,
+        _resolve_execution_policy_for_task,
+    )
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    execution_policy = _resolve_execution_policy_for_task(
+        _env_config, task_id, env_type=env_type
+    )
+    if not execution_policy.capability.supported:
+        return json.dumps(
+            {
+                "status": "error",
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+                **execution_policy.capability.as_error(),
+            },
+            ensure_ascii=False,
+        )
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script

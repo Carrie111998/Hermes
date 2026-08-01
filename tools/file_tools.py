@@ -18,6 +18,7 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
+from tools.environments.execution_policy import ExecutionWriteScopeError
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -167,22 +168,20 @@ _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
+def _execution_scope_error(error: ExecutionWriteScopeError) -> str:
+    return json.dumps(
+        {"status": "error", **error.result.as_error()}, ensure_ascii=False
+    )
+
+
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
     try:
         from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
+            get_active_env,
         )
-
-        try:
-            container_key = _resolve_container_task_id(task_id)
-        except Exception:
-            container_key = task_id
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+        env = get_active_env(task_id)
         if env is not None:
             name = env.__class__.__name__.lower()
             if "local" in name:
@@ -627,19 +626,14 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     """Return the container-side Hermes mirror prefix for Docker file tools."""
     try:
         from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
+            get_active_env,
         )
-
-        container_key = _resolve_container_task_id(task_id)
     except Exception:
         return None
 
     try:
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+        env = get_active_env(task_id)
 
         if env is not None:
             if env.__class__.__name__ == "DockerEnvironment" and bool(
@@ -946,22 +940,44 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
+        _resolve_environment_key,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        _resolve_execution_policy_for_task,
+        resolve_task_overrides,
+        get_session_cwd,
     )
     import time
 
     raw_task_id = task_id or "default"
     task_id = _resolve_container_task_id(raw_task_id)
 
+    policy_config = _get_env_config()
+    policy_overrides = resolve_task_overrides(raw_task_id)
+    policy_cwd = (
+        policy_overrides.get("cwd")
+        or get_session_cwd(raw_task_id)
+        or policy_config["cwd"]
+    )
+    execution_policy = _resolve_execution_policy_for_task(
+        policy_config, raw_task_id,
+        env_type=policy_config["env_type"],
+        cwd=policy_cwd,
+    )
+    if not execution_policy.capability.supported:
+        from tools.environments.execution_policy import ExecutionWriteScopeError
+
+        raise ExecutionWriteScopeError(execution_policy.capability)
+    environment_key = _resolve_environment_key(raw_task_id, execution_policy)
+
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
     with _file_ops_lock:
-        cached = _file_ops_cache.get(task_id)
+        cached = _file_ops_cache.get(environment_key)
     if cached is not None:
         with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
+            if environment_key in _active_environments:
+                _last_activity[environment_key] = time.time()
                 return cached
             else:
                 # Environment was cleaned up -- preserve the old cwd in the
@@ -977,21 +993,21 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     except Exception:
                         pass
                 with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+                    _file_ops_cache.pop(environment_key, None)
 
     # Need to ensure the environment exists before building file_ops.
     # Acquire per-task lock so only one thread creates the sandbox.
     with _creation_locks_lock:
-        if task_id not in _creation_locks:
-            _creation_locks[task_id] = threading.Lock()
-        task_lock = _creation_locks[task_id]
+        if environment_key not in _creation_locks:
+            _creation_locks[environment_key] = threading.Lock()
+        task_lock = _creation_locks[environment_key]
 
     with task_lock:
         # Double-check: another thread may have created it while we waited
         with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                terminal_env = _active_environments[task_id]
+            if environment_key in _active_environments:
+                _last_activity[environment_key] = time.time()
+                terminal_env = _active_environments[environment_key]
             else:
                 terminal_env = None
 
@@ -1054,6 +1070,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
+                    "docker_extra_args": config.get("docker_extra_args", []),
+                    "execution_policy": execution_policy,
                 }
 
             ssh_config = None
@@ -1080,13 +1098,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 ssh_config=ssh_config,
                 container_config=container_config,
                 local_config=local_config,
-                task_id=task_id,
+                task_id=environment_key,
                 host_cwd=config.get("host_cwd"),
             )
 
             with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
+                _active_environments[environment_key] = terminal_env
+                _last_activity[environment_key] = time.time()
 
             _start_cleanup_thread()
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
@@ -1094,7 +1112,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     # Build file_ops from the (guaranteed live) environment and cache it
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
-        _file_ops_cache[task_id] = file_ops
+        _file_ops_cache[environment_key] = file_ops
     return file_ops
 
 
@@ -1102,7 +1120,21 @@ def clear_file_ops_cache(task_id: str = None):
     """Clear the file operations cache."""
     with _file_ops_lock:
         if task_id:
-            _file_ops_cache.pop(task_id, None)
+            keys = {str(task_id)}
+            try:
+                from tools.environments.execution_policy import (
+                    policy_environment_keys_for_session,
+                )
+
+                keys.update(policy_environment_keys_for_session(task_id))
+            except Exception:
+                pass
+            for key in list(_file_ops_cache):
+                if str(key) in keys or any(
+                    str(key).startswith(f"{candidate}:execution-write:")
+                    for candidate in keys
+                ):
+                    _file_ops_cache.pop(key, None)
         else:
             _file_ops_cache.clear()
 
@@ -1390,6 +1422,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             )
 
         return json.dumps(result_dict, ensure_ascii=False)
+    except ExecutionWriteScopeError as e:
+        return _execution_scope_error(e)
     except Exception as e:
         return tool_error(str(e))
 
@@ -1637,6 +1671,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
+    except ExecutionWriteScopeError as e:
+        return _execution_scope_error(e)
     except Exception as e:
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
@@ -1835,6 +1871,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     "content, or search_files to locate the text."
                 )
         return json.dumps(result_dict, ensure_ascii=False)
+    except ExecutionWriteScopeError as e:
+        return _execution_scope_error(e)
     except Exception as e:
         return tool_error(str(e))
 
@@ -1918,6 +1956,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             next_offset = offset + limit
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json
+    except ExecutionWriteScopeError as e:
+        return _execution_scope_error(e)
     except Exception as e:
         return tool_error(str(e))
 

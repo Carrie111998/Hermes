@@ -5,6 +5,7 @@ import subprocess
 import pytest
 
 from tools.environments import docker as docker_env
+from tools.environments.execution_policy import resolve_execution_write_policy
 
 
 def _mock_subprocess_run(monkeypatch):
@@ -53,6 +54,7 @@ def _make_dummy_env(**kwargs):
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
         persist_across_processes=kwargs.get("persist_across_processes", True),
+        execution_policy=kwargs.get("execution_policy"),
     )
 
 
@@ -76,6 +78,98 @@ def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, cap
         in record.getMessage()
         for record in caplog.records
     )
+
+
+class TestExecutionWriteScopeMappings:
+    def test_workspace_mapping_reaches_docker_only_after_normalization(self, monkeypatch, tmp_path):
+        calls = _mock_subprocess_run(monkeypatch)
+        monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        source = workspace / "project"
+        policy = resolve_execution_write_policy(
+            "workspace",
+            session_id="docker-mapping",
+            workspace_root=str(workspace),
+            backend="docker",
+            docker_volumes=[f"{source}:/workspace/project:rw"],
+        )
+
+        _make_dummy_env(execution_policy=policy)
+
+        run = next(command for command, _ in calls if len(command) > 1 and command[1] == "run")
+        assert f"{source.resolve()}:/workspace/project" in run
+
+    def test_workspace_mapping_rejects_outside_source_before_docker(self, monkeypatch, tmp_path):
+        policy = resolve_execution_write_policy(
+            "workspace",
+            session_id="docker-outside",
+            workspace_root=str(tmp_path / "workspace"),
+            backend="docker",
+            docker_volumes=[f"{tmp_path / 'outside'}:/workspace/project:rw"],
+        )
+        assert policy.capability.code == "outside_workspace_mapping"
+
+    def test_workspace_scope_keeps_persistent_root_and_workspace_private(
+        self, monkeypatch, tmp_path
+    ):
+        calls = _mock_subprocess_run(monkeypatch)
+        monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        policy = resolve_execution_write_policy(
+            "workspace",
+            session_id="docker-private-storage",
+            workspace_root=str(workspace),
+            backend="docker",
+        )
+
+        _make_dummy_env(execution_policy=policy, persistent_filesystem=True)
+
+        run = next(command for command, _ in calls if command[1] == "run")
+        assert not any(arg.startswith(str(tmp_path)) and arg.endswith(":/root") for arg in run)
+        assert not any(arg.startswith(str(tmp_path)) and arg.endswith(":/workspace") for arg in run)
+        assert "/root:rw,exec,size=1g" in run
+        assert "/workspace:rw,exec,size=10g" in run
+
+    def test_generated_inputs_are_read_only_in_workspace_scope(
+        self, monkeypatch, tmp_path
+    ):
+        calls = _mock_subprocess_run(monkeypatch)
+        monkeypatch.setattr(docker_env, "find_docker", lambda: "docker")
+        credential = tmp_path / "token.json"
+        credential.write_text("token", encoding="utf-8")
+        skills = tmp_path / "skills"
+        skills.mkdir()
+        cache = tmp_path / "images"
+        cache.mkdir()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        policy = resolve_execution_write_policy(
+            "workspace",
+            session_id="docker-generated-inputs",
+            workspace_root=str(workspace),
+            backend="docker",
+        )
+        monkeypatch.setattr(
+            "tools.credential_files.get_credential_file_mounts",
+            lambda: [{"host_path": str(credential), "container_path": "/run/token.json"}],
+        )
+        monkeypatch.setattr(
+            "tools.credential_files.get_skills_directory_mount",
+            lambda: [{"host_path": str(skills), "container_path": "/root/.hermes/skills"}],
+        )
+        monkeypatch.setattr(
+            "tools.credential_files.get_cache_directory_mounts",
+            lambda: [{"host_path": str(cache), "container_path": "/root/.hermes/images"}],
+        )
+
+        _make_dummy_env(execution_policy=policy)
+
+        run = next(command for command, _ in calls if command[1] == "run")
+        assert f"{credential}:/run/token.json:ro" in run
+        assert f"{skills}:/root/.hermes/skills:ro" in run
+        assert f"{cache}:/root/.hermes/images:ro" in run
 
 
 def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):

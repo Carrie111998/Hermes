@@ -141,3 +141,30 @@ def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
     assert terminal_tool._safe_getcwd() == "/home/me"
+
+
+def test_windows_docker_namespace_cwd_keeps_host_workspace_provenance(monkeypatch, tmp_path):
+    """The Docker default ``/root`` must not become a Windows host path."""
+    import hermes_cli.config as config_module
+
+    monkeypatch.setattr(terminal_tool, "_ensure_terminal_env_bridged", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_safe_getcwd", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {"terminal": {"execution_write_scope": "workspace"}},
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.delenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", raising=False)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == "/root"
+    assert config["host_cwd"] == str(tmp_path.resolve())
+    assert config["host_workspace_root"] == str(tmp_path.resolve())
+    policy = terminal_tool._resolve_execution_policy_for_task(
+        config, "windows-docker-session", env_type="docker", cwd=config["cwd"]
+    )
+    assert policy.workspace_root == str(tmp_path.resolve())
+    assert policy.workspace_root != r"D:\root"

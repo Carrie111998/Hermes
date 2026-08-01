@@ -121,6 +121,7 @@ Hermes supports seven terminal backends. Each determines where the agent's shell
 ```yaml
 terminal:
   backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity
+  execution_write_scope: legacy  # legacy | workspace; workspace is Docker-only
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   timeout: 180      # Per-command timeout in seconds
   home_mode: auto   # auto | real | profile — subprocess HOME policy
@@ -131,6 +132,12 @@ terminal:
 ```
 
 For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
+
+#### `terminal.execution_write_scope`
+
+`legacy` is the default and preserves the existing backend behavior. Set this to `workspace` when the session must have a process write boundary. This release supports that scope only on Docker. Docker validates every writable host mapping against the session's immutable workspace and refuses before container creation when it cannot prove the mapping. Local, SSH, Singularity, Modal, Daytona, and Vercel Sandbox return an explicit unsupported error and Hermes keeps the configured backend; it does not switch backends.
+
+The scope covers process writes and descendants. Private files inside the Docker container remain writable, but they are not published to the broker or made available through file delivery. `execution_write_scope` is configuration-owned and has no environment-variable override.
 
 ### Backend Overview
 
@@ -292,7 +299,7 @@ Parallel subagents spawned via `delegate_task(tasks=[...])` share this one conta
 
 #### Environment variable overrides
 
-Every key under `terminal:` has an env-var override of the form `TERMINAL_<KEY_UPPERCASE>`. The most useful ones for the Docker backend:
+Most keys under `terminal:` have an env-var override of the form `TERMINAL_<KEY_UPPERCASE>`. `execution_write_scope` is configuration-only because execution authority must not be supplied by an ambient process environment. The most useful environment overrides for the Docker backend are:
 
 | Env var | Maps to | Notes |
 |---|---|---|
