@@ -48,6 +48,15 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _script_timeout_display(job) -> str:
+    timeout = job.get("script_timeout_seconds")
+    if timeout is None:
+        return "global"
+    if timeout == 0:
+        return "unlimited"
+    return f"{timeout}s"
+
+
 def _active_cron_provider_name() -> str:
     """Name of the resolved cron scheduler provider ('builtin', 'chronos', …).
 
@@ -158,6 +167,7 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+            print(f"    Timeout:   {_script_timeout_display(job)}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
         workdir = job.get("workdir")
@@ -350,6 +360,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        script_timeout_seconds=getattr(args, "script_timeout_seconds", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -362,6 +373,7 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+        print(f"  Script timeout: {_script_timeout_display(job_data)}")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
@@ -401,19 +413,23 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
-    result = _cron_api(
-        action="update",
-        job_id=args.job_id,
-        schedule=getattr(args, "schedule", None),
-        prompt=getattr(args, "prompt", None),
-        name=getattr(args, "name", None),
-        deliver=getattr(args, "deliver", None),
-        repeat=getattr(args, "repeat", None),
-        skills=final_skills,
-        script=getattr(args, "script", None),
-        workdir=getattr(args, "workdir", None),
-        no_agent=getattr(args, "no_agent", None),
-    )
+    update_args = {
+        "action": "update",
+        "job_id": args.job_id,
+        "schedule": getattr(args, "schedule", None),
+        "prompt": getattr(args, "prompt", None),
+        "name": getattr(args, "name", None),
+        "deliver": getattr(args, "deliver", None),
+        "repeat": getattr(args, "repeat", None),
+        "skills": final_skills,
+        "script": getattr(args, "script", None),
+        "workdir": getattr(args, "workdir", None),
+        "no_agent": getattr(args, "no_agent", None),
+    }
+    if hasattr(args, "script_timeout_seconds"):
+        update_args["script_timeout_seconds"] = args.script_timeout_seconds
+
+    result = _cron_api(**update_args)
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -428,6 +444,7 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+        print(f"  Script timeout: {_script_timeout_display(updated)}")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):

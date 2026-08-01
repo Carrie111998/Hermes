@@ -49,6 +49,10 @@ hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
   --skill maps \
   --name "Skill combo"
+
+# Give this job 90 seconds for its attached script.
+hermes cron create "every 1h" "Summarize the collector output" \
+  --script collect.py --script-timeout-seconds 90
 ```
 
 ### Through natural conversation
@@ -152,6 +156,8 @@ hermes cron edit <job_id> --skill blogwatcher --skill maps
 hermes cron edit <job_id> --add-skill maps
 hermes cron edit <job_id> --remove-skill blogwatcher
 hermes cron edit <job_id> --clear-skills
+hermes cron edit <job_id> --script-timeout-seconds 0
+hermes cron edit <job_id> --script-timeout-seconds default
 ```
 
 Notes:
@@ -160,6 +166,13 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
+- `--script-timeout-seconds` controls only the attached script's wall-clock
+  limit. Omit it on create, pass `default` on CLI edit, or use `null` through
+  the tool/dashboard API to use the global `cron.script_timeout_seconds` /
+  `HERMES_CRON_SCRIPT_TIMEOUT` value; a positive finite number sets a
+  job-specific limit; exactly `0` disables the wall-clock limit. Negative
+  values, booleans, strings, NaN, and infinity are rejected on create and
+  update.
 
 ## Lifecycle actions
 

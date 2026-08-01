@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -1140,6 +1141,29 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def normalize_script_timeout_seconds(value: Any) -> Optional[Union[int, float]]:
+    """Validate a persisted per-job script wall-clock timeout.
+
+    ``None`` means use the global timeout, positive finite numbers override it,
+    and numeric zero disables the wall-clock timeout. Deliberately do not
+    coerce strings or booleans: accepting values such as ``"0"`` or ``False``
+    can silently turn malformed input into an unlimited job.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "script_timeout_seconds must be a finite number greater than or "
+            "equal to 0, or null to use the global timeout"
+        )
+    if (isinstance(value, float) and not math.isfinite(value)) or value < 0:
+        raise ValueError(
+            "script_timeout_seconds must be a finite number greater than or "
+            "equal to 0, or null to use the global timeout"
+        )
+    return value
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1213,6 +1237,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    script_timeout_seconds: Optional[Union[int, float]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1289,6 +1314,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_script_timeout = normalize_script_timeout_seconds(script_timeout_seconds)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1384,6 +1410,9 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Keep the historical serialized shape when the global timeout applies.
+    if normalized_script_timeout is not None:
+        job["script_timeout_seconds"] = normalized_script_timeout
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1458,14 +1487,23 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    updates = dict(updates or {})
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
-    bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
+    bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates)
     if bad_fields:
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+
+    clear_script_timeout = False
+    if "script_timeout_seconds" in updates:
+        normalized_timeout = normalize_script_timeout_seconds(
+            updates["script_timeout_seconds"]
+        )
+        clear_script_timeout = normalized_timeout is None
+        updates["script_timeout_seconds"] = normalized_timeout
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1484,6 +1522,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if clear_script_timeout:
+                updated.pop("script_timeout_seconds", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

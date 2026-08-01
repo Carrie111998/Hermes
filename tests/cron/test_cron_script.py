@@ -88,6 +88,178 @@ class TestJobScriptField:
         assert updated.get("script") is None
 
 
+class TestScriptTimeoutField:
+    """Per-job timeout validation, persistence, formatting, and execution."""
+
+    def test_tool_create_persists_and_executes_with_timeout(
+        self, cron_env, monkeypatch, tmp_path
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import get_job
+        from cron.scheduler import _run_job_script_for_job
+        from tools.cronjob_tools import cronjob
+
+        script = cron_env / "scripts" / "collector.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        captured = {}
+
+        def fake_run(*_args, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Summarize the collector",
+                schedule="every 1h",
+                script="collector.py",
+                workdir=str(workdir),
+                script_timeout_seconds=2.5,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["script_timeout_seconds"] == 2.5
+        stored = get_job(created["job_id"])
+        assert stored["script_timeout_seconds"] == 2.5
+
+        success, output = _run_job_script_for_job(
+            stored, workdir=stored["workdir"]
+        )
+        assert success is True
+        assert output == "ok"
+        assert captured["timeout"] == 2.5
+        assert captured["cwd"] == stored["workdir"]
+
+    def test_tool_update_supports_positive_zero_and_clear(self, cron_env):
+        from cron.jobs import get_job
+        from tools.cronjob_tools import cronjob
+
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 1h")
+        )
+        job_id = created["job_id"]
+
+        positive = json.loads(
+            cronjob(
+                action="update",
+                job_id=job_id,
+                script_timeout_seconds=30,
+            )
+        )
+        assert positive["success"] is True
+        assert get_job(job_id)["script_timeout_seconds"] == 30
+
+        unlimited = json.loads(
+            cronjob(
+                action="update",
+                job_id=job_id,
+                script_timeout_seconds=0,
+            )
+        )
+        assert unlimited["success"] is True
+        assert unlimited["job"]["script_timeout_seconds"] == 0
+
+        cleared = json.loads(
+            cronjob(
+                action="update",
+                job_id=job_id,
+                script_timeout_seconds=None,
+            )
+        )
+        assert cleared["success"] is True
+        assert "script_timeout_seconds" not in get_job(job_id)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [-1, float("nan"), float("inf"), "30", True],
+    )
+    def test_tool_create_rejects_invalid_timeout(self, cron_env, invalid):
+        from tools.cronjob_tools import cronjob
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="x",
+                schedule="every 1h",
+                script_timeout_seconds=invalid,
+            )
+        )
+        assert result["success"] is False
+        assert "script_timeout_seconds" in result["error"]
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [-1, float("nan"), float("-inf"), "0", False],
+    )
+    def test_tool_update_rejects_invalid_timeout(self, cron_env, invalid):
+        from tools.cronjob_tools import cronjob
+
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 1h")
+        )
+        result = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                script_timeout_seconds=invalid,
+            )
+        )
+        assert result["success"] is False
+        assert "script_timeout_seconds" in result["error"]
+
+    def test_legacy_missing_timeout_uses_global(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script_for_job
+
+        script = cron_env / "scripts" / "legacy.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+        captured = {}
+
+        def fake_run(*_args, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 77)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        assert _run_job_script_for_job({"script": "legacy.py"}) == (True, "ok")
+        assert captured["timeout"] == 77
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [-1, "30", False, float("nan"), float("inf")],
+    )
+    def test_malformed_legacy_timeout_warns_and_uses_global(
+        self, cron_env, monkeypatch, caplog, invalid
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script_for_job
+
+        script = cron_env / "scripts" / "legacy.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+        captured = {}
+
+        def fake_run(*_args, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 88)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        with caplog.at_level("WARNING"):
+            result = _run_job_script_for_job(
+                {"script": "legacy.py", "script_timeout_seconds": invalid}
+            )
+
+        assert result == (True, "ok")
+        assert captured["timeout"] == 88
+        assert "using global timeout" in caplog.text
+
+
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     from tools.cronjob_tools import cronjob
 

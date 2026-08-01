@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 from hermes_cli.subcommands.cron import build_cron_parser
 
 
@@ -55,6 +57,7 @@ def test_cron_create_options():
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
         "--workdir", "/tmp/x",
+        "--script-timeout-seconds", "12.5",
     ])
     assert ns.schedule == "0 9 * * *"
     assert ns.prompt == "daily task prompt"
@@ -64,6 +67,7 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+    assert ns.script_timeout_seconds == 12.5
 
 
 def test_cron_edit_no_agent_tristate():
@@ -72,6 +76,25 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j", "--no-agent"]).no_agent is True
     assert parser.parse_args(["cron", "edit", "j", "--agent"]).no_agent is False
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "bad"])
+def test_cron_script_timeout_rejects_invalid_values(value):
+    parser = _build()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["cron", "create", "30m", "prompt", "--script-timeout-seconds", value]
+        )
+
+
+def test_cron_script_timeout_default_is_explicit_null():
+    parser = _build()
+    omitted = parser.parse_args(["cron", "edit", "j"])
+    cleared = parser.parse_args(
+        ["cron", "edit", "j", "--script-timeout-seconds", "default"]
+    )
+    assert not hasattr(omitted, "script_timeout_seconds")
+    assert cleared.script_timeout_seconds is None
 
 
 def test_cron_dispatch_func_is_injected_handler():

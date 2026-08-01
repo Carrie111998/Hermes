@@ -14,6 +14,7 @@ export interface CronJobFormState {
   context_from: string;
   enabled_toolsets: string[];
   workdir: string;
+  script_timeout_seconds: string;
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -44,6 +45,13 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function optionalNonNegativeNumber(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 /** Build the create/update payload. Optional fields collapse to null so an
  * update explicitly clears them rather than leaving stale values. */
 export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
@@ -63,6 +71,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
+    script_timeout_seconds: optionalNonNegativeNumber(form.script_timeout_seconds),
   };
 }
 
@@ -91,5 +100,9 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     context_from: listToText(job.context_from),
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
+    script_timeout_seconds:
+      typeof job.script_timeout_seconds === "number"
+        ? String(job.script_timeout_seconds)
+        : "",
   };
 }

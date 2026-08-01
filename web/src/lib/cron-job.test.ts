@@ -24,6 +24,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    script_timeout_seconds: "",
     ...overrides,
   };
 }
@@ -68,7 +69,19 @@ describe("buildCronJobPayload", () => {
       context_from: null,
       enabled_toolsets: null,
       workdir: null,
+      script_timeout_seconds: null,
     });
+  });
+
+  it("preserves positive and zero script timeout overrides", () => {
+    expect(
+      buildCronJobPayload(form({ script_timeout_seconds: "12.5" }))
+        .script_timeout_seconds,
+    ).toBe(12.5);
+    expect(
+      buildCronJobPayload(form({ script_timeout_seconds: "0" }))
+        .script_timeout_seconds,
+    ).toBe(0);
   });
 });
 
@@ -96,12 +109,14 @@ describe("cronJobFormFromJob", () => {
       schedule_display: "every 1h",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      script_timeout_seconds: 0,
     };
 
     expect(cronJobFormFromJob(job)).toMatchObject({
       schedule: "every 1h",
       context_from: "upstream-a\nupstream-b",
       enabled_toolsets: ["web"],
+      script_timeout_seconds: "0",
     });
   });
 

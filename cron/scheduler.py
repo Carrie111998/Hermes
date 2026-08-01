@@ -2206,7 +2206,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     *,
-    timeout_seconds: int | float | str | None = None,
+    timeout_seconds: Any = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2272,12 +2272,14 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout: int | None = _get_script_timeout()
+    script_timeout: int | float | None = _get_script_timeout()
     if timeout_seconds is not None:
         try:
-            configured_timeout = int(float(timeout_seconds))
-            script_timeout = configured_timeout if configured_timeout > 0 else None
-        except (TypeError, ValueError):
+            from cron.jobs import normalize_script_timeout_seconds
+
+            configured_timeout = normalize_script_timeout_seconds(timeout_seconds)
+            script_timeout = None if configured_timeout == 0 else configured_timeout
+        except ValueError:
             logger.warning(
                 "Invalid per-job script_timeout_seconds=%r; using global timeout",
                 timeout_seconds,
