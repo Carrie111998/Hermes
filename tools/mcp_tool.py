@@ -3500,10 +3500,15 @@ class MCPServerTask:
         connected" errors on every turn.
         """
         from tools.registry import registry
+        from tools.tool_search import unmark_description_only_tool
 
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
             registry.deregister(tool_name)
             _forget_mcp_tool_server(tool_name)
+            # Drop description_only marks so a disabled/unloaded server can't
+            # leave stale marks that make is_deferrable_tool_name() return True
+            # forever for tools that no longer exist. (#66826)
+            unmark_description_only_tool(tool_name)
         self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
@@ -5736,6 +5741,13 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     # discovered via tool_search rather than loaded into the tools array
     # on every turn. Mirroring Claude Code's ``defer_loading`` pattern.
     tool_injection = config.get("tool_injection", "full")
+    if tool_injection not in ("full", "description_only"):
+        logger.warning(
+            "MCP server '%s': invalid tool_injection=%r — expected 'full' or "
+            "'description_only'; falling back to 'full'",
+            name, tool_injection,
+        )
+        tool_injection = "full"
     is_description_only = tool_injection == "description_only"
 
     if is_description_only:
@@ -6460,7 +6472,7 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
-    from model_tools import get_tool_definitions
+    import model_tools
     from tools.registry import registry
 
     # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
@@ -6489,7 +6501,7 @@ def refresh_agent_mcp_tools(
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
     new_defs = list(
-        get_tool_definitions(
+        model_tools.get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
@@ -6497,6 +6509,14 @@ def refresh_agent_mcp_tools(
         or []
     )
     new_names = {t["function"]["name"] for t in new_defs}
+    # Pre-assembly view of the SAME snapshot: get_tool_definitions restores
+    # model_tools._last_pre_assembly_tool_names on both the fresh-compute and
+    # cache-hit paths, so this always reflects the full granted set before
+    # tool_search assembly (description_only tools included). Published onto
+    # the agent atomically with the snapshot below — without this, a server
+    # registered AFTER agent_init (lazy refresh / /reload-mcp) would never
+    # reach the system-prompt description_only inventory. (#66826)
+    new_pre_assembly = set(model_tools._last_pre_assembly_tool_names)
 
     # Re-append the post-build injected families that get_tool_definitions does
     # NOT reproduce, so a refresh never strips them (memory-provider + context-
@@ -6532,6 +6552,9 @@ def refresh_agent_mcp_tools(
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
+        # Publish the pre-assembly view atomically with the snapshot so the
+        # system-prompt description_only inventory tracks late registrations.
+        agent._pre_assembly_tool_names = new_pre_assembly
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

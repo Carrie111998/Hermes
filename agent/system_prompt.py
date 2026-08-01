@@ -348,7 +348,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 # (bridge tools only); ``_pre_assembly_tool_names`` is the full
                 # set of tools granted to this session.
                 _pre_names = getattr(agent, '_pre_assembly_tool_names', None)
-                _do_names = get_description_only_tool_names() & (_pre_names if _pre_names is not None else agent.valid_tool_names)
+                if _pre_names is None:
+                    _pre_names = agent.valid_tool_names
+                # The intersection below needs a set: agent_init stores a set,
+                # but tolerate a list-valued fallback (valid_tool_names) or an
+                # externally-constructed agent instead of silently dropping
+                # the whole inventory block on a TypeError.
+                if not isinstance(_pre_names, (set, frozenset)):
+                    _pre_names = set(_pre_names)
+                _do_names = get_description_only_tool_names() & _pre_names
                 if _do_names:
                     from tools.registry import registry
                     _do_lines = []
@@ -366,8 +374,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                             + "\n".join(_do_lines)
                         )
                         stable_parts.append(_do_block)
-        except Exception:
-            pass
+        except Exception as e:  # pragma: no cover — never break prompt building
+            logger.warning("Description-only tool inventory build failed: %s", e)
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt

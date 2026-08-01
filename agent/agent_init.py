@@ -1427,9 +1427,16 @@ def init_agent(
         # the ones that happen to be visible after assembly.
         try:
             import model_tools
-            agent._pre_assembly_tool_names = set(model_tools._last_resolved_tool_names)
-        except Exception:
+            # Read the PRE-assembly snapshot, not ``_last_resolved_tool_names``:
+            # the latter is overwritten with the cached POST-assembly list on a
+            # quiet_mode cache hit, which would silently empty the inventory
+            # for every session after the first with the same toolset key.
+            # ``_last_pre_assembly_tool_names`` is restored identically on both
+            # the fresh-compute and cache-hit paths. (#66826)
+            agent._pre_assembly_tool_names = set(model_tools._last_pre_assembly_tool_names)
+        except Exception as e:
             agent._pre_assembly_tool_names = set()
+            logger.warning("Failed to capture pre-assembly tool names: %s", e)
         tool_names = sorted(agent.valid_tool_names)
         if not agent.quiet_mode:
             print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")

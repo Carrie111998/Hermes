@@ -212,6 +212,17 @@ def mark_description_only_tool(name: str) -> None:
     _description_only_tool_names.add(name)
 
 
+def unmark_description_only_tool(name: str) -> None:
+    """Remove a description-only mark (idempotent).
+
+    Called when the owning MCP server's tools are deregistered (server
+    disabled/unloaded/parked), so a stale mark can't keep
+    :func:`is_deferrable_tool_name` returning True forever for a tool that
+    no longer exists in the registry. (#66826)
+    """
+    _description_only_tool_names.discard(name)
+
+
 def is_description_only_tool(name: str) -> bool:
     """Return True if this tool is registered as description-only."""
     return name in _description_only_tool_names
@@ -1089,6 +1100,7 @@ __all__ = [
     "scoped_deferrable_names",
     "validate_deferred_call_args",
     "mark_description_only_tool",
+    "unmark_description_only_tool",
     "is_description_only_tool",
     "get_description_only_tool_names",
 ]
