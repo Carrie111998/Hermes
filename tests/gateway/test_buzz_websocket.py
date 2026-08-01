@@ -135,7 +135,7 @@ async def test_membership_event_adopts_new_named_channel_when_unpinned():
                 {"channel_id": new_channel, "name": "release-team", "description": "Announcements"}
             ]), ""
         if args[:2] == ["messages", "get"]:
-            return 0, "[]", ""
+            return 0, json.dumps([{"id": "pre-join", "created_at": 41}]), ""
         raise AssertionError(f"unexpected CLI command: {args}")
 
     class WebSocket:
@@ -150,9 +150,14 @@ async def test_membership_event_adopts_new_named_channel_when_unpinned():
     subscriptions = {"membership": None}
     await adapter._handle_membership_event(websocket, subscriptions, {"created_at": 42})
 
-    assert adapter._channel_state[new_channel]["chat_type"] == "group"
-    assert adapter._channel_state[new_channel]["last_ts"] == 0
-    assert any(channel_id == new_channel for channel_id in subscriptions.values())
+    state = adapter._channel_state[new_channel]
+    assert state["chat_type"] == "group"
+    assert state["last_ts"] == 41
+    assert "pre-join" in state["seen"]
+    subscription_id = next(key for key, value in subscriptions.items() if value == new_channel)
+    assert websocket.sent == [[
+        "REQ", subscription_id, {"kinds": [9], "#h": [new_channel], "since": 40}
+    ]]
 
 
 @pytest.mark.asyncio
@@ -171,3 +176,21 @@ async def test_membership_event_does_not_adopt_channel_outside_explicit_watch_li
     adapter._run_cli = run_cli
     await adapter._handle_membership_event(_FakeWebSocket(), {"membership": None}, {"created_at": 42})
     assert "not-configured" not in adapter._channel_state
+
+
+@pytest.mark.asyncio
+async def test_membership_event_leaves_state_unchanged_when_channel_lookup_fails():
+    adapter = _make_adapter()
+
+    async def run_cli(args, **_kwargs):
+        if args == ["dms", "list"]:
+            return 0, "[]", ""
+        if args == ["channels", "list"]:
+            return 1, "", "unavailable"
+        raise AssertionError(f"unexpected CLI command: {args}")
+
+    adapter._run_cli = run_cli
+    subscriptions = {"membership": None}
+    await adapter._handle_membership_event(_FakeWebSocket(), subscriptions, {"created_at": 42})
+    assert adapter._channel_state == {}
+    assert subscriptions == {"membership": None}

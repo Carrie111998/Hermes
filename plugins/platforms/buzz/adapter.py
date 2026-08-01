@@ -804,7 +804,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
         before = set(self._channel_state)
         await self._discover_dms(seed=False)
-        await self._discover_joined_channels(seed=True)
+        await self._discover_joined_channels()
         for channel_id in self._channel_state:
             if channel_id in before:
                 continue
@@ -963,11 +963,13 @@ class BuzzAdapter(BasePlatformAdapter):
             else:
                 self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
 
-    async def _discover_joined_channels(self, *, seed: bool) -> None:
-        """Adopt community channels joined after startup when no watch list is pinned.
+    async def _discover_joined_channels(self) -> None:
+        """Adopt newly joined community channels when no watch list is pinned.
 
-        This is deliberately separate from the DM fallback: real channels must
-        never be reclassified as DMs merely because their membership changes.
+        The initial high-water mark suppresses pre-membership history, matching
+        startup channel discovery. This is deliberately separate from the DM
+        fallback: real channels must never be reclassified as DMs merely
+        because their membership changes.
         """
         if self.channels:
             return
@@ -982,10 +984,7 @@ class BuzzAdapter(BasePlatformAdapter):
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
             if ch_id in self._channel_state:
                 continue
-            if seed:
-                await self._seed_channel(ch_id, chat_type="group")
-            else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+            await self._seed_channel(ch_id, chat_type="group")
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
