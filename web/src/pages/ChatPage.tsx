@@ -36,6 +36,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
@@ -739,6 +740,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.loadAddon(new WebLinksAddon());
 
     let mobileInputCleanup: (() => void) | null = null;
+    // xterm occasionally drops committed dead-key/IME text instead of emitting
+    // onData. The compositionend event supplies the authoritative text.
+    let sendComposedText: (data: string) => void = () => undefined;
+    const compositionForwarder = createPtyCompositionForwarder((data) => {
+      sendComposedText(data);
+    });
     term.open(host);
 
     const textarea = term.textarea;
@@ -763,8 +770,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
         }
       };
-      const markCompositionEnd = () => {
+      const markCompositionEnd = (ev: Event) => {
         mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
+        compositionForwarder.onCompositionEnd((ev as CompositionEvent).data);
       };
 
       textarea.addEventListener("beforeinput", markReplacementInput, true);
@@ -1179,7 +1187,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // behave normally.
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-      onDataDisposable = term.onData((data) => {
+      const forwardPtyData = (data: string) => {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
         // terminal doesn't trip the "reconnecting" notice.
@@ -1210,6 +1218,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           mobileReplacementInputUntilRef.current = 0;
         }
         ws.send(normalized.data);
+      };
+      sendComposedText = forwardPtyData;
+      onDataDisposable = term.onData((data) => {
+        if (compositionForwarder.shouldForwardTerminalData(data)) {
+          forwardPtyData(data);
+        }
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
