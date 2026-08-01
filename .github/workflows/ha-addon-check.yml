@@ -1,0 +1,89 @@
+name: Home Assistant Add-on Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'build.yaml'
+      - 'config.yaml'
+      - 'Dockerfile'
+      - 'run.sh'
+      - '.github/workflows/ha-addon-check.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'build.yaml'
+      - 'config.yaml'
+      - 'Dockerfile'
+      - 'run.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-addon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Validate config.yaml structure
+        run: |
+          # Validate config.yaml is valid YAML and has required HA add-on fields
+          python3 -c "
+import yaml, sys
+
+with open('config.yaml') as f:
+    cfg = yaml.safe_load(f)
+
+required = ['name', 'version', 'slug', 'description', 'arch', 'startup', 'boot']
+for field in required:
+    assert field in cfg, f'Missing required field: {field}'
+    assert cfg[field], f'Empty required field: {field}'
+
+assert cfg.get('arch'), 'arch must be non-empty'
+assert cfg['startup'] in ('application', 'services', 'once', 'initialize'), \
+    f'Invalid startup value: {cfg[\"startup\"]}'
+assert cfg['boot'] in ('auto', 'manual'), f'Invalid boot value: {cfg[\"boot\"]}'
+
+# ingress_port required when ingress is enabled
+if cfg.get('ingress'):
+    assert cfg.get('ingress_port'), 'ingress: true but missing ingress_port'
+
+print('config.yaml: OK')
+"
+
+      - name: Validate build.yaml structure
+        run: |
+          python3 -c "
+import yaml, sys
+
+with open('build.yaml') as f:
+    cfg = yaml.safe_load(f)
+
+assert 'build_from' in cfg, 'Missing build_from'
+assert 'dockerfile' in cfg, 'Missing dockerfile'
+assert cfg['dockerfile'] == 'Dockerfile', f'Expected Dockerfile, got {cfg[\"dockerfile\"]}'
+
+for arch in ('aarch64', 'amd64'):
+    assert arch in cfg['build_from'], f'Missing arch {arch} in build_from'
+    assert 'base-python' in cfg['build_from'][arch], \
+        f'build_from.{arch} does not reference a base-python image'
+
+print('build.yaml: OK')
+"
+
+      - name: Validate Dockerfile builds (amd64)
+        run: |
+          docker build . \
+            --file Dockerfile \
+            --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.21 \
+                  --build-arg BUILD_ARCH=amd64 \
+                  --tag test-build \
+                  --quiet
+                echo 'Dockerfile (amd64): OK'
