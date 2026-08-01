@@ -128,7 +128,7 @@ export function FloatingPet() {
   const [position, setPosition] = useState<Point>(loadPosition)
   const containerRef = useRef<HTMLDivElement | null>(null)
   // P0.1: Tracks whether we already auto-popped this pet activation.
-  const restoredRef = useRef(false)
+  const [hasAutoPopped, setHasAutoPopped] = useState(false)
   // The facing mirror lives on the sprite wrapper, not the container, so the
   // speech bubble (a container child) never renders flipped/backwards.
   const spriteWrapRef = useRef<HTMLDivElement | null>(null)
@@ -252,7 +252,7 @@ export function FloatingPet() {
   useOnProfileSwitch(() => {
     setPetInfo({ enabled: false })
     resetPetGallery()
-    restoredRef.current = false
+    setHasAutoPopped(false)
   })
 
   // Wire the overlay control channel once, only in the primary window — the
@@ -286,20 +286,16 @@ export function FloatingPet() {
   // avatarMode is 'desktop' (the default). If the user previously docked,
   // fall back to restorePetOverlay (reopens only if it was already popped).
   // Primary window only; runs at most once per pet activation.
-
-  // Mark restoration intent in render body — prevents stale-read lag and
-  // avoids the no-restricted-syntax rule against useEffect-based ref sync.
-  // The ref guards exactly one auto-pop per activation; idempotent when
-  // re-renders don't change active state.
-  // eslint-disable-next-line no-restricted-syntax -- intentional render-body sentinel
-  if (!isSecondaryWindow() && !restoredRef.current && active) {
-    restoredRef.current = true
-  }
-
   useEffect(() => {
-    if (isSecondaryWindow() || !restoredRef.current || !active) {
+    if (isSecondaryWindow() || !active) {
       return
     }
+
+    // One-shot sentinel: auto-pop at most once per activation.
+    if (hasAutoPopped) {
+      return
+    }
+    setHasAutoPopped(true)
 
     const mode = $avatarMode.get()
 
@@ -314,7 +310,7 @@ export function FloatingPet() {
     } else {
       restorePetOverlay()
     }
-  }, [active])
+  }, [active, hasAutoPopped])
 
   // Never strand or crop the pet: re-clamp (and persist) whenever the viewport
   // shrinks or the pet's own size changes (wheel/slider). `clamp` carries the

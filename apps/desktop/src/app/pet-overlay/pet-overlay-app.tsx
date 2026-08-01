@@ -193,9 +193,6 @@ export function PetOverlayApp() {
   // Last mirrored reaction id — a bump means the main window fired a reaction.
   const lastReactionRef = useRef<number | null>(null)
   const ignoreRef = useRef(true)
-  const composerOpenRef = useRef(false)
-  const settingsOpenRef = useRef(false)
-  const contextMenuRef = useRef(false)
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const setIgnore = (ignore: boolean) => {
@@ -307,8 +304,8 @@ export function PetOverlayApp() {
         return false
       }
 
-      // Context menu and settings panel are always interactive.
-      if (contextMenuRef.current || settingsOpenRef.current) {
+      // Context menu / settings panel / composer are always interactive.
+      if (contextMenu || settingsOpen || composerOpen) {
         return true
       }
 
@@ -344,7 +341,7 @@ export function PetOverlayApp() {
     }
 
     const onMove = (ev: MouseEvent) => {
-      if (dragRef.current || composerOpenRef.current || contextMenuRef.current || settingsOpenRef.current) {
+      if (dragRef.current || composerOpen || contextMenu || settingsOpen) {
         setIgnore(false)
 
         return
@@ -359,17 +356,7 @@ export function PetOverlayApp() {
       window.removeEventListener('mousemove', onMove)
       clearTimeout(clickTimerRef.current)
     }
-  }, [])
-
-  // Keep refs current for callback access — render-body assignment is
-  // intentional here: useEffect-based ref sync lags one render and causes
-  // stale-read bugs in mousemove handlers that read these refs.
-  // eslint-disable-next-line no-restricted-syntax -- intentional render-body ref sync
-  composerOpenRef.current = composerOpen
-  // eslint-disable-next-line no-restricted-syntax -- intentional render-body ref sync
-  settingsOpenRef.current = settingsOpen
-  // eslint-disable-next-line no-restricted-syntax -- intentional render-body ref sync
-  contextMenuRef.current = Boolean(contextMenu)
+  }, [composerOpen, settingsOpen, contextMenu])
 
   // The whole window must stay interactive while the composer or settings are
   // open (so inputs keep focus). The overlay is a non-activating panel — flip
