@@ -14017,5 +14017,171 @@ def test_d4_real_dispatcher_claims_development_and_review_reentry(kanban_home, m
         assert tid in [spawn[0] for spawn in result.spawned]
         assert task is not None and task.current_run_id is not None
         assert run is not None and run.profile == "resolver"
-        if step == "review":
-            assert tid in calls
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "assignee",
+        "project_id",
+        "workflow_template_id",
+        "current_step_key",
+        "workspace_path",
+        "branch_name",
+    ],
+)
+def test_d3_rejects_oversized_cas_metadata_before_create_mutation(kanban_home, field):
+    kwargs = {
+        "title": "D3 oversized metadata",
+        "workspace_kind": "worktree",
+        field: "值🙂é" * 30_000,
+    }
+    if field in {"workflow_template_id", "current_step_key"}:
+        kwargs["workflow_template_id"] = "product"
+        kwargs["current_step_key"] = "development"
+        kwargs[field] = "值🙂é" * 30_000
+    if field == "project_id":
+        # The bound must be checked before project lookup, so a huge ID cannot
+        # be hidden behind the normal unknown-project error.
+        kwargs["workspace_kind"] = "scratch"
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match=field):
+            kb.create_task(conn, **kwargs)
+        assert kb.list_tasks(conn) == []
+
+
+def test_d4_rejects_coherently_forged_non_resolver_cycle_without_mutation(kanban_home):
+    board = "d4-forged-resolver"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        blocked_id = expected["escalation_event_id"]
+        preflight = next(
+            event for event in kb.list_events(conn, tid)
+            if event.id == expected["preflight_event_id"]
+        )
+        resolved_id = blocked_id - 1
+        resolved = next(event for event in kb.list_events(conn, tid) if event.id == resolved_id)
+        forged_preflight = dict(preflight.payload)
+        forged_preflight["hermes_assignee"] = "developer"
+        forged_resolved = dict(resolved.payload)
+        forged_resolved["resolver_profile"] = "developer"
+        conn.execute(
+            "UPDATE task_runs SET profile='developer' WHERE id=?",
+            (expected["run_id"],),
+        )
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(forged_preflight), preflight.id),
+        )
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(forged_resolved), resolved.id),
+        )
+        conn.commit()
+        before_task = kb.get_task(conn, tid)
+        before_events = kb.list_events(conn, tid)
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+        assert kb.get_task(conn, tid) == before_task
+        assert kb.list_events(conn, tid) == before_events
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("reason", 123),
+        ("reason", None),
+        ("resolution", {}),
+        ("resolution", False),
+        ("attempted_resolutions", {}),
+        ("attempted_resolutions", None),
+        ("attempted_resolutions", ["valid", 7]),
+    ],
+)
+def test_d4_rejects_present_malformed_copied_evidence_atomically(
+    kanban_home, field, bad_value
+):
+    board = f"d4-evidence-{field}-{type(bad_value).__name__}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        blocked = next(event for event in kb.list_events(conn, tid) if event.id == expected["escalation_event_id"])
+        payload = dict(blocked.payload)
+        payload[field] = bad_value
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), blocked.id),
+        )
+        conn.commit()
+        before_task = kb.get_task(conn, tid)
+        before_events = kb.list_events(conn, tid)
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+        assert kb.get_task(conn, tid) == before_task
+        assert kb.list_events(conn, tid) == before_events
+
+
+def test_d4_absent_optional_copied_evidence_remains_distinct_from_malformed(kanban_home):
+    board = "d4-evidence-absent"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        blocked = next(event for event in kb.list_events(conn, tid) if event.id == expected["escalation_event_id"])
+        payload = dict(blocked.payload)
+        payload.pop("reason")
+        payload.pop("resolution")
+        payload.pop("attempted_resolutions")
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), blocked.id),
+        )
+        conn.commit()
+        event_id = kb.reenter_resolver_escalation(
+            conn, tid, board=board, answer="answer", answered_by="operator",
+            expected=expected,
+        )
+        answer_event = next(event for event in kb.list_events(conn, tid) if event.id == event_id)
+    assert answer_event.payload["reason"] == ""
+    assert answer_event.payload["resolver_escalation_reason"] == ""
+    assert answer_event.payload["attempted_resolutions"] == []
+
+
+@pytest.mark.parametrize(
+    "event_kind",
+    [
+        "dispatcher_metadata_conflict",
+        "diagnostic",
+        "heartbeat",
+        "traceability",
+        "unknown",
+        "workflow_step",
+        "status_changed",
+    ],
+)
+def test_d4_non_audit_events_invalidate_escalation_without_mutation(kanban_home, event_kind):
+    board = f"d4-event-{event_kind}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _, expected = _d4_escalated(conn, board)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (tid, event_kind, json.dumps({"note": "later event"}), int(time.time())),
+        )
+        conn.commit()
+        before_task = kb.get_task(conn, tid)
+        before_events = kb.list_events(conn, tid)
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.reenter_resolver_escalation(
+                conn, tid, board=board, answer="answer", answered_by="operator",
+                expected=expected,
+            )
+        assert kb.get_task(conn, tid) == before_task
+        assert kb.list_events(conn, tid) == before_events

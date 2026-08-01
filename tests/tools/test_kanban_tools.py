@@ -653,6 +653,120 @@ def test_review_target_schema_accepts_only_offset():
     assert params["required"] == []
 
 
+def _resolver_show_boundary_task(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    kb._INITIALIZED_PATHS.clear()
+
+    board = "resolver-unicode-boundary"
+    kb.create_board(board, name="Resolver Unicode Boundary", preset="product")
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    workflow = metadata.setdefault("product_workflow", {})
+    workflow["handoff_v2"] = True
+    workflow["human_escalation_profile"] = "resolver"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # These are the largest multibyte values admitted by their respective
+    # Resolver CAS fields while still satisfying the public task-ingress
+    # contract. The worktree is not resolved: its metadata is what this test
+    # exercises, so the path need only be an absolute stored value.
+    workspace_path = "/" + ("🙂" * 4095)
+    branch_name = "🙂" * 1024
+    assert len(workspace_path) == 4096
+    assert len(workspace_path.encode("utf-8")) <= 16_384
+    assert len(branch_name) == 1024
+    assert len(branch_name.encode("utf-8")) == 4_096
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Resolver Unicode boundary",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a Resolver decision",
+            kind="needs_input",
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None and resolver.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    return board, task_id, workspace_path, branch_name
+
+
+def test_resolver_show_preserves_multibyte_cas_boundaries_and_fails_closed(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    board, task_id, workspace_path, branch_name = _resolver_show_boundary_task(
+        monkeypatch, tmp_path
+    )
+
+    with kb.connect(board=board) as conn:
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        before_task = kb.get_task(conn, task_id)
+        before_events = kb.list_events(conn, task_id)
+        with pytest.raises(
+            ValueError,
+            match="workspace_path exceeds exact Resolver snapshot bound",
+        ):
+            kb.set_workspace_path(conn, task_id, workspace_path + "x")
+        assert kb.get_task(conn, task_id) == before_task
+        assert kb.list_events(conn, task_id) == before_events
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show.encode("utf-8")) < 96_000
+    shown = json.loads(raw_show)
+    assert shown["expected"] == expected
+    assert shown["expected"]["workspace_path"] == workspace_path
+    assert shown["expected"]["branch_name"] == branch_name
+
+    # A legacy row altered outside public ingress is an explicit, concise
+    # fail-closed residual. It must not be truncated into an apparently valid
+    # CAS or padded with a repair token.
+    with kb.connect(board=board) as conn:
+        malformed_path = workspace_path + "x"
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?",
+            (malformed_path, task_id),
+        )
+        conn.commit()
+    residual = json.loads(kt._handle_show({}))
+    error = residual.get("error", "")
+    assert error.startswith(
+        "kanban_show: workspace_path exceeds exact Resolver snapshot bound"
+    )
+    assert len(error.encode("utf-8")) < 512
+    assert "truncated" not in error
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})

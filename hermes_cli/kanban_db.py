@@ -2351,6 +2351,7 @@ def set_phase(
     if meta is None or not _handoff_v2_enabled(meta):
         return False
     _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
+    _validate_resolver_cas_fields({"phase": phase})
     with authorized_governance_write(), write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET current_step_key = ? WHERE id = ?",
@@ -2992,7 +2993,8 @@ def resolver_expected_snapshot(
     if row is None or preflight is None:
         return None
     preflight_event_id, _payload = preflight
-    return {
+    snapshot = {
+        "task_id": task_id,
         "run_id": row["current_run_id"],
         "preflight_event_id": preflight_event_id,
         "status": row["status"],
@@ -3006,6 +3008,9 @@ def resolver_expected_snapshot(
         "running": bool(row["running"]),
         "blocked": bool(row["blocked"]),
     }
+    _validate_resolver_cas_fields(snapshot)
+    snapshot.pop("task_id")
+    return snapshot
 
 
 def has_unresolved_product_preflight(
@@ -3085,6 +3090,14 @@ def _complete_product_workflow_step(
             next_status = _column_status_for_step(meta, next_step)
         role = transition.get("assignee_role")
         next_assignee = _product_role_assignee(meta, role, product_role_assignees)
+        _validate_resolver_cas_fields(
+            {
+                "status": next_status,
+                "assignee": next_assignee,
+                "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+                "current_step_key": next_step,
+            }
+        )
         sql = """
             UPDATE tasks
                SET status        = ?,
@@ -3165,6 +3178,47 @@ _RESOLVER_EXPECTED_KEYS = frozenset({
     "running",
     "blocked",
 })
+
+# These fields are copied into the exact Resolver CAS and into the task view.
+# Bound them at both the Unicode-character and UTF-8-byte level so a valid row
+# cannot make the fixed 96 KiB Resolver response impossible. The limits are
+# deliberately field-specific: paths need more room than enum-like workflow
+# keys, while all remain far below the response ceiling after the values are
+# repeated in the task and expected-snapshot objects.
+_RESOLVER_CAS_FIELD_LIMITS: dict[str, tuple[int, int]] = {
+    "task_id": (128, 512),
+    "status": (32, 128),
+    "assignee": (256, 1_024),
+    "project_id": (256, 1_024),
+    "workflow_template_id": (128, 512),
+    "current_step_key": (128, 512),
+    "phase": (128, 512),
+    "workspace_kind": (32, 128),
+    "workspace_path": (4_096, 16_384),
+    "branch_name": (1_024, 4_096),
+}
+
+
+def _validate_resolver_cas_fields(fields: Mapping[str, Any]) -> None:
+    """Reject values that cannot fit the exact Resolver CAS response.
+
+    ``None`` remains valid for nullable task metadata. Values are not trimmed,
+    truncated, stringified, or otherwise changed: exact CAS requires the
+    persisted value to be the value that was validated before the write.
+    """
+    for field, value in fields.items():
+        limits = _RESOLVER_CAS_FIELD_LIMITS.get(field)
+        if limits is None or value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string for an exact Resolver snapshot")
+        max_chars, max_bytes = limits
+        value_bytes = len(value.encode("utf-8"))
+        if len(value) > max_chars or value_bytes > max_bytes:
+            raise ValueError(
+                f"{field} exceeds exact Resolver snapshot bound "
+                f"({max_chars} characters/{max_bytes} UTF-8 bytes)"
+            )
 
 
 def _validate_adopted_handoff_sha(
@@ -3293,6 +3347,7 @@ def resolve_product_preflight(
     expected = request.get("expected")
     if not isinstance(expected, dict) or set(expected) != _RESOLVER_EXPECTED_KEYS:
         raise ValueError("expected must contain the complete Resolver snapshot")
+    _validate_resolver_cas_fields(expected)
     repair = request.get("repair")
     if decision == "repair":
         if not isinstance(repair, dict) or not repair:
@@ -3355,6 +3410,7 @@ def resolve_product_preflight(
             "running": bool(row["running"]),
             "blocked": bool(row["blocked"]),
         }
+        _validate_resolver_cas_fields(current)
         if current != expected:
             raise TaskSnapshotConflict("resolving preflight", current)
         if (
@@ -3669,6 +3725,14 @@ def _route_product_human_block_to_preflight(
         resume_status = _column_status_for_step(meta, step_key)
         if resume_status in {"running", "blocked", "done", "archived"}:
             resume_status = "ready"
+        _validate_resolver_cas_fields(
+            {
+                "status": resume_status,
+                "assignee": hermes_assignee,
+                "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+                "current_step_key": step_key,
+            }
+        )
         sql = """
             UPDATE tasks
                SET status        = ?,
@@ -3754,14 +3818,12 @@ _RESOLVER_ESCALATION_RUN_STATUS = "blocked"
 _RESOLVER_ESCALATION_RUN_OUTCOME = "preflight_escalated"
 _RESOLVER_ESCALATION_POST_ASSIGNEE = "default"
 _RESOLVER_ESCALATION_BENIGN_EVENT_KINDS = frozenset({
+    # Only comment/audit-only records may be appended without invalidating
+    # ownership, provenance, dispatch, or review lifecycle CAS.
     "audit",
     "audit_only",
     "comment",
     "commented",
-    "diagnostic",
-    "dispatcher_metadata_conflict",
-    "heartbeat",
-    "traceability",
 })
 _RESOLVER_ESCALATION_EXPECTED_KEYS = frozenset(
     set(_RESOLVER_EXPECTED_KEYS) | {"escalation_event_id"}
@@ -3825,7 +3887,7 @@ def _resolver_escalation_snapshot(
     preflight_event_id: Optional[int],
     resolver_run_id: int,
 ) -> dict[str, Any]:
-    return {
+    snapshot = {
         "escalation_event_id": escalation_event_id,
         "preflight_event_id": preflight_event_id,
         "run_id": resolver_run_id,
@@ -3840,6 +3902,8 @@ def _resolver_escalation_snapshot(
         "running": bool(row["running"]),
         "blocked": bool(row["blocked"]),
     }
+    _validate_resolver_cas_fields(snapshot)
+    return snapshot
 
 
 def _d4_prior_task_event(
@@ -3891,19 +3955,38 @@ def resolver_escalation_expected_snapshot(
     )
 
 
-def _d4_bounded_copied_text(value: Any, limit: int) -> str:
-    if not isinstance(value, str):
+_D4_MISSING = object()
+
+
+def _d4_bounded_copied_text(
+    value: Any,
+    limit: int,
+    *,
+    field: str,
+) -> str:
+    if value is _D4_MISSING:
         return ""
+    if not isinstance(value, str):
+        raise TaskSnapshotConflict("resolver re-entry", {field: "non-string"})
     return value[:limit]
 
 
-def _d4_bounded_attempted_resolutions(value: Any) -> list[str]:
-    if not isinstance(value, list):
+def _d4_bounded_attempted_resolutions(
+    value: Any,
+    *,
+    field: str = "attempted_resolutions",
+) -> list[str]:
+    if value is _D4_MISSING:
         return []
-    items = []
-    for item in value[-_RESOLVER_REENTRY_ATTEMPTED_RESOLUTIONS_MAX_ITEMS:]:
-        text = item if isinstance(item, str) else str(item)
-        items.append(text[:_RESOLVER_REENTRY_ATTEMPTED_RESOLUTION_ITEM_MAX_CHARS])
+    if not isinstance(value, list):
+        raise TaskSnapshotConflict("resolver re-entry", {field: "non-list"})
+    for item in value:
+        if not isinstance(item, str):
+            raise TaskSnapshotConflict("resolver re-entry", {field: "non-string-item"})
+    items = [
+        item[:_RESOLVER_REENTRY_ATTEMPTED_RESOLUTION_ITEM_MAX_CHARS]
+        for item in value[-_RESOLVER_REENTRY_ATTEMPTED_RESOLUTIONS_MAX_ITEMS:]
+    ]
     bounded: list[str] = []
     total = 0
     for item in reversed(items):
@@ -3941,7 +4024,28 @@ def _d4_canonical_assignee(raw: Any, *, field: str) -> str:
         raise TaskSnapshotConflict(
             "resolver re-entry", {field: "invalid-canonical"}
         )
+    try:
+        _validate_resolver_cas_fields({"assignee": canonical})
+    except ValueError as exc:
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {field: "invalid-canonical"}
+        ) from exc
     return canonical
+
+
+def _d4_governed_resolver_profile(meta: Optional[dict]) -> str:
+    """Return the board-governed Resolver identity, not event provenance."""
+    workflow = _product_workflow_dict(meta)
+    if "human_escalation_profile" not in workflow:
+        return "resolver"
+    raw_profile = workflow.get("human_escalation_profile")
+    if not isinstance(raw_profile, str) or not raw_profile.strip():
+        raise TaskSnapshotConflict(
+            "resolver re-entry", {"governed_resolver_profile": "invalid"}
+        )
+    return _d4_canonical_assignee(
+        raw_profile, field="governed_resolver_profile"
+    )
 
 
 def _d4_raw_governed_assignee(
@@ -4165,6 +4269,15 @@ def reenter_resolver_escalation(
             resolver_profile = _d4_canonical_assignee(
                 run["profile"], field="resolver_profile"
             )
+            governed_resolver_profile = _d4_governed_resolver_profile(meta)
+            if resolver_profile != governed_resolver_profile:
+                raise TaskSnapshotConflict(
+                    "resolver re-entry",
+                    {
+                        "resolver_profile": resolver_profile,
+                        "governed_resolver_profile": governed_resolver_profile,
+                    },
+                )
             try:
                 resolver_step = run["step_key"]
                 current_step = row["current_step_key"]
@@ -4236,6 +4349,27 @@ def reenter_resolver_escalation(
                 "running", "blocked", "done", "archived",
             }:
                 resume_status = "ready"
+            copied_reason = _d4_bounded_copied_text(
+                escalation_payload.get("reason", _D4_MISSING),
+                _RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS,
+                field="reason",
+            )
+            copied_attempted_resolutions = _d4_bounded_attempted_resolutions(
+                escalation_payload.get("attempted_resolutions", _D4_MISSING)
+            )
+            copied_resolution = _d4_bounded_copied_text(
+                escalation_payload.get("resolution", _D4_MISSING),
+                _RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS,
+                field="resolution",
+            )
+            _validate_resolver_cas_fields(
+                {
+                    "status": resume_status,
+                    "assignee": resolver_profile,
+                    "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+                    "current_step_key": resolver_step,
+                }
+            )
 
             updated = conn.execute(
                 "UPDATE tasks SET status = ?, assignee = ?, running = 0, blocked = 0, "
@@ -4255,24 +4389,16 @@ def reenter_resolver_escalation(
                 task_id,
                 PRODUCT_WORKFLOW_PRECHECK_EVENT,
                 {
-                    "reason": _d4_bounded_copied_text(
-                        escalation_payload.get("reason"),
-                        _RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS,
-                    ),
+                    "reason": copied_reason,
                     "kind": "resolver_reentry",
-                    "attempted_resolutions": _d4_bounded_attempted_resolutions(
-                        escalation_payload.get("attempted_resolutions")
-                    ),
+                    "attempted_resolutions": copied_attempted_resolutions,
                     "original_assignee": original_assignee,
                     "hermes_assignee": resolver_profile,
                     "step_key": resolver_step,
                     "resume_status": resume_status,
                     "memory_capture_id": secrets.token_hex(16),
                     "reentry_of_event_id": escalation_event_id,
-                    "resolver_escalation_reason": _d4_bounded_copied_text(
-                        escalation_payload.get("resolution"),
-                        _RESOLVER_REENTRY_COPIED_TEXT_MAX_CHARS,
-                    ),
+                    "resolver_escalation_reason": copied_resolution,
                     "human_answer": answer,
                     "answered_by": answered_by,
                 },
@@ -8243,6 +8369,21 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
+    if workspace_path is not None:
+        workspace_path = str(workspace_path)
+    if project_id is not None:
+        project_id = str(project_id).strip() or None
+    _validate_resolver_cas_fields(
+        {
+            "assignee": assignee,
+            "project_id": project_id,
+            "workflow_template_id": workflow_template_id,
+            "current_step_key": current_step_key,
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+            "branch_name": branch_name,
+        }
+    )
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     if work_item_kind not in {"card", "epic"}:
@@ -8560,6 +8701,19 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                _validate_resolver_cas_fields(
+                    {
+                        "task_id": task_id,
+                        "status": task_status,
+                        "assignee": assignee,
+                        "project_id": project_id,
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
+                        "workspace_kind": workspace_kind,
+                        "workspace_path": workspace_path,
+                        "branch_name": branch_name,
+                    }
+                )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -8781,6 +8935,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    _validate_resolver_cas_fields({"assignee": profile})
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -14856,20 +15011,24 @@ def resolve_workspace(
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    path = str(path)
+    _validate_resolver_cas_fields({"workspace_path": path})
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
+            (path, task_id),
         )
 
 
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    branch_name = str(branch_name)
+    _validate_resolver_cas_fields({"branch_name": branch_name})
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
-            (str(branch_name), task_id),
+            (branch_name, task_id),
         )
 
 
