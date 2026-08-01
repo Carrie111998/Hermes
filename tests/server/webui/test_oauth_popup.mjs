@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const source = readFileSync(
   new URL('../../../server/webui/js/oauth-popup.js', import.meta.url),
@@ -365,6 +368,21 @@ function fakeBrowserWindow() {
   };
 }
 
+function copyWebuiModulePackage() {
+  const packageRoot = mkdtempSync(join(tmpdir(), 'interfaze-webui-test-'));
+  const moduleRoot = join(packageRoot, 'js');
+  cpSync(
+    fileURLToPath(new URL('../../../server/webui/js/', import.meta.url)),
+    moduleRoot,
+    { recursive: true },
+  );
+  writeFileSync(join(packageRoot, 'package.json'), '{"type":"module"}\n');
+  return {
+    url: relativePath => pathToFileURL(join(moduleRoot, relativePath)).href,
+    remove: () => rmSync(packageRoot, { recursive: true, force: true }),
+  };
+}
+
 async function flushUntil(predicate, message) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (predicate()) return;
@@ -381,6 +399,7 @@ test('Google Connect starts provider OAuth and refreshes Integrations once on su
   const originalSetInterval = globalThis.setInterval;
   const documentRef = fakeDocument();
   const windowRef = fakeBrowserWindow();
+  const webuiModules = copyWebuiModulePackage();
   const requests = [];
   let emailLists = 0;
   let dispose;
@@ -417,8 +436,8 @@ test('Google Connect starts provider OAuth and refreshes Integrations once on su
   };
 
   try {
-    const { resetReal } = await import('../../../server/webui/js/mocks/db.js');
-    const { mount } = await import('../../../server/webui/js/pages/integrations.js');
+    const { resetReal } = await import(webuiModules.url('mocks/db.js'));
+    const { mount } = await import(webuiModules.url('pages/integrations.js'));
     resetReal();
     const root = new FakeNode('main');
     dispose = await mount(root, { navigate() {} });
@@ -458,5 +477,6 @@ test('Google Connect starts provider OAuth and refreshes Integrations once on su
     globalThis.fetch = originalFetch;
     globalThis.setTimeout = originalSetTimeout;
     globalThis.setInterval = originalSetInterval;
+    webuiModules.remove();
   }
 });
