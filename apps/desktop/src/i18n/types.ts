@@ -1532,6 +1532,7 @@ export interface Translations {
     groupAriaUngrouped: string
     showProjects: string
     showSessions: string
+    refreshSessions: string
     groupTitleGrouped: string
     groupTitleUngrouped: string
     allPinned: string
