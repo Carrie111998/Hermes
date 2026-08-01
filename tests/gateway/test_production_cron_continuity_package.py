@@ -183,11 +183,13 @@ def test_plan_is_exhaustive_primary_model_authored_and_owner_complete(
 
     assert plan["disposition_counts"] == {
         package.DISPOSITION_KEEP: 1,
-        package.DISPOSITION_AGENT: 5,
-        package.DISPOSITION_COLLECTOR: 21,
+        package.DISPOSITION_AGENT: 4,
+        package.DISPOSITION_COLLECTOR: len(rail.COLLECTOR_SPECS),
         package.DISPOSITION_PRESERVE: 1,
     }
-    assert plan["replacement_record_count"] == 24
+    assert plan["replacement_record_count"] == (
+        build.replacement_bundle["record_count"]
+    )
     assert plan["owner_input_required_job_ids"] == []
     assert plan["cutover_executable"] is True
     assert plan["blanket_inert_migration_allowed"] is False
@@ -237,7 +239,7 @@ def test_plan_is_exhaustive_primary_model_authored_and_owner_complete(
     ]
 
     records = build.replacement_bundle["records"]
-    assert len(records) == 24
+    assert len(records) == build.replacement_bundle["record_count"] == 28
     for record in records:
         assert record["provider"] == review.PRIMARY_PROVIDER
         assert record["model"] == review.PRIMARY_MODEL
@@ -257,15 +259,12 @@ def test_plan_is_exhaustive_primary_model_authored_and_owner_complete(
         for record in records
         if "discord_guild_read" in record["enabled_toolsets"]
     }
-    assert {
+    assert ({
         "2c9a05136051",
         "e873367f6019",
         "cd778104fc92",
         "a1dfd5c2a7ab",
-        "969248a7da45",
-        "06ef64d72891",
-        "e62f55ca93ca",
-    }.issubset(guild_history_records)
+    } | set(package.REVIEWED_GUILD_TARGETS)).issubset(guild_history_records)
     assert resolve_toolset("discord_guild_read") == [
         "discord_guild_history"
     ]
@@ -295,7 +294,7 @@ def test_plan_is_exhaustive_primary_model_authored_and_owner_complete(
     assert "1526870121677848636" not in thread_record["prompt"]
 
     plan_rows = {row["job_id"]: row for row in plan["records"]}
-    for job_id in {"06ef64d72891", "e62f55ca93ca"}:
+    for job_id in package.REVIEWED_GUILD_TARGETS:
         target = plan_rows[job_id]["target"]
         assert target["approved_guild_target"] == package.REVIEWED_GUILD_TARGETS[
             job_id
@@ -409,7 +408,7 @@ def test_artifact_stage_is_complete_private_and_replay_exact(
     )
 
     assert first == second
-    assert first["file_count"] == 45
+    assert first["file_count"] == 3 + (2 * len(rail.COLLECTOR_SPECS))
     assert first["units_installed"] is False
     assert first["timers_enabled"] is False
     assert first["timers_started"] is False
@@ -458,7 +457,7 @@ def test_target_transform_replaces_twenty_four_and_preserves_archived_owner(
         and job.get("provider") == review.PRIMARY_PROVIDER
         and job.get("model") == review.PRIMARY_MODEL
         for job in target["jobs"]
-    ) == 25
+    ) == build.replacement_bundle["record_count"] + 1
     assert all(
         job.get("enabled") is False
         or job.get("script") is None
@@ -545,7 +544,9 @@ def test_plan_or_bundle_tamper_fails_closed(
     readiness = drifted_namespace["collector_execution_readiness"]
     readiness["unit_namespace_readiness_packaged"] = True
     readiness["unit_namespace_readiness_receipt_sha256"] = "9" * 64
-    readiness["unit_namespace_readiness_job_count"] = 21
+    readiness["unit_namespace_readiness_job_count"] = len(
+        rail.COLLECTOR_SPECS
+    )
     readiness["direct_dependencies_ready"] = True
     readiness["readiness_sha256"] = package._sha256(
         package._canonical({

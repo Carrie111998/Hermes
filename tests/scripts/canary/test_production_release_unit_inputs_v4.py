@@ -36,7 +36,7 @@ def _v3_payload() -> dict[str, Any]:
         for index, domain in enumerate(domains)
     }
     receipt_keys = {
-        domain: f"{index:x}" * 64
+        domain: f"{index:064x}"
         for index, domain in enumerate(domains, start=1)
     }
     return {

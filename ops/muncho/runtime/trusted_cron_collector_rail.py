@@ -142,10 +142,11 @@ class CollectorSpec:
     # Byte-exact legacy provenance only. It is never an authorization or an
     # executable destination for this credential-isolated collector.
     historical_source_delivery: str = "local"
+    preserve_source_prompt: bool = False
 
     @property
     def execution_boundary(self) -> str:
-        if self.mode in {"mechanical_command", "git_refs"}:
+        if self.mode in {"mechanical_command", "git_refs", "operational_edge"}:
             return EXECUTION_BOUNDARY_SCOPED
         return EXECUTION_BOUNDARY_ISOLATED
 
@@ -162,6 +163,7 @@ def _spec(
     json_roots: Sequence[Path] = (),
     json_include_content: bool = False,
     historical_source_delivery: str = "local",
+    preserve_source_prompt: bool = False,
 ) -> CollectorSpec:
     return CollectorSpec(
         source_job_id=source_job_id,
@@ -174,6 +176,7 @@ def _spec(
         json_roots=tuple(str(item) for item in json_roots),
         json_include_content=json_include_content,
         historical_source_delivery=historical_source_delivery,
+        preserve_source_prompt=preserve_source_prompt,
     )
 
 
@@ -188,8 +191,6 @@ _PERSISTENCE_WATCHDOG = CANONICAL_ROOT / "bin/free_hermes_operational_persistenc
 _WATCHTOWER = HERMES_HOME / "scripts/devops_watchtower_phase1.py"
 _CONTABO = HERMES_HOME / "scripts/contabo_observer.py"
 _ALWYZON = HERMES_HOME / "scripts/alwyzon_phoenix_observer.py"
-_SKYVISION_COUNT = HERMES_HOME / "scripts/skyvision_from_heart_weekly_count.py"
-_SKYVISION_DB = HERMES_HOME / "bin/skyvision_db_readonly"
 _LEARNING_ROOT = CANONICAL_ROOT / "state/private/learning_loop"
 _REPORTS_ROOT = CANONICAL_ROOT / "state/reports"
 _DOCS_ROOT = CANONICAL_ROOT / "docs"
@@ -221,7 +222,12 @@ COLLECTOR_SPECS: tuple[CollectorSpec, ...] = (
     _spec("27f7f59fa0ca", "devops-watchtower-infrastructure", {"kind": "cron", "expr": "*/10 * * * *"}, "mechanical_command", model_review=True, command=(str(PYTHON), str(_WATCHTOWER), "--mode", "infra", "--no-dispatch"), dependencies=(_WATCHTOWER, _CONTABO, _ALWYZON)),
     _spec("6faf380f3512", "devops-watchtower-tls-dns", {"kind": "cron", "expr": "0 * * * *"}, "mechanical_command", model_review=True, command=(str(PYTHON), str(_WATCHTOWER), "--mode", "hourly", "--no-dispatch"), dependencies=(_WATCHTOWER,)),
     _spec("90ac99d45130", "devops-watchtower-digest", {"kind": "cron", "expr": "0 * * * *"}, "mechanical_command", model_review=True, command=(str(PYTHON), str(_WATCHTOWER), "--mode", "digest", "--no-dispatch"), dependencies=(_WATCHTOWER,)),
-    _spec("dee523e6f47b", "skyvision-from-heart-weekly-count", {"kind": "cron", "expr": "59 * * * 0"}, "mechanical_command", model_review=True, command=(str(PYTHON), str(_SKYVISION_COUNT)), dependencies=(_SKYVISION_COUNT, _SKYVISION_DB), historical_source_delivery="origin"),
+    _spec("29672043aa91", "skyvision-backup-raw-review", {"kind": "interval", "minutes": 30}, "operational_edge", model_review=True),
+    _spec("2b8fbfcf9699", "skyvision-discount-codes-raw-review", {"kind": "cron", "expr": "59 * * * 0"}, "operational_edge", model_review=True, historical_source_delivery="origin", preserve_source_prompt=True),
+    _spec("ded5510a72ec", "skyvision-seo-daily-raw-review", {"kind": "cron", "expr": "0 6 * * *"}, "operational_edge", model_review=True, historical_source_delivery="discord:1504852355588423801:1531765777735090207", preserve_source_prompt=True),
+    _spec("9af26dbf2361", "skyvision-seo-weekly-raw-review", {"kind": "cron", "expr": "30 6 * * 1"}, "operational_edge", model_review=True, historical_source_delivery="discord:1504852355588423801:1531765777735090207", preserve_source_prompt=True),
+    _spec("4f6ea4a310b6", "skyvision-seo-nasi-weekly-raw-review", {"kind": "cron", "expr": "15 6 * * 1"}, "operational_edge", model_review=True, historical_source_delivery="discord:1505499746939174993:1531991176952021033", preserve_source_prompt=True),
+    _spec("7c2bed784dfd", "skyvision-seo-nasi-monthly-raw-review", {"kind": "cron", "expr": "30 6 1 * *"}, "operational_edge", model_review=True, historical_source_delivery="discord:1505499746939174993:1531991176952021033", preserve_source_prompt=True),
 )
 
 
@@ -273,7 +279,7 @@ def _namespace_boot_id_sha256() -> str:
 
 def _catalog() -> dict[str, CollectorSpec]:
     result = {item.source_job_id: item for item in COLLECTOR_SPECS}
-    if len(result) != len(COLLECTOR_SPECS) or len(result) != 21:
+    if not result or len(result) != len(COLLECTOR_SPECS):
         raise TrustedCronCollectorError("trusted_cron_catalog_invalid")
     rail_pairs = {(item.source_job_id, item.rail_id) for item in COLLECTOR_SPECS}
     for item in COLLECTOR_SPECS:
@@ -284,6 +290,7 @@ def _catalog() -> dict[str, CollectorSpec]:
             not in {
                 "mechanical_command",
                 "git_refs",
+                "operational_edge",
                 "json_tree",
                 "filesystem_metadata",
                 "voice_stage",
@@ -293,6 +300,7 @@ def _catalog() -> dict[str, CollectorSpec]:
             or item.mode in {"json_tree", "filesystem_metadata", "voice_stage"}
             and not item.json_roots
             or not isinstance(item.schedule, Mapping)
+            or type(item.preserve_source_prompt) is not bool
             or item.execution_boundary
             not in {EXECUTION_BOUNDARY_ISOLATED, EXECUTION_BOUNDARY_SCOPED}
         ):
@@ -314,6 +322,7 @@ def catalog_public_contract() -> list[dict[str, Any]]:
             "mode": item.mode,
             "model_review_required": item.model_review_required,
             "historical_source_delivery": item.historical_source_delivery,
+            "preserve_source_prompt": item.preserve_source_prompt,
             "historical_source_delivery_eligible": False,
             "execution_boundary": item.execution_boundary,
             "command_argv_sha256": (
@@ -372,6 +381,10 @@ def _calendar(schedule: Mapping[str, Any]) -> tuple[str, str]:
         "*/10 * * * *": "OnCalendar=*-*-* *:0/10:00 UTC",
         "0 * * * *": "OnCalendar=*-*-* *:00:00 UTC",
         "59 * * * 0": "OnCalendar=Sun *-*-* *:59:00 UTC",
+        "0 6 * * *": "OnCalendar=*-*-* 06:00:00 UTC",
+        "30 6 * * 1": "OnCalendar=Mon *-*-* 06:30:00 UTC",
+        "15 6 * * 1": "OnCalendar=Mon *-*-* 06:15:00 UTC",
+        "30 6 1 * *": "OnCalendar=*-*-01 06:30:00 UTC",
     }
     calendar = exact.get(expr)
     if calendar is None:
@@ -1022,7 +1035,7 @@ def validate_unit_namespace_readiness(
     expected_boot_id_sha256: str | None = None,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
-    """Validate a complete 21-job proof from the real systemd namespace."""
+    """Validate a complete proof for the exact current collector catalog."""
 
     trusted = validate_package_manifest(manifest)
     expected_fields = {

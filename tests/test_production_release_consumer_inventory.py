@@ -118,11 +118,11 @@ def _validate(
 def test_catalog_is_exact_and_derived_from_existing_contracts() -> None:
     catalog = inventory.expected_consumer_catalog()
 
-    assert len(catalog) == inventory.EXPECTED_UNIT_COUNT == 63
+    assert len(catalog) == inventory.EXPECTED_UNIT_COUNT == 75
     assert (
         sum(spec.executes_release for spec in catalog.values())
         == inventory.EXPECTED_EXECUTION_SERVICE_COUNT
-        == 40
+        == 47
     )
     assert (
         sum(
@@ -130,7 +130,7 @@ def test_catalog_is_exact_and_derived_from_existing_contracts() -> None:
             for spec in catalog.values()
         )
         == inventory.EXPECTED_LONG_RUNNING_SERVICE_COUNT
-        == 16
+        == 18
     )
     assert (
         sum(
@@ -146,13 +146,13 @@ def test_catalog_is_exact_and_derived_from_existing_contracts() -> None:
             for spec in catalog.values()
         )
         == inventory.EXPECTED_TRIGGERED_ONESHOT_SERVICE_COUNT
-        == 23
+        == 28
     )
-    assert inventory.EXPECTED_ONESHOT_SERVICE_COUNT == 24
+    assert inventory.EXPECTED_ONESHOT_SERVICE_COUNT == 29
     assert (
         sum(spec.kind in {"socket", "timer"} for spec in catalog.values())
         == inventory.EXPECTED_TRIGGER_UNIT_COUNT
-        == 23
+        == 28
     )
     assert {spec.source for spec in catalog.values()} == {
         "host",

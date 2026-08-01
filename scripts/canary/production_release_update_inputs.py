@@ -8,7 +8,7 @@ module makes that distinction explicit for every remaining Stage-0 input and
 cross-binds the documents to the signed update publication.
 
 No function in this module reads the host.  In particular, the cron artifact
-index is validated as the exact, self-hashed 45-row envelope produced by the
+index is validated as the exact, self-hashed collector envelope produced by the
 trusted-cron package.  Re-attesting those rows against installed host bytes is
 a separate privileged host-action gate before mutation.
 """
@@ -944,7 +944,7 @@ def _expected_cron_rows() -> Mapping[str, tuple[int, bool]]:
         rows[
             f"cron/trusted-collector/systemd/{stem}.timer"
         ] = (0o640, False)
-    if len(rows) != 45:
+    if len(rows) != 3 + 2 * len(cron_rail.COLLECTOR_SPECS):
         _fail("release_update_inputs_cron_index_invalid")
     return dict(sorted(rows.items()))
 

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from gateway.operational_edge_catalog import CREDENTIALS_BY_DOMAIN
 from tests.gateway.test_canonical_writer_production_cutover import (
     _runtime_attestation,
 )
@@ -37,14 +38,12 @@ def _identity(user: str, group: str, uid: int, gid: int) -> dict[str, object]:
 
 
 def _operational_receipt_key_ids() -> dict[str, str]:
-    domains = (
-        "adventico_email", "bitrix", "canonical", "github",
-        "infrastructure", "skyvision_db", "skyvision_email",
-        "skyvision_gitlab", "skyvision_panel",
-    )
+    domains = sorted(CREDENTIALS_BY_DOMAIN)
     return {
-        domain: f"{index:x}" * 64
-        for index, domain in enumerate(domains, start=1)
+        domain: hashlib.sha256(
+            f"test-operational-receipt-key:{domain}".encode("utf-8")
+        ).hexdigest()
+        for domain in domains
     }
 
 
@@ -64,9 +63,7 @@ def _unit_input_authority(revision: str) -> tuple[dict, dict, dict]:
             "port": 5432,
             "writer_login": "muncho_production_writer_login",
         },
-        "gateway": _identity(
-            "ai-platform-brain", "ai-platform-brain", 1000, 1000
-        ),
+        "gateway": _identity("ai-platform-brain", "ai-platform-brain", 1000, 1000),
         "writer": _identity(
             "muncho-canonical-writer", "muncho-canonical-writer", 2000, 2000
         ),
@@ -77,9 +74,7 @@ def _unit_input_authority(revision: str) -> tuple[dict, dict, dict]:
         "connector": _identity(
             "muncho-discord-connector", "muncho-discord-connector", 2001, 2001
         ),
-        "mac_ops": _identity(
-            "muncho-mac-ops-edge", "muncho-mac-ops-edge", 2003, 2003
-        ),
+        "mac_ops": _identity("muncho-mac-ops-edge", "muncho-mac-ops-edge", 2003, 2003),
         "browser": _identity(
             "muncho-capability-browser",
             "muncho-capability-browser",
@@ -108,9 +103,7 @@ def _unit_input_authority(revision: str) -> tuple[dict, dict, dict]:
         "writer_capability_public_key_id": "c" * 64,
         "discord_edge_receipt_public_key_id": "a" * 64,
         "operational_edge_key_foundation_sha256": "d" * 64,
-        "operational_edge_receipt_public_key_ids": (
-            _operational_receipt_key_ids()
-        ),
+        "operational_edge_receipt_public_key_ids": (_operational_receipt_key_ids()),
         "discord_reconciliation_intent": {
             "schema": "muncho-production-discord-reconciliation-intent.v1",
             "purpose": "production_discord_policy_reconciliation",
@@ -171,7 +164,9 @@ def _unit_input_authority(revision: str) -> tuple[dict, dict, dict]:
     return plan, approval, unit_inputs
 
 
-def _run_shell(body: str, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_shell(
+    body: str, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", "-c", f'source "$DEPLOY_HELPER"\n{body}'],
         check=False,
@@ -194,7 +189,7 @@ def test_target_blob_bootstrap_does_not_depend_on_active_old_command(
         "from pathlib import Path\n"
         "path = Path(os.environ['TEST_UNIT_INPUT_OUTPUT'])\n"
         "path.chmod(0o444)\n"
-        "print('{\"schema\":\"target-blob-bootstrap-test.v1\"}')\n",
+        'print(\'{"schema":"target-blob-bootstrap-test.v1"}\')\n',
         encoding="utf-8",
     )
     git = shutil.which("git") or "/usr/bin/git"
@@ -233,10 +228,7 @@ def test_target_blob_bootstrap_does_not_depend_on_active_old_command(
     fake_bin.mkdir()
     sudo = fake_bin / "sudo"
     sudo.write_text(
-        "#!/bin/sh\n"
-        "[ \"$1\" = -n ] && shift\n"
-        "[ \"$1\" = -u ] && shift 2\n"
-        "exec \"$@\"\n",
+        '#!/bin/sh\n[ "$1" = -n ] && shift\n[ "$1" = -u ] && shift 2\nexec "$@"\n',
         encoding="utf-8",
     )
     sudo.chmod(0o755)
@@ -246,7 +238,7 @@ def test_target_blob_bootstrap_does_not_depend_on_active_old_command(
     runtime = (tmp_path / "run").resolve()
     runtime.mkdir()
     owner = subprocess.check_output(["id", "-un"], text=True).strip()
-    body = f'''
+    body = f"""
 OWNER={json.dumps(owner)}
 SYSTEM_GIT={json.dumps(git)}
 SYSTEM_PYTHON={json.dumps(sys.executable)}
@@ -257,7 +249,7 @@ CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(output_path))}
 CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
 CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
 bootstrap_cutover_unit_inputs_from_target {json.dumps(str(source))} {revision}
-'''
+"""
 
     completed = _run_shell(
         body,
@@ -288,7 +280,7 @@ def test_root_config_seal_rejects_owner_payload_drift_before_chown(
     identity_before = config.stat()
     owner = subprocess.check_output(["id", "-un"], text=True).strip()
     id_path = shutil.which("id") or "/usr/bin/id"
-    body = f'''
+    body = f"""
 OWNER={json.dumps(owner)}
 SYSTEM_ID={json.dumps(id_path)}
 SYSTEM_PYTHON={json.dumps(sys.executable)}
@@ -296,7 +288,7 @@ RELEASES={json.dumps(str(releases))}
 RUNTIME_CONFIG_ROOT_UID={os.getuid()}
 RUNTIME_CONFIG_ROOT_GID={os.getgid()}
 seal_agent_browser_config {json.dumps(str(release))} {revision}
-'''
+"""
 
     completed = _run_shell(body, {})
 
@@ -332,7 +324,7 @@ def test_owner_config_is_mechanically_sealed_before_manifest_build(
         os.chown(path, os.geteuid(), os.getegid())
     owner = subprocess.check_output(["id", "-un"], text=True).strip()
     id_path = shutil.which("id") or "/usr/bin/id"
-    body = f'''
+    body = f"""
 OWNER={json.dumps(owner)}
 SYSTEM_ID={json.dumps(id_path)}
 SYSTEM_PYTHON={json.dumps(sys.executable)}
@@ -340,7 +332,7 @@ RELEASES={json.dumps(str(releases))}
 RUNTIME_CONFIG_ROOT_UID={os.getuid()}
 RUNTIME_CONFIG_ROOT_GID={os.getgid()}
 seal_agent_browser_config {json.dumps(str(release))} {revision}
-'''
+"""
 
     completed = _run_shell(body, {})
 

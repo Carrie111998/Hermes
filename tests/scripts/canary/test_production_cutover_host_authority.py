@@ -2172,7 +2172,9 @@ def test_packaged_cron_stage_receipt_binds_all_forty_five_files(
         artifact_index,
         freeze_plan=freeze,
     )
-    assert accepted["file_count"] == 45
+    assert accepted["file_count"] == 3 + 2 * len(
+        _collector_package()["units"]
+    )
 
     changed = copy.deepcopy(artifact_index)
     changed["files"][0], changed["files"][1] = (

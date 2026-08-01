@@ -366,7 +366,11 @@ def test_root_initial_collector_uses_only_sealed_target_and_public_receipts(
     assert "plan" not in captured["request"]
     assert receipt["initial_snapshot"]["source_owner"] == "legacy_event_owner"
     assert receipt["source_boot_id_sha256"] == "f" * 64
-    assert receipt["cron_inventory"]["job_count"] == 29
+    assert receipt["cron_inventory"]["job_count"] == len(
+        cron_inventory["compatible_enabled_records"]
+        + cron_inventory["incompatible_enabled_records"]
+        + cron_inventory["disabled_records"]
+    )
     assert receipt["cron_continuity_plan"] == continuity.build.plan
     assert receipt["mechanical_job_host_facts"]["github_cli"]["path"] == (
         "/usr/bin/gh"

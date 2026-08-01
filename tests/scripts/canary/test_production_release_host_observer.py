@@ -268,12 +268,24 @@ def test_collects_valid_inventory_and_returns_self_hashed_receipt() -> None:
     assert result.process_observations == ()
     validated = observer.validate_host_observation_receipt(result.receipt)
     assert validated["receipt_sha256"] == result.receipt["receipt_sha256"]
-    assert validated["systemd"]["canonical_unit_count"] == 63
+    assert validated["systemd"]["canonical_unit_count"] == inventory.EXPECTED_UNIT_COUNT
     assert validated["processes"]["scanned_process_count"] == 0
-    assert validated["validation"]["long_running_service_count"] == 16
-    assert validated["validation"]["startup_oneshot_service_count"] == 1
-    assert validated["validation"]["triggered_oneshot_service_count"] == 23
-    assert validated["validation"]["oneshot_service_count"] == 24
+    assert (
+        validated["validation"]["long_running_service_count"]
+        == inventory.EXPECTED_LONG_RUNNING_SERVICE_COUNT
+    )
+    assert (
+        validated["validation"]["startup_oneshot_service_count"]
+        == inventory.EXPECTED_STARTUP_ONESHOT_SERVICE_COUNT
+    )
+    assert (
+        validated["validation"]["triggered_oneshot_service_count"]
+        == inventory.EXPECTED_TRIGGERED_ONESHOT_SERVICE_COUNT
+    )
+    assert (
+        validated["validation"]["oneshot_service_count"]
+        == inventory.EXPECTED_ONESHOT_SERVICE_COUNT
+    )
     assert "cmdline" not in validated["processes"]
 
 
@@ -304,7 +316,9 @@ def test_non_runnable_template_definition_is_accounted_without_show() -> None:
 
     result = _observe(harness)
 
-    assert result.receipt["systemd"]["enumerated_name_count"] == 64
+    assert result.receipt["systemd"]["enumerated_name_count"] == (
+        inventory.EXPECTED_UNIT_COUNT + 1
+    )
     assert result.receipt["systemd"]["non_runnable_template_name_count"] == 1
 
 

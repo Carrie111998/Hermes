@@ -118,7 +118,7 @@ def test_packaged_console_entry_and_catalog_are_exact(
     contract = json.loads(capsys.readouterr().out)
     assert contract["semantic_routing"] is False
     assert contract["unknown_operation_fails_closed"] is True
-    assert len(contract["operations"]) == len(operation_catalog()) == 62
+    assert len(contract["operations"]) == len(operation_catalog())
     assert all(row["purpose"] for row in contract["operations"])
 
     assert cli.main(

@@ -172,12 +172,12 @@ def test_observation_rejects_credential_shaped_job_fields_without_echo() -> None
 def test_catalog_accounts_for_every_enabled_record_without_blanket_inert() -> None:
     plan = review.build_owner_review_plan(_synthetic_observation())
 
-    assert plan["enabled_count"] == 28
-    assert plan["incompatible_count"] == 27
+    assert plan["enabled_count"] == len(review.REVIEW_CATALOG) == 32
+    assert plan["incompatible_count"] == len(review.REVIEW_CATALOG) - 1
     assert plan["disposition_counts"] == {
         review.DISPOSITION_KEEP: 1,
-        review.DISPOSITION_AGENT: 5,
-        review.DISPOSITION_COLLECTOR: 16,
+        review.DISPOSITION_AGENT: 4,
+        review.DISPOSITION_COLLECTOR: 21,
         review.DISPOSITION_BLOCK: 6,
     }
     assert plan["owner_semantic_decision_job_ids"] == [
@@ -244,7 +244,6 @@ def test_business_followups_keep_primary_model_and_use_authorized_guild_reader()
         "e873367f6019",
         "cd778104fc92",
         "a1dfd5c2a7ab",
-        "969248a7da45",
     }
     for row in agent_rows.values():
         target = row["target"]
@@ -277,7 +276,7 @@ def test_collector_replacements_are_specific_and_not_yet_cutover_ready() -> None
     ]
     rail_ids = {row["target"]["systemd_rail_id"] for row in collectors}
 
-    assert len(collectors) == len(rail_ids) == 16
+    assert len(collectors) == len(rail_ids) == 21
     assert all(row["target"]["source_script_sha256"] for row in collectors)
     assert all(
         row["target"]["model_or_provider_allowed"] is False

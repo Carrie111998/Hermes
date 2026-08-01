@@ -29,6 +29,7 @@ from gateway.operational_edge_readiness import (
     build_operational_edge_readiness,
 )
 from ops.muncho.runtime import mechanical_job_rail
+from ops.muncho.runtime import trusted_cron_collector_rail
 from tests.gateway.test_production_capability_prerequisites import (
     _receipt_pair as _capability_receipt_pair,
 )
@@ -39,6 +40,19 @@ from tests.gateway.test_canonical_capability_canary_e2e import (
 
 NOW = 1_800_000_000
 REVISION = "a" * 40
+CRON_COLLECTOR_COUNT = len(trusted_cron_collector_rail.COLLECTOR_SPECS)
+CRON_SCOPED_COUNT = sum(
+    spec.execution_boundary
+    == trusted_cron_collector_rail.EXECUTION_BOUNDARY_SCOPED
+    for spec in trusted_cron_collector_rail.COLLECTOR_SPECS
+)
+CRON_REPLACEMENT_COUNT = (
+    production_cron_continuity_package._expected_plan_shape()[1]
+)
+CRON_COLLECTOR_ONLY_COUNT = sum(
+    not spec.model_review_required
+    for spec in trusted_cron_collector_rail.COLLECTOR_SPECS
+)
 
 
 def test_phase_b_receipt_parent_is_nonroot_readable_but_not_writable() -> None:
@@ -444,13 +458,12 @@ def test_direct_mvp_waiver_retains_live_and_pre_db_gates_without_canary(
 
 
 def _operational_receipt_key_ids() -> dict[str, str]:
-    domains = (
-        "adventico_email", "bitrix", "canonical", "github",
-        "infrastructure", "skyvision_db", "skyvision_email",
-        "skyvision_gitlab", "skyvision_panel",
-    )
-    key_digits = ("a", "b", "c", "d", "e", "f", "1", "2", "3")
-    return dict(zip(domains, (digit * 64 for digit in key_digits), strict=True))
+    return {
+        domain: f"{index:064x}"
+        for index, domain in enumerate(
+            sorted(cutover.CREDENTIALS_BY_DOMAIN), start=1
+        )
+    }
 
 
 def _operational_key_foundation(
@@ -2465,7 +2478,7 @@ def _cron_receipt(
             "schema": production_cron_cutover_runtime.PREFLIGHT_SCHEMA,
             **common,
             "expected_target_store_sha256": "2" * 64,
-            "collector_timer_count": 21,
+            "collector_timer_count": CRON_COLLECTOR_COUNT,
             "gateway_writer_connector_stopped": True,
             "artifacts_valid": True,
             "source_store_unchanged": True,
@@ -2485,7 +2498,7 @@ def _cron_receipt(
             "operational_edge_collector_nonce": (
                 "f1438b18-df67-46ea-ae46-5e4f3f863f09"
             ),
-            "operational_edge_meaningful_packet_count": 14,
+            "operational_edge_meaningful_packet_count": CRON_SCOPED_COUNT,
             "collector_execution_ready": True,
             "recovery_evidence_persisted": True,
             "runtime_target_mutation_performed": False,
@@ -2500,11 +2513,11 @@ def _cron_receipt(
             "jobs_archive_sha256": "1" * 64,
             "host_snapshot_path": "/root/host-snapshot.json",
             "host_snapshot_sha256": "4" * 64,
-            "replacement_agent_record_count": 24,
-            "collector_only_inert_record_count": 2,
+            "replacement_agent_record_count": CRON_REPLACEMENT_COUNT,
+            "collector_only_inert_record_count": CRON_COLLECTOR_ONLY_COUNT,
             "preserved_inert_record_count": 1,
-            "collector_unit_file_count": 42,
-            "collector_timer_count": 21,
+            "collector_unit_file_count": 2 * CRON_COLLECTOR_COUNT,
+            "collector_timer_count": CRON_COLLECTOR_COUNT,
             "collector_manifest_installed": True,
             "collector_timers_disabled": True,
             "collector_timers_active": False,
@@ -2516,7 +2529,7 @@ def _cron_receipt(
             "operational_edge_collector_nonce": (
                 "f1438b18-df67-46ea-ae46-5e4f3f863f09"
             ),
-            "operational_edge_meaningful_packet_count": 14,
+            "operational_edge_meaningful_packet_count": CRON_SCOPED_COUNT,
             "collector_execution_ready": True,
             "service_identity_reused_from_owner_bound_foundation": True,
             "records_deleted": False,
@@ -2544,7 +2557,7 @@ def _cron_receipt(
             "activation_authority_sha256": activation_authority_sha256,
             "target_store_sha256": "2" * 64,
             "gateway_writer_connector_active": True,
-            "collector_timer_count": 21,
+            "collector_timer_count": CRON_COLLECTOR_COUNT,
             "collector_timers_enabled": True,
             "collector_timers_active": True,
             "jobs_executed_by_activation_action": False,

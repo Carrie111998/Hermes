@@ -418,7 +418,7 @@ def observe_enabled_jobs_file(path: Path) -> dict[str, Any]:
 
 
 # Expected definition digests come from one redaction-safe, read-only
-# production observation on 2026-07-14.  They bind schedule, prompt/script
+# production observations through 2026-08-01. They bind schedule, prompt/script
 # identity, origin, route, tools, and all other static record fields while
 # excluding only runtime counters/status.  A changed definition must be
 # reviewed as a new record; the catalog never guesses that it is equivalent.
@@ -444,13 +444,17 @@ _EXPECTED_DEFINITION_SHA256 = {
     "cd778104fc92": "b3051076d5cac8a7644fd2ef22f279d76e3fa1faab999627685dfb57e140b407",
     "a1dfd5c2a7ab": "a158cb710306188be39f4ecb64dd1d9fbf0a93a5c8a542273b7f1bd461bd9b2c",
     "457b208c90ab": "c3d6d31bc29a0a54cb75850f2e40e0f6a824bdc2a77a9323c31db03d4e471cb2",
-    "969248a7da45": "4ba0c5a3b507c8e31a47ad6ca7574b887c26f70b1bbf363a34bdc0ff76642874",
     "e62f55ca93ca": "6861092e5d1941eaa4f5505dad1b1b492f3a8272088570a93bd4d99c7a5bfbe6",
     "7e4a90bdeff0": "3fb3e2bb2e4188e66e8c691911b586106066badfaf9137c6a4b50abfa2a511ca",
     "27f7f59fa0ca": "a3f35f4e32029b2a0082db878aa27b320d2dfe043c0837d62e2233a65f22089c",
     "6faf380f3512": "868f2d6aab796c94921e91a9d7288e631493e90d0118c60e98a2ed2e0bf23eec",
     "90ac99d45130": "eea03924f54a1e0a8a6eaf2b5e3847cf2b0aacf4b05b460c7020b6a1eaa37095",
-    "dee523e6f47b": "eeff2015f69cf6a637eea2bdfffb454e9318ab57c6d4a7da751df6ef33fe1454",
+    "29672043aa91": "0a5ea6fc348df61b6aff656fcd9efef0daf64e3fc50b8f8c45b9ee53bf7801a8",
+    "2b8fbfcf9699": "83f503e7dc1cadc21f107caff6346b70650d58473d875227f2587748fbea266a",
+    "ded5510a72ec": "52e1c3466e99986202db589ef37b3003ac704272ceb2f835b09a68d72e241c7d",
+    "9af26dbf2361": "b87e3040da702faa7f9d2d476e492a3f6a6d590a05f9f0028279c2649ca2a57d",
+    "4f6ea4a310b6": "bacd0bed8aaa3873e641913f44d332c6153f98a37a9989a297e742916aca74cd",
+    "7c2bed784dfd": "df1b16341c3aca62b9538ac3bd88e180b92a25f82f6d58d972faafaba6c870d7",
 }
 
 
@@ -593,16 +597,6 @@ REVIEW_CATALOG: tuple[ReviewDisposition, ...] = (
         target_id=None,
     ),
     _entry(
-        "969248a7da45",
-        code=_DISCORD_TOOLSET_FORBIDDEN,
-        disposition=DISPOSITION_AGENT,
-        target_id="strict-primary-agent",
-        tools=(GUILD_HISTORY_TOOLSET,),
-        delivery="origin",
-        remove_workdir=True,
-        remove_script=True,
-    ),
-    _entry(
         "e62f55ca93ca",
         code=_SCRIPT_FORBIDDEN,
         disposition=DISPOSITION_BLOCK,
@@ -614,7 +608,12 @@ REVIEW_CATALOG: tuple[ReviewDisposition, ...] = (
     _entry("27f7f59fa0ca", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="devops-watchtower-infrastructure"),
     _entry("6faf380f3512", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="devops-watchtower-tls-dns"),
     _entry("90ac99d45130", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="devops-watchtower-digest"),
-    _entry("dee523e6f47b", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-from-heart-weekly-count"),
+    _entry("29672043aa91", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-backup-raw-review", external_semantics=True),
+    _entry("2b8fbfcf9699", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-discount-codes-raw-review", external_semantics=True),
+    _entry("ded5510a72ec", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-seo-daily-raw-review", external_semantics=True),
+    _entry("9af26dbf2361", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-seo-weekly-raw-review", external_semantics=True),
+    _entry("4f6ea4a310b6", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-seo-nasi-weekly-raw-review", external_semantics=True),
+    _entry("7c2bed784dfd", code=_SCRIPT_FORBIDDEN, disposition=DISPOSITION_COLLECTOR, target_id="skyvision-seo-nasi-monthly-raw-review", external_semantics=True),
 )
 
 
@@ -815,7 +814,7 @@ def _catalog() -> dict[str, ReviewDisposition]:
                 and entry.blocker_code is None
                 and entry.owner_semantic_decision_required is False
                 and entry.inferred_target_id is None
-                and entry.semantic_logic_outside_model_observed is False
+                and type(entry.semantic_logic_outside_model_observed) is bool
             )
         else:
             valid = (

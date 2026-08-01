@@ -69,10 +69,12 @@ _OPERATIONAL_EDGE_DOMAINS = (
     "canonical",
     "github",
     "infrastructure",
+    "skyvision_backup",
     "skyvision_db",
     "skyvision_email",
     "skyvision_gitlab",
     "skyvision_panel",
+    "skyvision_seo",
 )
 _FIXED_USERS = (
     "ai-platform-brain",

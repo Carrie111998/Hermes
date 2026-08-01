@@ -1392,7 +1392,8 @@ TARGET_FIELDS = {
 }
 OPERATIONAL_EDGE_DOMAINS = {
     "adventico_email", "bitrix", "canonical", "github", "infrastructure",
-    "skyvision_db", "skyvision_email", "skyvision_gitlab", "skyvision_panel",
+    "skyvision_backup", "skyvision_db", "skyvision_email",
+    "skyvision_gitlab", "skyvision_panel", "skyvision_seo",
 }
 RECONCILIATION_FIELDS = {
     "schema", "purpose", "release_revision", "legacy_public_policy_sha256",

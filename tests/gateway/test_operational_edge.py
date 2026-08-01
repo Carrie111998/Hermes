@@ -146,15 +146,21 @@ def test_catalog_is_exactly_implemented_and_credential_scoped() -> None:
     assets = asset_catalog()
     required = required_cron_operations()
 
-    assert len(catalog) == 62
-    assert len(required) == 14
+    assert len(required) == sum(
+        bool(item.cron_source_job_id) for item in catalog.values()
+    )
     assert set(CREDENTIALS_BY_DOMAIN) == {item.domain for item in catalog.values()}
     assert all(item.asset_id in assets for item in catalog.values())
     assert all(required[job] == operation.operation_id for operation in catalog.values() if (job := operation.cron_source_job_id))
-    assert CREDENTIALS_BY_DOMAIN["canonical"] == ()
+    assert {
+        domain
+        for domain, bindings in CREDENTIALS_BY_DOMAIN.items()
+        if not bindings
+    } == {"canonical", "skyvision_seo"}
     assert all(
         CREDENTIALS_BY_DOMAIN[domain]
-        for domain in set(CREDENTIALS_BY_DOMAIN) - {"canonical"}
+        for domain in set(CREDENTIALS_BY_DOMAIN)
+        - {"canonical", "skyvision_seo"}
     )
 
     mutations = [item for item in catalog.values() if item.access is OperationalAccess.MUTATION]
@@ -544,7 +550,8 @@ def test_collector_nonce_prevents_probe_receipt_replay() -> None:
         boot_id_sha256=BOOT_SHA,
         observed_at_unix=NOW,
     )
-    first_keys, second_keys = keys[:14], keys[14:]
+    required_count = len(required_cron_operations())
+    first_keys, second_keys = keys[:required_count], keys[required_count:]
     assert first["collector_nonce"] != second["collector_nonce"]
     assert set(first_keys).isdisjoint(second_keys)
     assert all(f":{first['collector_nonce']}:" in key for key in first_keys)
@@ -841,7 +848,9 @@ def test_create_only_key_stager_and_pure_foundation_bind_real_key_ids(
     assert foundation.manifest["receipt_public_key_ids"] == {
         row["domain"]: row["public_key_id"] for row in pre_owner["keys"]
     }
-    assert foundation.manifest["artifact_count"] == 19
+    assert foundation.manifest["artifact_count"] == (
+        2 * len(CREDENTIALS_BY_DOMAIN) + 1
+    )
     config_artifacts = [
         item
         for item in foundation.artifacts
@@ -852,7 +861,7 @@ def test_create_only_key_stager_and_pure_foundation_bind_real_key_ids(
     assert all(item.mode == 0o400 for item in config_artifacts)
 
 
-def test_asset_packager_seals_all_62_operation_dependencies(tmp_path: Path) -> None:
+def test_asset_packager_seals_all_operation_dependencies(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes-home"
     canonical = tmp_path / "canonical-brain"
     release = tmp_path / "release"
@@ -874,7 +883,7 @@ def test_asset_packager_seals_all_62_operation_dependencies(tmp_path: Path) -> N
         canonical_brain=canonical,
     )
     assert manifest["asset_count"] == len(asset_catalog())
-    assert manifest["operation_count"] == 62
+    assert manifest["operation_count"] == len(operation_catalog())
     assert manifest["all_operations_implemented"] is True
     assert manifest["credential_material_packaged"] is False
     assert all(
@@ -935,7 +944,7 @@ def test_units_load_only_domain_credentials_and_attest_service_gid() -> None:
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
     )
-    assert bundle.manifest["operation_count"] == 62
+    assert bundle.manifest["operation_count"] == len(operation_catalog())
     assert bundle.manifest["release_owner_uid"] == 1006
     assert bundle.manifest["release_owner_gid"] == 1007
     identity = bundle.manifest["identity_contract"]
@@ -963,9 +972,15 @@ def test_units_load_only_domain_credentials_and_attest_service_gid() -> None:
     assert bundle.manifest["receipt_public_key_ids"] == receipt_key_ids
     client = json.loads(bundle.client_config)
     assert client["schema"] == "muncho-operational-edge-client-config.v3"
-    assert len({row["service_uid"] for row in client["domains"].values()}) == 9
-    assert len({row["service_gid"] for row in client["domains"].values()}) == 9
-    assert len({row["socket_gid"] for row in client["domains"].values()}) == 9
+    assert len({row["service_uid"] for row in client["domains"].values()}) == len(
+        CREDENTIALS_BY_DOMAIN
+    )
+    assert len({row["service_gid"] for row in client["domains"].values()}) == len(
+        CREDENTIALS_BY_DOMAIN
+    )
+    assert len({row["socket_gid"] for row in client["domains"].values()}) == len(
+        CREDENTIALS_BY_DOMAIN
+    )
     for raw in bundle.configs.values():
         config = json.loads(raw)
         domain = config["domain"]

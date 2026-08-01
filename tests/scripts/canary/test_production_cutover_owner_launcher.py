@@ -69,14 +69,11 @@ def test_owner_transport_rejects_custom_ca_environment(
 
 
 def _operational_receipt_key_ids() -> dict[str, str]:
-    domains = (
-        "adventico_email", "bitrix", "canonical", "github",
-        "infrastructure", "skyvision_db", "skyvision_email",
-        "skyvision_gitlab", "skyvision_panel",
-    )
     return {
-        domain: f"{index:x}" * 64
-        for index, domain in enumerate(domains, start=1)
+        domain: f"{index:064x}"
+        for index, domain in enumerate(
+            sorted(package.CREDENTIALS_BY_DOMAIN), start=1
+        )
     }
 
 

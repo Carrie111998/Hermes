@@ -24,6 +24,7 @@ from gateway.api_verifier_credentials import (
     build_api_bearer_verifier,
 )
 from gateway.operational_edge_catalog import asset_catalog
+from ops.muncho.runtime import trusted_cron_collector_rail as trusted_cron
 from scripts.canary import package_production_cutover_artifacts as package
 from tests.gateway.test_canonical_writer_production_cutover import (
     _cron_authority,
@@ -44,20 +45,11 @@ HAS_FCNTL = importlib.util.find_spec("fcntl") is not None
 
 
 def _operational_receipt_key_ids() -> dict[str, str]:
-    domains = (
-        "adventico_email",
-        "bitrix",
-        "canonical",
-        "github",
-        "infrastructure",
-        "skyvision_db",
-        "skyvision_email",
-        "skyvision_gitlab",
-        "skyvision_panel",
-    )
     return {
-        domain: f"{index:x}" * 64
-        for index, domain in enumerate(domains, start=1)
+        domain: f"{index:064x}"
+        for index, domain in enumerate(
+            sorted(package.CREDENTIALS_BY_DOMAIN), start=1
+        )
     }
 
 
@@ -1655,8 +1647,8 @@ def test_packager_binds_gateway_imports_to_its_target_release_under_isolation(
     (gateway / "operational_edge_catalog.py").write_text(
         "CREDENTIALS_BY_DOMAIN={name:() for name in ("
         "'adventico_email','bitrix','canonical','github','infrastructure',"
-        "'skyvision_db','skyvision_email','skyvision_gitlab',"
-        "'skyvision_panel')}\n",
+        "'skyvision_backup','skyvision_db','skyvision_email',"
+        "'skyvision_gitlab','skyvision_panel','skyvision_seo')}\n",
         encoding="utf-8",
     )
     (gateway / "operational_edge_assets.py").write_text(
@@ -1957,7 +1949,9 @@ def test_generated_runtime_binds_split_cron_identities_and_inert_namespace(
     tampered_readiness = tampered_cron["collector_execution_readiness"]
     tampered_readiness["unit_namespace_readiness_packaged"] = True
     tampered_readiness["unit_namespace_readiness_receipt_sha256"] = "9" * 64
-    tampered_readiness["unit_namespace_readiness_job_count"] = 21
+    tampered_readiness["unit_namespace_readiness_job_count"] = len(
+        trusted_cron.COLLECTOR_SPECS
+    )
     tampered_readiness["direct_dependencies_ready"] = True
     tampered_readiness["readiness_sha256"] = _sha_json({
         key: item
