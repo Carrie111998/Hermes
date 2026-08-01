@@ -4,7 +4,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -231,6 +231,71 @@ class TestTeamsRequirements:
         cfg = _make_config(client_id="id", client_secret="secret", tenant_id="tenant")
         assert validate_config(cfg) is True
 
+    def test_validate_config_missing_tenant_is_valid_for_multi_tenant(self, monkeypatch):
+        # Empty TEAMS_TENANT_ID is the correct shape for multi-tenant bots — the SDK
+        # builds a multi-tenant JWT validator when tenant_id is falsy.
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "test-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "test-secret")
+        monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
+        assert validate_config(_make_config()) is True
+
+    def test_validate_config_missing_client_id_is_invalid(self, monkeypatch):
+        monkeypatch.delenv("TEAMS_CLIENT_ID", raising=False)
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "test-secret")
+        monkeypatch.setenv("TEAMS_TENANT_ID", "test-tenant")
+        assert validate_config(_make_config()) is False
+
+    def test_validate_config_missing_client_secret_is_invalid(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "test-id")
+        monkeypatch.delenv("TEAMS_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("TEAMS_TENANT_ID", "test-tenant")
+        assert validate_config(_make_config()) is False
+
+class TestTeamsEnvEnablement:
+    """``_env_enablement`` gates env-only bootstrap; it must match validate_config.
+
+    If it demanded a tenant id while validate_config did not, an env-only
+    multi-tenant bot would validate but never seed PlatformConfig.extra, so it
+    would never show up as configured or connected.
+    """
+
+    def _clear(self, monkeypatch):
+        for var in (
+            "TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET", "TEAMS_TENANT_ID",
+            "TEAMS_PORT", "TEAMS_SERVICE_URL", "TEAMS_HOME_CHANNEL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_multi_tenant_env_seeds_without_tenant_id(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "bot-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "bot-secret")
+
+        seed = _teams_mod._env_enablement()
+
+        assert seed is not None, (
+            "an env-only multi-tenant bot must still seed PlatformConfig.extra"
+        )
+        assert seed["client_id"] == "bot-id"
+        assert "tenant_id" not in seed
+
+    def test_single_tenant_env_seeds_tenant_id(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "bot-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "bot-secret")
+        monkeypatch.setenv("TEAMS_TENANT_ID", "my-tenant-guid")
+
+        seed = _teams_mod._env_enablement()
+
+        assert seed is not None
+        assert seed["tenant_id"] == "my-tenant-guid"
+
+    def test_missing_client_secret_returns_none(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "bot-id")
+
+        assert _teams_mod._env_enablement() is None
+
 
 # ---------------------------------------------------------------------------
 # Tests: Adapter Init
@@ -310,6 +375,20 @@ class TestTeamsInteractiveSetup:
         assert "TEAMS_CLIENT_ID=client-id" in env_text
         assert "TEAMS_TENANT_ID=tenant-id" in env_text
 
+def _stub_aiohttp_web():
+    """Stand in for ``aiohttp.web`` so connect() runs without aiohttp installed.
+
+    The adapter imports ``web`` lazily and leaves it ``None`` when aiohttp is
+    absent, which is the norm in this suite (the Teams SDK is mocked for the
+    same reason). Only the four symbols connect() touches need to behave.
+    """
+    web = MagicMock()
+    web.AppRunner.return_value.setup = AsyncMock()
+    web.AppRunner.return_value.cleanup = AsyncMock()
+    web.TCPSite.return_value.start = AsyncMock()
+    return web
+
+
 class TestTeamsConnect:
     @pytest.mark.anyio
     async def test_connect_fails_without_sdk(self, monkeypatch):
@@ -327,6 +406,127 @@ class TestTeamsConnect:
         result = await adapter.connect()
         assert result is False
 
+    @pytest.mark.anyio
+    async def test_connect_succeeds_without_tenant_id_for_multi_tenant(self, monkeypatch):
+        # Multi-tenant deployments leave TEAMS_TENANT_ID empty; that's the only
+        # input shape the SDK's TokenValidator.for_entra() accepts to issue a
+        # multi-tenant validator. The adapter must NOT fail-fast on empty tenant_id.
+        # TEAMS_TENANT_ID takes precedence over config, so clear it — the
+        # interactive-setup tests seed one earlier in this module.
+        monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret",
+        ))
+        assert adapter._tenant_id == ""
+
+        with patch.object(_teams_mod, "web", _stub_aiohttp_web()):
+            result = await adapter.connect()
+        assert result is True, (
+            "connect() must succeed when tenant_id is empty so the SDK can "
+            "build a multi-tenant JWT validator"
+        )
+
+    @pytest.mark.anyio
+    async def test_connect_omits_tenant_id_kwarg_when_empty(self, monkeypatch, caplog):
+        # The SDK switches between single- and multi-tenant validators based on
+        # the *truthiness* of the tenant_id kwarg passed to App(). The adapter
+        # MUST omit the kwarg entirely (not pass tenant_id="") when running in
+        # multi-tenant mode — otherwise an empty string would still be treated
+        # as a single-tenant constraint.
+        monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
+        captured: dict = {}
+
+        class _CapturingApp:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.server = MagicMock()
+                self.server.handle_request = AsyncMock(return_value={"status": 200, "body": None})
+                self.credentials = MagicMock()
+                self.credentials.client_id = kwargs.get("client_id")
+
+            @property
+            def id(self):
+                return captured.get("client_id")
+
+            def on_message(self, fn):
+                return fn
+
+            def on_card_action(self, fn):
+                return fn
+
+            async def initialize(self):
+                pass
+
+            async def start(self, port=3978):
+                pass
+
+            async def stop(self):
+                pass
+
+        monkeypatch.setattr(_teams_mod, "App", _CapturingApp)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="",
+        ))
+        with patch.object(_teams_mod, "web", _stub_aiohttp_web()), \
+                caplog.at_level("INFO", logger=_teams_mod.logger.name):
+            result = await adapter.connect()
+        assert result is True
+        assert "tenant_id" not in captured, (
+            "tenant_id must not be passed to App() when empty; the SDK relies on "
+            "an absent/None tenant_id to build a multi-tenant validator"
+        )
+        assert any("multi-tenant mode" in rec.message for rec in caplog.records), (
+            "expected an INFO log line announcing multi-tenant mode startup"
+        )
+
+    @pytest.mark.anyio
+    async def test_connect_passes_tenant_id_kwarg_when_set(self, monkeypatch, caplog):
+        # Single-tenant deployments must forward the tenant_id to App() so the
+        # SDK builds a single-tenant validator scoped to that tenant.
+        monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
+        captured: dict = {}
+
+        class _CapturingApp:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.server = MagicMock()
+                self.server.handle_request = AsyncMock(return_value={"status": 200, "body": None})
+                self.credentials = MagicMock()
+                self.credentials.client_id = kwargs.get("client_id")
+
+            @property
+            def id(self):
+                return captured.get("client_id")
+
+            def on_message(self, fn):
+                return fn
+
+            def on_card_action(self, fn):
+                return fn
+
+            async def initialize(self):
+                pass
+
+            async def start(self, port=3978):
+                pass
+
+            async def stop(self):
+                pass
+
+        monkeypatch.setattr(_teams_mod, "App", _CapturingApp)
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="my-tenant-guid",
+        ))
+        with patch.object(_teams_mod, "web", _stub_aiohttp_web()), \
+                caplog.at_level("INFO", logger=_teams_mod.logger.name):
+            result = await adapter.connect()
+        assert result is True
+        assert captured.get("tenant_id") == "my-tenant-guid"
+        assert any("single-tenant mode" in rec.message for rec in caplog.records), (
+            "expected an INFO log line announcing single-tenant mode startup"
+        )
 
 # ---------------------------------------------------------------------------
 # Tests: Send
@@ -653,6 +853,109 @@ class TestTeamsStandaloneSend:
         assert activity_kwargs["json"]["text"] == "hello cron"
         assert activity_kwargs["json"]["type"] == "message"
 
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_uses_multi_tenant_authority_without_tenant_id(
+        self, monkeypatch,
+    ):
+        """A multi-tenant bot has no home tenant; it must use botframework.com.
+
+        Bot Framework documents the shared authority for multi-tenant bots at
+        the same api.botframework.com scope. Building the tenant-scoped URL is
+        impossible without a tenant id, so a blank one selects that authority
+        rather than failing the send.
+        """
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "client-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "secret")
+        monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
+        monkeypatch.delenv("TEAMS_SERVICE_URL", raising=False)
+
+        token_resp = _FakeAiohttpResponse(200, {"access_token": "the-token"})
+        activity_resp = _FakeAiohttpResponse(200, {"id": "msg-1"})
+        session = _FakeAiohttpSession([token_resp, activity_resp])
+        _install_fake_aiohttp(monkeypatch, session)
+
+        result = await _teams_mod._standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            "19:abc@thread.skype",
+            "hello cron",
+        )
+
+        assert result == {"success": True, "message_id": "msg-1"}
+        token_url, token_kwargs = session.calls[0]
+        assert token_url == (
+            "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+        )
+        # Scope is identical for both app types.
+        assert token_kwargs["data"]["scope"] == "https://api.botframework.com/.default"
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_still_uses_tenant_authority_when_set(
+        self, monkeypatch,
+    ):
+        """Single-tenant bots must keep authenticating against their own tenant."""
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "client-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("TEAMS_TENANT_ID", "my-tenant-guid")
+        monkeypatch.delenv("TEAMS_SERVICE_URL", raising=False)
+
+        token_resp = _FakeAiohttpResponse(200, {"access_token": "the-token"})
+        activity_resp = _FakeAiohttpResponse(200, {"id": "msg-2"})
+        session = _FakeAiohttpSession([token_resp, activity_resp])
+        _install_fake_aiohttp(monkeypatch, session)
+
+        result = await _teams_mod._standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            "19:abc@thread.skype",
+            "hello cron",
+        )
+
+        assert result == {"success": True, "message_id": "msg-2"}
+        token_url, _ = session.calls[0]
+        assert token_url == (
+            "https://login.microsoftonline.com/my-tenant-guid/oauth2/v2.0/token"
+        )
+        assert "botframework.com/oauth2" not in token_url
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_still_requires_client_credentials(self, monkeypatch):
+        """Relaxing the tenant gate must not relax the credential gate."""
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "client-id")
+        monkeypatch.delenv("TEAMS_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("TEAMS_TENANT_ID", raising=False)
+
+        session = _FakeAiohttpSession([])
+        _install_fake_aiohttp(monkeypatch, session)
+
+        result = await _teams_mod._standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            "19:abc@thread.skype",
+            "hi",
+        )
+
+        assert "error" in result
+        assert "TEAMS_CLIENT_SECRET" in result["error"]
+        assert len(session.calls) == 0, "must not reach the token endpoint"
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_rejects_malformed_tenant_id(self, monkeypatch):
+        """A supplied tenant id is still validated before it reaches a URL."""
+        monkeypatch.setenv("TEAMS_CLIENT_ID", "client-id")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("TEAMS_TENANT_ID", "bad/../tenant?x=y")
+
+        session = _FakeAiohttpSession([])
+        _install_fake_aiohttp(monkeypatch, session)
+
+        result = await _teams_mod._standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            "19:abc@thread.skype",
+            "hi",
+        )
+
+        assert "error" in result
+        assert "TEAMS_TENANT_ID" in result["error"]
+        assert len(session.calls) == 0, "must not reach the token endpoint"
 
     @pytest.mark.asyncio
     async def test_standalone_send_propagates_token_failure(self, monkeypatch):

@@ -7,7 +7,8 @@ Proactive messaging (send, typing) uses the SDK's App.send() method.
 
 Requires:
     pip install microsoft-teams-apps aiohttp
-    TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID env vars
+    TEAMS_CLIENT_ID and TEAMS_CLIENT_SECRET env vars
+    TEAMS_TENANT_ID env var (optional — leave unset for multi-tenant bots)
 
 Configuration in config.yaml:
     platforms:
@@ -16,7 +17,12 @@ Configuration in config.yaml:
         extra:
           client_id: "your-client-id"      # or TEAMS_CLIENT_ID env var
           client_secret: "your-secret"      # or TEAMS_CLIENT_SECRET env var
-          tenant_id: "your-tenant-id"       # or TEAMS_TENANT_ID env var
+          tenant_id: "your-tenant-id"       # or TEAMS_TENANT_ID env var.
+                                            # Leave unset/blank for multi-tenant bots
+                                            # (signInAudience=AzureADMultipleOrgs).
+                                            # The SDK treats any non-empty value
+                                            # (including "common") as a single-tenant
+                                            # constraint and will 401 cross-tenant tokens.
           port: 3978                        # or TEAMS_PORT env var
 """
 
@@ -406,12 +412,17 @@ def check_requirements() -> bool:
 
 
 def validate_config(config) -> bool:
-    """Return True when the config has the minimum required credentials."""
+    """Return True when the config has the minimum required credentials.
+
+    ``TEAMS_TENANT_ID`` is intentionally optional: an unset/blank value is the
+    correct shape for multi-tenant bots (the SDK falls back to multi-tenant JWT
+    validation when ``tenant_id`` is falsy). Only ``TEAMS_CLIENT_ID`` and
+    ``TEAMS_CLIENT_SECRET`` are strictly required.
+    """
     extra = getattr(config, "extra", {}) or {}
     client_id = os.getenv("TEAMS_CLIENT_ID") or extra.get("client_id", "")
     client_secret = os.getenv("TEAMS_CLIENT_SECRET") or extra.get("client_secret", "")
-    tenant_id = os.getenv("TEAMS_TENANT_ID") or extra.get("tenant_id", "")
-    return bool(client_id and client_secret and tenant_id)
+    return bool(client_id and client_secret)
 
 
 def is_connected(config) -> bool:
@@ -433,13 +444,16 @@ def _env_enablement() -> dict | None:
     client_id = os.getenv("TEAMS_CLIENT_ID", "").strip()
     client_secret = os.getenv("TEAMS_CLIENT_SECRET", "").strip()
     tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip()
-    if not (client_id and client_secret and tenant_id):
+    # Mirror validate_config(): tenant_id is optional, so an env-only
+    # multi-tenant bot must still seed extra or it never shows as configured.
+    if not (client_id and client_secret):
         return None
     seed: dict = {
         "client_id": client_id,
         "client_secret": client_secret,
-        "tenant_id": tenant_id,
     }
+    if tenant_id:
+        seed["tenant_id"] = tenant_id
     port = os.getenv("TEAMS_PORT", "").strip()
     if port:
         try:
@@ -463,6 +477,12 @@ def _env_enablement() -> dict | None:
 # ``https://smba.infra.gov.teams.microsoft.us/``) which can be supplied via
 # ``TEAMS_SERVICE_URL`` or ``extra['service_url']``.
 _DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+
+# Shared token authority for multi-tenant bots. ``botframework.com`` is a fixed
+# literal here, not a tenant id — it is never interpolated from configuration.
+_MULTI_TENANT_TOKEN_URL = (
+    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+)
 
 # Allowlist of Bot Framework service hosts that may receive a freshly
 # minted bearer token.  Operator-supplied URLs are matched against this
@@ -503,6 +523,29 @@ def _validate_teams_service_url(raw: str) -> Optional[str]:
     return normalized
 
 
+def _bot_framework_token_url(tenant_id: str) -> str:
+    """Return the client-credentials token endpoint for this bot's app type.
+
+    Bot Framework documents two authorities for the same
+    ``https://api.botframework.com/.default`` scope:
+
+    * single-tenant — ``login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token``
+    * multi-tenant  — ``login.microsoftonline.com/botframework.com/oauth2/v2.0/token``
+
+    A multi-tenant bot has no home tenant to authenticate against, so the
+    tenant-scoped URL cannot be built for it at all. Callers therefore treat a
+    blank tenant id as "multi-tenant" rather than as missing configuration.
+
+    See "Authenticate requests with the Bot Connector API", Step 1 (the
+    Multi-tenant / Single-tenant tabs) and the "Security protocol changes"
+    table:
+    https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+    """
+    if tenant_id:
+        return f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    return _MULTI_TENANT_TOKEN_URL
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -519,10 +562,15 @@ async def _standalone_send(
     separate process from ``hermes gateway``).  Without this hook,
     ``deliver=teams`` cron jobs fail with ``No live adapter for platform``.
 
-    Configuration: requires ``TEAMS_CLIENT_ID``, ``TEAMS_CLIENT_SECRET``,
-    ``TEAMS_TENANT_ID``, ``TEAMS_HOME_CHANNEL`` (the conversation ID), and
-    optionally ``TEAMS_SERVICE_URL`` (Bot Framework service host; must be
-    a known Bot Framework endpoint, see ``_ALLOWED_TEAMS_SERVICE_HOSTS``).
+    Configuration: requires ``TEAMS_CLIENT_ID``, ``TEAMS_CLIENT_SECRET`` and
+    ``TEAMS_HOME_CHANNEL`` (the conversation ID), and optionally
+    ``TEAMS_SERVICE_URL`` (Bot Framework service host; must be a known Bot
+    Framework endpoint, see ``_ALLOWED_TEAMS_SERVICE_HOSTS``).
+
+    ``TEAMS_TENANT_ID`` selects the token authority rather than being required:
+    a single-tenant bot authenticates against its own tenant, a multi-tenant
+    bot against the shared ``botframework.com`` authority. See
+    :func:`_bot_framework_token_url`.
 
     Security: ``service_url`` is validated against an allowlist of known
     Bot Framework hosts to block SSRF / token-exfiltration via a tampered
@@ -538,8 +586,8 @@ async def _standalone_send(
     client_id = os.getenv("TEAMS_CLIENT_ID") or extra.get("client_id", "")
     client_secret = os.getenv("TEAMS_CLIENT_SECRET") or extra.get("client_secret", "")
     tenant_id = os.getenv("TEAMS_TENANT_ID") or extra.get("tenant_id", "")
-    if not (client_id and client_secret and tenant_id):
-        return {"error": "Teams standalone send: TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID are all required"}
+    if not (client_id and client_secret):
+        return {"error": "Teams standalone send: TEAMS_CLIENT_ID and TEAMS_CLIENT_SECRET are required"}
 
     raw_service_url = (
         os.getenv("TEAMS_SERVICE_URL")
@@ -561,10 +609,12 @@ async def _standalone_send(
         return {"error": "Teams standalone send: chat_id (conversation ID) is required"}
     if not _TEAMS_CONV_ID_RE.match(chat_id):
         return {"error": "Teams standalone send: chat_id contains characters outside the Bot Framework conversation ID set"}
-    if not _TEAMS_CONV_ID_RE.match(tenant_id):
+    # Only meaningful when a tenant id is supplied; a blank one selects the
+    # fixed multi-tenant authority and is never interpolated into a URL.
+    if tenant_id and not _TEAMS_CONV_ID_RE.match(tenant_id):
         return {"error": "Teams standalone send: TEAMS_TENANT_ID contains characters outside the expected set"}
 
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    token_url = _bot_framework_token_url(tenant_id)
     activities_url = f"{service_url}v3/conversations/{chat_id}/activities"
 
     if not AIOHTTP_AVAILABLE:
@@ -741,10 +791,10 @@ class TeamsAdapter(BasePlatformAdapter):
             )
             return False
 
-        if not self._client_id or not self._client_secret or not self._tenant_id:
+        if not self._client_id or not self._client_secret:
             self._set_fatal_error(
                 "MISSING_CREDENTIALS",
-                "TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID are all required",
+                "TEAMS_CLIENT_ID and TEAMS_CLIENT_SECRET are required",
                 retryable=False,
             )
             return False
@@ -758,13 +808,30 @@ class TeamsAdapter(BasePlatformAdapter):
             aiohttp_app = web.Application(client_max_size=_MAX_BODY_BYTES)
             aiohttp_app.router.add_get("/health", lambda _: web.Response(text="ok"))
 
-            self._app = App(
-                client_id=self._client_id,
-                client_secret=self._client_secret,
-                tenant_id=self._tenant_id,
-                http_server_adapter=_AiohttpBridgeAdapter(aiohttp_app),
-                client=ClientOptions(headers={"User-Agent": "Hermes"}),
-            )
+            # Pass tenant_id to the SDK only when it's set. A non-empty value
+            # (including the literal string "common") forces single-tenant JWT
+            # validation in microsoft-teams-apps via TokenValidator.for_entra(tenant_id);
+            # an absent kwarg lets the SDK build a multi-tenant validator.
+            app_kwargs: Dict[str, Any] = {
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "http_server_adapter": _AiohttpBridgeAdapter(aiohttp_app),
+                "client": ClientOptions(headers={"User-Agent": "Hermes"}),
+            }
+            if self._tenant_id:
+                app_kwargs["tenant_id"] = self._tenant_id
+                logger.info(
+                    "Teams adapter starting in single-tenant mode "
+                    "(tenant_id=%s)",
+                    self._tenant_id,
+                )
+            else:
+                logger.info(
+                    "Teams adapter starting in multi-tenant mode "
+                    "(TEAMS_TENANT_ID unset; SDK will accept tokens from any tenant)"
+                )
+
+            self._app = App(**app_kwargs)
 
             # Register message handler before initialize()
             @self._app.on_message
@@ -1385,10 +1452,13 @@ def interactive_setup() -> None:
         return
     save_env_value("TEAMS_CLIENT_SECRET", client_secret.strip())
 
-    tenant_id = prompt("Tenant ID", default=get_env_value("TEAMS_TENANT_ID") or "")
-    if not tenant_id:
-        print_warning("Tenant ID is required — skipping Teams setup")
-        return
+    print()
+    print_info("Tenant ID is OPTIONAL.")
+    print_info("  • Single-tenant bot (signInAudience=AzureADMyOrg): enter your tenant GUID.")
+    print_info("  • Multi-tenant bot (signInAudience=AzureADMultipleOrgs): leave blank.")
+    print_info("Do NOT enter \"common\" — the SDK treats it as a single-tenant constraint")
+    print_info("and will 401 every cross-tenant token.")
+    tenant_id = prompt("Tenant ID (leave blank for multi-tenant)", default=get_env_value("TEAMS_TENANT_ID") or "")
     save_env_value("TEAMS_TENANT_ID", tenant_id.strip())
 
     print()
@@ -1424,7 +1494,7 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET", "TEAMS_TENANT_ID"],
+        required_env=["TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET"],
         install_hint="pip install microsoft-teams-apps aiohttp",
         setup_fn=interactive_setup,
         # Env-driven auto-configuration — seeds PlatformConfig.extra with

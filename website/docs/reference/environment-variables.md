@@ -715,7 +715,7 @@ The Microsoft Teams platform adapter (Bot Framework / Azure AD), distinct from t
 |----------|-------------|
 | `TEAMS_CLIENT_ID` | Azure AD application (Bot Framework) client ID. |
 | `TEAMS_CLIENT_SECRET` | Azure AD application client secret. |
-| `TEAMS_TENANT_ID` | Azure AD tenant ID hosting the bot application. |
+| `TEAMS_TENANT_ID` | Optional. Azure AD tenant ID hosting the bot application, for single-tenant bots (`signInAudience=AzureADMyOrg`). Leave unset for multi-tenant bots — any non-empty value, including `common`, forces single-tenant token validation. |
 | `TEAMS_HOST` | Webhook bind host (default: unset → dual-stack, all interfaces IPv4+IPv6). |
 | `TEAMS_PORT` | Webhook listen port (Bot Framework default: `3978`). |
 | `TEAMS_ALLOWED_USERS` | Comma-separated Teams user IDs / UPNs allowed to talk to the bot. |

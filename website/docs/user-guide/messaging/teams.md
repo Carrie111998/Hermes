@@ -93,6 +93,10 @@ Add to `~/.hermes/.env`:
 # Required
 TEAMS_CLIENT_ID=<your-client-id>
 TEAMS_CLIENT_SECRET=<your-client-secret>
+
+# Single-tenant bots only (signInAudience=AzureADMyOrg).
+# Leave this OUT for a multi-tenant bot — any non-empty value (including
+# "common") forces single-tenant token validation and 401s cross-tenant users.
 TEAMS_TENANT_ID=<your-tenant-id>
 
 # Restrict access to specific users (recommended)
@@ -140,7 +144,7 @@ Open the printed link in your browser — it opens directly in the Teams client.
 |----------|-------------|
 | `TEAMS_CLIENT_ID` | Azure AD App (client) ID |
 | `TEAMS_CLIENT_SECRET` | Azure AD client secret |
-| `TEAMS_TENANT_ID` | Azure AD tenant ID |
+| `TEAMS_TENANT_ID` | Azure AD tenant ID — optional; omit for multi-tenant bots |
 | `TEAMS_ALLOWED_USERS` | Comma-separated AAD object IDs allowed to use the bot |
 | `TEAMS_ALLOW_ALL_USERS` | Set `true` to skip the allowlist and allow anyone |
 | `TEAMS_HOME_CHANNEL` | Conversation ID for cron/proactive message delivery |
@@ -236,7 +240,7 @@ Make sure your configured port (`TEAMS_PORT`, default `3978`) is reachable from 
 |---------|----------|
 | `health` endpoint works but bot doesn't respond | Check that your tunnel is still running and the bot's messaging endpoint matches the tunnel URL |
 | `KeyError: 'teams'` in logs | Restart the container — this is fixed in the current version |
-| Bot responds with auth errors | Verify `TEAMS_CLIENT_ID`, `TEAMS_CLIENT_SECRET`, and `TEAMS_TENANT_ID` are all set correctly |
+| Bot responds with auth errors | Verify `TEAMS_CLIENT_ID` and `TEAMS_CLIENT_SECRET` are set correctly. For a multi-tenant bot also confirm `TEAMS_TENANT_ID` is **unset** — a stale value (or `common`) forces single-tenant validation and 401s cross-tenant users |
 | `No inference provider configured` | Check that `ANTHROPIC_API_KEY` (or another provider key) is set in `~/.hermes/.env` |
 | Bot receives messages but ignores them | Your AAD object ID may not be in `TEAMS_ALLOWED_USERS`. Run `teams status --verbose` to find it |
 | Tunnel URL changes on restart | devtunnel URLs are persistent if you use a named tunnel (`devtunnel create hermes-bot`). ngrok and cloudflared generate a new URL each run unless you have a paid plan — update the bot endpoint with `teams app update` when it changes |
