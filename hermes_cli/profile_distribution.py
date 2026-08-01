@@ -658,13 +658,14 @@ def install_distribution(
                 )
             except OSError as e:
                 # Fresh installs must not leave a profiles/<name>/ tree without
-                # the sentinel — backfill would copy default credentials into it.
+                # the sentinel. Distribution-aware backfill writes a placeholder
+                # (not default secrets), but a half-created env-less tree is
+                # still a broken install — fail closed and remove it.
                 if not plan.existing:
                     shutil.rmtree(plan.target_dir, ignore_errors=True)
                 raise DistributionError(
                     f"Failed to seed per-profile .env at {env_path}: {e}. "
-                    "Refusing to leave the profile without a .env sentinel "
-                    "(hermes update would backfill default credentials)."
+                    "Refusing to leave the profile without a .env sentinel."
                 ) from e
             try:
                 os.chmod(str(env_path), 0o600)
