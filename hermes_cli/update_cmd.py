@@ -3856,10 +3856,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # "fix npm and re-run hermes update" recovery lands in this
             # commit_count == 0 branch. Re-check the manifest digest here and
             # rebuild a stale web bundle after the dependency refresh succeeds.
+            # Successful recovery is defined by the persisted digest/stamp,
+            # not the helpers' return values: missing npm is a soft skip in
+            # _update_node_dependencies(), and _build_web_ui() may serve a
+            # stale dist after a failed build.
             node_failures = _update_node_dependencies()
-            web_ok = False
-            if not node_failures:
-                web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+            node_refresh_pending = _npm_lockfile_changed(_m().PROJECT_ROOT)
+            web_refresh_pending = False
+            if not node_failures and not node_refresh_pending:
+                _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+                web_refresh_pending = _m()._web_ui_build_needed(
+                    _m().PROJECT_ROOT / "web"
+                )
 
             healthy, detail = _venv_core_imports_healthy()
             if not healthy:
@@ -3901,7 +3909,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            elif node_failures or not web_ok:
+            elif node_failures or node_refresh_pending or web_refresh_pending:
                 print(
                     "⚠ Checkout is current, but Node.js dependency recovery is still incomplete."
                 )

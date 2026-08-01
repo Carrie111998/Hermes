@@ -215,6 +215,7 @@ class TestCmdUpdateBranchFallback:
         origin but behind NousResearch/hermes-agent silently misses updates.
         """
         from hermes_cli import main as hm
+        from hermes_cli import update_cmd
 
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
@@ -224,7 +225,17 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock, patch.object(
+            update_cmd, "_update_node_dependencies", return_value=[]
+        ), patch.object(
+            update_cmd, "_npm_lockfile_changed", return_value=False
+        ), patch.object(
+            hm, "_build_web_ui", return_value=True
+        ), patch.object(
+            hm, "_web_ui_build_needed", return_value=False
+        ), patch.object(
+            update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
+        ):
             cmd_update(mock_args)
 
         expected_git_cmd = (
@@ -250,8 +261,12 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(
             update_cmd, "_update_node_dependencies", return_value=[]
         ) as refresh_node, patch.object(
+            update_cmd, "_npm_lockfile_changed", return_value=False
+        ), patch.object(
             hm, "_build_web_ui", return_value=True
         ) as build_web, patch.object(
+            hm, "_web_ui_build_needed", return_value=False
+        ), patch.object(
             update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
         ):
             cmd_update(mock_args)
@@ -274,6 +289,8 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(
             update_cmd, "_update_node_dependencies", return_value=["repo root"]
         ) as refresh_node, patch.object(
+            update_cmd, "_npm_lockfile_changed", return_value=True
+        ), patch.object(
             hm, "_build_web_ui"
         ) as build_web, patch.object(
             update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
@@ -286,6 +303,63 @@ class TestCmdUpdateBranchFallback:
         assert "Already up to date!" not in out
         assert "Node.js dependency recovery is still incomplete" in out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_up_to_date_rerun_treats_stale_manifest_digest_as_incomplete(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """Missing npm is a soft skip, not successful stale dependency repair."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(commit_count="0")
+        with patch.object(
+            hm, "_get_origin_url", return_value="https://github.com/NousResearch/hermes-agent.git"
+        ), patch.object(
+            update_cmd, "_update_node_dependencies", return_value=[]
+        ), patch.object(
+            update_cmd, "_npm_lockfile_changed", return_value=True
+        ), patch.object(
+            hm, "_build_web_ui"
+        ) as build_web, patch.object(
+            update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
+        ):
+            cmd_update(mock_args)
+
+        build_web.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Already up to date!" not in out
+        assert "Node.js dependency recovery is still incomplete" in out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_up_to_date_rerun_checks_web_stamp_after_soft_build_success(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """A stale-dist fallback must not be reported as completed recovery."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(commit_count="0")
+        with patch.object(
+            hm, "_get_origin_url", return_value="https://github.com/NousResearch/hermes-agent.git"
+        ), patch.object(
+            update_cmd, "_update_node_dependencies", return_value=[]
+        ), patch.object(
+            update_cmd, "_npm_lockfile_changed", return_value=False
+        ), patch.object(
+            hm, "_build_web_ui", return_value=True
+        ) as build_web, patch.object(
+            hm, "_web_ui_build_needed", return_value=True
+        ), patch.object(
+            update_cmd, "_venv_core_imports_healthy", return_value=(True, "ok")
+        ):
+            cmd_update(mock_args)
+
+        build_web.assert_called_once_with(PROJECT_ROOT / "web")
+        out = capsys.readouterr().out
+        assert "Already up to date!" not in out
+        assert "Node.js dependency recovery is still incomplete" in out
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
