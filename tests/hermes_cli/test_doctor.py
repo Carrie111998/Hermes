@@ -411,7 +411,7 @@ def test_run_doctor_accepts_stable_key_when_provider_name_differs(
     assert "model.provider 'custom:local-127.0.0.1:11434' is unknown" not in out
 
 
-def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
+def test_run_doctor_accepts_bare_custom_provider_with_local_auth_status(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
@@ -449,7 +449,9 @@ def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
     assert "model.provider 'custom' is not a recognised provider" not in out
 
 
-def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(monkeypatch, tmp_path):
+def test_run_doctor_flags_missing_openrouter_credentials_with_local_auth_status(
+    monkeypatch, tmp_path
+):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
@@ -500,7 +502,7 @@ def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(mon
         ("moa", "anthropic/claude-sonnet-4.6"),
     ],
 )
-def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
+def test_run_doctor_accepts_extended_hermes_provider_catalog_aliases(
     monkeypatch, tmp_path, provider, default_model
 ):
     home = tmp_path / ".hermes"
@@ -595,7 +597,9 @@ def test_run_doctor_accepts_vendor_slugs_for_named_custom_provider(monkeypatch, 
 
 
 
-def test_run_doctor_accepts_kimi_coding_cn_provider(monkeypatch, tmp_path):
+def test_run_doctor_accepts_kimi_coding_cn_provider_with_local_auth_status(
+    monkeypatch, tmp_path
+):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
     (home / ".env").write_text("KIMI_CN_API_KEY=***\n", encoding="utf-8")
@@ -634,7 +638,9 @@ def test_run_doctor_accepts_kimi_coding_cn_provider(monkeypatch, tmp_path):
     assert "model.provider 'kimi-coding-cn' is not a recognised provider" not in out
 
 
-def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser(monkeypatch, tmp_path):
+def test_run_doctor_termux_local_auth_does_not_mark_browser_available_without_agent_browser(
+    monkeypatch, tmp_path
+):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
