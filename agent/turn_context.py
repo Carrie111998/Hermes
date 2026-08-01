@@ -493,7 +493,9 @@ def build_turn_context(
     # Log conversation turn start for debugging/observability.
     # Log a length and a checksum prefix instead of the message body, for
     # the same reason as the gateway side: what a user writes must not
-    # accumulate in log files.
+    # accumulate in log files.  The digest is taken over the value this layer
+    # actually sees, which the gateway may have enriched, so the two logs are
+    # not expected to agree — each identifies its own input.
     _preview_text = summarize_user_message_for_log(user_message)
     if _preview_text:
         import hashlib as _hashlib
