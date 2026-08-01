@@ -98,14 +98,29 @@ def test_get_ca_certs_not_implemented_does_not_raise(monkeypatch, tmp_path):
     import ssl as _ssl
 
     fake = tmp_path / "corporate-ca.pem"
-    # Minimal but real PEM so the file-size + create_default_context checks
-    # pass before we reach the get_ca_certs probe.
-    fake.write_text(
+    # Minimal but valid CA cert (self-signed, CA:TRUE) so the file-size +
+    # create_default_context checks pass before we reach the get_ca_certs
+    # probe.
+    VALID_CA_PEM = (
         "-----BEGIN CERTIFICATE-----\n"
-        "MIIBhTCCASugAwIBAgIRAOv5Nqg==\n"
-        "-----END CERTIFICATE-----\n",
-        encoding="utf-8",
+        "MIICsjCCAZqgAwIBAgIBAjANBgkqhkiG9w0BAQsFADASMRAwDgYDVQQDDAd0ZXN0\n"
+        "LWNhMB4XDTI2MDEwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowEjEQMA4GA1UEAwwH\n"
+        "dGVzdC1jYTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAM+pOnxK9587\n"
+        "ogBujI83LfyqYHmjTFjhP3rguQlanpPLpupgd+qShiyrIOoT957IMCWmG/RGrS/t\n"
+        "5NFREEukbyXn/gSHFsUsUGgr8S9Jnoq5x9FJ8pwwsxq14gmEfdysLDNMqoqkHaOf\n"
+        "CotRTso6WkPX9YSnmRA2zUFfT3AYrRvC3bazZJ6n8ioF506BwlcckmoEP0x0vepx\n"
+        "ItRkWv0gt3uR/wavqLXcpmrXK7/tIrwWFIB9bZVdsqX8tGkP40rJygZiWznFx7/4\n"
+        "dwg4h261ktsLdA8dEIJQbFgn4OXPU1P1HekfWK+C4CqnKZjHMyhCVXmexcfJzP0e\n"
+        "2x6Y4k9mdbUCAwEAAaMTMBEwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsF\n"
+        "AAOCAQEAP/i+0tCc6QxTeYCNPlMq9MhC8GziSxlKzvw2QfM1vEgiiODLTQuUIHCG\n"
+        "mZ+IKnwwdMUhS141gX82nSITz72hjIUDx06wVCQAXql7zj/RTcFx0RCUYALBzCqJ\n"
+        "/IAzLIP4/1nkrQa8S1pVj4sSu+BkoWivA1Ntaec04gF6LGNeBmWPfFX4nLCX/Itg\n"
+        "NbGBXIKap4LVB+BxLljuo16m9IPhCWWq68XBImfnS/8iIRDplbEYHVEFcJ52noqv\n"
+        "tmCaz9VArYVePEoYivgtpKYse+I3KbrsJJEJRHM5H93WQVM7M+RWVSi0UkpC/0UA\n"
+        "s59nHXtJ1woNehm+ILox0ED+Rs6OOg==\n"
+        "-----END CERTIFICATE-----\n"
     )
+    fake.write_text(VALID_CA_PEM, encoding="utf-8")
     monkeypatch.setenv("SSL_CERT_FILE", str(fake))
 
     real_create_default_context = _ssl.create_default_context
@@ -140,12 +155,26 @@ def test_get_ca_certs_empty_list_still_raises(monkeypatch, tmp_path):
     import ssl as _ssl
 
     fake = tmp_path / "empty-but-valid.pem"
-    fake.write_text(
+    VALID_CA_PEM = (
         "-----BEGIN CERTIFICATE-----\n"
-        "MIIBhTCCASugAwIBAgIRAOv5Nqg==\n"
-        "-----END CERTIFICATE-----\n",
-        encoding="utf-8",
+        "MIICsjCCAZqgAwIBAgIBAjANBgkqhkiG9w0BAQsFADASMRAwDgYDVQQDDAd0ZXN0\n"
+        "LWNhMB4XDTI2MDEwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowEjEQMA4GA1UEAwwH\n"
+        "dGVzdC1jYTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAM+pOnxK9587\n"
+        "ogBujI83LfyqYHmjTFjhP3rguQlanpPLpupgd+qShiyrIOoT957IMCWmG/RGrS/t\n"
+        "5NFREEukbyXn/gSHFsUsUGgr8S9Jnoq5x9FJ8pwwsxq14gmEfdysLDNMqoqkHaOf\n"
+        "CotRTso6WkPX9YSnmRA2zUFfT3AYrRvC3bazZJ6n8ioF506BwlcckmoEP0x0vepx\n"
+        "ItRkWv0gt3uR/wavqLXcpmrXK7/tIrwWFIB9bZVdsqX8tGkP40rJygZiWznFx7/4\n"
+        "dwg4h261ktsLdA8dEIJQbFgn4OXPU1P1HekfWK+C4CqnKZjHMyhCVXmexcfJzP0e\n"
+        "2x6Y4k9mdbUCAwEAAaMTMBEwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsF\n"
+        "AAOCAQEAP/i+0tCc6QxTeYCNPlMq9MhC8GziSxlKzvw2QfM1vEgiiODLTQuUIHCG\n"
+        "mZ+IKnwwdMUhS141gX82nSITz72hjIUDx06wVCQAXql7zj/RTcFx0RCUYALBzCqJ\n"
+        "/IAzLIP4/1nkrQa8S1pVj4sSu+BkoWivA1Ntaec04gF6LGNeBmWPfFX4nLCX/Itg\n"
+        "NbGBXIKap4LVB+BxLljuo16m9IPhCWWq68XBImfnS/8iIRDplbEYHVEFcJ52noqv\n"
+        "tmCaz9VArYVePEoYivgtpKYse+I3KbrsJJEJRHM5H93WQVM7M+RWVSi0UkpC/0UA\n"
+        "s59nHXtJ1woNehm+ILox0ED+Rs6OOg==\n"
+        "-----END CERTIFICATE-----\n"
     )
+    fake.write_text(VALID_CA_PEM, encoding="utf-8")
     monkeypatch.setenv("SSL_CERT_FILE", str(fake))
 
     real_create_default_context = _ssl.create_default_context

@@ -1965,7 +1965,8 @@ def anthropic_prompt_cache_policy(
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
-    from agent.ssl_verify import resolve_httpx_verify
+    from agent.ssl_verify import resolve_httpx_verify, resolve_httpx_verify_with_truststore
+    from hermes_cli.config import load_config_readonly
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
     # copies of it) in; any in-place mutation leaks back into the stored dict and is
     # reused on subsequent requests. #10933 hit this by injecting an httpx.Client
@@ -1977,7 +1978,11 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client_kwargs = dict(client_kwargs)
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
-    httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
+    trust_store = load_config_readonly().get("network", {}).get("trust_store", False)
+    httpx_verify = resolve_httpx_verify_with_truststore(
+        ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg,
+        trust_store=bool(trust_store),
+    )
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):

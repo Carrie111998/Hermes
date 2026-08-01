@@ -31,62 +31,6 @@ from typing import Any, Optional
 from utils import base_url_hostname, normalize_proxy_url
 
 
-# Inject the OS trust store into Python's default SSLContext on platforms
-# where certifi does not see corporate / MDM-deployed root CAs (Windows,
-# macOS). On corporate networks with TLS-inspecting proxies, IT deploys the
-# proxy's root CA to the OS trust store via Group Policy / MDM; Python's
-# certifi bundle is statically bundled and never sees it, so every outbound
-# HTTPS call fails with a certificate-verification error. truststore makes
-# Python's ssl module consult the OS trust store — the same trust decision
-# the operator's admin already made — closing the gap.
-#
-# This is opt-in via the optional `truststore` extra (`uv pip install -e
-# ".[truststore]"`) and silently no-ops when the package is not installed,
-# so default installs are untouched. Never raises: a failure here leaves the
-# certifi default in place and lets ssl_guard.py surface a clear error.
-#
-# Gates:
-#   - opt-out env var HERMES_DISABLE_TRUSTSTORE=1 (escape hatch)
-#   - platform check: only Windows / macOS where the OS trust store is the
-#     primary trust authority; Linux distros already wire the OS store via
-#     ca-certificates.crt and certifi, so injecting truststore is a no-op
-#     there and we skip the extra import cost.
-_TRUSTSTORE_INJECTED = False
-
-
-def _maybe_inject_truststore() -> None:
-    """Inject the OS trust store into Python's default SSLContext.
-
-    Idempotent. No-op on Linux, when the env escape hatch is set, or when the
-    `truststore` package is not installed. Never raises.
-    """
-    global _TRUSTSTORE_INJECTED
-    if _TRUSTSTORE_INJECTED:
-        return
-    if os.getenv("HERMES_DISABLE_TRUSTSTORE", "").strip().lower() in {"1", "true", "yes", "on"}:
-        return
-    # Linux distros already bridge the OS trust store into certifi /
-    # /etc/ssl/certs/ca-certificates.crt; truststore is a no-op there.
-    if sys.platform not in ("win32", "darwin"):
-        return
-    try:
-        import truststore
-
-        truststore.inject_into_ssl()
-        _TRUSTSTORE_INJECTED = True
-    except Exception:
-        # truststore is an optional extra. If it's not installed or the
-        # injection fails for any reason, fall back to the certifi default.
-        # ssl_guard.py will surface a clear error if the bundle is broken.
-        pass
-
-
-# Apply on import so the injection is in place before any httpx / openai /
-# requests client is constructed downstream.  Entry points import this
-# module early via run_agent.
-_maybe_inject_truststore()
-
-
 # Cached at module level so we only pay the OpenAI SDK import cost once
 # per process (after the first lazy load).
 _OPENAI_CLS_CACHE = None
@@ -280,5 +224,4 @@ __all__ = [
     "_get_proxy_from_env",
     "_get_proxy_for_base_url",
     "build_keepalive_http_client",
-    "_maybe_inject_truststore",
 ]

@@ -3118,11 +3118,32 @@ DEFAULT_CONFIG = {
 
     # Network settings — workarounds for connectivity issues.
     "network": {
-        # Force IPv4 connections.  On servers with broken or unreachable IPv6,
-        # Python tries AAAA records first and hangs for the full TCP timeout
-        # before falling back to IPv4.  Set to true to skip IPv6 entirely.
-        "force_ipv4": False,
-    },
+            # Force IPv4 connections.  On servers with broken or unreachable IPv6,
+            # Python tries AAAA records first and hangs for the full TCP timeout
+            # before falling back to IPv4.  Set to true to skip IPv6 entirely.
+            "force_ipv4": False,
+
+            # Consult the OS trust store (Windows cert store, macOS keychain)
+            # when building SSL/CAs for provider outbound TLS connections.
+            # On corporate networks with TLS-inspecting proxies, IT deploys the
+            # proxy's root CA to the OS trust store via Group Policy / MDM;
+            # Python's bundled certifi cacert.pem never sees it, so every
+            # outbound HTTPS call fails with a certificate-verification error.
+            # Set to true to include OS-trusted CAs in the verify context
+            # passed to httpx / OpenAI / requests clients.
+            #   - Opt-in: requires the optional `[truststore]` extra
+            #     (``uv pip install -e ".[truststore]"``). Silent no-op when the
+            #     package is absent or the platform is Linux (distros already bridge
+            #     the OS store into /etc/ssl/certs/ca-certificates.crt + certifi).
+            #   - False by default — default installs stay lean and certifi-only.
+            #   - TLS verification is never weakened. The OS trust store is
+            #     ADDED to Python's CA set (the same trust decision the operator's
+            #     admin already made); no certificates are pinned or blindly trusted.
+            # Per-platform gate: Linux distros already bridge the OS store via
+            # ca-certificates.crt + certifi, so truststore is skipped there even
+            # when enabled.
+            "trust_store": False,
+        },
 
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.

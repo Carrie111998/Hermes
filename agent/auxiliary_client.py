@@ -141,19 +141,22 @@ def _resolve_aux_verify(base_url: Optional[str]) -> Any:
     the httpx/certifi default (``True``).
     """
     try:
-        from agent.ssl_verify import resolve_httpx_verify
+        from agent.ssl_verify import resolve_httpx_verify_with_truststore
         from hermes_cli.config import (
             get_custom_provider_tls_settings,
             load_config_readonly,
         )
 
+        config = load_config_readonly()
         tls = get_custom_provider_tls_settings(
-            str(base_url or ""), config=load_config_readonly()
+            str(base_url or ""), config=config
         )
-        return resolve_httpx_verify(
+        trust_store = config.get("network", {}).get("trust_store", False)
+        return resolve_httpx_verify_with_truststore(
             ca_bundle=tls.get("ssl_ca_cert"),
             ssl_verify=tls.get("ssl_verify"),
             base_url=str(base_url or ""),
+            trust_store=bool(trust_store),
         )
     except Exception:
         return True
