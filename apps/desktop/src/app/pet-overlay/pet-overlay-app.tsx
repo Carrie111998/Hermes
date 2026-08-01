@@ -124,9 +124,8 @@ export function PetOverlayApp() {
 
   // P1 Voice: Track the latest assistant reply for TTS auto-speak.
   // The main renderer pushes assistant messages via the 'submit'→gateway path,
-  // but we can't see the reply directly. Instead, we mirror `busy` transitions:
+  // but we can't see the reply directly. Instead, subscribe to busy transitions:
   // when busy goes false after being true, the reply just landed.
-  const prevBusyRef = useRef(false)
   const [replyId, setReplyId] = useState(0)
   const [lastReply, setLastReply] = useState<string | null>(null)
   // P1.5: Nonce for duplicate TTS guard — tracks which assistant message
@@ -155,20 +154,24 @@ export function PetOverlayApp() {
   })
 
   // Detect busy→idle transition as a signal that a reply landed.
-  // In a real implementation, the main renderer would push the actual reply
-  // text via the state payload. For P1, we bump replyId when busy settles.
+  // Subscribe to $busy atom directly — no ref mirror needed.
   useEffect(() => {
-    if (prevBusyRef.current && !liveBusy) {
-      setReplyId(id => id + 1)
-    }
-
-    prevBusyRef.current = liveBusy
-  }, [liveBusy])
+    return $busy.listen((next, prev) => {
+      if (prev && !next) {
+        setReplyId(id => id + 1)
+      }
+    })
+  }, [])
 
   const dragRef = useRef<DragState | null>(null)
   // Last Alt+wheel anchor, consumed by the resize effect to zoom toward the
   // cursor; null means a non-wheel scale change (slider) → anchor bottom-center.
   const zoomAnchorRef = useRef<PetZoomAnchor | null>(null)
+  const consumeZoomAnchor = useCallback((): PetZoomAnchor | null => {
+    const anchor = zoomAnchorRef.current
+    zoomAnchorRef.current = null
+    return anchor
+  }, [])
   const petRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null)
@@ -343,11 +346,15 @@ export function PetOverlayApp() {
     }
   }, [])
 
+  // Keep refs current for callback access (render-body update — no stale-read lag).
+  composerOpenRef.current = composerOpen
+  settingsOpenRef.current = settingsOpen
+  contextMenuRef.current = Boolean(contextMenu)
+
   // The whole window must stay interactive while the composer or settings are
   // open (so inputs keep focus). The overlay is a non-activating panel — flip
   // it focusable while inputs need the keyboard, then back when they close.
   useEffect(() => {
-    composerOpenRef.current = composerOpen
     const needsFocus = composerOpen || settingsOpen || Boolean(contextMenu)
     window.hermesDesktop?.petOverlay?.setFocusable(needsFocus)
 
@@ -360,14 +367,6 @@ export function PetOverlayApp() {
       })
     }
   }, [composerOpen, settingsOpen, contextMenu])
-
-  useEffect(() => {
-    settingsOpenRef.current = settingsOpen
-  }, [settingsOpen])
-
-  useEffect(() => {
-    contextMenuRef.current = Boolean(contextMenu)
-  }, [contextMenu])
 
   const onPetPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) {
@@ -582,13 +581,12 @@ export function PetOverlayApp() {
     const curH = window.outerHeight
 
     if (width === curW && height === curH) {
-      zoomAnchorRef.current = null
+      consumeZoomAnchor()
 
       return
     }
 
-    const anchor = zoomAnchorRef.current
-    zoomAnchorRef.current = null
+    const anchor = consumeZoomAnchor()
 
     const ratio = anchor?.ratio ?? 1
     const ax = anchor?.clientX ?? curW / 2

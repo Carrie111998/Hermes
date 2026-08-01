@@ -121,7 +121,7 @@ export function avatarPacksFolderPath(hermesHome) {
  * Validate a parsed pack.json object. Returns the manifest or throws.
  * @param {unknown} raw
  * @param {string} packId
- * @returns {Object}
+ * @returns {{ id: string, name: string, version: string, type: string, states: Record<string, string>, render: { transparent: boolean, loop: boolean }, defaultState: string }}
  */
 function validateManifest(raw, packId) {
   if (!raw || typeof raw !== 'object') {
@@ -159,9 +159,10 @@ function validateManifest(raw, packId) {
     throw new Error(`pack.json missing required field: states`)
   }
 
+  /** @type {Record<string, string>} */
   const validStates = {}
 
-  for (const [key, value] of Object.entries(/** @type {Object} */ (states))) {
+  for (const [key, value] of Object.entries(/** @type {Record<string, unknown>} */ (states))) {
     if (!VALID_STATES.has(key)) {
       continue // Ignore unknown states gracefully
     }
@@ -223,6 +224,7 @@ async function resolvePack(packDir, packId) {
     return null // No manifest = not a valid pack
   }
 
+  /** @type {{ states: Record<string, string> }} */
   let manifest
 
   try {
@@ -233,7 +235,7 @@ async function resolvePack(packDir, packId) {
     warnings.push(`Invalid pack.json: ${err instanceof Error ? err.message : String(err)}`)
 
     // Can't use this pack at all
-    return {
+    return /** @type {ResolvedAvatarPack} */ ({
       id: packId,
       name: packId,
       version: '0.0.0',
@@ -244,7 +246,7 @@ async function resolvePack(packDir, packId) {
       defaultState: 'idle',
       render: { transparent: true, loop: true },
       warnings
-    }
+    })
   }
 
   // 2. Check pack size (sum of all files)
@@ -266,9 +268,10 @@ async function resolvePack(packDir, packId) {
   }
 
   // 3. Resolve per-state assets
+  /** @type {Record<string, ResolvedStateAsset>} */
   const assets = {}
 
-  for (const [stateName, filename] of Object.entries(manifest.states)) {
+  for (const [stateName, filename] of Object.entries(manifest.states as Record<string, string>)) {
     const assetPath = path.join(packDir, filename)
 
     // Security: verify the resolved path is inside the pack folder
@@ -388,7 +391,7 @@ export async function listAvatarPacks(hermesHome) {
           id: resolved.id,
           name: resolved.name,
           version: resolved.version,
-          hasIdle: Boolean(resolved.assets.idle),
+          hasIdle: Boolean('idle' in resolved.assets),
           stateCount
         })
       }

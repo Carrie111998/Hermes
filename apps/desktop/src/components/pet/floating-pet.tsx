@@ -286,12 +286,17 @@ export function FloatingPet() {
   // avatarMode is 'desktop' (the default). If the user previously docked,
   // fall back to restorePetOverlay (reopens only if it was already popped).
   // Primary window only; runs at most once per pet activation.
+
+  // Mark restoration intent in render body — prevents stale-read lag and
+  // keeps the effect body free of ref writes.
+  if (!isSecondaryWindow() && !restoredRef.current && active) {
+    restoredRef.current = true
+  }
+
   useEffect(() => {
-    if (isSecondaryWindow() || restoredRef.current || !active) {
+    if (isSecondaryWindow() || !restoredRef.current || !active) {
       return
     }
-
-    restoredRef.current = true
 
     const mode = $avatarMode.get()
 

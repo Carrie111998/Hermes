@@ -158,11 +158,7 @@ export function useOverlayVoiceLoop({
   // Refs for async-safe state access.
   const statusRef = useRef<OverlayVoiceStatus>('idle')
   const voiceRepliesRef = useRef(initialVoiceReplies)
-  const busyRef = useRef(busy)
-  const lastReplyRef = useRef(lastReply)
-  const replyIdRef = useRef(replyId)
-  const spokenReplyIdRef = useRef(replyId)
-  const disposedRef = useRef(false)
+  const disposedAc = useRef(new AbortController())
 
   // Mic recording refs.
   const recorderRef = useRef<MediaRecorder | null>(null)
@@ -324,7 +320,7 @@ export function useOverlayVoiceLoop({
         audioContextRef.current = ctx
 
         const tick = () => {
-          if (disposedRef.current || statusRef.current !== 'listening') {
+          if (disposedAc.current.signal.aborted || statusRef.current !== 'listening') {
             return
           }
 
@@ -548,7 +544,7 @@ export function useOverlayVoiceLoop({
         const dataUrl = await apiSpeak(speakable)
         setState(prev => ({ ...prev, ttsAvailable: true }))
 
-        if (!dataUrl || disposedRef.current) {
+        if (!dataUrl || disposedAc.current.signal.aborted) {
           setStatus('idle')
 
           return
@@ -610,27 +606,27 @@ export function useOverlayVoiceLoop({
     }
   }, [onVoiceRepliesChange, stopSpeaking])
 
+  const [spokenReplyId, setSpokenReplyId] = useState(replyId)
+
   // ── Auto-speak new replies when voice replies is ON ──────────────────────
 
   useEffect(() => {
     if (
-      voiceRepliesRef.current &&
-      replyId > spokenReplyIdRef.current &&
+      state.voiceReplies &&
+      replyId > spokenReplyId &&
       lastReply &&
       !busy &&
       statusRef.current !== 'listening' &&
       statusRef.current !== 'transcribing'
     ) {
-      spokenReplyIdRef.current = replyId
+      setSpokenReplyId(replyId)
       void speakReply(lastReply)
     }
-  }, [replyId, lastReply, busy, speakReply])
+  }, [replyId, lastReply, busy, speakReply, state.voiceReplies, spokenReplyId])
 
-  // ── Sync busy ref ────────────────────────────────────────────────────────
+  // ── Busy → idle transition ──────────────────────────────────────────────
 
   useEffect(() => {
-    busyRef.current = busy
-
     // When the agent finishes (busy goes false) and we were in 'thinking',
     // transition to idle. The auto-speak effect will pick up the reply.
     if (!busy && statusRef.current === 'thinking') {
@@ -638,23 +634,11 @@ export function useOverlayVoiceLoop({
     }
   }, [busy, setStatus])
 
-  // ── Sync refs ────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    lastReplyRef.current = lastReply
-  }, [lastReply])
-
-  useEffect(() => {
-    replyIdRef.current = replyId
-  }, [replyId])
-
   // ── Cleanup on unmount ───────────────────────────────────────────────────
 
   useEffect(() => {
-    disposedRef.current = false
-
     return () => {
-      disposedRef.current = true
+      disposedAc.current.abort()
       cancelListening()
       stopSpeaking()
       stopElapsedTimer()
