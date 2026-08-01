@@ -221,6 +221,77 @@ class TestStaleBridgeHandshake:
         mock_popen.assert_called_once()  # stale flags → replaced, not reused
 
 
+class TestWindowsDetachFallback:
+    """Regression tests for sweeper point: the CREATE_NO_WINDOW fallback
+    must run ONLY on Windows PermissionError with WinError 5 (job-object
+    access denial), not on any other OSError."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_runs_on_windows_winerror5(self, tmp_path):
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        detach_err = PermissionError(13, "Access is denied")
+        detach_err.winerror = 5
+
+        calls = []
+        def fake_popen(*a, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise detach_err
+            return mock_proc
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", side_effect=fake_popen) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        assert len(calls) == 2, "fallback Popen should be attempted after WinError 5"
+        # Second (fallback) call must use CREATE_NO_WINDOW via creationflags
+        assert "creationflags" in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_fallback_does_not_run_on_non_winerror5(self, tmp_path):
+        """A PermissionError without winerror 5 (e.g. missing node binary
+        on POSIX, or a different error code) must not trigger the Windows
+        job-object fallback."""
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+
+        other_err = PermissionError(13, "Permission denied")
+        other_err.winerror = 13  # not 5 -> fallback must NOT trigger
+
+        # connect() catches top-level bridge-start failures and logs them, so
+        # the exception does not escape connect(). The guard must prevent the
+        # *fallback Popen*: with a non-5 winerror, Popen is attempted once.
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", side_effect=other_err) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        assert mock_popen.call_count == 1, \
+            "fallback must NOT run for non-WinError-5 PermissionError"
+
+
 class TestDepRefreshStamp:
     @pytest.mark.asyncio
     async def test_skips_install_when_stamp_fresh(self, tmp_path):

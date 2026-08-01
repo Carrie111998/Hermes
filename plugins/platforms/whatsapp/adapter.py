@@ -780,7 +780,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     **base_kwargs,
                     **windows_detach_popen_kwargs(),
                 )
-            except (PermissionError, OSError):
+            except PermissionError as exc:
+                # Restrict the fallback to the exact case it exists for: the
+                # gateway running inside a Windows job object that disallows
+                # breakaway, which surfaces as PermissionError [WinError 5]
+                # (Access is denied). Any other spawn failure (missing
+                # executable, unrelated error) must propagate rather than be
+                # silently retried with altered process-group semantics.
+                if not (_IS_WINDOWS and getattr(exc, "winerror", None) == 5):
+                    raise
                 logger.info(
                     "[%s] windows_detach_popen_kwargs failed (WinError 5), "
                     "falling back to CREATE_NO_WINDOW",
