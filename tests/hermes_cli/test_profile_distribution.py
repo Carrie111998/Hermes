@@ -304,16 +304,20 @@ class TestUpdate:
         assert "user override" in (plan.target_dir / "config.yaml").read_text()
 
     def test_update_preserves_config_when_source_removes_it(self, profile_env):
-        """Regression (review of #75494): a newer distribution revision
-        that removes config.yaml from its own source entirely (not just
-        changes it) must still preserve the user's existing target
-        config.yaml -- the src.exists() early-continue for a
-        no-longer-staged owned path must not skip the preservation
-        accounting that keeps config.yaml out of the stale-file prune.
-        Matches the documented default: config.yaml survives unless
-        --force-config, independent of what the current source contains."""
-        import shutil as _shutil
-
+        """Regression within the newly-introduced installed_files
+        tracking/pruning design (review of #75656) -- NOT a defect on
+        unmodified current main, which has no stale-file pruning at all
+        (_copy_dist_payload() there only ever copies entries still
+        present in staged.iterdir(), so an omitted config.yaml is simply
+        never visited and never deleted). This test instead verifies an
+        ordering bug introduced by this PR chain's own new pruning logic:
+        the src.exists() early-continue for a no-longer-staged owned
+        path ran before the config.yaml preservation accounting, so once
+        pruning exists, a newer revision that removes config.yaml from
+        its source entirely would cause the user's existing target
+        config to be wrongly treated as stale and deleted. Matches the
+        documented default: config.yaml survives unless --force-config,
+        independent of what the current source contains."""
         staged = _make_staging_dir(profile_env, "src")
         plan = install_distribution(str(staged), name="config_removed_test")
 
@@ -336,6 +340,76 @@ class TestUpdate:
         assert "user override" in (plan.target_dir / "config.yaml").read_text()
         # The actually-distributed change still lands correctly.
         assert (plan.target_dir / "SOUL.md").read_text() == "I am Source v2.\n"
+
+    def test_legacy_profile_without_installed_files_prunes_nothing_on_first_update(
+        self, profile_env
+    ):
+        """Migration behavior (requested in review of #75656): a profile
+        installed by an OLDER version of this code (before installed_files
+        tracking existed) has no such field in its persisted manifest.
+        read_manifest(...).installed_files correctly defaults to an empty
+        list for it (DistributionManifest's own field default), so
+        previous_installed is empty on its first update under this code
+        -- the stale-file prune (which only ever acts on entries in
+        previous_installed) therefore removes NOTHING on that first
+        update. This is the intentionally SAFE fallback: since there's no
+        record of what this legacy profile's distributor previously
+        shipped, the conservative choice is to prune nothing rather than
+        guess and risk deleting a genuine user file. A file that WAS
+        stale (distributed before, removed from the newer source) simply
+        isn't cleaned up on this transitional update -- normal tracking
+        (and pruning) resumes from the SECOND update onward, once this
+        code's own install/update has written installed_files once."""
+        staged = _make_staging_dir(profile_env, "src")
+        plan = install_distribution(str(staged), name="legacy_migration_test")
+
+        # Simulate a manifest written by an older version of this code,
+        # before installed_files existed at all -- write one WITHOUT that
+        # field, matching exactly what a pre-tracking install left behind.
+        legacy_yaml = (
+            "name: legacy_migration_test\n"
+            "version: 0.1.0\n"
+            f"source: {staged}\n"
+            "distribution_owned:\n"
+            "- SOUL.md\n"
+            "- config.yaml\n"
+            "- mcp.json\n"
+            "- skills\n"
+            "- cron\n"
+            "- distribution.yaml\n"
+        )
+        (plan.target_dir / "distribution.yaml").write_text(legacy_yaml)
+        assert "installed_files" not in read_manifest(
+            plan.target_dir
+        ).to_dict(), "test setup must produce a genuinely field-less legacy manifest"
+
+        # A file that a genuinely-untracked prior install would have
+        # shipped, now removed from the newer source -- must NOT be
+        # deleted on this first, transitional update (no tracking data
+        # exists yet to safely distinguish it from a user file).
+        legacy_stale_file = plan.target_dir / "skills" / "old-legacy-skill" / "SKILL.md"
+        legacy_stale_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_stale_file.write_text("# From before tracking existed\n")
+
+        import shutil as _shutil
+        _shutil.rmtree(staged / "skills" / "old-legacy-skill", ignore_errors=True)
+        (staged / "SOUL.md").write_text("I am Source v2.\n")
+
+        update_distribution("legacy_migration_test", force_config=False)
+
+        assert legacy_stale_file.exists(), (
+            "a file from before installed_files tracking existed must "
+            "not be deleted on the first (transitional) update -- there "
+            "is no tracking data yet to safely distinguish it from a "
+            "genuine user file, so the safe default is to prune nothing"
+        )
+        # The distributed content that IS still current correctly updates.
+        assert (plan.target_dir / "SOUL.md").read_text() == "I am Source v2.\n"
+        # And tracking now exists going forward, from this update onward.
+        assert read_manifest(plan.target_dir).installed_files, (
+            "installed_files must now be populated after this update, "
+            "so a SUBSEQUENT update can correctly prune stale files"
+        )
 
 
     def test_update_missing_manifest_errors(self, profile_env):
