@@ -48,3 +48,28 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_script_help_names_active_profile_directory(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "seozavod"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    parser = _build()
+    root_subparsers = next(
+        action for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    cron_parser = root_subparsers.choices["cron"]
+    cron_subparsers = next(
+        action for action in cron_parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    create_parser = cron_subparsers.choices["create"]
+    script_action = next(
+        action for action in create_parser._actions
+        if "--script" in action.option_strings
+    )
+
+    assert f"{profile_home}/scripts/" in script_action.help
+    assert "existing script" in script_action.help
+    assert "~/.hermes/scripts/" not in script_action.help

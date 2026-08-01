@@ -206,6 +206,11 @@ import requests, json
 # Print summary to stdout — agent analyzes and reports
 ```
 
+The file must exist in the active profile's `$HERMES_HOME/scripts/` directory
+before the job is created or edited. Public create/edit surfaces accept its
+relative path; the scheduler repeats containment and existence checks at run
+time in case the file changes later.
+
 The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` resolves the limit through a three-layer chain:
 
 1. **Module-level override** — `_SCRIPT_TIMEOUT` (for tests/monkeypatching). Only used when it differs from the default.

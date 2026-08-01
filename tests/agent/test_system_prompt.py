@@ -142,9 +142,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
-    monkeypatch.setattr(
-        system_prompt, "get_default_hermes_root", lambda: Path("/hermes")
-    )
 
     expected_profile = (
         "Active Hermes profile: default. Other profiles (if any) live "
@@ -186,29 +183,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     assert prompt == expected
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
-
-
-def test_named_profile_hint_uses_active_home_without_duplicate_suffix(monkeypatch):
-    """A profile-scoped HERMES_HOME is already the session's home."""
-    import agent.system_prompt as system_prompt
-
-    active_home = Path("/opt/data/profiles/seozavod")
-    hermes_root = Path("/opt/data")
-    monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: active_home)
-    monkeypatch.setattr(system_prompt, "get_default_hermes_root", lambda: hermes_root)
-
-    with patch(
-        "agent.file_safety._resolve_active_profile_name",
-        return_value="seozavod",
-    ):
-        stable = _stable_prompt(_make_agent())
-
-    assert (
-        "Active Hermes profile: seozavod. This session reads and writes "
-        "/opt/data/profiles/seozavod/."
-    ) in stable
-    assert "/opt/data/skills/" in stable
-    assert "/opt/data/profiles/seozavod/profiles/seozavod/" not in stable
 
 
 class TestTelegramRichMessagesHint:

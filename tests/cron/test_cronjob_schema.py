@@ -19,3 +19,12 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
+def test_cronjob_schema_requires_writing_script_before_scheduling():
+    """Description-driven models must not create a job before its file exists."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    script_desc = CRONJOB_SCHEMA["parameters"]["properties"]["script"]["description"]
+    assert "MUST already exist" in script_desc
+    assert "write it there first" in script_desc
+    assert "relative path" in script_desc
+

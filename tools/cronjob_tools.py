@@ -498,9 +498,11 @@ def _validate_cron_base_url(
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
-    Scripts must be relative paths that resolve within HERMES_HOME/scripts/.
-    Absolute paths and ~ expansion are rejected to prevent arbitrary script
-    execution via prompt injection.
+    Scripts must already be regular files beneath HERMES_HOME/scripts/ and be
+    supplied as relative paths.  Absolute paths and ~ expansion are rejected
+    to prevent arbitrary script execution via prompt injection.  Requiring the
+    file here keeps an invalid job out of the store instead of deferring a
+    deterministic "Script not found" failure to the first scheduler tick.
 
     Returns an error string if blocked, else None (valid).
     """
@@ -526,10 +528,24 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from tools.path_security import validate_within_dir
 
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
+    script_path = scripts_dir / raw
+    containment_error = validate_within_dir(script_path, scripts_dir)
     if containment_error:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
+        )
+
+    script_display = f"{scripts_display}/{raw}"
+    if not script_path.exists():
+        return (
+            f"Script file does not exist in the active profile: {script_display}. "
+            f"Write the file there before creating or updating the cron job, "
+            f"then pass only the relative path {raw!r}."
+        )
+    if not script_path.is_file():
+        return (
+            f"Cron script must be a regular file in the active profile: "
+            f"{script_display}."
         )
 
     return None
@@ -1001,7 +1017,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "script": {
                 "type": "string",
-                "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
+                "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). The file MUST already exist under the active profile's {display_hermes_home()}/scripts/ directory before create/update; write it there first, then pass only its relative path (for example, 'memory-watchdog.sh'). ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
             },
             "no_agent": {
                 "type": "boolean",

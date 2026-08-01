@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from typing import Callable
 
+from hermes_constants import display_hermes_home
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     """Attach the ``cron`` subcommand (and its sub-actions) to ``subparsers``."""
+    scripts_dir = f"{display_hermes_home()}/scripts/"
     cron_parser = subparsers.add_parser(
         "cron", help="Cron job management", description="Manage scheduled tasks"
     )
@@ -48,7 +50,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument(
         "--script",
         help=(
-            "Path to a script under ~/.hermes/scripts/. Default mode: "
+            f"Relative path to an existing script under {scripts_dir}. Default mode: "
             "script stdout is injected into the agent's prompt each run. "
             "With --no-agent: the script IS the job and its stdout is "
             "delivered verbatim. .sh/.bash files run via bash, everything "
@@ -120,7 +122,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--script",
         help=(
-            "Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
+            f"Relative path to an existing script under {scripts_dir}. Pass empty string to clear. "
             "With --no-agent the script IS the job; otherwise its stdout is "
             "injected into the agent's prompt each run."
         ),

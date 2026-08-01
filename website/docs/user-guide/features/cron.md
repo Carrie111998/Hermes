@@ -480,7 +480,7 @@ Semantics:
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 
-`.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Scripts must resolve inside `$HERMES_HOME/scripts/` — relative names, absolute paths, and `~`-prefixed paths are accepted when the resolved target stays in that directory; paths that escape it are rejected. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
+`.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Scripts must already be regular files inside the active profile's `$HERMES_HOME/scripts/` directory. Write the file first, then pass only its relative path to `cronjob` or `hermes cron`; create/edit rejects missing files, directories, absolute or `~`-prefixed paths, and paths that escape the directory. Runtime validates the boundary and existence again. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
 
 ### The agent sets these up for you
 
@@ -490,7 +490,7 @@ The `cronjob` tool's schema exposes `no_agent` to Hermes directly, so you can de
 Ping me on Telegram if RAM is over 85%, every 5 minutes.
 ```
 
-Hermes will write the check script to `~/.hermes/scripts/` via `write_file`, then call:
+Hermes will first write the check script to the active profile's `$HERMES_HOME/scripts/` directory via `write_file` (the tool schema shows the profile-aware path), then call:
 
 ```python
 cronjob(action="create", schedule="every 5m",

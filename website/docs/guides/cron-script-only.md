@@ -28,7 +28,7 @@ Hermes calls this **no-agent mode**. It's the cron system minus the LLM.
 
 - **No LLM call.** Zero tokens, zero agent loop, zero model spend.
 - **Script is the job.** The script decides whether to alert. Emit output → message gets sent. Emit nothing → silent tick.
-- **Bash or Python.** `.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash`; any other extension runs under the current Python interpreter. Paths must resolve inside `~/.hermes/scripts/` (relative, absolute, or `~` forms are OK if they stay in that directory). Cron scripts do **not** inherit provider credentials from the Hermes process environment.
+- **Bash or Python.** `.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash`; any other extension runs under the current Python interpreter. The file must already exist in the active profile's `$HERMES_HOME/scripts/` directory, and create/edit calls pass its relative path. Cron scripts do **not** inherit provider credentials from the Hermes process environment.
 - **Same scheduler.** Lives in `cronjob` alongside LLM jobs — pausing, resuming, listing, logs, and delivery targeting all work the same way.
 
 ## When to Use It
@@ -56,6 +56,10 @@ The real win of no-agent mode is that the agent itself can set up the watchdog f
 > Set up. Runs every 5 min, alerts Telegram only when RAM is over 85%. Script: `memory-watchdog.sh`. Job ID: `abc123`.
 
 Under the hood, the agent makes two tool calls:
+
+`~/.hermes/scripts/` below is the default profile's directory. For a named
+profile, the `cronjob` tool description supplies that profile's own scripts
+directory instead.
 
 ```python
 # 1. Write the check script
@@ -151,7 +155,7 @@ The "silent when empty" behavior is the key to the classic watchdog pattern: the
 
 ## Script Rules
 
-Scripts must live in `~/.hermes/scripts/`. This is enforced at both job-creation time and run time — absolute paths, `~/` expansion, and path-traversal patterns (`../`) are rejected. The same directory is shared with the pre-check script gate used by LLM jobs.
+Scripts must be regular files in the active profile's `$HERMES_HOME/scripts/` directory. Write the file first, then pass only its relative path to `cronjob` or `hermes cron`. Job creation/edit rejects missing files, directories, absolute or `~/` paths, and path traversal (`../`); runtime validates the boundary and existence again. The same directory is shared with the pre-check script gate used by LLM jobs.
 
 Interpreter choice is by file extension:
 

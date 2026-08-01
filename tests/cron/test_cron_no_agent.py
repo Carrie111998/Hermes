@@ -92,10 +92,11 @@ def test_cronjob_script_error_names_active_profile_directory(
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
 
-    error = _validate_cron_script_path("/tmp/poll.py")
+    error = _validate_cron_script_path("poll.py")
 
     assert error is not None
-    assert f"{display_hermes_home()}/scripts/" in error
+    assert f"{display_hermes_home()}/scripts/poll.py" in error
+    assert "does not exist" in error
     assert "~/.hermes/scripts/" not in error
 
 

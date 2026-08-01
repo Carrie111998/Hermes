@@ -248,6 +248,7 @@ class TestCronjobToolScript:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        (cron_env / "scripts" / "some_script.py").write_text("print('ok')\n")
         create_result = json.loads(cronjob(
             action="create",
             schedule="every 1h",
@@ -268,6 +269,7 @@ class TestCronjobToolScript:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        (cron_env / "scripts" / "data_collector.py").write_text("print('ok')\n")
         cronjob(
             action="create",
             schedule="every 1h",
@@ -374,6 +376,77 @@ class TestScriptPathContainment:
 
 class TestCronjobToolScriptValidation:
     """Test API-boundary validation of cron script paths in cronjob_tools."""
+
+    def test_create_with_missing_script_rejected_before_job_is_stored(
+        self, cron_env, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from cron.jobs import list_jobs
+        from tools.cronjob_tools import cronjob
+
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script="missing.py",
+        ))
+
+        assert result["success"] is False
+        assert "does not exist" in result["error"]
+        assert "missing.py" in result["error"]
+        assert list_jobs(include_disabled=True) == []
+
+    def test_create_with_existing_regular_file_allowed(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        (cron_env / "scripts" / "monitor.py").write_text("print('ok')\n")
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script="monitor.py",
+        ))
+
+        assert result["success"] is True
+        assert result["job"]["script"] == "monitor.py"
+
+    def test_create_with_script_directory_rejected(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        (cron_env / "scripts" / "monitor.py").mkdir()
+        result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+            script="monitor.py",
+        ))
+
+        assert result["success"] is False
+        assert "regular file" in result["error"]
+
+    def test_update_with_missing_script_rejected_without_mutating_job(
+        self, cron_env, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from cron.jobs import get_job
+        from tools.cronjob_tools import cronjob
+
+        created = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Monitor things",
+        ))
+        result = json.loads(cronjob(
+            action="update",
+            job_id=created["job_id"],
+            script="missing.py",
+        ))
+
+        assert result["success"] is False
+        assert "does not exist" in result["error"]
+        assert get_job(created["job_id"]).get("script") is None
 
 
     def test_create_with_traversal_script_rejected(self, cron_env, monkeypatch):
