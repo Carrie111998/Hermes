@@ -473,6 +473,7 @@ async def _save_if_ready(raw: str, save_to, started: float) -> str:
     # Dropped whether or not the save succeeds. A retry re-polls, which mints a
     # fresh URL, so nothing is lost by not handing this one to the model.
     result.pop("sample", None)
+    result.pop("samples", None)  # plural form also carries the signed URL (#75667)
 
     try:
         target, size = await _download_video(url.strip(), save_to, started)
