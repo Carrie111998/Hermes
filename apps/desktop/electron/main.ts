@@ -37,6 +37,7 @@ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import {
   canImportHermesCli,
   execProbeSync,
@@ -2785,23 +2786,11 @@ async function releaseBackendLock(updateRoot, tag) {
   // processes (launcher + worker), drains in-flight agents (planned-stop
   // marker → resume_pending persistence), and force-kills survivors — exactly
   // the logic hermes update's _pause_windows_gateways_for_update relies on.
+  // Best-effort: failure (wedged/absent CLI) does not abort the hand-off;
+  // the shim-lock poll below and the updater's venv-blocker scan still fail
+  // loudly if the venv stays held.
   if (IS_WINDOWS) {
-    const hermesCli = venvHermesShimPath(updateRoot)
-
-    try {
-      if (fs.existsSync(hermesCli)) {
-        execFileSync(hermesCli, ['gateway', 'stop', '--all'], {
-          timeout: 20_000,
-          windowsHide: true,
-          stdio: 'ignore',
-          env: { ...process.env, HERMES_HOME }
-        })
-      }
-    } catch {
-      // Best-effort: a wedged/absent CLI must not abort the hand-off. The
-      // shim-lock poll below re-checks liveness and the updater's own
-      // venv-blocker scan will still fail loudly if something holds the venv.
-    }
+    stopGatewayBeforeUpdate(venvHermesShimPath(updateRoot), HERMES_HOME)
   }
 
   const shim = venvHermesShimPath(updateRoot)
