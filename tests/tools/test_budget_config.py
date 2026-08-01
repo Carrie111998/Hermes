@@ -19,6 +19,7 @@ from tools.budget_config import (
     PINNED_THRESHOLDS,
     BudgetConfig,
     budget_for_context_window,
+    budget_with_overrides,
 )
 
 
@@ -147,6 +148,50 @@ class TestResolveThreshold:
         mock_registry.get_max_result_size.return_value = 100_000
         cfg = BudgetConfig()  # default_result_size == 100_000
         assert cfg.resolve_threshold("web_search") == 100_000
+
+
+class TestBudgetConfigOverrides:
+    def test_applies_positive_limits(self):
+        base = BudgetConfig()
+
+        resolved = budget_with_overrides(
+            base,
+            {
+                "max_result_chars": 8_000,
+                "max_turn_chars": 16_000,
+                "preview_chars": 1_500,
+            },
+        )
+
+        assert resolved.default_result_size == 8_000
+        assert resolved.turn_budget == 16_000
+        assert resolved.preview_size == 1_500
+
+    def test_invalid_values_preserve_base(self):
+        base = BudgetConfig(default_result_size=20_000, turn_budget=40_000)
+
+        resolved = budget_with_overrides(
+            base,
+            {
+                "max_result_chars": 0,
+                "max_turn_chars": "invalid",
+                "preview_chars": None,
+            },
+        )
+
+        assert resolved is base
+
+    def test_preview_cannot_exceed_result_or_turn_budget(self):
+        resolved = budget_with_overrides(
+            BudgetConfig(),
+            {
+                "max_result_chars": 1_000,
+                "max_turn_chars": 900,
+                "preview_chars": 2_000,
+            },
+        )
+
+        assert resolved.preview_size == 900
 
 
 # ---------------------------------------------------------------------------

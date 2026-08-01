@@ -48,7 +48,12 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
-from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.budget_config import (
+    BudgetConfig,
+    DEFAULT_BUDGET,
+    budget_for_context_window,
+    budget_with_overrides,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,19 +81,36 @@ def _ensure_file_checkpoint(
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
-    """Resolve a tool-result BudgetConfig scaled to the agent's context window.
+    """Resolve context-scaled tool budgets plus optional cron-only overrides.
 
     Large-context models keep the historical 100K/200K char defaults; small
     models (e.g. a 65K-token local model switched into mid-session) get a budget
     proportional to their window so a single large tool result can't push the
-    request past the model's limit (#23767). Falls back to the default budget
-    when the context length isn't resolvable.
+    request past the model's limit (#23767). Cron agents may further constrain
+    those values through ``cron.tool_result_budget``. Interactive agents never
+    read or apply the cron override.
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        base = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
-        return DEFAULT_BUDGET
+        base = DEFAULT_BUDGET
+
+    if getattr(agent, "platform", None) != "cron":
+        return base
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        cron_config = config.get("cron", {}) if isinstance(config, dict) else {}
+        overrides = (
+            cron_config.get("tool_result_budget", {})
+            if isinstance(cron_config, dict)
+            else {}
+        )
+        return budget_with_overrides(base, overrides)
+    except Exception:
+        return base
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
