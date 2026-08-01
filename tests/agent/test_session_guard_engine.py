@@ -277,3 +277,169 @@ def test_all_six_methods_defined_on_session_guard():
             f"将使用 ContextEngine 默认实现（绕过 _real 代理）"
         )
         assert ses_method is not None, f"{method_name} 在 SessionGuardEngine 上找不到"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 集成测试（真实 ContextCompressor + SessionGuardEngine）
+# ═══════════════════════════════════════════════════════════════
+
+def _make_real_compressor():
+    """创建一个状态完备的真实 ContextCompressor（绕过 __init__，避免 HTTP 探测）。
+
+    参考 tests/agent/test_context_compressor_cross_session_guard.py 中的
+    _make_compressor() 构造模式。所有属性手动设置，使 compress() 全流程
+    可在无本地 LLM、无网络的环境下运行。
+    """
+    from agent.context_compressor import ContextCompressor
+    c = ContextCompressor.__new__(ContextCompressor)
+    # ── 基础配置 ──
+    c.quiet_mode = True
+    c.model = "test/model"
+    c.provider = "test"
+    c.base_url = "http://test"
+    c.api_key = "test-key"
+    c.api_mode = ""
+    c.context_length = 128000
+    c.threshold_tokens = 64000
+    c.threshold_percent = 0.50
+    c.tail_token_budget = 500       # 小 tail 预算，确保有中间窗口可压缩
+    c.protect_last_n = 12
+    c.protect_first_n = 3
+    c.summary_model = ""
+    c.summary_target_ratio = 0.20
+    c.summary_budget_tokens = 2000
+    c.max_tokens = None
+    c.min_tail_user_messages = 1
+    # ── token 追踪 ──
+    c.last_prompt_tokens = 100000
+    c.last_completion_tokens = 0
+    c.last_real_prompt_tokens = 0
+    c.last_compression_rough_tokens = 0
+    c.last_rough_tokens_when_real_prompt_fit = 0
+    c.awaiting_real_usage_after_compression = False
+    # ── 压缩状态 ──
+    c.compression_count = 0
+    c._context_probed = False
+    c._last_compression_savings_pct = 100.0
+    c._ineffective_compression_count = 0
+    c._last_compression_made_progress = False
+    # ── 摘要相关 ──
+    c._previous_summary = None
+    c._summary_has_user_turn = None
+    c._summary_failure_cooldown_until = 0.0
+    c._max_compaction_summary_tokens = 2000
+    c.abort_on_summary_failure = False
+    c._last_compress_aborted = False
+    c._summary_model_fallen_back = False
+    c._last_summary_error = None
+    c._last_summary_dropped_count = 0
+    c._last_summary_fallback_used = False
+    c._last_aux_model_failure_error = None
+    c._last_aux_model_failure_model = None
+    c._last_summary_auth_failure = False
+    c._last_summary_network_failure = False
+    # ── 内部状态（避免 lazy resolution 行为）──
+    c._config_threshold_percent = 0.50
+    c._base_threshold_percent = 0.50
+    c._configured_threshold_percent = 0.50
+    c._resolved_context_length = 128000
+    c._threshold_tokens = 64000
+    c._tail_token_budget = 500
+    c._max_summary_tokens = 2000
+    c._log_init_summary = False
+    c._anti_thrash_recovery_deadline = 0.0
+    c._fallback_compression_streak = 0
+    c._verify_compaction_cleared_threshold = False
+    c._cooldown_persist_failed = False
+    # ── 可选功能（禁用）──
+    c.proactive_prune_tokens = 0
+    c.proactive_prune_min_result_chars = 8000
+    c.proactive_prune_min_reclaim_tokens = 0
+    c.threshold_tokens_cap = None
+    c.model_thresholds = {}
+    c._session_db = None
+    c._session_id = ""
+    return c
+
+
+def test_real_noop_short_messages():
+    """集成测试：短消息列表不会触发压缩，_guard_compress_count 保持 0。
+
+    构造 < _min_for_compress 的消息，调用真实 ContextCompressor 的
+    compress()，验证其 no-op 返回行为 + 守卫不计数。
+    """
+    real = _make_real_compressor()
+    engine = SessionGuardEngine()
+    engine._real = real
+    engine._guard_compress_count = 0
+
+    short_msgs = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there"},
+        {"role": "user", "content": "How are you?"},
+        {"role": "assistant", "content": "I'm good, thanks!"},
+    ]
+
+    result = engine.compress(short_msgs, force=False)
+
+    # 守卫计数器不变（ContextCompressor 因消息太少 no-op）
+    assert engine._guard_compress_count == 0, (
+        f"_guard_compress_count 应为 0（未实际压缩），实际 {engine._guard_compress_count}"
+    )
+    # 消息原样返回
+    assert result == short_msgs, (
+        f"短消息列表应原样返回，但结果不同。\n输入: {len(short_msgs)} 条\n输出: {len(result)} 条"
+    )
+
+
+def test_real_compress_counts_and_safe_injection():
+    """集成测试：真实压缩后计数器递增 + 第 3 次压缩注入提醒。
+
+    构造 ~80 条 user/assistant 交换（足够触发压缩），mock
+    _generate_summary 返回测试摘要，预设 _guard_compress_count=2，
+    验证压缩后计数为 3 且结果中包含会话守卫提醒。
+    """
+    real = _make_real_compressor()
+
+    # 构造长消息列表：system + 80 对 user/assistant 交换 + padding
+    long_msgs = [{"role": "system", "content": "You are a helpful assistant."}]
+    for i in range(80):
+        long_msgs.append({"role": "user", "content": f"Question {i}: what is 2+2?"})
+        long_msgs.append(
+            {"role": "assistant",
+             "content": f"Answer {i}: the answer is 4. " + "extra padding to increase token count. " * 60}
+        )
+
+    engine = SessionGuardEngine()
+    engine._real = real
+    engine._guard_compress_count = 2  # 第 3 次将触发提醒
+
+    with patch.object(real, "_generate_summary",
+                      return_value="[CONTEXT COMPACTION] test summary for integration test"):
+        result = engine.compress(long_msgs, force=False)
+
+    # 守卫计数递增（从 2 到 3）
+    assert engine._guard_compress_count == 3, (
+        f"_guard_compress_count 应为 3，实际 {engine._guard_compress_count}"
+    )
+    # 内部 ContextCompressor 的 compression_count 也递增
+    assert real.compression_count == 1, (
+        f"真实 compressor 的 compression_count 应为 1，实际 {real.compression_count}"
+    )
+    # 结果中注入了提醒
+    reminder_found = any(
+        "会话守卫强制提醒" in (m.get("content", "") or "")
+        for m in result
+    )
+    assert reminder_found, (
+        "压缩结果中应包含「会话守卫强制提醒」，但未找到。\n"
+        f"结果消息数: {len(result)}\n"
+        f"结果 role 序列: {[m.get('role') for m in result]}"
+    )
+    # 角色交替安全：结果不以连续 user 结尾（提醒合并到末条 user 或新建）
+    roles = [m.get("role") for m in result]
+    for i in range(len(roles) - 1):
+        assert roles[i] != roles[i + 1] or roles[i] != "user", (
+            f"角色交替违规：连续 user 消息出现在索引 {i} 和 {i + 1}"
+        )
