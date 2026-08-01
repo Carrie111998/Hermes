@@ -1008,7 +1008,10 @@ class TeamsAdapter(BasePlatformAdapter):
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
         """Handle an Adaptive Card Action.Execute button click."""
-        from tools.approval import resolve_gateway_approval, has_blocking_approval
+        from tools.approval import (
+            get_blocking_approval_data,
+            resolve_gateway_approval,
+        )
 
         action = ctx.activity.value.action
         data = action.data or {}
@@ -1019,6 +1022,23 @@ class TeamsAdapter(BasePlatformAdapter):
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+
+        # The session_key round-trips through the Teams client and is
+        # untrusted: bind it to this conversation before anything else.
+        # Teams session keys embed the conversation id as the chat id
+        # segment, so a key that doesn't contain this conversation's id
+        # belongs to a different session (cross-session approval).
+        conversation_id = getattr(ctx.activity.conversation, "id", "")
+        if not conversation_id or conversation_id not in session_key:
+            logger.warning(
+                "[teams] card action rejected: session_key %r does not match conversation %r",
+                session_key, conversation_id,
+            )
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(
+                    value="⛔ Approval does not belong to this conversation."),
             )
 
         # Only authorized users may click approval buttons.
@@ -1064,7 +1084,11 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        if not has_blocking_approval(session_key):
+        # Enforce the render-time permissions server-side: a client can
+        # resubmit button choices the card never offered (smart DENY /
+        # allow_session=False / allow_permanent=False withhold them).
+        approval_data = get_blocking_approval_data(session_key)
+        if approval_data is None:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionCardResponse(
@@ -1072,6 +1096,27 @@ class TeamsAdapter(BasePlatformAdapter):
                     .with_version("1.4")
                     .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
                 ),
+            )
+        smart_denied = bool(approval_data.get("smart_denied"))
+        allow_session = bool(approval_data.get("allow_session", True))
+        allow_permanent = bool(approval_data.get("allow_permanent", True))
+        if smart_denied and choice in {"session", "always"}:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(
+                    value="⛔ Smart DENY: owner override applies to this one operation only."),
+            )
+        if choice == "session" and not allow_session:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(
+                    value="⛔ Session-wide approval was not offered for this command."),
+            )
+        if choice == "always" and (not allow_session or not allow_permanent):
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(
+                    value="⛔ Permanent approval was not offered for this command."),
             )
 
         resolve_gateway_approval(session_key, choice)

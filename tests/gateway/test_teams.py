@@ -714,3 +714,85 @@ class TestTeamsMediaAttachments:
         adapter._app.send.assert_awaited_once()
 
 
+
+
+import asyncio
+
+
+class TestTeamsApprovalCardSecurity:
+    """Card-action handler must bind session_key to the conversation and
+    enforce render-time permissions server-side (cross-session IDOR and
+    withheld-choice escalation, GHSA-class)."""
+
+    @staticmethod
+    def _ctx(data, conversation_id, aad="user-aad"):
+        activity = MagicMock()
+        activity.value = MagicMock()
+        activity.value.action = MagicMock()
+        activity.value.action.data = data
+        activity.conversation = MagicMock()
+        activity.conversation.id = conversation_id
+        activity.from_ = MagicMock()
+        activity.from_.aad_object_id = aad
+        activity.from_.id = aad
+        ctx = MagicMock()
+        ctx.activity = activity
+        return ctx
+
+    @staticmethod
+    def _seed(session_key, data):
+        from tools import approval as ap
+        entry = ap._ApprovalEntry(data)
+        with ap._lock:
+            ap._gateway_queues.setdefault(session_key, []).append(entry)
+        return entry
+
+    def _adapter(self):
+        return object.__new__(TeamsAdapter)
+
+    def teardown_method(self):
+        from tools import approval as ap
+        with ap._lock:
+            ap._gateway_queues.clear()
+
+    def test_cross_session_approval_rejected(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "user-aad")
+        victim_key = "agent:main:teams:dm:19:victim-chat@thread.tacv2"
+        entry = self._seed(victim_key, {"command": "rm -rf /tmp/x",
+                                        "allow_permanent": True, "allow_session": True})
+        ctx = self._ctx({"hermes_action": "approve_once", "session_key": victim_key},
+                        conversation_id="19:attacker-chat@thread.tacv2")
+        asyncio.run(self._adapter()._on_card_action(ctx))
+        assert entry.result is None
+
+    def test_withheld_approve_always_rejected(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "user-aad")
+        key = "agent:main:teams:dm:19:victim2-chat@thread.tacv2"
+        entry = self._seed(key, {"command": "rm -rf /tmp/y",
+                                 "allow_permanent": False, "allow_session": False,
+                                 "smart_denied": True})
+        ctx = self._ctx({"hermes_action": "approve_always", "session_key": key},
+                        conversation_id="19:victim2-chat@thread.tacv2")
+        asyncio.run(self._adapter()._on_card_action(ctx))
+        assert entry.result is None
+
+    def test_smart_deny_session_choice_rejected(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "user-aad")
+        key = "agent:main:teams:dm:19:victim3-chat@thread.tacv2"
+        entry = self._seed(key, {"command": "rm -rf /tmp/z",
+                                 "allow_permanent": True, "allow_session": True,
+                                 "smart_denied": True})
+        ctx = self._ctx({"hermes_action": "approve_session", "session_key": key},
+                        conversation_id="19:victim3-chat@thread.tacv2")
+        asyncio.run(self._adapter()._on_card_action(ctx))
+        assert entry.result is None
+
+    def test_owner_in_conversation_approve_once_works(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "user-aad")
+        key = "agent:main:teams:dm:19:owner-chat@thread.tacv2"
+        entry = self._seed(key, {"command": "ls",
+                                 "allow_permanent": True, "allow_session": True})
+        ctx = self._ctx({"hermes_action": "approve_once", "session_key": key},
+                        conversation_id="19:owner-chat@thread.tacv2")
+        asyncio.run(self._adapter()._on_card_action(ctx))
+        assert entry.result == "once"

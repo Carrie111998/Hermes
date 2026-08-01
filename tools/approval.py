@@ -2237,6 +2237,20 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def get_blocking_approval_data(session_key: str) -> Optional[dict]:
+    """Return the oldest pending approval's data dict, or None.
+
+    Platform approval handlers need this to enforce the render-time
+    permissions (allow_session / allow_permanent / smart_denied) server-side
+    — a client can resubmit button choices the card never offered.
+    """
+    with _lock:
+        queue = _gateway_queues.get(session_key) or []
+        if not queue:
+            return None
+        return queue[0].data
+
+
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:
