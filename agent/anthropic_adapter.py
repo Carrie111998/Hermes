@@ -129,6 +129,8 @@ _ANTHROPIC_OUTPUT_LIMITS = {
     "claude-fable":      128_000,
     # Claude Sonnet 5
     "claude-sonnet-5":   128_000,
+    # Claude Opus 5
+    "claude-opus-5":     128_000,
     # Claude 4.8
     "claude-opus-4-8":   128_000,
     # Claude 4.7

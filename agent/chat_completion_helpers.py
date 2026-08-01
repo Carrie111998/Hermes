@@ -57,6 +57,22 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# Last-resort output budget for api_mode="bedrock_converse" when neither an
+# explicit model.max_tokens nor a known model output ceiling is available.
+# The Converse API requires inferenceConfig.maxTokens, and non-Claude Bedrock
+# models (Nova, Llama, DeepSeek) cap well below the Claude ceilings, so this
+# stays conservative.  Claude-on-Bedrock resolves its real limit (128000 for
+# Opus 4.x/5) via _resolve_bedrock_max_output_tokens instead.
+_BEDROCK_FALLBACK_MAX_OUTPUT_TOKENS = 8192
+
+# Ceiling applied when model.max_tokens (or a truncation boost) is set but the
+# active Bedrock model is NOT in the Claude output-limits table, so we have no
+# real ceiling to clamp against.  Bedrock hard-rejects an over-large
+# inferenceConfig.maxTokens instead of clamping it, so a stale Claude-sized pin
+# (e.g. 128000) must degrade rather than fail the turn.  32768 comfortably
+# covers Nova/Llama/DeepSeek output caps.
+_BEDROCK_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS = 32768
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -1120,6 +1136,55 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _resolve_bedrock_max_output_tokens(agent, ephemeral_out=None) -> int:
+    """Resolve ``inferenceConfig.maxTokens`` for the bedrock_converse path.
+
+    Priority (highest first):
+      1. ``ephemeral_out`` — the truncation/tool-call recovery boost set on
+         ``agent._ephemeral_max_output_tokens``.  Without honouring it, a
+         truncated turn re-ran with the *same* budget and burned all 4
+         continuation retries before failing with "Response truncated due to
+         output length limit".
+      2. ``agent.max_tokens`` — explicit user/config value (``model.max_tokens``).
+      3. The model's real output ceiling (Claude-on-Bedrock models resolve via
+         ``_get_anthropic_max_output``; e.g. 128000 for Opus 4.x/5).
+      4. ``_BEDROCK_FALLBACK_MAX_OUTPUT_TOKENS`` for non-Claude models.
+
+    The result is clamped to the model ceiling so a boosted retry can't exceed
+    what Bedrock accepts (a too-large value is a hard ValidationException:
+    "The maximum tokens you requested exceeds the model limit").
+    """
+    ceiling = None
+    try:
+        from agent.anthropic_adapter import (
+            _get_anthropic_max_output,
+            _ANTHROPIC_OUTPUT_LIMITS,
+        )
+        _model_norm = (agent.model or "").lower().replace(".", "-")
+        if any(key in _model_norm for key in _ANTHROPIC_OUTPUT_LIMITS):
+            ceiling = _get_anthropic_max_output(agent.model)
+    except Exception:
+        ceiling = None
+
+    for candidate in (ephemeral_out, getattr(agent, "max_tokens", None)):
+        if isinstance(candidate, bool) or not isinstance(candidate, int):
+            continue
+        if candidate <= 0:
+            continue
+        if ceiling:
+            return min(candidate, ceiling)
+        # Unknown (non-Claude) Bedrock model: we have no ceiling to clamp
+        # against, and a too-large inferenceConfig.maxTokens is a HARD
+        # ValidationException ("The maximum tokens you requested exceeds the
+        # model limit"), not a clamp.  A flat model.max_tokens pinned for a
+        # Claude model (e.g. 128000) would therefore break the turn outright
+        # after switching to Nova/Llama/DeepSeek.  Cap unknown models at the
+        # conservative fallback so a stale pin degrades instead of failing.
+        return min(candidate, _BEDROCK_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS)
+
+    return ceiling or _BEDROCK_FALLBACK_MAX_OUTPUT_TOKENS
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
@@ -1158,11 +1223,23 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
+        # Output budget parity with the anthropic_messages path (#truncation):
+        # a flat 4096 cap made long Claude-on-Bedrock answers hit
+        # finish_reason="max_tokens" and the loop then burned all 4
+        # continuation retries before giving up with "Response truncated due
+        # to output length limit".  Resolve the model's real output ceiling
+        # and honour the ephemeral boost the truncation-recovery path sets.
+        _br_ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+        if _br_ephemeral_out is not None:
+            agent._ephemeral_max_output_tokens = None  # consume immediately
+        _br_max_tokens = _resolve_bedrock_max_output_tokens(
+            agent, ephemeral_out=_br_ephemeral_out
+        )
         return _bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
-            max_tokens=agent.max_tokens or 4096,
+            max_tokens=_br_max_tokens,
             region=region,
             guardrail_config=guardrail,
         )
