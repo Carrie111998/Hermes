@@ -3707,6 +3707,26 @@ def install_from_quarantine(
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
 
     if install_dir.exists():
+        # Guard against wiping a category bucket that contains other skills.
+        # If the directory is NOT a previously hub-installed skill, check
+        # whether it holds any SKILL.md files from other skills — if so,
+        # refuse to overwrite to prevent silent data loss (issue #75983).
+        lock = HubLockFile()
+        is_hub_installed = lock.get_installed(safe_skill_name) is not None
+        if not is_hub_installed:
+            # Check if this is a category directory containing other skills
+            other_skills = [
+                p for p in install_dir.rglob("SKILL.md")
+                if p.resolve() != (install_dir / "SKILL.md").resolve()
+            ]
+            if other_skills:
+                raise ValueError(
+                    f"Cannot install skill '{safe_skill_name}': "
+                    f"{install_dir} already exists and contains "
+                    f"{len(other_skills)} other skill(s). "
+                    f"Choose a different name with --name, or specify a "
+                    f"category with --category to avoid the collision."
+                )
         shutil.rmtree(install_dir)
 
     # Warn (but don't block) if SKILL.md is very large
