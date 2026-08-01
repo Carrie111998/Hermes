@@ -947,11 +947,8 @@ class BuzzAdapter(BasePlatformAdapter):
                     self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
                 self._channel_names.setdefault(dm_id, "DM")
 
-        code, out, err = await self._run_cli(["channels", "list"])
+        code, out, _err = await self._run_cli(["channels", "list"])
         if code != 0:
-            logger.debug(
-                "Buzz: could not discover newly joined channels — %s", _cli_error_message(err, code)
-            )
             return
         for ch in _parse_json_list(out):
             ch_id = str(ch.get("channel_id") or "")
