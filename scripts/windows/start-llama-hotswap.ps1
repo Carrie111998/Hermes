@@ -202,28 +202,78 @@ function Test-PortListening {
     return $false
 }
 
+function Get-RouterModelStatus {
+    param(
+        [string]$RouterUrl,
+        [string]$ModelId
+    )
+    $models = Invoke-RestMethod -Uri "$RouterUrl/v1/models" -TimeoutSec 10
+    $row = @($models.data | Where-Object { $_.id -eq $ModelId }) | Select-Object -First 1
+    if ($row -and $row.status) { return [string]$row.status.value }
+    return "missing"
+}
+
+function Wait-RouterModelStatus {
+    param(
+        [string]$RouterUrl,
+        [string]$ModelId,
+        [string[]]$ExpectedStatus,
+        [int]$TimeoutSec = 600
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastStatus = "missing"
+    while ((Get-Date) -lt $deadline) {
+        $lastStatus = Get-RouterModelStatus -RouterUrl $RouterUrl -ModelId $ModelId
+        if ($lastStatus -in $ExpectedStatus) {
+            return $lastStatus
+        }
+        if ($lastStatus -in @("failed", "error")) {
+            throw "Model '$ModelId' entered status '$lastStatus'."
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "Timed out waiting for model '$ModelId' status '$($ExpectedStatus -join '/')'; last status was '$lastStatus'."
+}
+
 function Invoke-WarmSecondary {
     param(
-        [string]$BaseUrl,
+        [string]$RouterUrl,
         [string]$PrimaryId,
         [string]$SecondaryId,
         [int]$TimeoutSec = 600
     )
     Write-Output "Warm-standby: loading secondary '$SecondaryId' once (LRU will unload primary)..."
+    $modelBody = @{ model = $SecondaryId } | ConvertTo-Json
+    $secondaryStatus = Get-RouterModelStatus -RouterUrl $RouterUrl -ModelId $SecondaryId
+    if ($secondaryStatus -notin @("loaded", "ready", "loading")) {
+        $null = Invoke-RestMethod -Uri "$RouterUrl/models/load" -Method Post -Body $modelBody -ContentType "application/json" -TimeoutSec 15
+    }
+    $null = Wait-RouterModelStatus -RouterUrl $RouterUrl -ModelId $SecondaryId -ExpectedStatus @("loaded", "ready") -TimeoutSec $TimeoutSec
     $bodySec = @{
         model = $SecondaryId
         max_tokens = 4
         messages = @(@{ role = "user"; content = "warm" })
     } | ConvertTo-Json -Depth 5
-    $null = Invoke-RestMethod -Uri "$BaseUrl/chat/completions" -Method Post -Body $bodySec -ContentType "application/json" -TimeoutSec $TimeoutSec
+    $null = Invoke-RestMethod -Uri "$RouterUrl/v1/chat/completions" -Method Post -Body $bodySec -ContentType "application/json" -TimeoutSec $TimeoutSec
+    Write-Output "Warm-standby: unloading secondary '$SecondaryId'..."
+    if ((Get-RouterModelStatus -RouterUrl $RouterUrl -ModelId $SecondaryId) -ne "unloaded") {
+        $null = Invoke-RestMethod -Uri "$RouterUrl/models/unload" -Method Post -Body $modelBody -ContentType "application/json" -TimeoutSec 15
+    }
+    $null = Wait-RouterModelStatus -RouterUrl $RouterUrl -ModelId $SecondaryId -ExpectedStatus @("unloaded") -TimeoutSec $TimeoutSec
     Write-Output "Warm-standby: reloading primary '$PrimaryId'..."
+    $modelBody = @{ model = $PrimaryId } | ConvertTo-Json
+    $primaryStatus = Get-RouterModelStatus -RouterUrl $RouterUrl -ModelId $PrimaryId
+    if ($primaryStatus -notin @("loaded", "ready", "loading")) {
+        $null = Invoke-RestMethod -Uri "$RouterUrl/models/load" -Method Post -Body $modelBody -ContentType "application/json" -TimeoutSec 15
+    }
+    $null = Wait-RouterModelStatus -RouterUrl $RouterUrl -ModelId $PrimaryId -ExpectedStatus @("loaded", "ready") -TimeoutSec $TimeoutSec
     $bodyPri = @{
         model = $PrimaryId
         max_tokens = 4
         messages = @(@{ role = "user"; content = "warm" })
     } | ConvertTo-Json -Depth 5
-    $null = Invoke-RestMethod -Uri "$BaseUrl/chat/completions" -Method Post -Body $bodyPri -ContentType "application/json" -TimeoutSec $TimeoutSec
-    $models = Invoke-RestMethod -Uri "$BaseUrl/models" -TimeoutSec 10
+    $null = Invoke-RestMethod -Uri "$RouterUrl/v1/chat/completions" -Method Post -Body $bodyPri -ContentType "application/json" -TimeoutSec $TimeoutSec
+    $models = Invoke-RestMethod -Uri "$RouterUrl/v1/models" -TimeoutSec 10
     foreach ($row in $models.data) {
         Write-Output ("warm-status {0}={1}" -f $row.id, $row.status.value)
     }
@@ -284,9 +334,11 @@ if (Test-PortListening -TargetHost $HostName -TargetPort $Port) {
             Write-Warning ("HF-cache stubs still listed ({0}). Re-run with -ForceRestart to apply hf-cache isolation." -f ($hfStubs -join ", "))
         }
         if ($WarmSecondary) {
-            Invoke-WarmSecondary -BaseUrl "http://${HostName}:${Port}/v1" -PrimaryId $PrimaryId -SecondaryId $SecondaryId -TimeoutSec $WaitSeconds
+            Invoke-WarmSecondary -RouterUrl "http://${HostName}:${Port}" -PrimaryId $PrimaryId -SecondaryId $SecondaryId -TimeoutSec $WaitSeconds
         }
-    } catch {}
+    } catch {
+        throw "Existing llama router failed inspection or warm-standby: $($_.Exception.Message)"
+    }
     exit 0
 }
 
@@ -379,6 +431,7 @@ try {
 $modelsUrl = "http://${HostName}:${Port}/v1/models"
 $deadline = (Get-Date).AddSeconds($WaitSeconds)
 $listedOnce = $false
+$routerReady = $false
 while ((Get-Date) -lt $deadline) {
     if ($proc.HasExited) {
         $tail = ""
@@ -408,19 +461,24 @@ while ((Get-Date) -lt $deadline) {
             Write-Output "pid=$($proc.Id) primary_status=$primaryStatus"
             Write-Output ("models: {0}" -f ($ids -join ", "))
             Write-Output "swap: model='$PrimaryId' or '$SecondaryId' (models-max=$ModelsMax LRU)"
-            if ($WarmSecondary) {
-                Invoke-WarmSecondary -BaseUrl "http://${HostName}:${Port}/v1" -PrimaryId $PrimaryId -SecondaryId $SecondaryId -TimeoutSec $WaitSeconds
-            }
-            Write-Output "stdout=$stdoutPath"
-            Write-Output "stderr=$stderrPath"
-            exit 0
+            $routerReady = $true
+            break
         }
     } catch {
         Start-Sleep -Seconds 2
     }
 }
 
-if (-not $proc.HasExited) {
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+if (-not $routerReady) {
+    if (-not $proc.HasExited) {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    throw "llama-server hot-swap did not become ready within $WaitSeconds seconds. See $stderrPath"
 }
-throw "llama-server hot-swap did not become ready within $WaitSeconds seconds. See $stderrPath"
+
+if ($WarmSecondary) {
+    Invoke-WarmSecondary -RouterUrl "http://${HostName}:${Port}" -PrimaryId $PrimaryId -SecondaryId $SecondaryId -TimeoutSec $WaitSeconds
+}
+Write-Output "stdout=$stdoutPath"
+Write-Output "stderr=$stderrPath"
+exit 0
