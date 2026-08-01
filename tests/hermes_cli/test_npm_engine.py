@@ -207,14 +207,16 @@ class TestRepairDecision:
             str(system_npm), NODE25_EBADENGINE_OUTPUT
         )
 
-        # A foreign npm stays untouched, and the guidance describes a compatible
-        # Node/npm *pair* instead of suggesting npm 12 on an unsupported Node.
+        # A foreign npm stays untouched. The guidance reports the current pair,
+        # preserves an actionable, shell-safe range command (npm resolves a
+        # Node-compatible release), and also covers coupled Node/npm managers.
         err = capsys.readouterr().err
         assert "Current toolchain: Node 25.9.0, npm 11.12.1" in err
         assert "Required npm: <11.10.0 || >=12.0.0" in err
-        assert "version manager that owns this Node install" in err
-        assert "re-run `hermes update`" in err
-        assert "npm install -g" not in err
+        assert "Install a compatible npm release" in err
+        assert "npm install -g 'npm@<11.10.0 || >=12.0.0'" in err
+        assert "select a compatible Node/npm pair instead" in err
+        assert "re-run the original command" in err
 
     def test_non_engine_failure_never_upgrades(self, managed_npm, monkeypatch):
         def explode(cmd, **kwargs):  # pragma: no cover - must not be reached
