@@ -919,6 +919,16 @@ class GatewayConfig:
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
 
+    # Worker threads reserved for INTERACTIVE (non-webhook) agent turns.
+    # The shared agent-turn executor is FIFO: on installs with heavy webhook
+    # traffic, batch turns occupy every worker and a human chat message can
+    # queue for hours before its turn even starts (observed: telegram turns
+    # completing with time=8335s api_calls=0 — pure queue wait). When set to
+    # a positive int, turns from interactive platforms run on a dedicated
+    # pool of this size so batch work can never starve them. 0/None (default)
+    # keeps the single shared pool — no behavior change.
+    interactive_executor_workers: Optional[int] = None
+
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
     # profile on the host: profiles are stamped into session keys and (in later
@@ -1069,6 +1079,7 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
+            "interactive_executor_workers": self.interactive_executor_workers,
             "multiplex_profiles": self.multiplex_profiles,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
@@ -1174,6 +1185,18 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        if "interactive_executor_workers" in data:
+            interactive_workers_raw = data.get("interactive_executor_workers")
+            interactive_workers_key = "interactive_executor_workers"
+        else:
+            interactive_workers_raw = nested_gateway.get(
+                "interactive_executor_workers"
+            )
+            interactive_workers_key = "gateway.interactive_executor_workers"
+        interactive_executor_workers = _coerce_optional_positive_int(
+            interactive_workers_raw,
+            interactive_workers_key,
+        )
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -1210,6 +1233,7 @@ class GatewayConfig:
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
+            interactive_executor_workers=interactive_executor_workers,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,

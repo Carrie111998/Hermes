@@ -241,6 +241,45 @@ class TestGatewayConfigRoundtrip:
         )
 
 
+    def test_interactive_executor_workers_defaults_to_none(self):
+        config = GatewayConfig.from_dict({})
+
+        assert config.interactive_executor_workers is None
+
+    def test_interactive_executor_workers_from_top_level_key(self):
+        config = GatewayConfig.from_dict({"interactive_executor_workers": 6})
+
+        assert config.interactive_executor_workers == 6
+
+    def test_interactive_executor_workers_from_nested_gateway_key(self):
+        config = GatewayConfig.from_dict(
+            {"gateway": {"interactive_executor_workers": 4}}
+        )
+
+        assert config.interactive_executor_workers == 4
+
+    def test_interactive_executor_workers_ignores_invalid_values(self, caplog):
+        caplog.set_level(logging.WARNING, logger="gateway.config")
+
+        for raw in ("several", True, 0, -2, 1.5):
+            config = GatewayConfig.from_dict(
+                {"interactive_executor_workers": raw}
+            )
+            assert config.interactive_executor_workers is None
+
+        assert any(
+            "Ignoring invalid interactive_executor_workers" in record.message
+            for record in caplog.records
+        )
+
+    def test_interactive_executor_workers_roundtrips_through_to_dict(self):
+        config = GatewayConfig(interactive_executor_workers=8)
+
+        restored = GatewayConfig.from_dict(config.to_dict())
+
+        assert restored.interactive_executor_workers == 8
+
+
     def test_roundtrip_preserves_unauthorized_dm_behavior(self):
         config = GatewayConfig(
             unauthorized_dm_behavior="ignore",

@@ -20319,12 +20319,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
-    async def _run_in_executor_with_context(self, func, *args):
-        """Run blocking work in the thread pool while preserving session contextvars."""
+    async def _run_in_executor_with_context(self, func, *args, _interactive=False):
+        """Run blocking work in the thread pool while preserving session contextvars.
+
+        When ``_interactive`` is True and a reserved interactive lane is
+        configured (``gateway.interactive_executor_workers`` > 0), the work
+        runs on the interactive pool so chat turns never queue behind batch
+        (webhook) work. Default False = shared pool, the historical behavior.
+        """
         loop = asyncio.get_running_loop()
         ctx = copy_context()
+        executor = (
+            self._get_interactive_executor() if _interactive
+            else self._get_executor()
+        )
         return await loop.run_in_executor(
-            self._get_executor(),
+            executor,
             ctx.run,
             func,
             *args,
@@ -20349,6 +20359,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._executor = executor
             return executor
 
+    def _get_interactive_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the reserved interactive-turn executor, or the shared pool
+        when no interactive lane is configured.
+
+        The shared agent-turn pool is FIFO; on installs with heavy webhook
+        traffic, batch turns occupy every worker and a human chat message can
+        wait hours before its turn starts (observed: a telegram turn completing
+        with ``time=8335s api_calls=0`` — pure queue wait). A reserved lane
+        makes interactive latency independent of batch backlog. Disabled
+        (default) = single shared pool, byte-identical to prior behavior.
+        """
+        workers = getattr(self.config, "interactive_executor_workers", None) or 0
+        if workers <= 0:
+            return self._get_executor()
+
+        lock = getattr(self, "_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._executor_lock = lock
+
+        with lock:
+            if getattr(self, "_executor_closing", False):
+                raise RuntimeError("Gateway is shutting down; executor unavailable")
+            executor = getattr(self, "_interactive_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                logger.info(
+                    "Gateway interactive executor starting with max_workers=%d",
+                    workers,
+                )
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers,
+                    thread_name_prefix="hermes-gw-interactive",
+                )
+                self._interactive_executor = executor
+            return executor
+
+    @staticmethod
+    def _is_batch_platform(source) -> bool:
+        """Whether a turn's source is batch traffic (shares the main pool).
+
+        Fail-safe policy: any malformed source (missing/None/unknown platform)
+        routes to the SHARED pool — the pre-lane behavior — so it can never
+        consume reserved interactive capacity.
+        """
+        try:
+            raw = getattr(source, "platform", None)
+            platform = getattr(raw, "value", raw)
+            if not isinstance(platform, str) or not platform:
+                return True
+        except Exception:
+            return True
+        return platform in ("webhook",)
+
     def _shutdown_executor(self) -> None:
         """Stop the gateway-owned executor without touching the loop default."""
         lock = getattr(self, "_executor_lock", None)
@@ -20359,14 +20422,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._executor_closing = True
             executor = getattr(self, "_executor", None)
             self._executor = None
+            interactive = getattr(self, "_interactive_executor", None)
+            self._interactive_executor = None
 
-        if executor is None:
-            return
-
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
+        for pool in (executor, interactive):
+            if pool is None:
+                continue
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
 
     def _decide_image_input_mode(
         self,
@@ -23968,7 +24033,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
             _executor_task = asyncio.ensure_future(
-                self._run_in_executor_with_context(run_sync)
+                self._run_in_executor_with_context(
+                    run_sync,
+                    # Human-facing platforms use the reserved interactive lane
+                    # (no-op when gateway.interactive_executor_workers is unset).
+                    _interactive=not self._is_batch_platform(source),
+                )
             )
 
             _inactivity_timeout = False
