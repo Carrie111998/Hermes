@@ -28,6 +28,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
+import { sessionTabsEnabled } from '@/store/session-tabs'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeSessionId,
@@ -159,9 +160,10 @@ function useSessionActions({
   const spec = (partial: Omit<ActionItemSpec, 'onSelect'> & { onSelect: () => void }): ActionItemSpec => partial
 
   // OPEN — where else this session can go. A tab surface IS a tab already,
-  // so it only offers the window hop (and its own Close, below).
+  // so it only offers the window hop (and its own Close, below). Hide "Open
+  // in new tab" when the user has disabled session tabs entirely.
   const openItems: ActionItemSpec[] = [
-    ...(surface === 'row' && !alreadyTabbed
+    ...(surface === 'row' && !alreadyTabbed && sessionTabsEnabled()
       ? [
           spec({
             disabled: !sessionId,

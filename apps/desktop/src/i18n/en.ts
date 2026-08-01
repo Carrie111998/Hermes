@@ -445,6 +445,9 @@ export const en: Translations = {
       backdropDesc: 'The faint statue image behind the conversation.',
       reactionsTitle: 'Message Reactions',
       reactionsDesc: 'iMessage-style emoji tapbacks — react to messages, and Hermes can react to yours.',
+      sessionTabsTitle: 'Session Tabs',
+      sessionTabsDesc:
+        'When on, sidebar + and ⌘/⌃-click open a new tab if main already has a chat. When off, those actions always load into main.',
       embedsTitle: 'Inline Embeds',
       embedsDesc:
         'Rich previews load from third-party sites (YouTube, X, …). Ask shows a placeholder until you allow each one; Always loads them automatically; Off keeps plain links.',

@@ -45,6 +45,7 @@ import {
   refreshActiveProfile
 } from '@/store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
+import { sessionTabsEnabled } from '@/store/session-tabs'
 import {
   $activeSessionId,
   $connection,
@@ -501,12 +502,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // project so the new lane is visible.
   //
   // `openTab` is the sidebar "+" behavior: once a chat is loaded, stack a new
-  // tab instead of replacing it (see mainChatOccupied). The composer's
+  // tab instead of replacing it (see mainChatOccupied) — unless the user
+  // disabled session tabs (Settings → Appearance). The composer's
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
     (path: null | string, options?: { openTab?: boolean }) => {
-      if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
+      if (
+        options?.openTab &&
+        sessionTabsEnabled() &&
+        mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())
+      ) {
         void openNewSessionTile('center', { cwd: path, listed: false })
 
         return
