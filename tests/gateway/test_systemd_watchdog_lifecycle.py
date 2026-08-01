@@ -104,6 +104,38 @@ async def test_startup_deadline_stays_active_until_ready_boundary(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_deadline_stops_when_runner_returns_false(monkeypatch):
+    order: list[str] = []
+
+    class _FakeDeadline:
+        def __init__(self, *, config_enabled):
+            order.append(f"deadline.init:{config_enabled}")
+
+        def start(self):
+            order.append("deadline.start")
+            return True
+
+        async def stop(self):
+            order.append("deadline.stop")
+
+    class _Runner:
+        config = GatewayConfig(systemd_watchdog_seconds=120)
+
+        async def start(self):
+            order.append("runner.start:false")
+            return False
+
+    monkeypatch.setattr("gateway.run.SystemdStartupDeadline", _FakeDeadline)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: None)
+
+    success, deadline = await _discover_mcp_and_start_runner(_Runner())
+
+    assert success is False
+    assert deadline is not None
+    assert order[-2:] == ["runner.start:false", "deadline.stop"]
+
+
+@pytest.mark.asyncio
 async def test_startup_deadline_stops_when_runner_start_fails(monkeypatch):
     order: list[str] = []
 
