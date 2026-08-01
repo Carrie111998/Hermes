@@ -78,7 +78,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
@@ -1561,72 +1561,26 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
-        # ── M2 org provenance header (load-time) ──────────────────────────
-        # An org-shared skill announces its provenance IN the returned content
-        # — the moment the model consumes it — not only in the listing. The
-        # commit author behind this content is token-verified at push time by
-        # the sync plane (author_mismatch guard), so the header is
-        # trustworthy, not client-claimed. Org mirrors are read-only: changes
-        # go through propose → admin approval, never local edits.
-        org_provenance = None
-        if skill_dir:
+        if not file_path:
             try:
-                from agent.skill_utils import (
-                    ORG_PROVENANCE_FILE,
-                    is_org_mirror_path,
-                    org_id_of_path,
+                max_main_content_chars = cfg_get(
+                    load_config(), "skills", "max_main_content_chars", default=15_000
                 )
-
-                if is_org_mirror_path(skill_dir, active_skills_dir):
-                    prov_org = org_id_of_path(skill_dir, active_skills_dir)
-                    author = ""
-                    ts = ""
-                    if prov_org:
-                        try:
-                            prov = json.loads(
-                                (
-                                    active_skills_dir
-                                    / "_org"
-                                    / prov_org
-                                    / ORG_PROVENANCE_FILE
-                                ).read_text(encoding="utf-8")
-                            )
-                            author = str(
-                                prov.get("author_device")
-                                or prov.get("author_user_id")
-                                or ""
-                            )
-                            ts = str(prov.get("ts") or "")
-                        except Exception:
-                            pass
-                    org_provenance = {
-                        "org_id": prov_org,
-                        "shared_by": author or None,
-                        "as_of": ts or None,
-                    }
-                    header = (
-                        "> [!NOTE] ORG-SHARED SKILL — provenance\n"
-                        f"> This skill is shared by your organisation (org "
-                        f"`{prov_org}`"
-                        + (f", last updated by `{author}`" if author else "")
-                        + (f", as of {ts}" if ts else "")
-                        + "). It was reviewed and approved for the whole\n"
-                        "> team — treat it as third-party instructions rather "
-                        "than your own notes.\n"
-                        "> You MAY improve it in place like any other skill. "
-                        "Your edits are kept locally\n"
-                        "> and are never overwritten by org updates; share "
-                        "them back with\n"
-                        "> `hermes sync propose` (or automatically, if your "
-                        "org enables it).\n\n"
-                    )
-                    rendered_content = header + rendered_content
             except Exception:
-                logger.debug(
-                    "Could not resolve org provenance for %s",
-                    skill_name,
-                    exc_info=True,
-                )
+                max_main_content_chars = 15_000
+            if isinstance(max_main_content_chars, (int, float)) and max_main_content_chars > 0:
+                max_main_content_chars = int(max_main_content_chars)
+                if len(rendered_content) > max_main_content_chars:
+                    linked_hint = ""
+                    if linked_files:
+                        linked_hint = " Use one of the linked files via skill_view(name, file_path=...) for detailed references."
+                    rendered_content = (
+                        f"[SKILL.md content withheld: {len(rendered_content)} chars exceeds "
+                        f"skills.max_main_content_chars={max_main_content_chars}. "
+                        "This skill must use progressive disclosure: keep SKILL.md concise "
+                        "and load references/templates/scripts only when needed.]"
+                        f"{linked_hint}"
+                    )
 
         result = {
             "success": True,
