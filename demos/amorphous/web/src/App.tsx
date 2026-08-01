@@ -158,55 +158,110 @@ export default function App() {
   };
 
   const gridPadRight = dockPos === "right" ? 418 : 0;
-  const gridPadBottom = dockPos === "bottom" ? (dockCollapsed ? 64 : 268) : 16;
+
+  /* stats strip numbers */
+  const nComps = visible.length;
+  const nWorkflows = state.workflows.length;
+  const nConnected = state.connections.filter((c) => c.connected).length;
+  const layoutVersion = state.layout._meta?.version ?? 1;
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen flex">
+      {/* ===== left sidebar ===== */}
+      <aside className="w-[228px] shrink-0 bg-panel border-r border-line flex flex-col fixed top-0 bottom-0 left-0 z-40">
+        <div className="h-14 flex items-center gap-2.5 px-4 border-b border-line shrink-0">
+          <span className="w-7 h-7 rounded-lg bg-blue/15 text-blue-2 flex items-center justify-center text-[16px]">☤</span>
+          <div className="leading-tight">
+            <div className="text-[14px] w590">Hermes Station</div>
+            <div className="text-[10px] text-ink-4 uppercase tracking-[0.08em]">amorphous apps</div>
+          </div>
+        </div>
+        <nav className="flex-1 overflow-auto py-3">
+          <div className="microlabel px-4 pb-1.5">Station</div>
+          <SideItem active icon={<LayoutGrid size={15} />} label="Dashboard" />
+          <SideItem icon={<FlaskConical size={15} />} label="Evolve now" onClick={evolveNow} />
+          <SideItem icon={<Eye size={15} />} label={`Proposals`} badge={state.proposals.length}
+                    onClick={() => setTrayOpen(!trayOpen)} />
+          <div className="microlabel px-4 pb-1.5 pt-4">Connections</div>
+          {state.connections.slice(0, 7).map((cn) => (
+            <div key={cn.id} className="flex items-center gap-2.5 px-4 py-[5px] text-[12.5px] text-ink-3">
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cn.connected ? "bg-green shadow-[0_0_5px] shadow-green" : "bg-ink-4/40"}`} />
+              <span className="truncate">{cn.name}</span>
+            </div>
+          ))}
+        </nav>
+        <div className="border-t border-line px-4 py-3 shrink-0">
+          <div className="flex items-center gap-2.5">
+            <span className="w-7 h-7 rounded-full bg-blue/20 text-blue-2 flex items-center justify-center text-[11px] w590 uppercase">{USER.slice(0, 2)}</span>
+            <div className="leading-tight min-w-0">
+              <div className="text-[12.5px] w510 truncate">{USER}</div>
+              <div className="text-[10.5px] text-ink-4 truncate">{state.agent.model || "agent"}</div>
+            </div>
+            <span className="ml-auto w-1.5 h-1.5 rounded-full bg-green shadow-[0_0_5px] shadow-green" />
+          </div>
+        </div>
+      </aside>
+
+      {/* ===== main column ===== */}
+      <div className="flex-1 min-w-0 ml-[228px] h-screen flex flex-col">
       {/* top bar */}
-      <header className="sticky top-0 z-40 h-14 flex items-center justify-between px-4 border-b border-line bg-background/85 backdrop-blur-xl">
-        <div className="flex items-center gap-2.5 text-[15px]">
-          <span className="text-accent-2 text-[17px]">☤</span> <span className="w510">Hermes Station</span>
-          <span className="text-ink-3 text-[11.5px] font-normal hidden sm:inline">amorphous applications</span>
+      <header className="h-14 shrink-0 flex items-center justify-between px-5 border-b border-line bg-background/85 backdrop-blur-xl">
+        <div className="flex items-center gap-3">
+          <span className="text-[15.5px] w590">{state.layout.title || "Dashboard"}</span>
+          <span className="hidden md:inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-green/10 text-green text-[11px] w510">
+            <span className="w-1.5 h-1.5 rounded-full bg-green" /> live
+          </span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="hidden md:inline-flex items-center gap-2 h-7 px-3 rounded-full border border-line text-[12px] text-ink-2 max-w-[240px]">
-            <span className="w-1.5 h-1.5 rounded-full bg-green shadow-[0_0_6px] shadow-green shrink-0" />
-            <span className="truncate">{state.agent.model || "agent"}</span>
-          </span>
           <TopBtn onClick={evolveNow}><FlaskConical size={14} /> Evolve</TopBtn>
           <TopBtn onClick={() => setTrayOpen(!trayOpen)}>
             <LayoutGrid size={14} /> Proposals
-            <span className={`min-w-[18px] h-[18px] px-1 rounded-full text-[11px] font-bold inline-flex items-center justify-center ${state.proposals.length ? "bg-brand text-white" : "bg-white/[0.07] text-ink-3"}`}>
+            <span className={`min-w-[18px] h-[18px] px-1 rounded-full text-[11px] font-bold inline-flex items-center justify-center ${state.proposals.length ? "bg-blue text-white" : "bg-line-2 text-ink-3"}`}>
               {state.proposals.length}
             </span>
           </TopBtn>
-          <TopBtn onClick={() => setDockCollapsed(!dockCollapsed)}><MessageSquare size={14} /> Chat</TopBtn>
+          <button onClick={() => setDockCollapsed(!dockCollapsed)}
+                  className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-md bg-blue text-white text-[13px] w510 hover:bg-blue-2 transition-colors">
+            <MessageSquare size={14} /> Chat
+          </button>
         </div>
       </header>
 
+      {/* stats strip */}
+      {!preview && (
+        <div className="flex items-stretch border-b border-line bg-panel/40">
+          <Stat label="components" value={nComps} />
+          <Stat label="workflows" value={nWorkflows} />
+          <Stat label="connections live" value={nConnected} dot="green" />
+          <Stat label="layout version" value={`v${layoutVersion}`} />
+          <Stat label="curator runs" value={state.curator.runs} last />
+        </div>
+      )}
+
       {/* preview banner */}
       {preview && (
-        <div className="sticky top-14 z-40 flex items-center gap-3 px-4 py-2.5 bg-brand/10 border-b border-brand/40 text-[13.5px]">
-          <Eye size={15} className="text-accent-2 shrink-0" />
-          <b className="text-accent-2 w590 shrink-0">Previewing proposal</b>
+        <div className="sticky top-14 z-40 flex items-center gap-3 px-4 py-2.5 bg-blue/10 border-b border-blue/40 text-[13.5px]">
+          <Eye size={15} className="text-blue-2 shrink-0" />
+          <b className="text-blue-2 w590 shrink-0">Previewing proposal</b>
           <span className="flex-1 text-ink-2 truncate">
             {preview.diff.map((d) => `${d.change}: ${d.title}`).join(" · ") || "reflow only"}
           </span>
           <button onClick={() => actProposal(preview.p.id, "approve", "", "up")}
-                  className="h-8 px-3.5 rounded-md bg-brand text-white text-[13px] w510 inline-flex items-center gap-1.5 hover:bg-accent-2 transition-colors">
+                  className="h-8 px-3.5 rounded-md bg-blue text-white text-[13px] w510 inline-flex items-center gap-1.5 hover:bg-blue-2 transition-colors">
             <Check size={13} /> Keep
           </button>
           <button onClick={() => {
             const why = prompt("Why keep the current layout? (optional — steers the curator)") || "";
             actProposal(preview.p.id, "reject", why, "down");
-          }} className="h-8 px-3.5 rounded-md border border-line-2 bg-white/[0.02] text-[13px] text-ink-2 inline-flex items-center gap-1.5 hover:bg-white/[0.05]">
+          }} className="h-8 px-3.5 rounded-md border border-line-2 bg-surface text-[13px] text-ink-2 inline-flex items-center gap-1.5 hover:bg-surface-2">
             <XIcon size={13} /> Go back
           </button>
         </div>
       )}
 
-      {/* grid */}
-      <main style={{ paddingRight: gridPadRight, paddingBottom: gridPadBottom }} className="transition-[padding] duration-200">
+      {/* grid — scrolls between stats strip and docked chat */}
+      <main style={{ paddingRight: gridPadRight }} className="flex-1 min-h-0 overflow-y-auto">
+        <div>
         <GridBody
           visible={visible}
           rglLayout={rglLayout}
@@ -220,18 +275,30 @@ export default function App() {
             Hidden:
             {hidden.map((c) => (
               <button key={c.id} onClick={() => showComp(c.id)}
-                      className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md border border-line bg-white/[0.02] text-ink-3 hover:border-line-2 hover:text-ink-2">
+                      className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md border border-line bg-surface text-ink-3 hover:border-line-2 hover:text-ink-2">
                 <Plus size={12} /> {c.title}
               </button>
             ))}
           </div>
         )}
+        </div>
       </main>
+
+      {/* docked chat: bottom = in-flow structural panel; right = fixed side panel */}
+      <ChatDock
+        position={dockPos}
+        collapsed={dockCollapsed}
+        msgs={msgs}
+        busy={chatBusy}
+        onSend={sendChat}
+        onMove={moveDock}
+        onCollapse={() => setDockCollapsed(!dockCollapsed)}
+      />
 
       {/* proposals tray */}
       {trayOpen && (
         <aside className="fixed top-14 right-0 bottom-0 w-[420px] z-[60] bg-panel border-l border-line overflow-auto p-4"
-               style={{ paddingBottom: gridPadBottom + 20 }}>
+               style={{ paddingBottom: 40 }}>
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-[15px] font-semibold m-0">Evolution proposals</h3>
             <button onClick={() => setTrayOpen(false)} className="text-ink-3 hover:text-ink"><XIcon size={16} /></button>
@@ -248,22 +315,44 @@ export default function App() {
         </aside>
       )}
 
-      <ChatDock
-        position={dockPos}
-        collapsed={dockCollapsed}
-        msgs={msgs}
-        busy={chatBusy}
-        onSend={sendChat}
-        onMove={moveDock}
-        onCollapse={() => setDockCollapsed(!dockCollapsed)}
-      />
-
       {toast && (
         <div className="fixed left-1/2 -translate-x-1/2 z-[95] bg-surface-2 border border-line-2 rounded-lg px-4 py-2.5 text-[13.5px] shadow-[0_10px_36px_rgba(0,0,0,.5)]"
-             style={{ bottom: gridPadBottom + 16 }}>
+             style={{ bottom: 260 }}>
           {toast}
         </div>
       )}
+      </div>
+    </div>
+  );
+}
+
+function SideItem({ icon, label, active, badge, onClick }: {
+  icon: React.ReactNode; label: string; active?: boolean; badge?: number; onClick?: () => void;
+}) {
+  return (
+    <button onClick={onClick}
+            className={`relative w-full flex items-center gap-2.5 px-4 py-[7px] text-[13px] text-left transition-colors
+              ${active ? "text-ink bg-blue/[0.08]" : "text-ink-3 hover:text-ink-2 hover:bg-surface"}`}>
+      {active && <span className="absolute left-0 top-1 bottom-1 w-[3px] rounded-r bg-blue" />}
+      <span className={active ? "text-blue-2" : ""}>{icon}</span>
+      <span className={active ? "w510" : ""}>{label}</span>
+      {badge != null && badge > 0 && (
+        <span className="ml-auto min-w-[18px] h-[18px] px-1 rounded-full bg-blue text-white text-[10.5px] font-bold inline-flex items-center justify-center">
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function Stat({ label, value, dot, last }: { label: string; value: any; dot?: string; last?: boolean }) {
+  return (
+    <div className={`flex items-baseline gap-2.5 px-5 py-3 ${last ? "" : "border-r border-line"}`}>
+      <span className="text-[22px] w590 tabular-nums leading-none">{value}</span>
+      <span className="microlabel flex items-center gap-1.5">
+        {dot && <span className="w-1.5 h-1.5 rounded-full bg-green" />}
+        {label}
+      </span>
     </div>
   );
 }
@@ -301,7 +390,7 @@ function GridBody({ visible, rglLayout, preview, onPersist, onHide, onRemove }: 
 function TopBtn({ children, onClick }: any) {
   return (
     <button onClick={onClick}
-            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] text-ink-2 hover:text-ink hover:bg-white/[0.04] border border-transparent">
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] text-ink-2 hover:text-ink hover:bg-surface-2 border border-transparent">
       {children}
     </button>
   );
@@ -332,7 +421,7 @@ function ProposalCard({ p, onTry, onAct }: { p: Proposal; onTry: () => void; onA
       {p.rationale && <div className="text-[12.5px] text-ink-3 leading-relaxed">{p.rationale}</div>}
       <textarea value={fb} onChange={(e) => setFb(e.target.value)}
                 placeholder="Optional feedback — steers the next evolution"
-                className="w-full min-h-[44px] mt-2.5 px-2.5 py-2 bg-white/[0.03] border border-line rounded-md text-[13px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2 resize-y" />
+                className="w-full min-h-[44px] mt-2.5 px-2.5 py-2 bg-[#101a30] border border-line rounded-md text-[13px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2 resize-y" />
       <div className="flex gap-2 mt-2.5">
         <ActionBtn onClick={onTry}><Eye size={13} /> Try it</ActionBtn>
         <ActionBtn primary onClick={() => onAct("approve", fb)}><Check size={13} /> Apply</ActionBtn>
@@ -346,9 +435,9 @@ function ActionBtn({ children, onClick, primary, destructive }: any) {
   return (
     <button onClick={onClick}
             className={`inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] font-medium border
-              ${primary ? "bg-brand text-white border-brand w510" :
+              ${primary ? "bg-blue text-white border-blue w510" :
                 destructive ? "border-red/40 text-red hover:bg-red/10" :
-                "border-line-2 bg-white/[0.02] text-ink-2 hover:bg-white/[0.05]"}`}>
+                "border-line-2 bg-surface text-ink-2 hover:bg-surface-2"}`}>
       {children}
     </button>
   );

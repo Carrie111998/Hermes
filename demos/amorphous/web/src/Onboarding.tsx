@@ -38,7 +38,7 @@ export default function Onboarding({ onDone }: { onDone: () => Promise<any> }) {
   return (
     <div className="max-w-[720px] mx-auto px-6 pt-16 pb-32">
       <h1 className="text-[26px] font-bold tracking-tight m-0 mb-1.5">
-        <span className="text-accent-2">☤</span> Hermes Station
+        <span className="text-blue-2">☤</span> Hermes Station
       </h1>
       <p className="text-ink-2 text-[14.5px] leading-relaxed mb-9">
         Your work surface, powered and shaped by Hermes. Pick a starting point, see what's
@@ -51,11 +51,11 @@ export default function Onboarding({ onDone }: { onDone: () => Promise<any> }) {
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
         {opts.templates.map((t: any) => (
           <button key={t.id} onClick={() => setTemplate(t.id)}
-                  className={`text-left p-4 rounded-xl border transition-colors cursor-pointer bg-white/[0.02]
-                    ${template === t.id ? "border-brand ring-1 ring-brand/60" : "border-line hover:border-line-2"}`}>
+                  className={`text-left p-4 rounded-xl border transition-colors cursor-pointer bg-surface
+                    ${template === t.id ? "border-blue ring-1 ring-blue/50" : "border-line hover:border-line-2"}`}>
             <div className="flex items-center justify-between">
               <span className="font-semibold text-[14.5px]">{t.name}</span>
-              {template === t.id && <Check size={15} className="text-accent-2" />}
+              {template === t.id && <Check size={15} className="text-blue-2" />}
             </div>
             <div className="text-ink-3 text-[12.5px] leading-snug mt-1">{t.blurb}</div>
           </button>
@@ -64,11 +64,11 @@ export default function Onboarding({ onDone }: { onDone: () => Promise<any> }) {
       {template === "developer" && (
         <input value={repo} onChange={(e) => setRepo(e.target.value)}
                placeholder="Path to your main repo (default: ~/.hermes/hermes-agent)"
-               className="mt-2.5 w-full h-10 px-3.5 bg-white/[0.03] border border-line rounded-lg text-[13.5px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2" />
+               className="mt-2.5 w-full h-10 px-3.5 bg-[#101a30] border border-line rounded-lg text-[13.5px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2" />
       )}
 
       <StepLabel>2 · Live connections detected</StepLabel>
-      <div className="bg-white/[0.02] border border-line rounded-xl px-4 py-1">
+      <div className="bg-surface border border-line rounded-xl px-4 py-1">
         {opts.connections.map((c: any) => (
           <div key={c.id} className="flex items-center justify-between py-2.5 border-b border-line last:border-0 text-[13.5px]">
             <span>
@@ -85,11 +85,11 @@ export default function Onboarding({ onDone }: { onDone: () => Promise<any> }) {
       <StepLabel>3 · Tell Hermes about your day <span className="normal-case font-normal text-ink-3">(optional, free-form)</span></StepLabel>
       <textarea value={brief} onChange={(e) => setBrief(e.target.value)}
                 placeholder="e.g. I lead dev on hermes-agent — I care about open PRs, CI, what the community is saying, and BTC. Mornings start with triage."
-                className="w-full min-h-[88px] px-4 py-3 bg-white/[0.03] border border-line rounded-lg text-[13.5px] leading-relaxed text-ink placeholder:text-ink-4 outline-none focus:border-line-2 resize-y" />
+                className="w-full min-h-[88px] px-4 py-3 bg-[#101a30] border border-line rounded-lg text-[13.5px] leading-relaxed text-ink placeholder:text-ink-4 outline-none focus:border-line-2 resize-y" />
 
       <div className="mt-8 flex items-center gap-4">
         <button onClick={go} disabled={busy}
-                className="h-11 px-6 rounded-xl bg-brand text-white text-[14.5px] w510 hover:bg-accent-2 transition-colors disabled:opacity-60 inline-flex items-center gap-2">
+                className="h-11 px-6 rounded-xl bg-blue text-white text-[14.5px] w510 hover:bg-blue-2 transition-colors disabled:opacity-60 inline-flex items-center gap-2">
           {busy && <LoaderCircle size={15} className="spin" />}
           Build my Station
         </button>

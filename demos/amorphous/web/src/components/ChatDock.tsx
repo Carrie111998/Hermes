@@ -30,11 +30,11 @@ export default function ChatDock({ position, collapsed, msgs, onSend, onMove, on
 
   const shell =
     position === "right"
-      ? "fixed right-0 top-14 bottom-0 w-[410px] border-l border-line"
-      : `fixed left-1/2 -translate-x-1/2 bottom-3 w-[min(860px,calc(100vw-16px))] rounded-2xl border border-line ${collapsed ? "h-12" : "h-[240px]"}`;
+      ? "fixed right-0 top-14 bottom-0 w-[410px] border-l border-line z-50 bg-panel/95 backdrop-blur-xl shadow-[0_-8px_40px_rgba(0,0,0,.45)]"
+      : `shrink-0 w-full border-t border-line bg-panel ${collapsed ? "h-12" : "h-[236px]"}`;
 
   return (
-    <div className={`${shell} z-50 bg-panel/95 backdrop-blur-xl flex flex-col shadow-[0_-8px_40px_rgba(0,0,0,.45),0_0_0_1px_rgba(255,255,255,.03)]`}>
+    <div className={`${shell} flex flex-col transition-[height] duration-150`}>
       <div className="flex items-center gap-3 h-12 px-4 border-b border-line shrink-0">
         <span className="text-[13.5px] w510 text-ink">◎ Hermes</span>
         <span className="text-[12px] text-ink-3 flex-1 truncate">
@@ -55,7 +55,7 @@ export default function ChatDock({ position, collapsed, msgs, onSend, onMove, on
                 <div key={i} className="text-[12px] font-mono text-ink-3">⚙ {m.text}</div>
               ) : (
                 <div key={i} className="text-[13.5px] leading-relaxed">
-                  <span className={`block text-[10.5px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-accent-2" : "text-ink-3"}`}>
+                  <span className={`block text-[10.5px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-blue-2" : "text-ink-3"}`}>
                     {m.who}
                   </span>
                   <span className="text-ink whitespace-pre-wrap">{m.text}</span>
@@ -79,7 +79,7 @@ export default function ChatDock({ position, collapsed, msgs, onSend, onMove, on
             <button
               onClick={send}
               disabled={busy}
-              className="mr-3 inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-brand text-white text-[13px] w510 hover:bg-accent-2 disabled:opacity-50 transition-colors"
+              className="mr-3 inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-blue text-white text-[13px] w510 hover:bg-blue-2 disabled:opacity-50 transition-colors"
             >
               <Send size={13} /> Send
             </button>

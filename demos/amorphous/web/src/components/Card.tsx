@@ -92,7 +92,7 @@ function CtxItem({ children, onSelect, destructive }: any) {
   return (
     <ContextMenu.Item
       onSelect={onSelect}
-      className={`flex items-center gap-2.5 px-2.5 py-[7px] rounded-md cursor-pointer outline-none data-[highlighted]:bg-white/[0.05] ${destructive ? "text-red" : "text-ink-2"}`}
+      className={`flex items-center gap-2.5 px-2.5 py-[7px] rounded-md cursor-pointer outline-none data-[highlighted]:bg-[#26334f] ${destructive ? "text-red" : "text-ink-2"}`}
     >
       {children}
     </ContextMenu.Item>
@@ -128,16 +128,16 @@ function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () =>
   };
 
   return (
-    <div className="absolute inset-0 z-20 bg-panel/97 backdrop-blur-sm flex flex-col rounded-xl border border-accent/40"
+    <div className="absolute inset-0 z-20 bg-panel/97 backdrop-blur-sm flex flex-col rounded-xl border border-blue/50"
          onMouseDown={(e) => e.stopPropagation()}>
       <div className="flex items-center justify-between px-3.5 h-10 border-b border-line shrink-0">
-        <span className="text-[13px] font-semibold text-accent-2 truncate">◎ {c.title}</span>
+        <span className="text-[13px] font-semibold text-blue-2 truncate">◎ {c.title}</span>
         <button onClick={onClose} className="text-ink-3 hover:text-ink"><X size={15} /></button>
       </div>
       <div className="flex-1 overflow-auto px-3.5 py-2.5 space-y-2.5 min-h-0">
         {msgs.map((m, i) => (
           <div key={i} className="text-[13px] leading-relaxed">
-            <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-accent-2" : "text-ink-3"}`}>{m.who}</span>
+            <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-blue-2" : "text-ink-3"}`}>{m.who}</span>
             <span className="text-ink-2 whitespace-pre-wrap">{m.text}</span>
           </div>
         ))}
@@ -152,7 +152,7 @@ function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () =>
           placeholder="Ask or change this component…"
           className="flex-1 bg-transparent px-3.5 py-2.5 text-[13px] outline-none placeholder:text-ink-3"
         />
-        <button onClick={send} className="pr-3 text-ink-3 hover:text-accent-2"><Send size={15} /></button>
+        <button onClick={send} className="pr-3 text-ink-3 hover:text-blue-2"><Send size={15} /></button>
       </div>
     </div>
   );

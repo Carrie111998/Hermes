@@ -60,7 +60,7 @@ export function DataView({ c, data, err }: { c: Component; data: any; err: strin
       return (
         <div className="text-[13px] text-ink-2 leading-relaxed">
           <b className="text-ink">{data.source}</b> isn't connected.
-          <div className="mt-1.5"><code className="bg-white/[0.06] px-1.5 py-0.5 rounded text-[12px]">{data.how}</code></div>
+          <div className="mt-1.5"><code className="bg-line px-1.5 py-0.5 rounded text-[12px]">{data.how}</code></div>
         </div>
       );
     default:
@@ -103,9 +103,9 @@ function KVView({ data }: { data: any }) {
               <span className="font-semibold tabular-nums text-right truncate">{v}</span>
             </div>
             {bar !== null && (
-              <div className="mt-1 h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+              <div className="mt-1 h-1.5 rounded-full bg-line overflow-hidden">
                 <div
-                  className={`h-full rounded-full ${bar > 0.85 ? "bg-red" : bar > 0.65 ? "bg-amber" : "bg-accent"}`}
+                  className={`h-full rounded-full ${bar > 0.85 ? "bg-red" : bar > 0.65 ? "bg-amber" : "bg-blue"}`}
                   style={{ width: `${Math.min(bar * 100, 100)}%` }}
                 />
               </div>
@@ -146,7 +146,7 @@ function TableView({ data }: { data: any }) {
           {data.columns.map((col: string, i: number) => (
             <th key={col}
                 onClick={() => setSort(sort?.col === i ? (sort.dir === 1 ? { col: i, dir: -1 } : null) : { col: i, dir: 1 })}
-                className="sticky -top-3 bg-[#101112] z-[1] text-left font-semibold text-[10.5px] uppercase tracking-wider text-ink-3 pb-1.5 pr-3 border-b border-line-2 cursor-pointer select-none hover:text-ink-2">
+                className="sticky -top-3 bg-surface z-[1] text-left font-semibold text-[10.5px] uppercase tracking-wider text-ink-3 pb-1.5 pr-3 border-b border-line-2 cursor-pointer select-none hover:text-ink-2">
               <span className="inline-flex items-center gap-0.5">
                 {col}
                 {sort?.col === i && (sort.dir === 1 ? <ChevronUp size={11} /> : <ChevronDown size={11} />)}
@@ -157,7 +157,7 @@ function TableView({ data }: { data: any }) {
       </thead>
       <tbody>
         {rows.map((r: any[], i: number) => (
-          <tr key={i} className="hover:bg-white/[0.03] transition-colors">
+          <tr key={i} className="hover:bg-[#101a30] transition-colors">
             {r.map((v, j) => (
               <td key={j} title={String(v)}
                   className={`py-[7px] pr-3 border-b border-line last:border-0 truncate max-w-[280px] align-middle ${j === 0 ? "font-mono text-[11.5px] text-ink-3" : ""} ${/^[-+$0-9.,%#]/.test(String(v)) ? "tabular-nums" : ""}`}>
@@ -227,25 +227,25 @@ function ChartView({ data }: { data: any }) {
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={pts} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
             <defs>
-              <linearGradient id="accentFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#7170ff" stopOpacity={0.28} />
-                <stop offset="100%" stopColor="#7170ff" stopOpacity={0.02} />
+              <linearGradient id="blueFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.28} />
+                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.02} />
               </linearGradient>
             </defs>
-            <CartesianGrid stroke="rgba(255,255,255,0.05)" strokeDasharray="3 3" vertical={false} />
+            <CartesianGrid stroke="#24304a" strokeDasharray="3 3" vertical={false} />
             <XAxis dataKey="label" hide />
             <YAxis domain={[mn, mx]} hide />
             <Tooltip
               contentStyle={{
-                background: "#191a1b", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10,
+                background: "#1e293b", border: "1px solid #334155", borderRadius: 10,
                 fontSize: 12, color: "#f4f4f5", padding: "6px 10px",
               }}
               labelStyle={{ color: "#7b7e87", fontSize: 11 }}
               formatter={(v: any) => [fmt(v), ""]}
               separator=""
             />
-            <Area type="monotone" dataKey="v" stroke="#7170ff" strokeWidth={2}
-                  fill="url(#accentFill)" dot={false} activeDot={{ r: 3.5, fill: "#7170ff" }} />
+            <Area type="monotone" dataKey="v" stroke="#3b82f6" strokeWidth={2}
+                  fill="url(#blueFill)" dot={false} activeDot={{ r: 3.5, fill: "#3b82f6" }} />
           </AreaChart>
         </ResponsiveContainer>
       </div>
@@ -265,7 +265,7 @@ function LinksView({ data }: { data: any }) {
         const fav = faviconFor(l.url);
         return (
           <a key={i} href={l.url} target="_blank" rel="noreferrer"
-             className="group flex items-center gap-2.5 py-[7px] text-[13.5px] text-ink hover:text-accent-2 border-b border-line last:border-0">
+             className="group flex items-center gap-2.5 py-[7px] text-[13.5px] text-ink hover:text-blue-2 border-b border-line last:border-0">
             {fav
               ? <img src={fav} className="w-4 h-4 rounded-sm shrink-0 opacity-80" alt="" loading="lazy"
                      onError={(e) => ((e.target as HTMLImageElement).style.display = "none")} />
@@ -284,7 +284,7 @@ function FeedView({ data }: { data: any }) {
   if (!data.items.length)
     return <div className="text-[13px] text-ink-3 leading-relaxed">No activity yet — run a workflow or chat with Hermes.</div>;
   const iconFor = (icon: string) =>
-    icon === "⚙" ? <Workflow size={12} className="text-accent-2" />
+    icon === "⚙" ? <Workflow size={12} className="text-blue-2" />
       : icon === "◎" ? <MessageSquare size={12} className="text-ink-3" />
       : <MousePointerClick size={12} className="text-ink-3" />;
   return (
@@ -352,17 +352,17 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
           {inputs.map((inp: any) => (
             <input key={inp.name} placeholder={inp.label}
                    onChange={(e) => (inputsRef.current[inp.name] = e.target.value)}
-                   className="h-8 px-3 bg-white/[0.03] border border-line rounded-md text-[13px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2 min-w-[150px]" />
+                   className="h-8 px-3 bg-[#101a30] border border-line rounded-md text-[13px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2 min-w-[150px]" />
           ))}
         </div>
       )}
       <button onClick={run} disabled={running}
-              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-brand text-white text-[13px] w510 w-fit hover:bg-accent-2 disabled:opacity-60 transition-colors">
+              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-blue text-white text-[13px] w510 w-fit hover:bg-blue-2 disabled:opacity-60 transition-colors">
         {running ? <LoaderCircle size={14} className="spin" /> : <Play size={13} />}
         {running ? "Running" : "Run"}
       </button>
       {result && (
-        <div className="mt-2.5 bg-white/[0.03] border border-line rounded-lg px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 whitespace-pre-wrap overflow-auto flex-1 min-h-0">
+        <div className="mt-2.5 bg-[#101a30] border border-line rounded-lg px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 whitespace-pre-wrap overflow-auto flex-1 min-h-0">
           {result}
         </div>
       )}
