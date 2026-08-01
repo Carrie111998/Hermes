@@ -9,25 +9,25 @@ import (
 // Config holds runtime paths and secrets loaded from flags/env.
 // This binary is intentionally outside Hermes tool/plugin discovery.
 type Config struct {
-	IntervalSec             int
-	FailThreshold           int
-	Once                    bool
-	PrewarmBackend          bool
-	BackendStartTimeoutSec  int
-	BackendReadyTimeoutSec  int
-	ManagedBackendPort      int
-	ListenAddr              string
-	TsnetHostname           string
-	EnableTsnet             bool
-	HermesRoot              string
-	HermesHome              string
-	PackagedExe             string
-	DataDir                 string
-	LogPath                 string
-	LockPath                string
-	StatePath               string
-	AdminToken              string
-	TsAuthKey               string
+	IntervalSec            int
+	FailThreshold          int
+	Once                   bool
+	PrewarmBackend         bool
+	BackendStartTimeoutSec int
+	BackendReadyTimeoutSec int
+	ManagedBackendPort     int
+	ListenAddr             string
+	TsnetHostname          string
+	EnableTsnet            bool
+	HermesRoot             string
+	HermesHome             string
+	PackagedExe            string
+	DataDir                string
+	LogPath                string
+	LockPath               string
+	StatePath              string
+	AdminToken             string
+	TsAuthKey              string
 }
 
 func defaultHermesHome() string {
@@ -53,15 +53,15 @@ func defaultDataDir() string {
 }
 
 func defaultPackagedExe(repoRoot string) string {
-	local := os.Getenv("LOCALAPPDATA")
-	if local != "" {
-		candidate := filepath.Join(local, "hermes", "hermes-agent", "apps", "desktop", "release", "win-unpacked", "Hermes.exe")
+	if repoRoot != "" {
+		candidate := filepath.Join(repoRoot, "apps", "desktop", "release", "win-unpacked", "Hermes.exe")
 		if fileExists(candidate) {
 			return candidate
 		}
 	}
-	if repoRoot != "" {
-		candidate := filepath.Join(repoRoot, "apps", "desktop", "release", "win-unpacked", "Hermes.exe")
+	local := os.Getenv("LOCALAPPDATA")
+	if local != "" {
+		candidate := filepath.Join(local, "hermes", "hermes-agent", "apps", "desktop", "release", "win-unpacked", "Hermes.exe")
 		if fileExists(candidate) {
 			return candidate
 		}
