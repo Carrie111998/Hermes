@@ -6847,44 +6847,80 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except ImportError:  # pragma: no cover - scaffold/import bootstrap
             ContextCompressor = None
 
-        # Older compacted rows predate the explicit hidden marker. Use the
-        # durable compacted flag as a migration fallback, but only suppress the
-        # replay block before the first genuinely new active turn.
-        archived_counts: Dict[tuple[str, ...], int] = {}
-        for message in messages:
-            if message.get("_db_compacted") and not message.get("_db_active"):
-                signature = _message_signature(message)
-                archived_counts[signature] = archived_counts.get(signature, 0) + 1
-        replay_open = bool(archived_counts)
-
-        display = []
-        for message in messages:
+        def _prepare_display_message(message):
             if message.get("display_kind") == "hidden":
-                continue
+                return None
             content = message.get("content")
             if (
                 message.get("role") == "user"
                 and isinstance(content, str)
                 and content.lstrip().startswith("[System:")
             ):
-                continue
+                return None
             if ContextCompressor is not None:
                 if (
                     ContextCompressor.classify_summary_content(message.get("content"))
                     == "standalone"
                 ):
-                    continue
+                    return None
                 message = ContextCompressor._strip_context_summary_handoff_message(message)
                 if message is None:
-                    continue
-            if replay_open and message.get("_db_active") and not message.get("_db_compacted"):
-                signature = _message_signature(message)
-                if archived_counts.get(signature, 0) > 0:
-                    archived_counts[signature] -= 1
-                    continue
-                replay_open = False
-            display.append(message)
-        return display
+                    return None
+            return message
+
+        prepared = []
+        for index, message in enumerate(messages):
+            display_message = _prepare_display_message(message)
+            if display_message is not None:
+                prepared.append((index, display_message))
+
+        # Newer compaction rows carry an explicit hidden marker. Only use the
+        # signature-based fallback for old rows with no such marker; otherwise
+        # a legitimate post-compaction prompt that repeats an archived prompt
+        # could still be mistaken for a replay copy.
+        has_explicit_replay_marker = any(
+            message.get("_db_active") and message.get("display_kind") == "hidden"
+            for message in messages
+        )
+        archived_signatures = [
+            _message_signature(message)
+            for _, message in prepared
+            if message.get("_db_compacted") and not message.get("_db_active")
+        ]
+        active_candidates = [
+            (index, message)
+            for index, message in prepared
+            if message.get("_db_active") and not message.get("_db_compacted")
+        ]
+        replay_indexes = set()
+        if not has_explicit_replay_marker and archived_signatures and active_candidates:
+            active_signatures = [
+                _message_signature(message) for _, message in active_candidates
+            ]
+            longest_match = 0
+            for start in range(len(archived_signatures)):
+                match_length = 0
+                while (
+                    match_length < len(active_signatures)
+                    and start + match_length < len(archived_signatures)
+                    and active_signatures[match_length]
+                    == archived_signatures[start + match_length]
+                ):
+                    match_length += 1
+                longest_match = max(longest_match, match_length)
+            # A single matching row is ambiguous with a new repeated prompt.
+            # Legacy replay suppression is safe only when it identifies a
+            # multi-row contiguous snapshot block.
+            if longest_match >= 2:
+                replay_indexes = {
+                    index for index, _ in active_candidates[:longest_match]
+                }
+
+        return [
+            message
+            for index, message in prepared
+            if index not in replay_indexes
+        ]
 
     def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
         """Return the ancestor-only display messages for a session lineage.

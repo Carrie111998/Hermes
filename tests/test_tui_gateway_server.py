@@ -2840,6 +2840,62 @@ def test_compaction_display_history_keeps_legitimate_repeated_user_turns(tmp_pat
         db.close()
 
 
+def test_compaction_display_history_keeps_repeated_turn_added_after_compaction(tmp_path):
+    """A legacy display projection must not hide a new repeated prompt.
+
+    Before ``display_kind`` was persisted, the read-time fallback used the
+    total count of archived signatures. Two identical prompts before
+    compaction, one protected-tail copy in the compacted snapshot, and a new
+    identical prompt after compaction left one archived count available for
+    the new turn, so only its assistant reply appeared.
+    """
+    from agent.context_compressor import SUMMARY_PREFIX
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s1", source="tui")
+        original = [
+            ("user", "repeat this"),
+            ("assistant", "first answer"),
+            ("user", "repeat this"),
+            ("assistant", "second answer"),
+        ]
+        for role, content in original:
+            db.append_message("s1", role=role, content=content)
+
+        db.archive_and_compact(
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": f"{SUMMARY_PREFIX}\nsummary",
+                    "_compressed_summary": True,
+                },
+                {"role": "user", "content": "repeat this"},
+                {"role": "assistant", "content": "second answer"},
+            ],
+        )
+        db.append_message("s1", role="user", content="repeat this")
+        db.append_message("s1", role="assistant", content="third answer")
+
+        # Simulate a database written before the explicit replay-copy marker.
+        db._conn.execute("UPDATE messages SET display_kind = NULL WHERE session_id = ?", ("s1",))
+        db._conn.commit()
+
+        _, display_history = db.get_resume_conversations("s1")
+        assert [message.get("content") for message in display_history] == [
+            "repeat this",
+            "first answer",
+            "repeat this",
+            "second answer",
+            "repeat this",
+            "third answer",
+        ]
+    finally:
+        db.close()
+
+
 def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch, tmp_path):
     """The delegated-child watch-window cold resume (lazy=True) must serve the
     verbatim display projection so a persisted verification candidate is not
