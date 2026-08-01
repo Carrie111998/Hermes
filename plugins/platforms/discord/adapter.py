@@ -11362,27 +11362,33 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         else platform_extra_cfg.get("allow_from")
     )
     if allowed_users_cfg is not None:
-        if isinstance(allowed_users_cfg, list):
-            allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
-        seeded_extra["allow_from"] = str(allowed_users_cfg)
+        allowed_users_env = (
+            ",".join(str(v) for v in allowed_users_cfg)
+            if isinstance(allowed_users_cfg, list)
+            else str(allowed_users_cfg)
+        )
+        seeded_extra["allow_from"] = allowed_users_cfg
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_USERS"):
-            os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
+            os.environ["DISCORD_ALLOWED_USERS"] = allowed_users_env
     allowed_roles_cfg = (
         discord_cfg["allowed_roles"] if "allowed_roles" in discord_cfg
         else platform_extra_cfg.get("allowed_roles")
     )
     if allowed_roles_cfg is not None:
-        if isinstance(allowed_roles_cfg, list):
-            allowed_roles_cfg = ",".join(str(v) for v in allowed_roles_cfg)
-        seeded_extra["allowed_roles"] = str(allowed_roles_cfg)
+        allowed_roles_env = (
+            ",".join(str(v) for v in allowed_roles_cfg)
+            if isinstance(allowed_roles_cfg, list)
+            else str(allowed_roles_cfg)
+        )
+        seeded_extra["allowed_roles"] = allowed_roles_cfg
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_ROLES"):
-            os.environ["DISCORD_ALLOWED_ROLES"] = str(allowed_roles_cfg)
+            os.environ["DISCORD_ALLOWED_ROLES"] = allowed_roles_env
     allow_all_cfg = (
         discord_cfg["allow_all_users"] if "allow_all_users" in discord_cfg
         else platform_extra_cfg.get("allow_all_users")
     )
     if allow_all_cfg is not None:
-        seeded_extra["allow_all_users"] = str(allow_all_cfg).lower()
+        seeded_extra["allow_all_users"] = allow_all_cfg
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOW_ALL_USERS"):
             os.environ["DISCORD_ALLOW_ALL_USERS"] = str(allow_all_cfg).lower()
     approval_mentions_cfg = (
@@ -11393,11 +11399,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
     frc = discord_cfg.get("free_response_channels")
     if frc is not None:
-        if isinstance(frc, list):
-            frc = ",".join(str(v) for v in frc)
-        seeded_extra["free_response_channels"] = str(frc)
+        frc_env = ",".join(str(v) for v in frc) if isinstance(frc, list) else str(frc)
+        seeded_extra["free_response_channels"] = frc
         if not _skip_env_bridge and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
-            os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+            os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = frc_env
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
@@ -11408,27 +11413,24 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # ignored_channels: channels where bot never responds (even when mentioned)
     ic = discord_cfg.get("ignored_channels")
     if ic is not None:
-        if isinstance(ic, list):
-            ic = ",".join(str(v) for v in ic)
-        seeded_extra["ignored_channels"] = str(ic)
+        ic_env = ",".join(str(v) for v in ic) if isinstance(ic, list) else str(ic)
+        seeded_extra["ignored_channels"] = ic
         if not _skip_env_bridge and not os.getenv("DISCORD_IGNORED_CHANNELS"):
-            os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
+            os.environ["DISCORD_IGNORED_CHANNELS"] = ic_env
     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
     ac = discord_cfg.get("allowed_channels")
     if ac is not None:
-        if isinstance(ac, list):
-            ac = ",".join(str(v) for v in ac)
-        seeded_extra["allowed_channels"] = str(ac)
+        ac_env = ",".join(str(v) for v in ac) if isinstance(ac, list) else str(ac)
+        seeded_extra["allowed_channels"] = ac
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
-            os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+            os.environ["DISCORD_ALLOWED_CHANNELS"] = ac_env
     # no_thread_channels: channels where bot responds directly without creating thread
     ntc = discord_cfg.get("no_thread_channels")
     if ntc is not None:
-        if isinstance(ntc, list):
-            ntc = ",".join(str(v) for v in ntc)
-        seeded_extra["no_thread_channels"] = str(ntc)
+        ntc_env = ",".join(str(v) for v in ntc) if isinstance(ntc, list) else str(ntc)
+        seeded_extra["no_thread_channels"] = ntc
         if not _skip_env_bridge and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
-            os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
+            os.environ["DISCORD_NO_THREAD_CHANNELS"] = ntc_env
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.

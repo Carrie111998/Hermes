@@ -311,11 +311,13 @@ class TestYamlBridgeSeeding:
                 "allow_all_users": False,
             },
         )
-        assert seeded["allowed_channels"] == "111,112"
+        # PlatformConfig.extra keeps the YAML shape; only the legacy env
+        # bridge serializes list values to comma-separated strings.
+        assert seeded["allowed_channels"] == ["111", "112"]
         assert seeded["ignored_channels"] == "333"
-        assert seeded["allow_from"] == "1001"
-        assert seeded["allowed_roles"] == "31"
-        assert seeded["allow_all_users"] == "false"
+        assert seeded["allow_from"] == ["1001"]
+        assert seeded["allowed_roles"] == [31]
+        assert seeded["allow_all_users"] is False
         # Legacy env bridge preserved for single-profile deployments.
         assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "111,112"
 
