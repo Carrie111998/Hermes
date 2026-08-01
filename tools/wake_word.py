@@ -101,6 +101,112 @@ def _is_macos_arm64() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
+# ---------------------------------------------------------------------------
+# Windows 25H2 ONNX Runtime shadow guard (WinError 1114)
+# ---------------------------------------------------------------------------
+# Windows 25H2 ships its own ``onnxruntime.dll`` in System32 (a Microsoft
+# "os-germanium" component build, ~1.17.x). When present it can shadow the
+# PyPI wheel's ``onnxruntime.dll`` (1.27.x in ``site-packages/onnxruntime/
+# capi/``): ``onnxruntime_pybind11_state`` then fails to initialize with
+# WinError 1114 (DLL initialization routine failed — the wheel's import table
+# pulls msvcp140/vcruntime140 from System32, where the stale 14.32 build
+# crashes the init path). The openwakeword backend dies with only a
+# ``logger.warning`` logged, so the wake word looks enabled but never fires.
+# These helpers turn that silent failure into an actionable hint.
+_WIN32_ONNX_SHADOW_FIX = (
+    "copy the newer VC++ runtime (msvcp140.dll, msvcp140_1.dll, msvcp140_2.dll, "
+    "vcruntime140.dll, vcruntime140_1.dll, concrt140.dll) into the venv's "
+    "Scripts\\ folder and preload it via sitecustomize.py "
+    "(os.add_dll_directory + ctypes.WinDLL) before starting Hermes"
+)
+_WIN32_ONNX_SHADOW_HINT = (
+    "Windows 25H2 ships onnxruntime.dll in System32 that shadows the PyPI "
+    f"wheel (WinError 1114). Fix: {_WIN32_ONNX_SHADOW_FIX}."
+)
+
+_warned_system32_onnx = False
+
+
+def _win32_system32_onnx() -> Optional[Path]:
+    """``System32\\onnxruntime.dll`` (the Windows 25H2 component) or None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        candidate = root / "System32" / "onnxruntime.dll"
+        return candidate if candidate.exists() else None
+    except Exception:
+        return None
+
+
+def _onnx_import_ok() -> bool:
+    """True when the PyPI onnxruntime wheel imports (or isn't installed yet).
+
+    ``ImportError`` means the dep is simply absent — that's the normal
+    lazy-install path, NOT the System32 shadow. Any other failure while the
+    System32 DLL is present is the WinError 1114 class we can remediate.
+    """
+    try:
+        import onnxruntime  # noqa: F401
+
+        return True
+    except ImportError:
+        return True
+    except Exception:
+        return False
+
+
+def _preload_onnx_dll_directory() -> None:
+    """Register the PyPI wheel's ``capi`` DLL dir so it wins over System32.
+
+    Extension loading already includes the ``.pyd`` directory, but an explicit
+    ``os.add_dll_directory`` for the wheel's own runtime DLLs is harmless and
+    more robust against System32 shadowing. Best-effort; never raises.
+    """
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("onnxruntime")
+        origin = getattr(spec, "origin", None) if spec is not None else None
+        if origin:
+            capi = Path(origin).parent / "capi"
+            if capi.is_dir():
+                os.add_dll_directory(str(capi))
+    except Exception:
+        pass
+
+
+def preflight_onnx_runtime() -> str:
+    """Windows guard for System32 ONNX Runtime shadowing the PyPI wheel.
+
+    Returns an actionable remediation hint when the conflict is real (the
+    System32 component DLL is present AND the wheel import fails with the
+    WinError 1114 class), and ``""`` otherwise. Never raises: on win32 with
+    the System32 DLL present it pre-registers the wheel's own DLL directory
+    and logs a one-time informational warning when the wheel still imports
+    (the component can break it after any Windows update).
+    """
+    global _warned_system32_onnx
+
+    sys32 = _win32_system32_onnx()
+    if sys32 is None:
+        return ""
+    _preload_onnx_dll_directory()
+    if _onnx_import_ok():
+        if not _warned_system32_onnx:
+            _warned_system32_onnx = True
+            logger.warning(
+                "wake word: Windows 25H2 ships its own onnxruntime.dll in "
+                "System32, which can shadow the PyPI wheel and break the wake "
+                "word with WinError 1114. If the wake word stops loading, %s.",
+                _WIN32_ONNX_SHADOW_FIX,
+            )
+        return ""
+    hint = _WIN32_ONNX_SHADOW_HINT
+    logger.warning("wake word: %s", hint)
+    return hint
+
+
 def default_inference_framework() -> str:
     """The openWakeWord backend to use on this platform.
 
@@ -433,6 +539,14 @@ class _OpenWakeWordEngine(_Engine):
         from tools import lazy_deps
 
         lazy_deps.ensure("wake.openwakeword", prompt=False)
+
+        # Windows 25H2 guard: if System32's onnxruntime.dll shadows the PyPI
+        # wheel (WinError 1114), fail loudly with the remediation instead of
+        # letting openwakeword's import die and the listener look armed-but-
+        # dead behind a single logger.warning.
+        onnx_hint = preflight_onnx_runtime()
+        if onnx_hint:
+            raise RuntimeError(onnx_hint)
 
         import openwakeword
         from openwakeword.model import Model
@@ -823,6 +937,14 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     tts_ok = _tts_ready()
     hint = ""
 
+    # Windows 25H2 guard: System32's onnxruntime.dll shadowing the PyPI wheel
+    # (WinError 1114) breaks the openwakeword backend at import time. Surface
+    # the remediation as a hard "unavailable" instead of letting the listener
+    # fail after /wake on reports success (the old silent-death failure mode).
+    win32_onnx_hint = ""
+    if provider not in ("porcupine", "sherpa", "sherpa-onnx", "kws", "open"):
+        win32_onnx_hint = preflight_onnx_runtime()
+
     # The tflite backend needs a runtime openWakeWord doesn't declare off Linux.
     # Report it as a real remediation instead of arming a detector that can't fire.
     tflite_ok = True
@@ -836,6 +958,8 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         hint = "Set PORCUPINE_ACCESS_KEY (free key at https://console.picovoice.ai)."
     elif not deps_ok and not lazy_ok:
         hint = lazy_deps.feature_install_command(feature) or ""
+    elif win32_onnx_hint:
+        hint = win32_onnx_hint
     elif not tflite_ok:
         hint = "The wake word needs the tflite runtime on this Mac: pip install ai-edge-litert"
     elif deps_ok and not audio_ok:
@@ -848,7 +972,7 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
                 f"(Voice section) or see the voice-mode docs.")
 
     return {
-        "available": key_ok and stt_ok and tts_ok and tflite_ok
+        "available": key_ok and stt_ok and tts_ok and tflite_ok and not win32_onnx_hint
         and ((deps_ok and audio_ok) or (not deps_ok and lazy_ok)),
         "provider": provider,
         "deps_available": deps_ok,
