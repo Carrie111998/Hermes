@@ -6,6 +6,7 @@ import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { dedupeMessagesById, journalDuplicateMessages } from '@/lib/dedupe-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -143,7 +144,16 @@ function reconcileAuthoritativeMessages(
   const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
 
-  return preserveLocalAssistantErrors(withPendingTurn, previousMessages)
+  // Guard against duplicate message ids entering the renderer cache. A repeated
+  // id would render the same message twice (the 2026-07-31 "doubled but stored
+  // once" report). This collapses true repeats defensively and journals them in
+  // dev so a recurrence is observable, not a phantom.
+  const deduped = dedupeMessagesById(withPendingTurn)
+  if (deduped.removedAny) {
+    journalDuplicateMessages(deduped.removed, { source: 'reconcileAuthoritativeMessages' })
+  }
+
+  return preserveLocalAssistantErrors(deduped.messages, previousMessages)
 }
 
 // `session.create` params from the current profile + sticky-UI model/effort/fast,
