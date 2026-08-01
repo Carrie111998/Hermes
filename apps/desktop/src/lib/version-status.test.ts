@@ -30,6 +30,19 @@ describe('resolveVersionStatus', () => {
     expect(status.tooltip).toContain('12 commits behind main')
   })
 
+  it('counts releases instead of commits on the release track', () => {
+    const status = client({
+      behind: 2,
+      currentRelease: 'v2026.7.20',
+      distanceUnit: 'releases',
+      version: '0.4.2'
+    })
+
+    expect(status.label).toBe('v0.4.2 (+2)')
+    expect(status.detail).toBe('v2026.7.20')
+    expect(status.tooltip).toContain('2 releases behind')
+  })
+
   it('names the client as one of two versions in remote mode', () => {
     expect(client({ remote: true, version: '0.4.2' }).label).toBe('client v0.4.2')
   })

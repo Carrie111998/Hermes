@@ -227,6 +227,8 @@ export function useStatusbarItems({
       behind: updateStatus?.behind ?? 0,
       branch: updateStatus?.branch,
       copy,
+      currentRelease: updateStatus?.currentRelease,
+      distanceUnit: updateStatus?.distanceUnit,
       remote: connection?.mode === 'remote',
       restarting: updateApply.stage === 'restart',
       sha: updateStatus?.currentSha?.slice(0, 7) ?? null,
@@ -238,7 +240,13 @@ export function useStatusbarItems({
       className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
       detail: status.detail,
       hidden: status.unknown,
-      icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
+      icon: applying ? (
+        <Loader2 className="size-3 animate-spin" />
+      ) : updateStatus?.track === 'release' ? (
+        <Codicon className="size-3" name="tag" size="0.75rem" />
+      ) : (
+        <Hash className="size-3" />
+      ),
       id: 'version-client',
       label: status.label,
       // Update state is not a preference: hiding it is how a user misses that
@@ -258,7 +266,10 @@ export function useStatusbarItems({
     updateApply.stage,
     updateStatus?.behind,
     updateStatus?.branch,
-    updateStatus?.currentSha
+    updateStatus?.currentRelease,
+    updateStatus?.currentSha,
+    updateStatus?.distanceUnit,
+    updateStatus?.track
   ])
 
   const backendVersionItem = useMemo<StatusbarItem | null>(() => {

@@ -272,6 +272,8 @@ declare global {
         apply: (opts?: DesktopUpdateApplyOptions) => Promise<DesktopUpdateApplyResult>
         getBranch: () => Promise<{ branch: string }>
         setBranch: (name: string) => Promise<{ branch: string }>
+        getTrack: () => Promise<{ track: DesktopUpdateTrack }>
+        setTrack: (track: DesktopUpdateTrack) => Promise<{ track: DesktopUpdateTrack }>
         onProgress: (callback: (payload: DesktopUpdateProgress) => void) => () => void
       }
       uninstall: {
@@ -370,20 +372,38 @@ export interface DesktopUpdateCommit {
   at: number
 }
 
+export type DesktopUpdateTrack = 'release' | 'main'
+export type DesktopUpdateDistanceUnit = 'releases' | 'commits'
+
+export interface DesktopUpdateRelease {
+  body: string
+  name: string
+  publishedAt: string
+  sha: string
+  tag: string
+  url: string
+}
+
 export interface DesktopUpdateStatus {
   supported: boolean
   updateAvailable?: boolean
+  track?: DesktopUpdateTrack
+  distanceUnit?: DesktopUpdateDistanceUnit
   branch?: string
   currentBranch?: string
   reason?: string
   message?: string
   error?: string
   behind?: number
+  countKnown?: boolean
   currentSha?: string
+  currentRelease?: string | null
   /** Backend only: the version string the backend reports for itself. */
   currentVersion?: string
   targetSha?: string
+  targetRelease?: string
   commits?: DesktopUpdateCommit[]
+  releases?: DesktopUpdateRelease[]
   dirty?: boolean
   fetchedAt?: number
 }
@@ -392,6 +412,8 @@ export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
 
 export interface DesktopUpdateApplyOptions {
   dirtyStrategy?: DesktopUpdateDirtyStrategy
+  targetRelease?: string
+  targetSha?: string
 }
 
 export interface DesktopUpdateApplyResult {

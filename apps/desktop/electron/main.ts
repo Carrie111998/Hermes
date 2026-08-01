@@ -87,6 +87,12 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
+import {
+  type DesktopUpdateConfig,
+  establishDesktopUpdateTrack,
+  loadDesktopUpdateConfig,
+  writeDesktopUpdateConfig as persistDesktopUpdateConfig
+} from './desktop-update-config'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
@@ -199,6 +205,11 @@ import {
   sandboxFallbackFromEnv,
   sandboxPreflight
 } from './update-relaunch'
+import {
+  fetchOfficialGithubReleases,
+  parseRemoteReleaseTags,
+  resolveDesktopReleaseStatus
+} from './update-releases'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
@@ -213,9 +224,11 @@ import {
 import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
   buildPathExtCandidates,
+  chooseReleaseUpdaterArgs,
   chooseUpdaterArgs,
   getVenvSitePackagesEntries,
-  resolveVenvHermesCommand
+  resolveVenvHermesCommand,
+  shouldRecoverReleaseTrack
 } from './windows-hermes-path'
 import {
   buildWindowsInteractiveCommand,
@@ -2276,15 +2289,18 @@ function recentHermesLog() {
 
 // ─── Self-update (git-pull against the running backend's hermes root) ──────
 
-function readDesktopUpdateConfig() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
-    const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
+let desktopUpdateConfig: DesktopUpdateConfig | null = null
 
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
-  } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
+function readDesktopUpdateConfig() {
+  if (!desktopUpdateConfig) {
+    desktopUpdateConfig = loadDesktopUpdateConfig({
+      configPath: DESKTOP_UPDATE_CONFIG_PATH,
+      installationAlreadyExisted: fs.existsSync(DESKTOP_INSTALLATION_PATH),
+      defaultBranch: DEFAULT_UPDATE_BRANCH
+    })
   }
+
+  return desktopUpdateConfig
 }
 
 // Atomic file write: temp + rename (atomic on all platforms). Prevents
@@ -2296,8 +2312,10 @@ function writeFileAtomic(targetPath, data, encoding?: BufferEncoding) {
 }
 
 function writeDesktopUpdateConfig(config) {
-  fs.mkdirSync(path.dirname(DESKTOP_UPDATE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_UPDATE_CONFIG_PATH, JSON.stringify(config, null, 2))
+  desktopUpdateConfig = persistDesktopUpdateConfig(DESKTOP_UPDATE_CONFIG_PATH, {
+    ...readDesktopUpdateConfig(),
+    ...config
+  })
 }
 
 // ─── Main-window geometry persistence (window-state.json) ──────────────────
@@ -2448,9 +2466,60 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
+async function checkReleaseUpdates(updateRoot) {
+  const git = args => runGit(args, { cwd: updateRoot }).then(result => result.stdout.trim())
+
+  const [currentSha, dirtyStr, currentBranch, releaseRecords, remoteTagsResult] = await Promise.all([
+    git(['rev-parse', 'HEAD']),
+    git(['status', '--porcelain']),
+    git(['rev-parse', '--abbrev-ref', 'HEAD']),
+    fetchOfficialGithubReleases(),
+    runGit(['ls-remote', '--tags', OFFICIAL_REPO_HTTPS_URL, 'refs/tags/v20*'], { cwd: updateRoot })
+  ])
+
+  if (remoteTagsResult.code !== 0) {
+    return {
+      supported: true,
+      track: 'release',
+      distanceUnit: 'releases',
+      branch: DEFAULT_UPDATE_BRANCH,
+      error: 'fetch-failed',
+      message: firstLine(remoteTagsResult.stderr) || 'Could not resolve official release tags.',
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
+  const status = resolveDesktopReleaseStatus({
+    currentSha,
+    releaseRecords,
+    remoteTags: parseRemoteReleaseTags(remoteTagsResult.stdout)
+  })
+
+  return {
+    supported: true,
+    track: 'release',
+    distanceUnit: 'releases',
+    branch: DEFAULT_UPDATE_BRANCH,
+    currentBranch,
+    behind: status.behind,
+    countKnown: status.countKnown,
+    currentRelease: status.currentRelease,
+    targetRelease: status.targetRelease,
+    currentSha,
+    targetSha: status.targetSha,
+    releases: status.releases,
+    commits: [],
+    dirty: dirtyStr.length > 0,
+    hermesRoot: updateRoot,
+    fetchedAt: Date.now()
+  }
+}
+
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
-  let { branch } = readDesktopUpdateConfig()
+  const updateConfig = readDesktopUpdateConfig()
+  let { branch } = updateConfig
   const gitDir = path.join(updateRoot, '.git')
 
   if (!directoryExists(gitDir)) {
@@ -2459,8 +2528,13 @@ async function checkUpdates() {
       reason: 'not-a-git-checkout',
       message: `${updateRoot} isn't a git checkout — desktop self-update only runs against a source install.`,
       hermesRoot: updateRoot,
+      track: updateConfig.track,
       branch
     }
+  }
+
+  if (updateConfig.track === 'release') {
+    return checkReleaseUpdates(updateRoot)
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
@@ -2481,6 +2555,8 @@ async function checkUpdates() {
     if (target.code !== 0 || !targetSha) {
       return {
         supported: true,
+        track: 'main',
+        distanceUnit: 'commits',
         branch,
         error: 'fetch-failed',
         message: firstLine(target.stderr) || 'git ls-remote failed.',
@@ -2491,6 +2567,8 @@ async function checkUpdates() {
 
     return {
       supported: true,
+      track: 'main',
+      distanceUnit: 'commits',
       branch,
       currentBranch,
       behind: currentSha && currentSha === targetSha ? 0 : 1,
@@ -2508,6 +2586,8 @@ async function checkUpdates() {
   if (fetched.code !== 0) {
     return {
       supported: true,
+      track: 'main',
+      distanceUnit: 'commits',
       branch,
       error: 'fetch-failed',
       message: firstLine(fetched.stderr) || 'git fetch failed.',
@@ -2552,6 +2632,8 @@ async function checkUpdates() {
 
   return {
     supported: true,
+    track: 'main',
+    distanceUnit: 'commits',
     branch,
     currentBranch,
     behind,
@@ -2830,6 +2912,42 @@ async function releaseBackendLock(updateRoot, tag) {
 //
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
+async function resolveApplyUpdateTarget(updateRoot, opts: any = {}) {
+  const config = readDesktopUpdateConfig()
+
+  if (config.track === 'release') {
+    const status = await checkReleaseUpdates(updateRoot)
+
+    if (status.error || !status.targetRelease || !status.targetSha) {
+      throw new Error(status.message || 'Could not resolve the latest official release.')
+    }
+
+    if (
+      (opts.targetRelease && opts.targetRelease !== status.targetRelease) ||
+      (opts.targetSha && opts.targetSha !== status.targetSha)
+    ) {
+      throw new Error('The latest release changed after it was checked. Check for updates again before applying.')
+    }
+
+    return {
+      track: 'release',
+      release: status.targetRelease,
+      sha: status.targetSha,
+      cliArgs: ['--release', status.targetRelease, '--release-commit', status.targetSha],
+      command: `hermes update --release ${status.targetRelease} --release-commit ${status.targetSha}`
+    }
+  }
+
+  const branch = await resolveHealedBranch(updateRoot, config.branch || DEFAULT_UPDATE_BRANCH)
+
+  return {
+    track: 'main',
+    branch,
+    cliArgs: ['--branch', branch],
+    command: branch === 'main' ? 'hermes update' : `hermes update --branch ${branch}`
+  }
+}
+
 async function applyUpdates(opts = {}) {
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
@@ -2839,6 +2957,8 @@ async function applyUpdates(opts = {}) {
 
   try {
     const updater = resolveUpdaterBinary()
+    const updateRoot = resolveUpdateRoot()
+    const updateTarget = await resolveApplyUpdateTarget(updateRoot, opts)
 
     if (!updater && !IS_WINDOWS) {
       // macOS/Linux drag-install: no staged Tauri hermes-setup. Unlike Windows
@@ -2847,7 +2967,7 @@ async function applyUpdates(opts = {}) {
       // whole update itself: `hermes update` (backend) + `hermes desktop
       // --build-only` (OS-aware GUI rebuild), then swap the running .app bundle
       // with the freshly built one and relaunch.
-      return await applyUpdatesPosixInApp(opts)
+      return await applyUpdatesPosixInApp(opts, updateTarget)
     }
 
     if (!updater) {
@@ -2860,23 +2980,7 @@ async function applyUpdates(opts = {}) {
       // silently switch a bb/gui (or any non-main) install off-branch. Mirror
       // the GUI button's contract: append --branch <current> for non-main
       // checkouts, keep it bare for main so the card stays clean.
-      const updateRoot = resolveUpdateRoot()
-      let command = 'hermes update'
-
-      try {
-        const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-        const current = (head.stdout || '').trim()
-
-        if (head.code === 0 && current && current !== 'HEAD') {
-          const branch = await resolveHealedBranch(updateRoot, current)
-
-          if (branch !== 'main') {
-            command = `hermes update --branch ${branch}`
-          }
-        }
-      } catch {
-        // Best-effort: fall back to bare `hermes update` if branch detection fails.
-      }
+      const command = updateTarget.command
 
       rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
       emitUpdateProgress({ stage: 'manual', message: command, percent: null })
@@ -2892,10 +2996,7 @@ async function applyUpdates(opts = {}) {
     })
     repairMacUpdaterHelper(updater)
 
-    const updateRoot = resolveUpdateRoot()
-    const { branch: configuredBranch } = readDesktopUpdateConfig()
-    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
-    const updaterArgs = ['--update', '--branch', branch]
+    const updaterArgs = ['--update', ...updateTarget.cliArgs]
     const targetApp = IS_MAC ? runningAppBundle() : null
 
     if (targetApp) {
@@ -3018,11 +3119,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   }
 
   const updateRoot = resolveUpdateRoot()
-  const { branch: configuredBranch } = readDesktopUpdateConfig()
-
-  const branch = directoryExists(path.join(updateRoot, '.git'))
-    ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
-    : configuredBranch || DEFAULT_UPDATE_BRANCH
+  const updateConfig = readDesktopUpdateConfig()
 
   const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
   const venvHermes = path.join(venvBin, IS_WINDOWS ? 'hermes.exe' : 'hermes')
@@ -3037,7 +3134,35 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const haveRealInstall =
     fileExists(venvPython) || fileExists(venvHermes) || fileExists(path.join(updateRoot, '.hermes-bootstrap-complete'))
 
-  const updaterArgs = chooseUpdaterArgs(haveRealInstall, branch)
+  const haveGitCheckout = directoryExists(path.join(updateRoot, '.git'))
+
+  let updaterArgs
+
+  if (shouldRecoverReleaseTrack(updateConfig.track, updateConfig.trackSource)) {
+    if (!haveRealInstall || !haveGitCheckout) {
+      throw new Error('Release Track recovery requires an existing Hermes checkout; refusing to repair from main.')
+    }
+
+    const releaseStatus = await checkReleaseUpdates(updateRoot)
+
+    if (releaseStatus.error || !releaseStatus.targetRelease || !releaseStatus.targetSha) {
+      throw new Error(releaseStatus.message || 'Could not establish the exact Release Track recovery target.')
+    }
+
+    updaterArgs = chooseReleaseUpdaterArgs(haveRealInstall, releaseStatus.targetRelease, releaseStatus.targetSha)
+
+    if (!updaterArgs) {
+      throw new Error('Release Track recovery target was incomplete; refusing to fall back to main.')
+    }
+  } else {
+    const configuredBranch = updateConfig.branch || DEFAULT_UPDATE_BRANCH
+
+    const branch = directoryExists(path.join(updateRoot, '.git'))
+      ? await resolveHealedBranch(updateRoot, configuredBranch)
+      : configuredBranch
+
+    updaterArgs = chooseUpdaterArgs(haveRealInstall, branch)
+  }
 
   await releaseBackendLockForUpdate(updateRoot)
 
@@ -3233,7 +3358,7 @@ function shellQuote(value) {
 // (`hermes desktop --build-only`), then atomically swap the running .app bundle
 // with the freshly built one and relaunch. Degrades to "backend updated,
 // restart to load the new GUI" if the swap can't be performed.
-async function applyUpdatesPosixInApp(opts: any) {
+async function applyUpdatesPosixInApp(opts: any, updateTarget: any) {
   const updateRoot = resolveUpdateRoot()
   const hermes = resolveHermesCliBinary(updateRoot)
 
@@ -3287,24 +3412,13 @@ async function applyUpdatesPosixInApp(opts: any) {
     env.HERMES_DESKTOP_CHILD_PID = desktopChildPids.join(',')
   }
 
-  // Branch-pin so a non-main checkout doesn't get switched to main (and self-heal
-  // to main when the pinned branch no longer exists on origin).
-  let branchArgs = []
-
-  try {
-    const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-    const current = (head.stdout || '').trim()
-
-    if (head.code === 0 && current && current !== 'HEAD') {
-      branchArgs = ['--branch', await resolveHealedBranch(updateRoot, current)]
-    }
-  } catch {
-    // best effort
-  }
+  // Pin the exact release tag + peeled commit selected during the fresh apply
+  // check, or preserve the configured fast-track branch.
+  const targetArgs = updateTarget.cliArgs
 
   emitUpdateProgress({ stage: 'update', message: 'Updating Hermes (git + dependencies)…', percent: 10 })
 
-  const updated = (await runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
+  const updated = (await runStreamedUpdate(hermes, ['update', '--yes', ...targetArgs], {
     cwd: updateRoot,
     env,
     stage: 'update'
@@ -7193,6 +7307,20 @@ async function buildRemoteConnection(
 }
 
 const sshConnections = new Map<string, any>()
+// Infer and persist the update track before creating the installation ID.
+// Otherwise a fresh release-track install would look pre-existing on restart.
+const startupUpdateConfig = readDesktopUpdateConfig()
+
+// A completed first bootstrap is the durable boundary between a resumable
+// default install and fail-closed Release Track recovery.
+if (fileExists(BOOTSTRAP_COMPLETE_MARKER) && directoryExists(path.join(ACTIVE_HERMES_ROOT, '.git'))) {
+  const establishedUpdateConfig = establishDesktopUpdateTrack(startupUpdateConfig)
+
+  if (establishedUpdateConfig !== startupUpdateConfig) {
+    writeDesktopUpdateConfig(establishedUpdateConfig)
+  }
+}
+
 const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PATH)
 
 const sshBootstrapCoordinator = createBootstrapCoordinator()
@@ -11267,6 +11395,7 @@ ipcMain.handle('hermes:updates:check', async () =>
   checkUpdates().catch(error => ({
     supported: true,
     branch: readDesktopUpdateConfig().branch,
+    track: readDesktopUpdateConfig().track,
     error: 'check-failed',
     message: error?.message || String(error),
     fetchedAt: Date.now()
@@ -11288,6 +11417,18 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   writeDesktopUpdateConfig({ branch })
 
   return { branch }
+})
+
+ipcMain.handle('hermes:updates:track:get', async () => ({ track: readDesktopUpdateConfig().track }))
+
+ipcMain.handle('hermes:updates:track:set', async (_event, requestedTrack) => {
+  if (requestedTrack !== 'release' && requestedTrack !== 'main') {
+    throw new Error('Update track must be release or main.')
+  }
+
+  writeDesktopUpdateConfig({ track: requestedTrack, trackSource: 'explicit' })
+
+  return { track: requestedTrack }
 })
 
 // Resolve the canonical Hermes version (the one `release.py` bumps in

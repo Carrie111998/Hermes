@@ -11,6 +11,7 @@ import type {
   DesktopUpdateProgress,
   DesktopUpdateStage,
   DesktopUpdateStatus,
+  DesktopUpdateTrack,
   DesktopVersionInfo
 } from '@/global'
 import { checkHermesUpdate, getActionStatus, updateHermes } from '@/hermes'
@@ -47,6 +48,7 @@ export const $updateApply = atom<UpdateApplyState>(IDLE)
 export const $updateChecking = atom<boolean>(false)
 export const $updateOverlayOpen = atom<boolean>(false)
 export const $updateStatus = atom<DesktopUpdateStatus | null>(null)
+export const $updateTrack = atom<DesktopUpdateTrack>('release')
 
 // Client and backend are independently updatable; each keeps its own state.
 export const $backendUpdateStatus = atom<DesktopUpdateStatus | null>(null)
@@ -77,12 +79,16 @@ const UPDATE_TOAST_ID = 'desktop-update-available'
 const UPDATE_TOAST_SNOOZE_KEY = 'hermes:update-toast-snooze-until'
 const UPDATE_TOAST_COOLDOWN_MS = 24 * 60 * 60 * 1000
 
-function snoozeUpdateToast(): void {
-  persistString(UPDATE_TOAST_SNOOZE_KEY, String(Date.now() + UPDATE_TOAST_COOLDOWN_MS))
+function updateToastSnoozeKey(track: DesktopUpdateTrack): string {
+  return `${UPDATE_TOAST_SNOOZE_KEY}:${track}`
 }
 
-function isUpdateToastSnoozed(): boolean {
-  const until = Number(storedString(UPDATE_TOAST_SNOOZE_KEY) || 0)
+function snoozeUpdateToast(track: DesktopUpdateTrack): void {
+  persistString(updateToastSnoozeKey(track), String(Date.now() + UPDATE_TOAST_COOLDOWN_MS))
+}
+
+function isUpdateToastSnoozed(track: DesktopUpdateTrack): boolean {
+  const until = Number(storedString(updateToastSnoozeKey(track)) || 0)
 
   return Number.isFinite(until) && Date.now() < until
 }
@@ -208,7 +214,9 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
     return
   }
 
-  if (isUpdateToastSnoozed()) {
+  const track = status.track ?? 'main'
+
+  if (isUpdateToastSnoozed(track)) {
     return
   }
 
@@ -217,12 +225,13 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
   }
 
   const behind = status.behind ?? 0
+  const isReleaseTrack = track === 'release'
 
   notify({
     action: {
       label: translateNow('notifications.seeWhatsNew'),
       onClick: () => {
-        snoozeUpdateToast()
+        snoozeUpdateToast(track)
         openUpdatesWindow()
       }
     },
@@ -230,10 +239,40 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
     icon: 'gift',
     id: UPDATE_TOAST_ID,
     kind: 'info',
-    message: translateNow('notifications.updateReadyMessage', behind),
-    onDismiss: () => snoozeUpdateToast(),
-    title: translateNow('notifications.updateReadyTitle')
+    message: isReleaseTrack
+      ? translateNow('notifications.releaseReadyMessage', status.targetRelease ?? '')
+      : translateNow('notifications.updateReadyMessage', behind),
+    onDismiss: () => snoozeUpdateToast(track),
+    title: translateNow(isReleaseTrack ? 'notifications.releaseReadyTitle' : 'notifications.updateReadyTitle')
   })
+}
+
+export async function refreshUpdateTrack(): Promise<DesktopUpdateTrack> {
+  const bridge = window.hermesDesktop?.updates
+
+  if (!bridge?.getTrack) {
+    return $updateTrack.get()
+  }
+
+  const { track } = await bridge.getTrack()
+  $updateTrack.set(track)
+
+  return track
+}
+
+export async function setUpdateTrack(track: DesktopUpdateTrack): Promise<void> {
+  const bridge = window.hermesDesktop?.updates
+
+  if (!bridge?.setTrack) {
+    return
+  }
+
+  const saved = await bridge.setTrack(track)
+  updateCheckGeneration += 1
+  $updateTrack.set(saved.track)
+  $updateStatus.set(null)
+  dismissNotification(UPDATE_TOAST_ID)
+  await checkUpdates({ supersede: true })
 }
 
 export function openUpdatesWindow(): void {
@@ -349,27 +388,46 @@ export async function checkBackendUpdates(): Promise<DesktopUpdateStatus | null>
   }
 }
 
-export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
+let updateCheckGeneration = 0
+
+export async function checkUpdates(
+  options: { supersede?: boolean } = {}
+): Promise<DesktopUpdateStatus | null> {
   const bridge = window.hermesDesktop?.updates
 
-  if (!bridge || $updateChecking.get()) {
+  if (!bridge || ($updateChecking.get() && !options.supersede)) {
     return $updateStatus.get()
   }
 
+  const generation = updateCheckGeneration
   $updateChecking.set(true)
 
   try {
     const status = await bridge.check()
+
+    if (generation !== updateCheckGeneration) {
+      return $updateStatus.get()
+    }
+
+    if (status.track) {
+      $updateTrack.set(status.track)
+    }
+
     $updateStatus.set(status)
     maybeNotifyUpdateAvailable(status)
     void refreshDesktopVersion()
 
     return status
   } catch (error) {
+    if (generation !== updateCheckGeneration) {
+      return $updateStatus.get()
+    }
+
     const previous = $updateStatus.get()
 
     const fallback: DesktopUpdateStatus = {
       supported: previous?.supported ?? true,
+      track: previous?.track,
       branch: previous?.branch,
       error: 'check-failed',
       message: error instanceof Error ? error.message : String(error),
@@ -380,7 +438,9 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
 
     return fallback
   } finally {
-    $updateChecking.set(false)
+    if (generation === updateCheckGeneration) {
+      $updateChecking.set(false)
+    }
   }
 }
 
@@ -395,7 +455,13 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
   $updateApply.set({ ...IDLE, applying: true, stage: 'prepare', message: 'Starting update…' })
 
   try {
-    const result = await bridge.apply(opts)
+    const status = $updateStatus.get()
+
+    const result = await bridge.apply({
+      ...opts,
+      targetRelease: status?.track === 'release' ? status.targetRelease : undefined,
+      targetSha: status?.track === 'release' ? status.targetSha : undefined
+    })
 
     // CLI install with no staged updater: not an error — the user just runs
     // `hermes update` themselves. Land on a dedicated manual state so the
