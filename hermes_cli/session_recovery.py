@@ -881,13 +881,14 @@ def _reconstruct_missing_sessions(
 
         cursor = destination.execute(
             "INSERT INTO sessions "
-            "(id, source, started_at, title, message_count) "
-            "VALUES (?, 'recovered', ?, ?, ?)",
+            "(id, source, started_at, title, message_count, conversation_id) "
+            "VALUES (?, 'recovered', ?, ?, ?, ?)",
             (
                 session_id,
                 started_at,
                 title,
                 int(message_count),
+                session_id,
             ),
         )
         if cursor.rowcount != 1:

@@ -102,7 +102,7 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_config TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
+    conversation_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     end_reason TEXT,

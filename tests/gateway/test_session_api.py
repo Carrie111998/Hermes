@@ -332,6 +332,7 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
     row = session_db.get_session("browser-lock-session")
     assert row["source"] == "hermes_browser"
     assert row["model"] == "x-ai/grok-4.5"
+    assert row["conversation_id"] == "browser-lock-session"
     import json as _json
     model_config = row.get("model_config")
     if isinstance(model_config, str):

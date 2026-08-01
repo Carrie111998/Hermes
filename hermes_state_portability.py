@@ -443,6 +443,9 @@ class SessionPortabilityMixin:
                 clean_session["parent_session_id"] = self._import_text_or_none(
                     clean_session.get("parent_session_id"), "parent_session_id"
                 )
+                clean_session["conversation_id"] = self._import_text_or_none(
+                    clean_session.get("conversation_id"), "conversation_id"
+                )
                 for field in session_text_fields:
                     clean_session[field] = self._import_text_or_none(
                         clean_session.get(field), field
@@ -518,7 +521,8 @@ class SessionPortabilityMixin:
                 conn.execute(
                     """INSERT INTO sessions (
                            id, source, user_id, model, model_config, system_prompt,
-                           parent_session_id, started_at, ended_at, end_reason,
+                           parent_session_id, conversation_id, started_at,
+                           ended_at, end_reason,
                            message_count, tool_call_count, input_tokens, output_tokens,
                            cache_read_tokens, cache_write_tokens, reasoning_tokens,
                            cwd, git_branch, git_repo_root,
@@ -528,8 +532,9 @@ class SessionPortabilityMixin:
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
-                           :system_prompt, NULL, :started_at, :ended_at,
-                           :end_reason, 0, 0, :input_tokens, :output_tokens,
+                           :system_prompt, NULL, :conversation_id,
+                           :started_at, :ended_at, :end_reason, 0, 0,
+                           :input_tokens, :output_tokens,
                            :cache_read_tokens, :cache_write_tokens,
                            :reasoning_tokens, :cwd, :git_branch, :git_repo_root,
                            :billing_provider, :billing_base_url, :billing_mode,
@@ -544,6 +549,7 @@ class SessionPortabilityMixin:
                         "model": raw.get("model"),
                         "model_config": raw.get("model_config"),
                         "system_prompt": raw.get("system_prompt"),
+                        "conversation_id": raw.get("conversation_id"),
                         "started_at": started_at,
                         "ended_at": self._float_or_none(raw.get("ended_at")),
                         "end_reason": raw.get("end_reason"),
@@ -642,6 +648,11 @@ class SessionPortabilityMixin:
                     # of a malformed imported lineage.
                     parent_by_child.pop(session_id, None)
                     detached += 1
+
+            # Legacy exports do not carry conversation_id. Run the same
+            # conservative classifier only after valid parent links have
+            # been restored. Explicit imported identities remain immutable.
+            self._backfill_conversation_ids(conn)
 
             return {
                 "ok": True,

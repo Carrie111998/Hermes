@@ -162,3 +162,33 @@ def test_compression_lease_blocks_non_owner_but_allows_owner_flush(
         compression_lock_holder="winner",
     )
     assert [m["content"] for m in db.get_messages("leased")] == ["winner flush"]
+
+
+def test_publish_compression_child_inherits_stable_conversation_identity(
+    db: SessionDB,
+) -> None:
+    db.create_session("conversation-root", source="webui")
+    db.end_session("conversation-root", "compression")
+
+    db.create_session(
+        "current-parent",
+        source="webui",
+        parent_session_id="conversation-root",
+    )
+
+    parent = db.get_session("current-parent")
+    assert parent is not None
+    assert parent["conversation_id"] == "conversation-root"
+
+    db.publish_compression_child(
+        parent_session_id="current-parent",
+        child_session_id="next-tip",
+        source="webui",
+        messages=[{"role": "user", "content": "compressed summary"}],
+        require_compression_lease=False,
+    )
+
+    child = db.get_session("next-tip")
+    assert child is not None
+    assert child["parent_session_id"] == "current-parent"
+    assert child["conversation_id"] == "conversation-root"

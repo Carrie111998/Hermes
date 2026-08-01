@@ -2787,13 +2787,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         without a recoverable routing mapping (#59527).
         """
         def _do(conn):
+            conversation_id = session_id
+
+            if parent_session_id:
+                parent = conn.execute(
+                    """SELECT id, conversation_id, end_reason
+                       FROM sessions
+                       WHERE id = ?""",
+                    (parent_session_id,),
+                ).fetchone()
+
+                config = model_config if isinstance(model_config, dict) else {}
+
+                is_compression_continuation = (
+                    parent is not None
+                    and parent["end_reason"] == "compression"
+                    and config.get("_branched_from") is None
+                    and config.get("_delegate_from") is None
+                    and source != "tool"
+                )
+
+                if is_compression_continuation:
+                    conversation_id = (
+                        parent["conversation_id"] or parent["id"]
+                    )
+
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd,
-                   profile_name, git_repo_root, started_at
+                   model, model_config, system_prompt, parent_session_id,
+                   conversation_id, cwd, profile_name, git_repo_root, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -2803,6 +2828,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                       conversation_id = COALESCE(sessions.conversation_id, excluded.conversation_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
                        git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
@@ -2818,6 +2844,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
+                    conversation_id,
                     cwd,
                     profile_name,
                     git_repo_root,
@@ -3303,9 +3330,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
-                          user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                """SELECT ended_at, conversation_id, cwd, git_branch,
+                          git_repo_root, user_id, session_key, chat_id,
+                          chat_type, thread_id, display_name, origin_json,
+                          profile_name
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -3319,10 +3347,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, model, model_config, system_prompt,
-                   parent_session_id, cwd, git_branch, git_repo_root,
-                   profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   parent_session_id, conversation_id, cwd, git_branch,
+                   git_repo_root, profile_name, user_id, session_key,
+                   chat_id, chat_type, thread_id, display_name,
+                   origin_json, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -3330,6 +3359,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
+                    parent["conversation_id"] or parent_session_id,
                     cwd or parent["cwd"],
                     parent["git_branch"],
                     parent["git_repo_root"],
