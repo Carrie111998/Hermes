@@ -92,7 +92,10 @@ class APIServerLifecycleMixin:
                 )
                 if mw is not None
             ]
-            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
+            self._app = web.Application(
+                middlewares=mws,
+                client_max_size=MAX_RUNTIME_REQUEST_BYTES,
+            )
             assert self._app is not None
             self._setup_routes()
             # Store the adapter after native routes are registered. Local Hermes-Relay

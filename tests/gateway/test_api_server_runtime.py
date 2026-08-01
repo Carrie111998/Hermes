@@ -13,6 +13,12 @@ from types import SimpleNamespace
 import pytest
 import gateway.api_server_runtime as runtime_module
 from gateway.api_server_audit import request_audit_middleware
+from gateway.api_server_shared import (
+    MAX_REQUEST_BYTES,
+    MAX_RUNTIME_ATTACHMENT_BYTES,
+    MAX_RUNTIME_REQUEST_BYTES,
+    body_limit_middleware,
+)
 
 from gateway.api_server_runtime import (
     APIServerRuntimeMixin,
@@ -31,6 +37,65 @@ from gateway.api_server_runtime import (
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+
+
+@pytest.mark.asyncio
+async def test_runtime_run_body_limit_matches_inline_attachment_contract():
+    assert MAX_RUNTIME_REQUEST_BYTES >= (
+        MAX_REQUEST_BYTES
+        + 4 * ((MAX_RUNTIME_ATTACHMENT_BYTES + 2) // 3)
+    )
+
+    async def consume(request):
+        body = await request.read()
+        return web.json_response({"bytes": len(body)})
+
+    app = web.Application(
+        middlewares=[body_limit_middleware],
+        client_max_size=MAX_RUNTIME_REQUEST_BYTES,
+    )
+    app.router.add_post("/v1/runtime/runs", consume)
+    app.router.add_post("/v1/responses", consume)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        payload = b"x" * (MAX_REQUEST_BYTES + 1)
+        accepted = await client.post("/v1/runtime/runs", data=payload)
+        assert accepted.status == 200
+        assert await accepted.json() == {"bytes": len(payload)}
+
+        rejected = await client.post("/v1/responses", data=payload)
+        assert rejected.status == 413
+        assert (await rejected.json())["error"]["code"] == "body_too_large"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_route_body_limit_rejects_chunked_bypass():
+    async def consume(request):
+        await request.read()
+        return web.Response(status=204)
+
+    async def oversized_chunks():
+        chunk = b"x" * 1_000_000
+        for _ in range(10):
+            yield chunk
+        yield b"x"
+
+    app = web.Application(
+        middlewares=[body_limit_middleware],
+        client_max_size=MAX_RUNTIME_REQUEST_BYTES,
+    )
+    app.router.add_post("/v1/responses", consume)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/responses", data=oversized_chunks())
+        assert response.status == 413
+        assert (await response.json())["error"]["code"] == "body_too_large"
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,14 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+MAX_RUNTIME_ATTACHMENT_BYTES = 64 << 20
+# /v1/runtime/runs carries trusted private attachments inline as base64. Keep
+# the ordinary API cap plus the exact worst-case base64 expansion promised by
+# the Runtime attachment contract; every other route remains at 10 MB.
+MAX_RUNTIME_REQUEST_BYTES = (
+    MAX_REQUEST_BYTES
+    + 4 * ((MAX_RUNTIME_ATTACHMENT_BYTES + 2) // 3)
+)
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -602,19 +610,34 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 
 
 if AIOHTTP_AVAILABLE:
+    def _request_body_limit(request: "web.Request") -> int:
+        if request.method == "POST" and request.path == "/v1/runtime/runs":
+            return MAX_RUNTIME_REQUEST_BYTES
+        return MAX_REQUEST_BYTES
+
+
     @web.middleware
     async def body_limit_middleware(request, handler):
-        """Reject overly large request bodies early based on Content-Length."""
+        """Enforce the route-specific cap for fixed and chunked requests."""
+        limit = _request_body_limit(request)
         if request.method in {"POST", "PUT", "PATCH"}:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    if int(cl) > limit:
                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
-        return await handler(request)
+        bounded_request = request.clone(client_max_size=limit)
+        try:
+            return await handler(bounded_request)
+        except web.HTTPRequestEntityTooLarge:
+            return web.json_response(
+                _openai_error("Request body too large.", code="body_too_large"),
+                status=413,
+            )
 else:
+    _request_body_limit = None  # type: ignore[assignment]
     body_limit_middleware = None  # type: ignore[assignment]
 
 _SECURITY_HEADERS = {

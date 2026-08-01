@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from gateway.api_server_shared import AIOHTTP_AVAILABLE, web
+from gateway.api_server_shared import (
+    AIOHTTP_AVAILABLE,
+    MAX_RUNTIME_ATTACHMENT_BYTES,
+    web,
+)
 from gateway.runtime_contract import runtime_error_envelope
 
 logger = logging.getLogger(__name__)
@@ -431,7 +435,6 @@ _RUNTIME_VIDEO_MIME_TYPES = {
 }
 _MAX_RUNTIME_IMAGE_BYTES = 20 << 20
 _MAX_RUNTIME_VIDEO_BYTES = 50 << 20
-_MAX_RUNTIME_ATTACHMENT_BYTES = 64 << 20
 _RUNTIME_VIDEO_SUFFIXES = {
     "video/mp4": ".mp4",
     "video/quicktime": ".mov",
@@ -482,7 +485,7 @@ def _runtime_attachment_parts(
         except (ValueError, binascii.Error) as exc:
             raise ValueError("attachment data must be valid base64") from exc
         total_bytes += len(data)
-        if total_bytes > _MAX_RUNTIME_ATTACHMENT_BYTES:
+        if total_bytes > MAX_RUNTIME_ATTACHMENT_BYTES:
             raise ValueError("runtime attachments exceed the 64 MiB total limit")
         if media_type == "image":
             if mime_type not in _RUNTIME_IMAGE_MIME_TYPES or not data or len(data) > _MAX_RUNTIME_IMAGE_BYTES:
