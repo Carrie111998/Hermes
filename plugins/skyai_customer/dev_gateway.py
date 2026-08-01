@@ -163,6 +163,7 @@ class CanarySettings:
     live_model: bool = False
     allow_public_bind: bool = False
     auth_token: str = ""
+    trusted_proxy_cidr: str = ""
     version: str = VERSION
     behavior_version: str = SKYAI_BEHAVIOR_VERSION
     discord_mirror_enabled: bool = False
@@ -212,6 +213,11 @@ def validate_settings(settings: CanarySettings) -> None:
         raise ValueError("SkyAI gateway host must be a nonempty string")
     if type(settings.port) is not int or not 1 <= settings.port <= 65535:
         raise ValueError("SkyAI gateway port must be an integer from 1 to 65535")
+    if type(settings.auth_token) is not str:
+        raise ValueError("SkyAI bearer token must be a string")
+    trusted_proxy_network = _parse_trusted_proxy_network(
+        settings.trusted_proxy_cidr
+    )
     if not is_loopback_host(settings.host) and not settings.allow_public_bind:
         raise ValueError(
             "SkyAI v2 canary gateway refuses non-loopback binds unless "
@@ -221,8 +227,20 @@ def validate_settings(settings: CanarySettings) -> None:
         not is_loopback_host(settings.host)
         and not is_private_bind_host(settings.host)
         and not settings.auth_token
+        and trusted_proxy_network is None
     ):
-        raise ValueError("A bearer token is required for non-loopback canary binds")
+        raise ValueError(
+            "A bearer token or exact trusted proxy CIDR is required for "
+            "non-loopback canary binds"
+        )
+    if (
+        settings.runtime_mode == RUNTIME_MODE_PRODUCTION
+        and not settings.auth_token
+        and trusted_proxy_network is None
+    ):
+        raise ValueError(
+            "Production requires a bearer token or exact trusted proxy CIDR"
+        )
     _validate_exact_http_base(
         settings.compare_prod_base_url,
         "compare production base URL",
@@ -241,6 +259,37 @@ def validate_settings(settings: CanarySettings) -> None:
     if settings.voice_backend_target not in voice_contract.VOICE_BACKEND_TARGETS:
         raise ValueError("voice backend target must exactly equal a configured target")
     _validate_discord_mirror_settings(settings)
+
+
+def _parse_trusted_proxy_network(
+    value: Any,
+) -> ipaddress.IPv4Network | None:
+    """Parse one exact private IPv4 transport boundary.
+
+    This is a resource boundary, not a semantic classifier. Only the socket
+    peer address is eligible for authorization; forwarded headers never
+    participate.
+    """
+
+    if type(value) is not str:
+        raise ValueError("Trusted proxy CIDR must be a string")
+    if not value:
+        return None
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError as exc:
+        raise ValueError(
+            "Trusted proxy CIDR must be an exact canonical network"
+        ) from exc
+    if (
+        not isinstance(network, ipaddress.IPv4Network)
+        or not network.is_private
+        or str(network) != value
+    ):
+        raise ValueError(
+            "Trusted proxy CIDR must be an exact canonical private IPv4 network"
+        )
+    return network
 
 
 def _validate_exact_http_base(value: Any, field_name: str) -> None:
@@ -2809,10 +2858,30 @@ def _validate_card(
 
 
 def _authorize(request: "web.Request", settings: CanarySettings) -> bool:
-    if not settings.auth_token:
-        return True
     header = request.headers.get("Authorization", "")
-    return header == f"Bearer {settings.auth_token}"
+    if (
+        settings.auth_token
+        and header == f"Bearer {settings.auth_token}"
+    ):
+        return True
+
+    trusted_proxy_network = _parse_trusted_proxy_network(
+        settings.trusted_proxy_cidr
+    )
+    if trusted_proxy_network is not None:
+        remote = getattr(request, "remote", None)
+        if type(remote) is not str or not remote:
+            return False
+        try:
+            remote_address = ipaddress.ip_address(remote)
+        except ValueError:
+            return False
+        return (
+            isinstance(remote_address, ipaddress.IPv4Address)
+            and remote_address in trusted_proxy_network
+        )
+
+    return not settings.auth_token
 
 
 def format_discord_mirror_message(

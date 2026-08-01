@@ -248,13 +248,15 @@ Production must run
 `python -m plugins.skyai_customer.production_gateway`, using the fail-closed VM
 release contract under `deploy/`. That entrypoint accepts no `--dev` escape
 hatch and requires the dedicated DSN, Discord token, exact mirror channel,
-immutable build identity, and pinned driver before it listens. The separate
-`dev_gateway --dev` path remains available for local DEV only. The request
-handler writes the exact chat/voice mirror envelope and its lossless Discord
-chunks before any Discord network call. If that insert fails, the HTTP request
-returns 503; if the insert succeeds but Discord is unavailable, the customer
-response may complete while the persisted delivery remains queued for
-bounded-lease retries.
+immutable build identity, pinned driver, exact private bind address, and exact
+trusted proxy CIDR before it listens. The trusted boundary uses only the
+socket peer address; forwarded headers are ignored. A bearer token is an
+optional additional authorization path. The separate `dev_gateway --dev` path
+remains available for local DEV only. The request handler writes the exact
+chat/voice mirror envelope and its lossless Discord chunks before any Discord
+network call. If that insert fails, the HTTP request returns 503; if the insert
+succeeds but Discord is unavailable, the customer response may complete while
+the persisted delivery remains queued for bounded-lease retries.
 
 Each durable request must carry a caller-created top-level string
 `delivery_id`. The widget creates it before the HTTP request and the caller

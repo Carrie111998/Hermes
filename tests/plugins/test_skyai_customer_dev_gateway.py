@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +43,69 @@ def test_validate_settings_allows_private_bind_with_explicit_gate_without_token(
     dev_gateway.validate_settings(
         settings(tmp_path, host="10.80.0.3", allow_public_bind=True)
     )
+
+
+def test_trusted_proxy_authorization_uses_transport_peer_only(
+    tmp_path: Path,
+) -> None:
+    canary_settings = settings(
+        tmp_path,
+        host="10.80.0.4",
+        allow_public_bind=True,
+        trusted_proxy_cidr="10.80.2.0/28",
+    )
+    dev_gateway.validate_settings(canary_settings)
+
+    trusted_request = SimpleNamespace(
+        headers={"X-Forwarded-For": "203.0.113.9"},
+        remote="10.80.2.7",
+    )
+    untrusted_request = SimpleNamespace(
+        headers={"X-Forwarded-For": "10.80.2.7"},
+        remote="10.80.3.7",
+    )
+
+    assert dev_gateway._authorize(trusted_request, canary_settings) is True
+    assert dev_gateway._authorize(untrusted_request, canary_settings) is False
+
+
+def test_trusted_proxy_authorization_rejects_invalid_or_missing_peer(
+    tmp_path: Path,
+) -> None:
+    canary_settings = settings(
+        tmp_path,
+        host="10.80.0.4",
+        allow_public_bind=True,
+        trusted_proxy_cidr="10.80.2.0/28",
+    )
+
+    for remote in (None, "", "10.80.2.7 ", "not-an-ip"):
+        request = SimpleNamespace(headers={}, remote=remote)
+        assert dev_gateway._authorize(request, canary_settings) is False
+
+
+def test_bearer_or_trusted_proxy_can_authorize_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    canary_settings = settings(
+        tmp_path,
+        host="10.80.0.4",
+        allow_public_bind=True,
+        auth_token="exact-token",
+        trusted_proxy_cidr="10.80.2.0/28",
+    )
+
+    bearer_request = SimpleNamespace(
+        headers={"Authorization": "Bearer exact-token"},
+        remote="10.80.3.7",
+    )
+    trusted_request = SimpleNamespace(
+        headers={"Authorization": "Bearer wrong-token"},
+        remote="10.80.2.7",
+    )
+
+    assert dev_gateway._authorize(bearer_request, canary_settings) is True
+    assert dev_gateway._authorize(trusted_request, canary_settings) is True
 
 
 @pytest.mark.parametrize("host", ["LOCALHOST", "localhost ", " 127.0.0.1", "１２７.０.０.１"])

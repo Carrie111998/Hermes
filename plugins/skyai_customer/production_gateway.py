@@ -10,6 +10,7 @@ Hermes model plus the durable Discord outbox.
 from __future__ import annotations
 
 from importlib import metadata, util
+import ipaddress
 import math
 import os
 from pathlib import Path
@@ -21,7 +22,6 @@ from plugins.skyai_customer import dev_gateway
 
 
 PRODUCTION_VERSION = "skyai-hermes-v2.production"
-PRODUCTION_HOST = "0.0.0.0"
 PRODUCTION_PROFILE_HOME = Path(
     "/var/lib/skyai/codex/profiles/skyai-v2-prod"
 )
@@ -30,6 +30,8 @@ EXACT_BUILD_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 RUNTIME_MODE_ENV = "SKYAI_RUNTIME_MODE"
 PROFILE_HOME_ENV = "SKYAI_V2_PROFILE_HOME"
 AUTH_TOKEN_ENV = "SKYAI_V2_CANARY_TOKEN"
+PRODUCTION_BIND_HOST_ENV = "SKYAI_PRODUCTION_BIND_HOST"
+TRUSTED_PROXY_CIDR_ENV = "SKYAI_TRUSTED_PROXY_CIDR"
 BUILD_COMMIT_ENV = dev_gateway.BUILD_COMMIT_ENV
 DISCORD_BOT_TOKEN_ENV = "SKYAI_DISCORD_BOT_TOKEN"
 DISCORD_DATABASE_URL_ENV = "SKYAI_DISCORD_MIRROR_DATABASE_URL"
@@ -127,6 +129,43 @@ def _optional_exact_env(
     return value
 
 
+def _optional_exact_secret_env(
+    environ: Mapping[str, str],
+    name: str,
+) -> str:
+    value = environ.get(name, "")
+    if type(value) is not str:
+        raise ValueError(f"{name} must be a string secret binding")
+    if value and any(character.isspace() for character in value):
+        raise ValueError(
+            f"{name} secret binding must not contain whitespace"
+        )
+    return value
+
+
+def _required_private_bind_host(
+    environ: Mapping[str, str],
+) -> str:
+    value = _required_exact_env(environ, PRODUCTION_BIND_HOST_ENV)
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{PRODUCTION_BIND_HOST_ENV} must be an exact private IPv4 address"
+        ) from exc
+    if (
+        not isinstance(address, ipaddress.IPv4Address)
+        or not address.is_private
+        or address.is_loopback
+        or address.is_unspecified
+        or str(address) != value
+    ):
+        raise ValueError(
+            f"{PRODUCTION_BIND_HOST_ENV} must be an exact private IPv4 address"
+        )
+    return value
+
+
 def load_production_settings(
     environ: Mapping[str, str],
 ) -> dev_gateway.CanarySettings:
@@ -163,18 +202,21 @@ def load_production_settings(
     if port > 65535:
         raise ValueError("PORT must not exceed 65535")
 
+    host = _required_private_bind_host(environ)
+    trusted_proxy_cidr = _required_exact_env(
+        environ,
+        TRUSTED_PROXY_CIDR_ENV,
+    )
+
     settings = dev_gateway.CanarySettings(
         profile_home=profile_home,
         runtime_mode=dev_gateway.RUNTIME_MODE_PRODUCTION,
-        host=PRODUCTION_HOST,
+        host=host,
         port=port,
         live_model=True,
         allow_public_bind=True,
-        auth_token=_required_exact_env(
-            environ,
-            AUTH_TOKEN_ENV,
-            secret=True,
-        ),
+        auth_token=_optional_exact_secret_env(environ, AUTH_TOKEN_ENV),
+        trusted_proxy_cidr=trusted_proxy_cidr,
         version=PRODUCTION_VERSION,
         discord_mirror_enabled=True,
         discord_mirror_bot_token=_required_exact_env(
