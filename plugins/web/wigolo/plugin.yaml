@@ -1,0 +1,7 @@
+name: web-wigolo
+version: 1.0.0
+description: "Wigolo local-first web search (multi-engine + ML rerank, no API key, $0/query). Requires a one-time `npx wigolo init` (~1.5GB browser engine + on-device models)."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - wigolo

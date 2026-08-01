@@ -27,6 +27,7 @@ def register_all_web_providers():
     from plugins.web.parallel.provider import ParallelWebSearchProvider
     from plugins.web.searxng.provider import SearXNGWebSearchProvider
     from plugins.web.tavily.provider import TavilyWebSearchProvider
+    from plugins.web.wigolo.provider import WigoloWebSearchProvider
     from plugins.web.xai.provider import XAIWebSearchProvider
 
     _reset_for_tests()
@@ -38,9 +39,29 @@ def register_all_web_providers():
         ParallelWebSearchProvider,
         SearXNGWebSearchProvider,
         TavilyWebSearchProvider,
+        WigoloWebSearchProvider,
         XAIWebSearchProvider,
     ):
         register_provider(cls())
+
+
+@pytest.fixture(autouse=True)
+def _wigolo_hermetic(monkeypatch):
+    """Wigolo's availability is ambient machine state (a provisioned ~/.wigolo
+    plus a Node toolchain) — the one thing a hermetic suite must never consult.
+    On a dev box where `npx wigolo init` has been run, every "no keys => web
+    unavailable" assertion would silently flip. Default it OFF for all tests;
+    the wigolo provider's own tests re-patch to simulate installed states
+    (their per-test monkeypatch applies after this autouse one, so it wins).
+    """
+    # 对象级补丁而非字符串路径:部分测试会整树替换/掏空 plugins 模块,字符串
+    # 解析在那些测试里会炸(autouse 意味着它跑在每一个测试里,必须打不还手)。
+    try:
+        from plugins.web.wigolo import provider as _wig
+
+        monkeypatch.setattr(_wig, "_initialized", lambda: False)
+    except Exception:
+        pass
 
 
 @pytest.fixture
