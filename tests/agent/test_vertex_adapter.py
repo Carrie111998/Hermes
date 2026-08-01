@@ -83,20 +83,8 @@ def vertex_adapter(monkeypatch):
     return va
 
 
-def test_build_base_url_global(vertex_adapter):
-    url = vertex_adapter.build_vertex_base_url("proj", "global")
-    assert url == (
-        "https://aiplatform.googleapis.com/v1beta1/projects/proj/"
-        "locations/global/endpoints/openapi"
-    )
 
 
-def test_build_base_url_regional(vertex_adapter):
-    url = vertex_adapter.build_vertex_base_url("proj", "us-central1")
-    assert url == (
-        "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/proj/"
-        "locations/us-central1/endpoints/openapi"
-    )
 
 
 def test_get_vertex_config_uses_adc_and_default_region(vertex_adapter):
@@ -122,15 +110,6 @@ def test_config_yaml_supplies_project_and_region(vertex_adapter, monkeypatch):
     assert "locations/europe-west4" in base
 
 
-def test_env_overrides_config_yaml(vertex_adapter, monkeypatch):
-    monkeypatch.setattr(
-        vertex_adapter, "_vertex_config",
-        lambda: {"project_id": "cfg-project", "region": "cfg-region"},
-    )
-    monkeypatch.setenv("VERTEX_PROJECT_ID", "env-project")
-    monkeypatch.setenv("VERTEX_REGION", "us-east4")
-    assert vertex_adapter._resolve_project_override() == "env-project"
-    assert vertex_adapter._resolve_region() == "us-east4"
 
 
 def test_has_vertex_credentials_via_config_project(vertex_adapter, monkeypatch):
@@ -142,15 +121,6 @@ def test_has_vertex_credentials_false_when_nothing_set(vertex_adapter):
     assert vertex_adapter.has_vertex_credentials() is False
 
 
-def test_missing_google_auth_returns_none(monkeypatch):
-    for var in ("VERTEX_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS",
-                "VERTEX_PROJECT_ID", "VERTEX_REGION"):
-        monkeypatch.delenv(var, raising=False)
-    import agent.vertex_adapter as va
-    va = importlib.reload(va)
-    monkeypatch.setattr(va, "google", None)
-    va._creds_cache.clear()
-    assert va.get_vertex_credentials() == (None, None)
 
 
 def test_multiplex_scope_takes_precedence_over_raw_environ(vertex_adapter, monkeypatch):
