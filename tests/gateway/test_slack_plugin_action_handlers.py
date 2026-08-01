@@ -228,6 +228,7 @@ def _connect_with_recording_app(
     mock_app.event = mock_event
     mock_app.command = mock_command
     mock_app.action = mock_action
+    mock_app.view = mock_action
     mock_app.client = AsyncMock()
 
     mock_web_client = AsyncMock()
@@ -289,6 +290,29 @@ class TestSlackAdapterPluginActionWiring:
         # Built-ins still wired
         action_ids = [aid for aid, _cb in registered]
         assert "hermes_approve_once" in action_ids
+
+    def test_disabled_plan_cards_still_register_ack_handlers(self):
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake",
+            extra={"native_plan_cards": False},
+        )
+        adapter = SlackAdapter(config)
+
+        result, registered = _connect_with_recording_app(
+            adapter, plugin_handlers=[],
+        )
+
+        assert result is True
+        action_ids = [action_id for action_id, _callback in registered]
+        assert {
+            "hermes_plan_complete",
+            "hermes_plan_cancel",
+            "hermes_plan_add",
+            "hermes_plan_refresh",
+            "hermes_plan_add_task",
+        }.issubset(action_ids)
+        assert adapter._plan_reconcile_task is None
 
     def test_plugin_exception_does_not_propagate_to_slack(self):
         """A misbehaving plugin handler must NOT crash slack_bolt's dispatch.

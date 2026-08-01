@@ -898,6 +898,9 @@ class TestSlackProxyBehavior:
 
                 return decorator
 
+            def view(self, callback_id):
+                return self.action(callback_id)
+
         class FakeSocketModeHandler:
             def __init__(self, app, app_token, proxy=None):
                 self.app = app
@@ -992,6 +995,9 @@ class TestSlackProxyBehavior:
                     return fn
 
                 return decorator
+
+            def view(self, callback_id):
+                return self.action(callback_id)
 
         class FakeSocketModeHandler:
             def __init__(self, app, app_token, proxy=None):

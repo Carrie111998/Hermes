@@ -48,7 +48,8 @@ Mode — all at once.
 3. Pick your workspace, paste the JSON contents, review, click **Next**
    → **Create**
 4. Skip ahead to **Step 6: Install App to Workspace**. The manifest
-   handled scopes, events, and slash commands for you.
+   handled scopes, events, slash commands, and enabled Interactivity &
+   Shortcuts for you.
 
 ### Option B: From scratch (manual)
 
@@ -117,6 +118,11 @@ You can always find or regenerate app-level tokens under **Settings → Basic In
 ---
 
 ## Step 4: Subscribe to Events
+
+Before subscribing to events for a manually configured app, open **Features →
+Interactivity & Shortcuts** and switch **Interactivity** on. Hermes receives
+interactive actions through Socket Mode, so no public Request URL is required.
+The generated manifest already sets `settings.interactivity.is_enabled: true`.
 
 This step is critical — it controls what messages the bot can see.
 
@@ -347,6 +353,49 @@ In channels, always @mention the bot to start a conversation. Once the bot is ac
 
 Beyond the required environment variables from Step 8, you can customize Slack bot behavior through `~/.hermes/config.yaml`.
 
+### Native Plan Cards
+
+Native Plan Cards are disabled by default. Enable them and configure the
+metadata signing key through the top-level Slack settings:
+
+```yaml
+slack:
+  native_plan_cards: true
+  native_plan_cards_signing_secret: "<owner-generated secret>"
+```
+
+Use a strong secret generated and retained by the owner; do not copy the
+placeholder above. `SLACK_SIGNING_SECRET` remains supported when resolved
+through the current profile's scoped environment or secret store and takes
+precedence over `native_plan_cards_signing_secret`. In a multiplexed background
+context with no profile scope, Hermes fails closed instead of reading another
+profile's process-global environment; the adapter-local YAML value remains the
+safe fallback. Without either signing value, Hermes still renders and refreshes
+plan cards but omits **Add task** rather than accepting unverifiable modal
+metadata.
+
+Restart the Gateway after changing either value. The legacy nested forms
+`platforms.slack.extra.native_plan_cards` and
+`platforms.slack.extra.native_plan_cards_signing_secret` remain compatible,
+but the top-level `slack:` form above is the recommended user-facing path.
+
+Plan-card recovery is restart-safe on a best-effort basis, not a global
+exactly-once guarantee. Hermes persists Slack's UUID `client_msg_id` before a
+create and reuses it after restart; it also attempts a bounded history read to
+recover the resulting message timestamp. A single active anchor therefore
+depends on Slack retaining/deduplicating that identity or allowing the bot to
+read the relevant thread/channel history. Retention gaps or missing history
+permissions can limit recovery, although Hermes still retries with the same
+`client_msg_id` rather than inventing a new one.
+
+:::caution Disabling or downgrading plan cards
+Turning `native_plan_cards` off stops new cards and mutations, while the current
+candidate still acknowledges controls on cards that were already posted. Before
+downgrading to an older Hermes binary that has no plan-card handlers, delete or
+neutralize those existing Slack card messages while this candidate is still
+running. Otherwise their stale controls will no longer be acknowledged.
+:::
+
 ### Thread & Reply Behavior
 
 ```yaml
@@ -406,6 +455,8 @@ platforms:
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
 | `platforms.slack.extra.rich_blocks` | `false` | When `true`, agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. No app reinstall required — it's a send-side change only. |
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |
+| `slack.native_plan_cards` | `false` | Projects successful Hermes todo snapshots into native Slack plan cards. Todo remains authoritative. Interactive controls are limited to 10 tasks; extreme Slack display limits may truncate the visible fallback while Hermes retains the complete todo list. Restart the Gateway after changing it. |
+| `slack.native_plan_cards_signing_secret` | unset | Signs **Add task** modal metadata. A `SLACK_SIGNING_SECRET` resolved through the current profile's scoped environment or secret store takes precedence. In multiplexed no-scope contexts, Hermes fails closed and uses this adapter-local YAML value instead of process-global environment. Restart the Gateway after changing it. |
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
 | `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |

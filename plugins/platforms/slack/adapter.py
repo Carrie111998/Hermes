@@ -10,9 +10,11 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -38,6 +40,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from agent.secret_scope import UnscopedSecretError, get_secret
 from gateway.config import Platform, PlatformConfig
+from utils import is_truthy_value
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -57,11 +60,30 @@ from gateway.platforms.base import (
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks
+    from .plan_cards import (
+        PlanCardStore,
+        _RetryScheduleKind,
+        build_plan_blocks,
+        sign_private_metadata,
+        verify_private_metadata,
+    )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks  # type: ignore
+    from plan_cards import (  # type: ignore
+        PlanCardStore,
+        _RetryScheduleKind,
+        build_plan_blocks,
+        sign_private_metadata,
+        verify_private_metadata,
+    )
 
 
 logger = logging.getLogger(__name__)
+
+
+class _PlanRetryPersistenceError(RuntimeError):
+    """Signal retry state could not be made durable for the sole worker."""
+
 
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
@@ -502,6 +524,20 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Native plan cards are a Slack-only cached projection of Hermes todo.
+        # The upstream default is intentionally off.
+        self._plan_cards_enabled = is_truthy_value(
+            self.config.extra.get("native_plan_cards")
+            if isinstance(self.config.extra, dict)
+            else None,
+            default=False,
+        )
+        from hermes_constants import get_hermes_home
+        self._plan_store = PlanCardStore(get_hermes_home())
+        self._plan_reconcile_task: Optional[asyncio.Task] = None
+        self._plan_reconcile_generation = 0
+        self._plan_reconcile_stopping = True
+        self._plan_reconcile_wakeup = asyncio.Event()
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -1035,6 +1071,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
             lock_acquired = True
             self._running = False
+            await self._stop_plan_reconcile_worker()
 
             # Tear down any prior reconnect state before flipping ``_running``
             # back on. We must cancel + await the existing watchdog (not just
@@ -1221,6 +1258,17 @@ class SlackAdapter(BasePlatformAdapter):
 
             self._app.action("hermes_feedback")(self._handle_feedback_action)
 
+            # Always register these ACK handlers so controls posted before a
+            # config rollback do not time out or retry after the feature is off.
+            for _action_id in (
+                "hermes_plan_complete",
+                "hermes_plan_cancel",
+                "hermes_plan_add",
+                "hermes_plan_refresh",
+            ):
+                self._app.action(_action_id)(self._handle_plan_action)
+            self._app.view("hermes_plan_add_task")(self._handle_plan_add_view)
+
             # Register plugin-provided Block Kit action handlers.
             #
             # Plugins call ``ctx.register_slack_action_handler(action_id, cb)``
@@ -1283,6 +1331,7 @@ class SlackAdapter(BasePlatformAdapter):
                 self._start_socket_mode_handler()
                 self._running = True
                 self._ensure_socket_watchdog()
+                self._start_plan_reconcile_worker()
             except Exception:
                 self._running = False
                 try:
@@ -1351,7 +1400,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
+        self._plan_reconcile_stopping = True
         self._running = False
+        await self._stop_plan_reconcile_worker()
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
@@ -1377,6 +1428,12 @@ class SlackAdapter(BasePlatformAdapter):
         self._release_platform_lock()
 
         logger.info("[Slack] Disconnected")
+
+    async def cancel_background_tasks(self) -> None:
+        """Stop generation-owned plan work before generic background cleanup."""
+        self._plan_reconcile_stopping = True
+        await self._stop_plan_reconcile_worker()
+        await super().cancel_background_tasks()
 
     @staticmethod
     def _metadata_team_id(metadata: Optional[Dict[str, Any]]) -> str:
@@ -4033,6 +4090,836 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         return _env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
+    def _plan_signing_secret(self) -> Optional[bytes]:
+        override = getattr(self, "_plan_signing_secret_override", ...)
+        if override is not ...:
+            return str(override).encode("utf-8") if override else None
+        try:
+            value = get_secret("SLACK_SIGNING_SECRET")
+        except UnscopedSecretError:
+            value = None
+        except Exception:
+            value = None
+        if not value and isinstance(self.config.extra, dict):
+            value = self.config.extra.get("native_plan_cards_signing_secret")
+        return str(value).encode("utf-8") if value else None
+
+    def record_desired_plan_snapshot(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        route_user_id: str,
+        chat_type: str,
+        todos: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Synchronously persist a desired projection before Slack I/O."""
+        if not self._plan_cards_enabled:
+            return None
+        return self._plan_store.record_desired_snapshot(
+            {
+                "session_key": session_key,
+                "session_id": session_id,
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "route_user_id": route_user_id,
+                "chat_type": chat_type,
+            },
+            todos,
+        )
+
+    def _render_plan_state(self, state: Dict[str, Any]):
+        context = {
+            "session_key": state.get("session_key", ""),
+            "session_id": state.get("session_id", ""),
+            "team_id": state.get("team_id", ""),
+            "channel_id": state.get("channel_id", ""),
+            "thread_ts": state.get("thread_ts", ""),
+            "message_ts": state.get("message_ts", ""),
+            "route_user_id": state.get("route_user_id", ""),
+            "chat_type": state.get("chat_type", "group"),
+        }
+        return build_plan_blocks(
+            state.get("last_desired_snapshot") or [],
+            revision=int(state.get("desired_revision") or 0),
+            snapshot_hash=str(state.get("desired_hash") or ""),
+            signing_secret=self._plan_signing_secret(),
+            action_context=context,
+        )
+
+    @staticmethod
+    def _plan_error_text(exc: Exception) -> str:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                return str(response.get("error") or response)
+            except Exception:
+                pass
+        return str(exc)
+
+    @classmethod
+    def _is_native_plan_unsupported(cls, exc: Exception) -> bool:
+        text = cls._plan_error_text(exc).lower()
+        return "invalid_blocks" in text or "unsupported" in text
+
+    @classmethod
+    def _is_plan_message_missing(cls, exc: Exception) -> bool:
+        text = cls._plan_error_text(exc).lower()
+        return any(token in text for token in (
+            "message_not_found", "cant_update_message", "not_found", "update_not_found"
+        ))
+
+    async def _apply_plan_blocks(
+        self,
+        *,
+        generation: int,
+        state: Dict[str, Any],
+        text: str,
+        blocks: List[Dict[str, Any]],
+    ) -> str:
+        if not self._plan_generation_active(generation):
+            raise asyncio.CancelledError
+        client = self._get_client(state["channel_id"], team_id=state.get("team_id") or None)
+        message_ts = str(state.get("message_ts") or "")
+        if message_ts:
+            result = await client.chat_update(
+                channel=state["channel_id"],
+                ts=message_ts,
+                text=text,
+                blocks=blocks,
+            )
+            return str(result.get("ts") or message_ts)
+        kwargs: Dict[str, Any] = {
+            "channel": state["channel_id"],
+            "text": text,
+            "blocks": blocks,
+            "client_msg_id": state["client_msg_id"],
+        }
+        if state.get("thread_ts"):
+            kwargs["thread_ts"] = state["thread_ts"]
+        result = await client.chat_postMessage(**kwargs)
+        return str(result.get("ts") or "")
+
+    async def _apply_rendered_plan(
+        self,
+        generation: int,
+        state: Dict[str, Any],
+        rendered,
+    ) -> str:
+        try:
+            return await self._apply_plan_blocks(
+                generation=generation,
+                state=state,
+                text=rendered.text,
+                blocks=rendered.native_blocks,
+            )
+        except Exception as native_exc:
+            if not self._is_native_plan_unsupported(native_exc):
+                raise
+            return await self._apply_plan_blocks(
+                generation=generation,
+                state=state,
+                text=rendered.text,
+                blocks=rendered.fallback_blocks,
+            )
+
+    async def _read_back_plan_anchor(
+        self,
+        generation: int,
+        anchor: Dict[str, Any],
+    ) -> Tuple[Optional[str], bool]:
+        """Perform one bounded Slack history read for an attempted create."""
+        client_msg_id = str(anchor.get("client_msg_id") or "")
+        if not client_msg_id:
+            return None, True
+        if not self._plan_generation_active(generation):
+            raise asyncio.CancelledError
+        try:
+            client = self._get_client(
+                anchor["channel_id"], team_id=anchor.get("team_id") or None
+            )
+            if anchor.get("thread_ts"):
+                response = await client.conversations_replies(
+                    channel=anchor["channel_id"],
+                    ts=anchor["thread_ts"],
+                    limit=100,
+                )
+            else:
+                response = await client.conversations_history(
+                    channel=anchor["channel_id"],
+                    limit=100,
+                )
+            expected_user = str(
+                self._team_bot_user_ids.get(str(anchor.get("team_id") or "")) or ""
+            )
+            for message in response.get("messages") or []:
+                if str(message.get("client_msg_id") or "") != client_msg_id:
+                    continue
+                message_user = str(message.get("user") or "")
+                if expected_user and message_user and message_user != expected_user:
+                    continue
+                message_ts = str(message.get("ts") or "")
+                if message_ts:
+                    return message_ts, True
+            return None, True
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Plan-card create recovery read unavailable for %s/%s: %s; "
+                "retrying with the same client_msg_id",
+                anchor.get("channel_id", ""),
+                anchor.get("thread_ts", ""),
+                exc,
+            )
+            return None, False
+
+    async def _neutralize_orphaned_plan_message(
+        self,
+        generation: int,
+        state: Dict[str, Any],
+        message_ts: str,
+    ) -> bool:
+        """Best-effort delete or neutralize a retired/conflicting card."""
+        if not self._plan_generation_active(generation):
+            raise asyncio.CancelledError
+        try:
+            client = self._get_client(
+                state["channel_id"], team_id=state.get("team_id") or None
+            )
+            try:
+                await client.chat_delete(channel=state["channel_id"], ts=message_ts)
+            except Exception:
+                if not self._plan_generation_active(generation):
+                    raise asyncio.CancelledError
+                await client.chat_update(
+                    channel=state["channel_id"],
+                    ts=message_ts,
+                    text="This Hermes plan card is no longer active.",
+                    blocks=[],
+                )
+            return True
+        except Exception:
+            logger.debug(
+                "[Slack] Failed to neutralize orphaned plan card %s",
+                message_ts,
+                exc_info=True,
+            )
+            return False
+
+    def _queue_retired_orphan(
+        self,
+        session_key: str,
+        state: Dict[str, Any],
+        message_ts: str,
+    ) -> None:
+        added = self._plan_store.retire_orphan_anchor(
+            session_key,
+            {**state, "message_ts": str(message_ts)},
+        )
+        if added:
+            return
+        persisted = self._plan_store.get_session(session_key)
+        identity = (
+            str(state.get("team_id") or ""),
+            str(state.get("channel_id") or ""),
+            str(message_ts),
+            str(state.get("client_msg_id") or ""),
+        )
+        if not persisted or not any(
+            (
+                str(anchor.get("team_id") or ""),
+                str(anchor.get("channel_id") or ""),
+                str(anchor.get("message_ts") or ""),
+                str(anchor.get("client_msg_id") or ""),
+            ) == identity
+            for anchor in persisted.get("retired_anchors") or []
+        ):
+            raise RuntimeError("Slack plan-card orphan lineage was not persisted")
+
+    async def _cleanup_retired_plan_anchors(
+        self,
+        generation: int,
+        session_key: str,
+    ) -> bool:
+        all_clean = True
+        for anchor in self._plan_store.list_retired(session_key):
+            anchor_id = str(anchor.get("anchor_id") or "")
+            message_ts = str(anchor.get("message_ts") or "")
+            if not message_ts and anchor.get("client_msg_id") and anchor.get("create_attempted_at"):
+                recovered_ts, readable = await self._read_back_plan_anchor(
+                    generation, anchor
+                )
+                if not self._plan_generation_active(generation):
+                    raise asyncio.CancelledError
+                if recovered_ts:
+                    outcome = self._plan_store.record_create_result(
+                        session_key,
+                        expected_route=anchor,
+                        client_msg_id=str(anchor.get("client_msg_id") or ""),
+                        message_ts=recovered_ts,
+                    )
+                    if outcome == "retired":
+                        message_ts = recovered_ts
+                    elif outcome == "conflict":
+                        self._queue_retired_orphan(session_key, anchor, recovered_ts)
+                        self._plan_store.complete_retired_cleanup(session_key, anchor_id)
+                        all_clean = False
+                        continue
+                else:
+                    self._mark_retired_plan_retry(session_key, anchor_id)
+                    all_clean = False
+                    continue
+            if not message_ts:
+                self._plan_store.complete_retired_cleanup(session_key, anchor_id)
+                continue
+            cleaned = await self._neutralize_orphaned_plan_message(
+                generation, anchor, message_ts
+            )
+            if not self._plan_generation_active(generation):
+                raise asyncio.CancelledError
+            if cleaned:
+                self._plan_store.complete_retired_cleanup(session_key, anchor_id)
+            else:
+                self._mark_retired_plan_retry(session_key, anchor_id)
+                all_clean = False
+        return all_clean
+
+    def _plan_generation_active(self, generation: int) -> bool:
+        return (
+            self._plan_cards_enabled
+            and self._running
+            and not self._plan_reconcile_stopping
+            and generation == self._plan_reconcile_generation
+            and asyncio.current_task() is self._plan_reconcile_task
+        )
+
+    async def _reconcile_plan_session(
+        self,
+        generation: int,
+        session_key: str,
+    ) -> bool:
+        """Reconcile one durable session from the generation-owned worker."""
+        if not self._app:
+            return False
+        try:
+            for _attempt in range(8):
+                if not self._plan_generation_active(generation):
+                    return False
+                retired_clean = await self._cleanup_retired_plan_anchors(
+                    generation, session_key
+                )
+                state = self._plan_store.get_session(session_key)
+                if not state:
+                    return False
+                desired_revision = int(state.get("desired_revision") or 0)
+                if desired_revision <= int(state.get("applied_revision") or 0):
+                    return retired_clean
+                if float(state.get("next_retry_at") or 0) > time.time():
+                    return retired_clean
+                if state.get("message_ts") and state.get("applied_hash") == state.get("desired_hash"):
+                    if self._plan_store.mark_applied(
+                        session_key,
+                        revision=desired_revision,
+                        snapshot_hash=state["desired_hash"],
+                        message_ts=state["message_ts"],
+                        expected_message_ts=str(state.get("message_ts") or ""),
+                        expected_client_msg_id=str(state.get("client_msg_id") or ""),
+                    ):
+                        return retired_clean
+                    continue
+
+                if not state.get("message_ts"):
+                    prepared = self._plan_store.prepare_create(
+                        session_key, expected_route=state
+                    )
+                    if not prepared:
+                        continue
+                    state = prepared
+                    if prepared.get("was_attempted"):
+                        recovered_ts, _readable = await self._read_back_plan_anchor(
+                            generation, state
+                        )
+                        if recovered_ts:
+                            if not self._plan_generation_active(generation):
+                                return False
+                            outcome = self._plan_store.record_create_result(
+                                session_key,
+                                expected_route=state,
+                                client_msg_id=str(state.get("client_msg_id") or ""),
+                                message_ts=recovered_ts,
+                            )
+                            if outcome in {"current", "retired"}:
+                                continue
+                            if outcome == "conflict":
+                                self._queue_retired_orphan(
+                                    session_key, state, recovered_ts
+                                )
+                                continue
+
+                rendered = self._render_plan_state(state)
+                expected_message_ts = str(state.get("message_ts") or "")
+                creating_anchor = not bool(expected_message_ts)
+                try:
+                    try:
+                        message_ts = await self._apply_rendered_plan(
+                            generation, state, rendered
+                        )
+                    except Exception as apply_exc:
+                        if not self._plan_generation_active(generation):
+                            raise asyncio.CancelledError
+                        if expected_message_ts and self._is_plan_message_missing(apply_exc):
+                            self._plan_store.reset_missing_anchor(
+                                session_key, expected_message_ts=expected_message_ts
+                            )
+                            continue
+                        raise
+                    if not message_ts:
+                        raise RuntimeError("Slack plan-card response did not include a message ts")
+                    client_msg_id = str(state.get("client_msg_id") or "")
+                    if creating_anchor:
+                        try:
+                            create_outcome = self._plan_store.record_create_result(
+                                session_key,
+                                expected_route=state,
+                                client_msg_id=client_msg_id,
+                                message_ts=message_ts,
+                            )
+                            if create_outcome in {"conflict", "route_changed"}:
+                                self._queue_retired_orphan(
+                                    session_key, state, message_ts
+                                )
+                        except Exception:
+                            logger.error(
+                                "[Slack] Created plan card %s but failed to persist its lineage for %s",
+                                message_ts,
+                                session_key,
+                                exc_info=True,
+                            )
+                            raise
+                    if not self._plan_generation_active(generation):
+                        return False
+                    if self._plan_store.mark_applied(
+                        session_key,
+                        revision=desired_revision,
+                        snapshot_hash=state["desired_hash"],
+                        message_ts=message_ts,
+                        rendered_revision=desired_revision,
+                        expected_message_ts=expected_message_ts,
+                        expected_client_msg_id=client_msg_id,
+                    ):
+                        return retired_clean
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not self._plan_generation_active(generation):
+                        raise asyncio.CancelledError
+                    logger.warning(
+                        "[Slack] Plan-card reconciliation failed for %s: %s",
+                        session_key, exc, exc_info=True,
+                    )
+                    self._mark_plan_retry(session_key)
+                    return False
+            self.request_plan_reconcile()
+            return False
+        except asyncio.CancelledError:
+            raise
+        except _PlanRetryPersistenceError:
+            raise
+        except Exception:
+            logger.warning(
+                "[Slack] Plan-card reconciliation crashed for %s",
+                session_key, exc_info=True,
+            )
+            if self._plan_generation_active(generation):
+                self._mark_plan_retry(session_key)
+            return False
+
+    def _mark_plan_retry(self, session_key: str) -> None:
+        try:
+            self._plan_store.mark_retry(session_key)
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Failed to persist plan-card retry metadata for %s",
+                session_key,
+                exc_info=True,
+            )
+            raise _PlanRetryPersistenceError(session_key) from exc
+
+    def _mark_retired_plan_retry(self, session_key: str, anchor_id: str) -> None:
+        try:
+            self._plan_store.mark_retired_retry(session_key, anchor_id)
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Failed to persist retired plan-card retry metadata for %s/%s",
+                session_key,
+                anchor_id,
+                exc_info=True,
+            )
+            raise _PlanRetryPersistenceError(session_key) from exc
+
+    def request_plan_reconcile(self) -> None:
+        if not self._plan_cards_enabled:
+            return
+        self._plan_reconcile_wakeup.set()
+
+    async def _plan_reconcile_worker(self, generation: int) -> None:
+        error_count = 0
+        while self._plan_generation_active(generation):
+            try:
+                self._plan_reconcile_wakeup.clear()
+                dirty = self._plan_store.list_dirty()
+                for state in dirty:
+                    if not self._plan_generation_active(generation):
+                        return
+                    await self._reconcile_plan_session(
+                        generation,
+                        str(state.get("session_key") or ""),
+                    )
+                if not self._plan_generation_active(generation):
+                    return
+                if self._plan_reconcile_wakeup.is_set():
+                    error_count = 0
+                    continue
+                retry_schedule = self._plan_store.retry_schedule()
+                error_count = 0
+                if self._plan_reconcile_wakeup.is_set():
+                    continue
+                if retry_schedule.kind is _RetryScheduleKind.DUE_NOW:
+                    continue
+                if retry_schedule.kind is _RetryScheduleKind.NO_WORK:
+                    await self._plan_reconcile_wakeup.wait()
+                else:
+                    retry_delay = max(
+                        0.0,
+                        float(retry_schedule.deadline or 0) - time.time(),
+                    )
+                    if retry_delay <= 0:
+                        continue
+                    try:
+                        await asyncio.wait_for(
+                            self._plan_reconcile_wakeup.wait(), timeout=retry_delay
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not self._plan_generation_active(generation):
+                    return
+                error_count += 1
+                delay = min(5.0, 0.1 * (2 ** min(error_count - 1, 8)))
+                delay += random.uniform(0, delay * 0.2)
+                logger.warning(
+                    "[Slack] Plan reconcile worker iteration failed; retrying in %.2fs",
+                    delay,
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._plan_reconcile_wakeup.wait(), timeout=delay
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+    def _start_plan_reconcile_worker(self) -> None:
+        if not self._plan_cards_enabled or not self._running:
+            return
+        task = self._plan_reconcile_task
+        if task is not None and not task.done():
+            self.request_plan_reconcile()
+            return
+        self._plan_reconcile_generation += 1
+        self._plan_reconcile_stopping = False
+        generation = self._plan_reconcile_generation
+        self._plan_reconcile_task = asyncio.create_task(
+            self._plan_reconcile_worker(generation)
+        )
+        self.request_plan_reconcile()
+
+    async def _stop_plan_reconcile_worker(self) -> None:
+        self._plan_reconcile_stopping = True
+        self._plan_reconcile_wakeup.set()
+        task = self._plan_reconcile_task
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if self._plan_reconcile_task is task:
+            self._plan_reconcile_task = None
+
+    def validate_plan_action_metadata(self, metadata: Dict[str, Any]) -> bool:
+        return self._plan_store.validate_action(metadata) is not None
+
+    def _plan_state_from_interaction(
+        self,
+        body: Dict[str, Any],
+        action: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        team_id = self._event_team_id({}, body)
+        channel_id = str((body.get("channel") or {}).get("id") or "")
+        message = body.get("message") or {}
+        message_ts = str(message.get("ts") or "")
+        state = self._plan_store.lookup_route(team_id, channel_id, message_ts)
+        if not state:
+            return None
+        if (
+            team_id != str(state.get("team_id") or "")
+            or channel_id != str(state.get("channel_id") or "")
+            or message_ts != str(state.get("message_ts") or "")
+        ):
+            return None
+        body_thread = str(message.get("thread_ts") or "")
+        if body_thread != str(state.get("thread_ts") or ""):
+            return None
+        block_id = str(action.get("block_id") or "")
+        expected_prefix = (
+            f"hermes-plan-controls-r{int(state.get('applied_render_revision') or 0)}-"
+            f"{str(state.get('desired_hash') or '')[:10]}"
+        )
+        if block_id != expected_prefix:
+            return None
+        return state
+
+    @staticmethod
+    def _plan_interaction_owner_matches(state: Dict[str, Any], user_id: str) -> bool:
+        route_user_id = str(state.get("route_user_id") or "")
+        return not route_user_id or route_user_id == str(user_id or "")
+
+    @staticmethod
+    def _plan_action_dedupe_id(body: Dict[str, Any], action: Dict[str, Any]) -> str:
+        action_ts = str(action.get("action_ts") or "")
+        if not action_ts:
+            actions = body.get("actions") or []
+            if actions and isinstance(actions[0], dict):
+                action_ts = str(actions[0].get("action_ts") or "")
+        pieces = (
+            str((body.get("team") or {}).get("id") or body.get("team_id") or ""),
+            str((body.get("channel") or {}).get("id") or ""),
+            str((body.get("message") or {}).get("ts") or ""),
+            str((body.get("user") or {}).get("id") or ""),
+            str(action.get("action_id") or ""),
+            action_ts or str(body.get("trigger_id") or ""),
+        )
+        return hashlib.sha256("\x1f".join(pieces).encode("utf-8")).hexdigest()
+
+    async def _dispatch_plan_action_event(
+        self,
+        *,
+        state: Dict[str, Any],
+        body: Dict[str, Any],
+        changes: Dict[str, Any],
+    ) -> None:
+        task_ids = sorted({
+            str(task_id)
+            for key, value in changes.items()
+            if key.endswith("task_ids")
+            for task_id in (value or [])
+        })
+        trusted = {
+            "session_key": state["session_key"],
+            "session_id": state["session_id"],
+            "team_id": state["team_id"],
+            "channel_id": state["channel_id"],
+            "thread_ts": state.get("thread_ts", ""),
+            "message_ts": state["message_ts"],
+            "revision": state["desired_revision"],
+            "snapshot_hash": state["desired_hash"],
+            "task_ids": task_ids,
+            "action_user_id": str((body.get("user") or {}).get("id") or ""),
+            **changes,
+        }
+        source = self.build_source(
+            chat_id=state["channel_id"],
+            chat_type=str(state.get("chat_type") or "group"),
+            user_id=str(state.get("route_user_id") or "") or None,
+            thread_id=str(state.get("thread_ts") or "") or None,
+            scope_id=str(state.get("team_id") or "") or None,
+        )
+        prompt = (
+            "[Trusted Slack plan action]\n"
+            "Use the todo tool to apply exactly this structured change to the current full todo list. "
+            "Preserve every task not named by the action.\n"
+            + json.dumps(changes, ensure_ascii=False, sort_keys=True)
+        )
+        await self.handle_message(MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(state.get("message_ts") or ""),
+            internal=True,
+            metadata={
+                "slack_plan_action": trusted,
+                "gateway_session_id": str(state.get("session_id") or ""),
+            },
+        ))
+
+    async def _handle_plan_action(self, ack, body, action) -> None:
+        """Ack immediately and isolate all plan-card interaction failures."""
+        await ack()
+        try:
+            await self._handle_plan_action_after_ack(body, action)
+        except Exception:
+            logger.warning("[Slack] Plan-card action failed", exc_info=True)
+
+    async def _handle_plan_action_after_ack(self, body, action) -> None:
+        if not self._plan_cards_enabled:
+            return
+        team_id = self._event_team_id({}, body)
+        channel_id = str((body.get("channel") or {}).get("id") or "")
+        user = body.get("user") or {}
+        if not self._is_interactive_user_authorized(
+            str(user.get("id") or ""),
+            channel_id=channel_id,
+            user_name=user.get("name"),
+            team_id=team_id,
+        ):
+            return
+        state = self._plan_state_from_interaction(body, action)
+        if not state:
+            return
+        if not self._plan_interaction_owner_matches(state, str(user.get("id") or "")):
+            return
+        dedupe_id = self._plan_action_dedupe_id(body, action)
+        if not self._plan_store.consume_action_id(dedupe_id):
+            return
+        action_id = str(action.get("action_id") or "")
+        tasks = state.get("last_desired_snapshot") or []
+        if action_id == "hermes_plan_refresh":
+            self._plan_store.request_refresh(state["session_key"])
+            self.request_plan_reconcile()
+            return
+        if action_id == "hermes_plan_add":
+            secret = self._plan_signing_secret()
+            if not secret:
+                return
+            payload = {
+                "session_key": state["session_key"],
+                "session_id": state["session_id"],
+                "team_id": state["team_id"],
+                "channel_id": state["channel_id"],
+                "thread_ts": state.get("thread_ts", ""),
+                "message_ts": state["message_ts"],
+                "revision": state["desired_revision"],
+                "snapshot_hash": state["desired_hash"],
+                "task_ids": [],
+            }
+            private_metadata = sign_private_metadata(payload, secret)
+            if not private_metadata:
+                return
+            await self._get_client(channel_id, team_id=team_id or None).views_open(
+                trigger_id=body.get("trigger_id"),
+                view={
+                    "type": "modal",
+                    "callback_id": "hermes_plan_add_task",
+                    "private_metadata": private_metadata,
+                    "title": {"type": "plain_text", "text": "Add task"},
+                    "submit": {"type": "plain_text", "text": "Add"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [{
+                        "type": "input",
+                        "block_id": "task",
+                        "label": {"type": "plain_text", "text": "Task"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "content",
+                            "multiline": True,
+                        },
+                    }],
+                },
+            )
+            return
+        if action_id == "hermes_plan_cancel":
+            selected = action.get("selected_option") or {}
+            task_id = str(selected.get("value") or "")
+            eligible_cancel = {
+                task["id"] for task in tasks
+                if task["status"] not in {"completed", "cancelled"}
+            }
+            if task_id in eligible_cancel:
+                await self._dispatch_plan_action_event(
+                    state=state, body=body, changes={"cancel_task_ids": [task_id]}
+                )
+            return
+        if action_id == "hermes_plan_complete":
+            selected = {
+                str(option.get("value") or "")
+                for option in action.get("selected_options") or []
+                if option.get("value")
+            }
+            eligible = {task["id"] for task in tasks if task["status"] != "cancelled"}
+            completed = {task["id"] for task in tasks if task["status"] == "completed"}
+            if not selected.issubset(eligible):
+                return
+            complete_ids = sorted(selected - completed)
+            reopen_ids = sorted(completed - selected)
+            if not complete_ids and not reopen_ids:
+                return
+            await self._dispatch_plan_action_event(
+                state=state,
+                body=body,
+                changes={
+                    "complete_task_ids": complete_ids,
+                    "reopen_task_ids": reopen_ids,
+                },
+            )
+
+    async def _handle_plan_add_view(self, ack, body, view=None, client=None) -> None:
+        await ack()
+        try:
+            await self._handle_plan_add_view_after_ack(body)
+        except Exception:
+            logger.warning("[Slack] Plan-card modal submission failed", exc_info=True)
+
+    async def _handle_plan_add_view_after_ack(self, body) -> None:
+        if not self._plan_cards_enabled:
+            return
+        payload = verify_private_metadata(
+            str((body.get("view") or {}).get("private_metadata") or ""),
+            self._plan_signing_secret(),
+        )
+        if not payload:
+            return
+        state = self._plan_store.validate_action(payload)
+        if not state:
+            return
+        user = body.get("user") or {}
+        if not self._is_interactive_user_authorized(
+            str(user.get("id") or ""),
+            channel_id=str(state.get("channel_id") or ""),
+            user_name=user.get("name"),
+            team_id=str(state.get("team_id") or ""),
+        ):
+            return
+        if not self._plan_interaction_owner_matches(
+            state, str(user.get("id") or "")
+        ):
+            return
+        view_body = body.get("view") or {}
+        dedupe_id = hashlib.sha256(
+            "\x1f".join((
+                "view_submission",
+                str(view_body.get("id") or ""),
+                str(view_body.get("hash") or ""),
+                str(user.get("id") or ""),
+                str(payload.get("session_key") or ""),
+                str(payload.get("revision") or ""),
+            )).encode("utf-8")
+        ).hexdigest()
+        if not self._plan_store.consume_action_id(dedupe_id):
+            return
+        values = ((body.get("view") or {}).get("state") or {}).get("values") or {}
+        content = str((((values.get("task") or {}).get("content") or {}).get("value")) or "").strip()
+        if not content:
+            return
+        await self._dispatch_plan_action_event(
+            state=state,
+            body=body,
+            changes={"add_task_content": content},
+        )
+
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
         await ack()
@@ -5091,20 +5978,19 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
-    """Translate ``config.yaml`` ``slack:`` keys into ``SLACK_*`` env vars.
+    """Apply recognized ``config.yaml`` ``slack:`` keys.
 
     Implements the ``apply_yaml_config_fn`` contract (#24849). Mirrors the
     legacy ``slack_cfg`` block that used to live in
-    ``gateway/config.py::load_gateway_config()`` before this migration.
+    ``gateway/config.py::load_gateway_config()`` before this migration, while
+    also seeding the native plan-card settings consumed from
+    ``PlatformConfig.extra``.
 
     The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    for the legacy settings below, so this hook keeps their existing YAML→env
+    translation and env-over-YAML precedence. Native plan-card settings are
+    intentionally returned as a narrow extras dict instead; unknown Slack keys
+    are not bridged and secrets are not copied into the process environment.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -5124,7 +6010,15 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    extras = {
+        key: slack_cfg[key]
+        for key in (
+            "native_plan_cards",
+            "native_plan_cards_signing_secret",
+        )
+        if key in slack_cfg
+    }
+    return extras or None
 
 
 def _is_connected(config) -> bool:
@@ -5158,11 +6052,10 @@ def register(ctx) -> None:
         # Interactive setup wizard — replaces hermes_cli/setup.py::_setup_slack
         # and the static _PLATFORMS["slack"] dict in hermes_cli/gateway.py.
         setup_fn=interactive_setup,
-        # YAML→env config bridge — owns the translation of config.yaml slack:
-        # keys (require_mention, strict_mention, allow_bots,
-        # free_response_channels, reactions, allowed_channels) into SLACK_*
-        # env vars that the adapter reads via os.getenv(). Replaces the
-        # hardcoded block in gateway/config.py. Hook contract: #24849.
+        # Slack YAML bridge — translates the legacy env-driven settings into
+        # SLACK_* and returns only the recognized native plan-card settings for
+        # PlatformConfig.extra. Replaces the hardcoded block in
+        # gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,
         # Auth env vars for _is_user_authorized() integration
         allowed_users_env="SLACK_ALLOWED_USERS",

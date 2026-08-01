@@ -1573,6 +1573,118 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
+    def test_bridges_slack_native_plan_cards_from_top_level_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            "  native_plan_cards: true\n"
+            "  unrecognized_plan_setting: should-not-bridge\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.SLACK].extra
+        assert extra["native_plan_cards"] is True
+        assert "unrecognized_plan_setting" not in extra
+
+    def test_slack_native_plan_signing_secret_stays_in_extra(self, tmp_path, monkeypatch, caplog):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        secret = "plan-signing-secret-" + "a" * 44
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            f"  native_plan_cards_signing_secret: {secret}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("SLACK_SIGNING_SECRET", raising=False)
+        monkeypatch.delenv("SLACK_NATIVE_PLAN_CARDS_SIGNING_SECRET", raising=False)
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.SLACK].extra[
+                "native_plan_cards_signing_secret"
+            ]
+            == secret
+        )
+        assert secret not in os.environ.values()
+        assert secret not in caplog.text
+
+    def test_slack_native_plan_cards_false_remains_false(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n  native_plan_cards: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].extra["native_plan_cards"] is False
+
+    def test_absent_slack_native_plan_keys_stay_absent(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n  require_mention: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.SLACK].extra
+        assert "native_plan_cards" not in extra
+        assert "native_plan_cards_signing_secret" not in extra
+        assert os.environ["SLACK_REQUIRE_MENTION"] == "true"
+
+    def test_nested_slack_native_plan_extra_still_loads(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  slack:\n"
+            "    extra:\n"
+            "      native_plan_cards: true\n"
+            "      native_plan_cards_signing_secret: nested-secret\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.SLACK].extra
+        assert extra["native_plan_cards"] is True
+        assert extra["native_plan_cards_signing_secret"] == "nested-secret"
+
+    def test_nested_slack_native_plan_extra_keeps_existing_precedence(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  slack:\n"
+            "    extra:\n"
+            "      native_plan_cards: false\n"
+            "      native_plan_cards_signing_secret: nested-secret\n"
+            "slack:\n"
+            "  native_plan_cards: true\n"
+            "  native_plan_cards_signing_secret: top-level-secret\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.SLACK].extra
+        assert extra["native_plan_cards"] is True
+        assert extra["native_plan_cards_signing_secret"] == "top-level-secret"
+
     def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

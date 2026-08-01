@@ -3857,6 +3857,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=_profile,
         )
 
+    def _record_slack_plan_tool_completion(
+        self,
+        *,
+        event_type: str,
+        tool_name: Optional[str],
+        is_error: bool,
+        result: Any,
+        source: SessionSource,
+        session_key: Optional[str],
+        session_id: str,
+        loop: Optional[asyncio.AbstractEventLoop],
+    ) -> Optional[Dict[str, Any]]:
+        """Persist and wake the Slack todo projection from a sync callback."""
+        if (
+            event_type != "tool.completed"
+            or tool_name != "todo"
+            or is_error
+            or source.platform != Platform.SLACK
+        ):
+            return None
+        adapter = self._adapter_for_source(source)
+        if adapter is None or not getattr(adapter, "_plan_cards_enabled", False):
+            return None
+        try:
+            from plugins.platforms.slack.plan_cards import parse_todo_result
+
+            todos = parse_todo_result(result)
+            if todos is None:
+                return None
+            resolved_key = session_key or self._session_key_for_source(source)
+            state = adapter.record_desired_plan_snapshot(
+                session_key=resolved_key,
+                session_id=session_id,
+                team_id=str(getattr(source, "scope_id", None) or ""),
+                channel_id=str(source.chat_id or ""),
+                thread_ts=str(getattr(source, "thread_id", None) or ""),
+                route_user_id=str(getattr(source, "user_id", None) or ""),
+                chat_type=str(getattr(source, "chat_type", None) or "group"),
+                todos=todos,
+            )
+            if not state:
+                return None
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(adapter.request_plan_reconcile)
+            return state
+        except Exception:
+            logger.warning(
+                "Slack plan-card todo projection failed; normal response continues",
+                exc_info=True,
+            )
+            return None
+
+    async def _validate_slack_plan_action_after_claim(
+        self,
+        event: MessageEvent,
+        claimed_session_key: str,
+    ) -> bool:
+        """Revalidate trusted Slack action metadata while session ownership is held."""
+        metadata = (getattr(event, "metadata", None) or {}).get("slack_plan_action")
+        if not metadata:
+            return True
+        if event.source.platform != Platform.SLACK or not getattr(event, "internal", False):
+            return False
+        adapter = self._adapter_for_source(event.source)
+        valid = bool(
+            adapter
+            and callable(getattr(adapter, "validate_plan_action_metadata", None))
+            and adapter.validate_plan_action_metadata(metadata)
+        )
+        expected_key = str(metadata.get("session_key") or "")
+        expected_session_id = str(metadata.get("session_id") or "")
+        if valid and expected_key != claimed_session_key:
+            valid = False
+        if valid:
+            current_session_id = await asyncio.to_thread(
+                self._lookup_session_id_under_store_lock,
+                self.session_store,
+                claimed_session_key,
+            )
+            valid = str(current_session_id or "") == expected_session_id
+        if valid:
+            return True
+        if adapter is not None:
+            try:
+                await adapter.send(
+                    event.source.chat_id,
+                    "This plan card is stale. Refresh it and try again.",
+                    metadata=self._thread_metadata_for_source(event.source),
+                )
+            except Exception:
+                logger.debug("Failed to send stale Slack plan-card notice", exc_info=True)
+        return False
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -11407,6 +11500,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            if not await self._validate_slack_plan_action_after_claim(event, _quick_key):
+                return None
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -19151,6 +19246,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            # Native Slack plan projection is independent of progress display.
+            # Persist synchronously before any log/off/no-queue early return,
+            # then wake Slack reconciliation on the gateway loop.
+            try:
+                self._record_slack_plan_tool_completion(
+                    event_type=event_type,
+                    tool_name=tool_name,
+                    is_error=bool(kwargs.get("is_error")),
+                    result=kwargs.get("result"),
+                    source=source,
+                    session_key=session_key,
+                    session_id=session_id,
+                    loop=_voice_ack_loop,
+                )
+            except Exception:
+                logger.warning(
+                    "Slack plan-card bridge failed; normal tool progress continues",
+                    exc_info=True,
+                )
             # Live status line (Slack's assistant status): stash the current
             # tool phrase on the adapter; the _keep_typing refresh renders it
             # within a couple of seconds. Handled before every other gate
