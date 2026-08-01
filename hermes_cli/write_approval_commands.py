@@ -30,8 +30,9 @@ def _fmt_state(subsystem: str) -> str:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _fmt_pending_list(subsystem: str) -> str:
-    snapshot = wa.pending_snapshot(subsystem)
+def _fmt_pending_list(subsystem: str, snapshot=None) -> str:
+    if snapshot is None:
+        snapshot = wa.pending_snapshot(subsystem)
     records = snapshot["records"]
     cleanup = _fmt_cleanup_notice(subsystem, snapshot)
     if not records:
@@ -78,6 +79,7 @@ def handle_pending_subcommand(
     *,
     memory_store=None,
     set_mode_fn=None,
+    pending_snapshot=None,
 ) -> Optional[str]:
     """Dispatch a /memory or /skills subcommand.
 
@@ -97,13 +99,13 @@ def handle_pending_subcommand(
     """
     if not args:
         # Bare /memory or /skills with no sub → show pending + gate state.
-        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
+        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem, pending_snapshot)
 
     sub = args[0].lower()
     rest = args[1:]
 
     if sub == "pending":
-        return _fmt_pending_list(subsystem)
+        return _fmt_pending_list(subsystem, pending_snapshot)
 
     if sub in {"approve", "apply"}:
         return _approve(subsystem, rest, memory_store)
