@@ -107,15 +107,41 @@ def test_comfyui_skill_referenced(skill_text: str):
 
 
 def test_memory_integration_documented(skill_text: str):
-    """Preference learning must reference Hermes memory."""
+    """Preference learning must reference Hermes memory for durable writes."""
     assert "memory" in skill_text.lower()
-    assert "memory(action=add)" in skill_text or "memory(action=read)" in skill_text
+    assert "memory(action=add" in skill_text
 
 
 def test_cron_scheduling_documented(skill_text: str):
     """Scheduling must reference Hermes cron."""
     assert "cron" in skill_text.lower()
     assert "hermes cron" in skill_text
+
+
+def test_cron_syntax_uses_positional_args(skill_text: str):
+    """hermes cron add takes schedule and prompt as positional args, NOT --schedule/--prompt."""
+    assert "hermes cron add" in skill_text
+    # Must NOT use the invalid --schedule or --prompt flags
+    assert "--schedule" not in skill_text
+    assert "--prompt" not in skill_text
+
+
+def test_cron_syntax_uses_repeatable_skill_flag(skill_text: str):
+    """Skills are attached via repeatable --skill (singular), not --skills."""
+    assert "--skill" in skill_text
+
+
+def test_no_memory_read_action(skill_text: str):
+    """memory(action=read) does not exist — must not be documented as an interface."""
+    assert "memory(action=read)" not in skill_text
+
+
+def test_uses_hermes_skill_dir_template(skill_text: str):
+    """Skill assets must use ${HERMES_SKILL_DIR}, not repo-relative paths."""
+    assert "${HERMES_SKILL_DIR}" in skill_text
+    # Must not reference optional-skills/ paths (repo layout assumption)
+    assert "optional-skills/creative/wallpaper-engine/" not in skill_text
+
 
 
 def test_set_wallpaper_referenced(skill_text: str):

@@ -2,7 +2,7 @@
 name: wallpaper-engine
 description: Generate and cycle desktop wallpapers via ComfyUI.
 version: 1.0.0
-author: Hermes Agent
+author: Loki San (@theycallmeloki) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -48,20 +48,21 @@ Load when the user says things like:
    comfyui skill will verify this.
 
 3. **The wallpaper-engine skill installed** — `hermes skills install
-   official/creative/wallpaper-engine`.  After install the scripts under
-   `optional-skills/creative/wallpaper-engine/scripts/` are on the skill path.
+   official/creative/wallpaper-engine`.  After install, this skill's scripts
+   and workflows are available under the skill directory.
 
 ## How to Run
 
-Every workflow below starts from the **skill directory** (`SKILL_DIR`).  The
-comfyui skill scripts are at `SKILL_DIR/../../skills/creative/comfyui/scripts/`
-relative to this skill, or `skills/creative/comfyui/scripts/` from the repo
-root.
+When both the **comfyui** and **wallpaper-engine** skills are loaded, their
+absolute directories are announced in the system prompt.  Use
+`${HERMES_SKILL_DIR}` for this skill's own assets (scripts, workflows); the
+comfyui skill's scripts live at its own announced directory.  The examples
+below show the pattern.
 
 ### Step 0: Verify ComfyUI is ready
 
 ```bash
-python3 skills/creative/comfyui/scripts/health_check.py
+python3 <comfyui-skill-dir>/scripts/health_check.py
 ```
 
 If the check fails, follow the comfyui skill's setup path (hardware check →
@@ -70,8 +71,8 @@ install → launch) before continuing.
 ### Step 1: Check the workflow's dependencies
 
 ```bash
-python3 skills/creative/comfyui/scripts/check_deps.py \
-  optional-skills/creative/wallpaper-engine/workflows/wallpaper_txt2img.json
+python3 <comfyui-skill-dir>/scripts/check_deps.py \
+  ${HERMES_SKILL_DIR}/workflows/wallpaper_txt2img.json
 ```
 
 If models or nodes are missing, use `auto_fix_deps.py` from the comfyui skill.
@@ -79,8 +80,8 @@ If models or nodes are missing, use `auto_fix_deps.py` from the comfyui skill.
 ### Step 2: See what parameters are available
 
 ```bash
-python3 skills/creative/comfyui/scripts/extract_schema.py \
-  optional-skills/creative/wallpaper-engine/workflows/wallpaper_txt2img.json \
+python3 <comfyui-skill-dir>/scripts/extract_schema.py \
+  ${HERMES_SKILL_DIR}/workflows/wallpaper_txt2img.json \
   --summary-only
 ```
 
@@ -92,8 +93,8 @@ The key parameters: `positive_prompt` (node 6), `negative_prompt` (node 7),
 ### Step 3: Generate the wallpaper
 
 ```bash
-python3 skills/creative/comfyui/scripts/run_workflow.py \
-  --workflow optional-skills/creative/wallpaper-engine/workflows/wallpaper_txt2img.json \
+python3 <comfyui-skill-dir>/scripts/run_workflow.py \
+  --workflow ${HERMES_SKILL_DIR}/workflows/wallpaper_txt2img.json \
   --args '{"positive_prompt": "your prompt here", "negative_prompt": "ugly, blurry, ...", "seed": -1}' \
   --output-dir ~/.hermes/wallpaper-engine/images/
 ```
@@ -101,14 +102,14 @@ python3 skills/creative/comfyui/scripts/run_workflow.py \
 ### Step 4: Set the wallpaper
 
 ```bash
-python3 optional-skills/creative/wallpaper-engine/scripts/set_wallpaper.py \
+python3 ${HERMES_SKILL_DIR}/scripts/set_wallpaper.py \
   ~/.hermes/wallpaper-engine/images/wallpaper_00001_.png
 ```
 
 ### Step 5: Record the generation
 
 ```bash
-python3 optional-skills/creative/wallpaper-engine/scripts/wallpaper_history.py \
+python3 ${HERMES_SKILL_DIR}/scripts/wallpaper_history.py \
   add ~/.hermes/wallpaper-engine/images/wallpaper_00001_.png \
   "the prompt used" "wallpaper_txt2img.json"
 ```
@@ -116,7 +117,7 @@ python3 optional-skills/creative/wallpaper-engine/scripts/wallpaper_history.py \
 ### Step 6: Collect feedback (later, when the user reacts)
 
 ```bash
-python3 optional-skills/creative/wallpaper-engine/scripts/wallpaper_history.py \
+python3 ${HERMES_SKILL_DIR}/scripts/wallpaper_history.py \
   feedback <id-from-step-5> 5 "dark" "moody" "mountains"
 ```
 
@@ -131,8 +132,8 @@ python3 optional-skills/creative/wallpaper-engine/scripts/wallpaper_history.py \
 | Record feedback | `wallpaper_history.py feedback <id> <rating> [tags...]` |
 | List recent generations | `wallpaper_history.py list [--limit N] [--rated-only]` |
 | Get preference stats | `wallpaper_history.py stats` |
-| Check user preferences | `memory(action=read)` — look in USER.md for aesthetic notes |
-| Store learned preference | `memory(action=add, content="...")` |
+| Check user preferences | MEMORY.md and USER.md are injected into context at session start — scan them for aesthetic notes |
+| Store learned preference | `memory(action=add, target="user", content="...")` |
 
 ## Procedure
 
@@ -140,10 +141,10 @@ python3 optional-skills/creative/wallpaper-engine/scripts/wallpaper_history.py \
 
 When the user asks for a new wallpaper:
 
-1. **Read existing preferences** from memory.  `memory(action=read)` returns
-   MEMORY.md and USER.md.  Look for aesthetic notes about wallpaper styles the
-   user has liked or disliked.  If none exist, ask the user what kind of
-   wallpaper they want — mood, colors, subject matter.
+1. **Check existing preferences** from the session context.  MEMORY.md and
+   USER.md are injected at session start — scan them for aesthetic notes about
+   wallpaper styles the user has liked or disliked.  If none exist, ask the
+   user what kind of wallpaper they want — mood, colors, subject matter.
 
 2. **Pick a prompt template** from `references/prompt-library.md` that matches
    the user's stated or learned preferences.  Layer any additional guidance
@@ -199,7 +200,8 @@ When the user expresses like or dislike about a wallpaper:
 When the user asks about their taste profile:
 
 1. **Run stats**: `wallpaper_history.py stats`
-2. **Read memory**: `memory(action=read)` and extract the aesthetic notes
+2. **Scan context**: MEMORY.md and USER.md are injected at session start —
+   extract the aesthetic notes about wallpaper preferences from them
 3. **Summarize**: present the top loved tags, top disliked tags, average
    rating, and a prose summary of their taste from memory.
 
@@ -207,7 +209,8 @@ When the user asks about their taste profile:
 
 When the user wants regular wallpaper changes:
 
-1. **Read preferences** from memory and history stats.
+1. **Check preferences** from session context (MEMORY.md/USER.md) and history
+   stats (`wallpaper_history.py stats`).
 
 2. **Construct a self-contained cron prompt** that includes the preferences
    and instructs the agent to follow the One-Shot Generation procedure above.
@@ -220,13 +223,12 @@ When the user wants regular wallpaper changes:
    > wallpaper-engine/scripts/set_wallpaper.py and record it via
    > wallpaper_history.py add."
 
-3. **Create the cron job** via terminal:
+3. **Create the cron job** via terminal (schedule and prompt are positional;
+   `--skill` is repeatable for each skill to attach):
    ```bash
-   hermes cron add \
-     --schedule "0 7 * * *" \
+   hermes cron add "0 7 * * *" "<the constructed prompt>" \
      --name "daily-wallpaper" \
-     --skills "comfyui,wallpaper-engine" \
-     --prompt "<the constructed prompt>"
+     --skill comfyui --skill wallpaper-engine
    ```
 
 4. **Confirm** the schedule with the user and tell them how to manage it:
