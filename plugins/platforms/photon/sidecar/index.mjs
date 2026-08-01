@@ -281,7 +281,9 @@ if (!projectId || !projectSecret || !sharedToken) {
 // Lazy-load spectrum-ts so a missing install fails with a clear message
 // instead of a cryptic module-resolution error during import. Apply Hermes'
 // pinned-sdk compatibility patch first so existing installs self-heal at
-// runtime, not only during npm postinstall.
+// runtime, not only during npm postinstall. Each compatibility patch gets its
+// own failure boundary so a mixed-attachment patch failure can't skip the poll
+// patch (and vice versa), and each logs its own patch-specific message.
 try {
   const patchResult = patchSpectrumTs();
   if (patchResult.patched) {
@@ -289,6 +291,16 @@ try {
       `photon-sidecar: spectrum mixed attachment patch applied: ${patchResult.file}`
     );
   }
+} catch (e) {
+  console.error(
+    "photon-sidecar: spectrum mixed attachment patch failed. " +
+      "Run `npm install` inside plugins/platforms/photon/sidecar/ or " +
+      "upgrade the Photon sidecar patch for the pinned spectrum-ts version. " +
+      "Original error: " +
+      (e && e.stack ? e.stack : String(e))
+  );
+}
+try {
   const pollPatchResult = patchSpectrumPollSchema();
   if (pollPatchResult.patched) {
     console.error(
@@ -297,7 +309,7 @@ try {
   }
 } catch (e) {
   console.error(
-    "photon-sidecar: spectrum mixed attachment patch failed. " +
+    "photon-sidecar: spectrum poll schema patch failed. " +
       "Run `npm install` inside plugins/platforms/photon/sidecar/ or " +
       "upgrade the Photon sidecar patch for the pinned spectrum-ts version. " +
       "Original error: " +
