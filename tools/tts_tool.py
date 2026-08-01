@@ -224,6 +224,20 @@ DEFAULT_MINIMAX_MODEL = "speech-02-hd"
 DEFAULT_MINIMAX_VOICE_ID = "English_expressive_narrator"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
 DEFAULT_MINIMAX_CN_BASE_URL = "https://api.minimaxi.com/v1/t2a_v2"
+DEFAULT_MINIMAX_VOICE_CLONE_MODEL = "speech-2.8-hd"
+MINIMAX_VOICE_CLONE_MODELS = frozenset({
+    "speech-2.8-hd",
+    "speech-2.6-hd",
+    "speech-02-hd",
+    "speech-01-hd",
+})
+DEFAULT_MINIMAX_VOICE_CLONE_URL = "https://api.minimax.io/v1/voice_clone"
+DEFAULT_MINIMAX_CN_VOICE_CLONE_URL = "https://api.minimaxi.com/v1/voice_clone"
+DEFAULT_MINIMAX_VOICE_DESIGN_URL = "https://api.minimax.io/v1/voice_design"
+DEFAULT_MINIMAX_CN_VOICE_DESIGN_URL = "https://api.minimaxi.com/v1/voice_design"
+DEFAULT_MINIMAX_FILE_UPLOAD_URL = "https://api.minimax.io/v1/files/upload"
+DEFAULT_MINIMAX_CN_FILE_UPLOAD_URL = "https://api.minimaxi.com/v1/files/upload"
+MINIMAX_VOICE_AUDIO_FORMATS = frozenset({"mp3", "m4a", "wav"})
 DEFAULT_MISTRAL_TTS_MODEL = "voxtral-mini-tts-2603"
 DEFAULT_MISTRAL_TTS_VOICE_ID = "c69964a6-ab8b-4f8a-9465-ec0925096ec8"  # Paul - Neutral
 DEFAULT_XAI_VOICE_ID = "eve"
@@ -574,6 +588,190 @@ def _resolve_minimax_tts_runtime(
         credential_source=credential_source,
         api_key=api_key,
     )
+
+
+def _minimax_voice_config(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    mm_config = tts_config.get("minimax") if isinstance(tts_config, dict) else None
+    return mm_config if isinstance(mm_config, dict) else {}
+
+
+def _resolve_minimax_voice_url(
+    tts_config: Dict[str, Any],
+    *,
+    operation: str,
+) -> str:
+    runtime = _resolve_minimax_tts_runtime(tts_config)
+    mm_config = _minimax_voice_config(tts_config)
+    defaults = {
+        "clone": {
+            "global": DEFAULT_MINIMAX_VOICE_CLONE_URL,
+            "cn": DEFAULT_MINIMAX_CN_VOICE_CLONE_URL,
+        },
+        "design": {
+            "global": DEFAULT_MINIMAX_VOICE_DESIGN_URL,
+            "cn": DEFAULT_MINIMAX_CN_VOICE_DESIGN_URL,
+        },
+        "upload": {
+            "global": DEFAULT_MINIMAX_FILE_UPLOAD_URL,
+            "cn": DEFAULT_MINIMAX_CN_FILE_UPLOAD_URL,
+        },
+    }
+    if operation not in defaults:
+        raise ValueError(f"Unsupported MiniMax voice operation: {operation}")
+
+    override = mm_config.get(f"{operation}_url")
+    if not override and operation == "clone":
+        override = mm_config.get("voice_clone_url")
+    if not override and operation == "design":
+        override = mm_config.get("voice_design_url")
+    if not override and operation == "upload":
+        override = mm_config.get("file_upload_url")
+    return str(override or defaults[operation][runtime.region]).strip()
+
+
+def _minimax_voice_headers(tts_config: Dict[str, Any]) -> Dict[str, str]:
+    runtime = _resolve_minimax_tts_runtime(tts_config)
+    return {"Authorization": f"Bearer {runtime.api_key}"}
+
+
+def _check_minimax_base_resp(result: Dict[str, Any], label: str) -> None:
+    base_resp = result.get("base_resp")
+    if not isinstance(base_resp, dict):
+        return
+    status_code = base_resp.get("status_code", 0)
+    if status_code != 0:
+        status_msg = base_resp.get("status_msg", "unknown error")
+        raise RuntimeError(f"{label} API error (code {status_code}): {status_msg}")
+
+
+def _extract_minimax_field(result: Dict[str, Any], field: str) -> str:
+    candidates = [
+        result.get(field),
+        (result.get("data") or {}).get(field) if isinstance(result.get("data"), dict) else None,
+        (result.get("file") or {}).get(field) if isinstance(result.get("file"), dict) else None,
+        (result.get("voice") or {}).get(field) if isinstance(result.get("voice"), dict) else None,
+    ]
+    if field == "file_id":
+        candidates.extend([result.get("id"), (result.get("data") or {}).get("id") if isinstance(result.get("data"), dict) else None])
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = str(candidate).strip()
+        if value:
+            return value
+    return ""
+
+
+def _extract_minimax_voice_id(result: Dict[str, Any]) -> str:
+    return _extract_minimax_field(result, "voice_id")
+
+
+def _validate_minimax_voice_audio_path(audio_path: str) -> Path:
+    path = Path(audio_path).expanduser()
+    if not path.is_file():
+        raise ValueError(f"MiniMax voice audio file not found: {audio_path}")
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix not in MINIMAX_VOICE_AUDIO_FORMATS:
+        allowed = ", ".join(sorted(MINIMAX_VOICE_AUDIO_FORMATS))
+        raise ValueError(f"MiniMax voice audio must be one of: {allowed}")
+    return path
+
+
+def _upload_minimax_voice_audio(
+    audio_path: str,
+    *,
+    purpose: str,
+    tts_config: Dict[str, Any],
+) -> str:
+    if purpose not in {"voice_clone", "prompt_audio"}:
+        raise ValueError("MiniMax voice upload purpose must be 'voice_clone' or 'prompt_audio'")
+
+    import requests
+
+    path = _validate_minimax_voice_audio_path(audio_path)
+    url = _resolve_minimax_voice_url(tts_config, operation="upload")
+    headers = _minimax_voice_headers(tts_config)
+    with open(path, "rb") as fh:
+        response = requests.post(
+            url,
+            headers=headers,
+            files={"file": (path.name, fh)},
+            data={"purpose": purpose},
+            timeout=120,
+        )
+    response.raise_for_status()
+    result = _read_tts_response_json(response, label="MiniMax voice upload")
+    _check_minimax_base_resp(result, "MiniMax voice upload")
+    file_id = _extract_minimax_field(result, "file_id")
+    if not file_id:
+        raise RuntimeError("MiniMax voice upload returned no file_id")
+    return file_id
+
+
+def _clone_minimax_voice(
+    *,
+    file_id: str,
+    voice_id: str,
+    model: Optional[str],
+    tts_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    import requests
+
+    selected_model = str(model or DEFAULT_MINIMAX_VOICE_CLONE_MODEL).strip()
+    if selected_model not in MINIMAX_VOICE_CLONE_MODELS:
+        allowed = ", ".join(sorted(MINIMAX_VOICE_CLONE_MODELS))
+        raise ValueError(f"MiniMax voice clone model must be one of: {allowed}")
+    payload = {
+        "file_id": str(file_id).strip(),
+        "voice_id": str(voice_id).strip(),
+        "model": selected_model,
+    }
+    if not payload["file_id"]:
+        raise ValueError("MiniMax voice clone requires file_id")
+    if not payload["voice_id"]:
+        raise ValueError("MiniMax voice clone requires voice_id")
+
+    response = requests.post(
+        _resolve_minimax_voice_url(tts_config, operation="clone"),
+        json=payload,
+        headers={**_minimax_voice_headers(tts_config), "Content-Type": "application/json"},
+        timeout=120,
+    )
+    response.raise_for_status()
+    result = _read_tts_response_json(response, label="MiniMax voice clone")
+    _check_minimax_base_resp(result, "MiniMax voice clone")
+    returned_voice_id = _extract_minimax_voice_id(result) or payload["voice_id"]
+    return {"voice_id": returned_voice_id, "model": selected_model}
+
+
+def _design_minimax_voice(
+    *,
+    prompt: str,
+    voice_id: str,
+    tts_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    import requests
+
+    payload = {
+        "prompt": str(prompt).strip(),
+        "voice_id": str(voice_id).strip(),
+    }
+    if not payload["prompt"]:
+        raise ValueError("MiniMax voice design requires prompt")
+    if not payload["voice_id"]:
+        raise ValueError("MiniMax voice design requires voice_id")
+
+    response = requests.post(
+        _resolve_minimax_voice_url(tts_config, operation="design"),
+        json=payload,
+        headers={**_minimax_voice_headers(tts_config), "Content-Type": "application/json"},
+        timeout=120,
+    )
+    response.raise_for_status()
+    result = _read_tts_response_json(response, label="MiniMax voice design")
+    _check_minimax_base_resp(result, "MiniMax voice design")
+    returned_voice_id = _extract_minimax_voice_id(result) or payload["voice_id"]
+    return {"voice_id": returned_voice_id}
 
 
 # ===========================================================================
@@ -3156,6 +3354,80 @@ def text_to_speech_tool(
         return tool_error(error_msg, success=False)
 
 
+def minimax_voice_clone_tool(
+    audio_path: str,
+    voice_id: str,
+    model: Optional[str] = None,
+) -> str:
+    """Upload clone audio and create a MiniMax cloned voice_id."""
+    try:
+        tts_config = _load_tts_config()
+        file_id = _upload_minimax_voice_audio(
+            audio_path,
+            purpose="voice_clone",
+            tts_config=tts_config,
+        )
+        result = _clone_minimax_voice(
+            file_id=file_id,
+            voice_id=voice_id,
+            model=model,
+            tts_config=tts_config,
+        )
+        return json.dumps({
+            "success": True,
+            "voice_id": result["voice_id"],
+            "file_id": file_id,
+            "model": result["model"],
+        }, ensure_ascii=False)
+    except Exception as exc:
+        logger.error("MiniMax voice clone failed: %s", exc, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": f"MiniMax voice clone failed: {exc}",
+        }, ensure_ascii=False)
+
+
+def minimax_voice_upload_tool(audio_path: str, purpose: str = "voice_clone") -> str:
+    """Upload MiniMax clone or prompt audio and return a file_id."""
+    try:
+        file_id = _upload_minimax_voice_audio(
+            audio_path,
+            purpose=purpose,
+            tts_config=_load_tts_config(),
+        )
+        return json.dumps({
+            "success": True,
+            "file_id": file_id,
+            "purpose": purpose,
+        }, ensure_ascii=False)
+    except Exception as exc:
+        logger.error("MiniMax voice upload failed: %s", exc, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": f"MiniMax voice upload failed: {exc}",
+        }, ensure_ascii=False)
+
+
+def minimax_voice_design_tool(prompt: str, voice_id: str) -> str:
+    """Create a MiniMax designed voice_id from a text prompt."""
+    try:
+        result = _design_minimax_voice(
+            prompt=prompt,
+            voice_id=voice_id,
+            tts_config=_load_tts_config(),
+        )
+        return json.dumps({
+            "success": True,
+            "voice_id": result["voice_id"],
+        }, ensure_ascii=False)
+    except Exception as exc:
+        logger.error("MiniMax voice design failed: %s", exc, exc_info=True)
+        return json.dumps({
+            "success": False,
+            "error": f"MiniMax voice design failed: {exc}",
+        }, ensure_ascii=False)
+
+
 # ===========================================================================
 # Requirements check
 # ===========================================================================
@@ -3235,6 +3507,15 @@ def check_tts_requirements() -> bool:
         plugin = get_provider(provider)
         return bool(plugin and plugin.is_available())
     except Exception:
+        return False
+
+
+def check_minimax_voice_requirements() -> bool:
+    """Return whether MiniMax voice clone/design can authenticate."""
+    try:
+        _resolve_minimax_tts_runtime(_load_tts_config())
+        return True
+    except ValueError:
         return False
 
 
@@ -3672,5 +3953,117 @@ registry.register(
         instructions=args.get("instructions"),
         provider=args.get("provider")),
     check_fn=check_tts_requirements,
+    emoji="🔊",
+)
+
+MINIMAX_VOICE_CLONE_SCHEMA = {
+    "name": "minimax_voice_clone",
+    "description": (
+        "Clone a MiniMax voice from an MP3, M4A, or WAV sample. Uploads the "
+        "audio with purpose=voice_clone, calls /v1/voice_clone, and returns "
+        "the cloned voice_id for later MiniMax TTS use."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "audio_path": {
+                "type": "string",
+                "description": "Path to a local MP3, M4A, or WAV voice sample.",
+            },
+            "voice_id": {
+                "type": "string",
+                "description": "Caller-chosen MiniMax voice_id to create.",
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional clone model. Supported values: speech-2.8-hd, "
+                    "speech-2.6-hd, speech-02-hd, speech-01-hd. Defaults to "
+                    "speech-2.8-hd."
+                ),
+            },
+        },
+        "required": ["audio_path", "voice_id"],
+    },
+}
+
+MINIMAX_VOICE_DESIGN_SCHEMA = {
+    "name": "minimax_voice_design",
+    "description": (
+        "Design a MiniMax voice from a text prompt via /v1/voice_design and "
+        "return the resulting voice_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Voice design prompt describing tone, accent, style, or role.",
+            },
+            "voice_id": {
+                "type": "string",
+                "description": "Caller-chosen MiniMax voice_id to create.",
+            },
+        },
+        "required": ["prompt", "voice_id"],
+    },
+}
+
+MINIMAX_VOICE_UPLOAD_SCHEMA = {
+    "name": "minimax_voice_upload",
+    "description": (
+        "Upload an MP3, M4A, or WAV file to MiniMax /v1/files/upload for "
+        "voice cloning or voice design prompt audio. Returns the file_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "audio_path": {
+                "type": "string",
+                "description": "Path to a local MP3, M4A, or WAV audio file.",
+            },
+            "purpose": {
+                "type": "string",
+                "description": "Upload purpose: voice_clone or prompt_audio.",
+            },
+        },
+        "required": ["audio_path", "purpose"],
+    },
+}
+
+registry.register(
+    name="minimax_voice_clone",
+    toolset="tts",
+    schema=MINIMAX_VOICE_CLONE_SCHEMA,
+    handler=lambda args, **kw: minimax_voice_clone_tool(
+        audio_path=args.get("audio_path", ""),
+        voice_id=args.get("voice_id", ""),
+        model=args.get("model"),
+    ),
+    check_fn=check_minimax_voice_requirements,
+    emoji="🔊",
+)
+
+registry.register(
+    name="minimax_voice_upload",
+    toolset="tts",
+    schema=MINIMAX_VOICE_UPLOAD_SCHEMA,
+    handler=lambda args, **kw: minimax_voice_upload_tool(
+        audio_path=args.get("audio_path", ""),
+        purpose=args.get("purpose", "voice_clone"),
+    ),
+    check_fn=check_minimax_voice_requirements,
+    emoji="🔊",
+)
+
+registry.register(
+    name="minimax_voice_design",
+    toolset="tts",
+    schema=MINIMAX_VOICE_DESIGN_SCHEMA,
+    handler=lambda args, **kw: minimax_voice_design_tool(
+        prompt=args.get("prompt", ""),
+        voice_id=args.get("voice_id", ""),
+    ),
+    check_fn=check_minimax_voice_requirements,
     emoji="🔊",
 )
