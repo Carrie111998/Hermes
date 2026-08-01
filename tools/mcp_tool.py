@@ -2431,7 +2431,13 @@ class MCPServerTask:
         # elsewhere, matching existing killpg-based cleanup's platform scope.
         # Applied AFTER the OSV preflight so the check inspects the real
         # package, not the watchdog wrapper.
-        command, args = _wrap_command_with_watchdog(command, args)
+        # Per-server escape hatch (``watchdog: false``): some binaries
+        # misbehave under the supervisor's new-session process-group setup
+        # (observed with Go binaries that manage their own guard
+        # subprocesses); opting out trades orphan-reaping for a working
+        # connection and falls back to the shutdown-sweep cleanup.
+        if config.get("watchdog", True):
+            command, args = _wrap_command_with_watchdog(command, args)
 
         server_params = StdioServerParameters(
             command=command,

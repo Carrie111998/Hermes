@@ -35,7 +35,9 @@ const tmpDir = join(repoRoot, '.tmp')
 mkdirSync(tmpDir, { recursive: true })
 process.env.TMPDIR = process.env.TMPDIR?.startsWith(repoRoot) ? process.env.TMPDIR : tmpDir
 
-const { chromium } = await import('playwright')
+// Via @playwright/test, not `playwright` — the former is this workspace's own
+// declared devDependency, so the driver needs no extra root-level dep.
+const { chromium } = await import('@playwright/test')
 
 const CDP_URL = process.env.CDP_URL || 'http://127.0.0.1:9222'
 const TIMEOUT_S = Number(process.env.CDP_TIMEOUT_S || 120)
