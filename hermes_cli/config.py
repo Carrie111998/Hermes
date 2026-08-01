@@ -1788,6 +1788,35 @@ DEFAULT_CONFIG = {
             # bws yourself and have it on PATH.
             "auto_install": True,
         },
+        "onepassword": {
+            # Master switch.  When false, the SDK is never contacted and
+            # the onepassword-sdk package is never auto-installed.
+            "enabled": False,
+            # 1Password vault title to search.  Empty = search all accessible
+            # vaults (slower; use a specific vault name when possible).
+            "vault": "",
+            # Title of the 1Password item whose fields are mapped to env vars.
+            "item": "",
+            # Optional explicit field → env var overrides.  Keys are 1Password
+            # field labels; values are the env var names to use instead of the
+            # auto-derived uppercase/underscored versions.
+            "field_mapping": {},
+            # Name of the env var that holds the service account token.
+            # This is the one bootstrap secret; it lives in ~/.hermes/.env
+            # (or your shell) and never in config.yaml.
+            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",
+            # Seconds to cache fetched secrets in-process.  0 disables.
+            "cache_ttl_seconds": 300,
+            # When True, 1Password values overwrite existing env vars that were
+            # NOT previously managed by 1Password.  Vars that 1Password injected
+            # in a prior sync are always refreshed regardless of this setting
+            # (to support credential rotation).
+            "override_existing": False,
+            # When True, the onepassword-sdk Python package is auto-installed
+            # on first use.  When False, you must install it yourself with
+            # `pip install onepassword-sdk` or `hermes secrets onepassword install`.
+            "auto_install": True,
+        },
     },
 
     # Config schema version - bump this when adding new required fields
@@ -2385,6 +2414,13 @@ OPTIONAL_ENV_VARS = {
         "description": "GitHub token for Skills Hub (higher API rate limits, skill publish)",
         "prompt": "GitHub Token",
         "url": "https://github.com/settings/tokens",
+        "password": True,
+        "category": "tool",
+    },
+    "OP_SERVICE_ACCOUNT_TOKEN": {
+        "description": "1Password service account token for secrets injection (ops_...)",
+        "prompt": "1Password service account token",
+        "url": "https://developer.1password.com/docs/service-accounts/",
         "password": True,
         "category": "tool",
     },

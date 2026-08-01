@@ -130,6 +130,8 @@ acp = ["agent-client-protocol==0.9.0"]
 #   5. Optionally re-add to [all] only after a few days of clean operation.
 bedrock = ["boto3==1.42.89"]
 azure-identity = ["azure-identity==1.25.3"]
+# 1Password Secrets Manager integration (pre-1.0 package — minor-pinned per AGENTS.md §versioning)
+onepassword = ["onepassword-sdk>=0.1.0,<0.2.0"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.6",

@@ -1,11 +1,18 @@
-"""CLI handlers for ``hermes secrets bitwarden ...``.
+"""CLI handlers for ``hermes secrets bitwarden ...`` and ``hermes secrets onepassword ...``.
 
-Subcommands:
+Bitwarden subcommands:
     setup    — interactive wizard: install bws, prompt for token + project, test fetch
     status   — show current config + binary version + last fetch outcome
     sync     — run a fetch right now and show what would be applied (dry-run friendly)
     disable  — flip ``secrets.bitwarden.enabled`` to False
     install  — just download the bws binary (no token / project required)
+
+1Password subcommands:
+    setup    — interactive wizard: prompt for service account token, vault, item
+    status   — show current config + SDK availability + connection status
+    sync     — run a fetch right now and show what was applied (dry-run friendly)
+    disable  — flip ``secrets.onepassword.enabled`` to False
+    install  — install the ``onepassword-sdk`` Python package
 """
 
 from __future__ import annotations
@@ -443,3 +450,408 @@ def _list_projects(
     if not isinstance(data, list):
         return []
     return [p for p in data if isinstance(p, dict) and p.get("id")]
+
+
+# ===========================================================================
+# 1Password CLI — register_op_cli + handlers
+# ===========================================================================
+
+
+def register_op_cli(parent_parser: argparse.ArgumentParser) -> None:
+    """Attach the ``onepassword`` subcommand tree to a parent parser.
+
+    Called from ``hermes_cli.main`` as part of building the top-level
+    ``hermes secrets`` parser.
+    """
+    sub = parent_parser.add_subparsers(dest="secrets_op_command")
+
+    setup = sub.add_parser(
+        "setup",
+        help=(
+            "Interactive wizard: pick vault + item. "
+            "Provide the service account token via the OP_SERVICE_ACCOUNT_TOKEN "
+            "environment variable, or enter it interactively when prompted."
+        ),
+    )
+    setup.add_argument(
+        "--vault",
+        help="Pre-select a vault name instead of prompting",
+    )
+    setup.add_argument(
+        "--item",
+        help="Pre-select an item title instead of prompting",
+    )
+    setup.set_defaults(func=cmd_op_setup)
+
+    status = sub.add_parser("status", help="Show config + SDK version + connection status")
+    status.set_defaults(func=cmd_op_status)
+
+    sync = sub.add_parser("sync", help="Fetch secrets now and report what changed")
+    sync.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Set the secrets in THIS command's own process environment "
+            "(default: dry-run). This does NOT export into your calling "
+            "shell — a child process cannot modify its parent's "
+            "environment. Use this to verify what override_existing would "
+            "apply; secrets reach hermes/gateway processes automatically "
+            "on their next startup or hot-reload regardless of this flag."
+        ),
+    )
+    sync.set_defaults(func=cmd_op_sync)
+
+    disable = sub.add_parser("disable", help="Turn off the 1Password integration")
+    disable.set_defaults(func=cmd_op_disable)
+
+    install = sub.add_parser(
+        "install",
+        help="Install the onepassword-sdk Python package",
+    )
+    install.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-install even if the SDK is already available",
+    )
+    install.set_defaults(func=cmd_op_install)
+
+
+# ---------------------------------------------------------------------------
+# 1Password handlers
+# ---------------------------------------------------------------------------
+
+
+def cmd_op_setup(args: argparse.Namespace) -> int:
+    from agent.secret_sources import onepassword as op  # noqa: PLC0415
+
+    console = Console()
+    console.print(
+        Panel.fit(
+            "[bold]1Password Secrets Manager setup[/bold]\n\n"
+            "Need a service account token?  In the 1Password web app:\n"
+            "  Developer Tools → Service Accounts → New Service Account\n"
+            "  Grant it read access to the vault(s) you want to use.\n\n"
+            "Copy the token (starts with [cyan]ops_[/cyan]…) — it cannot be retrieved later.",
+            border_style="cyan",
+        )
+    )
+
+    # ------------------------------------------------------------------ SDK
+    console.print()
+    console.print("[bold]Step 1[/bold]  Check the onepassword-sdk Python package")
+    if op._check_sdk_available():
+        console.print(f"  [green]✓[/green] SDK installed  ({op._sdk_version()})")
+    else:
+        console.print("  SDK not found — installing…")
+        try:
+            ver = op.install_onepassword_sdk()
+            console.print(f"  [green]✓[/green] Installed onepassword-sdk  ({ver})")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"  [red]✗ Could not install SDK: {exc}[/red]")
+            console.print(
+                "  Manual install:  [cyan]pip install onepassword-sdk[/cyan]"
+            )
+            return 1
+
+    # ------------------------------------------------------------------ token
+    console.print()
+    console.print("[bold]Step 2[/bold]  Provide your service account token")
+    cfg = load_config()
+    secrets_cfg = (cfg.setdefault("secrets", {})
+                     .setdefault("onepassword", {}))
+    token_env = secrets_cfg.get("service_account_token_env", "OP_SERVICE_ACCOUNT_TOKEN")
+
+    import getpass as _getpass  # noqa: PLC0415
+    # Read the token from the environment variable first so the caller never
+    # has to pass it via the process argv (which would expose it in `ps` and
+    # shell history).  Fall back to a secure getpass prompt for interactive
+    # sessions; refuse to continue in non-interactive mode.
+    token = os.environ.get(token_env, "").strip()
+    if not token:
+        if sys.stdin.isatty():
+            token = _getpass.getpass(f"  Paste service account token ({token_env}): ").strip()
+        else:
+            console.print(
+                f"  [red]Error: {token_env} environment variable is not set "
+                f"and stdin is not a terminal.  "
+                f"Set {token_env}=<your-token> before running this command.[/red]"
+            )
+            return 1
+    if not token:
+        console.print("  [red]Empty token, aborting.[/red]")
+        return 1
+    if not token.startswith("ops_"):
+        console.print(
+            "  [yellow]Warning: token doesn't start with 'ops_' — "
+            "are you sure this is a 1Password service account token?  "
+            "Continuing anyway.[/yellow]"
+        )
+
+    os.environ[token_env] = token
+    console.print(f"  [green]✓[/green] token loaded into current session as {token_env}")
+
+    # ------------------------------------------------------------------ vault
+    console.print()
+    console.print("[bold]Step 3[/bold]  Vault name")
+    vault_name = (getattr(args, "vault", None) or "").strip()
+    if not vault_name:
+        vault_name = console.input(
+            "  Vault name (leave empty to search all accessible vaults): "
+        ).strip()
+
+    # ------------------------------------------------------------------ item
+    console.print()
+    console.print("[bold]Step 4[/bold]  Item title")
+    item_title = (getattr(args, "item", None) or "").strip()
+    if not item_title:
+        item_title = console.input(
+            "  Item title (the 1Password item whose fields to import as env vars): "
+        ).strip()
+    if not item_title:
+        console.print("  [red]Item title is required, aborting.[/red]")
+        return 1
+
+    # ------------------------------------------------------------------ test
+    console.print()
+    console.print("[bold]Step 5[/bold]  Test fetch")
+    try:
+        secrets, warnings = op.fetch_onepassword_secrets(
+            token=token,
+            vault_name=vault_name,
+            item_title=item_title,
+            field_mapping=secrets_cfg.get("field_mapping") or {},
+            use_cache=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"  [red]✗ Fetch failed: {type(exc).__name__}[/red]")
+        return 1
+
+    if not secrets:
+        console.print(
+            "  [yellow]Fetch succeeded but the item has no readable fields.[/yellow]"
+        )
+    else:
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Field label", style="cyan")
+        table.add_column("Env var name")
+        table.add_column("Status")
+        for env_key in sorted(secrets):
+            if env_key == token_env:
+                status = "[dim]bootstrap token — never overrides itself[/dim]"
+            elif os.environ.get(env_key):
+                status = "[yellow]already set in env[/yellow]"
+            else:
+                status = "[green]new[/green]"
+            table.add_row("(mapped)", env_key, status)
+        console.print(table)
+
+    if warnings:
+        console.print(f"  [yellow]{len(warnings)} warning(s)[/yellow]")
+
+    # ------------------------------------------------------------------ save
+    secrets_cfg["enabled"] = True
+    secrets_cfg["service_account_token_env"] = token_env
+    secrets_cfg["vault"] = vault_name
+    secrets_cfg["item"] = item_title
+    secrets_cfg.setdefault("field_mapping", {})
+    secrets_cfg.setdefault("override_existing", False)
+    secrets_cfg.setdefault("cache_ttl_seconds", 300)
+    secrets_cfg.setdefault("auto_install", True)
+    save_config(cfg)
+
+    console.print(f"\n[yellow]Note:[/yellow] The service account token will not be stored locally.")
+    console.print(f"Set [bold]{token_env}=<your-token>[/bold] in your shell environment or system keychain.")
+    console.print(f"Example: export {token_env}=ops_eyJ...")
+
+    console.print()
+    console.print(
+        "[green]✓ 1Password Secrets Manager is enabled.[/green]  "
+        "Secrets will be pulled at the start of every Hermes process."
+    )
+    console.print(
+        "  Status:  [cyan]hermes secrets onepassword status[/cyan]\n"
+        "  Refresh: [cyan]hermes secrets onepassword sync[/cyan]\n"
+        "  Disable: [cyan]hermes secrets onepassword disable[/cyan]"
+    )
+    return 0
+
+
+def cmd_op_status(args: argparse.Namespace) -> int:
+    from agent.secret_sources import onepassword as op  # noqa: PLC0415
+
+    console = Console()
+    cfg = load_config()
+    op_cfg = (cfg.get("secrets") or {}).get("onepassword") or {}
+
+    status = op.get_onepassword_status(op_cfg, Path(get_env_path()).parent)
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("", style="bold")
+    table.add_column("")
+    table.add_row("Enabled",            _yn(status["enabled"]))
+    table.add_row("SDK available",      _yn(status["sdk_available"]))
+    table.add_row("SDK version",        status["sdk_version"])
+    table.add_row("Token env var",      status["token_env"])
+    table.add_row("Token in env",       _yn(status["token_set"]))
+    table.add_row("Vault",              status["vault"])
+    table.add_row("Item",               status["item"])
+    table.add_row("Override existing",  _yn(status["override_existing"]))
+    table.add_row("Cache TTL (s)",      str(status["cache_ttl_seconds"]))
+    table.add_row("Auto-install SDK",   _yn(status["auto_install"]))
+    if status["connection_ok"] is not None:
+        table.add_row(
+            "Connection",
+            "[green]OK[/green]" if status["connection_ok"] else f"[red]FAILED: {status['connection_error']}[/red]",
+        )
+
+    fm = status["field_mapping"]
+    if fm:
+        for label, env_var in fm.items():
+            table.add_row(f"  map: {label!r}", f"→ {env_var}")
+
+    console.print(Panel(table, title="1Password Secrets Manager", border_style="cyan"))
+
+    if not status["enabled"]:
+        console.print("\n  Run [cyan]hermes secrets onepassword setup[/cyan] to enable.")
+        return 0
+    if not status["sdk_available"]:
+        console.print(
+            "\n  [yellow]Enabled but the SDK is not installed — "
+            "run `hermes secrets onepassword install`.[/yellow]"
+        )
+    if not status["token_set"]:
+        console.print(
+            f"\n  [yellow]Enabled but {status['token_env']} is not set — "
+            "Hermes will skip 1Password and warn on next startup.[/yellow]"
+        )
+    if status["item"] == "(unset)":
+        console.print(
+            "\n  [yellow]Enabled but no item configured — nothing to fetch.[/yellow]"
+        )
+    if status["connection_ok"] is False:
+        console.print(
+            f"\n  [red]Connection check failed: {status['connection_error']}[/red]"
+        )
+        return 1
+    return 0
+
+
+def cmd_op_sync(args: argparse.Namespace) -> int:
+    from agent.secret_sources import onepassword as op  # noqa: PLC0415
+
+    console = Console()
+    cfg = load_config()
+    op_cfg = (cfg.get("secrets") or {}).get("onepassword") or {}
+
+    if not op_cfg.get("enabled"):
+        console.print(
+            "[yellow]1Password integration is disabled.  Run "
+            "`hermes secrets onepassword setup` first.[/yellow]"
+        )
+        return 1
+
+    token_env = op_cfg.get("service_account_token_env", "OP_SERVICE_ACCOUNT_TOKEN")
+    token = os.environ.get(token_env, "").strip()
+    if not token:
+        console.print(f"[red]{token_env} is not set.[/red]")
+        return 1
+
+    vault_name = op_cfg.get("vault", "")
+    item_title = op_cfg.get("item", "")
+    if not item_title:
+        console.print("[red]No item configured.  Run `hermes secrets onepassword setup`.[/red]")
+        return 1
+
+    field_mapping = op_cfg.get("field_mapping") or {}
+
+    try:
+        secrets, warnings = op.fetch_onepassword_secrets(
+            token=token,
+            vault_name=vault_name,
+            item_title=item_title,
+            field_mapping=field_mapping,
+            use_cache=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Fetch failed: {type(exc).__name__}[/red]")
+        return 1
+
+    if not secrets:
+        console.print("[yellow]No secrets found in the item.[/yellow]")
+        return 0
+
+    override = bool(op_cfg.get("override_existing", False)) or args.apply
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Env var", style="cyan")
+    table.add_column("Action")
+    applied = 0
+    for key in sorted(secrets):
+        if key == token_env:
+            table.add_row(key, "[dim]skip (bootstrap token)[/dim]")
+            continue
+        already = bool(os.environ.get(key))
+        if already and not override:
+            table.add_row(key, "[dim]skip (already set)[/dim]")
+            continue
+        if args.apply:
+            os.environ[key] = secrets[key]
+            applied += 1
+            table.add_row(
+                key,
+                "[green]set[/green]" + (" (overrode)" if already else ""),
+            )
+        else:
+            table.add_row(
+                key,
+                "[green]would set[/green]" + (" (overrides)" if already else ""),
+            )
+
+    console.print(table)
+    if warnings:
+        console.print(f"[yellow]{len(warnings)} warning(s)[/yellow]")
+
+    if not args.apply:
+        console.print(
+            "\n  This was a dry-run — secrets are picked up automatically by "
+            "every [cyan]hermes[/cyan]/gateway process on its next startup or "
+            "hot-reload, independent of this command.  Re-run with "
+            "[cyan]--apply[/cyan] to set them in this command's own process "
+            "(useful for testing overrides; it does not affect your shell)."
+        )
+    else:
+        console.print(
+            f"\n  [green]Set {applied} secret(s) in this process.[/green]  "
+            "This does not export to your shell — other hermes/gateway "
+            "processes already pick these up independently on their own "
+            "next sync."
+        )
+    return 0
+
+
+def cmd_op_disable(args: argparse.Namespace) -> int:
+    console = Console()
+    cfg = load_config()
+    op_cfg = (cfg.setdefault("secrets", {})
+               .setdefault("onepassword", {}))
+    op_cfg["enabled"] = False
+    save_config(cfg)
+    console.print(
+        "[green]Disabled.[/green]  1Password secrets will NOT be pulled on the next "
+        "Hermes invocation.\n"
+        "  Your service account token is left in .env — remove it manually if you "
+        "also want to revoke the credential."
+    )
+    return 0
+
+
+def cmd_op_install(args: argparse.Namespace) -> int:
+    from agent.secret_sources import onepassword as op  # noqa: PLC0415
+
+    console = Console()
+    try:
+        ver = op.install_onepassword_sdk(force=bool(args.force), skip_gate=True)
+        console.print(f"[green]✓[/green] onepassword-sdk  ({ver})")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Install failed: {exc}[/red]")
+        return 1

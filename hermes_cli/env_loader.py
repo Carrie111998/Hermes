@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,8 @@ _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")
 # tests) don't spam the same warning multiple times.
 _WARNED_KEYS: set[str] = set()
 
+logger = logging.getLogger(__name__)
+
 # Map of env-var name → source label ("bitwarden", etc.) for credentials
 # that were injected by an external secret source during load_hermes_dotenv().
 # Used by setup / `hermes model` flows to label detected credentials so
@@ -28,6 +31,18 @@ _WARNED_KEYS: set[str] = set()
 # directly (otherwise the "credentials detected ✓" line looks identical to
 # the .env case and they don't know Bitwarden is wired up).
 _SECRET_SOURCES: dict[str, str] = {}
+
+# Map of env-var name → the exact value a secret source last set it to.
+# The gateway is long-lived and calls load_hermes_dotenv() (and therefore
+# _apply_external_secret_sources()) on every turn to pick up rotated
+# credentials. Without this, a stale `_SECRET_SOURCES["X"] = "onepassword"`
+# label would survive even after an operator edits ~/.hermes/.env to
+# override X locally — the next 1Password refresh would silently clobber
+# the operator's override right back, since only the label (not whether the
+# value actually still matches what we set) was checked. Comparing against
+# this recorded value lets us detect "the value changed out from under us"
+# and treat the key as no longer managed, so a local override sticks.
+_SECRET_VALUES: dict[str, str] = {}
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -227,7 +242,7 @@ def load_hermes_dotenv(
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
-    """Pull secrets from external sources (currently Bitwarden) into env.
+    """Pull secrets from external sources (Bitwarden, 1Password) into env.
 
     Runs AFTER dotenv loads so .env values are visible (we use them to
     locate the access token) but BEFORE the rest of Hermes reads
@@ -239,51 +254,112 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     except Exception:  # noqa: BLE001 — config errors must not block startup
         return
 
-    bw_cfg = (cfg or {}).get("bitwarden") or {}
+    secrets_cfg = cfg or {}
+
+    # ------------------------------------------------------------------
+    # Bitwarden Secrets Manager
+    # ------------------------------------------------------------------
+    bw_cfg = secrets_cfg.get("bitwarden") or {}
     if not bw_cfg.get("enabled"):
-        return
+        pass
+    else:
+        try:
+            from agent.secret_sources.bitwarden import apply_bitwarden_secrets
+        except ImportError:
+            pass
+        else:
+            result = apply_bitwarden_secrets(
+                enabled=True,
+                access_token_env=bw_cfg.get("access_token_env", "BWS_ACCESS_TOKEN"),
+                project_id=bw_cfg.get("project_id", ""),
+                override_existing=bool(bw_cfg.get("override_existing", False)),
+                cache_ttl_seconds=float(bw_cfg.get("cache_ttl_seconds", 300)),
+                auto_install=bool(bw_cfg.get("auto_install", True)),
+            )
 
-    try:
-        from agent.secret_sources.bitwarden import apply_bitwarden_secrets
-    except ImportError:
-        return
+            if result.applied:
+                # Re-run the ASCII sanitization pass: BSM values are user-supplied
+                # and might have the same copy-paste corruption as a manually
+                # edited .env (see #6843).
+                _sanitize_loaded_credentials()
+                # Remember where these came from so the setup / `hermes model`
+                # flows can label detected credentials with "(from Bitwarden)" —
+                # otherwise users see "credentials ✓" with no hint that the value
+                # came from BSM rather than .env.
+                for name in result.applied:
+                    _SECRET_SOURCES[name] = "bitwarden"
+                print(
+                    f"  Bitwarden Secrets Manager: applied {len(result.applied)} "
+                    f"secret{'s' if len(result.applied) != 1 else ''} "
+                    f"({len(result.applied)} secret{'s' if len(result.applied) != 1 else ''})",
+                    file=sys.stderr,
+                )
+            if result.error:
+                print(
+                    "  Bitwarden Secrets Manager: sync failed"
+                    " (run `hermes secrets bitwarden setup` to diagnose)",
+                    file=sys.stderr,
+                )
+            for warn in result.warnings:
+                print(
+                    f"  Bitwarden Secrets Manager: {warn}",
+                    file=sys.stderr,
+                )
 
-    result = apply_bitwarden_secrets(
-        enabled=True,
-        access_token_env=bw_cfg.get("access_token_env", "BWS_ACCESS_TOKEN"),
-        project_id=bw_cfg.get("project_id", ""),
-        override_existing=bool(bw_cfg.get("override_existing", False)),
-        cache_ttl_seconds=float(bw_cfg.get("cache_ttl_seconds", 300)),
-        auto_install=bool(bw_cfg.get("auto_install", True)),
-    )
+    # ------------------------------------------------------------------
+    # 1Password Secrets Manager
+    # ------------------------------------------------------------------
+    op_cfg = secrets_cfg.get("onepassword") or {}
+    if op_cfg.get("enabled"):
+        try:
+            from agent.secret_sources.onepassword import apply_onepassword_secrets
 
-    if result.applied:
-        # Re-run the ASCII sanitization pass: BSM values are user-supplied
-        # and might have the same copy-paste corruption as a manually
-        # edited .env (see #6843).
-        _sanitize_loaded_credentials()
-        # Remember where these came from so the setup / `hermes model`
-        # flows can label detected credentials with "(from Bitwarden)" —
-        # otherwise users see "credentials ✓" with no hint that the value
-        # came from BSM rather than .env.
-        for name in result.applied:
-            _SECRET_SOURCES[name] = "bitwarden"
-        print(
-            f"  Bitwarden Secrets Manager: applied {len(result.applied)} "
-            f"secret{'s' if len(result.applied) != 1 else ''} "
-            f"({', '.join(sorted(result.applied))})",
-            file=sys.stderr,
-        )
-    if result.error:
-        print(
-            f"  Bitwarden Secrets Manager: {result.error}",
-            file=sys.stderr,
-        )
-    for warn in result.warnings:
-        print(
-            f"  Bitwarden Secrets Manager: {warn}",
-            file=sys.stderr,
-        )
+            # A key only counts as "still managed by 1Password" if its
+            # current value still matches what we last set it to. If an
+            # operator edited .env (loaded with override=True just above)
+            # to override a previously-injected key, the value on disk no
+            # longer matches — drop the stale label so the refresh/removal
+            # logic below leaves the operator's override alone instead of
+            # clobbering it back on the next sync.
+            stale_labels = [
+                k for k, v in _SECRET_SOURCES.items()
+                if v == "onepassword" and _SECRET_VALUES.get(k) != os.environ.get(k)
+            ]
+            for k in stale_labels:
+                del _SECRET_SOURCES[k]
+                _SECRET_VALUES.pop(k, None)
+
+            previously_managed = {k for k, v in _SECRET_SOURCES.items() if v == "onepassword"}
+            op_applied, op_removed = apply_onepassword_secrets(
+                op_cfg, home_path, previously_managed=previously_managed
+            )
+            if op_applied:
+                _sanitize_loaded_credentials()
+                for name in op_applied:
+                    _SECRET_SOURCES[name] = "onepassword"
+                    _SECRET_VALUES[name] = os.environ.get(name, "")
+                print(
+                    f"  1Password Secrets Manager: applied {len(op_applied)} "
+                    f"secret{'s' if len(op_applied) != 1 else ''}",
+                    file=sys.stderr,
+                )
+            for name in op_removed:
+                _SECRET_SOURCES.pop(name, None)
+                _SECRET_VALUES.pop(name, None)
+            if op_removed:
+                print(
+                    f"  1Password Secrets Manager: removed {len(op_removed)} "
+                    f"secret{'s' if len(op_removed) != 1 else ''} no longer in the item "
+                    f"({', '.join(sorted(op_removed))})",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Don't include exc in the message — it may contain token data
+            print(
+                f"  1Password Secrets Manager: sync failed ({type(exc).__name__})",
+                file=sys.stderr,
+            )
+            logger.warning("1Password secrets sync failed (%s)", type(exc).__name__)
 
 
 def _load_secrets_config(home_path: Path) -> dict:

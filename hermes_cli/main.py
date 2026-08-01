@@ -11083,15 +11083,15 @@ def main():
     fallback_parser.set_defaults(func=cmd_fallback)
 
     # =========================================================================
-    # secrets command — external secret managers (currently: Bitwarden)
+    # secrets command — external secret managers (Bitwarden, 1Password)
     # =========================================================================
     secrets_parser = subparsers.add_parser(
         "secrets",
-        help="Manage external secret sources (Bitwarden Secrets Manager)",
+        help="Manage external secret sources (Bitwarden, 1Password)",
         description=(
             "Pull API keys from an external secret manager at process startup "
-            "instead of storing them in ~/.hermes/.env.  Currently supports "
-            "Bitwarden Secrets Manager.  See: "
+            "instead of storing them in ~/.hermes/.env.  Supports "
+            "Bitwarden Secrets Manager and 1Password.  See: "
             "https://hermes-agent.nousresearch.com/docs/user-guide/secrets/bitwarden"
         ),
     )
@@ -11108,10 +11108,21 @@ def main():
 
     _secrets_cli.register_cli(secrets_bw)
 
+    secrets_op = secrets_subparsers.add_parser(
+        "onepassword",
+        aliases=["op"],
+        help="1Password Secrets Manager integration",
+    )
+
+    _secrets_cli.register_op_cli(secrets_op)
+
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
+        op_sub = getattr(args, "secrets_op_command", None)
         if sub in ("bitwarden", "bw") and bw_sub is not None:
+            return args.func(args)
+        if sub in ("onepassword", "op") and op_sub is not None:
             return args.func(args)
         secrets_parser.print_help()
         return 0

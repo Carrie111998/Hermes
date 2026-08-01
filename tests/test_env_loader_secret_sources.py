@@ -24,8 +24,10 @@ from hermes_cli import env_loader  # noqa: E402
 def _reset_sources():
     """Each test starts with a clean source map."""
     env_loader._SECRET_SOURCES.clear()
+    env_loader._SECRET_VALUES.clear()
     yield
     env_loader._SECRET_SOURCES.clear()
+    env_loader._SECRET_VALUES.clear()
 
 
 def test_get_secret_source_returns_none_for_untracked_var():
@@ -117,3 +119,97 @@ def test_apply_external_secret_sources_noop_when_disabled(tmp_path, monkeypatch)
     env_loader._apply_external_secret_sources(tmp_path)
 
     assert env_loader.get_secret_source("ANTHROPIC_API_KEY") is None
+
+
+def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    item: Hermes\n",
+        encoding="utf-8",
+    )
+
+    import agent.secret_sources.onepassword as op_module
+
+    monkeypatch.setattr(
+        op_module, "apply_onepassword_secrets",
+        lambda *a, **kw: ({"SOME_KEY": "***"}, []),
+    )
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert env_loader.get_secret_source("SOME_KEY") == "onepassword"
+
+
+def test_onepassword_local_override_is_not_clobbered_on_next_sync(tmp_path, monkeypatch):
+    """Regression test for the "preserve local overrides after a managed
+    refresh" fix: once an operator's .env value diverges from what
+    1Password last injected, the stale 'onepassword' label must be
+    dropped so the next sync's refresh-without-override_existing logic
+    doesn't treat it as still-managed and clobber the override."""
+    import os
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    item: Hermes\n",
+        encoding="utf-8",
+    )
+
+    import agent.secret_sources.onepassword as op_module
+
+    calls = []
+
+    def _fake_apply(config, home_path, previously_managed=None):
+        calls.append(set(previously_managed or set()))
+        os.environ["SOME_KEY"] = "op-value-1"
+        return {"SOME_KEY": "***"}, []
+
+    monkeypatch.setattr(op_module, "apply_onepassword_secrets", _fake_apply)
+
+    # First sync: nothing previously managed, 1Password sets SOME_KEY.
+    env_loader._apply_external_secret_sources(tmp_path)
+    assert calls[-1] == set()
+    assert env_loader.get_secret_source("SOME_KEY") == "onepassword"
+
+    # Operator edits .env to override it locally.
+    monkeypatch.setenv("SOME_KEY", "operator-override")
+
+    # Second sync: the label must be dropped BEFORE previously_managed is
+    # computed, since the env value no longer matches what 1Password set.
+    env_loader._apply_external_secret_sources(tmp_path)
+    assert calls[-1] == set()  # SOME_KEY must NOT appear as previously_managed
+    monkeypatch.delenv("SOME_KEY", raising=False)
+
+
+def test_onepassword_removal_clears_source_tracking(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    item: Hermes\n",
+        encoding="utf-8",
+    )
+
+    env_loader._SECRET_SOURCES["GONE_KEY"] = "onepassword"
+    env_loader._SECRET_VALUES["GONE_KEY"] = "old-value"
+
+    import agent.secret_sources.onepassword as op_module
+
+    monkeypatch.setattr(
+        op_module, "apply_onepassword_secrets",
+        lambda *a, **kw: ({}, ["GONE_KEY"]),
+    )
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert env_loader.get_secret_source("GONE_KEY") is None
+    assert "GONE_KEY" not in env_loader._SECRET_VALUES
