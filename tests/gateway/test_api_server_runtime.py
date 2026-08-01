@@ -159,7 +159,9 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "ask_user_question",
             "image_analyze",
             "skill_view",
-            "ultra_media_job_create",
+            "tool_call",
+            "tool_describe",
+            "tool_search",
             "web_extract",
             "web_search",
         }
@@ -220,6 +222,27 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "error": "Skill 'tv-ad' is not available for this run.",
         }
 
+        search_result = json.loads(_runtime_tool_middleware(
+            tool_name="tool_search",
+            args={"query": "create media"},
+            session_id=kwargs["session_id"],
+            tool_call_id="search_01",
+        ))
+        assert [match["name"] for match in search_result["matches"]] == [
+            "ultra_media_job_create",
+        ]
+        described = json.loads(_runtime_tool_middleware(
+            tool_name="tool_describe",
+            args={"name": "ultra_media_job_create"},
+            session_id=kwargs["session_id"],
+            tool_call_id="describe_01",
+        ))
+        assert described["name"] == "ultra_media_job_create"
+
+        delegated_args = {
+            "name": "ultra_media_job_create",
+            "arguments": {"operation": "image.generate", "prompt": "test"},
+        }
         agent._runtime_checkpoint_message = {
             "role": "assistant",
             "content": None,
@@ -227,22 +250,22 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
                 "id": "call_01",
                 "type": "function",
                 "function": {
-                    "name": "ultra_media_job_create",
-                    "arguments": '{"operation":"image.generate","prompt":"test"}',
+                    "name": "tool_call",
+                    "arguments": json.dumps(delegated_args),
                 },
             }],
         }
-        kwargs["tool_start_callback"]("call_01", "ultra_media_job_create", {"prompt": "test"})
+        kwargs["tool_start_callback"]("call_01", "tool_call", delegated_args)
         tool_result = await asyncio.to_thread(
             _runtime_tool_middleware,
-            tool_name="ultra_media_job_create",
-            args={"operation": "image.generate", "prompt": "test"},
+            tool_name="tool_call",
+            args=delegated_args,
             session_id=kwargs["session_id"],
             tool_call_id="call_01",
             next_call=lambda _args: pytest.fail("platform tool executed inside Hermes"),
         )
         assert json.loads(tool_result) == {"job_id": "job_01"}
-        kwargs["tool_complete_callback"]("call_01", "ultra_media_job_create", {}, tool_result)
+        kwargs["tool_complete_callback"]("call_01", "tool_call", delegated_args, tool_result)
         return {"final_response": "asset://image/01"}, {"total_tokens": 3}
 
 
@@ -815,14 +838,17 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
         checkpoint = json.loads(await response.content.readline())
         assert checkpoint["type"] == "checkpoint"
         assert checkpoint["payload"]["message"]["tool_calls"][0]["id"] == "call_01"
+        assert (
+            checkpoint["payload"]["message"]["tool_calls"][0]["function"]["name"]
+            == "ultra_media_job_create"
+        )
         tool_request = json.loads(await response.content.readline())
         assert tool_request["type"] == "tool_request"
-        expected_proof = {
-            "name": "media-qa",
-            "digest": root_skill_digest,
+        assert tool_request["payload"] == {
+            "call_id": "call_01",
+            "name": "ultra_media_job_create",
+            "arguments": {"operation": "image.generate", "prompt": "test"},
         }
-        assert tool_request["payload"]["skill"] == expected_proof
-        assert tool_request["payload"]["skills"] == [expected_proof]
 
         delivered = await client.post("/v1/runtime/runs/run_test/tool-results", json={
             "call_id": "call_01",
@@ -842,10 +868,6 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
 def test_runtime_skill_manifest_is_visibility_source_of_truth():
     tool_digest = "sha256:" + "a" * 64
     planning_digest = "sha256:" + "b" * 64
-    definitions = [{
-        "name": "media.generate_image",
-        "allowed_skills": ["tool-guided"],
-    }]
     manifest = {
         "skills": [
             {"runtime_alias": "tool-guided", "content_digest": tool_digest},
@@ -853,30 +875,26 @@ def test_runtime_skill_manifest_is_visibility_source_of_truth():
         ],
     }
 
-    assert _runtime_allowed_skill_names(definitions, manifest) == {
+    assert _runtime_allowed_skill_names(manifest) == {
         "tool-guided",
         "planning-only",
     }
-    assert _runtime_allowed_skill_digests(definitions, manifest) == {
+    assert _runtime_allowed_skill_digests(manifest) == {
         "tool-guided": tool_digest,
         "planning-only": planning_digest,
     }
-    with pytest.raises(
-        ValueError,
-        match="tool skill scope unavailable in skill_manifest: tool-guided",
-    ):
-        _runtime_allowed_skill_names(definitions, {
-            "skills": [{"runtime_alias": "planning-only", "content_digest": planning_digest}],
-        })
+    assert _runtime_allowed_skill_names({
+        "skills": [{"runtime_alias": "planning-only", "content_digest": planning_digest}],
+    }) == {"planning-only"}
     with pytest.raises(ValueError, match="duplicate runtime_alias"):
-        _runtime_allowed_skill_names([], {
+        _runtime_allowed_skill_names({
             "skills": [
                 {"runtime_alias": "duplicate", "content_digest": tool_digest},
                 {"runtime_alias": "duplicate", "content_digest": planning_digest},
             ],
         })
     with pytest.raises(ValueError, match="content_digest is invalid for tool-guided"):
-        _runtime_allowed_skill_digests(definitions, {
+        _runtime_allowed_skill_digests({
             "skills": [{"runtime_alias": "tool-guided"}],
         })
 
@@ -1345,10 +1363,6 @@ async def test_runtime_checkpoint_redacts_private_skill_reasoning_without_blocki
         "Inspect every supplied reference before composing the shot. Preserve "
         "exact packaging geometry, material finish, label hierarchy, and brand "
         "colors. Verify every output against the private acceptance checklist."
-    )
-    session.record_loaded_skill(
-        {"name": "product-photoshoot"},
-        {"success": True, "content": private_body},
     )
     safe_args = {
         "action": "recommend",

@@ -24,6 +24,15 @@ from gateway.runtime_skill_projection import (
     resolve_skill_projections,
     view_skill,
 )
+from gateway.runtime_tool_exposure import (
+    RuntimeToolExposure,
+    build_runtime_tool_exposure,
+)
+from tools.tool_search import (
+    TOOL_CALL_NAME,
+    TOOL_DESCRIBE_NAME,
+    TOOL_SEARCH_NAME,
+)
 
 from gateway.api_server_shared import (
     AIOHTTP_AVAILABLE,
@@ -339,36 +348,19 @@ def _skill_scope_error(name: str) -> str:
     )
 
 
-def _allowed_skill_names(definitions: list[dict[str, Any]]) -> set[str]:
-    names: set[str] = set()
-    for definition in definitions:
-        if not isinstance(definition, dict):
-            continue
-        legacy = str(definition.get("required_skill") or "").strip()
-        if legacy:
-            names.add(legacy)
-        for field_name in ("required_skills", "allowed_skills"):
-            values = definition.get(field_name)
-            if isinstance(values, list):
-                names.update(str(value).strip() for value in values if str(value).strip())
-    return names
-
-
 def _runtime_allowed_skill_names(
-    definitions: list[dict[str, Any]],
     skill_manifest: Any = _NO_SKILL_MANIFEST,
 ) -> set[str]:
-    """Resolve the immutable Run Skill scope, with legacy Tool fallback."""
-    return set(_runtime_allowed_skill_digests(definitions, skill_manifest))
+    """Resolve the immutable Run Skill scope from the user snapshot only."""
+    return set(_runtime_allowed_skill_digests(skill_manifest))
 
 
 def _runtime_allowed_skill_digests(
-    definitions: list[dict[str, Any]],
     skill_manifest: Any = _NO_SKILL_MANIFEST,
 ) -> dict[str, str]:
     """Resolve Runtime aliases to the immutable package digests they prove."""
     if skill_manifest is _NO_SKILL_MANIFEST:
-        return {name: "" for name in _allowed_skill_names(definitions)}
+        return {}
     if not isinstance(skill_manifest, dict):
         raise ValueError("skill_manifest must be an object")
     skills = skill_manifest.get("skills")
@@ -395,12 +387,6 @@ def _runtime_allowed_skill_digests(
         ):
             raise ValueError(f"skill_manifest content_digest is invalid for {name}")
         digests[name] = digest
-    outside_manifest = _allowed_skill_names(definitions) - set(digests)
-    if outside_manifest:
-        raise ValueError(
-            "tool skill scope unavailable in skill_manifest: "
-            + ", ".join(sorted(outside_manifest))
-        )
     return digests
 
 
@@ -724,11 +710,30 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
         session = _SESSIONS.get(session_id)
     if session is None:
         return next_call(args) if callable(next_call) else args
-    if tool_name in session.tool_names:
+    if tool_name in session.direct_tool_names:
         return session.invoke_platform_tool(
             tool_name,
             args,
             str(kwargs.get("tool_call_id") or ""),
+        )
+    if tool_name == TOOL_SEARCH_NAME:
+        return session.tool_exposure.search(args)
+    if tool_name == TOOL_DESCRIBE_NAME:
+        return session.tool_exposure.describe(args)
+    if tool_name == TOOL_CALL_NAME:
+        name, underlying_args, error = session.tool_exposure.resolve_call(args)
+        if error or name is None:
+            return json.dumps({
+                "error": {
+                    "code": "invalid_tool_request",
+                    "message": error or "deferred Tool is unavailable",
+                },
+            }, ensure_ascii=False, separators=(",", ":"))
+        return session.invoke_platform_tool(
+            name,
+            underlying_args,
+            str(kwargs.get("tool_call_id") or ""),
+            checkpoint_tool_name=TOOL_CALL_NAME,
         )
     if tool_name == "skill_view":
         requested = str(args.get("name") or args.get("skill") or "").strip()
@@ -736,9 +741,7 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
             return _skill_scope_error(requested)
         projection = session.allowed_skill_projections.get(requested)
         if projection is not None:
-            result = view_skill(requested, projection, args)
-            session.record_loaded_skill(args, result)
-            return result
+            return view_skill(requested, projection, args)
     if tool_name == "image_analyze":
         for source in _image_analysis_sources(args):
             parsed = urlparse(source)
@@ -769,10 +772,7 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
                 "success": False,
                 "error": "video_analyze may only read video attachments owned by this run.",
             })
-    result = next_call(args) if callable(next_call) else args
-    if tool_name == "skill_view":
-        session.record_loaded_skill(args, result)
-    return result
+    return next_call(args) if callable(next_call) else args
 
 
 def _image_analysis_sources(args: dict[str, Any]) -> list[str]:
@@ -831,6 +831,7 @@ class RuntimeBridgeSession:
         definitions: list[dict[str, Any]],
         deadline_ms: int,
         agent_session_id: str,
+        tool_exposure: RuntimeToolExposure | None = None,
         allowed_skill_names: set[str] | None = None,
         allowed_skill_projections: dict[str, RuntimeSkillProjection] | None = None,
         allowed_image_paths: set[str] | None = None,
@@ -842,10 +843,18 @@ class RuntimeBridgeSession:
         self.queue = queue
         self.definitions = {str(item["name"]): dict(item) for item in definitions}
         self.tool_names = set(self.definitions)
+        self.tool_exposure = tool_exposure or build_runtime_tool_exposure(
+            definitions,
+            _tool_schemas(definitions),
+        )
+        self.direct_tool_names = {
+            str((schema.get("function") or {}).get("name") or "")
+            for schema in self.tool_exposure.direct_schemas
+        }
         self.allowed_skill_names = (
             set(allowed_skill_names)
             if allowed_skill_names is not None
-            else _allowed_skill_names(definitions)
+            else set()
         )
         self.allowed_skill_projections = {
             name: projection
@@ -861,7 +870,6 @@ class RuntimeBridgeSession:
             for path in (allowed_video_paths or set())
         }
         self.deadline_seconds = max(0.001, deadline_ms / 1000) if deadline_ms > 0 else None
-        self.loaded_skills: dict[str, str] = {}
         self.local_activities: dict[str, str] = {}
         self.pending: dict[str, _PendingTool] = {}
         self.non_retryable_failures: dict[str, str] = {}
@@ -906,16 +914,6 @@ class RuntimeBridgeSession:
         except RuntimeError:
             pass
         self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
-
-    def record_loaded_skill(self, args: dict[str, Any], result: Any) -> None:
-        name = str(args.get("name") or args.get("skill") or "").strip()
-        if not self.is_skill_allowed(name):
-            return
-        digest = self.loaded_skill_digest(name, args, result)
-        if not digest:
-            return
-        with self.lock:
-            self.loaded_skills[name] = digest
 
     def loaded_skill_digest(self, name: str, args: Any, result: Any) -> str:
         """Return the digest of the root SKILL.md bytes actually loaded."""
@@ -967,7 +965,13 @@ class RuntimeBridgeSession:
                 payload["arguments"] = {"digest": digest}
         self.emit("activity_completed", payload)
 
-    def _checkpoint_message(self, call_id: str, name: str) -> dict[str, Any]:
+    def _checkpoint_message(
+        self,
+        call_id: str,
+        model_tool_name: str,
+        canonical_name: str,
+        canonical_args: dict[str, Any],
+    ) -> dict[str, Any]:
         agent = self.agent_ref[0]
         candidate = getattr(agent, "_runtime_checkpoint_message", None)
         if not isinstance(candidate, dict):
@@ -1016,11 +1020,24 @@ class RuntimeBridgeSession:
             [{"tool_call_id": call_id, "status": "succeeded", "output": {}}],
         )[0]
         function = checkpoint["tool_calls"][0].get("function") or {}
-        if str(function.get("name") or "") != name:
+        if str(function.get("name") or "") != model_tool_name:
             raise ValueError("runtime checkpoint tool name does not match active call")
+        function["name"] = canonical_name
+        function["arguments"] = json.dumps(
+            canonical_args,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return checkpoint
 
-    def invoke_platform_tool(self, name: str, args: dict[str, Any], call_id: str) -> str:
+    def invoke_platform_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        call_id: str,
+        *,
+        checkpoint_tool_name: str | None = None,
+    ) -> str:
         if not call_id:
             return json.dumps({"error": {"code": "invalid_tool_request", "message": "tool call id is required"}})
         signature_key = self._tool_signature_key(name, args)
@@ -1040,7 +1057,12 @@ class RuntimeBridgeSession:
                 },
             }, ensure_ascii=False, separators=(",", ":"))
         try:
-            checkpoint = self._checkpoint_message(call_id, name)
+            checkpoint = self._checkpoint_message(
+                call_id,
+                checkpoint_tool_name or name,
+                name,
+                args,
+            )
         except ValueError as exc:
             message = str(exc)
             self.emit("error", {"code": "runtime_checkpoint_invalid", "message": message})
@@ -1057,32 +1079,7 @@ class RuntimeBridgeSession:
             if call_id in self.pending:
                 return json.dumps({"error": {"code": "idempotency_conflict", "message": "duplicate active tool call id"}})
             self.pending[call_id] = pending
-            definition = self.definitions[name]
-            required_skills = definition.get("required_skills")
-            if not isinstance(required_skills, list):
-                legacy = str(definition.get("required_skill") or "").strip()
-                required_skills = [legacy] if legacy else []
-            proof_names = {
-                skill_name
-                for value in required_skills
-                if (skill_name := str(value).strip()) and skill_name in self.loaded_skills
-            }
-            if definition.get("requires_skill_guidance") is True:
-                allowed = definition.get("allowed_skills")
-                if isinstance(allowed, list):
-                    proof_names.update(
-                        skill_name
-                        for value in allowed
-                        if (skill_name := str(value).strip()) and skill_name in self.loaded_skills
-                    )
-            proofs = [
-                {"name": skill_name, "digest": self.loaded_skills[skill_name]}
-                for skill_name in sorted(proof_names)
-            ]
         payload: dict[str, Any] = {"call_id": call_id, "name": name, "arguments": args}
-        if proofs:
-            payload["skills"] = proofs
-            payload["skill"] = proofs[0]
         self.emit("checkpoint", {"message": checkpoint})
         self.emit("tool_request", payload)
         wait_timeout = (
@@ -1244,7 +1241,6 @@ class APIServerRuntimeMixin:
                 else _NO_SKILL_MANIFEST
             )
             allowed_skill_digests = _runtime_allowed_skill_digests(
-                definitions,
                 skill_manifest,
             )
             allowed_skill_names = set(allowed_skill_digests)
@@ -1255,6 +1251,7 @@ class APIServerRuntimeMixin:
                 + _run_state_prompt(body.get("run_state"))
             )
             schemas = _tool_schemas(definitions)
+            tool_exposure = build_runtime_tool_exposure(definitions, schemas)
             normalized_messages = [
                 {"role": str(item.get("role") or ""), "content": _message_text(item.get("content"))}
                 for item in messages
@@ -1325,6 +1322,7 @@ class APIServerRuntimeMixin:
             definitions,
             int(body.get("deadline_ms") or 0),
             agent_session_id,
+            tool_exposure=tool_exposure,
             allowed_skill_names=allowed_skill_names,
             allowed_skill_projections=allowed_skill_projections,
             allowed_image_paths={str(path) for path in runtime_image_paths},
@@ -1365,7 +1363,7 @@ class APIServerRuntimeMixin:
                 for tool in native
             ):
                 native.append(_native_video_tool_definition())
-            agent.tools = native + schemas
+            agent.tools = native + tool_exposure.model_schemas
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
             _pin_run_model(agent, body.get("model"))
             agent.ephemeral_system_prompt = None
