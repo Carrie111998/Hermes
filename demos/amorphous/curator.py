@@ -143,7 +143,7 @@ def run_curator(store: Store, user_id: str, since_ts: float) -> dict | None:
         wf = store.create_workflow(user_id, name=title, prompt_template=template,
                                    description=f"Auto-created: you asked this {count}× this period.",
                                    created_by="curator")
-        comp = new_component("workflow_button", title, 0, 0, 3, 1,
+        comp = new_component("workflow_button", title, 3, 1,
                              {"workflow_id": wf["id"]})
         mutations.append({"op": "add", "component": comp})
         notes.append(f"You asked \"{title}\" {count}× — minted a one-click workflow for it.")
@@ -225,18 +225,17 @@ def _llm_refine(spec: dict, usage: dict, draft: list[dict], store: Store,
 # ---------- chat-prompted rebuild ----------
 
 _REBUILD_SYSTEM = """You design mission-control dashboards from a component library.
-Component types: metric, timeseries, table, workflow_button, workflow_panel,
-agent_activity, notes, datasource_status, quick_links, evolution_log.
-Datasources and queries available:
-  datadog: p95.latency (metric,ms), error.rate (metric,%), requests.volume (timeseries)
-  betterstack: uptime.30d (metric,%), incidents.open (table)
-  metabase: signups.by_day (table)
-  confluence: runbooks (links)
+Component types: metric, timeseries, table, kv, feed, links, workflow_button,
+workflow_panel, notes, connections.
+Data components take props {{"source": "...", "query": {{...}}}} — sources:
+  git.log{{repo,limit}}, git.status{{repo}}, github.prs{{repo?,limit}},
+  github.issues{{repo?}}, system.stats{{}}, crypto.price{{coins}},
+  crypto.chart{{coin}}, rss{{url,limit}}, weather{{lat,lon}},
+  datadog.query{{query}}, betterstack.monitors{{}}, station.activity{{}}
 Workflows available: {workflows}
-Grid is 12 columns. Respond ONLY with JSON:
-{{"title": "...", "components": [{{"id","type","title","col","row","w","h","props"}}]}}
-props for data components: {{"datasource": "...", "query": "..."}};
-for workflow_button: {{"workflow_id": "..."}}."""
+Grid is 12 columns; components carry w (1-12) and h (rows). Respond ONLY with JSON:
+{{"title": "...", "components": [{{"id","type","title","w","h","props"}}]}}
+for workflow_button props: {{"workflow_id": "..."}}."""
 
 
 def rebuild_from_prompt(store: Store, user_id: str, prompt: str) -> dict | None:
@@ -302,10 +301,10 @@ def _offline_rebuild(spec: dict, prompt: str) -> dict:
     if "incident" in low or "ops" in low:
         comps = boost(lambda c: "incident" in c["title"].lower() or c["type"] == "workflow_button")
     elif "growth" in low or "business" in low or "signup" in low:
-        comps = boost(lambda c: c["props"].get("datasource") == "metabase" or c["type"] == "metric")
+        comps = boost(lambda c: c["type"] in ("metric", "table"))
     elif "minimal" in low or "clean" in low:
         for c in comps:
-            if c["type"] in ("quick_links", "notes", "evolution_log"):
+            if c["type"] in ("links", "notes", "connections"):
                 c["hidden"] = True
     new_spec["components"] = comps
     return new_spec

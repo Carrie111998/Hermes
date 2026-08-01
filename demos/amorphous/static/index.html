@@ -8,42 +8,49 @@
 </head>
 <body>
 <header id="topbar">
-  <div class="brand">☤ <span>Hermes Station</span> <small style="color:var(--dim);font-weight:400">amorphous applications</small></div>
+  <div class="brand"><span class="sigil">☤</span> Hermes Station <small>amorphous applications</small></div>
   <div class="top-actions">
-    <span id="agent-badge" class="badge">agent: …</span>
-    <button id="btn-evolve" title="Run the evolution curator now">⚗ Evolve now</button>
-    <button id="btn-proposals" title="Pending proposals">▣ Proposals <span id="proposal-count" class="pill">0</span></button>
-    <button id="btn-chat-toggle" title="Toggle chat dock">◎ Chat</button>
+    <span id="agent-badge" class="badge"><span class="dot"></span><span id="agent-label">agent</span></span>
+    <button class="btn ghost" id="btn-evolve" title="Run the evolution curator now">⚗ Evolve</button>
+    <button class="btn ghost" id="btn-proposals">▣ Proposals <span id="proposal-count" class="pill zero">0</span></button>
+    <button class="btn ghost" id="btn-chat-toggle" title="Toggle chat dock">◎ Chat</button>
   </div>
 </header>
 
-<main id="grid"></main>
+<div id="grid-wrap"><div id="grid"></div><div id="hidden-bar" class="hidden-bar"></div></div>
 
-<aside id="proposal-tray" class="hidden">
-  <div class="tray-head">
-    <h3>Evolution proposals</h3>
-    <button class="ghost" id="tray-close">✕</button>
-  </div>
+<aside id="proposal-tray">
+  <div class="tray-head"><h3>Evolution proposals</h3>
+    <button class="icon-btn" id="tray-close">✕</button></div>
   <div id="proposal-list"></div>
 </aside>
 
+<div id="ctx-menu"></div>
+
+<div id="comp-chat">
+  <div class="head"><span>◎ Ask <span class="scope" id="comp-chat-title"></span></span>
+    <button class="icon-btn" id="comp-chat-close">✕</button></div>
+  <div class="log" id="comp-chat-log"></div>
+  <form id="comp-chat-form"><input id="comp-chat-input" autocomplete="off"
+    placeholder="Ask about this component, or tell it to change…"></form>
+</div>
+
 <section id="chat-dock" data-position="bottom">
   <div id="chat-head">
-    <span>◎ Hermes</span>
-    <span class="chat-hint">try: /rebuild focus on incidents · /evolve</span>
-    <span class="chat-buttons">
-      <button class="ghost" id="chat-dock-move" title="Move dock">⇄</button>
-      <button class="ghost" id="chat-dock-hide" title="Hide">—</button>
-    </span>
+    <span class="who">◎ Hermes</span>
+    <span class="hint">full agent · changes the dashboard live · /rebuild · /evolve</span>
+    <button class="icon-btn" id="chat-dock-move" title="Dock right / bottom">⇄</button>
+    <button class="icon-btn" id="chat-dock-hide" title="Collapse">—</button>
   </div>
   <div id="chat-log"></div>
   <form id="chat-form">
     <input id="chat-input" autocomplete="off"
-           placeholder="Ask Hermes anything, or /rebuild <describe the dashboard you want>…">
-    <button type="submit">Send</button>
+           placeholder="Ask Hermes, or tell it to reshape your dashboard…">
+    <button class="btn primary sm" type="submit">Send</button>
   </form>
 </section>
 
+<div id="toast"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,20 +1,11 @@
-"""Component library + default seed dashboards for Amorphous Applications.
+"""Component library, templates, and layout mutation engine for Hermes Station.
 
-A dashboard *spec* is JSON:
-{
-  "title": "...",
-  "user_id": "...",
-  "grid": {"columns": 12},
-  "components": [
-     {"id": "...", "type": "<registry type>", "title": "...",
-      "col": 0, "row": 0, "w": 4, "h": 2, "props": {...}, "hidden": false}
-  ],
-  "chat_dock": {"position": "bottom", "visible": true}
-}
+Grid model: 12 columns × fixed row height (110px). Components declare w (cols)
+and h (rows). The reflow packer places visible components greedily with NO gaps:
+it always drops each card into the leftmost-topmost slot it fits (skyline pack),
+which eliminates stray whitespace even with mixed sizes.
 
-Component *types* are the pre-built library the curator composes from.
-Each type declares a renderer key the frontend knows, plus a data endpoint
-contract the server fulfils.
+Data components carry props {source, query:{...}} resolved by datasources.py.
 """
 
 from __future__ import annotations
@@ -23,161 +14,174 @@ import copy
 import uuid
 
 COMPONENT_LIBRARY: dict[str, dict] = {
-    "metric": {
-        "name": "Metric tile",
-        "description": "Single headline number with delta (from a datasource query).",
-        "min_w": 2, "min_h": 1,
-    },
-    "timeseries": {
-        "name": "Timeseries chart",
-        "description": "Line/area chart from a datasource query.",
-        "min_w": 4, "min_h": 2,
-    },
-    "table": {
-        "name": "Data table",
-        "description": "Tabular records from a datasource query.",
-        "min_w": 4, "min_h": 2,
-    },
-    "workflow_button": {
-        "name": "Workflow shortcut",
-        "description": "One-click repeatable agent workflow; surfaces last run result.",
-        "min_w": 2, "min_h": 1,
-    },
-    "workflow_panel": {
-        "name": "Workflow panel",
-        "description": "Parameterized agent workflow with input fields + run history.",
-        "min_w": 4, "min_h": 2,
-    },
-    "agent_activity": {
-        "name": "Agent activity feed",
-        "description": "Recent Hermes sessions, cron jobs, and workflow runs.",
-        "min_w": 3, "min_h": 2,
-    },
-    "notes": {
-        "name": "Notes / briefing",
-        "description": "Agent-maintained markdown briefing (curator can rewrite).",
-        "min_w": 3, "min_h": 2,
-    },
-    "datasource_status": {
-        "name": "Datasource status",
-        "description": "Connection health for external datasources.",
-        "min_w": 2, "min_h": 1,
-    },
-    "quick_links": {
-        "name": "Quick links",
-        "description": "Curated links (Confluence pages, runbooks, dashboards).",
-        "min_w": 2, "min_h": 1,
-    },
-    "evolution_log": {
-        "name": "Evolution log",
-        "description": "History of curator proposals and applied mutations.",
-        "min_w": 3, "min_h": 2,
-    },
+    "metric":          {"name": "Metric tile", "min_w": 2, "min_h": 1},
+    "timeseries":      {"name": "Chart", "min_w": 3, "min_h": 2},
+    "table":           {"name": "Table", "min_w": 4, "min_h": 2},
+    "kv":              {"name": "Key/value panel", "min_w": 2, "min_h": 1},
+    "feed":            {"name": "Activity feed", "min_w": 3, "min_h": 2},
+    "links":           {"name": "Link list", "min_w": 2, "min_h": 1},
+    "workflow_button": {"name": "Workflow shortcut", "min_w": 2, "min_h": 1},
+    "workflow_panel":  {"name": "Workflow panel", "min_w": 3, "min_h": 2},
+    "notes":           {"name": "Notes / briefing", "min_w": 2, "min_h": 1},
+    "connections":     {"name": "Connections status", "min_w": 2, "min_h": 1},
 }
 
 
-def new_component(ctype: str, title: str, col: int, row: int, w: int, h: int,
+def new_component(ctype: str, title: str, w: int, h: int,
                   props: dict | None = None, cid: str | None = None) -> dict:
     if ctype not in COMPONENT_LIBRARY:
         raise ValueError(f"unknown component type: {ctype}")
-    return {
-        "id": cid or f"{ctype}-{uuid.uuid4().hex[:6]}",
-        "type": ctype,
-        "title": title,
-        "col": col, "row": row, "w": w, "h": h,
-        "props": props or {},
-        "hidden": False,
-    }
+    return {"id": cid or f"{ctype}-{uuid.uuid4().hex[:6]}", "type": ctype,
+            "title": title, "w": w, "h": h, "props": props or {},
+            "hidden": False}
 
 
-def seed_layout(user_id: str, persona: str = "sre") -> dict:
-    """Default mission-control layout for a new user (SRE-flavoured demo persona)."""
-    comps = [
-        new_component("metric", "API p95 latency", 0, 0, 3, 1,
-                      {"datasource": "datadog", "query": "p95.latency", "unit": "ms"},
-                      cid="m-latency"),
-        new_component("metric", "Error rate", 3, 0, 3, 1,
-                      {"datasource": "datadog", "query": "error.rate", "unit": "%"},
-                      cid="m-errors"),
-        new_component("metric", "Uptime (30d)", 6, 0, 3, 1,
-                      {"datasource": "betterstack", "query": "uptime.30d", "unit": "%"},
-                      cid="m-uptime"),
-        new_component("datasource_status", "Datasources", 9, 0, 3, 1, {},
-                      cid="ds-status"),
-        new_component("timeseries", "Request volume", 0, 1, 6, 2,
-                      {"datasource": "datadog", "query": "requests.volume"},
-                      cid="ts-requests"),
-        new_component("table", "Open incidents", 6, 1, 6, 2,
-                      {"datasource": "betterstack", "query": "incidents.open"},
-                      cid="tbl-incidents"),
-        new_component("workflow_button", "Triage latest incident", 0, 3, 3, 1,
-                      {"workflow_id": "wf-triage"}, cid="wf-btn-triage"),
-        new_component("workflow_button", "Daily standup summary", 3, 3, 3, 1,
-                      {"workflow_id": "wf-standup"}, cid="wf-btn-standup"),
-        new_component("workflow_panel", "Ask about a service", 6, 3, 6, 2,
-                      {"workflow_id": "wf-service-report",
-                       "inputs": [{"name": "service", "label": "Service name"}]},
-                      cid="wf-panel-service"),
-        new_component("table", "Metabase: signups by day", 0, 4, 6, 2,
-                      {"datasource": "metabase", "query": "signups.by_day"},
-                      cid="tbl-signups"),
-        new_component("quick_links", "Runbooks (Confluence)", 0, 6, 3, 1,
-                      {"datasource": "confluence", "query": "runbooks"},
-                      cid="ql-runbooks"),
-        new_component("agent_activity", "Hermes activity", 3, 6, 5, 2, {},
-                      cid="agent-activity"),
-        new_component("evolution_log", "Dashboard evolution", 8, 6, 4, 2, {},
-                      cid="evo-log"),
-        new_component("notes", "Morning briefing", 9, 1, 3, 1,
-                      {"markdown": "_The curator will maintain this briefing "
-                                   "based on what you focus on._"},
-                      cid="notes-briefing"),
+# ---------------------------------------------------------------- templates
+
+def _dev_template(user_id: str, repo: str = ".") -> list[dict]:
+    return [
+        new_component("kv", "Repo status", 3, 1,
+                      {"source": "git.status", "query": {"repo": repo}}, "dev-status"),
+        new_component("kv", "System", 3, 1,
+                      {"source": "system.stats", "query": {}}, "dev-system"),
+        new_component("workflow_button", "Review my uncommitted diff", 3, 1,
+                      {"workflow_id": "wf-review-diff"}, "dev-wf-review"),
+        new_component("workflow_button", "Summarize repo activity", 3, 1,
+                      {"workflow_id": "wf-repo-summary"}, "dev-wf-summary"),
+        new_component("table", "Commit history", 6, 2,
+                      {"source": "git.log", "query": {"repo": repo, "limit": 10}}, "dev-log"),
+        new_component("table", "Open PRs", 6, 2,
+                      {"source": "github.prs", "query": {"cwd": repo, "limit": 8}}, "dev-prs"),
+        new_component("table", "Open issues", 6, 2,
+                      {"source": "github.issues", "query": {"cwd": repo, "limit": 8}}, "dev-issues"),
+        new_component("links", "Hacker News", 3, 2,
+                      {"source": "rss", "query": {"url": "https://hnrss.org/frontpage", "limit": 7}}, "dev-hn"),
+        new_component("feed", "Station activity", 3, 2,
+                      {"source": "station.activity", "query": {}}, "dev-activity"),
+        new_component("notes", "Briefing", 3, 1,
+                      {"markdown": "Hermes maintains this from your usage."}, "dev-notes"),
     ]
-    return {
+
+
+def _trader_template(user_id: str) -> list[dict]:
+    return [
+        new_component("table", "Prices", 4, 2,
+                      {"source": "crypto.price",
+                       "query": {"coins": "bitcoin,ethereum,solana,dogecoin"}}, "tr-prices"),
+        new_component("timeseries", "BTC 7d", 4, 2,
+                      {"source": "crypto.chart", "query": {"coin": "bitcoin"}}, "tr-btc"),
+        new_component("timeseries", "ETH 7d", 4, 2,
+                      {"source": "crypto.chart", "query": {"coin": "ethereum"}}, "tr-eth"),
+        new_component("workflow_button", "Morning market brief", 3, 1,
+                      {"workflow_id": "wf-market-brief"}, "tr-wf-brief"),
+        new_component("workflow_panel", "Analyze an asset", 5, 2,
+                      {"workflow_id": "wf-asset-analysis",
+                       "inputs": [{"name": "asset", "label": "Asset (e.g. solana)"}]}, "tr-wf-asset"),
+        new_component("links", "Market news", 4, 2,
+                      {"source": "rss",
+                       "query": {"url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "limit": 7}}, "tr-news"),
+        new_component("feed", "Station activity", 3, 1,
+                      {"source": "station.activity", "query": {}}, "tr-activity"),
+        new_component("notes", "Trade notes", 3, 1,
+                      {"markdown": "Ideas and levels — Hermes keeps this current."}, "tr-notes"),
+    ]
+
+
+def _exec_template(user_id: str) -> list[dict]:
+    return [
+        new_component("workflow_button", "Daily exec brief", 3, 1,
+                      {"workflow_id": "wf-exec-brief"}, "ex-wf-brief"),
+        new_component("workflow_panel", "Research a competitor", 5, 2,
+                      {"workflow_id": "wf-competitor",
+                       "inputs": [{"name": "company", "label": "Company"}]}, "ex-wf-comp"),
+        new_component("links", "Industry news", 4, 2,
+                      {"source": "rss", "query": {"url": "https://hnrss.org/frontpage", "limit": 7}}, "ex-news"),
+        new_component("kv", "Weather", 2, 1,
+                      {"source": "weather", "query": {"lat": 30.27, "lon": -97.74}}, "ex-wx"),
+        new_component("table", "Markets", 4, 2,
+                      {"source": "crypto.price", "query": {"coins": "bitcoin,ethereum"}}, "ex-mkt"),
+        new_component("feed", "Station activity", 3, 2,
+                      {"source": "station.activity", "query": {}}, "ex-activity"),
+        new_component("notes", "Priorities", 3, 1,
+                      {"markdown": "Top 3 priorities — tell Hermes and it will track them."}, "ex-notes"),
+    ]
+
+
+TEMPLATES = {
+    "developer": {"name": "Developer", "blurb": "Repos, commits, PRs/issues, code workflows",
+                  "builder": _dev_template},
+    "trader": {"name": "Trader", "blurb": "Live prices, charts, market briefs",
+               "builder": _trader_template},
+    "executive": {"name": "Executive", "blurb": "Briefs, research workflows, news, markets",
+                  "builder": _exec_template},
+    "blank": {"name": "Blank canvas", "blurb": "Start empty; build it in chat with Hermes",
+              "builder": lambda user_id, **kw: [
+                  new_component("notes", "Getting started", 4, 1,
+                                {"markdown": "Ask the chat below to build your dashboard — "
+                                             "e.g. \"add my repo's commit log and open PRs\"."},
+                                "blank-notes"),
+                  new_component("connections", "Connections", 3, 1, {}, "blank-conn"),
+              ]},
+}
+
+TEMPLATE_WORKFLOWS = {
+    "developer": [
+        {"id": "wf-review-diff", "name": "Review my uncommitted diff",
+         "description": "Reads git diff in the configured repo and reviews it.",
+         "prompt_template": "Run `git diff` (and `git diff --staged`) in {repo} via the "
+                            "terminal, then review the changes: bugs, risks, missing tests. "
+                            "If clean, say so. Context: {context}"},
+        {"id": "wf-repo-summary", "name": "Summarize repo activity",
+         "description": "Last 24h of commits/PRs/issues.",
+         "prompt_template": "Using git log and gh CLI in {repo}, summarize the last 24h: "
+                            "commits, opened/merged PRs, new issues. 5 bullets max. Context: {context}"},
+    ],
+    "trader": [
+        {"id": "wf-market-brief", "name": "Morning market brief",
+         "description": "Prices + overnight moves + notable news.",
+         "prompt_template": "Produce a morning market brief: check current BTC/ETH/SOL prices "
+                            "and 24h moves (station_query_datasource crypto.price), scan market "
+                            "news, and give 5 bullets: moves, catalysts, one risk. Context: {context}"},
+        {"id": "wf-asset-analysis", "name": "Analyze an asset",
+         "description": "Price action + news scan for one asset.",
+         "prompt_template": "Analyze {asset}: fetch its 7d chart data and current price via "
+                            "station_query_datasource, search the web for recent news, and give "
+                            "a terse read: trend, key levels, catalysts, risks. Context: {context}"},
+    ],
+    "executive": [
+        {"id": "wf-exec-brief", "name": "Daily exec brief",
+         "description": "News + markets + dashboard activity in 5 bullets.",
+         "prompt_template": "Produce today's exec brief: scan the news feeds on my dashboard, "
+                            "markets, and recent Station activity. 5 bullets: what matters, why, "
+                            "any action needed. Context: {context}"},
+        {"id": "wf-competitor", "name": "Research a competitor",
+         "description": "Web research on a named company.",
+         "prompt_template": "Research {company}: recent launches, funding, positioning vs us. "
+                            "Web-search as needed. Output: 6 bullets + one strategic implication. "
+                            "Context: {context}"},
+    ],
+    "blank": [],
+}
+
+
+def seed_layout(user_id: str, template: str = "developer", **kw) -> dict:
+    t = TEMPLATES.get(template, TEMPLATES["developer"])
+    comps = t["builder"](user_id, **kw)
+    spec = {
         "title": f"Hermes Station — {user_id}",
         "user_id": user_id,
-        "persona": persona,
-        "grid": {"columns": 12},
+        "template": template,
+        "grid": {"columns": 12, "row_px": 110},
         "components": comps,
         "chat_dock": {"position": "bottom", "visible": True},
     }
+    _reflow(spec)
+    return spec
 
 
-SEED_WORKFLOWS = [
-    {"id": "wf-triage", "name": "Triage latest incident",
-     "description": "Pull the newest open incident and produce a triage plan.",
-     "prompt_template": "Review the latest open incident from our monitoring "
-                        "(context: {context}). Produce a 5-line triage plan: likely "
-                        "cause, blast radius, first mitigation step, who to page, "
-                        "and a customer-comms one-liner."},
-    {"id": "wf-standup", "name": "Daily standup summary",
-     "description": "Summarize the last 24h of dashboard + agent activity.",
-     "prompt_template": "Summarize the last 24 hours for a standup update. "
-                        "Activity data: {context}. Output 3 bullets: what happened, "
-                        "what's at risk, what needs a decision."},
-    {"id": "wf-service-report", "name": "Service report",
-     "description": "Deep-dive report on a named service.",
-     "prompt_template": "Produce a short health report for service '{service}'. "
-                        "Metrics context: {context}. Cover latency, errors, recent "
-                        "deploys, and one recommendation."},
-]
-
+# ---------------------------------------------------------------- mutations
 
 def apply_mutations(spec: dict, mutations: list[dict]) -> dict:
-    """Apply curator/user mutations to a layout spec. Returns a new spec.
-
-    Mutation ops:
-      promote   {component_id}            -> move toward top-left, grow +1w (cap 6)
-      shrink    {component_id}            -> shrink to min size
-      hide      {component_id}
-      show      {component_id}
-      remove    {component_id}
-      retitle   {component_id, title}
-      add       {component}               -> full component dict
-      set_props {component_id, props}     -> shallow-merge props
-      set_notes {component_id, markdown}
-      move_chat_dock {position}
-    """
     spec = copy.deepcopy({k: v for k, v in spec.items() if k != "_meta"})
     comps = spec.setdefault("components", [])
     by_id = {c["id"]: c for c in comps}
@@ -189,12 +193,13 @@ def apply_mutations(spec: dict, mutations: list[dict]) -> dict:
         if op == "promote" and c:
             comps.remove(c)
             comps.insert(0, c)
-            c["row"] = 0
-            c["w"] = min(int(c.get("w", 3)) + 1, 6)
+            c["w"] = min(int(c.get("w", 3)) + 1, 8)
         elif op == "shrink" and c:
             lib = COMPONENT_LIBRARY.get(c["type"], {})
-            c["w"] = lib.get("min_w", 2)
-            c["h"] = lib.get("min_h", 1)
+            c["w"], c["h"] = lib.get("min_w", 2), lib.get("min_h", 1)
+        elif op == "resize" and c:
+            c["w"] = max(1, min(int(m.get("w", c["w"])), 12))
+            c["h"] = max(1, min(int(m.get("h", c["h"])), 6))
         elif op == "hide" and c:
             c["hidden"] = True
         elif op == "show" and c:
@@ -206,11 +211,15 @@ def apply_mutations(spec: dict, mutations: list[dict]) -> dict:
             c["title"] = m.get("title", c["title"])
         elif op == "add" and m.get("component"):
             nc = m["component"]
-            if nc.get("type") in COMPONENT_LIBRARY and nc.get("id") not in by_id:
-                nc.setdefault("hidden", False)
-                nc.setdefault("props", {})
-                comps.append(nc)
-                by_id[nc["id"]] = nc
+            if nc.get("type") in COMPONENT_LIBRARY:
+                nc.setdefault("id", f"{nc['type']}-{uuid.uuid4().hex[:6]}")
+                if nc["id"] not in by_id:
+                    nc.setdefault("hidden", False)
+                    nc.setdefault("props", {})
+                    nc.setdefault("w", COMPONENT_LIBRARY[nc["type"]]["min_w"])
+                    nc.setdefault("h", COMPONENT_LIBRARY[nc["type"]]["min_h"])
+                    comps.append(nc)
+                    by_id[nc["id"]] = nc
         elif op == "set_props" and c:
             c.setdefault("props", {}).update(m.get("props", {}))
         elif op == "set_notes" and c and c["type"] == "notes":
@@ -223,19 +232,32 @@ def apply_mutations(spec: dict, mutations: list[dict]) -> dict:
 
 
 def _reflow(spec: dict) -> None:
-    """Greedy re-pack of visible components into the grid, preserving order."""
+    """Skyline packer: place each visible component at the leftmost-topmost
+    position it fits. No gaps, works with mixed sizes, preserves list order
+    as priority."""
     columns = spec.get("grid", {}).get("columns", 12)
-    col = row = 0
-    row_h = 1
-    for c in spec.get("components", []):
-        if c.get("hidden"):
-            continue
-        w = min(int(c.get("w", 3)), columns)
-        h = int(c.get("h", 1))
+    occupied: set[tuple[int, int]] = set()
+
+    def fits(col: int, row: int, w: int, h: int) -> bool:
         if col + w > columns:
-            col = 0
-            row += row_h
-            row_h = 1
-        c["col"], c["row"], c["w"] = col, row, w
-        col += w
-        row_h = max(row_h, h)
+            return False
+        return all((c, r) not in occupied
+                   for c in range(col, col + w) for r in range(row, row + h))
+
+    for comp in spec.get("components", []):
+        if comp.get("hidden"):
+            continue
+        w = max(1, min(int(comp.get("w", 3)), columns))
+        h = max(1, int(comp.get("h", 1)))
+        row = 0
+        placed = False
+        while not placed:
+            for col in range(0, columns - w + 1):
+                if fits(col, row, w, h):
+                    comp["col"], comp["row"] = col, row
+                    for cc in range(col, col + w):
+                        for rr in range(row, row + h):
+                            occupied.add((cc, rr))
+                    placed = True
+                    break
+            row += 1

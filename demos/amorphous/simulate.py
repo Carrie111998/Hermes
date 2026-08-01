@@ -22,9 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from store import Store  # noqa: E402
 
-HOT = ["tbl-incidents", "wf-btn-triage", "ts-requests", "m-errors"]
-COLD = ["tbl-signups", "ql-runbooks", "m-uptime"]
-REPEATED_PROMPT = "what is the current deploy status of api-gateway"
+HOT = ["dev-prs", "dev-wf-review", "dev-log", "dev-status"]
+COLD = ["dev-hn", "ex-wx", "dev-notes"]
+REPEATED_PROMPT = "what is the ci status of hermes-agent main"
 
 
 def main() -> None:
@@ -48,24 +48,24 @@ def main() -> None:
             n += 2
         elif roll < 0.6:
             store.record_event(args.user, "workflow_run", rng.choice(HOT[:2]),
-                               {"workflow_id": "wf-triage"})
+                               {"workflow_id": "wf-review-diff"})
             n += 1
         elif roll < 0.72:
             store.record_event(args.user, "chat", None, {"text": REPEATED_PROMPT})
             n += 1
         elif roll < 0.8:
             store.record_event(args.user, "chat", None, {"text": rng.choice([
-                "summarize open incidents",
-                "who is on call today",
-                "did the 14:20 deploy finish",
+                "summarize open PRs",
+                "who opened the newest issue",
+                "did CI pass on the last commit",
             ])})
             n += 1
         else:
-            store.record_event(args.user, "view", rng.choice(HOT + ["agent-activity"]))
+            store.record_event(args.user, "view", rng.choice(HOT + ["dev-activity"]))
             n += 1
 
     # the user manually hid a cold component at some point
-    store.record_event(args.user, "hide", "ql-runbooks")
+    store.record_event(args.user, "hide", "dev-hn")
     n += 1
 
     print(f"Simulated {n} interaction events for user '{args.user}' in {args.db}")
