@@ -440,3 +440,39 @@ def test_atomic_routing_replace_receives_snapshot_timestamp(tmp_path):
     kwargs = db.replace_gateway_routing_entries.call_args.kwargs
     assert kwargs["scope"] == store._routing_scope()
     assert isinstance(kwargs["snapshot_at"], float)
+
+
+def test_snapshot_timestamp_is_captured_before_routing_copy(tmp_path, monkeypatch):
+    """The preserve-newer boundary must start before routing serialization.
+
+    If ``snapshot_at`` is captured after copying ``_entries``, a handoff that
+    lands during the copy can be absent from the stale snapshot while still
+    having ``updated_at <= snapshot_at``. The DB guarded replace would then be
+    allowed to delete the newer handoff. Capturing time first makes every
+    handoff committed during snapshot construction strictly newer than the
+    snapshot boundary.
+    """
+    db = _db_with_rows({})
+    store = _make_store(tmp_path, db)
+    key = store._generate_session_key(_source())
+    entry = _seed_entry(store, key, "sid-a")
+    timestamp_captured = False
+    original_to_dict = entry.to_dict
+
+    def fake_time():
+        nonlocal timestamp_captured
+        timestamp_captured = True
+        return 123.456
+
+    def asserting_to_dict():
+        assert timestamp_captured, "snapshot_at must be captured before copying entries"
+        return original_to_dict()
+
+    monkeypatch.setattr("gateway.session.time.time", fake_time)
+    monkeypatch.setattr(entry, "to_dict", asserting_to_dict)
+
+    data, generation, snapshot_at = store._snapshot_routing_locked()
+
+    assert key in data
+    assert generation == 1
+    assert snapshot_at == 123.456

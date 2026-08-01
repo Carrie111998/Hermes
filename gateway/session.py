@@ -1292,11 +1292,9 @@ class SessionStore:
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int, float]:
         """Capture immutable routing data, generation, and snapshot time."""
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
-        return (
-            {key: entry.to_dict() for key, entry in self._entries.items()},
-            self._routing_generation,
-            time.time(),
-        )
+        snapshot_at = time.time()
+        data = {key: entry.to_dict() for key, entry in self._entries.items()}
+        return data, self._routing_generation, snapshot_at
 
     def _persist_routing_data(
         self, data: Dict[str, Any], generation: int, snapshot_at: float
