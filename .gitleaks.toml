@@ -81,6 +81,13 @@ regexes = [
   # name glued directly onto preceding value text (no whitespace, quote, or
   # line start before it) is the concatenated-assignment shape those tests
   # exist to exercise — never a real assignment, which puts the name at a
-  # boundary. Recurred in #118 and #122; this covers future such fixtures.
-  '''[A-Za-z0-9](ANTHROPIC|OPENAI|OPENROUTER|FIRECRAWL|FAL)_(API_)?KEY=''',
+  # boundary. Recurred in #118 and #122.
+  #
+  # This must NOT be the shape alone (`regexTarget = "line"` means a bare
+  # `[A-Za-z0-9]KEY=` shape allowlists *any* line anywhere in the repo with
+  # that structure — including a real key accidentally pasted directly in
+  # front of one of these provider names). Match the exact synthetic
+  # fixture text instead: a new fixture needs a new entry here, same as
+  # every other placeholder above.
+  '''(abcANTHROPIC_API_KEY=|sk1ANTHROPIC_API_KEY=sk2|testANTHROPIC_API_KEY=sk-ant-test123|valFIRECRAWL_API_KEY=val2|111FIRECRAWL_API_KEY=222)''',
 ]
