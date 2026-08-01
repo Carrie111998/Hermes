@@ -12216,6 +12216,40 @@ def main():
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
+    sessions_finalize_orphans = sessions_subparsers.add_parser(
+        "finalize-orphans",
+        help="Audit or finalize proven abandoned CLI session rows",
+        description=(
+            "Report old unended CLI rows using live process-owner and state "
+            "evidence. Default is read-only. --apply reclassifies under the "
+            "owner-registry lock, then only sets ended_at/end_reason; it never "
+            "deletes transcripts."
+        ),
+    )
+    sessions_finalize_orphans.add_argument(
+        "--apply",
+        action="store_true",
+        help="Finalize proven candidates; requires --yes (default: dry run)",
+    )
+    sessions_finalize_orphans.add_argument(
+        "--yes", "-y", action="store_true", help="Authorize metadata-only apply"
+    )
+    sessions_finalize_orphans.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=24.0,
+        help="Minimum inactivity age in hours (default: 24)",
+    )
+    sessions_finalize_orphans.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum old unended rows to classify (default: 100)",
+    )
+    sessions_finalize_orphans.add_argument(
+        "--json", action="store_true", help="Print the full machine-readable report"
+    )
+
     sessions_rename = sessions_subparsers.add_parser(
         "rename", help="Set or change a session's title"
     )

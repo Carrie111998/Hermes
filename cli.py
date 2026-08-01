@@ -1337,9 +1337,57 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
         _single_query_finalize_attempted_session_ids.add(session_id)
 
 
+def _finalize_owned_cli_session_row(cli) -> None:
+    """Persist and end the SQLite row owned by a terminating CLI surface."""
+    agent = getattr(cli, "agent", None)
+    session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
+    session_db = getattr(cli, "_session_db", None)
+    if not session_db or not session_id:
+        return
+
+    persist = getattr(cli, "_persist_active_session_before_close", None)
+    if callable(persist):
+        try:
+            persisted = persist()
+        except (Exception, KeyboardInterrupt) as exc:
+            # Never mark the row closed if the final transcript flush failed.
+            # Leaving it open is fail-closed: later recovery preserves the
+            # already-durable transcript and keeps the persistence failure
+            # visible instead of converting it into a clean terminal state.
+            warning = (
+                "Warning: final transcript persistence failed; session row was left open "
+                "for audited recovery."
+            )
+            logger.warning("Could not persist CLI session before close: %s", exc)
+            print(warning, file=sys.stderr)
+            return
+        if persisted is False:
+            warning = (
+                "Warning: final transcript persistence failed; session row was left open "
+                "for audited recovery."
+            )
+            logger.warning("CLI session persistence reported failure before close")
+            print(warning, file=sys.stderr)
+            return
+
+    try:
+        session_db.end_session(session_id, "cli_close")
+    except (Exception, KeyboardInterrupt) as exc:
+        logger.debug("Could not close CLI session in DB: %s", exc)
+
+    if not getattr(cli, "_delete_session_on_exit", False):
+        discard_empty = getattr(cli, "_discard_session_if_empty", None)
+        if callable(discard_empty):
+            try:
+                discard_empty(session_id)
+            except (Exception, KeyboardInterrupt) as exc:
+                logger.debug("Could not prune empty CLI session: %s", exc)
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
+        _finalize_owned_cli_session_row(cli)
         _notify_single_query_session_finalize(cli)
         _run_cleanup(notify_session_finalize=False)
     finally:
@@ -2148,6 +2196,32 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             logger.debug("Orphan compression finalize skipped: %s", _finalize_exc)
 
         cfg = (_load_full_config().get("sessions") or {})
+
+        # Reconcile proven process-owned crashes before native retention. This
+        # is bounded and interval-gated in state_meta; failures are isolated so
+        # existing archive/prune maintenance still runs.
+        try:
+            from hermes_cli.active_sessions import recover_abandoned_session_rows
+
+            recovery = recover_abandoned_session_rows(
+                session_db,
+                apply=True,
+                older_than_seconds=86400.0,
+                limit=100,
+                respect_interval_seconds=(
+                    float(cfg.get("min_interval_hours", 24)) * 3600.0
+                ),
+            )
+            recovered_count = len(recovery.get("recovered_ids") or [])
+            if recovered_count:
+                logger.info(
+                    "Finalized %d proven abandoned CLI session(s)",
+                    recovered_count,
+                )
+        except Exception as _recovery_exc:
+            logger.warning(
+                "Abandoned-session recovery skipped: %s", _recovery_exc
+            )
 
         # Auto-archive (soft-hide stale sessions) is independent of the
         # destructive auto_prune sweep — run it first, before prune's early
@@ -4571,12 +4645,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"saved to disk and cannot be resumed later. Reason: {e}"
                 )
 
-        # Opportunistic state.db maintenance — runs at most once per
-        # min_interval_hours, tracked via state_meta in state.db itself so
-        # it's shared across all Hermes processes for this HERMES_HOME.
-        # Never blocks startup on failure.
-        _run_state_db_auto_maintenance(self._session_db)
-
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
@@ -4734,14 +4802,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
-            return True
+            message = (
+                "Hermes could not register process ownership; refusing to start "
+                "without lifecycle safety evidence."
+            )
+            if stderr:
+                print(message, file=sys.stderr)
+            else:
+                self._console_print(f"[bold red]{message}[/]")
+            return False
         if message:
             if stderr:
                 print(message, file=sys.stderr)
             else:
                 self._console_print(f"[bold red]{message}[/]")
             return False
+        if lease is None:
+            message = "Hermes did not receive a process ownership lease; refusing to start."
+            if stderr:
+                print(message, file=sys.stderr)
+            else:
+                self._console_print(f"[bold red]{message}[/]")
+            return False
         self._active_session_lease = lease
+        # Owner registration must precede state maintenance. Recovery runs
+        # first inside that boundary, then normal archive/prune retention.
+        session_db = getattr(self, "_session_db", None)
+        if lease is not None and session_db is not None:
+            _run_state_db_auto_maintenance(session_db)
         try:
             atexit.register(self._release_active_session)
         except Exception:
@@ -14207,8 +14295,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
-    def _persist_active_session_before_close(self):
-        """Best-effort SQLite/JSON flush before the CLI marks a session closed.
+    def _persist_active_session_before_close(self) -> bool:
+        """Flush SQLite/JSON state and report whether finalization is safe.
 
         ``run_conversation()`` normally persists at turn boundaries, but a
         terminal close/SIGHUP/SIGTERM can unwind the prompt_toolkit app while
@@ -14217,12 +14305,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session_search, and state.db do not lose the interrupted turn.
         """
         agent = getattr(self, "agent", None)
-        if not agent or not hasattr(agent, "_persist_session"):
-            return
+        if not agent:
+            return True
+        if not hasattr(agent, "_persist_session"):
+            return False
 
         persist_lock = getattr(agent, "_session_persist_lock", None)
 
-        def _snapshot_and_persist() -> None:
+        def _snapshot_and_persist() -> bool:
             # This snapshot must share the staging lock with ``chat()``. Without
             # it, close can retain a mutable history baseline just before chat
             # appends its pending dict; the later flush then mistakes that dict
@@ -14232,7 +14322,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not isinstance(messages, list):
                 messages = getattr(self, "conversation_history", None)
             if not isinstance(messages, list):
-                return
+                return False
             if isinstance(pending_cli_message, dict) and not any(
                 message is pending_cli_message for message in messages
             ):
@@ -14241,7 +14331,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # keeps any durable resumed prefix from being re-appended.
                 messages = [*messages, pending_cli_message]
             if not messages:
-                return
+                return True
 
             # A normal turn builds a new list that reuses the resumed-history dicts.
             # Keep that CLI history as the baseline so a signal between assigning
@@ -14274,23 +14364,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _restore_or_build_system_prompt(agent, None, conversation_history)
                 except Exception:
                     logger.debug("Could not build system prompt during CLI close", exc_info=True)
-                    return
+                    return False
             if getattr(agent, "_cached_system_prompt", None) is None:
-                return
+                return False
 
             agent._ensure_db_session()
-            agent._persist_session(messages, conversation_history)
+            persisted = agent._persist_session(messages, conversation_history)
+            if persisted is False:
+                return False
             if getattr(agent, "session_id", None):
                 self.session_id = agent.session_id
+            return True
 
         try:
             if persist_lock is None:
-                _snapshot_and_persist()
-            else:
-                with persist_lock:
-                    _snapshot_and_persist()
+                return _snapshot_and_persist()
+            with persist_lock:
+                return _snapshot_and_persist()
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Could not persist active CLI session before close: %s", e)
+            return False
 
     def _print_exit_summary(self, clear_screen: bool = True):
         """Print session resume info on exit, similar to Claude Code.
@@ -17292,40 +17385,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
-            # Flush any in-memory turn transcript before marking the session
-            # closed.  On SIGHUP/SIGTERM/window close the agent thread may not
-            # reach its normal run_conversation() persistence path before the
-            # daemon thread is reaped.
-            self._persist_active_session_before_close()
+            # Persist and close the SQLite row through the same idempotent owner
+            # boundary used by one-shot mode. Transcript persistence happens
+            # before end_session(); the first terminal reason still wins.
+            _finalize_owned_cli_session_row(self)
 
-            # Close session in SQLite
-            if hasattr(self, '_session_db') and self._session_db and self.agent:
+            # /exit --delete: also remove the current session's transcripts
+            # and SQLite history. Ported from google-gemini/gemini-cli#19332.
+            if (
+                getattr(self, '_delete_session_on_exit', False)
+                and self._session_db
+                and self.agent
+            ):
                 try:
-                    self._session_db.end_session(self.agent.session_id, "cli_close")
+                    from hermes_constants import get_hermes_home as _ghh
+                    _sessions_dir = _ghh() / "sessions"
+                    _sid = self.agent.session_id
+                    if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
+                        _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
+                    else:
+                        _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
                 except (Exception, KeyboardInterrupt) as e:
-                    logger.debug("Could not close session in DB: %s", e)
-                # Started-and-immediately-quit sessions never gained content;
-                # drop the empty row so /resume and `hermes sessions list`
-                # stay clean (gemini-cli#27770 port). No-op for resumed or
-                # titled sessions and anything with messages or children.
-                if not getattr(self, '_delete_session_on_exit', False):
-                    try:
-                        self._discard_session_if_empty(self.agent.session_id)
-                    except (Exception, KeyboardInterrupt) as e:
-                        logger.debug("Could not prune empty session: %s", e)
-                # /exit --delete: also remove the current session's transcripts
-                # and SQLite history. Ported from google-gemini/gemini-cli#19332.
-                if getattr(self, '_delete_session_on_exit', False):
-                    try:
-                        from hermes_constants import get_hermes_home as _ghh
-                        _sessions_dir = _ghh() / "sessions"
-                        _sid = self.agent.session_id
-                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
-                            _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
-                        else:
-                            _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
-                    except (Exception, KeyboardInterrupt) as e:
-                        logger.debug("Could not delete session on exit: %s", e)
+                    logger.debug("Could not delete session on exit: %s", e)
             # Plugin hook: on_session_end — safety net for interrupted exits.
             # run_conversation() already fires this per-turn on normal completion,
             # so only fire here if the agent was mid-turn (_agent_running) when

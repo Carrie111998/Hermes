@@ -507,15 +507,25 @@ def _claim_active_session_slot(
     try:
         from hermes_cli.active_sessions import try_acquire_active_session
 
-        return try_acquire_active_session(
+        lease, message = try_acquire_active_session(
             session_id=session_key,
             surface=surface,
             config=_load_cfg(),
             metadata={"live_session_id": live_session_id},
         )
+        if lease is None and message is None:
+            message = (
+                "Hermes could not register process ownership; refusing this turn "
+                "without lifecycle safety evidence."
+            )
+        return lease, message
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
-        return None, None
+        return (
+            None,
+            "Hermes could not register process ownership; refusing this turn "
+            "without lifecycle safety evidence.",
+        )
 
 
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
@@ -541,6 +551,11 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     )
     if limit_message is not None:
         return limit_message
+    if lease is None:
+        return (
+            "Hermes could not register process ownership; refusing this turn "
+            "without lifecycle safety evidence."
+        )
     session["active_session_lease"] = lease
     return None
 

@@ -2,7 +2,7 @@
 
 > **Audience:** Gateway developers and maintainers
 > **Source files:** `gateway/session.py` (~1444 lines), `gateway/run.py` (~16800 lines), `gateway/config.py`
-> **Last updated:** 2026-06-16
+> **Last updated:** 2026-07-31
 
 ## Overview
 
@@ -611,6 +611,71 @@ Session expiry watcher evicts agent when session finalizes
 When a session expires:
 1. `_cleanup_agent_resources(agent)` — shuts down memory provider, closes tool resources.
 2. `_evict_cached_agent(key)` — removes from `_agent_cache` so the agent can be GC'd.
+
+---
+
+## 9. Process-owned CLI row finalization and recovery
+
+CLI processes, gateway turns, and the first real TUI/Desktop turn register an
+owner lease in `~/.hermes/runtime/active_sessions.json` before running an agent.
+Registration remains active even when `max_concurrent_sessions` enforcement is
+disabled; the registry is also safety evidence for abandoned-row recovery. A
+registration exception or missing lease rejects the turn rather than running
+without ownership evidence. PID identity includes process start time to resist
+PID reuse.
+
+Normal interactive and `chat -q` shutdown persist the in-memory transcript, end
+the owned SQLite row, then release the owner lease. Empty untitled sessions are
+still deleted by the existing empty-session hygiene rule. Cron and delegated
+children retain their own existing owner/finalizer paths.
+
+Startup recovery is deliberately narrow and fail-closed:
+
+- only `source='cli'` rows from the always-on owner-lease era are eligible;
+- inactivity must exceed 24 hours (default);
+- a live owner lease excludes the row;
+- gateway metadata/routing, Telegram topic bindings, any handoff state,
+  compression locks, active delegations, live parent/child relationships,
+  pinned rows, and archived rows exclude the row;
+- ambiguous rows are reported with an explicit reason and left untouched;
+- recovery only sets `ended_at` and `end_reason='orphan_recovered'`; messages,
+  titles, metadata, and parent/child fields are not deleted or rewritten;
+- startup attempts are bounded by the configured maintenance interval and a
+  persistent last-attempt marker;
+- protected rows do not consume the recoverable-candidate batch limit, so an
+  old pinned, handed-off, delegated, routed, or otherwise protected row cannot
+  permanently starve a later proven orphan;
+- apply classification and update run in one SQLite write transaction while
+  holding the cross-process owner-registry lock; dry classification uses a read
+  connection and does not enter the write/checkpoint path.
+
+### Audit and manual apply
+
+The maintenance command is dry-run by default:
+
+```bash
+hermes sessions finalize-orphans
+hermes sessions finalize-orphans --json
+```
+
+It reports proven candidates and exclusion reasons without creating the lease
+epoch, creating/pruning the owner registry, entering the SQLite write/checkpoint
+path, or changing session rows. The audit copies a verified-stable main database
+to a temporary file and opens only that copy with immutable SQLite access, so
+the live database and WAL/SHM sidecars remain byte-identical. It rejects a
+non-empty WAL or rollback journal and also rejects any main-file or sidecar
+change observed while taking the snapshot rather than returning a potentially
+incomplete report. The temporary snapshot is removed on close. To request a
+write:
+
+```bash
+hermes sessions finalize-orphans --apply --yes
+```
+
+`--apply` requires `--yes`, always performs a fresh dry classification first,
+then reclassifies under the registry lock before changing any row. Use
+`--min-age-hours` and `--limit` to adjust the
+bounded scan. This command is not a transcript-deletion or database-repair tool.
 
 ---
 

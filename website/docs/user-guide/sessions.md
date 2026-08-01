@@ -435,6 +435,44 @@ hermes sessions rename 20250305_091523_a1b2c3d4 debugging auth flow
 
 If the title is already in use by another session, an error is shown.
 
+### Audit Crash-Abandoned CLI Sessions
+
+Hermes normally persists the transcript and ends each process-owned session row
+before releasing its process lease. After a hard kill or power loss, bounded
+startup maintenance can finalize only an old CLI row that has no live
+PID/start-time owner and no gateway route, topic binding, handoff, delegation,
+compression lock, pinned/archive state, or ambiguous parent/child relationship.
+This recovery only records `ended_at` and `end_reason=orphan_recovered`; it does
+not delete or rewrite messages, titles, usage, routing, or bindings.
+
+Audit the same classifier without writing anything:
+
+```bash
+hermes sessions finalize-orphans
+hermes sessions finalize-orphans --json
+hermes sessions finalize-orphans --min-age-hours 48 --limit 200
+```
+
+A dry run does not create the recovery epoch or registry lock, prune the owner
+registry, enter the SQLite write/checkpoint path, or change session rows. It
+copies a verified-stable main database to a temporary file and opens only that
+copy with immutable SQLite access, preserving the live database and WAL/SHM
+sidecars. A non-empty WAL or rollback journal, or any source change observed
+while taking the snapshot, makes the command refuse the audit rather than
+return a potentially incomplete report. The temporary snapshot is removed on
+close. Applying requires
+both flags and reclassifies under the cross-process owner-registry lock before
+writing:
+
+```bash
+hermes sessions finalize-orphans --apply --yes
+```
+
+Rows from before trustworthy always-on owner registration are reported as
+legacy/unproven and are never finalized automatically. Native retention only
+considers ended sessions, so `retention_days` begins to matter after a normal
+or recovered lifecycle boundary; recovery itself is not deletion.
+
 ### Prune Old Sessions
 
 ```bash

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -179,18 +180,44 @@ class _FileLock:
             self._fh = None
 
 
-def _read_entries(path: Path) -> list[dict[str, Any]]:
+def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"invalid active session registry: {path}") from exc
         logger.warning("Ignoring corrupt active session registry at %s", path)
         return []
     entries = data.get("entries") if isinstance(data, dict) else data
     if not isinstance(entries, list):
+        if strict:
+            raise RuntimeError(f"invalid active session registry: {path}")
         return []
+    if strict:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"invalid active session registry: {path}")
+            pid_raw = entry.get("pid")
+            process_start = _optional_float(entry.get("process_start_time"))
+            try:
+                pid = int(str(pid_raw))
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"invalid active session registry: {path}"
+                ) from None
+            if (
+                pid <= 0
+                or process_start is None
+                or process_start <= 0
+                or not isinstance(entry.get("lease_id"), str)
+                or not entry.get("lease_id")
+                or not isinstance(entry.get("session_id"), str)
+                or not entry.get("session_id")
+            ):
+                raise RuntimeError(f"invalid active session registry: {path}")
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
@@ -217,7 +244,8 @@ def _optional_float(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
@@ -234,13 +262,16 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
 
         exists = bool(_pid_exists(pid_int))
     except Exception:
-        return False
+        # Owner liveness is a safety proof. If the process table cannot be
+        # inspected, retain the lease as potentially live rather than allowing
+        # recovery to finalize its session row.
+        return True
     if not exists:
         return False
     expected_start = _optional_float(process_start_time)
     if expected_start is None:
         return True
-    current_start = _process_start_time(pid_int)
+    current_start = _optional_float(_process_start_time(pid_int))
     if current_start is None:
         return True
     return abs(current_start - expected_start) < 0.001
@@ -277,26 +308,24 @@ def try_acquire_active_session(
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
     """Acquire an active-session slot.
 
-    Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
-    a no-op object so callers can unconditionally call ``release()``.
+    Returns ``(lease, None)`` on success. Owner identity is registered even
+    when the concurrency cap is disabled; only cap rejection is skipped.
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
-        return ActiveSessionLease(
-            lease_id=lease_id,
-            session_id=session_id,
-            surface=surface,
-            enabled=False,
-        ), None
 
     now = time.time()
+    process_start_time = _optional_float(_process_start_time(os.getpid()))
+    if process_start_time is None:
+        raise RuntimeError(
+            "active session owner identity unavailable: process start time missing"
+        )
     entry = {
         "lease_id": lease_id,
         "session_id": str(session_id),
         "surface": str(surface),
         "pid": os.getpid(),
-        "process_start_time": _process_start_time(os.getpid()),
+        "process_start_time": process_start_time,
         "started_at": now,
         "updated_at": now,
     }
@@ -307,13 +336,13 @@ def try_acquire_active_session(
 
     state_path = _state_path()
     with _FileLock(_lock_path()):
-        raw_entries = _read_entries(state_path)
+        raw_entries = _read_entries(state_path, strict=True)
         entries = _prune_dead(raw_entries)
         pruned = len(raw_entries) - len(entries)
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
         active_count = len(entries)
-        if active_count >= max_sessions:
+        if max_sessions is not None and active_count >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",
@@ -338,7 +367,7 @@ def release_active_session(lease: ActiveSessionLease) -> None:
     state_path = _state_path()
     try:
         with _FileLock(_lock_path()):
-            entries = _prune_dead(_read_entries(state_path))
+            entries = _prune_dead(_read_entries(state_path, strict=True))
             kept = [
                 entry
                 for entry in entries
@@ -368,7 +397,7 @@ def transfer_active_session(
 
     state_path = _state_path()
     with _FileLock(_lock_path()):
-        entries = _prune_dead(_read_entries(state_path))
+        entries = _prune_dead(_read_entries(state_path, strict=True))
         updated = False
         for entry in entries:
             if str(entry.get("lease_id") or "") != lease.lease_id:
@@ -399,12 +428,11 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
     """
     pid = os.getpid()
     state_path = _state_path()
-    # With the cap disabled the registry is never written, so don't take a lock
-    # (or create its file) on the idle-reaper tick for the majority of installs.
+    # Avoid taking the lock (or creating it) when no registry exists yet.
     if not state_path.exists():
         return 0
     with _FileLock(_lock_path()):
-        entries = _prune_dead(_read_entries(state_path))
+        entries = _prune_dead(_read_entries(state_path, strict=True))
         kept = [
             entry
             for entry in entries
@@ -418,9 +446,82 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
 
 
 def active_session_registry_snapshot() -> list[dict[str, Any]]:
-    """Return the pruned active-session registry for diagnostics/tests."""
+    """Return a pruned active-session snapshot for diagnostics."""
     state_path = _state_path()
     with _FileLock(_lock_path()):
-        entries = _prune_dead(_read_entries(state_path))
+        entries = _prune_dead(_read_entries(state_path, strict=True))
         _write_entries(state_path, entries)
-        return entries
+        return [dict(entry) for entry in entries]
+
+
+def recover_abandoned_session_rows(
+    session_db: Any,
+    *,
+    apply: bool = True,
+    older_than_seconds: float = 86400,
+    limit: int = 100,
+    now: Optional[float] = None,
+    respect_interval_seconds: Optional[float] = None,
+) -> dict[str, Any]:
+    """Classify/recover rows using owner evidence; apply holds the registry lock."""
+    current_time = time.time() if now is None else float(now)
+    state_path = _state_path()
+
+    def _recover(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        active_ids = {
+            str(entry.get("session_id"))
+            for entry in entries
+            if entry.get("session_id")
+        }
+        if apply and respect_interval_seconds is not None:
+            if not session_db.claim_lifecycle_recovery_attempt(
+                now=current_time,
+                interval_seconds=float(respect_interval_seconds),
+            ):
+                return {
+                    "candidate_ids": [],
+                    "recovered_ids": [],
+                    "excluded": {},
+                    "skipped": "interval",
+                }
+        if apply:
+            try:
+                epoch = session_db.get_or_create_lifecycle_recovery_epoch(
+                    now=current_time
+                )
+            except (TypeError, ValueError, RuntimeError):
+                return {
+                    "candidate_ids": [],
+                    "recovered_ids": [],
+                    "excluded": {},
+                    "skipped": "invalid_epoch",
+                }
+        else:
+            epoch = session_db.get_lifecycle_recovery_epoch()
+            if epoch is None:
+                # No always-on lease era has been established yet. Treat every
+                # existing row as legacy/unproven without writing marker state.
+                epoch = current_time
+        return session_db.recover_abandoned_sessions(
+            older_than_seconds=older_than_seconds,
+            active_session_ids=active_ids,
+            eligible_started_after=epoch,
+            source_allowlist=("cli",),
+            limit=limit,
+            now=current_time,
+            apply=apply,
+            report_legacy_exclusions=not apply,
+        )
+
+    if not apply:
+        # A preview is never mutation authority. Read the atomically replaced
+        # registry without taking/creating its lock, and reclassify under lock
+        # if the operator later requests apply.
+        return _recover(_prune_dead(_read_entries(state_path, strict=True)))
+
+    with _FileLock(_lock_path()):
+        raw_entries = _read_entries(state_path, strict=True)
+        entries = _prune_dead(raw_entries)
+        if len(entries) != len(raw_entries):
+            _write_entries(state_path, entries)
+        return _recover(entries)

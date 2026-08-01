@@ -8150,7 +8150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
         if self._is_session_running(session_key):
-            return None, None
+            return None, "A turn is already active for this session; please retry shortly."
         local_limit_message = self._active_session_limit_message(session_key)
         if local_limit_message is not None:
             return None, local_limit_message
@@ -8158,7 +8158,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.active_sessions import try_acquire_active_session
 
             platform = source.platform.value if source and source.platform else "gateway"
-            return try_acquire_active_session(
+            lease, message = try_acquire_active_session(
                 session_id=session_key,
                 surface=f"gateway:{platform}",
                 config=getattr(self, "config", None),
@@ -8168,9 +8168,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "user_id": getattr(source, "user_id", "") or "",
                 },
             )
+            if lease is None and message is None:
+                message = (
+                    "Hermes could not register process ownership; refusing this turn "
+                    "without lifecycle safety evidence."
+                )
+            return lease, message
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
-            return None, None
+            return (
+                None,
+                "Hermes could not register process ownership; refusing this turn "
+                "without lifecycle safety evidence.",
+            )
 
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
