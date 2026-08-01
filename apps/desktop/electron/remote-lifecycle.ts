@@ -213,7 +213,8 @@ async function locateHermes(ssh, remoteHermesPath) {
 }
 
 // Probe the resolved binary's version string (first line of `<hermes> --version`,
-// e.g. "Douglas Agent Agent v0.18.2 ..."), or '' on failure. Surfaces WHICH hermes a
+// e.g. "Hermes Agent v0.18.2 ..." -- the CLI isn't rebranded yet, this documents
+// its actual current output, not the desktop's), or '' on failure. Surfaces WHICH hermes a
 // connection uses, so a stale/unexpected install is visible.
 async function probeHermesVersion(ssh, hermesPath) {
   try {

@@ -4019,7 +4019,7 @@ function resolveHermesBackend(backendArgs) {
   //    is a recoverable state the GUI can drive through.
   return {
     kind: 'bootstrap-needed',
-    label: 'Douglas Agent Agent not installed yet; bootstrap required',
+    label: 'Douglas Agent not installed yet; bootstrap required',
     command: null,
     args: backendArgs,
     bootstrap: true,
@@ -4158,7 +4158,7 @@ async function ensureRuntime(backend) {
     )
   }
 
-  // On Windows, preflight Git Bash. Douglas Agent' terminal tool calls bash.exe
+  // On Windows, preflight Git Bash. Douglas Agent's terminal tool calls bash.exe
   // directly (tools/environments/local.py); without it the agent can't run
   // terminal commands. install.ps1's Stage-Git puts PortableGit at
   // %LOCALAPPDATA%\hermes\git\, which findGitBash() picks up, so for any
@@ -10872,7 +10872,7 @@ function terminalShellEnv() {
 
   // Strip color/theme-detection vars that ride along when Electron is launched
   // from a non-tty agent shell (Cursor's runner sets NO_COLOR/FORCE_COLOR=0
-  // /TERM=dumb; some terminals set COLORFGBG which would flip Douglas Agent' TUI into
+  // /TERM=dumb; some terminals set COLORFGBG which would flip Douglas Agent's TUI into
   // light-mode). Our PTY is a real xterm-compat terminal — force truecolor.
   delete env.NO_COLOR
   delete env.FORCE_COLOR
@@ -10881,7 +10881,12 @@ function terminalShellEnv() {
   env.COLORTERM = 'truecolor'
   env.LC_CTYPE = env.LC_CTYPE || 'UTF-8'
   env.TERM = 'xterm-256color'
-  env.TERM_PROGRAM = 'Douglas Agent'
+  // TERM_PROGRAM is a de facto single-token identifier (vscode, iTerm.app,
+  // WarpTerminal, ...) that third-party shell tooling (oh-my-zsh/starship
+  // themes, color-support detection libs) exact-matches against. Keep it a
+  // single token, not the display name with a space, so that matching keeps
+  // working across the rename.
+  env.TERM_PROGRAM = 'DouglasAgent'
   env.TERM_PROGRAM_VERSION = app.getVersion()
 
   // Let a hermes/--tui launched in this pane know it's embedded in the desktop
