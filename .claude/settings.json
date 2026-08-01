@@ -8,7 +8,10 @@
     "memory": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory@0.6.2"]
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory@0.6.2"
+      ]
     }
   },
   "hooks": {
@@ -38,6 +41,15 @@
       }
     ],
     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh",
+            "timeout": 300
+          }
+        ]
+      },
       {
         "hooks": [
           {
