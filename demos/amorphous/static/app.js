@@ -47,6 +47,8 @@ async function loadState() {
 }
 
 /* ---------------- grid render ---------------- */
+let PREVIEW = null; // {proposal, spec, diff} while trying a proposed dashboard
+
 function renderAll() {
   const badge = document.getElementById("agent-badge");
   badge.textContent = `agent: ${STATE.agent.model}`;
@@ -54,12 +56,46 @@ function renderAll() {
   renderGrid();
   renderProposals();
   renderChatDockPosition();
+  renderPreviewBanner();
+}
+
+function activeSpec() {
+  return PREVIEW ? PREVIEW.spec : STATE.layout;
+}
+
+function renderPreviewBanner() {
+  let bar = document.getElementById("preview-banner");
+  if (!PREVIEW) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "preview-banner";
+    document.body.insertBefore(bar, document.getElementById("grid"));
+  }
+  const diffTxt = PREVIEW.diff.map((d) => `${d.change}: ${d.title}`).join(" · ") || "layout reflow only";
+  bar.innerHTML = `<span>👁 <b>Previewing proposed dashboard</b> — ${esc(diffTxt)}</span>
+    <span class="pv-actions">
+      <button class="approve" id="pv-approve">✔ Keep it</button>
+      <button class="reject" id="pv-reject">✕ Go back</button>
+    </span>`;
+  document.getElementById("pv-approve").addEventListener("click", async () => {
+    await actProposal(PREVIEW.proposal.id, "approve", "", "up");
+    PREVIEW = null;
+    await loadState();
+  });
+  document.getElementById("pv-reject").addEventListener("click", async () => {
+    const why = prompt("Optional: tell the curator why you're keeping the current dashboard\n" +
+      "(this steers the next evolution away from these changes)") || "";
+    await actProposal(PREVIEW.proposal.id, "reject", why, "down");
+    PREVIEW = null;
+    await loadState();
+  });
 }
 
 function renderGrid() {
   const grid = document.getElementById("grid");
   grid.innerHTML = "";
-  const comps = STATE.layout.components || [];
+  const spec = activeSpec();
+  const comps = spec.components || [];
   for (const c of comps) {
     if (c.hidden) continue;
     const card = document.createElement("div");
@@ -78,17 +114,21 @@ function renderGrid() {
     grid.appendChild(card);
     attachDwell(card, c.id);
     card.addEventListener("click", () => track("click", c.id));
-    card.querySelector(".t-hide").addEventListener("click", (e) => {
-      e.stopPropagation(); hideComponent(c.id);
-    });
-    card.querySelector(".t-up").addEventListener("click", (e) => {
-      e.stopPropagation(); moveComponentUp(c.id);
-    });
+    if (PREVIEW) {
+      card.querySelector(".card-tools").style.display = "none";
+    } else {
+      card.querySelector(".t-hide").addEventListener("click", (e) => {
+        e.stopPropagation(); hideComponent(c.id);
+      });
+      card.querySelector(".t-up").addEventListener("click", (e) => {
+        e.stopPropagation(); moveComponentUp(c.id);
+      });
+    }
     loadComponentData(c);
     track("view", c.id);
   }
   const hidden = comps.filter((c) => c.hidden);
-  if (hidden.length) {
+  if (hidden.length && !PREVIEW) {
     const bar = document.createElement("div");
     bar.className = "hidden-comps";
     bar.append(`Hidden: `);
@@ -106,7 +146,8 @@ async function loadComponentData(c) {
   const body = document.getElementById(`body-${c.id}`);
   if (!body) return;
   try {
-    const d = await api(`/api/component/${c.id}/data?user_id=${USER}`);
+    const pv = PREVIEW ? `&proposal_id=${PREVIEW.proposal.id}` : "";
+    const d = await api(`/api/component/${c.id}/data?user_id=${USER}${pv}`);
     body.innerHTML = "";
     body.appendChild(renderData(c, d));
   } catch (e) {
@@ -257,10 +298,18 @@ function renderProposals() {
       <div style="color:var(--dim);font-size:.8rem">${esc(p.rationale || "")}</div>
       <textarea placeholder="Optional feedback for the curator…"></textarea>
       <div class="actions">
+        <button class="try">👁 Try it</button>
         <button class="approve">✔ Approve & apply</button>
         <button class="reject">✕ Reject</button>
       </div>`;
     const fb = () => div.querySelector("textarea").value;
+    div.querySelector(".try").addEventListener("click", async () => {
+      const pv = await api(`/api/proposal/${p.id}/preview`);
+      PREVIEW = { proposal: p, spec: pv.preview, diff: pv.diff };
+      document.getElementById("proposal-tray").classList.add("hidden");
+      renderAll();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
     div.querySelector(".approve").addEventListener("click", () => actProposal(p.id, "approve", fb(), "up"));
     div.querySelector(".reject").addEventListener("click", () => actProposal(p.id, "reject", fb(), "down"));
     list.appendChild(div);
@@ -373,8 +422,28 @@ function when(ts) {
 /* refresh data periodically */
 setInterval(() => {
   if (!STATE) return;
-  for (const c of STATE.layout.components || []) if (!c.hidden) loadComponentData(c);
+  for (const c of activeSpec().components || []) if (!c.hidden) loadComponentData(c);
 }, 30000);
+
+/* live state polling: pick up curator runs / other-tab changes without reload */
+let LAST_SIG = "";
+setInterval(async () => {
+  if (!STATE || PREVIEW) return; // don't yank the user out of a preview
+  try {
+    const s = await api(`/api/state?user_id=${USER}`);
+    const sig = `${s.layout._meta.version}:${s.proposals.length}`;
+    if (LAST_SIG && sig !== LAST_SIG) {
+      const hadProposals = STATE.proposals.length;
+      STATE = s;
+      renderAll();
+      if (s.proposals.length > hadProposals) {
+        addMsg("agent", "⚗ The curator just proposed a dashboard evolution — " +
+          "open the ▣ Proposals tray to preview it.");
+      }
+    }
+    LAST_SIG = sig;
+  } catch (e) { /* server briefly away; retry next tick */ }
+}, 15000);
 
 loadState().then(() => addMsg("agent",
   "Welcome to your Amorphous mission control. I watch how you use this dashboard and evolve it for you. " +

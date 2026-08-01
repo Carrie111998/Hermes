@@ -112,8 +112,16 @@ def post_telemetry(batch: TelemetryBatch):
 
 
 @app.get("/api/component/{component_id}/data")
-def component_data(component_id: str, user_id: str = DEFAULT_USER):
-    spec = _ensure_user(user_id)
+def component_data(component_id: str, user_id: str = DEFAULT_USER,
+                   proposal_id: str = ""):
+    if proposal_id:
+        # preview mode: resolve the component from the proposal's would-be spec
+        p = store.get_proposal(proposal_id)
+        if not p:
+            raise HTTPException(404, "proposal not found")
+        spec = _proposal_preview_spec(user_id, p)
+    else:
+        spec = _ensure_user(user_id)
     comp = next((c for c in spec["components"] if c["id"] == component_id), None)
     if not comp:
         raise HTTPException(404, "component not found")
@@ -198,6 +206,48 @@ def curator_now(user_id: str = DEFAULT_USER):
     _curator_state["last_run"] = time.time()
     _curator_state["runs"] += 1
     return {"ok": True, "proposal": proposal}
+
+
+def _proposal_preview_spec(user_id: str, p: dict) -> dict:
+    """The layout as it WOULD look if this proposal were approved."""
+    replace = next((m for m in p["mutations"] if m.get("op") == "replace_spec"), None)
+    if replace:
+        return replace["spec"]
+    return apply_mutations(_ensure_user(user_id), p["mutations"])
+
+
+@app.get("/api/proposal/{pid}/preview")
+def preview_proposal(pid: str):
+    """Try-before-you-approve: returns the evolved layout without applying it,
+    plus a component-level diff versus the current dashboard."""
+    p = store.get_proposal(pid)
+    if not p:
+        raise HTTPException(404, "proposal not found")
+    user_id = p["user_id"]
+    current = _ensure_user(user_id)
+    preview = _proposal_preview_spec(user_id, p)
+    store.record_event(user_id, "proposal_action", None,
+                       {"proposal_id": pid, "action": "preview"})
+
+    cur = {c["id"]: c for c in current.get("components", [])}
+    new = {c["id"]: c for c in preview.get("components", [])}
+    diff = []
+    for cid, c in new.items():
+        old = cur.get(cid)
+        if old is None:
+            diff.append({"id": cid, "change": "added", "title": c["title"]})
+        elif old.get("hidden") != c.get("hidden"):
+            diff.append({"id": cid, "change": "hidden" if c.get("hidden") else "shown",
+                         "title": c["title"]})
+        elif (old.get("w"), old.get("h")) != (c.get("w"), c.get("h")):
+            diff.append({"id": cid, "change": "resized", "title": c["title"]})
+        elif old.get("title") != c.get("title"):
+            diff.append({"id": cid, "change": "renamed",
+                         "title": f"{old['title']} → {c['title']}"})
+    for cid, c in cur.items():
+        if cid not in new:
+            diff.append({"id": cid, "change": "removed", "title": c["title"]})
+    return {"proposal": p, "preview": preview, "diff": diff}
 
 
 @app.post("/api/proposal/{pid}")

@@ -243,6 +243,24 @@ class Store:
             )
             self._conn.commit()
 
+    def rejected_mutations(self, user_id: str, within_s: float = 7 * 86400) -> list[dict]:
+        """Mutations from recently-rejected proposals, each tagged with the
+        rejection feedback. The curator uses this as negative guidance."""
+        cutoff = time.time() - within_s
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mutations_json, feedback, resolved_at FROM proposals"
+                " WHERE user_id=? AND status='rejected' AND resolved_at>=?"
+                " ORDER BY resolved_at DESC LIMIT 20",
+                (user_id, cutoff),
+            ).fetchall()
+        out = []
+        for r in rows:
+            for m in json.loads(r["mutations_json"]):
+                out.append({"mutation": m, "feedback": r["feedback"] or "",
+                            "when": r["resolved_at"]})
+        return out
+
     # ---------- workflows ----------
     def create_workflow(self, user_id: str, name: str, prompt_template: str,
                         description: str = "", created_by: str = "user",

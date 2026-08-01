@@ -60,6 +60,21 @@ def run_curator(store: Store, user_id: str, since_ts: float) -> dict | None:
     mutations: list[dict] = []
     notes: list[str] = []
 
+    # negative guidance: don't re-propose what the user recently rejected
+    rejected = store.rejected_mutations(user_id)
+    vetoed: set[tuple] = set()
+    for r in rejected:
+        m = r["mutation"]
+        vetoed.add((m.get("op"), m.get("component_id")))
+        if m.get("op") == "replace_spec":
+            vetoed.add(("replace_spec", None))
+    rejection_notes = [f"{r['mutation'].get('op')}({r['mutation'].get('component_id')})"
+                       + (f" — user said: \"{r['feedback']}\"" if r["feedback"] else "")
+                       for r in rejected[:8]]
+
+    def veto(op, cid=None) -> bool:
+        return (op, cid) in vetoed
+
     # supersede any stale pending proposals — one live proposal at a time
     for p in store.list_proposals(user_id, status="pending"):
         store.resolve_proposal(p["id"], "superseded")
@@ -74,6 +89,8 @@ def run_curator(store: Store, user_id: str, since_ts: float) -> dict | None:
             continue
         if c.get("row", 9) == 0 and promoted == 0 and cid == scored[0][0]:
             continue  # already on top
+        if veto("promote", cid):
+            continue
         mutations.append({"op": "promote", "component_id": cid})
         notes.append(f"'{c['title']}' is your most-used panel (score {score:.0f}) — moved up and enlarged.")
         promoted += 1
@@ -87,16 +104,20 @@ def run_curator(store: Store, user_id: str, since_ts: float) -> dict | None:
             lib = COMPONENT_LIBRARY.get(c["type"], {})
             already_min = (c.get("w") == lib.get("min_w") and c.get("h") == lib.get("min_h"))
             if already_min:
+                if veto("hide", cid):
+                    continue
                 mutations.append({"op": "hide", "component_id": cid})
                 notes.append(f"'{c['title']}' went untouched this period — hidden (restorable).")
             else:
+                if veto("shrink", cid):
+                    continue
                 mutations.append({"op": "shrink", "component_id": cid})
                 notes.append(f"'{c['title']}' saw no use — shrunk to reclaim space.")
 
     # ---- user-hidden components: propose removal ----
     for cid, s in comp_stats.items():
         c = comps.get(cid)
-        if c and s.get("hidden", 0) > 0 and c.get("hidden"):
+        if c and s.get("hidden", 0) > 0 and c.get("hidden") and not veto("remove", cid):
             mutations.append({"op": "remove", "component_id": cid})
             notes.append(f"You hid '{c['title']}' yourself — proposing permanent removal.")
 
@@ -143,9 +164,15 @@ def run_curator(store: Store, user_id: str, since_ts: float) -> dict | None:
 
     # ---- optional LLM refinement ----
     if BRIDGE.live:
-        refined = _llm_refine(spec, usage, mutations, store, user_id)
+        refined = _llm_refine(spec, usage, mutations, store, user_id,
+                              rejection_notes)
         if refined:
             mutations, rationale = refined
+            # hard filter: even the LLM may not resurrect vetoed mutations
+            mutations = [m for m in mutations
+                         if not veto(m.get("op"), m.get("component_id"))]
+            if not mutations:
+                return None
             engine = "llm"
 
     summary = f"{len(mutations)} change(s): " + "; ".join(notes[:3])
@@ -170,11 +197,14 @@ mutations using ops: promote, shrink, hide, show, remove, retitle, set_props, se
 add (component types: metric,timeseries,table,workflow_button,workflow_panel,
 agent_activity,notes,datasource_status,quick_links,evolution_log).
 Respect user feedback — if they rejected similar changes before, do not repeat them.
+The field recently_rejected_do_not_repropose lists mutations the user explicitly
+turned down, with their stated reasons; treat these as hard constraints and steer
+the layout in a different direction instead.
 Respond ONLY with JSON: {"mutations": [...], "rationale": "..."}"""
 
 
 def _llm_refine(spec: dict, usage: dict, draft: list[dict], store: Store,
-                user_id: str):
+                user_id: str, rejection_notes: list[str] | None = None):
     fb = store.recent_feedback(user_id, limit=10)
     prompt = json.dumps({
         "layout": {c["id"]: {"type": c["type"], "title": c["title"],
@@ -183,6 +213,7 @@ def _llm_refine(spec: dict, usage: dict, draft: list[dict], store: Store,
         "usage": usage["components"],
         "recent_chat": usage["chat_prompts"][-10:],
         "user_feedback": [{"sentiment": f["sentiment"], "text": f["text"]} for f in fb],
+        "recently_rejected_do_not_repropose": rejection_notes or [],
         "draft_mutations": draft,
     }, indent=1)
     out = BRIDGE.json_task(prompt, system=_LLM_SYSTEM)
