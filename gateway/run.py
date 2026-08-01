@@ -2724,42 +2724,8 @@ def _reap_gateway_turn_processes(
     process_baseline,
     *,
     source: str,
-    is_still_current: Optional[Callable[[], bool]] = None,
 ) -> int:
-    """Reap only background processes created by one abandoned turn.
-
-    ``task_id`` is session-scoped (task_id == session_id), not turn-scoped,
-    so a *replacement* turn on the same session can start and spawn its own
-    legitimate process while this reap is still in flight. ``is_still_current``
-    — a closure over the run_generation captured when the reaping turn began
-    or was interrupted — lets the caller detect that a newer turn has since
-    claimed the session and bail out instead of killing that newer turn's
-    process. The newer turn snapshots its own baseline independently, so
-    skipping here does not leave anything permanently unreaped.
-    """
-    if not task_id:
-        # ProcessSession.task_id defaults to "" for sessionless callers, so a
-        # blank id would match (and kill) every unrelated empty-task process
-        # instead of this turn's own. Nothing session-scoped to reap.
-        return 0
-    if is_still_current is not None:
-        try:
-            if not is_still_current():
-                logger.debug(
-                    "Skipping reap for turn %s (%s): a newer turn already "
-                    "claimed this session; it owns its own baseline.",
-                    task_id,
-                    source,
-                )
-                return 0
-        except Exception:
-            logger.debug(
-                "is_still_current check failed for turn %s (%s); reaping anyway",
-                task_id,
-                source,
-                exc_info=True,
-            )
-
+    """Reap only background processes created by one abandoned turn."""
     from tools.process_registry import process_registry
 
     try:
@@ -2798,7 +2764,6 @@ def _abandon_timed_out_gateway_turn(
     worker_done: threading.Event,
     timeout_fired: threading.Event,
     cleanup_lock: threading.Lock,
-    is_still_current: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Interrupt one timed-out turn and reap only processes it created."""
     with cleanup_lock:
@@ -2807,9 +2772,9 @@ def _abandon_timed_out_gateway_turn(
         timeout_fired.set()
 
     agent = agent_holder[0] if agent_holder else None
-    if agent is not None:
+    if agent is not None and hasattr(agent, "interrupt"):
         try:
-            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT)
+            agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
 
@@ -2818,7 +2783,6 @@ def _abandon_timed_out_gateway_turn(
             task_id,
             process_baseline,
             source="gateway_turn_timeout",
-            is_still_current=is_still_current,
         )
     except Exception:
         logger.warning(
@@ -2839,7 +2803,6 @@ def _watch_gateway_turn_inactivity(
     timeout_fired: threading.Event,
     cleanup_lock: threading.Lock,
     poll_interval: float = 5.0,
-    is_still_current: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Thread watchdog that remains runnable when gateway asyncio is starved."""
     while not worker_done.wait(max(0.01, poll_interval)):
@@ -2861,7 +2824,6 @@ def _watch_gateway_turn_inactivity(
             worker_done=worker_done,
             timeout_fired=timeout_fired,
             cleanup_lock=cleanup_lock,
-            is_still_current=is_still_current,
         )
         return
 
@@ -22823,36 +22785,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _process_task_id = ""
         _process_baseline = None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            request_hard_interrupt(running_agent, interrupt_reason)
+            running_agent.interrupt(interrupt_reason)
             _process_task_id = getattr(
                 running_agent, "_gateway_turn_process_task_id", ""
             )
             _process_baseline = getattr(
                 running_agent, "_gateway_turn_process_baseline", None
             )
-        # Bump the generation *before* scheduling the reap thread and capture
-        # the post-bump value: task_id is session-scoped (task_id ==
-        # session_id), so if a replacement turn claims this session and
-        # spawns its own process before the reap thread actually runs, that
-        # claim bumps the generation again. The closure below then sees a
-        # stale generation and skips — the replacement turn's own baseline
-        # covers its own cleanup, so nothing is left permanently unreaped.
-        _generation_at_interrupt = self._invalidate_session_run_generation(
-            session_key, reason=invalidation_reason
-        )
-        if _process_task_id and _process_baseline is not None:
-            threading.Thread(
-                target=_reap_gateway_turn_processes,
-                args=(_process_task_id, _process_baseline),
-                kwargs={
-                    "source": "gateway_turn_interrupt",
-                    "is_still_current": lambda: self._is_session_run_current(
-                        session_key, _generation_at_interrupt
-                    ),
-                },
-                name=f"gateway-turn-reaper-{_process_task_id[:12]}",
-                daemon=True,
-            ).start()
+            if _process_task_id and _process_baseline is not None:
+                threading.Thread(
+                    target=_reap_gateway_turn_processes,
+                    args=(_process_task_id, _process_baseline),
+                    kwargs={"source": "gateway_turn_interrupt"},
+                    name=f"gateway-turn-reaper-{_process_task_id[:12]}",
+                    daemon=True,
+                ).start()
+        self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
             type(adapter), "interrupt_session_activity", None
@@ -24879,17 +24827,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _turn_worker_done = threading.Event()
             _turn_timeout_fired = threading.Event()
             _turn_cleanup_lock = threading.Lock()
-            # task_id above is session-scoped, not turn-scoped (#76115
-            # review): gate the eventual reap on this exact claim still
-            # being current, so a replacement turn that starts on the same
-            # session before the watchdog fires doesn't get its own fresh
-            # process killed by this turn's stale baseline.
-            _turn_run_generation = run_generation
-            _turn_is_current = (
-                (lambda: self._is_session_run_current(session_key, _turn_run_generation))
-                if _turn_run_generation is not None
-                else (lambda: True)
-            )
 
             def _run_sync_with_timeout_lifecycle():
                 try:
@@ -24924,7 +24861,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "timeout_fired": _turn_timeout_fired,
                         "cleanup_lock": _turn_cleanup_lock,
                         "poll_interval": 5.0,
-                        "is_still_current": _turn_is_current,
                     },
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
@@ -24992,6 +24928,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     done, _ = await asyncio.wait(
                         {_executor_task}, timeout=_POLL_INTERVAL
                     )
+                    if _turn_timeout_fired.is_set():
+                        _inactivity_timeout = True
+                        break
                     if done:
                         # Prefer the real result when the worker finished,
                         # even if the watchdog fired in the same window: the
@@ -25044,7 +24983,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "worker_done": _turn_worker_done,
                                 "timeout_fired": _turn_timeout_fired,
                                 "cleanup_lock": _turn_cleanup_lock,
-                                "is_still_current": _turn_is_current,
                             },
                             name=f"gateway-turn-reaper-{_turn_task_id[:12]}",
                             daemon=True,
