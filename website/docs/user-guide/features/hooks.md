@@ -1070,6 +1070,107 @@ def register(ctx):
 
 ---
 
+### Slack custom-message adapter subclass seam
+
+Slack exposes a versioned, two-stage subclass seam for out-of-tree plugins that need to own typed messages such as thread-safe `!` commands. It runs inside the Slack adapter because classification must happen before Slack's mention gate; it is **not** registered with `ctx.register_hook()`.
+
+:::note Why not `pre_gateway_dispatch`?
+`pre_gateway_dispatch` runs after platform gating, so it cannot make a bare command such as `!log` reachable in a mention-gated channel. The Slack seam can waive the mention/session gate for a classified message, but never waives authorization or channel policy.
+:::
+
+The compatibility marker is `SlackAdapter.CUSTOM_MESSAGE_HOOK_VERSION`. A plugin should check it before replacing the bundled adapter factory and fail closed on unsupported versions.
+
+#### Stage 1: classify synchronously
+
+Override `_classify_custom_message(text, event)` and return an opaque token to claim the message, or `None` to decline it.
+
+- The method is synchronous and runs on every message that reaches the custom seam, including classified messages later rejected by routed authorization. Adapter-wide bot/self, deduplication, ignored-channel, and media-safety authorization guards may reject an event before the seam.
+- It must be pure and side-effect-free: do not send messages, mutate state, perform I/O, or authorize users here. Parse and return only.
+- `text` is this message's text with the bot's own mention removed and surrounding whitespace trimmed. It has not received the `!` to `/` rewrite, block/attachment enrichment, or fetched thread history.
+- Classification runs before mention gating and before the seam's routed authorization. A token bypasses only mention/session gating; core still enforces bot/self filters, deduplication, subtype checks, `allowed_channels`, and routed user authorization.
+- If the classifier raises, core consumes the event rather than forwarding a possibly side-effecting command to the agent. Return `None` for all unrecognized input.
+
+#### Stage 2: handle asynchronously
+
+Override `async _on_custom_message(ctx)` to execute a classified message. Core calls it only after routed authorization and normal Slack policy checks, and under the owning profile's runtime scope on multiplexed gateways.
+
+- `ctx.classification` is the exact token returned by the classifier.
+- Return `True` when the plugin fully handled the message. Core consumes it before session creation or LLM dispatch.
+- Return `False` to continue normal handling. Use this only deliberately—for example, a recognized alias that should still reach the agent.
+- If the handler raises, core sends a generic failure reply and consumes the message. It never falls through to the LLM after a partial command failure.
+- `ctx.client` is the `AsyncWebClient` for the message's Slack workspace.
+- Prefer `self.send(ctx.channel_id, ..., metadata=ctx.reply_metadata)`. When known, `reply_metadata` carries `slack_team_id` so multi-workspace replies use the correct client, and adds `thread_id` only for a real thread reply. Do not reconstruct these fields from process-global state.
+
+#### External subclass example
+
+A user plugin can replace only the bundled Slack adapter factory while inheriting the bundled setup, YAML bridge, standalone sender, and connectivity checks:
+
+```text
+~/.hermes/plugins/platforms/slack/
+├── plugin.yaml
+└── __init__.py
+```
+
+```yaml title="plugin.yaml"
+name: my-slack-platform
+kind: platform
+version: "1.0.0"
+description: Adds a thread-safe !ping command to Slack
+```
+
+```python title="__init__.py"
+from plugins.platforms.slack.adapter import (
+    SlackAdapter,
+    SlackCustomMessageContext,
+    register as register_bundled_slack,
+)
+
+SUPPORTED_HOOK_VERSIONS = {1}
+
+
+class MySlackAdapter(SlackAdapter):
+    def _classify_custom_message(self, text: str, event: dict):
+        command, separator, argument = text.partition(" ")
+        if command != "!ping":
+            return None
+        # Parsing only: no I/O, state mutation, or authorization here.
+        return argument if separator else ""
+
+    async def _on_custom_message(
+        self, ctx: SlackCustomMessageContext
+    ) -> bool:
+        suffix = f" {ctx.classification}" if ctx.classification else ""
+        result = await self.send(
+            ctx.channel_id,
+            f"pong{suffix}",
+            metadata=ctx.reply_metadata,
+        )
+        if not result.success:
+            # Raising fails closed; the command never falls through to the LLM.
+            raise RuntimeError("Slack reply failed")
+        return True
+
+
+def register(ctx):
+    version = getattr(SlackAdapter, "CUSTOM_MESSAGE_HOOK_VERSION", None)
+    if version not in SUPPORTED_HOOK_VERSIONS:
+        raise RuntimeError(f"Unsupported Slack custom-message hook: {version!r}")
+
+    # Register all bundled Slack behavior, then replace only its factory.
+    register_bundled_slack(ctx)
+
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get("slack")
+    if entry is None:
+        raise RuntimeError("Bundled Slack platform did not register")
+    entry.adapter_factory = MySlackAdapter
+```
+
+Enable the plugin by adding `my-slack-platform` to `plugins.enabled`, then restart the gateway. The bundled and user manifests keep distinct discovery keys; the user plugin explicitly initializes the canonical `slack` platform entry with `register_bundled_slack(ctx)` and replaces only its `adapter_factory`. This preserves the bundled checks, CLI commands, config metadata, and all behavior the subclass does not override.
+
+---
+
 ### `pre_approval_request`
 
 Fires before an approval decision is requested. It covers prompted surfaces—interactive CLI, Ink TUI, gateway platforms, and ACP clients—and `approvals.mode=smart` decisions made without a human prompt (`surface="smart"`). In smart mode, the hook runs before the auxiliary LLM is called.
