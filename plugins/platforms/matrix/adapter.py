@@ -535,6 +535,48 @@ _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
 
+# Bounded retry for HTTP 429 (M_LIMIT_EXCEEDED) when sending events. A long
+# reply split into many events + redactions can exceed the homeserver's
+# per-user rc_message limit. mautrix 0.21 raises MLimitExceeded WITHOUT retrying
+# it (its HTTPAPI only retries 502/503/504) and without surfacing retry_after_ms,
+# so the adapter honours the backoff itself rather than failing the whole reply.
+_MATRIX_SEND_MAX_RETRIES = 4
+_MATRIX_DEFAULT_RETRY_AFTER_SECONDS = 2.0
+_MATRIX_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+def _matrix_retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Return the backoff (seconds) if *exc* is a Matrix rate-limit (429), else None.
+
+    mautrix 0.21 raises ``MLimitExceeded`` (a ``MatrixStandardRequestError`` with
+    ``http_status == 429``) for ``M_LIMIT_EXCEEDED`` and neither retries it nor
+    exposes ``retry_after_ms`` as an attribute. The 429 is detected structurally
+    (HTTP status / errcode text) so this module stays importable without mautrix
+    installed -- see the import stubs above. The server's requested delay is read
+    from an attribute if a future mautrix version adds one, else parsed out of the
+    response body/message, else defaulted. The result is clamped so a malformed
+    ``retry_after_ms`` can neither busy-loop nor stall the send.
+    """
+    is_rate_limited = (
+        getattr(exc, "http_status", None) == 429
+        or "M_LIMIT_EXCEEDED" in str(getattr(exc, "errcode", ""))
+        or "M_LIMIT_EXCEEDED" in str(exc)
+    )
+    if not is_rate_limited:
+        return None
+    retry_after_ms = getattr(exc, "retry_after_ms", None)
+    if retry_after_ms is None:
+        match = re.search(r"retry_after_ms['\"\s:=]+(\d+)", str(exc))
+        if match:
+            retry_after_ms = int(match.group(1))
+    seconds = (
+        retry_after_ms / 1000.0
+        if retry_after_ms is not None
+        else _MATRIX_DEFAULT_RETRY_AFTER_SECONDS
+    )
+    return min(max(seconds, 0.5), _MATRIX_MAX_RETRY_AFTER_SECONDS)
+
+
 _OUTBOUND_MENTION_RE = re.compile(
     r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)"
 )
@@ -1797,46 +1839,71 @@ class MatrixAdapter(BasePlatformAdapter):
 
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
-            try:
-                event_id = await asyncio.wait_for(
-                    self._client.send_message_event(
-                        RoomID(chat_id),
-                        EventType.ROOM_MESSAGE,
-                        msg_content,
-                    ),
-                    timeout=45,
-                )
-                last_event_id = str(event_id)
-                logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
-            except Exception as exc:
-                # On E2EE errors, retry after sharing keys.
-                if self._encryption and getattr(self._client, "crypto", None):
-                    try:
-                        await self._client.crypto.share_keys()
-                        event_id = await asyncio.wait_for(
-                            self._client.send_message_event(
-                                RoomID(chat_id),
-                                EventType.ROOM_MESSAGE,
-                                msg_content,
-                            ),
-                            timeout=45,
-                        )
-                        last_event_id = str(event_id)
-                        logger.info(
-                            "Matrix: sent event %s to %s (after key share)",
-                            last_event_id,
+            # Send this chunk, tolerating two recoverable conditions:
+            #   * HTTP 429 (M_LIMIT_EXCEEDED): back off for the server-requested
+            #     interval and retry, up to a bounded number of attempts, rather
+            #     than failing the whole reply (mautrix does not retry 429).
+            #   * E2EE errors: share keys and retry once (original behaviour).
+            shared_keys = False
+            attempt = 0
+            while True:
+                try:
+                    event_id = await asyncio.wait_for(
+                        self._client.send_message_event(
+                            RoomID(chat_id),
+                            EventType.ROOM_MESSAGE,
+                            msg_content,
+                        ),
+                        timeout=45,
+                    )
+                    last_event_id = str(event_id)
+                    logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
+                    break
+                except Exception as exc:
+                    retry_after = _matrix_retry_after_seconds(exc)
+                    if retry_after is not None:
+                        if attempt >= _MATRIX_SEND_MAX_RETRIES:
+                            logger.error(
+                                "Matrix: rate-limited sending to %s, gave up after "
+                                "%d retries: %s",
+                                chat_id,
+                                _MATRIX_SEND_MAX_RETRIES,
+                                exc,
+                            )
+                            return SendResult(success=False, error=str(exc))
+                        attempt += 1
+                        logger.warning(
+                            "Matrix: rate-limited (429) sending to %s, retry "
+                            "%d/%d in %.1fs",
                             chat_id,
+                            attempt,
+                            _MATRIX_SEND_MAX_RETRIES,
+                            retry_after,
                         )
+                        await asyncio.sleep(retry_after)
                         continue
-                    except Exception as retry_exc:
-                        logger.error(
-                            "Matrix: failed to send to %s after retry: %s",
-                            chat_id,
-                            retry_exc,
-                        )
-                        return SendResult(success=False, error=str(retry_exc))
-                logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
-                return SendResult(success=False, error=str(exc))
+                    # On E2EE errors, retry once after sharing keys.
+                    if (
+                        not shared_keys
+                        and self._encryption
+                        and getattr(self._client, "crypto", None)
+                    ):
+                        shared_keys = True
+                        try:
+                            await self._client.crypto.share_keys()
+                            logger.info(
+                                "Matrix: shared keys, retrying send to %s", chat_id
+                            )
+                            continue
+                        except Exception as retry_exc:
+                            logger.error(
+                                "Matrix: failed to send to %s after retry: %s",
+                                chat_id,
+                                retry_exc,
+                            )
+                            return SendResult(success=False, error=str(retry_exc))
+                    logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
+                    return SendResult(success=False, error=str(exc))
 
         return SendResult(success=True, message_id=last_event_id)
 
