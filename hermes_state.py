@@ -6963,13 +6963,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``hermes -c``/``--resume`` so the "last" session is the last one in
         the *current* workspace, not the global MRU.
         """
+        # Correlated scalar subquery instead of a LEFT JOIN over a
+        # derived-table aggregate: the join form materializes
+        # SELECT ... FROM messages GROUP BY session_id over EVERY message
+        # in the DB on every call (LIMIT 20 page or not), while the
+        # correlated form resolves MAX(timestamp) per session row via the
+        # messages(session_id, ...) index. Byte-identical results; same
+        # pattern list_sessions_rich already uses for its last_active.
         select_with_last_active = (
-            "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
+            "SELECT s.*, COALESCE("
+            "(SELECT MAX(m2.timestamp) FROM messages m2 "
+            "WHERE m2.session_id = s.id), "
+            "s.started_at) AS last_active "
             "FROM sessions s "
-            "LEFT JOIN ("
-            "SELECT session_id, MAX(timestamp) AS last_active "
-            "FROM messages GROUP BY session_id"
-            ") m ON m.session_id = s.id "
         )
         where_clauses = []
         params: list = []
