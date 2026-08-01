@@ -22,12 +22,30 @@ export interface McpAppUserMessage {
 export const $mcpAppUserMessage = atom<McpAppUserMessage | null>(null)
 
 let seq = 0
+/** Minimum interval (ms) between ui/message-triggered model turns per card. */
+const MIN_MESSAGE_INTERVAL_MS = 2000
 
-export function requestMcpAppUserMessage(text: string): void {
+/** Per-debounceKey last-posted timestamp so cards don't throttle each other. */
+const _lastMessageTime = new Map<string, number>()
+
+export function requestMcpAppUserMessage(text: string, debounceKey?: string): void {
   const trimmed = text.trim()
 
   if (!trimmed) {
     return
+  }
+
+  // Rate-limit per-card-instance so a sandboxed card firing ui/message in a
+  // tight loop can't trigger unlimited model turns (DoS).  Different cards
+  // (different debounceKey) are independent — one card's cooldown never blocks
+  // another card's message.
+  if (debounceKey) {
+    const now = Date.now()
+    const last = _lastMessageTime.get(debounceKey) ?? -MIN_MESSAGE_INTERVAL_MS
+    if (now - last < MIN_MESSAGE_INTERVAL_MS) {
+      return
+    }
+    _lastMessageTime.set(debounceKey, now)
   }
 
   seq += 1

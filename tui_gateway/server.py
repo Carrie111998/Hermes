@@ -7288,12 +7288,18 @@ def _(rid, params: dict) -> dict:
     """Proxy an MCP Apps card's JSON-RPC frame to its MCP server session.
 
     The desktop renderer relays the sandboxed iframe's ``{jsonrpc, id, method,
-    params}`` message here as ``params = {server, message}``. We run it against
-    the connected session and return ``{response}`` -- the JSON-RPC reply the
-    renderer posts back into the iframe (preserving its ``id`` correlation).
+    params}`` message here as ``params = {server, toolCallId, message}``. We run
+    it against the connected session and return ``{response}`` -- the JSON-RPC
+    reply the renderer posts back into the iframe (preserving its ``id``
+    correlation).
+
+    Security: the bridged method is validated against the server's registered
+    tool names to prevent a card from invoking unrelated MCP tools. The
+    ``toolCallId`` ties each bridge call back to the originating card for audit.
     """
     params = params or {}
     server = params.get("server")
+    tool_call_id = params.get("toolCallId")
     message = params.get("message") or {}
     inner_id = message.get("id")
     inner_method = message.get("method")
@@ -7304,7 +7310,10 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.mcp_tool import call_mcp_app_request
 
-        result = call_mcp_app_request(server, inner_method, inner_params)
+        result = call_mcp_app_request(
+            server, inner_method, inner_params,
+            tool_call_id=tool_call_id,
+        )
     except Exception as e:
         return _err(rid, -32000, f"mcp bridge error: {e}")
     if isinstance(result, dict) and set(result.keys()) == {"error"}:

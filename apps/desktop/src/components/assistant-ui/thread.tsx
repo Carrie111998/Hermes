@@ -57,7 +57,6 @@ import { uploadComposerAttachment } from '@/app/session/hooks/use-prompt-actions
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { DirectiveContent, hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
-import { hasMcpUi, McpAppCard } from '@/components/assistant-ui/mcp-app-card'
 import { VirtualizedThread } from '@/components/assistant-ui/thread-virtualizer'
 import { HoistedTodoPanel, todosFromMessageContent } from '@/components/assistant-ui/todo-tool'
 import { ToolFallback, ToolGroupSlot } from '@/components/assistant-ui/tool-fallback'
@@ -358,12 +357,6 @@ const ChainToolFallback: FC<ToolCallMessagePartProps> = props => {
   // todo parts are hoisted to a dedicated panel above the message content.
   if (props.toolName === 'todo') {
     return null
-  }
-
-  // MCP Apps: any tool whose result carries an interactive UI card renders as a
-  // sandboxed iframe, regardless of the (dynamic) MCP tool name.
-  if (hasMcpUi(props.result)) {
-    return <McpAppCard {...props} />
   }
 
   if (props.toolName === 'image_generate') {

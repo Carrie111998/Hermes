@@ -186,6 +186,9 @@ class _FakeResourceContents:
         self.text = text
         self.mimeType = mime
 
+    def model_dump(self, exclude_none=False, by_alias=False):
+        return {"text": self.text, "mimeType": self.mimeType, "uri": "db://internal/schema"}
+
 
 class _FakeReadResourceResult:
     def __init__(self, contents):
@@ -335,6 +338,88 @@ class TestBridgeProxy:
     def test_initialize_is_noop(self, _patch_mcp_server):
         assert mcp_tool.call_mcp_app_request(
             "test-server", "initialize", {}) == {}
+
+
+# --------------------------------------------------------------------------
+# Security: bridge whitelist validation
+# --------------------------------------------------------------------------
+
+class TestBridgeSecurity:
+    """Verify that bridge requests are validated per the security model."""
+
+    def test_tools_call_blocks_unregistered_tool(self, _patch_mcp_server):
+        """P0 (fixed): a card cannot call a tool the server did not advertise."""
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock()
+        # Simulate a server that only exposes catalog_search.
+        server = mcp_tool._servers["test-server"]
+        server._registered_tool_names = ["utp_catalog_search"]
+
+        # A sandboxed card tries to call a tool the server never declared.
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "tools/call",
+            {"name": "utp_checkout_complete", "arguments": {}}
+        )
+
+        assert set(out.keys()) == {"error"}
+        assert out["error"]["code"] == -32601
+        assert "not registered" in out["error"]["message"]
+        # The real tool was never invoked — the bridge blocked the call.
+        session.call_tool.assert_not_called()
+
+    def test_tools_call_permits_registered_tool(self, _patch_mcp_server):
+        """Sanity: a card CAN call tools the server advertised."""
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(
+                content=[_FakeContentBlock("added")]))
+        server = mcp_tool._servers["test-server"]
+        server._registered_tool_names = ["utp_cart_add"]
+
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "tools/call",
+            {"name": "utp_cart_add", "arguments": {"product_id": "p1"}}
+        )
+
+        assert "error" not in out
+        session.call_tool.assert_called_once_with(
+            "utp_cart_add", arguments={"product_id": "p1"})
+
+    def test_resources_read_blocks_non_ui_uri(self, _patch_mcp_server):
+        """P0 (fixed): resources/read rejects non-ui:// URIs through the bridge.
+
+        A sandboxed card should only access ui:// resources.  Non-ui:// URIs
+        (db://, file://, etc.) are for the model — the bridge must block them.
+        """
+        session = _patch_mcp_server
+        session.read_resource = AsyncMock()
+
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "resources/read",
+            {"uri": "db://internal/schema"}
+        )
+
+        # PROOF: the bridge REJECTED the non-ui:// URI before forwarding.
+        assert set(out.keys()) == {"error"}
+        assert out["error"]["code"] == -32601
+        session.read_resource.assert_not_called()
+
+    def test_resources_read_allows_ui_uri(self, _patch_mcp_server):
+        """Sanity: legitimate ui:// resource reads still work."""
+        session = _patch_mcp_server
+        session.read_resource = AsyncMock(
+            return_value=_FakeReadResourceResult(
+                [_FakeResourceContents("<!DOCTYPE html><body>catalog</body>")])
+        )
+
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "resources/read",
+            {"uri": "ui://utp/catalog-search"}
+        )
+
+        assert "contents" in out
+        assert "error" not in out
+        session.read_resource.assert_called_once_with("ui://utp/catalog-search")
 
 
 # --------------------------------------------------------------------------

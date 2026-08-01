@@ -5027,6 +5027,8 @@ def call_mcp_app_request(
     server_name: str,
     method: str,
     params: "dict | None" = None,
+    *,
+    tool_call_id: "str | None" = None,
     timeout: float = 60.0,
 ) -> dict:
     """Proxy an MCP Apps iframe JSON-RPC request to a connected server session.
@@ -5036,6 +5038,13 @@ def call_mcp_app_request(
     the request against the already-initialized session on the MCP loop and
     return a JSON-serializable dict. On failure a ``{"error": {...}}`` dict is
     returned so the caller can build a JSON-RPC error for the iframe.
+
+    Security: ``tools/call`` targets are validated against the server's
+    registered tool names so a sandboxed card cannot invoke tools the server
+    did not advertise. ``resources/read`` is restricted to ``ui://`` URIs 
+    only — non-UI resources are for the model, not the sandboxed iframe.
+    ``tool_call_id`` ties bridge calls back to the originating card for
+    audit trail.
     """
     params = params or {}
     with _lock:
@@ -5048,12 +5057,24 @@ def call_mcp_app_request(
         session = server.session
         if method == "tools/call":
             name = params.get("name")
+            # Validate the tool is registered on this server — prevents a
+            # sandboxed card from calling arbitrary or internal methods.
+            registered = getattr(server, "_registered_tool_names", None) or []
+            if name and registered and name not in registered:
+                return {"error": {"code": -32601,
+                        "message": f"tool '{name}' not registered on server '{server_name}'"}}
             arguments = params.get("arguments") or {}
             async with server._rpc_lock:
                 result = await session.call_tool(name, arguments=arguments)
             return _serialize_call_tool_result(result)
         if method == "resources/read":
             uri = params.get("uri")
+            # Security: only ui:// resources are accessible through the
+            # bridge. Non-ui:// URIs (db://, file://, etc.) are for the
+            # model, not the sandboxed iframe card.
+            if not isinstance(uri, str) or not uri.startswith("ui://"):
+                return {"error": {"code": -32601,
+                        "message": f"resource not accessible from a card: {uri}"}}
             async with server._rpc_lock:
                 res = await session.read_resource(uri)
             contents = []

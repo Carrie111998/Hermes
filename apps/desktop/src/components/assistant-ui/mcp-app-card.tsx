@@ -258,7 +258,7 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
                 // turn. Only ITS text is user-visible; staged context rides along
                 // invisibly on the send path.
                 if (method === 'ui/message') {
-                    requestMcpAppUserMessage(extractTextContent(msg.params))
+                    requestMcpAppUserMessage(extractTextContent(msg.params), toolCallId)
 
                     if (hasId) {
                         reply({ result: {} })
@@ -306,6 +306,7 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
                 try {
                     const res = await requestGateway<{ response?: JsonRpcFrame }>('mcp.app.request', {
                         server,
+                        toolCallId,
                         message: msg
                     })
 
