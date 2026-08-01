@@ -442,8 +442,8 @@ def test_resolve_sidebar_placement_rejects_unsafe_inbox_paths(
         )
 
 
-@pytest.mark.parametrize("source_cwd", ("relative", None))
-def test_resolve_sidebar_placement_rejects_missing_or_relative_source_identity(
+@pytest.mark.parametrize("source_cwd", ("relative",))
+def test_resolve_sidebar_placement_rejects_relative_source_identity(
     tmp_path: Path,
     source_cwd: str | None,
 ) -> None:
@@ -472,6 +472,23 @@ def test_resolve_sidebar_placement_rejects_missing_source_identity(
             placement_generation=1,
             source_cwd=str(tmp_path / "missing"),
         )
+
+
+def test_resolve_sidebar_placement_supports_inbox_only_authority(
+    tmp_path: Path,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    inbox.mkdir()
+
+    placement = resolve_sidebar_placement(
+        str(inbox),
+        inbox,
+        1,
+        None,
+    )
+
+    assert placement.inbox_cwd == str(inbox.resolve())
+    assert placement.runtime_workspace_roots == (str(inbox.resolve()),)
 
 
 @pytest.mark.parametrize("placement_generation", (True, False, 0, 2))

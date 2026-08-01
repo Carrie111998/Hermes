@@ -277,13 +277,20 @@ def resolve_sidebar_placement(
     configured_inbox_cwd: str,
     hermes_home: Path | str,
     placement_generation: int,
-    source_cwd: str,
+    source_cwd: str | None,
 ) -> SidebarPlacement:
     inbox = _resolve_canonical_inbox(configured_inbox_cwd, hermes_home)
     if not isinstance(placement_generation, int) or isinstance(
         placement_generation, bool
     ) or placement_generation != 1:
         raise SidebarPlacementError("source_identity_mismatch")
+    if source_cwd is None:
+        return SidebarPlacement(
+            inbox_cwd=str(inbox),
+            local_host="local",
+            runtime_workspace_roots=(str(inbox),),
+            placement_generation=placement_generation,
+        )
     source = _resolve_source(source_cwd)
 
     inbox_identity = filesystem_path_identity(str(inbox))

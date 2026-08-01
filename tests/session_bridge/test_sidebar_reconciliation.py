@@ -12,7 +12,7 @@ from hermes_state import SessionDB
 from session_bridge.codex_adapter import SidebarVerificationError
 from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.coordinator import SessionBridgeCoordinator
-from session_bridge.models import BridgeMarkerPayload, Provider
+from session_bridge.models import BridgeMarkerPayload, Provider, SessionProjection
 from session_bridge.sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
@@ -825,6 +825,78 @@ async def test_commit_binds_native_id_before_transient_verification_failure() ->
     assert failure.value.code == "bridge_temporarily_unavailable"
     assert store.binds == [("opaque-lease-token", THREAD, 101.0)]
     assert store.commits == []
+
+
+@pytest.mark.asyncio
+async def test_lineage_commit_treats_deleted_source_cwd_as_metadata_only(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    inbox.mkdir()
+    missing_source = tmp_path / "deleted-source-worktree"
+
+    class LineageStore(FakeSidebarStore):
+        def get_sidebar_candidate_for_delivery(
+            self, source_session_id: str
+        ) -> SidebarCandidate:
+            assert source_session_id == SOURCE
+            return SidebarCandidate(
+                source_session_id=SOURCE,
+                provider=Provider.CLAUDE,
+                bridge_id=BRIDGE,
+                title="[Claude] Deleted source worktree",
+                cwd=str(missing_source),
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+                eligible_at=1.0,
+            )
+
+        def commit_sidebar_job_with_lineage(self, **kwargs: Any) -> dict[str, Any]:
+            self.commits.append(
+                (kwargs["lease_token"], kwargs["codex_thread_id"], kwargs["now"])
+            )
+            return {
+                **_leased_job(),
+                "state": "sidebar_visible",
+                "codex_thread_id": kwargs["codex_thread_id"],
+            }
+
+    projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id=THREAD,
+        title="[Claude] Deleted source worktree",
+        cwd=str(inbox),
+        started_at=1.0,
+        last_active=2.0,
+        messages=(),
+    )
+    store = LineageStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(VerifiedSidebarThread(THREAD, SOURCE, BRIDGE, projection))
+    monkeypatch.setattr(
+        "session_bridge.coordinator.hermes_constants.get_hermes_home",
+        lambda: inbox,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(
+            sidebar=SidebarConfig(enabled=True, inbox_cwd=str(inbox))
+        ),
+        store=store,
+        adapters={},
+        sidebar_verifier=verifier,
+        clock=lambda: 101.0,
+    )
+
+    committed = await coordinator.commit_sidebar_job(
+        lease_token="opaque-lease-token",
+        codex_thread_id=THREAD,
+        ensure_lineage=True,
+    )
+
+    assert committed["state"] == "sidebar_visible"
+    assert store.commits == [("opaque-lease-token", THREAD, 101.0)]
 
 
 @pytest.mark.asyncio

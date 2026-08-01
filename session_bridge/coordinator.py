@@ -2142,7 +2142,7 @@ class SessionBridgeCoordinator:
                     cast(str, self._config.sidebar.inbox_cwd),
                     hermes_constants.get_hermes_home(),
                     self._config.sidebar.placement_generation,
-                    candidate.cwd,
+                    None,
                 )
             except SidebarPlacementError as exc:
                 raise SidebarVerificationError(exc.code) from None
