@@ -49,7 +49,7 @@ jobs:
         run: |
           uv venv .venv --python 3.13
           source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
+          uv pip install -e ".[all,dev,messaging]"
 
       - name: Run HA integration tests
         run: |
