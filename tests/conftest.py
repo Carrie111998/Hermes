@@ -30,6 +30,40 @@ from pathlib import Path
 
 import pytest
 
+# ── Collection-time HERMES_HOME redirect ────────────────────────────────
+# The autouse ``_hermetic_environment`` fixture below redirects HERMES_HOME
+# per test, but fixtures run AFTER collection.  94 test modules import
+# ``cli`` or ``hermes_cli.main`` at module scope, and both call
+# ``hermes_logging.setup_logging()`` at import (cli.py:796,
+# hermes_cli/main.py:737).  During collection HERMES_HOME is still unset, so
+# ``get_hermes_home()`` returns the real ``~/.hermes`` and rotating file
+# handlers for agent.log / errors.log are registered against the
+# developer's PRODUCTION logs for the rest of the session — every later
+# test WARNING and traceback is appended there.
+#
+# Nothing re-points them afterwards.  The handlers are registered before
+# setup_logging()'s ``_logging_initialized`` guard (hermes_logging.py:364)
+# and deduped by resolved path against ``_queued_file_handlers``
+# (hermes_logging.py:740); a later call with a different HERMES_HOME only
+# ADDS handlers.  Note they live on the async ``QueueListener``, not on the
+# root logger — inspect ``hermes_logging.get_queued_file_handlers()``, not
+# ``logging.getLogger().handlers``.
+#
+# Setting HERMES_HOME here — conftest import, the earliest point the suite
+# controls — closes it for every module-level path cache at once.  The
+# per-test fixture still overrides this value, and tests needing the
+# unset-HERMES_HOME fallback still ``monkeypatch.delenv`` it, so no test
+# semantics change.
+#
+# A shared fixed dir (not ``mkdtemp()``): scripts/run_tests_parallel.py
+# spawns one ``python -m pytest <file>`` process per test file, so
+# mkdtemp() would litter one dir per file per run.  The shared dir is
+# self-limiting — setup_logging caps it at agent.log 5MB x3 + errors.log
+# 2MB x2.  ``mkdir(exist_ok=True)`` is race-safe.
+_COLLECT_HERMES_HOME = Path(tempfile.gettempdir()) / "hermes-test-collect-home"
+_COLLECT_HERMES_HOME.mkdir(parents=True, exist_ok=True)
+os.environ["HERMES_HOME"] = str(_COLLECT_HERMES_HOME)
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
