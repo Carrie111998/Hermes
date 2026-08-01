@@ -105,6 +105,22 @@ class TestAgentConfigSignature:
         )
         assert sig_a == sig_b
 
+    def test_effective_recall_policy_changes_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        enabled = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", auto_inject_recall=True
+        )
+        disabled = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", auto_inject_recall=False
+        )
+
+        assert enabled != disabled
+        assert disabled == GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", auto_inject_recall=False
+        )
+
 
 class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of
@@ -173,6 +189,33 @@ class TestExtractCacheBustingConfig:
         out = GatewayRunner._extract_cache_busting_config({})
 
         assert out["tools.registry_generation"] == 12345
+
+
+class TestAutoInjectRecallResolution:
+    def test_false_global_default_applies_without_platform_override(self):
+        from gateway.run import GatewayRunner
+
+        config = {"memory": {"auto_inject_recall": False}}
+
+        assert GatewayRunner._resolve_auto_inject_recall(config, "whatsapp") is False
+        assert GatewayRunner._resolve_auto_inject_recall(config, "telegram") is False
+
+    def test_platform_boolean_override_wins_over_global_default(self):
+        from gateway.run import GatewayRunner
+
+        config = {
+            "memory": {"auto_inject_recall": True},
+            "gateway": {
+                "platforms": {
+                    "whatsapp": {"memory": {"auto_inject_recall": False}},
+                    "telegram": {"memory": {"auto_inject_recall": "false"}},
+                }
+            },
+        }
+
+        assert GatewayRunner._resolve_auto_inject_recall(config, "whatsapp") is False
+        assert GatewayRunner._resolve_auto_inject_recall(config, "telegram") is True
+        assert GatewayRunner._resolve_auto_inject_recall(config, "discord") is True
 
 
 class TestAgentCacheLifecycle:

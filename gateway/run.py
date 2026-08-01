@@ -4116,6 +4116,9 @@ class TurnRunner:
         # Map platform enum to the platform hint key the agent understands.
         # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+        auto_inject_recall = self._runner._resolve_auto_inject_recall(
+            ctx.user_config, platform_key
+        )
         
         # Combine platform context, YAML channel_prompts hint for this chat,
         # channel_overrides system_prompt (or global ephemeral), and gateway
@@ -4271,6 +4274,7 @@ class TurnRunner:
             cache_keys=self._runner._extract_cache_busting_config(ctx.user_config),
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
+            auto_inject_recall=auto_inject_recall,
         )
         agent = None
         reused_cached_agent = False
@@ -4495,6 +4499,7 @@ class TurnRunner:
                 provider_data_collection=pr.get("data_collection"),
                 session_id=ctx.session_id,
                 platform=platform_key,
+                auto_inject_recall=auto_inject_recall,
                 user_id=ctx.source.user_id,
                 user_id_alt=ctx.source.user_id_alt,
                 user_name=ctx.source.user_name,
@@ -16156,6 +16161,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
+                                    auto_inject_recall=self._resolve_auto_inject_recall(
+                                        _hyg_data,
+                                        _platform_config_key(source.platform),
+                                    ),
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -18572,6 +18581,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             platform_key = _platform_config_key(source.platform)
+            auto_inject_recall = self._resolve_auto_inject_recall(
+                user_config, platform_key
+            )
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -18625,6 +18637,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    auto_inject_recall=auto_inject_recall,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
@@ -21609,6 +21622,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return out
 
     @staticmethod
+    def _resolve_auto_inject_recall(user_config: dict | None, platform_key: str) -> bool:
+        """Resolve automatic external recall from global and platform config."""
+        from gateway.config import resolve_auto_inject_recall
+
+        return resolve_auto_inject_recall(user_config, platform_key)
+
+    @staticmethod
     def _agent_config_signature(
         model: str,
         runtime: dict,
@@ -21617,6 +21637,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        auto_inject_recall: bool = True,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -21671,6 +21692,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                bool(auto_inject_recall),
             ],
             sort_keys=True,
             default=str,

@@ -2130,7 +2130,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # here, diverging the summary request's prefix at the EARLIEST
             # sidecar-carrying message and re-prefilling the whole transcript
             # at exactly the moment the context is largest.
-            substitute_api_content(api_msg)
+            substitute_api_content(
+                api_msg,
+                auto_inject_recall=getattr(agent, "_auto_inject_recall", True),
+            )
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 api_msg.pop(internal_key, None)
             if _needs_sanitize:

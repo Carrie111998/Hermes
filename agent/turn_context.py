@@ -40,7 +40,10 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import (
+    build_memory_context_block,
+    render_api_content_without_manager_recall,
+)
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -84,7 +87,9 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
-def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
+def substitute_api_content(
+    api_msg: Dict[str, Any], *, auto_inject_recall: bool = True
+) -> Optional[str]:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
     Used at every API-bound message-build site (the ``api_messages`` build in
@@ -103,6 +108,10 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
         and sidecar
         and api_msg.get("role") in ("user", "assistant")
     ):
+        if not auto_inject_recall:
+            sidecar = render_api_content_without_manager_recall(
+                sidecar, api_msg.get("content")
+            )
         api_msg["content"] = sidecar
     return sidecar
 
@@ -1153,7 +1162,7 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and getattr(agent, "_auto_inject_recall", True):
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""

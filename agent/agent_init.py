@@ -495,6 +495,7 @@ def init_agent(
     request_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
+    auto_inject_recall: Optional[bool] = None,
     user_id: str = None,
     user_id_alt: str = None,
     user_name: str = None,
@@ -1620,6 +1621,15 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    mem_config = _agent_cfg.get("memory", {})
+    if not isinstance(mem_config, dict):
+        mem_config = {}
+    _configured_auto_inject_recall = mem_config.get("auto_inject_recall", True)
+    if auto_inject_recall is None:
+        auto_inject_recall = _configured_auto_inject_recall
+    agent._auto_inject_recall = (
+        auto_inject_recall if isinstance(auto_inject_recall, bool) else True
+    )
     # A flush/background agent may pass skip_memory=True to avoid spinning up an
     # external memory *provider*, but if the caller also explicitly enables the
     # "memory" toolset it still needs the built-in file-backed store — otherwise
@@ -1629,7 +1639,6 @@ def init_agent(
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
     if not skip_memory or _memory_toolset_requested:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))

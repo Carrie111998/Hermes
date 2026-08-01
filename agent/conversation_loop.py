@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.memory_manager import render_api_content_without_manager_recall
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1512,7 +1513,13 @@ def run_conversation(
                     # drift, and so every pass this turn sends identical
                     # bytes (composed from msg["content"], never from a
                     # previously-injected copy).
-                    api_msg["content"] = _api_content
+                    api_msg["content"] = (
+                        render_api_content_without_manager_recall(
+                            _api_content, api_msg.get("content")
+                        )
+                        if not getattr(agent, "_auto_inject_recall", True)
+                        else _api_content
+                    )
                 else:
                     # Callers that bypass the prologue stamping: compose live.
                     _composed = compose_user_api_content(
@@ -1536,7 +1543,13 @@ def run_conversation(
                 # ``get_messages_as_conversation``'s sanitize_context/strip
                 # would rewrite on reload — see the capture in
                 # ``_flush_messages_to_session_db``).
-                api_msg["content"] = _api_content
+                api_msg["content"] = (
+                    render_api_content_without_manager_recall(
+                        _api_content, api_msg.get("content")
+                    )
+                    if not getattr(agent, "_auto_inject_recall", True)
+                    else _api_content
+                )
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

@@ -32,7 +32,13 @@ from typing import Any, Optional, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
-from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
+from gateway.config import (
+    HomeChannel,
+    Platform,
+    PlatformConfig,
+    persist_home_channel,
+    resolve_auto_inject_recall,
+)
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
@@ -3876,6 +3882,7 @@ class GatewaySlashCommandsMixin:
             # "local" vs "cli" mismatch.
             from gateway.run import (
                 _GATEWAY_HYGIENE_PLATFORM,
+                _load_gateway_config,
                 _platform_config_key,
                 _seed_hygiene_system_prompt,
             )
@@ -3927,6 +3934,9 @@ class GatewaySlashCommandsMixin:
             if platform_key is not None:
                 runtime_kwargs["platform"] = platform_key
             runtime_kwargs["gateway_session_key"] = session_key
+            runtime_kwargs["auto_inject_recall"] = resolve_auto_inject_recall(
+                _load_gateway_config(), platform_key or "cli"
+            )
 
             # The manual compression helper skips memory-provider initialization,
             # but _compress_context may persist its cached system prompt. Restore
