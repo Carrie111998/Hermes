@@ -32,7 +32,7 @@ def _fmt_state(subsystem: str) -> str:
 
 def _fmt_pending_list(subsystem: str, snapshot=None) -> str:
     if snapshot is None:
-        snapshot = wa.pending_snapshot(subsystem)
+        snapshot = wa.pending_review_snapshot(subsystem)
     records = snapshot["records"]
     cleanup = _fmt_cleanup_notice(subsystem, snapshot)
     if not records:
@@ -56,8 +56,8 @@ def _fmt_pending_list(subsystem: str, snapshot=None) -> str:
 
 
 def _fmt_cleanup_notice(subsystem: str, snapshot) -> str:
-    expired = len(snapshot.get("expired_ids", []))
-    overflow = len(snapshot.get("overflow_ids", []))
+    expired = snapshot.get("expired_count", len(snapshot.get("expired_ids", [])))
+    overflow = snapshot.get("overflow_count", len(snapshot.get("overflow_ids", [])))
     if not expired and not overflow:
         return ""
     subject = "skill" if subsystem == wa.SKILLS else subsystem

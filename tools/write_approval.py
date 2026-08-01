@@ -46,6 +46,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -70,6 +71,9 @@ SKILL_MAX_PENDING_KEY = "write_approval_max_pending"
 SKILL_TTL_DAYS_KEY = "write_approval_ttl_days"
 DEFAULT_SKILL_MAX_PENDING = 100
 DEFAULT_SKILL_TTL_DAYS = 30
+
+_skill_state_guard = threading.Lock()
+_skill_states: Dict[Path, Dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +118,20 @@ def _normalize_enabled(value: Any) -> bool:
 
 def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
+
+
+def _skill_pending_state() -> Dict[str, Any]:
+    directory = _pending_dir(SKILLS).resolve()
+    with _skill_state_guard:
+        state = _skill_states.get(directory)
+        if state is None:
+            state = {
+                "lock": threading.RLock(),
+                "expired_count": 0,
+                "overflow_count": 0,
+            }
+            _skill_states[directory] = state
+        return state
 
 
 def _resolve_skill_pending_policy() -> tuple[int, float]:
@@ -298,8 +316,32 @@ def _skill_pending_snapshot() -> Dict[str, Any]:
 def pending_snapshot(subsystem: str) -> Dict[str, Any]:
     """Return the active pending-record snapshot and any cleanup report."""
     if subsystem == SKILLS:
-        return _skill_pending_snapshot()
+        state = _skill_pending_state()
+        with state["lock"]:
+            return _skill_pending_snapshot()
     return _basic_pending_snapshot(subsystem)
+
+
+def pending_review_snapshot(subsystem: str) -> Dict[str, Any]:
+    """Return a user-facing snapshot, including deferred stage cleanup counts."""
+    if subsystem != SKILLS:
+        return pending_snapshot(subsystem)
+
+    state = _skill_pending_state()
+    with state["lock"]:
+        expired_count = state["expired_count"]
+        overflow_count = state["overflow_count"]
+        state["expired_count"] = 0
+        state["overflow_count"] = 0
+        try:
+            snapshot = _skill_pending_snapshot()
+        except Exception:
+            state["expired_count"] += expired_count
+            state["overflow_count"] += overflow_count
+            raise
+        snapshot["expired_count"] = expired_count + len(snapshot["expired_ids"])
+        snapshot["overflow_count"] = overflow_count + len(snapshot["overflow_ids"])
+        return snapshot
 
 
 def stage_write(subsystem: str, payload: Dict[str, Any],
@@ -341,10 +383,14 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
     else:
         if subsystem == SKILLS:
-            try:
-                pending_snapshot(SKILLS)
-            except Exception as e:  # pragma: no cover - maintenance failure path
-                logger.error("Failed to maintain pending %s writes: %s", subsystem, e, exc_info=True)
+            state = _skill_pending_state()
+            with state["lock"]:
+                try:
+                    snapshot = _skill_pending_snapshot()
+                    state["expired_count"] += len(snapshot["expired_ids"])
+                    state["overflow_count"] += len(snapshot["overflow_ids"])
+                except Exception as e:  # pragma: no cover - maintenance failure path
+                    logger.error("Failed to maintain pending %s writes: %s", subsystem, e, exc_info=True)
     return record
 
 

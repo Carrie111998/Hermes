@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -525,6 +526,7 @@ def test_skill_pending_legacy_timestamp_and_unreadable_record_are_conservative(h
 
 
 def test_skill_pending_stage_list_get_and_count_share_snapshot(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa
 
     _set_skill_policy(2, 30)
@@ -547,6 +549,52 @@ def test_skill_pending_stage_list_get_and_count_share_snapshot(hermes_home, monk
     assert wa.get_pending(wa.SKILLS, "expired") is None
     assert wa.get_pending(wa.SKILLS, "older")["id"] == "older"
     assert wa.get_pending(wa.SKILLS, stage["id"])["id"] == stage["id"]
+
+    out = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    assert stage["id"] in out
+    assert out.count("Cleanup removed 1 expired pending skill write(s).") == 1
+    assert "Cleanup removed 1 expired pending skill write(s)." not in handle_pending_subcommand(
+        wa.SKILLS, ["pending"]
+    )
+
+
+def test_skill_pending_stage_and_review_serialize_cleanup_counts(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+
+    _set_skill_policy(2, 30)
+    now = 1_800_000_000.0
+    monkeypatch.setattr(wa.time, "time", lambda: now)
+    _write_pending_record(hermes_home, wa.SKILLS, "expired", created_at=now - (31 * 86400))
+
+    barrier = threading.Barrier(2)
+    snapshots = []
+
+    def stage():
+        barrier.wait()
+        wa.stage_write(
+            wa.SKILLS,
+            {"action": "write_file", "name": "new-skill", "file_path": "notes.txt", "file_content": "fresh"},
+            summary="fresh skill",
+            origin="foreground",
+        )
+
+    def review():
+        barrier.wait()
+        snapshots.append(wa.pending_review_snapshot(wa.SKILLS))
+
+    threads = [threading.Thread(target=stage), threading.Thread(target=review)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    counts = [
+        snapshot.get("expired_count", 0)
+        for snapshot in snapshots
+    ]
+    counts.append(wa.pending_review_snapshot(wa.SKILLS).get("expired_count", 0))
+    assert sum(counts) == 1
 
 
 @pytest.mark.parametrize("command", ["/skills", "/skills pending"])

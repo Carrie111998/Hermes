@@ -3498,8 +3498,8 @@ class GatewaySlashCommandsMixin:
         pending_snapshot = None
         if not gate_on and not wants_toggle:
             if is_pending_list:
-                pending_snapshot = wa.pending_snapshot(wa.SKILLS)
-                has_cleanup = pending_snapshot["expired_ids"] or pending_snapshot["overflow_ids"]
+                pending_snapshot = wa.pending_review_snapshot(wa.SKILLS)
+                has_cleanup = pending_snapshot.get("expired_count", 0) or pending_snapshot.get("overflow_count", 0)
                 if not pending_snapshot["records"] and not has_cleanup:
                     return ("Skill write approval is off (skills.write_approval). "
                             "Enable it with /skills approval on, then review staged "
