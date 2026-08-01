@@ -4124,7 +4124,7 @@ class TestMoaAggregatorStreamingBypass:
 
 class TestSynchronousFallbackCachePlans:
     @staticmethod
-    def _run_configured_fallback(monkeypatch, entry):
+    def _run_configured_fallback(monkeypatch, entry, *, cache_ttl="5m"):
         from agent.auxiliary_client import (
             _call_fallback_candidate_sync,
             _try_configured_fallback_chain,
@@ -4143,6 +4143,10 @@ class TestSynchronousFallbackCachePlans:
         monkeypatch.setattr(
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: {"fallback_chain": [entry]},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"prompt_caching": {"cache_ttl": cache_ttl}},
         )
         fallback_client, fallback_model, label = _try_configured_fallback_chain(
             task="moa_aggregator",
@@ -4213,6 +4217,29 @@ class TestSynchronousFallbackCachePlans:
             for part in (message.get("content") if isinstance(message.get("content"), list) else [])
         )
 
+    def test_cache_ttl_disable_strips_fallback_message_and_tool_markers(self, monkeypatch):
+        client, _resolved_calls, _tools = self._run_configured_fallback(
+            monkeypatch,
+            {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+            },
+            cache_ttl=False,
+        )
+
+        wire = client.chat.completions.create.call_args.kwargs
+        assert all("cache_control" not in tool for tool in wire["tools"])
+        assert all(
+            "cache_control" not in message
+            and not any(
+                isinstance(part, dict) and "cache_control" in part
+                for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+            )
+            for message in wire["messages"]
+        )
+
 
 
 class TestAsynchronousFallbackCachePlans:
@@ -4276,3 +4303,45 @@ class TestAsynchronousFallbackCachePlans:
         wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
         assert "cache_control" in wire_tools[-1]
         assert "cache_control" not in tools[-1]
+
+    @pytest.mark.asyncio
+    async def test_async_fallback_honors_cache_ttl_disable(self, monkeypatch):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        client = MagicMock()
+        client.base_url = "https://api.anthropic.com"
+
+        async def _create(**kwargs):
+            return _DummyResponse()
+
+        client.chat.completions.create = MagicMock(side_effect=_create)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"prompt_caching": {"cache_ttl": None}},
+        )
+        tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+        await _call_fallback_candidate_async(
+            client,
+            "claude-sonnet-4-6",
+            "anthropic",
+            task="moa_aggregator",
+            messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "lookup"}],
+            temperature=None,
+            max_tokens=None,
+            tools=tools,
+            effective_timeout=30.0,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+
+        wire = client.chat.completions.create.call_args.kwargs
+        assert all("cache_control" not in tool for tool in wire["tools"])
+        assert all(
+            "cache_control" not in message
+            and not any(
+                isinstance(part, dict) and "cache_control" in part
+                for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+            )
+            for message in wire["messages"]
+        )

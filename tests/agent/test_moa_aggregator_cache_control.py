@@ -151,3 +151,72 @@ def test_prepared_aggregator_plans_tools_without_decorating_prepared_state(monke
     assert "cache_control" in calls[0]["tools"][-1]
     assert "cache_control" not in tools[-1]
     assert prepared == canonical_prepared
+
+
+def test_cache_ttl_disable_blocks_prepared_aggregator_markers(monkeypatch):
+    from agent import moa_loop
+
+    calls = []
+    monkeypatch.setattr(moa_loop, "call_llm", lambda **kwargs: calls.append(kwargs) or _response())
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"prompt_caching": {"cache_ttl": "5m"}},
+    )
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        },
+    )
+    completions = moa_loop.MoAChatCompletions.__new__(moa_loop.MoAChatCompletions)
+    completions._pending_trace = None
+    completions._agent = SimpleNamespace(_cache_disabled=True)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+    completions._call_prepared_aggregator(
+        {
+            "messages": [{"role": "system", "content": "system"}, {"role": "user", "content": "lookup"}],
+            "guidance": None,
+            "aggregator": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+            "aggregator_temperature": None,
+        },
+        {"tools": tools},
+    )
+
+    wire = calls[0]
+    assert all("cache_control" not in tool for tool in wire["tools"])
+    assert all(
+        "cache_control" not in message
+        and not any(
+            isinstance(part, dict) and "cache_control" in part
+            for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+        )
+        for message in wire["messages"]
+    )
+
+
+def test_cache_ttl_disable_blocks_advisor_markers(monkeypatch):
+    from agent.moa_loop import _maybe_apply_moa_cache_control
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"prompt_caching": {"cache_ttl": "5m"}},
+    )
+    messages = [{"role": "system", "content": "advisor"}, {"role": "user", "content": "review"}]
+
+    wire = _maybe_apply_moa_cache_control(
+        messages,
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+            "_cache_disabled": True,
+        },
+    )
+
+    assert wire == messages

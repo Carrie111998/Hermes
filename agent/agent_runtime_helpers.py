@@ -1857,6 +1857,49 @@ def _direct_native_anthropic_tool_cache_capability(
     )
 
 
+def prompt_cache_disabled_from_config() -> bool:
+    """Return whether config globally disables prompt-cache decoration."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        ttl = (
+            (load_config_readonly().get("prompt_caching", {}) or {})
+            .get("cache_ttl", "5m")
+        )
+        return (
+            ttl is False
+            or ttl is None
+            or str(ttl).lower() in ("off", "false", "disabled", "no", "none")
+        )
+    except Exception:
+        return False
+
+
+def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
+    """Build the destination-identity-blank stub for ``anthropic_prompt_cache_policy``.
+
+    This is the only sanctioned constructor for that stub. Every caller that
+    resolves cache policy against a destination it identifies out-of-band
+    (not a live ``AIAgent``) must go through here, so ``_cache_disabled`` is
+    never silently missing from a hand-rolled ``SimpleNamespace`` (#76085).
+
+    ``cache_disabled``, when omitted, falls back to the global config so
+    stub-based paths without an agent snapshot still honor an operator
+    disable.
+    """
+    from types import SimpleNamespace
+
+    if cache_disabled is None:
+        cache_disabled = prompt_cache_disabled_from_config()
+    return SimpleNamespace(
+        provider="",
+        base_url="",
+        api_mode="",
+        model="",
+        _cache_disabled=cache_disabled,
+    )
+
+
 def plan_cache_sections_for_destination(
     messages: list,
     tools: Optional[list],
@@ -1865,6 +1908,7 @@ def plan_cache_sections_for_destination(
     base_url: str,
     api_mode: str,
     model: str,
+    cache_disabled: Optional[bool] = None,
 ) -> Tuple[list, list]:
     """Plan request-local cache sections for one resolved destination.
 
@@ -1878,15 +1922,13 @@ def plan_cache_sections_for_destination(
     Never mutates ``messages`` or ``tools`` — both return values are
     request-local copies.
     """
-    from types import SimpleNamespace
-
     from agent.prompt_caching import (
         build_prompt_cache_plan,
         strip_anthropic_cache_control,
         strip_anthropic_tool_cache_control,
     )
 
-    stub = SimpleNamespace(provider="", base_url="", api_mode="", model="")
+    stub = blank_cache_policy_stub(cache_disabled)
     should_cache, native_layout = anthropic_prompt_cache_policy(
         stub,
         provider=provider,
