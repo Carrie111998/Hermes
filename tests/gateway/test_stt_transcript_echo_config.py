@@ -10,7 +10,9 @@ def test_stt_echo_transcripts_defaults_on_for_backwards_compatibility():
 
     assert cfg.stt_enabled is True
     assert cfg.stt_echo_transcripts is True
+    assert cfg.stt_echo_format == "legacy"
     assert cfg.to_dict()["stt_echo_transcripts"] is True
+    assert cfg.to_dict()["stt_echo_format"] == "legacy"
 
 
 def test_top_level_stt_echo_transcripts_takes_precedence():
@@ -20,5 +22,24 @@ def test_top_level_stt_echo_transcripts_takes_precedence():
     })
 
     assert cfg.stt_echo_transcripts is False
+
+
+def test_nested_stt_echo_format_enables_copyable_transcript_block():
+    cfg = GatewayConfig.from_dict({"stt": {"echo_format": "transcript_md"}})
+    runner = object.__new__(GatewayRunner)
+    runner.config = cfg
+
+    assert cfg.stt_echo_format == "transcript_md"
+    assert runner._format_stt_transcript_echo("Как дела?") == (
+        "```\n"
+        "Как дела?\n"
+        "```"
+    )
+
+
+def test_unknown_stt_echo_format_falls_back_to_legacy():
+    cfg = GatewayConfig.from_dict({"stt": {"echo_format": "unknown"}})
+
+    assert cfg.stt_echo_format == "legacy"
 
 

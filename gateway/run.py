@@ -15820,7 +15820,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             try:
                                 await _echo_adapter.send(
                                     source.chat_id,
-                                    f'🎙️ "{_tx}"',
+                                    self._format_stt_transcript_echo(_tx),
                                     metadata=_echo_meta,
                                 )
                             except Exception as _echo_exc:
@@ -18981,6 +18981,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+    def _format_stt_transcript_echo(self, transcript: str) -> str:
+        """Format a raw STT echo without changing the transcript itself."""
+        if getattr(self.config, "stt_echo_format", "legacy") == "transcript_md":
+            return f"```\n{transcript}\n```"
+        return f'🎙️ "{transcript}"'
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
@@ -21490,7 +21496,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.send(
                     source.chat_id,
-                    f'🎙️ "{tx}"',
+                    self._format_stt_transcript_echo(tx),
                     metadata=metadata,
                 )
             except Exception as echo_exc:

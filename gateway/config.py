@@ -204,6 +204,15 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     return default
 
 
+def _normalize_stt_echo_format(value: Any, default: str = "legacy") -> str:
+    """Normalize the user-facing STT transcript echo presentation mode."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"legacy", "transcript_md"}:
+            return normalized
+    return default
+
+
 def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     """Normalize notice delivery mode to a supported value."""
     if isinstance(value, str):
@@ -913,6 +922,7 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
+    stt_echo_format: str = "legacy"  # "legacy" or copy-friendly Telegram "transcript_md"
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -1066,6 +1076,7 @@ class GatewayConfig:
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
+            "stt_echo_format": self.stt_echo_format,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
@@ -1126,6 +1137,13 @@ class GatewayConfig:
         if stt_echo_transcripts is None:
             stt_echo_transcripts = (
                 data.get("stt", {}).get("echo_transcripts")
+                if isinstance(data.get("stt"), dict)
+                else None
+            )
+        stt_echo_format = data.get("stt_echo_format")
+        if stt_echo_format is None:
+            stt_echo_format = (
+                data.get("stt", {}).get("echo_format")
                 if isinstance(data.get("stt"), dict)
                 else None
             )
@@ -1204,6 +1222,7 @@ class GatewayConfig:
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
+            stt_echo_format=_normalize_stt_echo_format(stt_echo_format),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
