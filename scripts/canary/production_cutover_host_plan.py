@@ -1073,7 +1073,7 @@ def _validate_staging_receipt(
     return copy.deepcopy(dict(value))
 
 
-def stage_fixed_host_artifacts(
+def _stage_fixed_host_artifacts_locked(
     revision: str,
     *,
     release_root: Path | None = None,
@@ -1306,6 +1306,41 @@ def stage_fixed_host_artifacts(
         gid=trusted_gid,
     )
     return _validate_staging_receipt(receipt, revision=revision, inputs=inputs)
+
+
+def stage_fixed_host_artifacts(
+    revision: str,
+    *,
+    release_root: Path | None = None,
+    filesystem_root: Path = Path("/"),
+    unit_inputs: Mapping[str, Any] | None = None,
+    secret_stager: Callable[..., Mapping[str, Any]] = (
+        production_secret_stager.stage_production_secret_foundation
+    ),
+    require_root: bool = True,
+    lock_factory: Any | None = None,
+) -> Mapping[str, Any]:
+    """Create or re-observe the fixed host set under the activation lease."""
+
+    from scripts.canary import production_cutover_activation_lock as authority_lock
+
+    try:
+        with authority_lock.authority_activation_lock(
+            require_root=require_root,
+            lock_factory=lock_factory,
+        ):
+            return _stage_fixed_host_artifacts_locked(
+                revision,
+                release_root=release_root,
+                filesystem_root=filesystem_root,
+                unit_inputs=unit_inputs,
+                secret_stager=secret_stager,
+                require_root=require_root,
+            )
+    except authority_lock.AuthorityActivationLockError as exc:
+        raise HostPlanProducerError(
+            "host_plan_activation_lock_unavailable"
+        ) from exc
 
 
 def _supplementary_groups(user: str, primary_gid: int) -> list[str]:

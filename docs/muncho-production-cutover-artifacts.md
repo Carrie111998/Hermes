@@ -135,7 +135,7 @@ root-owned mode `0400` files below
   separate synthetic canary config remains `public_only`);
 - the Phase-B, route-back, macOS edge, browser, and isolated-worker units and
   configs; and
-- nine credential-scoped operational-edge units and configs plus the exact
+- every credential-scoped operational-edge unit and config plus the exact
   root-owned client map; and
 - the root-only API bearer and approval verifiers.
 
@@ -160,14 +160,14 @@ plan. Those are exactly the fields needed to turn an observation into full
 cutover authority.
 
 The release manifest now carries a self-hashed host-artifact contract covering
-the exact 38-file host transition. Twenty-seven static runtime payloads have
+the exact manifest-derived host transition. Static runtime payloads have
 their final byte digests sealed by the release package, and the reviewed static
 gateway connector drop-in contributes one more package digest. The remaining
-eight production-rendered unit/config outputs and two root-only verifier files
+production-rendered unit/config outputs and root-only verifier files
 depend on owner-controlled live inputs, so packaging cannot truthfully know
 their final bytes. Instead, the owner submits one canonical, self-hashed host
 plan to the fixed read-only host-authority collector. That collector verifies
-the release contract, reads back all 38 fixed staged files, compares all 38
+the release contract, reads back every fixed staged file, compares every
 target pre-states, validates the topology and executable cron plan, and returns
 the full per-file evidence plus its aggregate digest. Any omitted, extra,
 changed, wrongly owned, wrongly permissioned, or package-mismatched file fails
@@ -221,6 +221,17 @@ root-side producer then:
 re-reads every staged file, rejects target or boot drift, and binds the result
 to the signed FreezePlan. Caller-authored `host_transition`, target identity,
 or `capability_topology` remains outside the authority boundary.
+
+If a newer release authority is approved before freeze/cutover begins, the
+create-only set is not overwritten or deleted. The fixed
+`production_cutover_host_staging_rotation` successor transaction acquires the
+same production activation lease, rejects any staged freeze/cutover authority,
+verifies every predecessor byte against its self-hashed receipt, atomically
+archives the predecessor host directory and receipt below the digest-addressed
+rotation root, and invokes the exact successor producer. A crash leaves either
+the predecessor intact or a resumable inert transaction; it never starts,
+stops, or reloads a production service. The predecessor remains available for
+audit after successor readback succeeds.
 
 ### Executable owner cutover sequence
 
@@ -411,16 +422,16 @@ with source and target both present is resumable only when their bytes compare
 equal internally; the source is retired before an apply receipt is possible.
 
 The same stopped action re-reads every sealed operational helper and manifest,
-installs the exact nine pre-staged Ed25519 receipt-key pairs, and starts only the
-nine credential-scoped operational-edge services under the reboot fence. It
-proves nine distinct non-root service UIDs/GIDs, nine distinct per-domain
+installs the exact pre-staged Ed25519 receipt-key pairs, and starts only the
+credential-scoped operational-edge services under the reboot fence. It proves
+distinct non-root service UIDs/GIDs and distinct per-domain
 socket groups, every systemd fragment, each Unix socket owner/group/mode, and a
 fresh boot-bound readiness receipt collected through the real signed socket
 protocol. Every service is a member of only its own socket group; its config
 admits only the gateway UID, its state directory is mode `0700`, and its
 systemd credential projection contains only that domain's leases. The root
 publisher drops the probe subprocess to the gateway UID/GID with exactly the
-nine client groups—never to an edge identity—so a compromised edge cannot
+manifest-derived client groups—never to an edge identity—so a compromised edge cannot
 invoke a sibling socket or read a sibling state/credential projection.
 Gateway, writer, Discord connector, and the normal prerequisite services remain
 stopped throughout this isolated canary gate.
@@ -443,10 +454,10 @@ It is intentionally fail-closed. The rollback contract sets
 identities have been restored and the DM-safe legacy boundary has been
 revalidated.
 
-Rollback also stops and removes the exact nine operational-edge units, removes
+Rollback also stops and removes the exact operational-edge units, removes
 the published readiness receipt, and verifies that both staged and final key
 copies remain exact but dormant. It never regenerates, replaces, exports, or
-deletes those private keys. The nine service identities and nine socket groups
+deletes those private keys. The service identities and socket groups
 remain dormant, with every pre-existing membership restored and no cross-domain
 membership widening.
 
