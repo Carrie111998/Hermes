@@ -2022,6 +2022,12 @@ def run_conversation(
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
         
+        # Keep the exact context that this iteration would resend after a
+        # provider failure. This list already includes the system prompt,
+        # assistant tool calls, and all tool outputs accumulated so far; later
+        # retry shaping mutates the same list object in place.
+        agent._current_fallback_context_messages = api_messages
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
