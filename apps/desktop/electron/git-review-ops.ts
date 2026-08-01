@@ -410,19 +410,38 @@ async function reviewUnstage(repoPath, filePath, gitBin) {
   return { ok: true }
 }
 
+// Does HEAD carry anything matching this pathspec? Verify the expected unborn
+// case separately so a real ls-tree failure still reaches the renderer.
+async function headHas(git, target) {
+  const head = await git.raw(['rev-parse', '--verify', '--quiet', 'HEAD'])
+
+  if (!head.trim()) {
+    return false
+  }
+
+  return Boolean((await git.raw(['ls-tree', '--name-only', 'HEAD', ...target])).trim())
+}
+
 // Discard changes back to the committed state. Destructive — the renderer
 // confirms first. Restores tracked files and removes untracked ones.
 async function reviewRevert(repoPath, filePath, gitBin) {
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review revert' })
   const git = gitFor(cwd, gitBin)
+  const target = filePath ? ['--', filePath] : ['--', '.']
 
-  if (filePath) {
-    await git.raw(['checkout', 'HEAD', '--', filePath]).catch(() => undefined)
-    await git.raw(['clean', '-fd', '--', filePath]).catch(() => undefined)
-  } else {
-    await git.raw(['checkout', 'HEAD', '--', '.']).catch(() => undefined)
-    await git.raw(['clean', '-fd']).catch(() => undefined)
+  // Unstage first: a *staged* new file is invisible to both commands below —
+  // `checkout HEAD` can't restore what HEAD never had, and `clean` skips it as
+  // tracked — so without this it survived the revert untouched.
+  await git.raw(filePath ? ['reset', '-q', 'HEAD', ...target] : ['reset', '-q'])
+
+  // Restore only what HEAD actually carries; for anything else `clean` is the
+  // whole job. Both commands now reject on failure, since neither is expected to
+  // fail on a path the review pane listed.
+  if (await headHas(git, target)) {
+    await git.raw(['checkout', 'HEAD', ...target])
   }
+
+  await git.raw(['clean', '-fd', ...target])
 
   return { ok: true }
 }

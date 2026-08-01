@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import web_server
+from hermes_cli import web_git, web_server
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -29,6 +29,12 @@ def client():
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+def _review_paths(client, repo: Path) -> set[str]:
+    """Paths the review pane still lists — i.e. what git really reports as changed."""
+    body = client.get("/api/git/review/list", params={"path": str(repo)}).json()
+    return {file["path"] for file in body["files"]}
 
 
 @pytest.fixture
@@ -71,8 +77,139 @@ def test_stage_commit_roundtrip_clears_changes(client, repo):
     assert after["untracked"] == 1
 
 
+def test_revert_removes_a_staged_new_file(client, repo):
+    # Staging is one click away from reverting in the review pane, and a staged
+    # new file is exactly what `checkout HEAD` (not in HEAD) and `clean` (tracked
+    # in the index) both refuse to touch.
+    _git(repo, "add", "new.py")
+
+    assert client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": "new.py"}
+    ).json() == {"ok": True}
+
+    assert not (repo / "new.py").exists()
+    # Scoped: the unrelated tracked edit is left alone.
+    assert _review_paths(client, repo) == {"a.txt"}
 
 
+def test_revert_removes_a_plain_untracked_file(client, repo):
+    # `checkout HEAD` legitimately fails here (the path is not in HEAD); `clean`
+    # is the whole job, so that failure must not abort the revert.
+    assert client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": "new.py"}
+    ).json() == {"ok": True}
+
+    assert not (repo / "new.py").exists()
+    assert _review_paths(client, repo) == {"a.txt"}
+
+
+def test_revert_restores_a_staged_modification(client, repo):
+    _git(repo, "add", "a.txt")
+
+    assert client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": "a.txt"}
+    ).json() == {"ok": True}
+
+    assert (repo / "a.txt").read_text() == "one\ntwo\n"
+    assert _review_paths(client, repo) == {"new.py"}
+
+
+def test_revert_restores_a_staged_deletion(client, repo):
+    _git(repo, "rm", "-q", "-f", "a.txt")
+
+    assert client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": "a.txt"}
+    ).json() == {"ok": True}
+
+    assert (repo / "a.txt").read_text() == "one\ntwo\n"
+    assert _review_paths(client, repo) == {"new.py"}
+
+
+def test_revert_all_clears_staged_unstaged_and_untracked(client, repo):
+    (repo / "staged-new.txt").write_text("staged\n")
+    _git(repo, "add", "staged-new.txt")
+
+    assert client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": None}
+    ).json() == {"ok": True}
+
+    assert (repo / "a.txt").read_text() == "one\ntwo\n"
+    assert not (repo / "new.py").exists()
+    assert not (repo / "staged-new.txt").exists()
+    assert _review_paths(client, repo) == set()
+
+
+def test_revert_removes_new_files_before_the_first_commit(client, tmp_path):
+    # An unborn HEAD has nothing to restore, but the new files still have to go.
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _git(fresh, "init", "-q")
+    (fresh / "staged.txt").write_text("staged\n")
+    (fresh / "loose.txt").write_text("loose\n")
+    _git(fresh, "add", "staged.txt")
+
+    assert client.post(
+        "/api/git/review/revert", json={"path": str(fresh), "file": None}
+    ).json() == {"ok": True}
+
+    assert not (fresh / "staged.txt").exists()
+    assert not (fresh / "loose.txt").exists()
+
+
+def test_revert_all_does_not_require_head_during_reset(client, tmp_path, monkeypatch):
+    """Newer Git rejects an explicit HEAD in an unborn repo; bare reset does not."""
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _git(fresh, "init", "-q")
+    (fresh / "staged.txt").write_text("staged\n")
+    (fresh / "loose.txt").write_text("loose\n")
+    _git(fresh, "add", "staged.txt")
+
+    real_git = web_git._git
+
+    def reject_unborn_head_reset(cwd, args, **kwargs):
+        if args[:3] == ["reset", "-q", "HEAD"]:
+            return 128, "", "fatal: ambiguous argument 'HEAD'"
+        return real_git(cwd, args, **kwargs)
+
+    monkeypatch.setattr(web_git, "_git", reject_unborn_head_reset)
+
+    response = client.post(
+        "/api/git/review/revert", json={"path": str(fresh), "file": None}
+    )
+
+    assert response.json() == {"ok": True}
+    assert not (fresh / "staged.txt").exists()
+    assert not (fresh / "loose.txt").exists()
+
+
+def test_revert_surfaces_ls_tree_failure_when_head_exists(client, repo, monkeypatch):
+    real_git = web_git._git
+
+    def fail_ls_tree(cwd, args, **kwargs):
+        if args and args[0] == "ls-tree":
+            return 1, "", "injected ls-tree failure"
+        return real_git(cwd, args, **kwargs)
+
+    monkeypatch.setattr(web_git, "_git", fail_ls_tree)
+
+    response = client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": "a.txt"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "injected ls-tree failure"
+
+
+def test_revert_reports_a_git_failure_instead_of_ok(client, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "note.txt").write_text("keep me\n")
+
+    response = client.post("/api/git/review/revert", json={"path": str(plain), "file": "note.txt"})
+
+    assert response.status_code == 400
+    assert (plain / "note.txt").read_text() == "keep me\n"
 
 
 def test_worktree_add_initializes_plain_folder(client, tmp_path):
