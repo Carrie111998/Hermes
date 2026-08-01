@@ -224,6 +224,59 @@ class TestRunConversationCodexPath:
         assert visible == ["I'll inspect it first.", "Done."]
         assert result["response_previewed"] is True
 
+    def test_streamed_final_without_item_id_is_rendered_once(self, monkeypatch):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            final_text = "Done."
+            self._on_event(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"delta": final_text},
+                }
+            )
+            self._on_event(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "final-message",
+                            "text": final_text,
+                        }
+                    },
+                }
+            )
+            return TurnResult(
+                final_text=final_text,
+                projected_messages=[{"role": "assistant", "content": final_text}],
+                turn_id="turn-no-item-id-1",
+                thread_id="thread-no-item-id-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-no-item-id-1",
+        )
+        visible = []
+
+        def deliver_interim(text, *, already_streamed=False):
+            if not already_streamed:
+                visible.append(text)
+
+        agent = _make_codex_agent(
+            stream_delta_callback=visible.append,
+            interim_assistant_callback=deliver_interim,
+        )
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+        if not result["response_previewed"]:
+            visible.append(result["final_response"])
+
+        assert visible == ["Done."]
+        assert result["response_previewed"] is True
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

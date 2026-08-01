@@ -403,19 +403,18 @@ This runtime is **opt-in beta**. Working as of Hermes Agent 2026.5 + Codex CLI 0
 - Memory and skill nudge counters (verified live via integration tests)
 - Hermes web_search through codex (verified live: "OpenAI Codex CLI – Getting Started" returned end-to-end)
 
+When `display.show_commentary` is enabled, completed app-server messages are
+surfaced immediately as interim updates. When a completed message was already
+streamed, Hermes marks it as previewed rather than rendering it a second time;
+when the final response matches text already delivered this turn, the result
+carries `response_previewed` so messaging clients skip the duplicate send.
+
 Known limitations:
 
 - **Hermes auth and codex auth are separate sessions.** You need both `codex login` AND `hermes auth add openai-codex` for the cleanest UX (the runtime uses codex's session for the LLM call). This is a deliberate design choice in Hermes' `_import_codex_cli_tokens` — Hermes won't share OAuth state with codex CLI to avoid clobbering each other on token refresh.
 - **`delegate_task`, `memory`, `session_search`, `todo` are unavailable on this runtime.** They need the running AIAgent context which a stateless MCP callback can't provide. Use `/codex-runtime auto` when you need these.
 - **No inline patch preview in approval prompts when codex doesn't track the changeset.** Codex's `fileChange` approval params don't always carry the changeset. Hermes caches the data from the corresponding `item/started` notification when possible, but if approval arrives before the item has streamed, the prompt falls back to whatever `reason` codex provides.
 - **Sub-second cancellation isn't guaranteed.** Mid-stream interrupts (Ctrl+C while codex is responding) are sent via `turn/interrupt`, but if codex has already flushed the final message, you get the response anyway.
-
-Completed app-server messages are surfaced immediately as interim updates. When
-an update was streamed, Hermes tracks its visible text by app-server item ID and
-settles the matching completed item without rendering it again. When the last
-completed update exactly matches the final response, Hermes also marks that
-response as already previewed so messaging clients do not send it twice.
-Distinct mid-turn commentary remains separate.
 
 If you find a bug, [open an issue](https://github.com/NousResearch/hermes-agent/issues) with the output of `hermes logs --since 5m`. Mention `codex-runtime` in the title so it's easy to triage.
 

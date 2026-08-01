@@ -599,8 +599,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         else:
             visible_text = " ".join(text.split())
             visible_streamed_text = " ".join(streamed_text.split())
-        already_streamed = bool(
-            visible_streamed_text and visible_text.startswith(visible_streamed_text)
+        already_streamed = (
+            True
+            if visible_streamed_text and visible_text.startswith(visible_streamed_text)
+            else None
         )
         try:
             emit(
@@ -619,6 +621,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}
+        if method in {"turn/completed", "turn/failed"}:
+            streamed_agent_messages.clear()
+            return
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return
