@@ -23,7 +23,8 @@ _DEFAULT_CONFIG_DIRECTORY = tempfile.TemporaryDirectory(
 _DEFAULT_CONFIG_HOME = Path(_DEFAULT_CONFIG_DIRECTORY.name).resolve()
 _default_config_home_token = set_hermes_home_override(_DEFAULT_CONFIG_HOME)
 try:
-    DEFAULT_CONFIG = importlib.import_module("hermes_cli.config").DEFAULT_CONFIG
+    config_module = importlib.import_module("hermes_cli.config")
+    _DEFAULT_CONFIG_SNAPSHOT = config_module.effective_default_config()
 finally:
     reset_hermes_home_override(_default_config_home_token)
 from session_bridge.config import (
@@ -142,7 +143,7 @@ def test_mcp_token_is_whitelisted_but_not_persisted_in_config(
 ) -> None:
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
-        lambda: deepcopy(DEFAULT_CONFIG),
+        lambda: deepcopy(_DEFAULT_CONFIG_SNAPSHOT),
     )
     config = _load(
         tmp_path / "missing.toml",
@@ -159,7 +160,7 @@ def test_live_characterization_gate_is_allowlisted_but_not_persisted_in_config(
 ) -> None:
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
-        lambda: deepcopy(DEFAULT_CONFIG),
+        lambda: deepcopy(_DEFAULT_CONFIG_SNAPSHOT),
     )
 
     config = _load(
@@ -186,7 +187,7 @@ def test_live_characterization_gate_rejects_near_match_environment_names(
 ) -> None:
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
-        lambda: deepcopy(DEFAULT_CONFIG),
+        lambda: deepcopy(_DEFAULT_CONFIG_SNAPSHOT),
     )
 
     with pytest.raises(
@@ -239,7 +240,7 @@ def _load_with_sidebar(
 def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert DEFAULT_CONFIG["session_bridge"] == {
+    assert _DEFAULT_CONFIG_SNAPSHOT["session_bridge"] == {
         "sidebar": {
             **_SIDEBAR_DEFAULTS,
             "inbox_cwd": str(_DEFAULT_CONFIG_HOME),
