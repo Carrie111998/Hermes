@@ -992,6 +992,22 @@ platform_toolsets:
 #       # the active profile's scripts directory and receive webhook JSON on stdin.
 #       script_timeout_seconds: 30
 #
+#   qqbot:
+#     enabled: false               # QQ bot disabled by default; enable only
+#                                  # after adding app credentials to .env
+#     extra:
+#       # Allowlist policy for group @-mentions (default pairing denies all
+#       # group messages; QQ has no group pairing flow).
+#       group_policy: allowlist
+#       group_allow_from:
+#         - "group_openid_example"
+#       # Optional per-member restriction: when set, only these member_openids
+#       # may @ the bot inside an allowed group. Kept separate from the C2C
+#       # allow_from list (different identity namespace). Applies only to QQ
+#       # group @-message member_openid values, not guild/channel author IDs.
+#       group_member_allow_from:
+#         - "member_openid_example"
+#
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #
 # discord:

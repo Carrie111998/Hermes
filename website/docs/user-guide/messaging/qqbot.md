@@ -70,12 +70,22 @@ platforms:
       app_id: "your-app-id"
       client_secret: "your-secret"
       markdown_support: true       # enable QQ markdown (msg_type 2). Config-only; no env-var equivalent.
-      dm_policy: "open"          # open | allowlist | disabled
+      dm_policy: "open"          # open | allowlist | disabled | pairing
       allow_from:
         - "user_openid_1"
-      group_policy: "open"       # open | allowlist | disabled
+      group_policy: "allowlist"  # allowlist | disabled | pairing | open
+                                 # (default pairing DENIES all group messages —
+                                 #  QQ has no group pairing flow. open is NOT an
+                                 #  authorization path for QQ groups: even with a
+                                 #  group allowlist configured, the gateway authz
+                                 #  layer denies open group traffic — use allowlist)
       group_allow_from:
-        - "group_openid_1"
+        - "group_openid_example"
+      group_member_allow_from:   # optional; when set, only these members may
+        - "member_openid_example" # @ the bot inside an allowed group
+                                 # Applies only to QQ group @-message
+                                 # member_openid values; it does not restrict
+                                 # guild/channel author IDs.
       stt:
         provider: "zai"          # zai (GLM-ASR), openai (Whisper), etc.
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4"
@@ -113,7 +123,7 @@ This usually means:
 
 - Verify the bot's **intents** are enabled at q.qq.com
 - Check `QQ_ALLOWED_USERS` if DM access is restricted
-- For group messages, ensure the bot is **@mentioned** (group policy may require allowlisting)
+- For group messages, ensure the bot is **@mentioned** and the group is explicitly allowlisted: set `group_policy: "allowlist"` with `QQ_GROUP_ALLOWED_USERS` (or `platforms.qqbot.extra.group_allow_from`), plus optional `group_member_allow_from` to restrict which members may interact. The default `pairing` policy denies all group messages (QQ has no group pairing flow)
 - Check `QQBOT_HOME_CHANNEL` for cron/notification delivery
 
 ### Connection errors

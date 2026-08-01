@@ -147,6 +147,21 @@ def _coerce_list(value: Any) -> List[str]:
     return _coerce_list_impl(value)
 
 
+def _mask_openid(value: Any) -> str:
+    """Mask an OpenID / message id for logs — short prefix and suffix only.
+
+    QQ OpenIDs are 32-hex-char identifiers (C2C user_openid, group_openid,
+    member_openid) and message ids are long ``ROBOT1.0_...`` tokens; neither
+    may be printed in full in logs.  Empty values render as ``<empty>``.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "<empty>"
+    if len(text) <= 10:
+        return "<id>"
+    return f"{text[:6]}...{text[-4:]}"
+
+
 # ---------------------------------------------------------------------------
 # QQAdapter
 # ---------------------------------------------------------------------------
@@ -216,6 +231,15 @@ class QQAdapter(BasePlatformAdapter):
         self._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
+        )
+        # Optional member-level allowlist for group @ messages.  Lives in its
+        # own field on purpose: QQ group ``member_openid`` values belong to a
+        # different identity namespace than C2C ``user_openid``, so group
+        # members must never be matched against the private-chat
+        # ``allow_from`` (QQ_ALLOWED_USERS).
+        self._group_member_allow_from = _coerce_list(
+            extra.get("group_member_allow_from")
+            or extra.get("groupMemberAllowFrom")
         )
 
         # Connection state
@@ -1318,11 +1342,42 @@ class QQAdapter(BasePlatformAdapter):
         """Handle a group @-message event."""
         group_openid = str(d.get("group_openid", ""))
         if not group_openid:
+            logger.debug(
+                "[%s] Group message missing group_openid, dropping", self._log_tag
+            )
             return
-        if not self._is_group_allowed(
-                group_openid, str(author.get("member_openid", ""))
+        allowed, deny_reason = self._evaluate_group_allowed(group_openid)
+        member_id = str(author.get("member_openid", ""))
+        # Member ACL applies only to QQ group @-messages: when an optional
+        # member allowlist is configured for the allowlist policy, the
+        # sender's member_openid must be listed. An empty list adds no
+        # member restriction. This never runs for guild channels or C2C DMs.
+        if (
+            allowed
+            and self._group_policy == "allowlist"
+            and self._group_member_allow_from
+            and not self._entry_matches(self._group_member_allow_from, member_id)
         ):
+            allowed = False
+            deny_reason = "member_not_allowed"
+        if not allowed:
+            # Deliberately masked: never log full OpenIDs or message bodies.
+            logger.warning(
+                "[%s] QQ group message denied: group=%s member=%s policy=%s reason=%s",
+                self._log_tag,
+                _mask_openid(group_openid),
+                _mask_openid(member_id),
+                self._group_policy,
+                deny_reason,
+            )
             return
+        logger.debug(
+            "[%s] QQ group message accepted: group=%s member=%s policy=%s",
+            self._log_tag,
+            _mask_openid(group_openid),
+            _mask_openid(member_id),
+            self._group_policy,
+        )
 
         # Strip the @bot mention prefix from content
         text = self._strip_at_mention(content)
@@ -1390,7 +1445,10 @@ class QQAdapter(BasePlatformAdapter):
         # bypass the configured allowlist.
         guild_id = str(d.get("guild_id", ""))
         author_id = str(author.get("id", ""))
-        if not self._is_group_allowed(guild_id or channel_id, author_id):
+        # Guild channels are group-like contexts: apply the plain group-level
+        # ACL only. author["id"] must never be fed into the QQ group member
+        # ACL (member_openid is a different identity namespace).
+        if not self._is_group_allowed(guild_id or channel_id):
             logger.debug(
                 "[%s] Guild message blocked by ACL: channel=%s user=%s",
                 self._log_tag, channel_id, author_id,
@@ -3195,16 +3253,45 @@ class QQAdapter(BasePlatformAdapter):
             return self._open_dm_opted_in()
         return False
 
-    def _is_group_allowed(self, group_id: str, user_id: str) -> bool:
+    def _is_group_allowed(self, group_id: str) -> bool:
+        """Legacy bool wrapper — see :meth:`_evaluate_group_allowed`."""
+        return self._evaluate_group_allowed(group_id)[0]
+
+    def _evaluate_group_allowed(self, group_id: str):
+        """Evaluate the QQ group-level policy gate.
+
+        Returns ``(allowed, reason)``.  ``reason`` is ``None`` when the
+        message is allowed, otherwise one of ``group_not_allowed`` /
+        ``pairing_unavailable``.
+
+        Explicit allowlist semantics:
+
+        * no group allowlist configured → deny;
+        * ``group_openid`` not in the group allowlist → deny.
+
+        This evaluator is group-level only: it never reads
+        ``group_member_allow_from``, ``member_openid`` values, guild author
+        IDs, or the C2C ``allow_from`` / ``QQ_ALLOWED_USERS``.  Member-level
+        authorization for QQ group @-messages is applied in
+        :meth:`_handle_group_message`; guild channels stay covered by this
+        plain group ACL via :meth:`_handle_guild_message`.
+        """
         if self._group_policy == "disabled":
-            return False
-        if self._group_policy == "allowlist":
-            return self._entry_matches(self._group_allow_from, group_id)
+            return False, "group_not_allowed"
         if self._group_policy == "pairing":
-            return False
+            # QQ has no pairing flow for group chats; pairing mode must not
+            # pretend an unpaired group is authorized.
+            return False, "pairing_unavailable"
         if self._group_policy == "open":
-            return True
-        return False
+            # Unchanged semantics at the adapter gate.  The gateway authz
+            # layer still requires an explicit group allowlist for QQ group
+            # traffic, so ``open`` does NOT blanket-authorize every group.
+            return True, None
+        if self._group_policy == "allowlist":
+            if not self._entry_matches(self._group_allow_from, group_id):
+                return False, "group_not_allowed"
+            return True, None
+        return False, "group_not_allowed"
 
     @staticmethod
     def _entry_matches(entries: List[str], target: str) -> bool:
