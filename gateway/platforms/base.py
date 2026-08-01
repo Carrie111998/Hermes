@@ -5475,6 +5475,16 @@ class BasePlatformAdapter(ABC):
         """
         await self._flush_text_debounce_now(session_key)
         pending_event = self._pending_messages.pop(session_key, None)
+        if pending_event is not None and (
+            getattr(pending_event, "metadata", None) or {}
+        ).get("media_delivery_feedback"):
+            runner = getattr(self, "gateway_runner", None)
+            promote = getattr(runner, "_promote_queued_event", None)
+            pending_event = (
+                promote(session_key, self, None)
+                if callable(promote)
+                else None
+            )
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return

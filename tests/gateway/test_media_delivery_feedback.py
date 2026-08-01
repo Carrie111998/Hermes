@@ -351,3 +351,31 @@ async def test_feedback_head_keeps_photo_followup_out_of_feedback_turn(tmp_path,
     queued = runner._sessions[session_key].conversation.queued_events
     assert len(queued) == 1
     assert queued[0] is photo
+
+
+@pytest.mark.asyncio
+async def test_session_command_drops_stale_feedback_and_keeps_followup(tmp_path, monkeypatch):
+    _, rejected = _media_paths(tmp_path, monkeypatch)
+    runner = _runner()
+    adapter = _MediaFeedbackAdapter()
+    adapter.gateway_runner = runner
+    session_key = build_session_key(_source())
+    command_guard = asyncio.Event()
+    adapter._active_sessions[session_key] = command_guard
+
+    runner._queue_media_delivery_feedback(
+        _event(),
+        session_key,
+        adapter,
+        [(str(rejected), False)],
+    )
+    followup = _event("follow-up")
+    runner._enqueue_fifo(session_key, followup, adapter)
+
+    started = []
+    adapter._start_session_processing = lambda event, key: started.append((event, key)) or True
+
+    await adapter._drain_pending_after_session_command(session_key, command_guard)
+
+    assert started == [(followup, session_key)]
+    assert adapter._active_sessions == {}
