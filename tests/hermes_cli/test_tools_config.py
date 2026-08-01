@@ -73,6 +73,36 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
 
 
 
+def test_agent_allowed_toolsets_is_a_hard_allowlist(monkeypatch):
+    """A service policy must win over platform, plugin, and MCP defaults."""
+    monkeypatch.delenv("HERMES_ALLOWED_TOOLSETS", raising=False)
+    config = {
+        "agent": {"allowed_toolsets": ["web", "vision"]},
+        "platform_toolsets": {"cli": ["all", "terminal", "web", "vision"]},
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert enabled == {"web", "vision"}
+
+
+def test_environment_allowed_toolsets_overrides_config(monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOWED_TOOLSETS", "web,vision")
+    config = {
+        "agent": {"allowed_toolsets": ["terminal"]},
+        "platform_toolsets": {"cli": ["all"]},
+    }
+
+    assert _get_platform_tools(config, "cli") == {"web", "vision"}
+
+
+def test_get_platform_tools_uses_default_when_platform_not_configured():
+    config = {}
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert enabled
+    assert enabled.isdisjoint(_DEFAULT_OFF_TOOLSETS)
 
 
 
