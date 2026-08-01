@@ -34,6 +34,14 @@ export const RICH_INPUT_SLOT = 'composer-rich-input'
 export const COMPOSER_PLACEHOLDER_CLASS =
   '[&:is(:empty,[data-empty])]:before:content-[attr(data-placeholder)] [&:is(:empty,[data-empty])]:before:text-muted-foreground/60'
 
+/** IME preedit belongs at the real caret, not after the inline placeholder.
+ * `data-empty` can outlive the first composition events because those input
+ * events are intentionally ignored until compositionend. Hide it up front;
+ * normalizeComposerEditorDom restores it if composition ends empty. */
+export function beginComposerComposition(editor: HTMLElement) {
+  delete editor.dataset.empty
+}
+
 /** Keep that marker in step with the editor root's contents. */
 export function markEditorEmptiness(editor: HTMLElement) {
   if (editor.childNodes.length === 0) {

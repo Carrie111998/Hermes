@@ -57,6 +57,7 @@ import { ActionBadges } from './micro-actions'
 import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
 import { QueuePanel } from './queue-panel'
 import {
+  beginComposerComposition,
   COMPOSER_PLACEHOLDER_CLASS,
   composerPlainText,
   deleteChipBeforeCaret,
@@ -969,8 +970,9 @@ export function ChatBar({
           // until an unrelated edit forces a sync (#39614).
           flushEditorToDraft(event.currentTarget)
         }}
-        onCompositionStart={() => {
+        onCompositionStart={event => {
           composingRef.current = true
+          beginComposerComposition(event.currentTarget)
         }}
         onDragOver={handleInputDragOver}
         onDrop={handleInputDrop}

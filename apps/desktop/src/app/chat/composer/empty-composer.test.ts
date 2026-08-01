@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { composerPlainText, normalizeComposerEditorDom, renderComposerContents, RICH_INPUT_SLOT } from './rich-editor'
+import {
+  beginComposerComposition,
+  composerPlainText,
+  normalizeComposerEditorDom,
+  renderComposerContents,
+  RICH_INPUT_SLOT
+} from './rich-editor'
 
 function editor(): HTMLDivElement {
   const el = document.createElement('div')
@@ -81,6 +87,14 @@ describe('an emptied composer shows its placeholder again', () => {
 
   it('advertises emptiness for a truly childless editor', () => {
     expect(editor().matches(PLACEHOLDER_SHOWS)).toBe(true)
+  })
+
+  it('hides the placeholder before IME preedit text starts', () => {
+    const el = emptied()
+
+    beginComposerComposition(el)
+
+    expect(el.matches(PLACEHOLDER_SHOWS)).toBe(false)
   })
 
   it('stops advertising it once something is typed', () => {
