@@ -332,30 +332,112 @@ class CatalogEntry:
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+# Split camelCase / PascalCase identifiers so BM25 can match query terms
+# against MCP tools whose wire names are CamelCase (common for HA Assist
+# intents and some OpenAPI-generated MCP surfaces).
+_CAMEL_BOUNDARY_RE = re.compile(
+    r"([a-z0-9])([A-Z])|([A-Z]+)([A-Z][a-z])"
+)
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+# Name-match boosts layered on top of BM25. These dominate BM25 so an
+# exact / near-exact tool name always outranks a long-description sibling
+# that merely shares common tokens (get/history/entity/...). Substring
+# fallback used to run *only* when BM25 produced zero hits, which buried
+# thin-description custom tools under a large fixed REST surface (#75903).
+_NAME_EXACT_BOOST = 1000.0
+_NAME_LEAF_EXACT_BOOST = 500.0
+_NAME_SUBSTRING_BOOST = 100.0
+_NAME_COMPACT_BOOST = 50.0
+
+
+def _split_ident(text: str) -> str:
+    """Insert spaces at snake/kebab/camel boundaries for tokenization."""
+    if not text:
+        return ""
+    text = (
+        text.replace("_", " ")
+        .replace(".", " ")
+        .replace("-", " ")
+        .replace(":", " ")
+    )
+    return _CAMEL_BOUNDARY_RE.sub(
+        lambda m: f"{m.group(1) or m.group(3)} {m.group(2) or m.group(4)}",
+        text,
+    )
 
 
 def _tokenize(text: str) -> List[str]:
     if not text:
         return []
-    return [t.lower() for t in _TOKEN_RE.findall(text)]
+    return [t.lower() for t in _TOKEN_RE.findall(_split_ident(text))]
+
+
+def _alnum_compact(text: str) -> str:
+    """Lowercase alphanumeric-only form for punctuation-insensitive match."""
+    return _NON_ALNUM_RE.sub("", (text or "").lower())
+
+
+def _name_leaf(name: str) -> str:
+    """Final segment of an MCP-prefixed name (``mcp__srv__tool`` → ``tool``)."""
+    if not name:
+        return ""
+    if "__" in name:
+        return name.rsplit("__", 1)[-1]
+    return name
+
+
+def _name_match_boost(query: str, tool_name: str) -> float:
+    """Return a score boost when ``query`` matches the tool's wire name.
+
+    Matching is checked against the full registry name and its final
+    ``__``-delimited leaf (the raw MCP tool name after Hermes prefixes
+    ``mcp__<server>__``). Compact alphanumeric comparison covers queries
+    that drop underscores (``gethouse reference`` vs ``get_house_reference``).
+    """
+    ql = (query or "").strip().lower()
+    if not ql or not tool_name:
+        return 0.0
+    name_l = tool_name.lower()
+    leaf = _name_leaf(tool_name).lower()
+    if name_l == ql or leaf == ql:
+        return _NAME_EXACT_BOOST if name_l == ql else _NAME_LEAF_EXACT_BOOST
+    if ql in name_l or (leaf and ql in leaf):
+        return _NAME_SUBSTRING_BOOST
+    q_compact = _alnum_compact(ql)
+    if not q_compact:
+        return 0.0
+    name_compact = _alnum_compact(name_l)
+    leaf_compact = _alnum_compact(leaf)
+    if q_compact == name_compact or q_compact == leaf_compact:
+        return _NAME_LEAF_EXACT_BOOST
+    if q_compact in name_compact or (leaf_compact and q_compact in leaf_compact):
+        return _NAME_COMPACT_BOOST
+    return 0.0
 
 
 def _entry_search_text(td: Dict[str, Any]) -> str:
     """Build the search-text blob for a deferrable tool.
 
-    Includes the tool name (with underscores broken into words so BM25 can
-    match against query terms), the description, and the names of the
-    top-level parameters. Schema bodies are deliberately excluded —
-    indexing them adds noise without improving recall in our measurement.
+    Includes the tool name (with snake/camel boundaries broken into words so
+    BM25 can match against query terms), the bare leaf name repeated for
+    weight, the description, and the names of the top-level parameters.
+    Schema bodies are deliberately excluded — indexing them adds noise
+    without improving recall in our measurement.
     """
     fn = td.get("function") or {}
-    name = fn.get("name", "")
+    name = fn.get("name", "") or ""
     desc = fn.get("description", "") or ""
-    params = ((fn.get("parameters") or {}).get("properties") or {})
-    param_names = " ".join(params.keys())
-    # Break snake_case and dotted names into words for BM25.
-    name_words = name.replace("_", " ").replace(".", " ").replace("-", " ").replace(":", " ")
-    return f"{name_words} {desc} {param_names}"
+    if not isinstance(desc, str):
+        desc = str(desc)
+    raw_params = fn.get("parameters") or {}
+    props = raw_params.get("properties") if isinstance(raw_params, dict) else None
+    param_names = " ".join(props.keys()) if isinstance(props, dict) else ""
+    name_words = _split_ident(name)
+    # Leaf (unprefixed MCP tool name) is the form users and models search for
+    # after seeing ``backend__script_key`` style listings.
+    leaf_words = _split_ident(_name_leaf(name))
+    return f"{name_words} {leaf_words} {leaf_words} {desc} {param_names}"
 
 
 def _classify_source(name: str) -> Tuple[str, str]:
@@ -385,6 +467,8 @@ def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
         if not name:
             continue
         desc = fn.get("description", "") or ""
+        if not isinstance(desc, str):
+            desc = str(desc)
         source, source_name = _classify_source(name)
         entry = CatalogEntry(
             name=name,
@@ -430,43 +514,50 @@ def _bm25_score(query_tokens: List[str], doc_tokens: List[str],
 
 
 def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> List[CatalogEntry]:
-    """Return the top-``limit`` catalog entries for ``query`` by BM25.
+    """Return the top-``limit`` catalog entries for ``query``.
 
-    Falls back to a stable name-substring match when BM25 yields no hits
-    above zero. That ensures a query like ``"github"`` against a catalog
-    where every tool is named ``github_*`` still returns results — BM25
-    can underperform when query and document share only one token that
-    appears in every document (zero IDF).
+    Ranking is BM25 over name + description + parameter names, with
+    **always-on** name-match boosts:
+
+    * exact full name / final ``__`` leaf
+    * substring of full name or leaf
+    * alphanumeric-compact match (ignores ``_``/``-``)
+
+    Name boosts used to apply only when BM25 returned zero hits. On a large
+    MCP surface (e.g. Home Assistant REST + Assist-exposed custom scripts)
+    BM25 almost always finds *something*, so thin-description custom tools
+    whose names are exact query hits were ranked past ``limit`` and never
+    returned (#75903). Boosts now layer on every candidate so a
+    name-substring query always surfaces the matching tool.
     """
     if not catalog or limit <= 0:
         return []
-    query_tokens = _tokenize(query)
-    if not query_tokens:
+    query = str(query or "").strip()
+    if not query:
         return []
+    query_tokens = _tokenize(query)
 
-    # Precompute doc statistics.
+    # Precompute doc statistics for BM25 (skipped when query has no tokens,
+    # e.g. punctuation-only — name boosts may still match).
     doc_lengths = [len(e._tokens) for e in catalog]
     avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
     doc_freq: Dict[str, int] = {}
-    for e in catalog:
-        seen = set(e._tokens)
-        for t in seen:
-            doc_freq[t] = doc_freq.get(t, 0) + 1
+    if query_tokens:
+        for e in catalog:
+            seen = set(e._tokens)
+            for t in seen:
+                doc_freq[t] = doc_freq.get(t, 0) + 1
     n_docs = len(catalog)
 
     scored: List[Tuple[float, CatalogEntry]] = []
     for entry in catalog:
-        s = _bm25_score(query_tokens, entry._tokens, doc_lengths, avg_dl,
-                        doc_freq, n_docs)
+        s = 0.0
+        if query_tokens:
+            s = _bm25_score(query_tokens, entry._tokens, doc_lengths, avg_dl,
+                            doc_freq, n_docs)
+        s += _name_match_boost(query, entry.name)
         if s > 0:
             scored.append((s, entry))
-
-    if not scored:
-        # Substring fallback against the original tool name.
-        ql = query.lower()
-        for entry in catalog:
-            if ql in entry.name.lower():
-                scored.append((0.1, entry))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [e for _, e in scored[:limit]]

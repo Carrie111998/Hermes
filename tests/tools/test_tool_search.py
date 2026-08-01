@@ -172,6 +172,94 @@ class TestRetrieval:
         hits = search_catalog(self._fake_catalog(), "github", limit=1)
         assert len(hits) <= 1
 
+    def _ha_style_catalog(self):
+        """Large fixed REST surface + thin-description Assist custom scripts.
+
+        Reproduces #75903: BM25 alone ranks empty-description custom tools
+        past ``limit`` because many REST siblings share get/entity/history
+        tokens and carry long descriptions. Name-match boosts must still
+        surface the exact tool.
+        """
+        from tools.tool_search import CatalogEntry, _tokenize, _entry_search_text
+
+        rest_blob = (
+            "Home Assistant REST API entity state history logbook statistics "
+            "service domain area device registry get list call fire render "
+        )
+        defs = []
+        for base in (
+            "get_state", "list_entities", "get_history", "get_logbook",
+            "get_statistics", "call_service", "get_config", "fire_event",
+            "render_template", "get_services", "get_entity", "entity_history",
+        ):
+            for i in range(14):
+                name = (
+                    f"mcp__backend__{base}"
+                    if i == 0
+                    else f"mcp__backend__{base}_{i}"
+                )
+                defs.append(_td(name, rest_blob + base, {
+                    "entity_id": {"type": "string"},
+                    "history": {"type": "string"},
+                }))
+        # HA-Assist-native custom scripts: name is the only strong signal.
+        defs.append(_td("mcp__backend__mcp_get_house_reference", "", {}))
+        defs.append(_td("mcp__backend__mcp_get_entity_history", "", {}))
+
+        catalog = []
+        for d in defs:
+            fn = d["function"]
+            e = CatalogEntry(
+                name=fn["name"], description=fn["description"],
+                schema=d, source="mcp", source_name="mcp-backend",
+            )
+            e._tokens = _tokenize(_entry_search_text(d))
+            catalog.append(e)
+        return catalog
+
+    def test_search_surfaces_thin_description_custom_script_by_exact_name(self):
+        """#75903 — exact script-key query must beat a noisy REST surface."""
+        from tools.tool_search import search_catalog
+
+        catalog = self._ha_style_catalog()
+        assert len(catalog) >= 150
+
+        hits = search_catalog(catalog, "mcp_get_entity_history", limit=20)
+        names = [h.name for h in hits]
+        assert "mcp__backend__mcp_get_entity_history" in names
+        assert names[0] == "mcp__backend__mcp_get_entity_history"
+
+        hits = search_catalog(catalog, "get_house_reference", limit=20)
+        names = [h.name for h in hits]
+        assert "mcp__backend__mcp_get_house_reference" in names
+        assert names[0] == "mcp__backend__mcp_get_house_reference"
+
+    def test_search_name_substring_not_gated_on_empty_bm25(self):
+        """Name substring boost applies even when BM25 already has hits."""
+        from tools.tool_search import search_catalog
+
+        catalog = self._ha_style_catalog()
+        # Many REST tools score on "entity"/"history"; without always-on
+        # name boosts the custom script ranks near the bottom of ~170 hits.
+        hits = search_catalog(catalog, "mcp_get_entity_history", limit=5)
+        assert hits[0].name == "mcp__backend__mcp_get_entity_history"
+
+    def test_search_matches_camelcase_leaf_name(self):
+        """CamelCase MCP wire names still match snake_case queries."""
+        from tools.tool_search import (
+            CatalogEntry, _tokenize, _entry_search_text, search_catalog,
+        )
+
+        d = _td("mcp__ha__McpGetHouseReference", "Assist script")
+        entry = CatalogEntry(
+            name=d["function"]["name"],
+            description=d["function"]["description"],
+            schema=d, source="mcp", source_name="mcp-ha",
+        )
+        entry._tokens = _tokenize(_entry_search_text(d))
+        hits = search_catalog([entry], "get_house_reference", limit=5)
+        assert [h.name for h in hits] == ["mcp__ha__McpGetHouseReference"]
+
 
 # ---------------------------------------------------------------------------
 # Assembly — the full passthrough/activate decision.
