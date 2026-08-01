@@ -951,7 +951,19 @@ NOUS_EXTRA_BODY = _nous_extra_body()
 auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3.6-flash"
+# NOTE: The OpenRouter default MUST carry a ``:free`` suffix. Auxiliary tasks
+# (compression, title generation, session search, …) fire in the background and
+# are expected to be cost-free by users who have pinned all visible surfaces to
+# free/local lanes. A paid model here creates a silent cash lane reachable from
+# vendor code the moment an ``OPENROUTER_API_KEY`` exists (e.g. for a separate
+# deliberate ``:free`` fallback rung). See #75803.
+_OPENROUTER_MODEL = "inclusionai/ring-2.6-1t:free"
+# OpenRouter vision-capable free model for auxiliary vision tasks.
+# The text-only ``_OPENROUTER_MODEL`` cannot process images; when the vision
+# auto-detect chain falls through to OpenRouter (step 2), use this model
+# instead so image-bearing requests succeed without silently dropping to a
+# paid model. See #75803.
+_OPENROUTER_VISION_MODEL = "google/gemini-2.0-flash-exp:free"
 _NOUS_MODEL = "google/gemini-3.6-flash"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -6619,7 +6631,11 @@ def _resolve_strict_vision_backend(
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
     if provider == "openrouter":
-        return _try_openrouter(model=model)
+        # Use a vision-capable free model — the text-only _OPENROUTER_MODEL
+        # cannot process images. Fall back to _OPENROUTER_VISION_MODEL when
+        # no explicit model is supplied.
+        vision_model = model or _OPENROUTER_VISION_MODEL
+        return _try_openrouter(model=vision_model)
     if provider == "nous":
         # Must go through resolve_provider_client so anthropic/* vision
         # recommendations wrap onto /v1/messages — _try_nous alone returns

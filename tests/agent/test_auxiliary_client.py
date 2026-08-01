@@ -1076,6 +1076,34 @@ class TestOpenRouterPaidLaneGuard:
         assert not _is_free_model(None)
 
 
+    def test_openrouter_default_model_is_free_suffix(self):
+        """_OPENROUTER_MODEL must carry a ':free' suffix.
+
+        Auxiliary tasks (compression, title generation, session search, …) fire
+        in the background and are expected to be cost-free by users who have
+        pinned all visible surfaces to free/local lanes. A paid default model
+        here creates a silent cash lane reachable from vendor code the moment an
+        OPENROUTER_API_KEY exists. See #75803.
+        """
+        assert _OPENROUTER_MODEL.endswith(":free"), (
+            f"_OPENROUTER_MODEL={_OPENROUTER_MODEL!r} must end with ':free' "
+            "to prevent silent paid-model fallbacks for auxiliary tasks"
+        )
+
+    def test_openrouter_model_used_when_no_main_provider(self, monkeypatch):
+        """When auto chain falls to OpenRouter, the returned model is the free default."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = _try_openrouter()
+
+        assert client is mock_client
+        assert model == _OPENROUTER_MODEL
+        assert _OPENROUTER_MODEL.endswith(":free")
+
+
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
 
