@@ -345,6 +345,21 @@ def _exact_optional_bool_field(
     return value
 
 
+def _exact_optional_public_php_bool_field(
+    item: dict[str, Any],
+    *keys: str,
+) -> bool | None:
+    value = _first_present(item, *keys, default=_MISSING)
+    if value is _MISSING or value is None:
+        return None
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    rendered = "/".join(keys)
+    raise ValueError(f"{rendered} must be an exact boolean")
+
+
 def _safe_limit(limit: int | None) -> int:
     if limit is None:
         return 8
@@ -1302,12 +1317,12 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
         "schedule": _truncate_text(source.get("schedule")),
         "cancellation_policy": _structured_cancellation_policy(source.get("cancellationPolicy"))["policy"],
         "cancellation": _structured_cancellation_policy(source.get("cancellationPolicy")),
-        "can_book": _exact_optional_bool_field(source, "canBook"),
-        "can_buy_voucher": _exact_optional_bool_field(
+        "can_book": _exact_optional_public_php_bool_field(source, "canBook"),
+        "can_buy_voucher": _exact_optional_public_php_bool_field(
             source,
             "canBuyVoucher",
         ),
-        "includes_bonus": _exact_optional_bool_field(
+        "includes_bonus": _exact_optional_public_php_bool_field(
             source,
             "includesBonus",
             "canReceiveBonusProduct",

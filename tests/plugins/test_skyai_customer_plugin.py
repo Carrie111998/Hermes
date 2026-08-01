@@ -264,6 +264,148 @@ def test_product_detail_exposes_structured_cancellation_policy_facts(monkeypatch
     }
 
 
+def test_product_detail_accepts_php_integer_canbook_and_preserves_cancellation_facts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": {
+                "id": 10536,
+                "name": "Кану-каяк под наем в Родопите",
+                "slug": "водни/кану-каяк-под-наем-в-родопите",
+                "cancellationPolicy": "Безплатно анулиране до 8 часa преди слота",
+                "canBook": 1,
+            }
+        },
+    )
+
+    result = public_tools.handle_skyai_product_detail(
+        product_path="водни/кану-каяк-под-наем-в-родопите"
+    )
+
+    assert result["status"] == "ok"
+    assert "answer" not in result
+    assert "guidance" not in result
+    assert "template" not in result
+    assert "routing" not in result
+    detail = result["detail"]
+    assert detail["can_book"] is True
+    assert detail["cancellation_policy"] == "Безплатно анулиране до 8 часa преди слота"
+    assert detail["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": "Безплатно анулиране до 8 часa преди слота",
+        "status": "free_until_hours_before_slot",
+        "hours_before_slot": 8,
+    }
+    assert "answer" not in detail
+    assert "guidance" not in detail
+    assert "template" not in detail
+    assert "routing" not in detail
+
+
+def test_product_detail_accepts_php_integer_zero_canbook(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": {
+                "id": 10537,
+                "name": "Само с ваучер",
+                "slug": "категория/само-с-ваучер",
+                "cancellationPolicy": "Безплатно анулиране до 24 часа преди слота",
+                "canBook": 0,
+            }
+        },
+    )
+
+    detail = public_tools.handle_skyai_product_detail(
+        product_path="категория/само-с-ваучер"
+    )["detail"]
+
+    assert detail["can_book"] is False
+    assert detail["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": "Безплатно анулиране до 24 часа преди слота",
+        "status": "free_until_hours_before_slot",
+        "hours_before_slot": 24,
+    }
+
+
+def test_product_detail_accepts_observed_public_php_boolean_siblings_without_losing_policy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": {
+                "id": 10540,
+                "name": "Кану-каяк под наем в Родопите",
+                "slug": "каякинг/кану-каяк-под-наем-в-родопите",
+                "cancellationPolicy": "Безплатно анулиране до 8 часa преди слота",
+                "canBook": 1,
+                "canBuyVoucher": 1,
+                "canReceiveBonusProduct": 1,
+            }
+        },
+    )
+
+    detail = public_tools.handle_skyai_product_detail(
+        product_path="каякинг/кану-каяк-под-наем-в-родопите"
+    )["detail"]
+
+    assert detail["can_book"] is True
+    assert detail["can_buy_voucher"] is True
+    assert detail["includes_bonus"] is True
+    assert detail["cancellation"] == {
+        "source_field": "cancellationPolicy",
+        "policy": "Безплатно анулиране до 8 часa преди слота",
+        "status": "free_until_hours_before_slot",
+        "hours_before_slot": 8,
+    }
+
+
+def test_product_detail_accepts_exact_json_boolean_canbook(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": {
+                "id": 10538,
+                "name": "JSON boolean",
+                "slug": "категория/json-boolean",
+                "cancellationPolicy": "Няма опция за безплатно анулиране",
+                "canBook": True,
+            }
+        },
+    )
+
+    detail = public_tools.handle_skyai_product_detail(
+        product_path="категория/json-boolean"
+    )["detail"]
+
+    assert detail["can_book"] is True
+    assert detail["cancellation_policy"] == "Няма опция за безплатно анулиране"
+
+
+@pytest.mark.parametrize("bad_canbook", [2, -1, 1.0, 0.0, "1", "true"])
+def test_product_detail_rejects_unsupported_numeric_and_string_canbook(monkeypatch, bad_canbook) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": {
+                "id": 10539,
+                "name": "Bad canBook",
+                "slug": "категория/bad-canbook",
+                "cancellationPolicy": "Безплатно анулиране до 48 часа преди слота",
+                "canBook": bad_canbook,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="canBook must be an exact boolean"):
+        public_tools.handle_skyai_product_detail(product_path="категория/bad-canbook")
+
+
 def test_product_detail_exposes_no_free_cancellation_policy(monkeypatch) -> None:
     def fake_http_json(url: str, *, timeout: float = 8.0):
         return {
