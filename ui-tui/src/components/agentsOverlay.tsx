@@ -344,7 +344,9 @@ function Detail({ id, node, t }: { id?: string; node: SubagentNode; t: Theme }) 
 
       <Box flexDirection="column" marginTop={1}>
         <Field name="depth" t={t} value={`${item.depth} · ${item.status}`} />
+        {item.routingProfile ? <Field name="profile" t={t} value={item.routingProfile} /> : null}
         {item.model ? <Field name="model" t={t} value={item.model} /> : null}
+        {item.reasoningEffort ? <Field name="effort" t={t} value={item.reasoningEffort} /> : null}
         {item.toolsets?.length ? <Field name="toolsets" t={t} value={item.toolsets.join(', ')} /> : null}
         <Field name="tools" t={t} value={`${item.toolCount ?? 0} (subtree ${agg.totalTools})`} />
         <Field

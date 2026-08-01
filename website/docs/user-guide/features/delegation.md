@@ -153,6 +153,70 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+## Per-task routing profiles
+
+For mixed workloads, `delegation.profiles` exposes trusted aliases that the
+parent can select independently for each task. Hermes resolves the alias to a
+provider, model, reasoning effort, and fallback policy before constructing any
+children:
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  require_profile: false
+  profiles:
+    quick:
+      description: "Bounded, reversible work with straightforward verification"
+      provider: "openrouter"
+      model: "provider/fast-model"
+      reasoning_effort: "low"
+      fallback_policy: "none"
+    deep:
+      description: "Complex work or expensive failure requiring stronger verification"
+      provider: "anthropic"
+      model: "claude-sonnet-4"
+      reasoning_effort: "high"
+      fallback_policy: "none"
+```
+
+Profile names are safe identifiers (`a-z`, `0-9`, `_`, and `-`, starting with
+a letter). Do not put API keys, secrets, base URLs, or transport settings in a
+profile. Hermes obtains provider credentials through its existing provider
+resolver.
+
+When profiles are configured, the `delegate_task` schema exposes only their
+aliases and descriptions — not raw provider credentials. The parent chooses a
+profile from the task's complexity, failure impact, and verification needs and
+supplies a short `routing_reason`:
+
+```python
+delegate_task(tasks=[
+    {
+        "goal": "Inventory the test fixtures",
+        "routing_profile": "quick",
+        "routing_reason": "Read-only, bounded, and directly verifiable"
+    },
+    {
+        "goal": "Review the authentication boundary",
+        "routing_profile": "deep",
+        "routing_reason": "Security-sensitive failure impact requires deeper review"
+    }
+])
+```
+
+Hermes validates every requested profile before constructing the first child,
+so an unknown or malformed entry rejects the whole batch instead of partially
+dispatching it. Set `delegation.require_profile: true` after qualification to
+reject calls that omit a profile. Leaving profiles empty, or keeping
+`require_profile: false`, preserves the legacy single-model behavior.
+
+`fallback_policy: "none"` prevents silent model changes. Use
+`fallback_policy: "inherit"` only when inheriting the parent's configured
+fallback chain is intentional. Results report the requested profile and the
+resolved provider, model, reasoning effort, and fallback policy. The TUI
+`/agents` overlay displays the profile, model, and reasoning effort while a
+child is running.
+
 ## Inherited Tool Access
 
 `delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.

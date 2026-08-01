@@ -17,10 +17,12 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
-import enum
 import contextvars
+import copy
+import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -959,6 +961,9 @@ def _build_child_progress_callback(
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
     model: Optional[str] = None,
+    routing_profile: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    fallback_policy: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
 ) -> Optional[callable]:
@@ -1006,6 +1011,12 @@ def _build_child_progress_callback(
             kw["depth"] = depth
         if model is not None:
             kw["model"] = model
+        if routing_profile is not None:
+            kw["routing_profile"] = routing_profile
+        if reasoning_effort is not None:
+            kw["reasoning_effort"] = reasoning_effort
+        if fallback_policy is not None:
+            kw["fallback_policy"] = fallback_policy
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1208,6 +1219,10 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Trusted routing-profile metadata resolved before child construction.
+    routing_profile: Optional[str] = None,
+    override_reasoning_effort: Any = None,
+    fallback_policy: str = "inherit",
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1246,6 +1261,24 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
+    delegation_effort = (
+        override_reasoning_effort
+        if override_reasoning_effort is not None
+        else delegation_cfg.get("reasoning_effort")
+    )
+    reasoning_effort_for_cb: Optional[str] = None
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed_effort = parse_reasoning_effort(delegation_effort)
+        if parsed_effort is not None:
+            reasoning_effort_for_cb = (
+                parsed_effort.get("effort")
+                if parsed_effort.get("enabled")
+                else "none"
+            )
+    except Exception:
+        pass
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1343,6 +1376,9 @@ def _build_child_agent(
         parent_id=parent_subagent_id,
         depth=tui_depth,
         model=effective_model_for_cb,
+        routing_profile=routing_profile,
+        reasoning_effort=reasoning_effort_for_cb,
+        fallback_policy=fallback_policy,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
     )
@@ -1439,7 +1475,6 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1458,7 +1493,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        None
+        if fallback_policy == "none"
+        else (getattr(parent_agent, "_fallback_chain", None) or None)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1551,6 +1590,16 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    setattr(child, "_delegate_routing_profile", routing_profile)
+    resolved_reasoning_effort = (
+        child_reasoning.get("effort")
+        if isinstance(child_reasoning, dict) and child_reasoning.get("enabled")
+        else "none"
+        if isinstance(child_reasoning, dict) and child_reasoning.get("enabled") is False
+        else None
+    )
+    setattr(child, "_delegate_reasoning_effort", resolved_reasoning_effort)
+    setattr(child, "_delegate_fallback_policy", fallback_policy)
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1960,6 +2009,27 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _child_route_metadata(child) -> Dict[str, Optional[str]]:
+    """Return the safe, resolved route fields exposed in events and results."""
+    profile = getattr(child, "_delegate_routing_profile", None)
+    provider = getattr(child, "provider", None)
+    model = getattr(child, "model", None)
+    effort = getattr(child, "_delegate_reasoning_effort", None)
+    fallback = getattr(child, "_delegate_fallback_policy", None)
+    return {
+        "routing_profile": profile if isinstance(profile, str) else None,
+        "provider": provider if isinstance(provider, str) else None,
+        "model": model if isinstance(model, str) else None,
+        "reasoning_effort": effort if isinstance(effort, str) else None,
+        "fallback_policy": fallback if isinstance(fallback, str) else None,
+    }
+
+
+def _child_subagent_id(child) -> Optional[str]:
+    subagent_id = getattr(child, "_subagent_id", None)
+    return subagent_id if isinstance(subagent_id, str) else None
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2100,6 +2170,9 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                "routing_profile": _child_route_metadata(child)["routing_profile"],
+                "reasoning_effort": _child_route_metadata(child)["reasoning_effort"],
+                "fallback_policy": _child_route_metadata(child)["fallback_policy"],
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -2277,6 +2350,7 @@ def _run_single_child(
 
             return {
                 "task_index": task_index,
+                "subagent_id": _subagent_id,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
@@ -2292,6 +2366,7 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                **_child_route_metadata(child),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2378,15 +2453,13 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
-        _model = getattr(child, "model", None)
-
         entry: Dict[str, Any] = {
             "task_index": task_index,
+            "subagent_id": _subagent_id,
             "status": status,
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
-            "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2397,6 +2470,7 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            **_child_route_metadata(child),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -2530,12 +2604,14 @@ def _run_single_child(
                 logger.debug("Progress callback failure relay failed: %s", e)
         return {
             "task_index": task_index,
+            "subagent_id": _subagent_id,
             "status": "error",
             "summary": None,
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            **_child_route_metadata(child),
         }
 
     finally:
@@ -2775,12 +2851,202 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+_ROUTING_PROFILE_REQUIRED_KEYS = {
+    "description",
+    "provider",
+    "model",
+    "reasoning_effort",
+    "fallback_policy",
+}
+_ROUTING_PROFILE_ALLOWED_KEYS = _ROUTING_PROFILE_REQUIRED_KEYS
+_ROUTING_PROFILE_ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_LEGACY_ROUTE_KEYS = {
+    "api_key",
+    "api_mode",
+    "base_url",
+    "model",
+    "provider",
+    "reasoning_effort",
+}
+
+
+def _validated_routing_profiles(cfg: dict) -> Dict[str, Dict[str, Any]]:
+    """Validate the trusted alias registry without resolving credentials."""
+    raw_profiles = cfg.get("profiles", {})
+    if raw_profiles in (None, {}):
+        return {}
+    if not isinstance(raw_profiles, dict):
+        raise ValueError("delegation.profiles must be a mapping of alias to profile config")
+
+    from hermes_constants import parse_reasoning_effort
+
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for raw_alias, raw_profile in raw_profiles.items():
+        if not isinstance(raw_alias, str) or not raw_alias.strip():
+            raise ValueError("delegation profile aliases must be non-empty strings")
+        alias = raw_alias.strip()
+        if alias != raw_alias:
+            raise ValueError(
+                f"delegation profile alias {raw_alias!r} must not contain outer whitespace"
+            )
+        if _ROUTING_PROFILE_ALIAS_PATTERN.fullmatch(alias) is None:
+            raise ValueError(
+                f"delegation profile alias {alias!r} must match "
+                "^[a-z][a-z0-9_-]{0,63}$"
+            )
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"delegation profile {alias!r} must be a mapping")
+
+        missing = sorted(_ROUTING_PROFILE_REQUIRED_KEYS - set(raw_profile))
+        if missing:
+            raise ValueError(
+                f"delegation profile {alias!r} is missing required keys: "
+                f"{', '.join(missing)}"
+            )
+        unknown = sorted(set(raw_profile) - _ROUTING_PROFILE_ALLOWED_KEYS)
+        if unknown:
+            raise ValueError(
+                f"delegation profile {alias!r} has unsupported keys: "
+                f"{', '.join(unknown)}"
+            )
+
+        profile = dict(raw_profile)
+        for key in ("description", "provider", "model"):
+            value = profile.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"delegation profile {alias!r} requires a non-empty {key}"
+                )
+            profile[key] = value.strip()
+
+        effort = profile.get("reasoning_effort")
+        if not isinstance(effort, str) or parse_reasoning_effort(effort) is None:
+            raise ValueError(
+                f"delegation profile {alias!r} has invalid "
+                f"reasoning_effort {effort!r}"
+            )
+        profile["reasoning_effort"] = effort.strip().lower()
+
+        fallback_policy = profile.get("fallback_policy")
+        if fallback_policy not in {"inherit", "none"}:
+            raise ValueError(
+                f"delegation profile {alias!r} fallback_policy must be "
+                "'inherit' or 'none'"
+            )
+        profiles[alias] = profile
+    return profiles
+
+
+def _prepare_task_routes(
+    cfg: dict,
+    task_list: List[Dict[str, Any]],
+    *,
+    top_routing_profile: Optional[str],
+    top_routing_reason: Optional[str],
+    parent_agent,
+) -> List[Dict[str, Any]]:
+    """Validate every task route, then resolve credentials atomically."""
+    try:
+        profiles = _validated_routing_profiles(cfg)
+    except ValueError as exc:
+        logger.error("Invalid delegation.profiles configuration: %s", exc)
+        raise ValueError(
+            "delegation.profiles configuration is invalid; no child was created"
+        ) from exc
+    require_profile = is_truthy_value(cfg.get("require_profile", False))
+    pending: List[Dict[str, Any]] = []
+
+    for index, task in enumerate(task_list):
+        raw_profile = task.get("routing_profile", top_routing_profile)
+        if raw_profile is not None and (
+            not isinstance(raw_profile, str) or not raw_profile.strip()
+        ):
+            raise ValueError(
+                f"Task {index} routing_profile must be a non-empty string"
+            )
+        profile_name = raw_profile.strip() if isinstance(raw_profile, str) else None
+        reason = task.get("routing_reason", top_routing_reason)
+
+        if profile_name is None:
+            if require_profile:
+                raise ValueError(
+                    f"Task {index} requires routing_profile because "
+                    "delegation.require_profile is enabled"
+                )
+            if reason not in (None, ""):
+                raise ValueError(
+                    f"Task {index} provides routing_reason without routing_profile"
+                )
+            pending.append(
+                {
+                    "routing_profile": None,
+                    "reasoning_effort": None,
+                    "fallback_policy": "inherit",
+                    "config": cfg,
+                }
+            )
+            continue
+
+        if profile_name not in profiles:
+            available = ", ".join(sorted(profiles)) or "none configured"
+            raise ValueError(
+                f"Task {index} requested unknown routing_profile "
+                f"{profile_name!r}; available profiles: {available}"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f"Task {index} routing_profile {profile_name!r} "
+                "requires routing_reason"
+            )
+        if len(reason.strip()) > 512:
+            raise ValueError(f"Task {index} routing_reason must be at most 512 characters")
+
+        profile = profiles[profile_name]
+        # A named profile is resolved through the existing provider resolver.
+        # Do not inherit the legacy one-route endpoint, API key, transport, or
+        # model overrides; those could silently redirect a different profile.
+        effective_cfg = {
+            key: value for key, value in cfg.items() if key not in _LEGACY_ROUTE_KEYS
+        }
+        effective_cfg.update(profile)
+        effective_cfg.pop("profiles", None)
+        effective_cfg.pop("require_profile", None)
+        pending.append(
+            {
+                "routing_profile": profile_name,
+                "reasoning_effort": profile["reasoning_effort"],
+                "fallback_policy": profile["fallback_policy"],
+                "config": effective_cfg,
+            }
+        )
+
+    resolved: List[Dict[str, Any]] = []
+    legacy_credentials: Optional[Dict[str, Any]] = None
+    for route in pending:
+        route = dict(route)
+        route_config = route.pop("config")
+        if route["routing_profile"] is None:
+            if legacy_credentials is None:
+                legacy_credentials = _resolve_delegation_credentials(
+                    route_config, parent_agent
+                )
+            route["credentials"] = legacy_credentials
+        else:
+            route["credentials"] = _resolve_delegation_credentials(
+                route_config, parent_agent
+            )
+        resolved.append(route)
+    return resolved
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    routing_profile: Optional[str] = None,
+    routing_reason: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2851,16 +3117,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2880,7 +3136,15 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "routing_profile": routing_profile,
+                "routing_reason": routing_reason,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2895,6 +3159,17 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    try:
+        task_routes = _prepare_task_routes(
+            cfg,
+            task_list,
+            top_routing_profile=routing_profile,
+            top_routing_reason=routing_reason,
+            parent_agent=parent_agent,
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2940,6 +3215,8 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        route = task_routes[i]
+        creds = route["credentials"]
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -2959,6 +3236,9 @@ def delegate_task(
             override_max_tokens=creds.get("max_output_tokens"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
+            routing_profile=route["routing_profile"],
+            override_reasoning_effort=route["reasoning_effort"],
+            fallback_policy=route["fallback_policy"],
             role=effective_role,
         )
         # Tee the child's progress events into its live transcript log.
@@ -3038,6 +3318,9 @@ def delegate_task(
                                 except Exception as exc:
                                     entry = {
                                         "task_index": idx,
+                                        "subagent_id": _child_subagent_id(
+                                            _child_by_index.get(idx)
+                                        ),
                                         "status": "error",
                                         "summary": None,
                                         "error": str(exc),
@@ -3046,10 +3329,14 @@ def delegate_task(
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
+                                        **_child_route_metadata(_child_by_index.get(idx)),
                                     }
                             else:
                                 entry = {
                                     "task_index": idx,
+                                    "subagent_id": _child_subagent_id(
+                                        _child_by_index.get(idx)
+                                    ),
                                     "status": "interrupted",
                                     "summary": None,
                                     "error": "Parent agent interrupted — child did not finish in time",
@@ -3058,6 +3345,7 @@ def delegate_task(
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
+                                    **_child_route_metadata(_child_by_index.get(idx)),
                                 }
                             results.append(entry)
                             completed_count += 1
@@ -3075,6 +3363,7 @@ def delegate_task(
                             idx = futures[future]
                             entry = {
                                 "task_index": idx,
+                                "subagent_id": _child_subagent_id(_child_by_index.get(idx)),
                                 "status": "error",
                                 "summary": None,
                                 "error": str(exc),
@@ -3083,6 +3372,7 @@ def delegate_task(
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
+                                **_child_route_metadata(_child_by_index.get(idx)),
                             }
                         results.append(entry)
                         completed_count += 1
@@ -3315,6 +3605,13 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _route_models = [route["credentials"].get("model") for route in task_routes]
+        _dispatch_model = (
+            _route_models[0]
+            if _route_models
+            and all(model == _route_models[0] for model in _route_models)
+            else "mixed"
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3322,7 +3619,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3816,18 +4113,58 @@ def _build_dynamic_schema_overrides() -> dict:
     get_definitions() pass rewrites the description fields to the user's
     actual limits.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
+    overrides_params = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    description = _build_top_level_description()
+    cfg = _load_config()
+    try:
+        profiles = _validated_routing_profiles(cfg)
+    except ValueError as exc:
+        profiles = {}
+        logger.error("Invalid delegation.profiles configuration: %s", exc)
+        description += (
+            "\n\nRouting profiles are unavailable because configuration "
+            "validation failed."
+        )
+
+    if profiles:
+        aliases = sorted(profiles)
+        profile_lines = "\n".join(
+            f"- {alias}: {profiles[alias]['description']}" for alias in aliases
+        )
+        profile_schema = {
+            "type": "string",
+            "enum": aliases,
+            "description": (
+                "Trusted routing alias configured by the user. Select from:\n"
+                f"{profile_lines}"
+            ),
+        }
+        reason_schema = {
+            "type": "string",
+            "maxLength": 512,
+            "description": (
+                "Short provenance for the selected routing profile, grounded "
+                "in goal complexity, failure impact, and verification needs. "
+                "Do not include secrets or source text."
+            ),
+        }
+        properties = overrides_params["properties"]
+        properties["routing_profile"] = copy.deepcopy(profile_schema)
+        properties["routing_reason"] = copy.deepcopy(reason_schema)
+        task_properties = properties["tasks"]["items"]["properties"]
+        task_properties["routing_profile"] = copy.deepcopy(profile_schema)
+        task_properties["routing_reason"] = copy.deepcopy(reason_schema)
+        description += (
+            "\n\nROUTING: Choose a configured routing_profile for each "
+            "delegated task and provide routing_reason. The runtime resolves "
+            "the alias; never put provider or model identifiers in task text."
+        )
+
     return {
-        "description": _build_top_level_description(),
+        "description": description,
         "parameters": overrides_params,
     }
 
@@ -3965,6 +4302,8 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        routing_profile=args.get("routing_profile"),
+        routing_reason=args.get("routing_reason"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

@@ -528,6 +528,7 @@ export interface SubagentEventPayload {
   cost_usd?: number
   depth?: number
   duration_seconds?: number
+  fallback_policy?: string
   files_read?: string[]
   files_written?: string[]
   goal: string
@@ -537,7 +538,9 @@ export interface SubagentEventPayload {
   output_tail?: { is_error?: boolean; preview?: string; tool?: string }[]
   output_tokens?: number
   parent_id?: null | string
+  reasoning_effort?: string
   reasoning_tokens?: number
+  routing_profile?: string
   status?: SubagentStatus
   subagent_id?: string
   summary?: string
@@ -555,9 +558,12 @@ export interface SubagentEventPayload {
 export interface DelegationStatusResponse {
   active?: {
     depth?: number
+    fallback_policy?: null | string
     goal?: string
     model?: null | string
     parent_id?: null | string
+    reasoning_effort?: null | string
+    routing_profile?: null | string
     started_at?: number
     status?: string
     subagent_id?: string

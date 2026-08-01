@@ -37,7 +37,9 @@ export interface SubagentProgress {
   outputTail?: SubagentOutputEntry[]
   outputTokens?: number
   parentId: null | string
+  reasoningEffort?: string
   reasoningTokens?: number
+  routingProfile?: string
   startedAt?: number
   status: SubagentStatus
   summary?: string
@@ -76,9 +78,12 @@ export interface SubagentAggregate {
 export interface DelegationStatus {
   active: {
     depth?: number
+    fallback_policy?: null | string
     goal?: string
     model?: null | string
     parent_id?: null | string
+    reasoning_effort?: null | string
+    routing_profile?: null | string
     started_at?: number
     status?: string
     subagent_id?: string

@@ -45,6 +45,9 @@ class _StubChild:
         self._subagent_id = subagent_id
         self._delegate_depth = 1
         self._delegate_role = "leaf"
+        self._delegate_routing_profile: str | None = None
+        self._delegate_reasoning_effort: str | None = None
+        self._delegate_fallback_policy: str | None = None
         self.model = "test/model"
         self.provider = "testprov"
         self.api_mode = "chat_completions"
@@ -197,6 +200,11 @@ class TestRunSingleChildTimeoutDump:
 
     def test_zero_api_calls_writes_dump_and_surfaces_path(self, hermes_home, monkeypatch):
         child = _StubChild(api_call_count=0, hang_seconds=10.0)
+        child._delegate_routing_profile = "high"
+        child.provider = "openai-codex"
+        child.model = "gpt-5.6-sol"
+        child._delegate_reasoning_effort = "xhigh"
+        child._delegate_fallback_policy = "none"
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
@@ -210,6 +218,11 @@ class TestRunSingleChildTimeoutDump:
         assert "without making any API call" in result["error"]
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
+        assert result["routing_profile"] == "high"
+        assert result["provider"] == "openai-codex"
+        assert result["model"] == "gpt-5.6-sol"
+        assert result["reasoning_effort"] == "xhigh"
+        assert result["fallback_policy"] == "none"
 
 
     # ── explicit timeout metadata (#51690, salvaged from PR #60378) ────

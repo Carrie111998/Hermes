@@ -1279,6 +1279,29 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().activity.filter(a => a.text.includes('/agents'))).toHaveLength(1)
   })
 
+  it('preserves subagent routing profile and reasoning effort', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        goal: 'routed child',
+        model: 'gpt-routed',
+        reasoning_effort: 'max',
+        routing_profile: 'critical',
+        subagent_id: 'sa-routed',
+        task_index: 0
+      },
+      type: 'subagent.start'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-routed')).toMatchObject({
+      model: 'gpt-routed',
+      reasoningEffort: 'max',
+      routingProfile: 'critical'
+    })
+  })
+
   it('nudges at most once per turn and resets on the next message.start', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

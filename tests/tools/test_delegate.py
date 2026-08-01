@@ -13,8 +13,10 @@ import json
 import os
 import threading
 import time
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -692,6 +694,614 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             requested="crof.ai", target_model="deepseek-v4-pro-CEER"
         )
 
+
+class TestDelegationRoutingProfiles(unittest.TestCase):
+    def _config(self, *, require_profile=False):
+        return {
+            "max_iterations": 45,
+            "require_profile": require_profile,
+            "profiles": {
+                "fast": {
+                    "description": "Bounded, reversible work",
+                    "provider": "openrouter",
+                    "model": "vendor/fast-model",
+                    "reasoning_effort": "low",
+                    "fallback_policy": "none",
+                },
+                "deep": {
+                    "description": "Complex work with expensive failure",
+                    "provider": "openrouter",
+                    "model": "vendor/deep-model",
+                    "reasoning_effort": "max",
+                    "fallback_policy": "none",
+                },
+            },
+        }
+
+    @patch("tools.delegate_tool._load_config")
+    def test_dynamic_schema_exposes_only_configured_profile_aliases(self, mock_cfg):
+        import tools.delegate_tool as dt
+
+        mock_cfg.return_value = self._config()
+        schema = dt._build_dynamic_schema_overrides()["parameters"]
+        props = schema["properties"]
+
+        self.assertEqual(props["routing_profile"]["enum"], ["deep", "fast"])
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertEqual(task_props["routing_profile"]["enum"], ["deep", "fast"])
+        self.assertIn("routing_reason", props)
+        self.assertIn("routing_reason", task_props)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_dynamic_schema_without_profiles_preserves_legacy_surface(self, _mock_cfg):
+        import tools.delegate_tool as dt
+
+        parameters = dt._build_dynamic_schema_overrides()["parameters"]
+        properties = parameters["properties"]
+        task_properties = properties["tasks"]["items"]["properties"]
+
+        self.assertNotIn("routing_profile", properties)
+        self.assertNotIn("routing_reason", properties)
+        self.assertNotIn("routing_profile", task_properties)
+        self.assertNotIn("routing_reason", task_properties)
+
+    def test_registry_fallback_forwards_top_level_and_per_task_routing(self):
+        import tools.delegate_tool as dt
+
+        entry = dt.registry.get_entry("delegate_task")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        parent = _make_mock_parent()
+        args = {
+            "goal": "single",
+            "routing_profile": "deep",
+            "routing_reason": "failure would be expensive",
+            "tasks": [
+                {
+                    "goal": "batch",
+                    "routing_profile": "fast",
+                    "routing_reason": "bounded and reversible",
+                    "acp_command": "must-not-pass",
+                }
+            ],
+        }
+
+        with patch.object(dt, "delegate_task", return_value="{}") as dispatch:
+            entry.handler(args, parent_agent=parent)
+
+        kwargs = dispatch.call_args.kwargs
+        self.assertEqual(kwargs["routing_profile"], "deep")
+        self.assertEqual(kwargs["routing_reason"], "failure would be expensive")
+        self.assertEqual(kwargs["tasks"][0]["routing_profile"], "fast")
+        self.assertEqual(
+            kwargs["tasks"][0]["routing_reason"], "bounded and reversible"
+        )
+        self.assertNotIn("acp_command", kwargs["tasks"][0])
+        self.assertIs(kwargs["parent_agent"], parent)
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_mixed_batch_resolves_each_profile_before_child_construction(
+        self, mock_cfg, mock_creds, mock_build, mock_run
+    ):
+        mock_cfg.return_value = self._config()
+        mock_creds.side_effect = lambda cfg, _parent: {
+            "provider": cfg["provider"],
+            "model": cfg["model"],
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        }
+        children = [MagicMock(), MagicMock()]
+        for child in children:
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+        mock_build.side_effect = children
+        mock_run.side_effect = [
+            {"task_index": 0, "status": "completed", "summary": "A"},
+            {"task_index": 1, "status": "completed", "summary": "B"},
+        ]
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", ThreadPoolExecutor):
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {
+                            "goal": "A",
+                            "routing_profile": "fast",
+                            "routing_reason": "Bounded and reversible",
+                        },
+                        {
+                            "goal": "B",
+                            "routing_profile": "deep",
+                            "routing_reason": "Failure would be expensive",
+                        },
+                    ],
+                    parent_agent=_make_mock_parent(),
+                )
+            )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(mock_creds.call_count, 2)
+        calls = mock_build.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "vendor/fast-model")
+        self.assertEqual(calls[0].kwargs["routing_profile"], "fast")
+        self.assertEqual(calls[0].kwargs["override_reasoning_effort"], "low")
+        self.assertEqual(calls[0].kwargs["fallback_policy"], "none")
+        self.assertEqual(calls[1].kwargs["model"], "vendor/deep-model")
+        self.assertEqual(calls[1].kwargs["routing_profile"], "deep")
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_invalid_mixed_batch_is_rejected_atomically(
+        self, mock_cfg, mock_creds, mock_build
+    ):
+        mock_cfg.return_value = self._config()
+
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {
+                        "goal": "A",
+                        "routing_profile": "fast",
+                        "routing_reason": "Bounded",
+                    },
+                    {
+                        "goal": "B",
+                        "routing_profile": "missing",
+                        "routing_reason": "Unknown route",
+                    },
+                ],
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("missing", result["error"])
+        mock_creds.assert_not_called()
+        mock_build.assert_not_called()
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_required_profile_rejects_legacy_call_before_child_construction(
+        self, mock_cfg, mock_creds, mock_build
+    ):
+        mock_cfg.return_value = self._config(require_profile=True)
+
+        result = json.loads(
+            delegate_task(goal="No route", parent_agent=_make_mock_parent())
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("routing_profile", result["error"])
+        mock_creds.assert_not_called()
+        mock_build.assert_not_called()
+
+    def test_default_config_keeps_profiles_optional(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        self.assertEqual(DEFAULT_CONFIG["delegation"]["profiles"], {})
+        self.assertIs(DEFAULT_CONFIG["delegation"]["require_profile"], False)
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_legacy_batch_reuses_single_global_credential_resolution(self, mock_creds):
+        import tools.delegate_tool as dt
+
+        credentials = {"provider": None, "model": None}
+        mock_creds.return_value = credentials
+        routes = dt._prepare_task_routes(
+            {},
+            [{"goal": "A"}, {"goal": "B"}],
+            top_routing_profile=None,
+            top_routing_reason=None,
+            parent_agent=_make_mock_parent(),
+        )
+
+        mock_creds.assert_called_once()
+        self.assertIs(routes[0]["credentials"], credentials)
+        self.assertIs(routes[1]["credentials"], credentials)
+
+    def test_profile_config_rejects_unsafe_aliases_and_inline_endpoints(self):
+        import tools.delegate_tool as dt
+
+        profile = {
+            "description": "Fast",
+            "provider": "openai-codex",
+            "model": "gpt-fast",
+            "reasoning_effort": "max",
+            "fallback_policy": "none",
+        }
+        with self.assertRaisesRegex(ValueError, "must match"):
+            dt._validated_routing_profiles({"profiles": {"../fast": profile}})
+
+        with self.assertRaisesRegex(ValueError, "unsupported keys"):
+            dt._validated_routing_profiles(
+                {"profiles": {"fast": {**profile, "base_url": "https://example.invalid"}}}
+            )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_profile_does_not_inherit_legacy_endpoint_or_api_key(self, mock_creds):
+        import tools.delegate_tool as dt
+
+        mock_creds.return_value = {"provider": "openai-codex", "model": "gpt-fast"}
+        cfg = {
+            "provider": "legacy-provider",
+            "model": "legacy-model",
+            "base_url": "https://legacy.invalid/v1",
+            "api_key": "legacy-secret",
+            "api_mode": "legacy-mode",
+            "profiles": {
+                "fast": {
+                    "description": "Fast",
+                    "provider": "openai-codex",
+                    "model": "gpt-fast",
+                    "reasoning_effort": "max",
+                    "fallback_policy": "none",
+                }
+            },
+        }
+
+        dt._prepare_task_routes(
+            cfg,
+            [{"goal": "A", "routing_profile": "fast", "routing_reason": "small"}],
+            top_routing_profile=None,
+            top_routing_reason=None,
+            parent_agent=_make_mock_parent(),
+        )
+
+        route_cfg = mock_creds.call_args.args[0]
+        self.assertEqual(route_cfg["provider"], "openai-codex")
+        self.assertEqual(route_cfg["model"], "gpt-fast")
+        self.assertNotIn("base_url", route_cfg)
+        self.assertNotIn("api_key", route_cfg)
+        self.assertNotIn("api_mode", route_cfg)
+
+    def test_profile_uses_real_provider_resolver_instead_of_parent_key(self):
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent()
+        parent.provider = "anthropic"
+        parent.api_key = "parent-secret"
+        cfg = {
+            "profiles": {
+                "deep": {
+                    "description": "Deep",
+                    "provider": "openrouter",
+                    "model": "vendor/deep-model",
+                    "reasoning_effort": "max",
+                    "fallback_policy": "none",
+                }
+            }
+        }
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "profile-provider-key"}):
+            routes = dt._prepare_task_routes(
+                cfg,
+                [
+                    {
+                        "goal": "Audit",
+                        "routing_profile": "deep",
+                        "routing_reason": "High impact",
+                    }
+                ],
+                top_routing_profile=None,
+                top_routing_reason=None,
+                parent_agent=parent,
+            )
+
+        credentials = routes[0]["credentials"]
+        self.assertEqual(credentials["provider"], "openrouter")
+        self.assertEqual(credentials["model"], "vendor/deep-model")
+        self.assertEqual(credentials["api_key"], "profile-provider-key")
+        self.assertNotEqual(credentials["api_key"], parent.api_key)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_profile_applies_reasoning_and_disables_parent_fallback(
+        self, mock_agent, _mock_cfg
+    ):
+        parent = _make_mock_parent()
+        parent._fallback_chain = [{"provider": "openrouter", "model": "fallback"}]
+        child = MagicMock()
+        mock_agent.return_value = child
+
+        built = _build_child_agent(
+            task_index=0,
+            goal="Route deeply",
+            context=None,
+            toolsets=None,
+            model="vendor/deep-model",
+            max_iterations=45,
+            task_count=1,
+            parent_agent=parent,
+            override_provider="openrouter",
+            override_base_url="https://example.invalid/v1",
+            override_api_key="test-key",
+            override_api_mode="chat_completions",
+            routing_profile="deep",
+            override_reasoning_effort="max",
+            fallback_policy="none",
+        )
+
+        _, kwargs = mock_agent.call_args
+        self.assertEqual(kwargs["model"], "vendor/deep-model")
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "max"}
+        )
+        self.assertIsNone(kwargs["fallback_model"])
+        self.assertEqual(getattr(built, "_delegate_routing_profile"), "deep")
+        self.assertEqual(getattr(built, "_delegate_reasoning_effort"), "max")
+        self.assertEqual(getattr(built, "_delegate_fallback_policy"), "none")
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_selected_profile_requires_reason(
+        self, mock_cfg, mock_creds, mock_build
+    ):
+        mock_cfg.return_value = self._config()
+
+        result = json.loads(
+            delegate_task(
+                goal="Missing provenance",
+                routing_profile="fast",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("requires routing_reason", result["error"])
+        mock_creds.assert_not_called()
+        mock_build.assert_not_called()
+
+    def test_profile_builds_real_child_with_resolved_runtime_route(self):
+        parent = MagicMock()
+        parent.enabled_toolsets = []
+        parent.disabled_toolsets = []
+        parent.model = "parent-model"
+        parent.provider = "openrouter"
+        parent.base_url = "https://openrouter.ai/api/v1"
+        parent.api_key = "parent-key"
+        parent.api_mode = "chat_completions"
+        parent.service_tier = None
+        parent.reasoning_config = {"enabled": True, "effort": "low"}
+        parent.max_output_chars = None
+        parent.quiet_mode = True
+        parent.platform = "cli"
+        parent.credential_pool = None
+        parent._fallback_chain = [{"provider": "openrouter", "model": "fallback"}]
+        parent.request_overrides = {}
+        parent._print_fn = None
+        parent.tool_progress_callback = None
+        parent._delegate_spinner = None
+        parent._delegate_depth = 0
+        parent.session_id = "parent-session"
+        parent._current_turn_id = "turn"
+        parent._subagent_id = None
+        parent._parent_subagent_id = None
+
+        child = _build_child_agent(
+            task_index=0,
+            goal="Audit route",
+            context=None,
+            toolsets=None,
+            model="vendor/deep-model",
+            max_iterations=5,
+            parent_agent=parent,
+            role="leaf",
+            task_count=1,
+            override_base_url="https://openrouter.ai/api/v1",
+            override_api_key="profile-key",
+            override_provider="openrouter",
+            override_api_mode="chat_completions",
+            override_reasoning_effort="max",
+            routing_profile="deep",
+            fallback_policy="none",
+        )
+        try:
+            self.assertEqual(getattr(child, "provider"), "openrouter")
+            self.assertEqual(getattr(child, "model"), "vendor/deep-model")
+            self.assertEqual(
+                getattr(child, "reasoning_config"), {"enabled": True, "effort": "max"}
+            )
+            self.assertEqual(getattr(child, "_fallback_chain"), [])
+            self.assertEqual(getattr(child, "_delegate_routing_profile"), "deep")
+        finally:
+            child.close()
+
+    def test_result_metadata_reports_resolved_profile_provider_and_effort(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "vendor/deep-model"
+        child.provider = "openrouter"
+        child._delegate_routing_profile = "deep"
+        child._delegate_reasoning_effort = "max"
+        child._delegate_fallback_policy = "none"
+        child._subagent_id = "sa-routed"
+        child.session_prompt_tokens = 10
+        child.session_completion_tokens = 5
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", ThreadPoolExecutor):
+            result = _run_single_child(
+                task_index=0,
+                goal="Metadata",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["routing_profile"], "deep")
+        self.assertEqual(result["provider"], "openrouter")
+        self.assertEqual(result["reasoning_effort"], "max")
+        self.assertEqual(result["fallback_policy"], "none")
+        self.assertEqual(result["subagent_id"], "sa-routed")
+
+    def test_error_result_keeps_exact_resolved_route_metadata(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "vendor/deep-model"
+        child.provider = "openrouter"
+        child._delegate_routing_profile = "deep"
+        child._delegate_reasoning_effort = "max"
+        child._delegate_fallback_policy = "none"
+        child._subagent_id = "sa-error"
+        child.run_conversation.side_effect = RuntimeError("transport failed")
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", ThreadPoolExecutor):
+            result = _run_single_child(
+                task_index=0,
+                goal="Metadata failure",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["model"], "vendor/deep-model")
+        self.assertEqual(result["provider"], "openrouter")
+        self.assertEqual(result["routing_profile"], "deep")
+        self.assertEqual(result["reasoning_effort"], "max")
+        self.assertEqual(result["fallback_policy"], "none")
+        self.assertEqual(result["subagent_id"], "sa-error")
+
+
+class TestRoutingProfileFakeClientIntegration(unittest.TestCase):
+    """Stage 4.1: isolated config through the native three-child consumer."""
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_isolated_config_routes_three_mixed_children_exactly(
+        self, mock_creds, mock_agent
+    ):
+        def resolve_credentials(cfg, _parent):
+            return {
+                "model": cfg["model"],
+                "provider": cfg["provider"],
+                "base_url": "https://synthetic.invalid/codex",
+                "api_key": "synthetic-test-key",
+                "api_mode": "codex_responses",
+            }
+
+        def build_fake_client(**kwargs):
+            child = MagicMock()
+            child.model = kwargs["model"]
+            child.provider = kwargs["provider"]
+            child.session_id = f"fake-{kwargs['model']}"
+            child.session_prompt_tokens = 10
+            child.session_completion_tokens = 5
+            child.run_conversation.return_value = {
+                "final_response": f"completed by {kwargs['model']}",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            return child
+
+        mock_creds.side_effect = resolve_credentials
+        mock_agent.side_effect = build_fake_client
+
+        config = """\
+delegation:
+  max_concurrent_children: 3
+  profiles:
+    low:
+      description: bounded work
+      provider: openai-codex
+      model: gpt-5.6-luna
+      reasoning_effort: max
+      fallback_policy: none
+    high:
+      description: cross-system work
+      provider: openai-codex
+      model: gpt-5.6-sol
+      reasoning_effort: xhigh
+      fallback_policy: none
+    critical:
+      description: high-consequence work
+      provider: openai-codex
+      model: gpt-5.6-sol
+      reasoning_effort: max
+      fallback_policy: none
+"""
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = []
+        parent.disabled_toolsets = []
+        parent.reasoning_config = {"enabled": True, "effort": "low"}
+        parent._fallback_chain = [{"provider": "openrouter", "model": "fallback"}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hermes_home = Path(tmpdir)
+            (hermes_home / "config.yaml").write_text(config, encoding="utf-8")
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                result = json.loads(
+                    delegate_task(
+                        tasks=[
+                            {
+                                "goal": "bounded extraction",
+                                "routing_profile": "low",
+                                "routing_reason": "bounded and directly verifiable",
+                            },
+                            {
+                                "goal": "cross-system synthesis",
+                                "routing_profile": "high",
+                                "routing_reason": "ambiguous cross-system dependency",
+                            },
+                            {
+                                "goal": "authority decision",
+                                "routing_profile": "critical",
+                                "routing_reason": "irreversible authority impact",
+                            },
+                        ],
+                        parent_agent=parent,
+                    )
+                )
+
+        self.assertEqual(
+            [item["status"] for item in result["results"]],
+            ["completed", "completed", "completed"],
+        )
+        self.assertEqual(
+            [
+                (
+                    item["routing_profile"],
+                    item["model"],
+                    item["reasoning_effort"],
+                    item["fallback_policy"],
+                )
+                for item in result["results"]
+            ],
+            [
+                ("low", "gpt-5.6-luna", "max", "none"),
+                ("high", "gpt-5.6-sol", "xhigh", "none"),
+                ("critical", "gpt-5.6-sol", "max", "none"),
+            ],
+        )
+        self.assertEqual(mock_agent.call_count, 3)
+        for call in mock_agent.call_args_list:
+            self.assertEqual(call.kwargs["base_url"], "https://synthetic.invalid/codex")
+            self.assertEqual(call.kwargs["fallback_model"], None)
+
+
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
@@ -1141,6 +1751,29 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_routing_fields_reach_native_delegate_dispatch(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "route this",
+                    "routing_profile": "deep",
+                    "routing_reason": "Expensive failure",
+                },
+            )
+
+        self.assertEqual(captured["routing_profile"], "deep")
+        self.assertEqual(captured["routing_reason"], "Expensive failure")
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
@@ -1166,6 +1799,26 @@ class TestDelegateEventEnum(unittest.TestCase):
         # Should not raise
         cb("some.unknown.event", tool_name="x")
         parent._delegate_spinner.print_above.assert_not_called()
+
+    def test_progress_callback_relays_route_identity(self):
+        parent = _make_mock_parent()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(
+            0,
+            "route-aware",
+            parent,
+            routing_profile="deep",
+            reasoning_effort="max",
+            fallback_policy="none",
+        )
+        assert cb is not None
+        cb("subagent.start")
+
+        kwargs = parent.tool_progress_callback.call_args.kwargs
+        self.assertEqual(kwargs["routing_profile"], "deep")
+        self.assertEqual(kwargs["reasoning_effort"], "max")
+        self.assertEqual(kwargs["fallback_policy"], "none")
 
     def test_progress_callback_task_progress_not_misrendered(self):
         """'subagent_progress' (legacy name for TASK_PROGRESS) carries a
