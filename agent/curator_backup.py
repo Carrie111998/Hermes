@@ -541,46 +541,31 @@ def _restore_cron_skill_links(snapshot_dir: Path) -> Dict[str, Any]:
 
 
 
-def _is_unsafe_archive_path(name: str) -> bool:
-    """True if *name* would escape the extraction root.
+def _unstage(moved: List[Tuple[Path, Path]]) -> List[str]:
+    """Move staged entries back to their original paths.
 
-    Catches POSIX absolute paths, Windows absolute / drive-letter / UNC
-    paths (``C:/x``, ``\\\\server\\share``) and any ``..`` traversal
-    component. ``Path(name).parts`` alone misses the Windows cases on a
-    POSIX host and the drive case on Windows, so we check both flavours
-    explicitly.
+    ``shutil.move`` moves *into* an existing destination directory rather than
+    replacing it, so a partially-completed extract leaves debris that would
+    otherwise bury the user's real skill one level deeper
+    (``skills/foo/foo/``) while the tree still looks populated. Clear whatever
+    the failed extract created at each original path first. The staged copy is
+    authoritative, and the pre-rollback safety snapshot is the undo handle for
+    the extract's own output.
+
+    Returns the names that could not be restored, so the caller can report an
+    incomplete recovery instead of claiming the state was restored.
     """
-    if not name:
-        return True
-    normalized = name.replace("\\", "/")
-    posix = PurePosixPath(normalized)
-    windows = PureWindowsPath(name)
-    if posix.is_absolute() or windows.is_absolute() or windows.drive:
-        return True
-    return any(part == ".." for part in posix.parts)
-
-
-def _assert_safe_member(member: "tarfile.TarInfo") -> None:
-    """Reject tar members that could escape the skills dir on extract.
-
-    Defense-in-depth for the Python < 3.12 fallback path, which has no
-    ``filter="data"`` and would otherwise honour a symlink/hardlink member
-    whose target points outside the destination (then write a later member
-    *through* that link). The original guard only inspected ``member.name``;
-    a link member's traversal lives in ``member.linkname``, and Windows
-    absolute paths slipped past the POSIX-only check entirely.
-    """
-    if _is_unsafe_archive_path(member.name):
-        raise tarfile.TarError(
-            f"refusing to extract unsafe path: {member.name!r}"
-        )
-    if member.issym() or member.islnk():
-        link = member.linkname or ""
-        if not link or _is_unsafe_archive_path(link):
-            raise tarfile.TarError(
-                "refusing to extract link with unsafe target: "
-                f"{member.name!r} -> {link!r}"
-            )
+    failed: List[str] = []
+    for orig, dest in moved:
+        try:
+            if orig.is_dir() and not orig.is_symlink():
+                shutil.rmtree(orig)
+            elif orig.exists() or orig.is_symlink():
+                orig.unlink()
+            shutil.move(str(dest), str(orig))
+        except OSError:
+            failed.append(orig.name)
+    return failed
 
 
 def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]]:
@@ -651,11 +636,7 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
             moved.append((entry, dest))
     except OSError as e:
         # Best-effort rollback of the move
-        for orig, dest in moved:
-            try:
-                shutil.move(str(dest), str(orig))
-            except OSError:
-                pass
+        _unstage(moved)
         try:
             shutil.rmtree(staged, ignore_errors=True)
         except OSError:
@@ -677,12 +658,30 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
                 # Python < 3.12 — no filter kwarg
                 tf.extractall(str(skills))
     except (OSError, tarfile.TarError) as e:
-        # Best-effort recover: move staged contents back
-        for orig, dest in moved:
+        # Best-effort recover. A partial extract can leave entries the
+        # original tree never had, so drop those first, otherwise the
+        # "restored" tree is the user's skills plus a slice of the snapshot.
+        staged_names = {orig.name for orig, _ in moved}
+        for entry in list(skills.iterdir()):
+            if entry.name in _EXCLUDE_TOP_LEVEL or entry.name in staged_names:
+                continue
             try:
-                shutil.move(str(dest), str(orig))
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
             except OSError:
                 pass
+        unrestored = _unstage(moved)
+        if unrestored:
+            # Do not claim a clean restore we did not achieve, and keep the
+            # staging dir so the entries can be recovered by hand.
+            return (
+                False,
+                f"snapshot extract failed: {e} - could not restore "
+                f"{', '.join(sorted(unrestored))}; staged copies kept at {staged}",
+                None,
+            )
         try:
             shutil.rmtree(staged, ignore_errors=True)
         except OSError:

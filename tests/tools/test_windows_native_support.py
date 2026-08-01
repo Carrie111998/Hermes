@@ -55,8 +55,7 @@ class TestConfigureWindowsStdio:
     def test_no_op_on_posix(self, monkeypatch):
         from hermes_cli import stdio
 
-        monkeypatch.setattr(stdio.sys, "platform", "linux")
-        assert stdio.is_windows() is False
+        monkeypatch.setattr(stdio, "is_windows", lambda: False)
         result = stdio.configure_windows_stdio()
         assert result is False
 

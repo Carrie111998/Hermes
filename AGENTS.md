@@ -68,108 +68,155 @@ their official paths — **do not relocate** for “cleanliness” (imports, CI,
 
 See [`fork/local-workspace/README.md`](fork/local-workspace/README.md).
 
-## Development Snapshot
+### Python
+**ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
+hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
+per-file subprocess isolation via `scripts/run_tests_parallel.py` — no xdist,
+worker count auto-scaled from CPU count). Direct `pytest`
+on a 16+ core developer machine with API keys set diverges from CI in ways
+that have caused multiple "works locally, fails in CI" incidents (and the reverse).
 
 ```bash
-# Prefer project .venv (Python 3.12 via uv); fall back only if needed
-source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
-scripts/run_tests.sh        # always — not bare pytest
+scripts/run_tests.sh                                  # full suite, CI-parity
+scripts/run_tests.sh tests/gateway/                   # one directory
+scripts/run_tests.sh tests/agent/test_foo.py -k test_x  # one test (file + -k; the runner is file-granular)
+scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
 ```
 
-User config: `~/.hermes/config.yaml` + `~/.hermes/.env` (secrets). Paths:
-`get_hermes_home()` / `display_hermes_home()` — never hardcode `~/.hermes`.
+**Flake policy:** the runner auto-retries a failing test FILE once in a fresh
+subprocess (`--file-retries`, default 1; `HERMES_TEST_FILE_RETRIES=0` to
+disable). Pass-on-retry counts as green but is printed in a `⚠ FLAKY` summary
+section with both attempts' output. A FLAKY report is a bug to fix, not noise
+to ignore — timing-sensitive tests must not assume a quiet runner (loose
+wall-clock bounds ≥ 2s, event-based sync, no `assert not _wait_until(...)`
+negative-timing races).
 
-Desktop: [`apps/desktop/AGENTS.md`](apps/desktop/AGENTS.md). Tools: register in
-`tools/` + wire into `toolsets.py`. Plugins must not patch core files.
+#### Subprocess-per-test-file isolation
 
-## Learned User Preferences
+Every test file runs in a freshly-spawned Python subprocess via `run_tests_parallel.py`. This means module-level dicts/sets and
+ContextVars from one test file cannot leak into the next.
 
-- Windows stack restarts include Desktop by default; exclude llama unless
-  explicitly requested. With llama: `restart-hermes-stack.ps1 -StartLlama` via
-  hot-swap (`start-llama-hotswap.ps1` / `llama-hotswap-models.ini`) or
-  Turboquant / RTX 5060 Ti scripts; wait until warm/ready — if `:8080`
-  `/v1/models` is already healthy, omit `-StartLlama`. No new non-secret
-  `HERMES_*`.
-- Prefer Desktop `.lnk` (Hermes icon) over `.ps1` launchers.
-- Keep Desktop↔backend mutual monitoring after restarts; prefer **Go watchdog
-  alone** (not parallel PowerShell watchdog). Operator watchdog / control-plane
-  HTTP must not be controllable from Hermes AI tools/sessions.
-- Avoid duplicate Desktop/backend/watchdog processes; use `-SkipTunnels` when
-  memory-graph/tunnels hang. If `-StartGoWatchdog` BuildIfMissing/prewarm hangs:
-  packaged exe + `hermes serve --skip-build` on `:9119`, then Desktop. Clean
-  Desktop recovery: stop Go watchdog → clear wedged `:9118`/`:9119` → timed HTTP
-  on serve (not only LISTEN) → single Desktop; do not disturb WebUI `:8787`.
-- Run CLI / restarts / Desktop backend / smoke from uv `.venv` on Python 3.12
-  (`uv venv --python 3.12` / `uv sync`); not system 3.14 or wrong `py -3`.
-- Upstream merges while live checkout stays up: separate branch/worktree; if
-  features equivalent, take upstream and reapply fork advantages via
-  `scripts/sync_all.py` / `scripts/merge_tools/`. Preserve fork `self_evolution`
-  (`ai_scientist_research` / `shinka_run` + API-key bridge) via overlay replay.
-- Upstream security/fix/Dependabot PRs: branch from latest `upstream/main`,
-  exclude `_docs`/fork noise, King's English, check for duplicate Issue/PR;
-  salvage incomplete prior fixes; harden env-leak / path-traversal /
-  agent-runaway without gutting capability. Large framework migrations
-  (e.g. react-router v8 / `web/`) stay on dedicated branches — do not fold
-  into Dependabot batch or upstream-sync merges.
-- New agent-facing folders (esp. harness docs): add `AGENTS.md` + README.
+#### Why the wrapper
 
-## Learned Workspace Facts
+|                     | Without wrapper                             | With wrapper                              |
+| ------------------- | ------------------------------------------- | ----------------------------------------- |
+| Provider API keys   | Whatever is in your env (auto-detects pool) | All env vars except a specific few unset. |
+| HOME / `~/.hermes/` | Your real config+auth.json                  | Temp dir per test                         |
+| Timezone            | Local TZ (PDT etc.)                         | UTC                                       |
+| Locale              | Whatever is set                             | C.UTF-8                                   |
 
-- Packaged Desktop: `%LOCALAPPDATA%\hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe`
-  (fallback: repo `apps/desktop/release/win-unpacked/Hermes.exe`). After Desktop
-  code changes: `hermes desktop --build-only --force-build` and sync into
-  LocalAppData.
-- Go watchdog: `scripts/windows/watchdog-go/` via `Start-HermesGoWatchdog.ps1`
-  (default `127.0.0.1:9920`, optional Tailscale). May prewarm serve on `:9118`;
-  Desktop expects announcement on `:9119` — mismatch/unready →
-  `Timed out waiting for Hermes backend port announcement (90000ms)`. Prefer
-  healthy `:9119` (or matching `HERMES_DESKTOP_REMOTE_*`). Paths with spaces:
-  separate argv for `-hermes-root` (never PowerShell `$args`); `detectRepoRoot`
-  needs `pyproject.toml`, must not stop at `\scripts`. Mutual monitoring:
-  `%LOCALAPPDATA%\HermesWatchdog\desktop-backend.json` + `HERMES_DESKTOP_REMOTE_*`.
-  Mirror / local hot-swap checkout:
-  `C:\Users\downl\Documents\New project\HermesDesktopwatchdog` (GitHub:
-  zapabob/HermesDesktopwatchdog). After Go watchdog or post-merge Desktop
-  announce/auth changes: rebuild from that checkout or
-  `Build-HermesGoWatchdog.ps1` (e.g. `-SkipTest`) before `-StartGoWatchdog`.
-- Prewarm/managed ports: `/api/status` or LISTEN alone is insufficient (wedged
-  serve can hang HTTP at 0 bytes). Manifest token drift → `/api/sessions` 401 /
-  “Could not connect”; Go watchdog `testBackendAuth` before publishing and
-  replaces on drift. Dead `:9119` may temporarily use healthy dashboard `:9120`
-  via `HERMES_DESKTOP_REMOTE_*`; clear stale overrides when recovering. Legacy
-  PS watchdog: `Start-HermesDesktopBackendWatchdog.ps1` (prefer Go-only).
-- Port map: [`fork/operations/AGENTS.md`](fork/operations/AGENTS.md) — **8787 =
-  Hermes-WebUI** (not messaging gateway); 9118 prewarm; 9119 Desktop serve;
-  9120 dashboard; llama 8080/8081; harness 18794. Reserved ops ports must not be
-  treated as Desktop backend or reaped by the watchdog.
-- On this Windows host, `Get-CimInstance` / `netstat` (sometimes `taskkill`) can
-  hang during cleanup — prefer `Stop-Process -Name` + short `curl.exe -m`.
-- Worktrees that cannot check out `main`: `git push origin HEAD:main`.
-- Local llama.cpp: context ≥ 65536 (often ~100k); GPU = RTX 5060 Ti 16GB;
-  Turboquant scripts under `scripts/windows/`. Hot-swap:
-  `start-llama-hotswap.ps1` + `llama-hotswap-models.ini` with isolated HF-cache
-  (recent `:8080` lineup: Qwen3.6-35B IQ3_M + Huihui-gemma-4-12B-agentic
-  Q4_K_M). Do not invent HF ids like
-  `NousResearch/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M`; if a Hermes-3 stub reappears
-  on `/v1/models`, ForceRestart the isolated hot-swap stack.
-- World Intel MCP (`zapabob/world-intel-mcp`, toolset often `world-intel`):
-  provider keys in `~/.hermes/.env` only; dashboard
-  `.venv\Scripts\intel-dashboard.exe` → `http://localhost:8501` (Tailscale for
-  remote).
-- Missing Desktop session history / post-merge boot failure: treat as
-  Desktop↔`hermes serve` connectivity/auth first (`:9119` LISTEN-but-HTTP-000
-  zombie, stale `HERMES_DESKTOP_REMOTE_*`). URL set without TOKEN is a hard fail —
-  clear both and use local `:9119`; also check manifest drift / 401.
-  `~/.hermes/state.db` is often intact — do not VACUUM/rewrite the live DB
-  while other agents may use it.
-- `vendor/airi` rebuild on Windows: `ACCESS_VIOLATION` occurs with parallel `pnpm build`
-  — always rebuild sequentially (`pnpm build` without `-p` / `--parallel`) after
-  stopping all AIRI processes first (`pnpm kill` or kill the Electron process).
-- AIRI provider/TTS localStorage sync: keys are under `stage-ui:*` namespace in
-  `localStorage`. CDP merge (`Runtime.evaluate` → `localStorage.setItem`) + `Page.reload`
-  is the reliable path. TTS endpoint is `irodori-tts` at `http://localhost:8088/v1/`;
-  provider slug for OpenAI-compatible audio speech is `openai-compatible-audio-speech`.
-- Desktop sidebar unreadability (wallpaper skin): sidebar renders behind the wallpaper's
-  `skinLayer` when no explicit `z-index` is set. Fix via a `sidebar_bg` token in
-  `apps/shared/src/skin.ts` and `apps/desktop/src/themes/skin.ts`, with per-skin
-  value in `~/.hermes/skins/<skin>.yaml` (e.g. `sidebar_bg: "#16092ee8"`).
+### Where to place what tests
+
+The CI change classifier (`scripts/ci/classify_changes.py`) runs specific jobs based on what files changed. A Python test that asserts
+about the contents of `package.json`, `package-lock.json`, `.ts`/`.tsx`
+source, or any other JS-side artifact will not run on a PR that only touches
+those files. This means a regression can go green on a PR and red on `main` (where the
+classifier fails open and runs everything).
+
+Any test that reads or asserts about `package.json`,
+`package-lock.json`, `tsconfig.json`, `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs`
+source files configuration belongs in the JS (vitest) test suite, not in `tests/*.py`.
+
+### Don't write change-detector tests
+
+A test is a **change-detector** if it fails whenever data that is **expected
+to change** gets updated — model catalogs, config version numbers,
+enumeration counts, hardcoded lists of provider models. These tests add no
+behavioral coverage; they just guarantee that routine source updates break
+CI and cost engineering time to "fix."
+
+**Do not write:**
+
+```python
+# catalog snapshot — breaks every model release
+assert "gemini-2.5-pro" in _PROVIDER_MODELS["gemini"]
+assert "MiniMax-M2.7" in models
+
+# config version literal — breaks every schema bump
+assert DEFAULT_CONFIG["_config_version"] == 21
+
+# enumeration count — breaks every time a skill/provider is added
+assert len(_PROVIDER_MODELS["huggingface"]) == 8
+```
+
+**Do write:**
+
+```python
+# behavior: does the catalog plumbing work at all?
+assert "gemini" in _PROVIDER_MODELS
+assert len(_PROVIDER_MODELS["gemini"]) >= 1
+
+# behavior: does migration bump the user's version to current latest?
+assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+
+# invariant: no plan-only model leaks into the legacy list
+assert not (set(moonshot_models) & coding_plan_only_models)
+
+# invariant: every model in the catalog has a context-length entry
+for m in _PROVIDER_MODELS["huggingface"]:
+    assert m.lower() in DEFAULT_CONTEXT_LENGTHS_LOWER
+```
+
+The rule: if the test reads like a snapshot of current data, delete it. If
+it reads like a contract about how two pieces of data must relate, keep it.
+When a PR adds a new provider/model and you want a test, make the test
+assert the relationship (e.g. "catalog entries all have context lengths"),
+not the specific names.
+
+Reviewers should reject new change-detector tests; authors should convert
+them into invariants before re-requesting review.
+
+### Never read source code in tests
+
+A test that reads a source file's text is testing *the shape of the
+source code*, not its behavior. This is a hard antipattern, banned outright.
+Any test that reads a .py, .ts, .tsx, etc., file is suspect.
+
+**Why it's actively harmful, not just weak:**
+
+- It passes when the implementation is subtly broken (the regex matches a
+  call site that exists but is wired wrong) and fails when a correct
+  refactor changes formatting, variable names, or control flow with
+  identical runtime behavior. Both directions of failure are wrong.
+- It can't be run against a built/bundled/minified artifact, so it silently
+  stops testing anything the moment code moves, gets renamed, or a
+  dependency reformats it.
+- It actively blocks refactors: reviewers see "keeps a pattern intact" tests
+  fail during pure structural cleanup with no behavior change, and either
+  hand-wave the failure (dangerous) or waste time updating regexes that add
+  nothing (waste).
+- It gives false confidence. a green suite full of source-regex tests
+  looks like coverage but has never once executed the code path it claims
+  to guard.
+
+**Do not write:**
+
+```ts
+const source = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
+
+test('backend spawn hides the Windows console', () => {
+  assert.match(source, /spawn\(\s*backend\.command,\s*backend\.args[\s\S]{0,300}hiddenWindowsChildOptions/)
+})
+```
+
+**Do write — extract the logic into a small pure/DI-testable function and
+call it for real:**
+
+```ts
+// backend-spawn.ts
+export function hiddenWindowsChildOptions(options: SpawnOptionsLike = {}, isWindows = process.platform === 'win32') {
+  if (!isWindows || 'windowsHide' in options) return options
+  return { ...options, windowsHide: true }
+}
+
+// backend-spawn.test.ts
+test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
+  assert.equal(hiddenWindowsChildOptions({}, true).windowsHide, true)
+  assert.equal(hiddenWindowsChildOptions({}, false).windowsHide, undefined)
+  assert.equal(hiddenWindowsChildOptions({ windowsHide: false }, true).windowsHide, false)
+})
+```
+
+If the logic lives inline in a god-file (`main.ts`, `cli.py`,
+`gateway/run.py`) and extracting it feels disruptive: that's the actual
+signal to do the extraction, not to regex around it.

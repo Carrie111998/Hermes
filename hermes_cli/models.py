@@ -126,6 +126,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # DeepSeek
     ("deepseek/deepseek-v4-pro",               ""),
     ("deepseek/deepseek-v4-flash",             ""),
+    ("deepseek/deepseek-v4-flash-0731",        "dated snapshot of v4-flash"),
     # Qwen
     ("qwen/qwen3.7-max",                       ""),
     # MoonshotAI
@@ -297,6 +298,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # DeepSeek
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-0731",
         # Qwen
         "qwen/qwen3.7-max",
         # MoonshotAI
@@ -2831,161 +2833,29 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
-def _dedupe_model_ids(*catalogs: list[str]) -> list[str]:
-    """Return model IDs in first-seen order with case-insensitive deduping."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for catalog in catalogs:
-        for raw in catalog or []:
-            mid = str(raw or "").strip()
-            if not mid:
-                continue
-            key = mid.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(mid)
-    return out
+def _openai_discovery_base_url(provider: str) -> str:
+    """Effective OpenAI endpoint for model discovery.
 
-
-def _fetch_opencode_live_models(
-    provider: Optional[str],
-    *,
-    force_refresh: bool = False,
-    timeout: float = 5.0,
-) -> Optional[list[str]]:
-    """Fetch OpenCode's live model catalog without requiring local auth state."""
-    normalized = normalize_provider(provider)
-    base_url = _OPENCODE_LIVE_MODEL_BASE_URLS.get(normalized)
-    if not base_url:
-        return None
-
-    now = time.time()
-    cached = _OPENCODE_LIVE_MODEL_CACHE.get(normalized)
-    if (
-        cached
-        and not force_refresh
-        and now - cached[0] <= _OPENCODE_LIVE_CACHE_TTL
-    ):
-        return list(cached[1])
-
+    Mirrors the runtime precedence so discovery probes the SAME endpoint
+    inference uses: ``$OPENAI_BASE_URL`` (explicit env override) →
+    ``model.base_url`` from config.yaml when the configured provider matches
+    → the canonical default. Previously this read the env var only, so a
+    config-set data-residency host (``us.api.openai.com``) was ignored and
+    the catalog kept coming from ``api.openai.com``.
+    """
+    env_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    if env_raw:
+        return env_raw
     try:
-        live = fetch_api_models(None, base_url, timeout=timeout)
+        model_cfg = _get_model_config_dict()
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if cfg_provider in ("openai", "openai-api") and normalize_provider(provider) == normalize_provider(cfg_provider):
+            cfg_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            if cfg_url:
+                return cfg_url
     except Exception:
-        live = None
-    if live:
-        models = _dedupe_model_ids(live)
-        _OPENCODE_LIVE_MODEL_CACHE[normalized] = (now, models)
-        return list(models)
-    return None
-
-
-def is_opencode_free_model_id(model_id: Optional[str]) -> bool:
-    """Return True when an OpenCode Zen model belongs to the free tier."""
-    mid = normalize_opencode_model_id("opencode-zen", model_id).strip().lower()
-    if not mid:
-        return False
-    return mid == "big-pickle" or mid.endswith("-free") or mid.endswith(":free")
-
-
-def opencode_free_model_ids(*, force_refresh: bool = False) -> list[str]:
-    """Return OpenCode Zen free models, using the live catalog when available."""
-    live_or_curated = provider_model_ids("opencode-zen", force_refresh=force_refresh)
-    free_models = [mid for mid in live_or_curated if is_opencode_free_model_id(mid)]
-    if free_models:
-        return _dedupe_model_ids(free_models)
-    return list(_OPENCODE_STATIC_FREE_MODELS)
-
-
-def is_opencode_free_model_alias(model_id: Optional[str]) -> bool:
-    """Return True when *model_id* is a virtual OpenCode free sentinel."""
-    return str(model_id or "").strip().lower() in OPENCODE_FREE_FALLBACK_MODEL_ALIASES
-
-
-def is_nous_free_model_id(model_id: Optional[str]) -> bool:
-    """Return True when a Nous Portal model id is on the free tier."""
-    mid = str(model_id or "").strip().lower()
-    if not mid:
-        return False
-    return mid.endswith(":free") or mid.endswith("-free")
-
-
-def is_nous_free_model_alias(model_id: Optional[str]) -> bool:
-    """Return True when *model_id* is a virtual Nous free sentinel."""
-    return str(model_id or "").strip().lower() in NOUS_FREE_FALLBACK_MODEL_ALIASES
-
-
-def is_nvidia_auto_model_alias(model_id: Optional[str]) -> bool:
-    """Return True when *model_id* requests rotating across NVIDIA NIM models."""
-    return str(model_id or "").strip().lower() in NVIDIA_AUTO_FALLBACK_MODEL_ALIASES
-
-
-def nous_free_model_ids(*, force_refresh: bool = False) -> list[str]:
-    """Return Nous Portal free-tier model ids for fallback rotation."""
-    curated = get_curated_nous_model_ids()
-    pricing: dict[str, dict[str, str]] = {}
-    try:
-        pricing = get_pricing_for_provider("nous", force_refresh=force_refresh)
-    except Exception:
-        pricing = {}
-
-    augmented_ids, augmented_pricing = union_with_portal_free_recommendations(
-        curated,
-        pricing,
-        force_refresh=force_refresh,
-    )
-    selectable, _unavailable = partition_nous_models_by_tier(
-        augmented_ids,
-        augmented_pricing,
-        free_tier=True,
-    )
-    suffix_free = [mid for mid in augmented_ids if is_nous_free_model_id(mid)]
-    combined = _dedupe_model_ids(list(selectable) + suffix_free)
-    if combined:
-        return combined
-    return list(_NOUS_STATIC_FREE_MODELS)
-
-
-def nvidia_fallback_model_ids(
-    *,
-    exclude: Optional[str] = None,
-    force_refresh: bool = False,
-) -> list[str]:
-    """Return NVIDIA NIM model ids for fallback rotation."""
-    models = provider_model_ids("nvidia", force_refresh=force_refresh)
-    exclude_norm = str(exclude or "").strip().lower()
-    if exclude_norm:
-        models = [mid for mid in models if mid.strip().lower() != exclude_norm]
-    return _dedupe_model_ids(models)
-
-
-def resolve_config_model_id(
-    provider: Optional[str],
-    model_id: Optional[str],
-    *,
-    force_refresh: bool = False,
-) -> str:
-    """Resolve configured model ids, expanding OpenCode free sentinels."""
-    normalized_provider = normalize_provider(provider)
-    mid = str(model_id or "").strip()
-    if normalized_provider == "opencode-zen":
-        if not mid or is_opencode_free_model_alias(mid):
-            free_models = opencode_free_model_ids(force_refresh=force_refresh)
-            if free_models:
-                return free_models[0]
-        return mid
-    if normalized_provider == "nous":
-        if not mid or is_nous_free_model_alias(mid):
-            free_models = nous_free_model_ids(force_refresh=force_refresh)
-            if free_models:
-                return free_models[0]
-        return mid
-    if normalized_provider == "nvidia" and is_nvidia_auto_model_alias(mid):
-        rotated = nvidia_fallback_model_ids(force_refresh=force_refresh)
-        if rotated:
-            return rotated[0]
-        return ""
-    return mid
+        pass
+    return "https://api.openai.com/v1"
 
 
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
@@ -3114,19 +2984,19 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized in ("openai", "openai-api"):
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if api_key:
-            base_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-            base = base_raw or "https://api.openai.com/v1"
+            base = _openai_discovery_base_url(normalized)
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
-            # discovery works. But the canonical api.openai.com /v1/models dump
-            # is 120+ entries of embeddings, whisper, tts, dall-e, moderation and
-            # legacy chat models — none of which belong in the agent model picker.
-            # For the default endpoint, intersect the live list with our curated
-            # agentic catalog so ``/model`` matches what ``hermes model`` shows.
-            is_default_openai = base.rstrip("/") in (
-                "https://api.openai.com/v1",
-                "https://api.openai.com",
-            )
+            # discovery works. But the official OpenAI hosts (canonical AND the
+            # data-residency regional hosts, which serve the identical dump)
+            # return 120+ entries of embeddings, whisper, tts, dall-e,
+            # moderation and legacy chat models — none of which belong in the
+            # agent model picker. For official hosts, intersect the live list
+            # with our curated agentic catalog so ``/model`` matches what
+            # ``hermes model`` shows.
+            from hermes_cli.providers import is_official_openai_host
+
+            is_default_openai = is_official_openai_host(base)
             try:
                 live = fetch_api_models(api_key, base)
                 if live:
@@ -3309,6 +3179,17 @@ def _credential_fingerprint(provider: str) -> str:
                 parts.append(f"{bev}={_os.environ.get(bev, '')}")
     except Exception:
         pass
+
+    # Effective configured endpoint: config.yaml's model.base_url changes the
+    # endpoint discovery probes (data-residency hosts) without touching any
+    # env var, so it must change the fingerprint too or `hermes config set
+    # model.base_url ...` keeps serving the previous endpoint's cached
+    # catalog until TTL expiry.
+    if provider in ("openai", "openai-api"):
+        try:
+            parts.append(f"effective_base={_openai_discovery_base_url(provider)}")
+        except Exception:
+            pass
 
     # OAuth / external-file mtimes that change on re-auth
     try:
@@ -5316,7 +5197,20 @@ def validate_requested_model(
             # listing that are still valid (stale cache, partial rollout,
             # gated previews).  Use the pure-catalog helper (no extra live
             # fetch) so we only accept models Hermes actually ships.  (#46850)
-            if _model_in_provider_catalog(
+            #
+            # EXCEPTION: official OpenAI hosts (canonical api.openai.com and
+            # the data-residency regional hosts).  Their /v1/models listing is
+            # access-scoped and authoritative — a model absent from it is one
+            # this key CANNOT serve, so the curated soft-accept would
+            # manufacture a selection that 400s at first use.  Custom
+            # OpenAI-compatible proxies keep the fallback (incomplete
+            # listings are common there).
+            _openai_listing_is_authoritative = False
+            if normalized in ("openai", "openai-api"):
+                from hermes_cli.providers import is_official_openai_host
+
+                _openai_listing_is_authoritative = is_official_openai_host(base_url)
+            if not _openai_listing_is_authoritative and _model_in_provider_catalog(
                 requested_for_lookup.lower(), _provider_keys(normalized)
             ):
                 return {

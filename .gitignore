@@ -229,35 +229,7 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
-
-# Go watchdog build artifacts
-scripts/windows/watchdog-go/dist/
-
-# SpecStory local IDE telemetry (never publish)
-.specstory/
-
-# Local merge/ops scratch (do not publish)
-_fork_assets_backup/
-nul
-
-.venv312/
-vendor/
-!vendor/
-!vendor/airi/
-!vendor/airi/**
-
-# Local scratch / misgenerated Electron bundle (never publish)
-_tmp/
-/electron-main.mjs
-
-# Local-only: personal interview packs, ST DB lockfiles, unfinished ST Python package
-_interview_prep/
-interview_prep/
-sillytavern.db
-sillytavern_py/
-.stpy_verify.py
-fix_config2.py
-
-# Local Buzz credentials
-vendor/buzz/.env
-vendor/buzz/deploy/compose/.env
+# Runtime marker written by hermes update when a lazy dependency refresh is
+# interrupted; consumed by launch-time recovery. Never commit it (was tracked
+# by accident via 3a69e34702, removed in the #72002 salvage).
+.lazy-refresh-incomplete

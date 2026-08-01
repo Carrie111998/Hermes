@@ -533,14 +533,12 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    tokens = _command_line_tokens(command)
+    # Normalize separators before the substring match: on Windows,
+    # str(Path) renders backslashes while a HERMES_HOME= value on the argv
+    # may carry forward slashes (Git Bash, JSON configs) — and vice versa.
+    command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
-    home_variants = {
-        str(profile_home).lower(),
-        profile_home.as_posix().lower(),
-    }
-    profile_arg = _profile_arg_value(tokens)
-    hermes_home_arg = _hermes_home_arg_value(tokens)
+    home_lc = str(profile_home).lower().replace("\\", "/")
 
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()

@@ -127,7 +127,7 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
   return (
     <span className="block">
       <button
-        className="mt-2 link-chip bg-transparent text-xs font-medium text-muted-foreground hover:text-foreground"
+        className="mt-2 ref text-xs font-medium text-muted-foreground hover:text-foreground"
         onClick={open}
         type="button"
       >
@@ -197,7 +197,7 @@ function MediaAttachment({ path }: { path: string }) {
 
   if (kind === 'audio' && src) {
     return (
-      <span className="my-3 block max-w-md rounded-xl border border-border bg-muted/35 p-3">
+      <span className="my-3 block max-w-md rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
         <span className="mb-2 block truncate text-xs font-medium text-muted-foreground">{name}</span>
         <audio className="block w-full" controls onError={() => setFailed(true)} preload="metadata" src={src} />
         {failed && <OpenMediaButton kind="audio" path={path} />}
@@ -207,7 +207,7 @@ function MediaAttachment({ path }: { path: string }) {
 
   if (kind === 'video' && src) {
     return (
-      <span className="my-3 block max-w-2xl rounded-xl border border-border bg-muted/35 p-3">
+      <span className="my-3 block max-w-2xl rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
         <span className="mb-2 block truncate text-xs font-medium text-muted-foreground">{name}</span>
         <video
           className="block max-h-112 w-full rounded-lg bg-black"
@@ -223,7 +223,7 @@ function MediaAttachment({ path }: { path: string }) {
   return (
     <span className="wrap-anywhere">
       <a
-        className="link-chip wrap-anywhere"
+        className="ref wrap-anywhere"
         href="#"
         onClick={event => {
           event.preventDefault()
@@ -273,7 +273,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
   if (!target || !/^https?:\/\//i.test(target)) {
     return (
       <a
-        className={cn('link-chip wrap-anywhere', className)}
+        className={cn('ref wrap-anywhere', className)}
         href={href}
         rel="noopener noreferrer"
         target="_blank"
@@ -369,11 +369,7 @@ function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<
     return (
       <span className="my-2 block text-sm text-muted-foreground">
         Couldn&apos;t load {name}.{' '}
-        <button
-          className="link-chip bg-transparent font-medium text-foreground hover:text-foreground"
-          onClick={open}
-          type="button"
-        >
+        <button className="ref font-medium text-foreground" onClick={open} type="button">
           Open image
         </button>
         {openFailed && <OpenMediaFailedNote name={name} />}
@@ -528,7 +524,7 @@ function HugeTextFallback({ containerClassName, text }: { containerClassName?: s
   return (
     <div
       className={cn(
-        'aui-md w-full max-w-none overflow-hidden rounded-[0.625rem] border border-border font-mono text-[0.7rem] leading-relaxed text-foreground/90',
+        'aui-md w-full max-w-none overflow-hidden rounded-[0.625rem] border border-(--ui-stroke-tertiary) font-mono text-[0.7rem] leading-relaxed text-foreground/90',
         containerClassName
       )}
     >
@@ -570,7 +566,103 @@ function MarkdownTextSurface({
   const components = useMemo(
     () =>
       ({
-        ...STABLE_MARKDOWN_COMPONENTS,
+        h1: ({ className, ...props }: ComponentProps<'h1'>) => (
+          <h1 className={cn('my-1 font-semibold', HEADING_SIZES.h1, className)} {...props} />
+        ),
+        h2: ({ className, ...props }: ComponentProps<'h2'>) => (
+          <h2 className={cn('my-1 font-semibold', HEADING_SIZES.h2, className)} {...props} />
+        ),
+        h3: ({ className, ...props }: ComponentProps<'h3'>) => (
+          <h3 className={cn('my-1 font-semibold', HEADING_SIZES.h3, className)} {...props} />
+        ),
+        h4: ({ className, ...props }: ComponentProps<'h4'>) => (
+          <h4 className={cn('my-1 font-semibold', HEADING_SIZES.h4, className)} {...props} />
+        ),
+        p: ({ className, ...props }: ComponentProps<'p'>) => (
+          // Vertical rhythm is owned by styles.css (`--paragraph-gap`), which
+          // must out-specify Tailwind Typography's `prose` margins — so no
+          // `my-*` here on purpose.
+          <p className={cn('wrap-anywhere leading-(--dt-line-height)', className)} {...props} />
+        ),
+        a: MarkdownLink,
+        // Inline code must not vote when an ancestor resolves `dir="auto"`
+        // (HTML's algorithm skips descendants that carry their own dir),
+        // mirroring the CSS isolate that already keeps it out of the
+        // plaintext scan. Fenced code never reaches this override; it goes
+        // through the code plugin's CodeCard path.
+        inlineCode: ({ className, ...props }: ComponentProps<'code'>) => (
+          <code className={className} dir="ltr" {...props} />
+        ),
+        // `---` as quiet spacing, not a heavy full-width rule.
+        hr: (_props: ComponentProps<'hr'>) => <div aria-hidden className="my-3" />,
+        // Lists and blockquotes have chrome that sits *beside* the text
+        // (markers, the quote border), and that side is driven by the CSS
+        // `direction` of the box, which `unicode-bidi: plaintext` never
+        // touches — an RTL list otherwise renders its numbers stranded at
+        // the far left. `dir="auto"` lets the browser resolve the box
+        // direction from content; the plaintext rules in styles.css keep
+        // owning per-line text direction. Inline code carries `dir="ltr"`
+        // (see the `code` override) so it doesn't vote here either, same
+        // contract as the CSS isolate.
+        // A `> [!NOTE]`/`[!WARNING]`/... blockquote renders as a GFM alert
+        // callout; everything else stays a plain quote.
+        blockquote: ({ children, className, ...props }: ComponentProps<'blockquote'>) => {
+          const alert = extractAlert(children)
+
+          if (alert) {
+            return <MarkdownAlert type={alert.type}>{alert.body}</MarkdownAlert>
+          }
+
+          return (
+            <blockquote
+              className={cn('border-s-2 border-(--ui-stroke-tertiary) ps-3 text-muted-foreground italic', className)}
+              dir="auto"
+              {...props}
+            >
+              {children}
+            </blockquote>
+          )
+        },
+        ul: ({ className, ...props }: ComponentProps<'ul'>) => (
+          <ul className={cn('my-1 gap-0', className)} dir="auto" {...props} />
+        ),
+        ol: ({ className, ...props }: ComponentProps<'ol'>) => (
+          <ol className={cn('my-1 gap-0', className)} dir="auto" {...props} />
+        ),
+        li: ({ className, ...props }: ComponentProps<'li'>) => (
+          <li className={cn('leading-(--dt-line-height)', className)} {...props} />
+        ),
+        table: ({ className, ...props }: ComponentProps<'table'>) => (
+          <div className="aui-md-table my-2 max-w-full overflow-x-auto rounded-[0.375rem] border border-(--ui-stroke-tertiary)">
+            <table
+              className={cn(
+                'm-0 w-full min-w-[18rem] border-collapse text-[0.8125rem] [&_tr]:border-b [&_tr]:border-(--ui-stroke-tertiary) last:[&_tr]:border-0',
+                className
+              )}
+              {...props}
+            />
+          </div>
+        ),
+        thead: ({ className, ...props }: ComponentProps<'thead'>) => (
+          <thead className={cn('m-0 bg-muted/35 text-muted-foreground', className)} {...props} />
+        ),
+        th: ({ className, ...props }: ComponentProps<'th'>) => (
+          <th
+            className={cn(
+              'whitespace-nowrap px-2.5 py-1.5 text-left align-middle text-[0.75rem] font-medium text-muted-foreground',
+              className
+            )}
+            {...props}
+          />
+        ),
+        td: ({ className, ...props }: ComponentProps<'td'>) => (
+          <td className={cn('px-2.5 py-1.5 align-top text-[0.8125rem] leading-snug', className)} {...props} />
+        ),
+        img: MarkdownImage,
+        // ```mermaid / ```svg fences route to their lazy renderers; substantial
+        // html/svg/code fences promote to an artifact card that opens in the
+        // right rail; every other language falls back to the Shiki-highlighted
+        // code block.
         SyntaxHighlighter: (props: SyntaxHighlighterProps) => {
           const artifact = disableArtifacts ? null : detectArtifact(props.language, props.code)
 
