@@ -3707,6 +3707,28 @@ def install_from_quarantine(
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
 
     if install_dir.exists():
+        # Guard against deleting a category directory that contains other
+        # skills.  When the install name collides with an existing category
+        # bucket (e.g. ``skills/research/`` holding 16 unrelated skills),
+        # an unconditional rmtree would destroy all of them.  (#75983)
+        #
+        # Only allow rmtree when the directory is a previously hub-installed
+        # skill (tracked in lock.json) — otherwise check for sibling skills.
+        lock = HubLockFile()
+        is_hub_skill = lock.get_installed(safe_skill_name) is not None
+        if install_dir.is_dir() and not is_hub_skill:
+            sibling_skills = [
+                p for p in install_dir.iterdir()
+                if p.is_dir() and (p / "SKILL.md").exists()
+            ]
+            if sibling_skills:
+                raise ValueError(
+                    f"Cannot install skill '{safe_skill_name}': "
+                    f"{install_dir} is a category directory containing "
+                    f"{len(sibling_skills)} other skill(s). "
+                    f"Use --category to install into a subdirectory, "
+                    f"or choose a different name."
+                )
         shutil.rmtree(install_dir)
 
     # Warn (but don't block) if SKILL.md is very large
