@@ -147,16 +147,21 @@ class TestHermesManagedNode:
         assert find_node_executable("npm") is None
         assert find_node_executable("npm") != str(path_npm)
 
-    def test_unstattable_managed_entry_is_treated_as_absent(self, tmp_path, monkeypatch):
-        """A managed entry that cannot be stat'd must not abort the probe.
+    def test_unstattable_managed_entry_heals_instead_of_path_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """An entry that raises on stat is broken, not absent.
 
         ``Path.is_file()`` only swallows the winerrors in
         ``pathlib._IGNORED_WINERRORS``; ``ERROR_CANT_ACCESS_FILE`` (1920) is not
         one of them, so an unresolvable reparse point — a POSIX Node tarball
         unpacked into a Windows ``HERMES_HOME`` leaves ``node/bin/npm`` as a
-        symlink Windows cannot traverse — used to raise straight through the
-        managed-Node scan and take down callers like ``hermes dashboard``
-        before they could fall back to PATH.
+        symlink Windows cannot traverse — used to raise straight out of the
+        managed-Node scan and take down callers like ``hermes dashboard``.
+
+        Catching it must not turn the tree into "absent": 65be0061e requires a
+        present-but-broken managed tree to be healed, never silently replaced
+        by system npm.
         """
         home = tmp_path / "hermes"
         unstattable = home / "node" / "npm"
@@ -165,6 +170,47 @@ class TestHermesManagedNode:
         bin_dir.mkdir()
         path_npm = bin_dir / "npm.cmd"
         path_npm.write_text("@echo off\n")
+        heal_called = {"value": False}
+
+        real_is_file = Path.is_file
+
+        def raising_is_file(self):
+            if self == unstattable:
+                raise OSError(22, "The file cannot be accessed by the system")
+            return real_is_file(self)
+
+        def _heal():
+            heal_called["value"] = True
+            return False
+
+        monkeypatch.setattr(Path, "is_file", raising_is_file)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setattr(hermes_constants, "_managed_node_heal_attempted", False)
+        monkeypatch.setattr(hermes_constants, "heal_hermes_managed_node", _heal)
+
+        assert hermes_managed_node_tree_present() is True
+        assert find_hermes_node_executable("npm") is None
+        assert heal_called["value"] is True
+        assert find_node_executable("npm") is None
+        assert find_node_executable("npm") != str(path_npm)
+
+    def test_unstattable_path_entry_is_skipped_not_returned(self, tmp_path, monkeypatch):
+        """On PATH the same raise means "skip", not "found" and not "stop".
+
+        `find_node_executable_on_path` walks every PATH entry, so one bad
+        reparse point in an early directory used to abort the whole scan. It
+        must not be handed back as an executable either — the scan continues to
+        the next directory.
+        """
+        early = tmp_path / "early"
+        late = tmp_path / "late"
+        early.mkdir()
+        late.mkdir()
+        unstattable = early / "npm.cmd"
+        good_npm = late / "npm.cmd"
+        good_npm.write_text("@echo off\n")
 
         real_is_file = Path.is_file
 
@@ -175,12 +221,9 @@ class TestHermesManagedNode:
 
         monkeypatch.setattr(Path, "is_file", raising_is_file)
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setenv("PATH", os.pathsep.join([str(early), str(late)]))
 
-        assert hermes_managed_node_tree_present() is False
-        assert find_hermes_node_executable("npm") is None
-        assert find_node_executable("npm") == str(path_npm)
+        assert find_node_executable_on_path("npm") == str(good_npm)
 
 
 
