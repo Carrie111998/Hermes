@@ -65,7 +65,13 @@ def test_static_assets_resolve_from_relative_hrefs():
     # index.html references ./js/, ./css/, ./assets/ — with webui/ as the web
     # root these must resolve without any path remapping.
     _, client = make_client()
-    for path in ("/js/main.js", "/js/adapters.js", "/css/app.css", "/assets/world.svg"):
+    for path in (
+        "/js/main.js",
+        "/js/adapters.js",
+        "/js/oauth-popup.js",
+        "/css/app.css",
+        "/assets/world.svg",
+    ):
         res = client.get(path)
         assert res.status_code == 200, path
 
