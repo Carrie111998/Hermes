@@ -3707,6 +3707,22 @@ def install_from_quarantine(
     install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
 
     if install_dir.exists():
+        # Guard against wiping an entire category directory.
+        # If ``install_dir`` is an existing category (has subdirectories that
+        # contain SKILL.md files but no SKILL.md of its own), refusing to
+        # rmtree prevents silent data loss — e.g. ``hermes skills install devops``
+        # when ``skills/devops/`` already holds multiple skills.
+        _child_skills = [
+            p for p in install_dir.iterdir()
+            if p.is_dir() and (p / "SKILL.md").is_file()
+        ]
+        if _child_skills and not (install_dir / "SKILL.md").is_file():
+            raise ValueError(
+                f"Refusing to install: '{install_dir.name}' is an existing "
+                f"category directory containing {len(_child_skills)} skill(s) "
+                f"({', '.join(p.name for p in _child_skills[:3])}{'...' if len(_child_skills) > 3 else ''}). "
+                f"Choose a different skill name or specify a category to install into."
+            )
         shutil.rmtree(install_dir)
 
     # Warn (but don't block) if SKILL.md is very large

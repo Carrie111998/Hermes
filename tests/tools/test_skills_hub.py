@@ -1157,6 +1157,53 @@ class TestInstallPathSafety:
         assert not (skills_dir / "bad-skill" / "leak.txt").exists()
         assert secret.read_text() == "data exfiltration payload\n"
 
+    def test_install_from_quarantine_refuses_to_rmtree_category_dir(self, tmp_path):
+        """Installing a skill whose name matches an existing category directory
+        must not rmtree the category (issue #75983)."""
+        import tools.skills_hub as hub
+        from tools.skills_guard import ScanResult
+
+        skills_dir = tmp_path / "skills"
+        quarantine_root = skills_dir / ".hub" / "quarantine"
+        quarantine_root.mkdir(parents=True)
+
+        # Create an existing category directory with two skills inside.
+        cat_dir = skills_dir / "devops"
+        for name in ("docker", "kubernetes"):
+            skill = cat_dir / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+
+        # Prepare a quarantine bundle whose name collides with the category.
+        q_dir = quarantine_root / "pending"
+        q_dir.mkdir()
+        (q_dir / "SKILL.md").write_text("---\nname: devops\n---\n")
+
+        bundle = hub.SkillBundle(
+            name="devops",
+            files={"SKILL.md": "---\nname: devops\n---\n"},
+            source="community",
+            identifier="x",
+            trust_level="community",
+        )
+        scan_result = ScanResult(
+            skill_name="devops",
+            source="community",
+            trust_level="community",
+            verdict="safe",
+        )
+
+        with patch.object(hub, "SKILLS_DIR", skills_dir), \
+             patch.object(hub, "QUARANTINE_DIR", quarantine_root):
+            with pytest.raises(ValueError, match="category directory"):
+                hub.install_from_quarantine(
+                    q_dir, "devops", "", bundle, scan_result,
+                )
+
+        # Category directory and its children must be untouched.
+        assert (cat_dir / "docker" / "SKILL.md").is_file()
+        assert (cat_dir / "kubernetes" / "SKILL.md").is_file()
+
 
 # ---------------------------------------------------------------------------
 # parallel_search_sources — overall_timeout must be honoured even when a
