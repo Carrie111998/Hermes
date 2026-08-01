@@ -280,6 +280,40 @@ class TestBuildSkillsSystemPrompt:
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
 
+    def test_skill_index_preamble_stays_compact_and_preserves_disclosure_contract(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+        preamble = result.split("<available_skills>", 1)[0]
+
+        assert "Skills (mandatory)" in preamble
+        assert (
+            "If a skill is relevant or even partially relevant, you MUST load it with "
+            "skill_view(name) before acting and follow it"
+        ) in preamble
+        assert (
+            "even when basic tools could handle the task; if uncertain, load it"
+        ) in preamble
+        assert "Descriptions are trigger hints; full procedures load on demand" in preamble
+        assert (
+            "load `hermes-agent` first and treat the official docs as authoritative"
+        ) in preamble
+        assert (
+            "Patch a loaded skill when its instructions are stale with "
+            "skill_manage(action='patch')"
+        ) in preamble
+        assert (
+            "After difficult/iterative tasks, offer to save the reusable procedure as a skill"
+        ) in preamble
+        assert len(preamble) <= 900
+
 
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
