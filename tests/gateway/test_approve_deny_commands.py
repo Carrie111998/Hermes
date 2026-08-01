@@ -204,6 +204,69 @@ class TestApproveCommand:
         assert e1.result == "session"
         assert e2.result == "session"
 
+    @pytest.mark.asyncio
+    async def test_sensitive_approve_requires_case_preserved_request_id_and_source_identity(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        runner.session_store.peek_session_id.return_value = "sid-approve-1"
+        entry = _ApprovalEntry({
+            "command": "sensitive",
+            "description": "sensitive",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": source.chat_id,
+                "user_id": source.user_id,
+                "session_id": "sid-approve-1",
+                "session_key": session_key,
+            },
+            "request_id": "ReqCaseSensitive123",
+            "sensitive": True,
+        })
+        _gateway_queues[session_key] = [entry]
+
+        no_id = await runner._handle_approve_command(_make_event("/approve"))
+        assert not entry.event.is_set()
+        assert "no pending" in no_id.lower()
+
+        result = await runner._handle_approve_command(_make_event("/approve ReqCaseSensitive123"))
+        assert entry.event.is_set()
+        assert entry.result == "once"
+        assert "approved" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_sensitive_approve_fails_closed_without_trusted_session_id(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        runner.session_store.peek_session_id.return_value = None
+        entry = _ApprovalEntry({
+            "command": "sensitive",
+            "description": "sensitive",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": source.chat_id,
+                "user_id": source.user_id,
+                "session_id": "sid-approve-1",
+                "session_key": session_key,
+            },
+            "request_id": "ReqCaseSensitive123",
+            "sensitive": True,
+        })
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_approve_command(
+            _make_event("/approve ReqCaseSensitive123")
+        )
+
+        assert not entry.event.is_set()
+        assert _gateway_queues[session_key] == [entry]
+        assert "no pending" in result.lower()
+
 
 # ------------------------------------------------------------------
 # /deny command
@@ -234,6 +297,38 @@ class TestDenyCommand:
         assert entry.result == "deny"
         assert entry.reason == "that path is still in use"
         assert "that path is still in use" in result
+
+    @pytest.mark.asyncio
+    async def test_sensitive_deny_uses_trusted_session_id_in_observed_context(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        runner.session_store.peek_session_id.return_value = "sid-deny-1"
+        entry = _ApprovalEntry({
+            "command": "sensitive",
+            "description": "sensitive",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": source.chat_id,
+                "user_id": source.user_id,
+                "session_id": "sid-deny-1",
+                "session_key": session_key,
+            },
+            "request_id": "ReqCaseSensitiveDeny123",
+            "sensitive": True,
+        })
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_deny_command(
+            _make_event("/deny ReqCaseSensitiveDeny123 not safe")
+        )
+
+        assert entry.event.is_set()
+        assert entry.result == "deny"
+        assert entry.reason == "not safe"
+        assert "not safe" in result
 
     @pytest.mark.asyncio
     async def test_deny_all_with_reason(self):

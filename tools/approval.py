@@ -9,12 +9,15 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import fnmatch
 import functools
 import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2152,9 +2155,117 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # resolves every pending approval in the session.
 
 
+_SENSITIVE_APPROVAL_CONTEXT_FIELDS = (
+    "platform",
+    "chat_id",
+    "user_id",
+    "thread_id",
+    "session_id",
+    "session_key",
+)
+_SENSITIVE_APPROVAL_DEFAULT_TTL_SECONDS = 120.0
+
+
+def _approval_event_id() -> str:
+    return "ape_" + secrets.token_urlsafe(32)
+
+
+def _approval_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class SensitiveApprovalContext:
+    """Immutable identity context required to resolve a sensitive approval.
+
+    Contract: this primitive binds only the authenticated platform user id plus
+    immutable session/chat/thread context.  A sensitive approval MUST include a
+    non-empty expected ``user_id`` from a real adapter; session_key,
+    session_id, chat_id, or thread_id alone are routing hints, not human
+    identity.  Future DPS rail writes must add their own binding above this
+    primitive: proposal token digest, tool name, payload/preview digest, and a
+    short TTL.  Initial DPS writes are Telegram-only.
+    """
+
+    platform: Optional[str] = None
+    chat_id: Optional[str] = None
+    user_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    session_id: Optional[str] = None
+    session_key: Optional[str] = None
+
+    @classmethod
+    def from_mapping(cls, value: Optional[dict]) -> "SensitiveApprovalContext":
+        data = value if isinstance(value, dict) else {}
+        normalized = {
+            field: (None if data.get(field) in (None, "") else str(data.get(field)))
+            for field in _SENSITIVE_APPROVAL_CONTEXT_FIELDS
+        }
+        return cls(**normalized)
+
+    def has_user_binding(self) -> bool:
+        return self.user_id is not None
+
+    def mismatches(self, observed: Optional[dict]) -> list[str]:
+        observed_ctx = self.from_mapping(observed)
+        fields = []
+        for field in _SENSITIVE_APPROVAL_CONTEXT_FIELDS:
+            expected = getattr(self, field)
+            if expected is not None and getattr(observed_ctx, field) != expected:
+                fields.append(field)
+        return fields
+
+
+def _sensitive_approval_result(
+    *,
+    request_id: Optional[str],
+    resolved: bool,
+    status: str,
+    mismatched_fields: Optional[list[str]] = None,
+    approval_event_id: Optional[str] = None,
+    approved_at: Optional[str] = None,
+) -> dict:
+    request_digest = _approval_request_digest(request_id)
+    result = {
+        "request_id": request_id,
+        "resolved": resolved,
+        "sensitive": True,
+        "status": status,
+    }
+    if mismatched_fields:
+        result["mismatched_fields"] = list(mismatched_fields)
+    if approval_event_id:
+        result["approval_event_id"] = approval_event_id
+    if approved_at:
+        result["approved_at"] = approved_at
+    logger.info(
+        "Sensitive approval resolution status=%s resolved=%s request_digest=%s",
+        status,
+        resolved,
+        request_digest,
+    )
+    return result
+
+
+def _approval_request_digest(request_id: Optional[str]) -> str:
+    if not request_id:
+        return ""
+    return hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:12]
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = (
+        "data",
+        "event",
+        "expires_at",
+        "reason",
+        "request_id",
+        "result",
+        "sensitive_context",
+        "approval_event_id",
+        "approved_at",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2164,6 +2275,93 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        self.request_id: Optional[str] = None
+        self.sensitive_context: Optional[SensitiveApprovalContext] = None
+        self.expires_at: Optional[float] = None
+        self.approval_event_id: Optional[str] = None
+        self.approved_at: Optional[str] = None
+
+        if data.get("sensitive") is True:
+            context = SensitiveApprovalContext.from_mapping(data.get("expected_context"))
+            if not context.has_user_binding():
+                raise ValueError("sensitive approvals require a non-empty expected user_id")
+            self.sensitive_context = context
+            self.request_id = str(data.get("request_id") or secrets.token_urlsafe(32))
+            try:
+                ttl_seconds = float(
+                    data.get("ttl_seconds", _SENSITIVE_APPROVAL_DEFAULT_TTL_SECONDS)
+                )
+            except (TypeError, ValueError):
+                ttl_seconds = _SENSITIVE_APPROVAL_DEFAULT_TTL_SECONDS
+            self.expires_at = time.monotonic() + ttl_seconds
+            data["request_id"] = self.request_id
+            data["allow_permanent"] = False
+            data["allow_session"] = False
+            data["choices"] = ["once", "deny"]
+
+    @property
+    def sensitive(self) -> bool:
+        return self.sensitive_context is not None
+
+    def resolve_sensitive(
+        self,
+        choice: str,
+        *,
+        request_id: Optional[str],
+        observed_context: Optional[dict],
+    ) -> dict:
+        if not self.sensitive:
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="not_sensitive",
+            )
+        if not request_id or request_id != self.request_id:
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="request_id_mismatch",
+            )
+        if self.expires_at is not None and time.monotonic() > self.expires_at:
+            self.result = "deny"
+            self.event.set()
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="expired",
+            )
+
+        mismatches = self.sensitive_context.mismatches(observed_context)
+        if mismatches:
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="context_mismatch",
+                mismatched_fields=mismatches,
+            )
+
+        normalized_choice = str(choice or "deny").strip().lower()
+        if normalized_choice not in {"once", "deny"}:
+            self.result = "deny"
+            self.event.set()
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="invalid_choice",
+            )
+
+        self.result = normalized_choice
+        if normalized_choice == "once":
+            self.approval_event_id = _approval_event_id()
+            self.approved_at = _approval_utc_now()
+        self.event.set()
+        return _sensitive_approval_result(
+            request_id=request_id,
+            resolved=True,
+            status="denied" if normalized_choice == "deny" else "approved",
+            approval_event_id=self.approval_event_id,
+            approved_at=self.approved_at,
+        )
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2195,9 +2393,59 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def resolve_sensitive_gateway_approval(
+    session_key: str,
+    choice: str,
+    *,
+    request_id: str,
+    observed_context: Optional[dict],
+    reason: Optional[str] = None,
+) -> dict:
+    """Resolve one sensitive approval by request id and observed identity."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="not_found",
+            )
+
+        entry = next(
+            (
+                candidate
+                for candidate in queue
+                if getattr(candidate, "sensitive", False)
+                and candidate.request_id == request_id
+            ),
+            None,
+        )
+        if entry is None:
+            return _sensitive_approval_result(
+                request_id=request_id,
+                resolved=False,
+                status="not_found",
+            )
+
+        result = entry.resolve_sensitive(
+            choice,
+            request_id=request_id,
+            observed_context=observed_context,
+        )
+        if reason:
+            entry.reason = reason
+        if entry.event.is_set():
+            queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+        return result
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             request_id: Optional[str] = None,
+                             observed_context: Optional[dict] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2211,15 +2459,33 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    if request_id:
+        result = resolve_sensitive_gateway_approval(
+            session_key,
+            choice,
+            request_id=request_id,
+            observed_context=observed_context,
+            reason=reason,
+        )
+        return 1 if result.get("resolved") else 0
+
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
         if resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = [entry for entry in queue if not getattr(entry, "sensitive", False)]
+            for entry in targets:
+                queue.remove(entry)
         else:
-            targets = [queue.pop(0)]
+            target = next(
+                (entry for entry in queue if not getattr(entry, "sensitive", False)),
+                None,
+            )
+            if target is None:
+                return 0
+            queue.remove(target)
+            targets = [target]
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -2231,10 +2497,66 @@ def resolve_gateway_approval(session_key: str, choice: str,
     return len(targets)
 
 
+def request_sensitive_human_approval(
+    *,
+    session_key: str,
+    command: str,
+    hook_command: str | None = None,
+    description: str,
+    expected_context: dict,
+    ttl_seconds: float,
+    pattern_key: str,
+) -> dict:
+    """Request a one-shot sensitive approval bound to exact human context.
+
+    Higher-level rails use this after binding their own proposal token and
+    preview digest. This helper deliberately exposes only the sensitive gateway
+    path: no YOLO, permanent allowlist, session approval, or FIFO approval can
+    authorize the action.
+    """
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        return {"resolved": False, "choice": None, "notify_failed": True}
+
+    return _await_gateway_decision(
+        session_key,
+        notify_cb,
+        {
+            "command": command,
+            "hook_command": hook_command if isinstance(hook_command, str) and hook_command else command,
+            "description": description,
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
+            "sensitive": True,
+            "expected_context": dict(expected_context or {}),
+            "ttl_seconds": ttl_seconds,
+            "allow_permanent": False,
+            "allow_session": False,
+            "choices": ["once", "deny"],
+        },
+        surface="gateway",
+    )
+
+
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def has_sensitive_gateway_approval(
+    session_key: str,
+    request_id: Optional[str] = None,
+) -> bool:
+    """Return whether a sensitive approval is pending for this session."""
+    with _lock:
+        queue = _gateway_queues.get(session_key) or []
+        return any(
+            getattr(entry, "sensitive", False)
+            and (request_id is None or entry.request_id == request_id)
+            for entry in queue
+        )
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -3263,6 +3585,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     the final tool-facing result dict remain the caller's responsibility.
     """
     command = approval_data.get("command", "")
+    hook_command = approval_data.get("hook_command", command)
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
@@ -3283,7 +3606,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # gateway notify callback so observers get the event in real time.
     _fire_approval_hook(
         "pre_approval_request",
-        command=command,
+        command=hook_command,
         description=description,
         pattern_key=primary_key,
         pattern_keys=list(all_keys),
@@ -3313,6 +3636,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     _now = time.monotonic()
     _deadline = _now + max(timeout, 0)
+    if entry.expires_at is not None:
+        _deadline = min(_deadline, entry.expires_at)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
@@ -3351,7 +3676,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _outcome = "timeout" if not resolved else (choice if choice else "timeout")
     _fire_approval_hook(
         "post_approval_response",
-        command=command,
+        command=hook_command,
         description=description,
         pattern_key=primary_key,
         pattern_keys=list(all_keys),
@@ -3359,7 +3684,18 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    result = {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+    }
+    if getattr(entry, "sensitive", False):
+        result["approval_request_id"] = entry.request_id
+        if entry.approval_event_id:
+            result["approval_event_id"] = entry.approval_event_id
+        if entry.approved_at:
+            result["approved_at"] = entry.approved_at
+    return result
 
 
 def check_all_command_guards(command: str, env_type: str,

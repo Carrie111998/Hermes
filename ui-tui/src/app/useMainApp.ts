@@ -924,13 +924,18 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
+    (choice: string) => {
+      const params: Record<string, unknown> = { choice, session_id: ui.sid }
+      if (overlay.approval?.requestId) {
+        params.request_id = overlay.approval.requestId
+      }
+      return respondWith('approval.respond', params, () => {
         patchOverlayState({ approval: null })
         patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
         patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
+      })
+    },
+    [overlay.approval?.requestId, respondWith, ui.sid]
   )
 
   const answerSudo = useCallback(

@@ -1115,6 +1115,53 @@ platform_toolsets:
 #       allowed_models: []      # model whitelist (empty = all)
 #       max_tool_rounds: 5      # tool loop limit (0 = disable)
 #       log_level: "info"       # audit verbosity
+#
+# Optional MCP prepare/execute permission rail. Disabled by default.
+# Configure by exact MCP server name; tool entries are fnmatch-style patterns
+# over that server's raw MCP tool names, not Hermes' mcp__server__tool names.
+# A protected execute requires a matching unexpired prepare result with a
+# proposal_token and preview, plus one-shot approval from the same Telegram
+# user/chat/thread/session context. Reads/status/prepare calls remain allowed.
+#
+# mcp_permission_rails:
+#   servers:
+#     dps-work:
+#       enabled: false
+#       ttl_seconds: 120
+#       tools:
+#         read: ["dps_get_*", "dps_list_*"]
+#         status: ["dps_status_*"]
+#         prepare: ["dps_prepare_*"]
+#         execute: ["dps_execute_*"]
+#       prepare_prefix: "dps_prepare_"
+#       execute_prefix: "dps_execute_"
+#       # Optional exact bindings may coexist with the prefix transform.
+#       bindings: []
+#       result_paths:
+#         proposal_token: ["data.proposal_token"]
+#         preview: ["data.action.preview"]
+#         expires_at: ["data.expires_at"]
+#         confirmation_code: ["data.confirmation_code"]
+#       execute_token_paths: ["proposal_token"]
+#       execute_confirmation_code_paths: ["confirmation_code"]
+#       # Optional client attestation for backend-verified prepare/execute
+#       # bindings. Disabled by default. These entries name environment
+#       # variables only; never put kid, HMAC key material, OAuth client id, or
+#       # operator subject plaintext in config.yaml. Backend B independently
+#       # verifies the OAuth client and operator subject against the request.
+#       attestation:
+#         enabled: false
+#         kid_env: DPS_WORK_HERMES_ATTESTATION_KID
+#         key_env: DPS_WORK_HERMES_ATTESTATION_KEY
+#         oauth_client_id_env: DPS_WORK_HERMES_OAUTH_CLIENT_ID
+#         operator_subject_env: DPS_WORK_HERMES_OPERATOR_SUBJECT
+#         ttl_seconds: 300
+#         # Nonempty thread sentinel signed for direct Telegram chats with no
+#         # thread/topic id.
+#         direct_thread_sentinel: "__hermes_direct_no_thread__"
+#       deny_execute_tools:
+#         # Keep denylisted until the backend import bug is fixed.
+#         - "dps_execute_project_document_import"
 
 # =============================================================================
 # Text-to-Speech

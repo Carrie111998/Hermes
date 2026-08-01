@@ -8,8 +8,10 @@ user message. If either anchor is unavailable or rejected, the adapter must
 avoid retrying with a partial topic route that can render outside the lane.
 """
 
+import asyncio
 import sys
 import socket
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -133,8 +135,94 @@ def _make_adapter():
     adapter._polling_conflict_count = 0
     adapter._polling_network_error_count = 0
     adapter._polling_error_callback_ref = None
+    adapter._typing_paused = set()
     adapter.platform = Platform.TELEGRAM
     return adapter
+
+
+def _approval_update(*, data: str, thread_id=None, answers=None):
+    answers = answers if answers is not None else []
+    edits = []
+
+    class Query:
+        def __init__(self):
+            self.data = data
+            self.from_user = SimpleNamespace(id="user-1", first_name="Alice")
+            self.message = SimpleNamespace(
+                chat_id="chat-1",
+                chat=SimpleNamespace(type="private"),
+                message_thread_id=thread_id,
+                text="approval prompt",
+            )
+
+        async def answer(self, text=None, **_kwargs):
+            answers.append(text)
+
+        async def edit_message_text(self, **kwargs):
+            edits.append(kwargs)
+
+    return SimpleNamespace(callback_query=Query()), answers, edits
+
+
+def _start_sensitive_approval(adapter):
+    from tools.approval import register_gateway_notify, request_sensitive_human_approval
+    from tools.hermes_attestation import DIRECT_THREAD_SENTINEL
+
+    notified = []
+    notify_seen = threading.Event()
+    result = {}
+
+    async def send_message(**_kwargs):
+        return SimpleNamespace(message_id=7001)
+
+    adapter._bot = SimpleNamespace(send_message=send_message)
+    adapter._approval_state = {}
+    adapter._is_callback_user_authorized = lambda *_args, **_kwargs: True
+
+    def notify(data):
+        notified.append(dict(data))
+        send_result = asyncio.run(
+            adapter.send_exec_approval(
+                chat_id="chat-1",
+                command=data["command"],
+                session_key="sess-1",
+                description=data["description"],
+                metadata={},
+                allow_permanent=data.get("allow_permanent", False),
+                allow_session=data.get("allow_session", False),
+                request_id=data["request_id"],
+                expected_context=data["expected_context"],
+            )
+        )
+        assert send_result.success
+        notify_seen.set()
+
+    def wait_for_decision():
+        register_gateway_notify("sess-1", notify)
+        result.update(
+            request_sensitive_human_approval(
+                session_key="sess-1",
+                command="Protected MCP execute",
+                description="Protected MCP execute requires Telegram approval.",
+                expected_context={
+                    "platform": "telegram",
+                    "chat_id": "chat-1",
+                    "user_id": "user-1",
+                    "thread_id": DIRECT_THREAD_SENTINEL,
+                    "session_id": "sid-1",
+                    "session_key": "sess-1",
+                },
+                ttl_seconds=10.0,
+                pattern_key="mcp_permission_rail:dps:execute",
+            )
+        )
+
+    worker = threading.Thread(target=wait_for_decision, daemon=True)
+    worker.start()
+    assert notify_seen.wait(2)
+    assert notified
+    approval_id = next(iter(adapter._approval_state))
+    return notified, result, worker, approval_id
 
 
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
@@ -199,6 +287,46 @@ def test_forum_group_topic_message_preserves_thread_session_key():
     assert event.source.chat_type == "group"
     assert event.source.thread_id == "17585"
     assert build_session_key(event.source) == "agent:main:telegram:group:-100123:17585"
+
+
+@pytest.mark.asyncio
+async def test_sensitive_approval_button_direct_no_thread_resolves_once():
+    adapter = _make_adapter()
+    _notified, result, worker, approval_id = _start_sensitive_approval(adapter)
+
+    update, answers, _edits = _approval_update(data=f"ea:once:{approval_id}", thread_id=None)
+    await adapter._handle_callback_query(update, SimpleNamespace())
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert result["resolved"] is True
+    assert result["choice"] == "once"
+    assert any(answer and "Approved once" in answer for answer in answers)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_approval_button_wrong_thread_fails_closed_then_direct_resolves():
+    adapter = _make_adapter()
+    _notified, result, worker, approval_id = _start_sensitive_approval(adapter)
+
+    wrong_update, wrong_answers, _wrong_edits = _approval_update(
+        data=f"ea:once:{approval_id}",
+        thread_id="thread-2",
+    )
+    await adapter._handle_callback_query(wrong_update, SimpleNamespace())
+
+    assert result == {}
+    assert worker.is_alive() is True
+    assert adapter._approval_state.get(approval_id)
+    assert any(answer and "different chat, thread, or user" in answer for answer in wrong_answers)
+
+    direct_update, _answers, _edits = _approval_update(data=f"ea:once:{approval_id}", thread_id=None)
+    await adapter._handle_callback_query(direct_update, SimpleNamespace())
+    worker.join(2)
+
+    assert worker.is_alive() is False
+    assert result["resolved"] is True
+    assert result["choice"] == "once"
 
 
 def test_forum_general_topic_without_message_thread_id_keeps_thread_context():
@@ -722,5 +850,3 @@ async def test_thread_fallback_only_fires_once():
     # Second chunk: should use thread_id=None directly (effective_thread_id
     # was cleared per-chunk but the metadata doesn't change between chunks)
     # The key point: the message was delivered despite the invalid thread
-
-

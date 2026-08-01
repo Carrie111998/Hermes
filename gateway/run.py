@@ -492,6 +492,7 @@ def _format_exec_approval_fallback(
     *,
     allow_permanent: bool = True,
     allow_session: bool = True,
+    request_id: str | None = None,
     smart_denied: bool = False,
 ) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
@@ -500,14 +501,20 @@ def _format_exec_approval_fallback(
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
-    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    approve_command = f"{command_prefix}approve"
+    deny_command = f"{command_prefix}deny"
+    if request_id:
+        approve_command = f"{approve_command} {request_id}"
+        deny_command = f"{deny_command} {request_id}"
+
+    choices = [f"Reply `{approve_command}` to execute this one operation"]
     if not smart_denied and allow_session:
         choices.append(
             f"`{command_prefix}approve session` to approve this pattern for the session"
         )
         if allow_permanent:
             choices.append(f"`{command_prefix}approve always` to approve permanently")
-    choices.append(f"`{command_prefix}deny` to cancel")
+    choices.append(f"`{deny_command}` to cancel")
     return (
         f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
@@ -4853,17 +4860,27 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_kwargs = {
+                        "chat_id": ctx._status_chat_id,
+                        "command": cmd,
+                        "session_key": _approval_session_key,
+                        "description": desc,
+                        "metadata": ctx._status_thread_metadata,
+                        "allow_permanent": approval_data.get("allow_permanent", True),
+                        "allow_session": approval_data.get("allow_session", True),
+                        "smart_denied": approval_data.get("smart_denied", False),
+                    }
+                    if approval_data.get("request_id"):
+                        try:
+                            _sig = inspect.signature(type(ctx._status_adapter).send_exec_approval)
+                            if "request_id" in _sig.parameters:
+                                _approval_kwargs["request_id"] = approval_data.get("request_id")
+                            if "expected_context" in _sig.parameters:
+                                _approval_kwargs["expected_context"] = approval_data.get("expected_context")
+                        except Exception:
+                            pass
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
+                        ctx._status_adapter.send_exec_approval(**_approval_kwargs),
                         ctx._loop_for_step,
                         logger=logger,
                         log_message="send_exec_approval scheduling error",
@@ -4893,6 +4910,7 @@ class TurnRunner:
                 _p,
                 allow_permanent=approval_data.get("allow_permanent", True),
                 allow_session=approval_data.get("allow_session", True),
+                request_id=approval_data.get("request_id"),
                 smart_denied=approval_data.get("smart_denied", False),
             )
             try:

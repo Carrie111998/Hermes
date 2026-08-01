@@ -1187,6 +1187,21 @@ describe('createGatewayEventHandler', () => {
     expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'], smartDenied: true })
   })
 
+  it('preserves approval request_id on the overlay', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: {
+        command: 'rm -rf /tmp/x',
+        description: 'sensitive',
+        request_id: 'req-sensitive'
+      },
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approval).toMatchObject({ requestId: 'req-sensitive' })
+  })
+
   it('still surfaces terminal turn failures as errors', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

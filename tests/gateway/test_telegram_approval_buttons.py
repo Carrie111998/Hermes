@@ -105,6 +105,40 @@ class TestTelegramExecApproval:
         assert "dangerous deletion" in kwargs["text"]
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
 
+    @pytest.mark.asyncio
+    async def test_sensitive_button_state_carries_expected_session_id(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command="protected write",
+            session_key="agent:main:telegram:group:12345:99",
+            request_id="req-sensitive",
+            expected_context={
+                "platform": "telegram",
+                "chat_id": "12345",
+                "user_id": "u123",
+                "thread_id": "99",
+                "session_id": "sess-durable-1",
+                "session_key": "agent:main:telegram:group:12345:99",
+            },
+        )
+
+        assert result.success is True
+        assert adapter._approval_state[1] == {
+            "request_id": "req-sensitive",
+            "session_key": "agent:main:telegram:group:12345:99",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "user_id": "u123",
+                "thread_id": "99",
+                "session_id": "sess-durable-1",
+                "session_key": "agent:main:telegram:group:12345:99",
+            },
+        }
+
 
     @pytest.mark.asyncio
     async def test_non_smart_allow_permanent_false_keeps_session(self, monkeypatch):
@@ -268,6 +302,144 @@ class TestTelegramApprovalCallback:
         assert "Alice\\_Bob" in edit_kwargs["text"]
         assert "Approved once" in edit_kwargs["text"]
 
+    @pytest.mark.asyncio
+    async def test_approval_callback_passes_request_id_and_observed_identity(self):
+        adapter = _make_adapter()
+        adapter._approval_state[7] = {
+            "request_id": "req-sensitive",
+            "session_key": "agent:main:telegram:group:12345:99",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "user_id": "u123",
+                "thread_id": "99",
+                "session_id": "sess-durable-1",
+                "session_key": "agent:main:telegram:group:12345:99",
+            },
+        }
+
+        query = AsyncMock()
+        query.data = "ea:once:7"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_thread_id = 99
+        query.message.chat = SimpleNamespace(type="supergroup")
+        query.from_user = MagicMock()
+        query.from_user.id = "u123"
+        query.from_user.first_name = "Alice"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.approval.resolve_sensitive_gateway_approval",
+                return_value={"resolved": True, "status": "approved"},
+            ) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_called_once()
+        _, choice = mock_resolve.call_args.args
+        kwargs = mock_resolve.call_args.kwargs
+        assert choice == "once"
+        assert kwargs["request_id"] == "req-sensitive"
+        assert kwargs["observed_context"] == {
+            "platform": "telegram",
+            "chat_id": "12345",
+            "user_id": "u123",
+            "thread_id": "99",
+            "session_id": "sess-durable-1",
+            "session_key": "agent:main:telegram:group:12345:99",
+        }
+
+    @pytest.mark.asyncio
+    async def test_sensitive_approval_callback_without_session_id_fails_closed(self):
+        adapter = _make_adapter()
+        adapter._approval_state[9] = {
+            "request_id": "req-sensitive",
+            "session_key": "agent:main:telegram:group:12345:99",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "user_id": "u123",
+                "thread_id": "99",
+                "session_key": "agent:main:telegram:group:12345:99",
+            },
+        }
+
+        query = AsyncMock()
+        query.data = "ea:once:9"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_thread_id = 99
+        query.message.chat = SimpleNamespace(type="supergroup")
+        query.from_user = MagicMock()
+        query.from_user.id = "u123"
+        query.from_user.first_name = "Alice"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.approval.resolve_sensitive_gateway_approval",
+                return_value={"resolved": True, "status": "approved"},
+            ) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.edit_message_text.assert_not_called()
+        assert "context" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_sensitive_approval_context_mismatch_keeps_button_live(self):
+        adapter = _make_adapter()
+        adapter._approval_state[8] = {
+            "request_id": "req-sensitive",
+            "session_key": "agent:main:telegram:group:12345:99",
+            "expected_context": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "user_id": "u123",
+                "thread_id": "99",
+                "session_id": "sess-durable-1",
+                "session_key": "agent:main:telegram:group:12345:99",
+            },
+        }
+
+        query = AsyncMock()
+        query.data = "ea:once:8"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_thread_id = 99
+        query.message.chat = SimpleNamespace(type="supergroup")
+        query.from_user = MagicMock()
+        query.from_user.id = "mallory"
+        query.from_user.first_name = "Mallory"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.approval.resolve_sensitive_gateway_approval",
+                return_value={"resolved": False, "status": "context_mismatch"},
+            ):
+                await adapter._handle_callback_query(update, context)
+
+        assert adapter._approval_state[8]["request_id"] == "req-sensitive"
+        query.edit_message_text.assert_not_called()
+        assert "different" in query.answer.call_args.kwargs["text"].lower()
+
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_not_affected(self, tmp_path):
@@ -359,4 +531,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

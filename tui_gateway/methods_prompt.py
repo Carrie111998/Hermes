@@ -889,7 +889,30 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from tools.approval import resolve_gateway_approval
+        from tools.approval import (
+            resolve_gateway_approval,
+            resolve_sensitive_gateway_approval,
+        )
+
+        request_id = params.get("request_id")
+        if request_id:
+            # TUI and Desktop talk to the locally spawned gateway over the
+            # trusted local JSON-RPC channel. There is no authenticated human
+            # account on that boundary, so sensitive approvals bind to the
+            # originating local runtime session instead of inventing user_id.
+            return _ok(
+                rid,
+                resolve_sensitive_gateway_approval(
+                    session["session_key"],
+                    params.get("choice", "deny"),
+                    request_id=request_id,
+                    observed_context={
+                        "platform": "tui",
+                        "session_id": params.get("session_id"),
+                        "session_key": session["session_key"],
+                    },
+                ),
+            )
 
         return _ok(
             rid,

@@ -349,7 +349,34 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
 
-def _is_hermes_internal_secret(key: str) -> bool:
+def _configured_attestation_key_envs() -> frozenset[str]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        return frozenset()
+    root = cfg.get("mcp_permission_rails") if isinstance(cfg, dict) else None
+    servers = root.get("servers") if isinstance(root, dict) else None
+    if not isinstance(servers, dict):
+        return frozenset()
+    names: set[str] = set()
+    for raw in servers.values():
+        if not isinstance(raw, dict):
+            continue
+        attestation = raw.get("attestation")
+        if not isinstance(attestation, dict) or attestation.get("enabled") is not True:
+            continue
+        key_env = str(attestation.get("key_env") or "").strip()
+        if key_env and key_env.upper().endswith("_KEY"):
+            names.add(key_env.upper())
+    return frozenset(names)
+
+
+def _is_hermes_internal_secret(
+    key: str,
+    attestation_key_envs: frozenset[str] | None = None,
+) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
 
     ``_HERMES_PROVIDER_ENV_BLOCKLIST`` is name-based and derived from the
@@ -383,6 +410,8 @@ def _is_hermes_internal_secret(key: str) -> bool:
     a model-driving CLI legitimately needs matches these patterns.
     """
     upper = key.upper()
+    if attestation_key_envs is not None and upper in attestation_key_envs:
+        return True
     if upper.startswith("AUXILIARY_") and (
         upper.endswith("_API_KEY") or upper.endswith("_BASE_URL")
     ):
@@ -461,11 +490,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _is_passthrough = lambda _: False  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    attestation_key_envs = _configured_attestation_key_envs()
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if _is_hermes_internal_secret(key):
+        if _is_hermes_internal_secret(key, attestation_key_envs):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
@@ -473,10 +503,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_hermes_internal_secret(real_key, attestation_key_envs):
                 continue
             sanitized[real_key] = value
-        elif _is_hermes_internal_secret(key):
+        elif _is_hermes_internal_secret(key, attestation_key_envs):
             continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
@@ -591,6 +621,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     ``os.environ`` into the returned dict.
     """
     env = os.environ.copy()
+    attestation_key_envs = _configured_attestation_key_envs()
 
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:
@@ -603,7 +634,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     for key in list(env):
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             env.pop(key, None)
-        elif _is_hermes_internal_secret(key):
+        elif _is_hermes_internal_secret(key, attestation_key_envs):
             env.pop(key, None)
 
     if not inherit_credentials:
@@ -1225,13 +1256,14 @@ def _make_run_env(env: dict) -> dict:
 
     merged = dict(os.environ | env)
     run_env = {}
+    attestation_key_envs = _configured_attestation_key_envs()
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if _is_hermes_internal_secret(real_key, attestation_key_envs):
                 continue
             run_env[real_key] = v
-        elif _is_hermes_internal_secret(k):
+        elif _is_hermes_internal_secret(k, attestation_key_envs):
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v

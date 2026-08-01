@@ -67,6 +67,17 @@ describe('approval prompt store', () => {
 
     expect($approvalRequest.get()?.allowPermanent).toBe(false)
   })
+
+  it('carries requestId for identity-bound approvals', () => {
+    setApprovalRequest({
+      command: 'x',
+      description: 'sensitive',
+      requestId: 'req-sensitive',
+      sessionId: 's1'
+    })
+
+    expect($approvalRequest.get()?.requestId).toBe('req-sensitive')
+  })
 })
 
 describe('sudo prompt store', () => {

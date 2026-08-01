@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from tools.environments.local import (
     hermes_subprocess_env,
+    _sanitize_subprocess_env,
     _ALWAYS_STRIP_KEYS,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
 )
@@ -212,3 +213,34 @@ class TestInternalDynamicSecrets:
         assert {
             "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_DELIVERY_KEY",
         } <= _ALWAYS_STRIP_KEYS
+
+
+def test_sanitize_subprocess_env_strips_configured_attestation_key_env():
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={
+            "mcp_permission_rails": {
+                "servers": {
+                    "dps": {
+                        "enabled": True,
+                        "attestation": {
+                            "enabled": True,
+                            "key_env": "LOCAL_HERMES_ATTESTATION_KEY",
+                        },
+                    }
+                }
+            }
+        },
+    ):
+        result = _sanitize_subprocess_env(
+            {
+                "PATH": "/usr/bin",
+                "LOCAL_HERMES_ATTESTATION_KEY": "attestation-key-material",
+                "DPS_HERMES_ATTESTATION_KID": "kid-1",
+                "DPS_HERMES_OAUTH_CLIENT_ID": "client-1",
+            }
+        )
+
+    assert "LOCAL_HERMES_ATTESTATION_KEY" not in result
+    assert result["DPS_HERMES_ATTESTATION_KID"] == "kid-1"
+    assert result["DPS_HERMES_OAUTH_CLIENT_ID"] == "client-1"

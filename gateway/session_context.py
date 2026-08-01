@@ -424,6 +424,22 @@ def session_is_messaging_surface() -> bool:
     return False
 
 
+def get_trusted_session_env(name: str, default: str = "") -> str:
+    """Read only ContextVar-bound session identity, never ``os.environ``.
+
+    Sensitive rails use this during protected calls so model-controlled process
+    env changes cannot spoof gateway provenance. Empty strings remain explicit
+    empty values; unset context variables return *default*.
+    """
+    var = _VAR_MAP.get(name)
+    if var is None:
+        return default
+    value = var.get()
+    if value is _UNSET:
+        return default
+    return value
+
+
 def declare_stateless_channel() -> None:
     """Declare that this session cannot receive an async background completion.
 

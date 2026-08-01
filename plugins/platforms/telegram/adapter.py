@@ -835,7 +835,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        self._approval_state: Dict[int, Any] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -5398,6 +5398,8 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         allow_session: bool = True,
+        request_id: Optional[str] = None,
+        expected_context: Optional[Dict[str, Any]] = None,
         smart_denied: bool = False,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
@@ -5461,7 +5463,15 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            if request_id:
+                expected_ctx = dict(expected_context or {}) if isinstance(expected_context, dict) else {}
+                self._approval_state[approval_id] = {
+                    "request_id": request_id,
+                    "session_key": session_key,
+                    "expected_context": expected_ctx,
+                }
+            else:
+                self._approval_state[approval_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6324,7 +6334,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                approval_state = self._approval_state.pop(approval_id, None)
+                request_id = None
+                if isinstance(approval_state, dict):
+                    session_key = approval_state.get("session_key")
+                    request_id = approval_state.get("request_id")
+                    expected_context = approval_state.get("expected_context")
+                else:
+                    session_key = approval_state
+                    expected_context = None
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
@@ -6338,15 +6356,63 @@ class TelegramAdapter(BasePlatformAdapter):
                 # the command was already denied and will not run (#63501
                 # regression follow-up: 60s waits made stale taps common).
                 try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
-                    logger.info(
-                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
+                    from tools.approval import (
+                        resolve_gateway_approval,
+                        resolve_sensitive_gateway_approval,
                     )
+                    observed_context = None
+                    resolution_status = ""
+                    if request_id:
+                        if not isinstance(expected_context, dict):
+                            await query.answer(text="This approval cannot prove its expected context.")
+                            return
+                        expected_session_id = str(expected_context.get("session_id") or "")
+                        expected_thread_id = str(expected_context.get("thread_id") or "")
+                        if not expected_session_id or not expected_thread_id:
+                            await query.answer(text="This approval cannot prove its expected context.")
+                            return
+                        observed_thread_id = (
+                            str(query_thread_id)
+                            if query_thread_id is not None
+                            else expected_thread_id
+                        )
+                        observed_context = {
+                            "platform": "telegram",
+                            "chat_id": str(query_chat_id) if query_chat_id is not None else None,
+                            "user_id": caller_id,
+                            "thread_id": observed_thread_id,
+                            "session_id": expected_session_id,
+                            "session_key": session_key,
+                        }
+                        resolution = resolve_sensitive_gateway_approval(
+                            session_key,
+                            choice,
+                            request_id=request_id,
+                            observed_context=observed_context,
+                        )
+                        resolution_status = str(resolution.get("status") or "")
+                        count = 1 if resolution.get("resolved") else 0
+                    else:
+                        count = resolve_gateway_approval(session_key, choice)
+                    if request_id:
+                        logger.info(
+                            "Telegram button resolved sensitive approval "
+                            "(resolved=%s, status=%s, choice=%s)",
+                            bool(count), resolution_status or "", choice,
+                        )
+                    else:
+                        logger.info(
+                            "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                            count, session_key, choice, user_display,
+                        )
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
                     count = 0
+
+                if request_id and count == 0 and resolution_status == "context_mismatch":
+                    self._approval_state[approval_id] = approval_state
+                    await query.answer(text="This approval belongs to a different chat, thread, or user.")
+                    return
 
                 if count:
                     # Map choice to human-readable label

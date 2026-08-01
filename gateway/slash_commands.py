@@ -69,6 +69,42 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+def _current_session_id_for_key(session_store: Any, session_key: str) -> str:
+    """Return the gateway-owned session_id currently bound to a session key."""
+    if not session_key or session_store is None:
+        return ""
+    peek = getattr(session_store, "peek_session_id", None)
+    if not callable(peek):
+        return ""
+    try:
+        value = peek(session_key)
+    except Exception:
+        return ""
+    return str(value or "")
+
+
+def _observed_sensitive_approval_context(
+    source: SessionSource,
+    *,
+    session_key: str,
+    session_id: str,
+) -> Optional[dict]:
+    if not session_id:
+        return None
+    try:
+        from tools.hermes_attestation import normalize_thread_id
+    except Exception:
+        normalize_thread_id = lambda value: value  # type: ignore[assignment]
+    return {
+        "platform": getattr(source.platform, "value", str(source.platform)),
+        "chat_id": source.chat_id,
+        "user_id": source.user_id,
+        "thread_id": normalize_thread_id(getattr(source, "thread_id", None)),
+        "session_id": session_id,
+        "session_key": session_key,
+    }
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -5209,6 +5245,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            has_sensitive_gateway_approval,
         )
 
         if not has_blocking_approval(session_key):
@@ -5218,18 +5255,44 @@ class GatewaySlashCommandsMixin:
             return t("gateway.approve.no_pending")
 
         # Parse args: support "all", "all session", "all always", "session", "always"
-        args = event.get_command_args().strip().lower().split()
-        resolve_all = "all" in args
-        remaining = [a for a in args if a != "all"]
+        args = event.get_command_args().strip().split()
+        args_lower = [a.lower() for a in args]
+        resolve_all = "all" in args_lower
+        remaining = [(raw, lower) for raw, lower in zip(args, args_lower) if lower != "all"]
+        request_id = next(
+            (
+                raw for raw, lower in remaining
+                if lower not in {"always", "permanent", "permanently", "session", "ses"}
+            ),
+            None,
+        )
+        if request_id and not has_sensitive_gateway_approval(session_key, request_id):
+            request_id = None
 
-        if any(a in {"always", "permanent", "permanently"} for a in remaining):
+        remaining_lower = [lower for _, lower in remaining]
+        if any(a in {"always", "permanent", "permanently"} for a in remaining_lower):
             choice = "always"
-        elif any(a in {"session", "ses"} for a in remaining):
+        elif any(a in {"session", "ses"} for a in remaining_lower):
             choice = "session"
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        observed_context = None
+        if request_id:
+            observed_context = _observed_sensitive_approval_context(
+                source,
+                session_key=session_key,
+                session_id=_current_session_id_for_key(
+                    getattr(self, "session_store", None), session_key
+                ),
+            )
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=False if request_id else resolve_all,
+            request_id=request_id,
+            observed_context=observed_context,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -5258,6 +5321,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            has_sensitive_gateway_approval,
         )
 
         if not has_blocking_approval(session_key):
@@ -5272,17 +5336,32 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip()
         tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
+        request_id = None
         if resolve_all:
             reason = raw_args[len(tokens[0]):].strip()
         else:
-            reason = raw_args
+            if tokens and has_sensitive_gateway_approval(session_key, tokens[0]):
+                request_id = tokens[0]
+                reason = raw_args[len(tokens[0]):].strip()
+            else:
+                reason = raw_args
         # Cap to a sane one-liner; the agent only needs a short hint.
         if reason:
             reason = reason[:280].strip()
 
+        observed_context = None
+        if request_id:
+            observed_context = _observed_sensitive_approval_context(
+                source,
+                session_key=session_key,
+                session_id=_current_session_id_for_key(
+                    getattr(self, "session_store", None), session_key
+                ),
+            )
         count = resolve_gateway_approval(
-            session_key, "deny", resolve_all=resolve_all,
-            reason=reason or None,
+            session_key, "deny", resolve_all=False if request_id else resolve_all,
+            reason=reason or None, request_id=request_id,
+            observed_context=observed_context,
         )
         if not count:
             return t("gateway.deny.no_pending")

@@ -4776,7 +4776,12 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    tool_annotations: Any = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -4843,8 +4848,40 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        rail_call_state = {"protected_execute": False, "rail_blocked": False}
+
         async def _call():
             _mark_server_call_started(server)
+            try:
+                from tools.mcp_permission_rail import before_tool_call
+
+                rail_decision = before_tool_call(
+                    server_name,
+                    tool_name,
+                    args or {},
+                    tool_annotations=tool_annotations,
+                )
+            except Exception as rail_exc:
+                logger.error(
+                    "MCP permission rail failed closed for %s/%s: %s",
+                    server_name,
+                    tool_name,
+                    rail_exc,
+                )
+                return tool_error(
+                    "BLOCKED: MCP permission rail failed closed before tool call."
+                )
+            if rail_decision.denied_message:
+                rail_call_state["rail_blocked"] = True
+                return tool_error(rail_decision.denied_message)
+            rail_call_state["protected_execute"] = bool(
+                getattr(rail_decision, "protected_execute", False)
+            )
+            call_args = getattr(rail_decision, "call_args", None)
+            if call_args is None:
+                call_args = args
+            mcp_meta = getattr(rail_decision, "mcp_meta", None) or {}
+
             async with server._rpc_lock:
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
@@ -4852,7 +4889,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if mcp_meta:
+                        result = await server.session.call_tool(
+                            tool_name,
+                            arguments=call_args,
+                            meta=mcp_meta,
+                        )
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=call_args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -4877,6 +4921,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return tool_error(_sanitize_error(
                     error_text or "MCP tool returned an error"
                 ))
+
+            try:
+                from tools.mcp_permission_rail import after_tool_result
+
+                rail_result_error = after_tool_result(rail_decision, result)
+            except Exception as rail_exc:
+                logger.error(
+                    "MCP permission rail failed closed after %s/%s: %s",
+                    server_name,
+                    tool_name,
+                    rail_exc,
+                )
+                return tool_error(
+                    "BLOCKED: MCP permission rail failed closed after tool call."
+                )
+            if rail_result_error:
+                rail_call_state["rail_blocked"] = True
+                return tool_error(rail_result_error)
 
             # Collect text from content blocks. MCP tool results can also
             # include ImageContent blocks (screenshot / Blockbench / Playwright
@@ -4950,7 +5012,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    if not rail_call_state.get("rail_blocked"):
+                        _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
@@ -4959,6 +5022,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
+            if rail_call_state.get("protected_execute"):
+                _bump_server_error(server_name)
+                logger.error(
+                    "Protected MCP execute %s/%s call failed without retry: %s",
+                    server_name, tool_name, exc,
+                )
+                return tool_error(_sanitize_error(
+                    f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
+                ))
+
             # Auth-specific recovery path: consult the manager, signal
             # reconnect if viable, retry once. Returns None to fall
             # through for non-auth exceptions.
@@ -5759,7 +5832,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    getattr(mcp_tool, "annotations", None) or {},
                 ),
                 "check_fn": check_fn,
             }

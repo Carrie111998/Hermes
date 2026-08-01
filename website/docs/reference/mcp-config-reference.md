@@ -125,6 +125,74 @@ Result:
 - `create_issue` is still allowed
 - `delete_issue` is ignored because `include` takes precedence
 
+## Prepare/Execute permission rail
+
+`mcp_permission_rails` is empty by default. When configured for an exact MCP
+server name, it protects server-native execute tools by requiring:
+
+- a matching protected prepare tool result in the same session context
+- an unexpired `proposal_token` digest and configured prepare/execute binding
+- one-shot approval from the same authenticated Telegram user/chat/thread/session
+
+Reads, status tools, and prepare tools remain callable. Desktop/TUI/local,
+cron, delegated subagents, detached/background, and other non-human contexts
+fail closed for protected execute.
+
+```yaml
+mcp_permission_rails:
+  servers:
+    dps-work:
+      enabled: false
+      ttl_seconds: 120
+      max_preview_chars: 3000
+      tools:
+        read: ["dps_get_*", "dps_list_*"]
+        status: ["dps_status_*"]
+        prepare: ["dps_prepare_*"]
+        execute: ["dps_execute_*"]
+      prepare_prefix: "dps_prepare_"
+      execute_prefix: "dps_execute_"
+      # Optional exact bindings may coexist with the prefix transform.
+      bindings: []
+      result_paths:
+        proposal_token: ["data.proposal_token"]
+        preview: ["data.action.preview"]
+        expires_at: ["data.expires_at"]
+        confirmation_code: ["data.confirmation_code"]
+      execute_token_paths: ["proposal_token"]
+      execute_confirmation_code_paths: ["confirmation_code"]
+      deny_execute_tools:
+        # Keep denylisted until the backend import bug is fixed.
+        - "dps_execute_project_document_import"
+```
+
+The example is deliberately disabled. Tool categories use server-native MCP
+tool patterns, not Hermes `mcp__server__tool` names. The rail classifies with
+deny > execute > prepare > status > read precedence. `prepare_prefix` and
+`execute_prefix` define a deterministic transform, so `dps_prepare_foo` binds
+to `dps_execute_foo`; exact `bindings` can be added for exceptions.
+
+For protected servers, Hermes also passes MCP tool annotations into the rail.
+Any tool whose `readOnlyHint` is not exactly `true` is treated as
+mutation-capable and must match a protected `execute` pattern or a
+`deny_execute_tools` pattern before the MCP call is made.
+
+Prepare results should prefer structured MCP output. The expected DPS shape is
+`structuredContent: {ok: true, data: {proposal_token, confirmation_code?,
+expires_at, action: {preview}}}`. `expires_at` must be valid and future; the
+pending approval expires at the earlier of the backend timestamp and the local
+`ttl_seconds`.
+
+The approval prompt must display the full canonical escaped preview. Hermes
+does not approve truncated previews for protected prepares; if the canonical
+preview exceeds `max_preview_chars` (default and hard cap: `3000`), prepare
+fails closed and asks the operator to narrow the request or use DPS Work. The
+stored preview digest is still computed from the full preview.
+
+If a session ends, hosts may call
+`tools.mcp_permission_rail.clear_session_pending_proposals(session_key)` to
+drop any remaining in-memory proposals for that session.
+
 ## Utility-tool policy
 
 Hermes may register these utility wrappers per MCP server:

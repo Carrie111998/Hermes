@@ -33,7 +33,7 @@ function part(toolName: string): ToolPart {
 function setRequest(
   command = 'rm -rf /tmp/x',
   allowPermanent?: boolean,
-  extra: { choices?: string[]; smartDenied?: boolean } = {}
+  extra: { choices?: string[]; requestId?: string; smartDenied?: boolean } = {}
 ) {
   $activeSessionId.set('sess-1')
   setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
@@ -86,6 +86,22 @@ describe('PendingToolApproval', () => {
       expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('includes request_id when responding to an identity-bound approval', async () => {
+    const request = mockGateway()
+    setRequest('rm -rf /tmp/x', undefined, { requestId: 'req-sensitive' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        choice: 'once',
+        request_id: 'req-sensitive',
+        session_id: 'sess-1'
+      })
+    })
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {

@@ -142,10 +142,14 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>('approval.respond', {
+        const params: { choice: ApprovalChoice; request_id?: string; session_id?: string } = {
           choice,
           session_id: request.sessionId ?? undefined
-        })
+        }
+        if (request.requestId) {
+          params.request_id = request.requestId
+        }
+        await gateway.request<{ resolved?: boolean }>('approval.respond', params)
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
         clearApprovalRequest(request.sessionId)
       } catch (error) {
@@ -153,7 +157,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.requestId, request.sessionId]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.
