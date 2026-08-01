@@ -785,6 +785,30 @@ def mock_config():
     }
 
 
+@pytest.fixture()
+def posix_bash():
+    """A bash that can open the native paths tests hand it.
+
+    Bare ``bash`` resolves to ``C:\\Windows\\System32\\bash.exe`` — the WSL
+    launcher — on any Windows box with WSL installed, and WSL's bash cannot
+    open a ``C:\\...`` argument: it strips the backslashes and exits 127.
+    ``_find_bash()`` already probes Git-for-Windows locations ahead of PATH
+    for exactly this reason; tests that shell out need the same lookup.
+    """
+    if sys.platform != "win32":
+        bash = shutil.which("bash")
+        if not bash:
+            pytest.skip("bash not on PATH")
+        return bash
+
+    from tools.environments.local import _find_bash
+
+    try:
+        return _find_bash()
+    except RuntimeError as exc:  # Git for Windows absent
+        pytest.skip(str(exc))
+
+
 # ── Per-test timeout — handled by the isolation plugin ─────────────────────
 #
 # The subprocess-per-test plugin enforces the configured ``isolate_timeout``
