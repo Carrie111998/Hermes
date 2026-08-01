@@ -12025,18 +12025,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
 
             recorder = self._voice_recorder
-            release_for_wake = (
-                getattr(self, "_wake_suspended", False)
-                and not self._voice_continuous
-            )
+            release_for_wake = getattr(self, "_wake_suspended", False)
             try:
                 wav_path = recorder.stop()
             finally:
-                # A wake-triggered turn hands the capture device back to the
-                # wake listener after one utterance. AudioRecorder.stop()
-                # deliberately keeps its stream alive for regular/continuous
-                # voice mode, but the wake listener cannot reopen an exclusive
-                # device while that persistent stream still owns it. Release it
+                # A wake-triggered capture hands the device to another owner:
+                # the wake listener after a single-turn command, or a
+                # full-duplex/follow-up recorder in continuous conversation.
+                # AudioRecorder.stop() deliberately keeps its stream alive for
+                # ordinary voice mode, but no wake hand-off can reopen an
+                # exclusive device while that stream still owns it. Release it
                 # before transcription, including when stop() itself fails.
                 if release_for_wake:
                     try:

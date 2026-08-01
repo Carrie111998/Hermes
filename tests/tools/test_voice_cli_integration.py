@@ -338,7 +338,8 @@ class TestVoiceStopAndTranscribeReal:
         assert cli._voice_recorder is None
         assert cli._pending_input.empty()
 
-    def test_wake_turn_releases_capture_device_before_transcription(self):
+    @pytest.mark.parametrize("continuous", [False, True])
+    def test_wake_turn_releases_capture_device_before_transcription(self, continuous):
         events = []
         recorder = MagicMock()
         recorder.stop.return_value = "/tmp/test.wav"
@@ -346,6 +347,7 @@ class TestVoiceStopAndTranscribeReal:
         cli = _make_voice_cli(
             _voice_recording=True,
             _voice_recorder=recorder,
+            _voice_continuous=continuous,
             _wake_suspended=True,
         )
 
