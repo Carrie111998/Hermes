@@ -618,3 +618,96 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# D4 resolver escalation answer/re-entry CLI contract
+# ---------------------------------------------------------------------------
+
+
+def _cli_d4_board(name: str) -> None:
+    kb.create_board(name, name="D4 CLI", preset="product")
+    metadata_path = kb.board_metadata_path(name)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.setdefault("product_workflow", {})["handoff_v2"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+
+def _cli_d4_escalated(board: str) -> str:
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Story: CLI D4",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None and first.current_run_id is not None
+        assert kb.block_task(
+            conn, task_id, reason="Need an operator", kind="needs_input",
+            expected_run_id=first.current_run_id, board=board,
+            human_escalation_assignee="resolver",
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None and resolver.current_run_id is not None
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        request = {
+            "decision": "escalate",
+            "fault_domain": "framework",
+            "diagnosis": "The answer is outside the Resolver context",
+            "reason": "Ask the operator",
+            "expected": expected,
+        }
+        assert kb.resolve_product_preflight(
+            conn, task_id, board=board, request=request,
+            resolver_profile="resolver", resolver_model="test-model",
+        )
+    return task_id
+
+
+def test_answer_escalation_parser_supports_double_dash_leading_answer():
+    wrapper = argparse.ArgumentParser()
+    subparsers = wrapper.add_subparsers(dest="root")
+    parser = kc.build_parser(subparsers)
+    args = parser.parse_args(["answer-escalation", "t_example", "--", "-starts-with-dash"])
+    assert args.kanban_action == "answer-escalation"
+    assert args.task_id == "t_example"
+    assert args.answer == ["-starts-with-dash"]
+
+
+def test_answer_escalation_cli_success_accepts_leading_dash_and_writes_no_comment(kanban_home):
+    board = "d4-cli-success"
+    _cli_d4_board(board)
+    task_id = _cli_d4_escalated(board)
+    with kb.scoped_current_board(board):
+        out = kc.run_slash(f"answer-escalation {task_id} -- --use-vendored-fixture")
+    assert "Answered" in out
+    assert "fresh Resolver" in out
+    with kb.connect(board=board) as conn:
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    assert not [comment for comment in comments if "use-vendored" in comment.body]
+    answer_events = [
+        event for event in events
+        if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT
+        and event.payload.get("kind") == "resolver_reentry"
+    ]
+    assert len(answer_events) == 1
+    assert answer_events[0].payload["human_answer"] == "--use-vendored-fixture"
+
+
+def test_answer_escalation_cli_stale_conflict_is_concise_and_public(kanban_home):
+    board = "d4-cli-conflict"
+    _cli_d4_board(board)
+    task_id = _cli_d4_escalated(board)
+    with kb.scoped_current_board(board):
+        first = kc.run_slash(f"answer-escalation {task_id} first --answered-by operator")
+        second = kc.run_slash(f"answer-escalation {task_id} second --answered-by operator")
+    assert "Answered" in first
+    assert "cannot answer" in second
+    assert "task changed" in second
+    assert "Traceback" not in second
+    assert "sqlite3" not in second

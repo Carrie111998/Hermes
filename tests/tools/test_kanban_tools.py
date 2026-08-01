@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -650,6 +651,120 @@ def test_review_target_schema_accepts_only_offset():
     assert params["additionalProperties"] is False
     assert set(params["properties"]) == {"offset"}
     assert params["required"] == []
+
+
+def _resolver_show_boundary_task(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    kb._INITIALIZED_PATHS.clear()
+
+    board = "resolver-unicode-boundary"
+    kb.create_board(board, name="Resolver Unicode Boundary", preset="product")
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    workflow = metadata.setdefault("product_workflow", {})
+    workflow["handoff_v2"] = True
+    workflow["human_escalation_profile"] = "resolver"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # These are the largest multibyte values admitted by their respective
+    # Resolver CAS fields while still satisfying the public task-ingress
+    # contract. The worktree is not resolved: its metadata is what this test
+    # exercises, so the path need only be an absolute stored value.
+    workspace_path = "/" + ("🙂" * 4095)
+    branch_name = "🙂" * 1024
+    assert len(workspace_path) == 4096
+    assert len(workspace_path.encode("utf-8")) <= 16_384
+    assert len(branch_name) == 1024
+    assert len(branch_name.encode("utf-8")) == 4_096
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Resolver Unicode boundary",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a Resolver decision",
+            kind="needs_input",
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None and resolver.current_run_id is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    return board, task_id, workspace_path, branch_name
+
+
+def test_resolver_show_preserves_multibyte_cas_boundaries_and_fails_closed(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    board, task_id, workspace_path, branch_name = _resolver_show_boundary_task(
+        monkeypatch, tmp_path
+    )
+
+    with kb.connect(board=board) as conn:
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        before_task = kb.get_task(conn, task_id)
+        before_events = kb.list_events(conn, task_id)
+        with pytest.raises(
+            ValueError,
+            match="workspace_path exceeds exact Resolver snapshot bound",
+        ):
+            kb.set_workspace_path(conn, task_id, workspace_path + "x")
+        assert kb.get_task(conn, task_id) == before_task
+        assert kb.list_events(conn, task_id) == before_events
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show.encode("utf-8")) < 96_000
+    shown = json.loads(raw_show)
+    assert shown["expected"] == expected
+    assert shown["expected"]["workspace_path"] == workspace_path
+    assert shown["expected"]["branch_name"] == branch_name
+
+    # A legacy row altered outside public ingress is an explicit, concise
+    # fail-closed residual. It must not be truncated into an apparently valid
+    # CAS or padded with a repair token.
+    with kb.connect(board=board) as conn:
+        malformed_path = workspace_path + "x"
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?",
+            (malformed_path, task_id),
+        )
+        conn.commit()
+    residual = json.loads(kt._handle_show({}))
+    error = residual.get("error", "")
+    assert error.startswith(
+        "kanban_show: workspace_path exceeds exact Resolver snapshot bound"
+    )
+    assert len(error.encode("utf-8")) < 512
+    assert "truncated" not in error
 
 
 def test_show_defaults_to_env_task_id(worker_env):
@@ -2662,6 +2777,673 @@ def test_worker_product_complete_uses_db_connection_board_for_handoff(
     assert task.status == "ready"
     assert task.assignee == "architect"
     assert task.current_step_key == "architecture"
+
+
+
+def test_worker_block_uses_connection_board_for_omitted_escalation(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board_a = "tool-connection-a"
+    board_b = "tool-connection-b"
+    kb.ensure_product_board_defaults(board_a)
+    kb.ensure_product_board_defaults(board_b)
+    for board, profile in ((board_a, "resolver"), (board_b, "wrong-profile")):
+        metadata = kb.read_board_metadata(board)
+        metadata.setdefault("product_workflow", {})[
+            "human_escalation_profile"
+        ] = profile
+        kb.board_metadata_path(board).write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+    kb.set_current_board(board_b)
+
+    with kb.connect(board=board_a) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="structured connection-board escalation",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, task_id, board=board_a)
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board_a)))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_block({
+        "reason": "Need a human decision",
+        "kind": "needs_input",
+        "attempted_resolutions": ["checked the documented alternatives"],
+    }))
+    assert out["ok"] is True, out
+
+    with kb.connect(board=board_a) as conn:
+        task = kb.get_task(conn, task_id)
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+
+    assert task.assignee == "resolver"
+    assert preflight.payload["hermes_assignee"] == "resolver"
+
+
+def test_resolver_show_is_bounded_and_returns_resolve_snapshot(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-test-model")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-bounded"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="retry-heavy resolver inspection",
+            body="task body " + ("b" * 9000),
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a decision about the deployment boundary",
+            kind="needs_input",
+            attempted_resolutions=[
+                "checked the deployment policy",
+                "reproduced the failure in the workspace",
+            ],
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+        for index in range(35):
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, profile, step_key, status, started_at, ended_at,
+                    outcome, summary, metadata, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    "developer",
+                    "development",
+                    "completed",
+                    index + 1,
+                    index + 2,
+                    "failed",
+                    "retry summary " + ("s" * 5000),
+                    json.dumps({"attempt": "m" * 5000}),
+                    "retry error " + ("e" * 5000),
+                ),
+            )
+        for index in range(40):
+            kb.add_comment(conn, task_id, "developer", "comment " + ("c" * 3000))
+        for index in range(70):
+            conn.execute(
+                """
+                INSERT INTO task_events (task_id, run_id, kind, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    resolver.current_run_id,
+                    "heartbeat",
+                    json.dumps({"noise": "n" * 3000, "index": index}),
+                    10000 + index,
+                ),
+            )
+        conn.commit()
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show) < 100_000
+    shown = json.loads(raw_show)
+    expected = shown["expected"]
+    assert set(expected) == set(kb._RESOLVER_EXPECTED_KEYS)
+    assert shown["unresolved_preflight"]["event_id"] == preflight.id
+    assert shown["unresolved_preflight"]["payload"] == preflight.payload
+    assert shown["unresolved_preflight"]["payload"]["reason"].startswith(
+        "Need a decision"
+    )
+    assert shown["unresolved_preflight"]["payload"]["attempted_resolutions"] == [
+        "checked the deployment policy",
+        "reproduced the failure in the workspace",
+    ]
+    assert shown["comments_omitted"] > 0
+    assert shown["runs_omitted"] > 0
+    assert shown["events_omitted"] > 0
+    assert len(shown["worker_context"]) < 500
+
+    request = {
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The deployment boundary is documented and recoverable.",
+        "reason": "Resume using the documented deployment boundary.",
+        "expected": expected,
+    }
+    resolved = json.loads(kt._handle_resolve(request))
+    assert resolved["ok"] is True, resolved
+
+    stale = json.loads(kt._handle_resolve(request))
+    assert "kanban_resolve conflict" in stale["error"]
+
+
+def test_resolver_show_adversarial_whole_response_stays_below_safety_ceiling(
+    monkeypatch, tmp_path
+):
+    """A busy card must fit the bound as one serialized response, not only
+    through independent field and row caps."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-stress-model")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-whole-response-bound"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+
+    title = "标题🙂é" * 6000
+    body = "正文🙂é" * 10000
+    result = "结果🙂é" * 10000
+    reason = "原始原因🙂é" * 6000
+    attempts = ["尝试🙂é" * 1500 for _ in range(20)]
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=body,
+            assignee="developer",
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "workspace"),
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason=reason,
+            kind="needs_input",
+            attempted_resolutions=attempts,
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
+
+        parent_ids = []
+        for index in range(1000):
+            parent_id = kb.create_task(
+                conn,
+                title=f"parent {index}",
+                assignee="developer",
+                workspace_kind="scratch",
+                workflow_template_id="product",
+                current_step_key="development",
+                board=board,
+                initial_status="running",
+            )
+            parent_ids.append(parent_id)
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.executemany(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                [(int(time.time()), parent_id) for parent_id in parent_ids],
+            )
+            conn.executemany(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                [(parent_id, task_id) for parent_id in parent_ids],
+            )
+
+        preflight_row = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'human_input_preflight' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert preflight_row is not None
+        preflight_payload = json.loads(preflight_row["payload"])
+        preflight_payload["metadata"] = {
+            "diagnostic": "元数据🙂é" * 6000,
+            "attempt_index": 17,
+        }
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (
+                json.dumps(preflight_payload, ensure_ascii=False),
+                preflight_row["id"],
+            ),
+        )
+
+        for index in range(50):
+            conn.execute(
+                """INSERT INTO task_runs
+                   (task_id, profile, step_key, status, started_at, ended_at,
+                    outcome, summary, metadata, error)
+                   VALUES (?, ?, ?, 'completed', ?, ?, 'failed', ?, ?, ?)""",
+                (
+                    task_id,
+                    "developer",
+                    "development",
+                    10_000 + index,
+                    10_001 + index,
+                    "retry summary🙂é" * 3000,
+                    json.dumps(
+                        {"run_metadata": "运行元数据🙂é" * 3000},
+                        ensure_ascii=False,
+                    ),
+                    "retry error🙂é" * 3000,
+                ),
+            )
+        for index in range(40):
+            conn.execute(
+                """INSERT INTO task_comments (task_id, author, body, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    task_id,
+                    "developer",
+                    f"comment {index} " + ("评论🙂é" * 3000),
+                    20_000 + index,
+                ),
+            )
+        for index in range(80):
+            conn.execute(
+                """INSERT INTO task_events
+                   (task_id, run_id, kind, payload, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    resolver.current_run_id,
+                    "heartbeat",
+                    json.dumps(
+                        {"noise": "事件噪声🙂é" * 3000, "index": index},
+                        ensure_ascii=False,
+                    ),
+                    30_000 + index,
+                ),
+            )
+        expected_event_id = int(preflight_row["id"])
+        conn.commit()
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    raw_show = kt._handle_show({})
+    shown = json.loads(raw_show)
+    serialized = json.dumps(shown, ensure_ascii=False)
+    assert len(raw_show.encode("utf-8")) == len(serialized.encode("utf-8"))
+    assert len(serialized.encode("utf-8")) < 96_000
+    assert set(shown["expected"]) == set(kb._RESOLVER_EXPECTED_KEYS)
+    assert shown["expected"] == expected
+    task_view = shown["task"]
+    for task_field, expected_field in (
+        ("assignee", "assignee"),
+        ("status", "status"),
+        ("project_id", "project_id"),
+        ("workflow_template_id", "workflow_template_id"),
+        ("workspace_kind", "workspace_kind"),
+        ("workspace_path", "workspace_path"),
+        ("branch_name", "branch_name"),
+        ("current_run_id", "run_id"),
+        ("current_step_key", "phase"),
+        ("running", "running"),
+        ("blocked", "blocked"),
+    ):
+        assert task_view[task_field] == expected[expected_field]
+    assert task_view["id"] == task_id
+    assert shown["unresolved_preflight"]["event_id"] == expected_event_id
+    payload = shown["unresolved_preflight"]["payload"]
+    assert payload["hermes_assignee"] == "resolver"
+    assert payload["step_key"] == "development"
+    assert payload["metadata"]["attempt_index"] == 17
+
+    reason_envelope = payload["reason"]
+    assert reason_envelope["truncated"] is True
+    assert reason_envelope["original_chars"] == len(reason)
+    assert reason_envelope["original_bytes"] == len(reason.encode("utf-8"))
+    assert isinstance(reason_envelope["preview"], str)
+
+    attempts_json = json.dumps(attempts, ensure_ascii=False)
+    attempts_envelope = payload["attempted_resolutions"]
+    assert attempts_envelope["truncated"] is True
+    assert attempts_envelope["original_chars"] == len(attempts_json)
+    assert attempts_envelope["original_bytes"] == len(attempts_json.encode("utf-8"))
+    assert isinstance(attempts_envelope["preview"], str)
+
+    diagnostic = payload["metadata"]["diagnostic"]
+    assert diagnostic["truncated"] is True
+    assert diagnostic["original_chars"] == len("元数据🙂é" * 6000)
+    assert diagnostic["original_bytes"] == len(("元数据🙂é" * 6000).encode("utf-8"))
+    assert isinstance(diagnostic["preview"], str)
+
+    assert shown["comments_total"] >= 40
+    assert shown["runs_total"] >= 51
+    assert shown["events_total"] >= 80
+    assert shown["comments_omitted"] > 0
+    assert shown["runs_omitted"] > 0
+    assert shown["events_omitted"] > 0
+    assert shown["history_truncated"] is True
+
+    request = {
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "Adversarial descriptive fields are bounded.",
+        "reason": "Resume with the exact Resolver snapshot.",
+        "expected": shown["expected"],
+    }
+    resolved = json.loads(kt._handle_resolve(request))
+    assert resolved["ok"] is True, resolved
+    stale = json.loads(kt._handle_resolve(request))
+    assert "kanban_resolve conflict" in stale["error"]
+
+
+def test_bounded_preflight_keeps_normal_values_exact_with_oversized_metadata():
+    from tools import kanban_tools as kt
+
+    reason = "normal reason🙂é" * 100
+    attempts = ["checked the documented path"]
+    payload = {
+        "kind": "needs_input",
+        "original_assignee": "developer",
+        "hermes_assignee": "resolver",
+        "step_key": "development",
+        "resume_status": "ready",
+        "memory_capture_id": "capture-1",
+        "reason": reason,
+        "attempted_resolutions": attempts,
+        "metadata": {
+            "diagnostic": "元数据🙂é" * 6000,
+            "attempt_index": 17,
+        },
+    }
+
+    shown = kt._show_bounded_preflight(payload, 12_288)
+
+    assert shown["reason"] == reason
+    assert shown["attempted_resolutions"] == attempts
+    assert shown["metadata"]["attempt_index"] == 17
+    assert shown["metadata"]["diagnostic"]["truncated"] is True
+
+
+
+def test_resolver_show_bounds_single_oversized_mandatory_task_field(
+    monkeypatch, tmp_path
+):
+    """A mandatory task field cannot defeat the whole-response ceiling."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-title-bound"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="标题🙂é" * 40_000,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        first = kb.claim_task(conn, task_id, board=board)
+        assert first is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a bounded answer",
+            kind="needs_input",
+            attempted_resolutions=["checked the documented path"],
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show.encode("utf-8")) < 96_000
+    shown = json.loads(raw_show)
+    assert shown["task"]["title"]["truncated"] is True
+    assert shown["task"]["title"]["original_chars"] == 160_000
+    assert shown["task"]["title"]["original_bytes"] == len(("标题🙂é" * 40_000).encode("utf-8"))
+
+
+def test_resolver_show_public_create_bounds_tenant_without_changing_modes(
+    monkeypatch, tmp_path,
+):
+    """Resolver show must retain task state when public create stores a huge tenant."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "resolver-show-tenant-bound"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("product_workflow", {})[
+        "human_escalation_profile"
+    ] = "resolver"
+    kb.board_metadata_path(board).write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    oversized_tenant = "T" * 200_000
+    created = json.loads(kt._handle_create({
+        "title": "public tenant-bound task",
+        "assignee": "developer",
+        "tenant": oversized_tenant,
+        "workspace_kind": "scratch",
+        "workflow_template_id": "product",
+        "current_step_key": "development",
+        "board": board,
+    }))
+    assert created["ok"] is True, created
+    task_id = created["task_id"]
+
+    normal_tenant = "tenant-normal"
+    normal_created = json.loads(kt._handle_create({
+        "title": "public normal tenant task",
+        "assignee": "developer",
+        "tenant": normal_tenant,
+        "workspace_kind": "scratch",
+        "workflow_template_id": "product",
+        "current_step_key": "development",
+        "board": board,
+    }))
+    assert normal_created["ok"] is True, normal_created
+    normal_task_id = normal_created["task_id"]
+
+    with kb.connect(board=board) as conn:
+        stored = kb.get_task(conn, task_id)
+        assert stored is not None
+        assert stored.tenant == oversized_tenant
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Need a bounded tenant display",
+            kind="needs_input",
+            attempted_resolutions=["checked the resolver display contract"],
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+        resolver = kb.claim_task(conn, task_id, board=board)
+        assert resolver is not None and resolver.current_run_id is not None
+        preflight = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "human_input_preflight"
+        ][-1]
+        expected = kb.resolver_expected_snapshot(conn, task_id)
+        assert expected is not None
+        assert set(expected) == set(kb._RESOLVER_EXPECTED_KEYS)
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+
+    raw_show = kt._handle_show({})
+    assert len(raw_show.encode("utf-8")) < 100_000
+    shown = json.loads(raw_show)
+    assert "task" in shown, shown
+    assert shown["expected"] == expected
+    assert shown["unresolved_preflight"]["event_id"] == preflight.id
+    assert shown["unresolved_preflight"]["payload"] == preflight.payload
+    assert shown["task"]["status"] == expected["status"]
+    for task_field, expected_field in (
+        ("assignee", "assignee"),
+        ("status", "status"),
+        ("project_id", "project_id"),
+        ("workflow_template_id", "workflow_template_id"),
+        ("workspace_kind", "workspace_kind"),
+        ("workspace_path", "workspace_path"),
+        ("branch_name", "branch_name"),
+        ("current_run_id", "run_id"),
+        ("current_step_key", "phase"),
+        ("running", "running"),
+        ("blocked", "blocked"),
+    ):
+        assert shown["task"][task_field] == expected[expected_field]
+    tenant_view = shown["task"]["tenant"]
+    assert tenant_view["truncated"] is True
+    assert tenant_view["original_chars"] == len(oversized_tenant)
+    assert tenant_view["original_bytes"] == len(oversized_tenant.encode("utf-8"))
+    assert isinstance(tenant_view["preview"], str)
+
+    resolved = json.loads(kt._handle_resolve({
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The bounded tenant display preserves Resolver state.",
+        "reason": "Resume with the exact Resolver snapshot.",
+        "expected": expected,
+    }))
+    assert resolved["ok"] is True, resolved
+    stale = json.loads(kt._handle_resolve({
+        "task_id": task_id,
+        "board": board,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The bounded tenant display preserves Resolver state.",
+        "reason": "Resume with the exact Resolver snapshot.",
+        "expected": expected,
+    }))
+    assert "kanban_resolve conflict" in stale["error"]
+
+    # Resolver-view bounding is mode-dependent: ordinary show keeps the
+    # existing raw task value, while a normal bounded field stays exact.
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    ordinary = json.loads(kt._handle_show({}))
+    assert ordinary["task"]["tenant"] == oversized_tenant
+
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", normal_task_id)
+    normal = json.loads(kt._handle_show({}))
+    assert normal["task"]["tenant"] == normal_tenant
 
 
 def test_resolver_tool_resumes_release_preflight(

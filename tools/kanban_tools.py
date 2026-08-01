@@ -57,6 +57,207 @@ REVIEW_TARGET_MAX_LINE_CHARS = 4_000
 REVIEW_TARGET_FILE_LIST_LIMIT = 200
 _FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# Resolver-facing `kanban_show` is consumed inside a model context, so its
+# safety limit applies to the complete serialized JSON document, not to any
+# individual field or row. Keep this below the external 100 KB result limit.
+KANBAN_SHOW_MAX_BYTES = 96_000
+
+
+def _show_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _show_text_envelope(
+    text: str,
+    budget: int,
+    *,
+    original_chars: Optional[int] = None,
+    original_bytes: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return a byte-bounded, explicit summary for one oversized value."""
+    original_chars = len(text) if original_chars is None else original_chars
+    original_bytes = (
+        len(text.encode("utf-8")) if original_bytes is None else original_bytes
+    )
+    envelope: dict[str, Any] = {
+        "truncated": True,
+        "original_chars": original_chars,
+        "original_bytes": original_bytes,
+        "preview": "",
+    }
+    if budget <= 0 or _show_json_bytes(envelope) > budget:
+        return envelope
+
+    low, high = 0, len(text)
+    best = envelope
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = dict(envelope)
+        candidate["preview"] = text[:middle]
+        if _show_json_bytes(candidate) <= budget:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _show_bounded_value(value: Any, budget: int) -> Any:
+    """Keep small JSON values exact and summarize oversized values."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) <= budget:
+            return value
+        return _show_text_envelope(value, budget)
+    try:
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, default=str
+        )
+    except Exception:
+        encoded = str(value)
+    encoded_bytes = len(encoded.encode("utf-8"))
+    if encoded_bytes <= budget:
+        return value
+    return _show_text_envelope(
+        encoded,
+        budget,
+        original_chars=len(encoded),
+        original_bytes=encoded_bytes,
+    )
+
+
+def _show_bounded_mapping(
+    value: dict[str, Any],
+    budget: int,
+    *,
+    preserve_keys: tuple[str, ...] = (),
+    nested_preserve: Optional[dict[str, tuple[str, ...]]] = None,
+) -> dict[str, Any]:
+    """Bound a mapping while retaining selected small control fields."""
+    if _show_json_bytes(value) <= budget:
+        return value
+    nested_preserve = nested_preserve or {}
+    ordered_keys = list(preserve_keys) + [
+        key for key in value if key not in preserve_keys
+    ]
+    result: dict[str, Any] = {}
+    pending: list[str] = []
+    omitted: list[str] = []
+
+    def _bounded_child(key: str, child: Any, child_budget: int) -> Any:
+        if isinstance(child, dict) and key in nested_preserve:
+            return _show_bounded_mapping(
+                child,
+                child_budget,
+                preserve_keys=nested_preserve[key],
+            )
+        return _show_bounded_value(child, child_budget)
+
+    def _reserved_child_bytes(key: str, child: Any) -> int:
+        """Estimate the minimum useful representation for a later field."""
+        try:
+            if _show_json_bytes(child) <= 2_048:
+                reserved = child
+            else:
+                reserve_budget = min(
+                    1_024,
+                    max(256, budget // max(2, len(value) * 2)),
+                )
+                reserved = _bounded_child(key, child, reserve_budget)
+            return _show_json_bytes({key: reserved})
+        except Exception:
+            # The actual child is still bounded and checked below; this only
+            # keeps an unusual value from consuming the entire parent budget.
+            return 128
+
+    # Keep normal-sized values exact whenever the mapping budget allows it.
+    # Oversized values are deferred so their previews cannot crowd out later
+    # control fields that would otherwise fit exactly.
+    for key in ordered_keys:
+        if key not in value:
+            continue
+        candidate = dict(result)
+        candidate[key] = value[key]
+        if _show_json_bytes(candidate) <= budget:
+            result[key] = value[key]
+        else:
+            pending.append(key)
+
+    for index, key in enumerate(pending):
+        child = value[key]
+        current_bytes = _show_json_bytes(result)
+        reserved_for_later = sum(
+            _reserved_child_bytes(later_key, value[later_key])
+            for later_key in pending[index + 1:]
+        )
+        key_bytes = len(json.dumps(key, ensure_ascii=False).encode("utf-8"))
+        separator_bytes = 4 if result else 2
+        child_budget = max(
+            0,
+            budget
+            - current_bytes
+            - reserved_for_later
+            - key_bytes
+            - separator_bytes,
+        )
+        bounded = _bounded_child(key, child, child_budget)
+        candidate = dict(result)
+        candidate[key] = bounded
+        if _show_json_bytes(candidate) <= budget:
+            result[key] = bounded
+            continue
+
+        # Estimates are deliberately conservative. If they left too little
+        # room, retry with all currently available bytes before omitting this
+        # optional field.
+        available = max(
+            0,
+            budget - current_bytes - key_bytes - separator_bytes,
+        )
+        bounded = _bounded_child(key, child, available)
+        candidate[key] = bounded
+        if _show_json_bytes(candidate) <= budget:
+            result[key] = bounded
+        else:
+            omitted.append(key)
+
+    if omitted:
+        marker = {
+            "truncated": True,
+            "omitted_count": len(omitted),
+            "omitted_fields": omitted,
+        }
+        candidate = dict(result)
+        candidate["_truncation"] = marker
+        if _show_json_bytes(candidate) <= budget:
+            result = candidate
+    return result
+
+
+def _show_bounded_preflight(payload: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Preserve Resolver control fields while summarizing legacy evidence."""
+    return _show_bounded_mapping(
+        payload,
+        budget,
+        preserve_keys=(
+            "kind",
+            "original_assignee",
+            "hermes_assignee",
+            "step_key",
+            "resume_status",
+            "memory_capture_id",
+            "reason",
+            "attempted_resolutions",
+            "metadata",
+        ),
+        nested_preserve={"metadata": ("attempt_index",)},
+    )
+
+
+def _show_serialized(response: dict[str, Any]) -> str:
+    return json.dumps(response, ensure_ascii=False)
+
 
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
@@ -324,12 +525,20 @@ def _product_role_assignees_from_config() -> dict[str, str]:
     return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
 
 
-def _product_human_escalation_profile(board: Optional[str] = None) -> str:
-    """Prefer the active product board's routing policy over local config."""
+def _product_human_escalation_profile(
+    board: Optional[str] = None,
+    *,
+    conn=None,
+) -> str:
+    """Prefer the connected product board's policy over local config."""
     try:
         from hermes_cli import kanban_db as kb
 
-        active_board = board or os.environ.get("HERMES_KANBAN_BOARD")
+        active_board = board
+        if active_board is None and conn is not None:
+            active_board = kb._board_slug_for_connection(conn)
+        if active_board is None:
+            active_board = os.environ.get("HERMES_KANBAN_BOARD")
         meta = kb.product_board_metadata(active_board)
         workflow = meta.get("product_workflow") if isinstance(meta, dict) else None
         if isinstance(workflow, dict):
@@ -807,8 +1016,7 @@ def _handle_review_target(args: dict, **kw) -> str:
 
 
 def _handle_show(args: dict, **kw) -> str:
-    """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    """Read a task's state, with a bounded view for task-scoped Resolver calls."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -828,21 +1036,37 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
             epic_id = kb.epic_id_for_task(conn, tid)
             epic = kb.get_task(conn, epic_id) if epic_id else None
+            resolver_view = (
+                os.environ.get("HERMES_PROFILE") == "resolver"
+                and os.environ.get("HERMES_KANBAN_TASK") == tid
+            )
 
-            def _task_dict(t):
+            def _bounded_text(value, limit):
+                return _show_bounded_value("" if value is None else str(value), limit)
+
+            def _bounded_value(value, limit):
+                return _show_bounded_value(value, limit)
+
+            def _task_dict(t, *, field_budget: Optional[int] = None):
+                def _field(value):
+                    return value if field_budget is None else _show_bounded_value(
+                        value, field_budget
+                    )
+
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
+                    "id": t.id, "title": _field(t.title),
+                    "body": _field(t.body),
                     "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
+                    "tenant": _field(t.tenant), "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
-                    "created_by": t.created_by, "created_at": t.created_at,
+                    "created_by": _field(t.created_by), "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
-                    "result": t.result,
+                    "result": _field(t.result),
                     "current_run_id": t.current_run_id,
-                    "model_override": t.model_override,
-                    "provider_override": t.provider_override,
+                    "model_override": _field(t.model_override),
+                    "provider_override": _field(t.provider_override),
                     "project_id": t.project_id,
                     "branch_name": t.branch_name,
                     "workflow_template_id": t.workflow_template_id,
@@ -852,53 +1076,265 @@ def _handle_show(args: dict, **kw) -> str:
                     "work_item_kind": t.work_item_kind,
                 }
 
-            def _run_dict(r):
+            def _run_dict(
+                r,
+                *,
+                text_budget: Optional[int] = None,
+                value_budget: Optional[int] = None,
+            ):
+                def _text(value):
+                    return value if text_budget is None else _show_bounded_value(
+                        value, text_budget
+                    )
+
+                def _value(value):
+                    return value if value_budget is None else _show_bounded_value(
+                        value, value_budget
+                    )
+
                 return {
                     "id": r.id, "profile": r.profile,
                     "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
+                    "summary": _text(r.summary),
+                    "error": _text(r.error),
+                    "metadata": _value(r.metadata),
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            response = {
-                "task": _task_dict(task),
-                "work_contract": kb.work_contract_view(
-                    conn, task.work_contract_id
-                ),
-                "epic": (
-                    {
-                        "id": epic_id,
-                        "title": epic.title if epic is not None else epic_id,
+            contract = kb.work_contract_view(conn, task.work_contract_id)
+            if resolver_view:
+                preflight = kb._latest_unresolved_product_preflight(conn, tid)
+                expected = kb.resolver_expected_snapshot(conn, tid)
+
+                def _build_resolver_response(
+                    *,
+                    comment_limit: int,
+                    event_limit: int,
+                    run_limit: int,
+                    text_budget: int,
+                    value_budget: int,
+                    field_budget: int,
+                    contract_field_budget: int,
+                    preflight_budget: int,
+                    relation_budget: int,
+                ) -> dict[str, Any]:
+                    bounded_contract = (
+                        {
+                            key: _show_bounded_value(value, contract_field_budget)
+                            for key, value in contract.items()
+                        }
+                        if isinstance(contract, dict)
+                        else _show_bounded_value(contract, contract_field_budget)
+                    )
+                    shown_comments = comments[-comment_limit:] if comment_limit else []
+                    shown_events = events[-event_limit:] if event_limit else []
+                    shown_runs = runs[-run_limit:] if run_limit else []
+                    preflight_payload = (
+                        preflight[1]
+                        if preflight is not None and isinstance(preflight[1], dict)
+                        else {}
+                    )
+                    bounded_preflight = (
+                        {
+                            "event_id": preflight[0],
+                            "payload": _show_bounded_preflight(
+                                preflight_payload, preflight_budget
+                            ),
+                        }
+                        if preflight is not None
+                        else None
+                    )
+                    response = {
+                        "task": _task_dict(task, field_budget=field_budget),
+                        "work_contract": bounded_contract,
+                        "epic": (
+                            {
+                                "id": epic_id,
+                                "title": _show_bounded_value(
+                                    epic.title if epic is not None else epic_id,
+                                    field_budget,
+                                ),
+                            }
+                            if epic_id
+                            else None
+                        ),
+                        "dependencies": _show_bounded_value(
+                            parents, relation_budget
+                        ),
+                        "dependents": _show_bounded_value(
+                            children, relation_budget
+                        ),
+                        "parents": _show_bounded_value(parents, relation_budget),
+                        "children": _show_bounded_value(children, relation_budget),
+                        "comments": [
+                            {
+                                "author": _show_bounded_value(c.author, text_budget),
+                                "body": _show_bounded_value(c.body, text_budget),
+                                "created_at": c.created_at,
+                            }
+                            for c in shown_comments
+                        ],
+                        "comments_omitted": max(
+                            0, len(comments) - len(shown_comments)
+                        ),
+                        "comments_total": len(comments),
+                        "events": [
+                            {
+                                "id": e.id,
+                                "kind": _show_bounded_value(e.kind, text_budget),
+                                "payload": _show_bounded_value(
+                                    e.payload, value_budget
+                                ),
+                                "created_at": e.created_at,
+                                "run_id": e.run_id,
+                            }
+                            for e in shown_events
+                        ],
+                        "events_omitted": max(
+                            0, len(events) - len(shown_events)
+                        ),
+                        "events_total": len(events),
+                        "runs": [
+                            _run_dict(
+                                r,
+                                text_budget=text_budget,
+                                value_budget=value_budget,
+                            )
+                            for r in shown_runs
+                        ],
+                        "runs_omitted": max(0, len(runs) - len(shown_runs)),
+                        "runs_total": len(runs),
+                        "unresolved_preflight": bounded_preflight,
+                        # This object is the Resolver's exact CAS contract;
+                        # never pass it through a text or byte bound.
+                        "expected": expected,
+                        "worker_context": (
+                            "Resolver view is bounded; use work_contract, comments, "
+                            "runs, events, unresolved_preflight, and expected."
+                        ),
                     }
-                    if epic_id
-                    else None
-                ),
-                "dependencies": parents,
-                "dependents": children,
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"id": e.id, "kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            }
-            if task.work_item_kind == "epic":
+                    if task.work_item_kind == "epic":
+                        response["members"] = _show_bounded_value(
+                            kb.list_epic_members(conn, tid), relation_budget
+                        )
+                        response["progress"] = _show_bounded_value(
+                            kb.epic_progress(conn, tid), relation_budget
+                        )
+                    response["history_truncated"] = bool(
+                        response["comments_omitted"]
+                        or response["events_omitted"]
+                        or response["runs_omitted"]
+                    )
+                    return response
+
+                limits = {
+                    "comment_limit": min(10, len(comments)),
+                    "event_limit": min(12, len(events)),
+                    "run_limit": min(6, len(runs)),
+                    "text_budget": 4_096,
+                    "value_budget": 2_048,
+                    "field_budget": 4_096,
+                    "contract_field_budget": 2_048,
+                    "preflight_budget": 12_288,
+                    "relation_budget": 16_384,
+                }
+                response = None
+                for _ in range(48):
+                    candidate = _build_resolver_response(**limits)
+                    if _show_json_bytes(candidate) < KANBAN_SHOW_MAX_BYTES:
+                        response = candidate
+                        break
+                    # Drop optional history first, halving each recent slice
+                    # so the response converges quickly without a fixed row
+                    # count pretending to be a whole-response guarantee.
+                    if limits["comment_limit"]:
+                        limits["comment_limit"] //= 2
+                        continue
+                    if limits["event_limit"]:
+                        limits["event_limit"] //= 2
+                        continue
+                    if limits["run_limit"]:
+                        limits["run_limit"] //= 2
+                        continue
+                    if limits["text_budget"] > 256:
+                        limits["text_budget"] //= 2
+                        continue
+                    if limits["value_budget"] > 256:
+                        limits["value_budget"] //= 2
+                        continue
+                    if limits["field_budget"] > 256:
+                        limits["field_budget"] //= 2
+                        continue
+                    if limits["contract_field_budget"] > 256:
+                        limits["contract_field_budget"] //= 2
+                        continue
+                    if limits["preflight_budget"] > 2_048:
+                        limits["preflight_budget"] //= 2
+                        continue
+                    if limits["relation_budget"] > 512:
+                        limits["relation_budget"] //= 2
+                        continue
+                    # All optional material is already at its minimum. This
+                    # final response retains the exact snapshot and the
+                    # resolver control scaffold while leaving no history rows.
+                    limits.update({
+                        "comment_limit": 0,
+                        "event_limit": 0,
+                        "run_limit": 0,
+                        "text_budget": 128,
+                        "value_budget": 128,
+                        "field_budget": 128,
+                        "contract_field_budget": 128,
+                        "preflight_budget": 1_024,
+                        "relation_budget": 256,
+                    })
+                # A normal SQLite task row cannot make the exact snapshot this
+                # small response exceed the ceiling. Keep the final guard so
+                # a future schema expansion fails closed instead of returning
+                # an unbounded tool result.
+                if response is None:
+                    response = _build_resolver_response(**limits)
+                if _show_json_bytes(response) >= KANBAN_SHOW_MAX_BYTES:
+                    return tool_error(
+                        "kanban_show: Resolver response cannot fit the safety ceiling"
+                    )
+            else:
+                response = {
+                    "task": _task_dict(task),
+                    "work_contract": contract,
+                    "epic": (
+                        {
+                            "id": epic_id,
+                            "title": epic.title if epic is not None else epic_id,
+                        }
+                        if epic_id
+                        else None
+                    ),
+                    "dependencies": parents,
+                    "dependents": children,
+                    "parents": parents,
+                    "children": children,
+                    "comments": [
+                        {"author": c.author, "body": c.body,
+                         "created_at": c.created_at}
+                        for c in comments
+                    ],
+                    "events": [
+                        {"id": e.id, "kind": e.kind, "payload": e.payload,
+                         "created_at": e.created_at, "run_id": e.run_id}
+                        for e in events[-50:]   # cap; full log via CLI
+                    ],
+                    "runs": [_run_dict(r) for r in runs],
+                    # Also surface the worker's own context block so the
+                    # agent can include it directly if it wants. This is
+                    # the same string build_worker_context returns to the
+                    # dispatcher at spawn time.
+                    "worker_context": kb.build_worker_context(conn, tid),
+                }
+            if task.work_item_kind == "epic" and not resolver_view:
                 response["members"] = kb.list_epic_members(conn, tid)
                 response["progress"] = kb.epic_progress(conn, tid)
-            return json.dumps(response)
+            return _show_serialized(response)
         finally:
             conn.close()
     except ValueError as e:
@@ -1698,7 +2134,9 @@ def _handle_block(args: dict, **kw) -> str:
                 metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
                 board=board,
-                human_escalation_assignee=_product_human_escalation_profile(board),
+                human_escalation_assignee=_product_human_escalation_profile(
+                    board, conn=conn
+                ),
             )
             if not ok:
                 return tool_error(

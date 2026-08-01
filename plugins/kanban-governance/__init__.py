@@ -773,6 +773,26 @@ def _command_policy(argv: list[str]) -> Optional[_CommandPolicy]:
     return _COMMAND_POLICIES.get(executable)
 
 
+def _unrecognized_executable_diagnostic(command: str) -> Optional[str]:
+    for argv in shell_command_argvs(command):
+        if not argv:
+            continue
+        raw_executable = argv[0]
+        if "/" in raw_executable or "\\" in raw_executable:
+            continue
+        executable = os.path.basename(raw_executable).lower()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]*", raw_executable):
+            continue
+        if executable not in _COMMAND_POLICIES:
+            return (
+                f"unrecognized executable basename {raw_executable!r}; "
+                "target verification remains blocked; use an allowlisted "
+                "verification command such as `python3 -m unittest`; "
+                "executable paths remain blocked"
+            )
+    return None
+
+
 def _policy_executable_is_trusted(argv: list[str], workspace: Path) -> bool:
     raw_executable = argv[0]
     if "/" in raw_executable or "\\" in raw_executable:
@@ -961,6 +981,11 @@ def _validate_worker(
     ambiguous_targets: bool,
 ) -> Optional[dict[str, str]]:
     if ambiguous_targets:
+        diagnostic = _unrecognized_executable_diagnostic(
+            str(args.get("command") or "")
+        )
+        if diagnostic:
+            return _block(diagnostic)
         return _block("worker mutation targets could not be verified")
     try:
         task = _load_worker_task(task_id)

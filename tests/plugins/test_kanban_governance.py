@@ -1491,3 +1491,40 @@ def test_one_shot_override_record_is_exact_and_consumed_once(governed_workspace)
     changed = dict(args, content="different")
     with pytest.raises(ValueError, match="operation hash"):
         mod._consume_approved_override("write_file", changed, record, actor="human:test")
+
+
+def test_worker_bare_python_gets_precise_allowlist_diagnostic(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    bare_python = mod._on_pre_tool_call(
+        "terminal",
+        {"command": "python -m unittest", "workdir": str(repo)},
+    )
+    assert bare_python["action"] == "block"
+    assert "unrecognized executable basename 'python'" in bare_python["message"]
+    assert "python3 -m unittest" in bare_python["message"]
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {"command": "python3 -m unittest", "workdir": str(repo)},
+    ) is None
+
+    path_python = mod._on_pre_tool_call(
+        "terminal",
+        {"command": "./python3 -m unittest", "workdir": str(repo)},
+    )
+    assert path_python["action"] == "block"
+    assert "unrecognized executable basename" not in path_python["message"]
+
+    unsupported_shape = mod._on_pre_tool_call(
+        "terminal",
+        {"command": "python3 -c 'pass'", "workdir": str(repo)},
+    )
+    assert unsupported_shape["action"] == "block"
+    assert "unrecognized executable basename" not in unsupported_shape["message"]
+    assert mod._command_policy(["python"]) is None
+    assert mod._command_policy(["python3"]) is not None
