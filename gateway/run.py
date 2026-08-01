@@ -18553,9 +18553,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not synth_text:
                         continue
                     try:
-                        await self._inject_watch_notification(synth_text, evt)
+                        delivered = await self._inject_watch_notification(
+                            synth_text, evt,
+                        )
+                        if delivered is False:
+                            # Retryable adapter failure — requeue the event
+                            # so it gets retried on the next poll. Mirrors
+                            # _async_delegation_watcher behavior.
+                            _pr.completion_queue.put(evt)
+                        elif delivered is None:
+                            # Terminal routing failure — drop the event.
+                            logger.warning(
+                                "Idle watch-pattern notification dropped "
+                                "(no route): %s",
+                                evt.get("session_id", "unknown"),
+                            )
                     except Exception as e:
-                        logger.error("Idle watch-pattern notification injection error: %s", e)
+                        # Requeue on unexpected error
+                        _pr.completion_queue.put(evt)
+                        logger.error(
+                            "Idle watch-pattern notification injection "
+                            "error: %s", e,
+                        )
             except Exception as e:
                 logger.debug("Watch-pattern idle watcher error: %s", e)
             await asyncio.sleep(interval)
