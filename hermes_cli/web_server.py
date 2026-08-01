@@ -3466,6 +3466,8 @@ async def get_learning_inbox(profile: Optional[str] = None):
 
         with _profile_scope(profile):
             return inbox_payload()
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("GET /api/learning/inbox failed")
         raise HTTPException(status_code=500, detail="Failed to load learning inbox")
@@ -3479,6 +3481,8 @@ async def get_learning_inbox_item(kind: str, item_id: str, profile: Optional[str
 
         with _profile_scope(profile):
             item = get_item(kind, item_id)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
@@ -3501,6 +3505,8 @@ async def resolve_learning_inbox_item(
 
         with _profile_scope(profile):
             result = approve(kind, item_id) if action == "approve" else dismiss(kind, item_id)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:

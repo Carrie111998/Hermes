@@ -1,6 +1,7 @@
+import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type * as React from 'react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 
 import { PageLoader } from '@/components/page-loader'
@@ -17,6 +18,7 @@ import { useI18n } from '@/i18n'
 import { Brain, Check, Clock, RefreshCw, X, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import type { LearningInboxDetail, LearningInboxItem, LearningInboxKind } from '@/types/hermes'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
@@ -71,12 +73,14 @@ export function LearningInboxView({ className, ...props }: LearningInboxViewProp
   const copy = t.learningInbox
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const profileKey = normalizeProfileKey(useStore($activeGatewayProfile))
+  const inboxQueryKey = useMemo(() => ['learning-inbox', profileKey] as const, [profileKey])
   const [selectedId, setSelectedId] = useState<null | string>(null)
   const [busyId, setBusyId] = useState<null | string>(null)
   const [enablingApprovals, setEnablingApprovals] = useState(false)
 
   const inboxQuery = useQuery({
-    queryKey: ['learning-inbox'],
+    queryKey: inboxQueryKey,
     queryFn: getLearningInbox,
     staleTime: 0
   })
@@ -85,11 +89,15 @@ export function LearningInboxView({ className, ...props }: LearningInboxViewProp
   const selectedItem = itemFromId(items, selectedId)
 
   const detailQuery = useQuery({
-    queryKey: ['learning-inbox-item', selectedId],
+    queryKey: ['learning-inbox-item', profileKey, selectedId],
     queryFn: () => getLearningInboxItem(selectedId as string),
     enabled: selectedId !== null,
     staleTime: 0
   })
+
+  useEffect(() => {
+    setSelectedId(null)
+  }, [profileKey])
 
   useEffect(() => {
     if (items.length === 0) {
@@ -120,8 +128,8 @@ export function LearningInboxView({ className, ...props }: LearningInboxViewProp
           throw new Error(result.error || copy.actionFailed)
         }
 
-        await queryClient.invalidateQueries({ queryKey: ['learning-inbox'] })
-        await queryClient.invalidateQueries({ queryKey: ['learning-inbox-item', item.id] })
+        await queryClient.invalidateQueries({ queryKey: inboxQueryKey })
+        await queryClient.invalidateQueries({ queryKey: ['learning-inbox-item', profileKey, item.id] })
         setSelectedId(null)
         notify({
           kind: 'success',
@@ -134,7 +142,7 @@ export function LearningInboxView({ className, ...props }: LearningInboxViewProp
         setBusyId(null)
       }
     },
-    [copy, queryClient]
+    [copy, inboxQueryKey, profileKey, queryClient]
   )
 
   const enableApprovals = useCallback(async () => {
@@ -155,14 +163,14 @@ export function LearningInboxView({ className, ...props }: LearningInboxViewProp
         throw new Error(copy.actionFailed)
       }
 
-      await queryClient.invalidateQueries({ queryKey: ['learning-inbox'] })
+      await queryClient.invalidateQueries({ queryKey: inboxQueryKey })
       notify({ kind: 'success', title: copy.approvalsEnabled, message: copy.approvalHint })
     } catch (error) {
       notifyError(error, copy.actionFailed)
     } finally {
       setEnablingApprovals(false)
     }
-  }, [copy, queryClient])
+  }, [copy, inboxQueryKey, queryClient])
 
   if (inboxQuery.isLoading) {
     return <PageLoader label={copy.loading} />

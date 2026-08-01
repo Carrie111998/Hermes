@@ -59,3 +59,11 @@ def test_learning_inbox_route_rejects_invalid_action_and_reference():
 
     invalid_reference = client.get("/api/learning/inbox/memory/../secrets")
     assert invalid_reference.status_code in {400, 404}
+
+
+def test_learning_inbox_route_preserves_invalid_profile_status():
+    client = _client()
+
+    response = client.get("/api/learning/inbox?profile=missing-profile")
+
+    assert response.status_code in {400, 404}

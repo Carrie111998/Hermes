@@ -97,7 +97,8 @@ def use_suggestions_store(home: Union[str, Path]):
 
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).
-_suggestions_lock = threading.Lock()
+_suggestions_lock = threading.RLock()
+_SUGGESTION_JOB_MARKER = "_learning_suggestion_id"
 
 # Cap pending suggestions so the list never becomes a nag wall. When full,
 # new suggestions are dropped (the user should clear the backlog first).
@@ -277,19 +278,54 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     an ``origin`` (platform/chat) is merged so "origin" delivery routes back to
     the chat where the user accepted.
     """
-    s = get_suggestion(ref)
-    if not s or s.get("status") != _STATUS_PENDING:
-        return None
+    with _suggestions_lock:
+        s = get_suggestion(ref)
+        if not s or s.get("status") != _STATUS_PENDING:
+            return None
 
-    from cron.jobs import create_job
+        from cron.jobs import _jobs_lock, create_job, load_jobs
 
-    spec = dict(s.get("job_spec") or {})
-    if origin is not None and "origin" not in spec:
-        spec["origin"] = origin
+        spec = dict(s.get("job_spec") or {})
+        if origin is not None and "origin" not in spec:
+            spec["origin"] = origin
 
-    job = create_job(**spec)
-    _set_status(s["id"], _STATUS_ACCEPTED)
-    return job
+        # Keep approval replay idempotent across a crash after cron job
+        # creation but before the suggestion status is persisted. The marker is
+        # nested in origin so it is retained with the existing job record while
+        # remaining invisible to delivery routing.
+        job_origin = spec.get("origin")
+        if isinstance(job_origin, dict):
+            marked_origin = dict(job_origin)
+            marked_origin[_SUGGESTION_JOB_MARKER] = s["id"]
+            spec["origin"] = marked_origin
+        else:
+            # Adding a marker-only origin would change create_job's implicit
+            # delivery default from local to origin, so preserve that default
+            # explicitly before attaching the durable marker.
+            if "deliver" not in spec:
+                spec["deliver"] = "local"
+            spec["origin"] = {_SUGGESTION_JOB_MARKER: s["id"]}
+
+        with _jobs_lock():
+            jobs = load_jobs()
+            job = next(
+                (
+                    candidate
+                    for candidate in jobs
+                    if isinstance(candidate.get("origin"), dict)
+                    and candidate["origin"].get(_SUGGESTION_JOB_MARKER) == s["id"]
+                ),
+                None,
+            )
+            if job is None:
+                job = create_job(**spec)
+
+        if not _set_status(s["id"], _STATUS_ACCEPTED):
+            raise RuntimeError(
+                "Cron job exists, but the learning suggestion could not be marked accepted; "
+                "retrying this approval is safe."
+            )
+        return job
 
 
 def clear_resolved() -> int:

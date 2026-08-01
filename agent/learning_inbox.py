@@ -13,6 +13,7 @@ the same replay and deduplication paths as the CLI and gateway commands.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -21,6 +22,7 @@ from tools import write_approval as wa
 
 MAX_PREVIEW_CHARS = 4_000
 _VALID_WRITE_KINDS = frozenset({"memory", "skill"})
+_resolution_lock = threading.Lock()
 
 
 def _iso_from_timestamp(value: Any) -> Optional[str]:
@@ -177,29 +179,37 @@ def get_item(kind: str, item_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _apply_write(kind: str, item_id: str) -> Dict[str, Any]:
-    subsystem = wa.MEMORY if kind == "memory" else wa.SKILLS
-    record = wa.get_pending(subsystem, item_id)
-    if not record:
-        return {"ok": False, "error": "Learning candidate not found or already resolved."}
+    with _resolution_lock:
+        subsystem = wa.MEMORY if kind == "memory" else wa.SKILLS
+        record = wa.get_pending(subsystem, item_id)
+        if not record:
+            return {"ok": False, "error": "Learning candidate not found or already resolved."}
 
-    payload_value = record.get("payload")
-    payload: Dict[str, Any] = payload_value if isinstance(payload_value, dict) else {}
-    try:
-        if kind == "memory":
-            from tools.memory_tool import apply_memory_pending, load_on_disk_store
+        payload_value = record.get("payload")
+        payload: Dict[str, Any] = payload_value if isinstance(payload_value, dict) else {}
+        try:
+            if kind == "memory":
+                from tools.memory_tool import apply_memory_pending, load_on_disk_store
 
-            result = apply_memory_pending(payload, load_on_disk_store())
-        else:
-            from tools.skill_manager_tool import apply_skill_pending
+                result = apply_memory_pending(payload, load_on_disk_store())
+            else:
+                from tools.skill_manager_tool import apply_skill_pending
 
-            result = json.loads(apply_skill_pending(payload))
-    except Exception as exc:  # pragma: no cover - defensive boundary
-        return {"ok": False, "error": str(exc)}
+                result = json.loads(apply_skill_pending(payload))
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            return {"ok": False, "error": str(exc)}
 
-    if not result.get("success"):
-        return {"ok": False, "error": result.get("error") or "The proposed write failed."}
-    wa.discard_pending(subsystem, item_id)
-    return {"ok": True, "kind": kind, "id": item_id}
+        if not result.get("success"):
+            return {"ok": False, "error": result.get("error") or "The proposed write failed."}
+        if not wa.discard_pending(subsystem, item_id):
+            return {
+                "ok": False,
+                "error": (
+                    "The proposed write was applied, but its pending record could not be "
+                    "cleared. It was not reported as resolved; do not retry automatically."
+                ),
+            }
+        return {"ok": True, "kind": kind, "id": item_id}
 
 
 def approve(kind: str, item_id: str) -> Dict[str, Any]:

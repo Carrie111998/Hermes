@@ -95,6 +95,25 @@ def test_approve_memory_reuses_existing_replay_path(inbox_home):
     assert "prefers evidence-backed work" in store.user_entries
 
 
+def test_approve_write_reports_pending_cleanup_failure(inbox_home, monkeypatch):
+    _, wa, _ = inbox_home
+    record = wa.stage_write(
+        wa.MEMORY,
+        {"action": "add", "target": "memory", "content": "cleanup failures are visible"},
+        summary="cleanup failures are visible",
+        origin="foreground",
+    )
+
+    monkeypatch.setattr(wa, "discard_pending", lambda *_args: False)
+
+    from agent.learning_inbox import approve
+
+    result = approve("memory", record["id"])
+
+    assert result["ok"] is False
+    assert "could not be cleared" in result["error"]
+
+
 def test_approve_automation_reuses_cron_suggestion_acceptance(inbox_home, monkeypatch):
     _, _, suggestions = inbox_home
     record = suggestions.add_suggestion(
