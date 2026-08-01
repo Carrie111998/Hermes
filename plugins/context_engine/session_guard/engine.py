@@ -140,6 +140,9 @@ class SessionGuardEngine(ContextEngine):
         memory_context: str = "",
     ) -> List[Dict[str, Any]]:
         self._ensure_real()
+
+        # 记录压缩前的权威计数，用于检测本次是否真正压缩
+        before_count = self._real.compression_count
         result = self._real.compress(
             messages,
             current_tokens=current_tokens,
@@ -148,12 +151,26 @@ class SessionGuardEngine(ContextEngine):
             memory_context=memory_context,
         )
 
-        # 只对自动压缩计数（手动 /compress 不计数）
-        if not force:
+        # 只在自动压缩且 ContextCompressor 确实完成了一次压缩时计数
+        # （ContextCompressor 在 insufficient messages / no compressible
+        #  window 时会 no-op 返回原样，compression_count 不变）
+        if not force and self._real.compression_count > before_count:
             self._guard_compress_count += 1
             if self._should_inject_reminder():
                 reminder = self._build_reminder()
-                result = list(result) + [reminder]
+                # 角色交替安全：避免 user→user 连续消息
+                # 如果结果最后已是 user 角色，合并提醒到该消息末尾；
+                # 否则安全地追加一条新 user 消息
+                if result and result[-1]["role"] == "user":
+                    merged = dict(result[-1])
+                    merged["content"] = (
+                        result[-1].get("content", "")
+                        + "\n\n"
+                        + reminder["content"]
+                    )
+                    result = list(result[:-1]) + [merged]
+                else:
+                    result = list(result) + [reminder]
 
         return result
 

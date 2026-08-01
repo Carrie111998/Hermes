@@ -32,7 +32,13 @@ def _engine_with_mock_real():
     mock.should_defer_preflight_to_real_usage.return_value = True
     mock.prune_tool_results_only.return_value = ([{"role": "user", "content": "x"}], 3)
     mock.has_content_to_compress.return_value = False
-    mock.compress.return_value = [{"role": "system", "content": "compressed"}]
+
+    # compress() 模拟真正压缩：返回压缩后结果 + 递增计数
+    def _do_compress(*args, **kwargs):
+        mock.compression_count += 1
+        return [{"role": "system", "content": "compressed"}]
+    mock.compress = _do_compress
+
     mock.on_session_start.return_value = None
     mock.on_session_end.return_value = None
     e._real = mock
@@ -145,6 +151,74 @@ def test_force_reminder_at_3():
 
     assert e._guard_compress_count == 3
     assert len(result) == 2
+    assert "会话守卫强制提醒" in result[-1]["content"]
+
+
+def test_compress_noop_does_not_count():
+    """ContextCompressor no-op 返回时（消息太少/无可压缩窗口），守卫不计数。"""
+    e, mock = _engine_with_mock_real()
+    # 重设 mock.compress 为 no-op（不递增 compression_count）
+    mock.compression_count = 5
+    mock.compress = MagicMock(return_value=[{"role": "user", "content": "same"}])
+
+    e._guard_compress_count = 1
+    result = e.compress(
+        [{"role": "user", "content": "short"}],
+        force=False,
+    )
+
+    # compression_count 没变 → 守卫不计数
+    assert e._guard_compress_count == 1
+    # 消息未变
+    assert len(result) == 1
+
+
+def test_compress_user_ended_safely_merges():
+    """compressed 结果以 user 结尾时，提醒合并到消息末而非新建 user（防交替违规）。"""
+    e, mock = _engine_with_mock_real()
+    e._guard_compress_count = 2  # 第 3 次触发
+    # compress 返回以 user 结尾的结果
+    mock.compress = MagicMock()
+    mock.compress.side_effect = None
+    mock.compress.return_value = None
+    # 需要每次调用递增计数
+    mock.compression_count = 0
+
+    def _do_compress(*args, **kwargs):
+        mock.compression_count += 1
+        return [{"role": "system", "content": "summary"}, {"role": "user", "content": "original user"}]
+
+    mock.compress = _do_compress
+
+    result = e.compress(
+        [{"role": "user", "content": "long conversation"}],
+        force=False,
+    )
+
+    assert e._guard_compress_count == 3  # 2 → 3（本次确实压缩了）
+    # 应该只有 2 条消息（system + user），提醒合并到最后一条 user
+    assert len(result) == 2
+    assert result[-1]["role"] == "user"
+    assert "会话守卫强制提醒" in result[-1]["content"]
+    assert "original user" in result[-1]["content"]
+
+
+def test_compress_non_user_ended_appends():
+    """compressed 结果以 system 结尾时，安全追加 user 提醒消息。"""
+    e, mock = _engine_with_mock_real()
+    e._guard_compress_count = 2
+    # compress 以 system 消息结尾
+    mock.compress.side_effect = None
+
+    result = e.compress(
+        [{"role": "user", "content": "long conversation"}],
+        force=False,
+    )
+
+    assert e._guard_compress_count == 3
+    # 原结果 (system) + 新追加 (user)
+    assert len(result) == 2
+    assert result[-1]["role"] == "user"
     assert "会话守卫强制提醒" in result[-1]["content"]
 
 
