@@ -266,19 +266,44 @@ def test_parse_accepts_claude_2_1_216_registration_metadata(tmp_path: Path) -> N
     ]
 
 
-def test_parse_rejects_conflicting_head_entrypoints(tmp_path: Path) -> None:
+def test_parse_preserves_first_entrypoint_when_desktop_mode_changes(
+    tmp_path: Path,
+) -> None:
     first = _message_record("first")
-    first["entrypoint"] = "cli"
+    first["entrypoint"] = "claude-desktop"
     second = _message_record(
         "second",
         event_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     )
-    second["entrypoint"] = "sdk-cli"
+    second["entrypoint"] = "claude-desktop-3p"
     path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
     path.write_bytes(_json_line(first) + _json_line(second))
 
-    with pytest.raises(ValueError, match="entrypoint changed"):
-        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    result = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert result.entrypoint == "claude-desktop"
+
+
+def test_increment_preserves_launch_entrypoint_when_desktop_mode_changes(
+    tmp_path: Path,
+) -> None:
+    first = _message_record("first")
+    first["entrypoint"] = "claude-desktop"
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(first))
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    initial = adapter.parse(path)
+    second = _message_record(
+        "second",
+        event_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+    second["entrypoint"] = "claude-desktop-3p"
+    with path.open("ab") as stream:
+        stream.write(_json_line(second))
+
+    result = adapter.parse(path, initial.cursor)
+
+    assert result.entrypoint == "claude-desktop"
 
 
 def test_parse_prefers_record_session_id_and_extracts_custom_title(tmp_path):

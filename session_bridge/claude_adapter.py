@@ -1060,21 +1060,19 @@ def _entrypoint_from_head(value: bytes) -> str | None:
 
 
 def _entrypoint_from_records(records: Sequence[dict[str, Any]]) -> str | None:
-    values = {
-        value.strip()
-        for record in records
-        if isinstance((value := record.get("entrypoint")), str) and value.strip()
-    }
-    if len(values) > 1:
-        raise ValueError("Claude transcript entrypoint changed")
-    return next(iter(values), None)
+    # Claude Desktop can change execution mode within one native session (for
+    # example, ``claude-desktop`` to ``claude-desktop-3p``).  Entrypoint is
+    # launch provenance, so preserve the first recorded value instead of
+    # turning a legitimate mode transition into a permanently poisoned scan.
+    for record in records:
+        value = record.get("entrypoint")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _merge_entrypoints(*values: str | None) -> str | None:
-    normalized = {value for value in values if value is not None}
-    if len(normalized) > 1:
-        raise ValueError("Claude transcript entrypoint changed")
-    return next(iter(normalized), None)
+    return next((value for value in values if value is not None), None)
 
 
 def _is_eligible_record(record: dict[str, Any]) -> bool:
