@@ -251,14 +251,26 @@ if (USER_DATA_OVERRIDE) {
 }
 
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
-const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACKAGED)
+// A dev-server run is by definition an unpackaged source-tree run, so it must
+// never be treated as packaged (keeps the DevTools CDP port open and routes
+// APP_ROOT below to the source tree).
+const IS_PACKAGED = process.env.HERMES_DESKTOP_DEV_SERVER
+  ? false
+  : app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACKAGED)
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
-const APP_ROOT = app.getAppPath()
+
+// APP_ROOT resolution: in dev mode the ESM bundle lives in dist/ and
+// `app.getAppPath()` can point at the dist directory itself, so resolve the
+// source-tree root explicitly (parent of dist/). Packaged and unpackaged prod
+// keep the canonical Electron answer via app.getAppPath().
+const APP_ROOT = process.env.HERMES_DESKTOP_DEV_SERVER
+  ? path.resolve(__dirname, '..')
+  : app.getAppPath()
 
 // Preload must be plain JS — Electron's sandbox can't run .ts, and tsx's
 // ESM loader is broken on Electron 40's Node (ERR_INVALID_RETURN_PROPERTY_VALUE).

@@ -43,7 +43,7 @@ await build({
   outfile: mainOut,
   external,
   banner: {
-    js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);",
+    js: "import { createRequire as __hermesCreateRequire } from 'module'; import { fileURLToPath as __hermesFileURLToPath } from 'node:url'; import { dirname as __hermesDirname } from 'node:path'; const require = __hermesCreateRequire(import.meta.url); const __filename = __hermesFileURLToPath(import.meta.url); const __dirname = __hermesDirname(__filename);",
   },
   define,
   logLevel: 'info',
