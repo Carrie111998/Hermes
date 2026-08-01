@@ -143,13 +143,20 @@ def _compute_skills_breakdown(skills_block: str) -> List[Dict[str, Any]]:
     ) -> None:
         path = name_to_path.get(name)
         md_bytes: Optional[int] = None
+        folder_slug = ""
         if path is not None:
             try:
                 md_bytes = path.stat().st_size
             except OSError:
                 md_bytes = None
+            folder_slug = path.parent.name
+        # ``name`` is the index/declared name. Expose folder_slug separately so
+        # audits can distinguish folder ``audiocraft`` from declared
+        # ``audiocraft-audio-generation`` without breaking older consumers.
         entries.append({
             "name": name,
+            "declared_name": name,
+            "folder_slug": folder_slug,
             "index_line_bytes": attributed_bytes,
             "index_line_total_bytes": total_bytes,
             "index_line_shared_bytes": shared_bytes,
@@ -348,6 +355,9 @@ def render_breakdown(data: Dict[str, Any]) -> str:
             md = sk["skill_md_bytes"]
             md_str = f"{md:>8,} B" if md is not None else f"{'n/a':>10}"
             name = sk["name"]
+            folder_slug = sk.get("folder_slug") or ""
+            if folder_slug and folder_slug != name:
+                name = f"{name} (folder: {folder_slug})"
             if len(name) > 28:
                 name = name[:27] + "…"
             lines.append(

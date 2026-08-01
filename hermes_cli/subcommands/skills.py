@@ -125,7 +125,14 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     )
 
     skills_check = skills_subparsers.add_parser(
-        "check", help="Check installed hub skills for updates"
+        "check",
+        help="Check hub updates and bundled install/manifest drift",
+        description=(
+            "Check hub-installed skills for upstream updates, report bundled "
+            "skills that are present in source/manifest but missing from the "
+            "local install (with curator/seeding provenance), and warn about "
+            "wrong-case skill.md packages that are never loaded."
+        ),
     )
     skills_check.add_argument(
         "name", nargs="?", help="Specific skill to check (default: all)"

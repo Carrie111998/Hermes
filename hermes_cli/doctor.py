@@ -299,6 +299,49 @@ def collect_deprecated_env_vars(env_map: dict | None) -> list[tuple[str, str]]:
     return findings
 
 
+def report_missing_bundled_skills_check(missing_bundled: list[dict] | None = None) -> str:
+    """Emit doctor severity for bundled source/manifest vs install drift.
+
+    Returns the severity label used: ``ok_match``, ``ok_intentional``, or
+    ``warn_actionable``. When every absence is ``opt_out`` or
+    ``curator_suppressed``, emit healthy/informational output with provenance
+    counts — never a warning. Warn only when at least one absence is
+    unexpected (``manifest_tracked_absent``, ``source_present_never_installed``,
+    ``manifest_orphan_no_source``, or ``unknown``).
+    """
+    from tools.skills_sync import (
+        list_missing_bundled_skills,
+        partition_missing_bundled_skills,
+        provenance_counts,
+    )
+
+    if missing_bundled is None:
+        missing_bundled = list_missing_bundled_skills()
+    if not missing_bundled:
+        check_ok("Bundled skills installed match source/manifest baseline")
+        return "ok_match"
+
+    by_prov = provenance_counts(missing_bundled)
+    prov_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_prov.items()))
+    _intentional, actionable = partition_missing_bundled_skills(missing_bundled)
+    if actionable:
+        check_warn(
+            f"{len(missing_bundled)} bundled skill(s) missing from install",
+            f"({prov_summary}; unexpected={len(actionable)}; see: hermes skills check)",
+        )
+        return "warn_actionable"
+
+    check_ok(
+        "Bundled skill absences are intentional",
+        f"({prov_summary}; see: hermes skills check)",
+    )
+    check_info(
+        f"{len(missing_bundled)} intentional absence(s) "
+        f"(opt_out / curator_suppressed) — no restore needed"
+    )
+    return "ok_intentional"
+
+
 def report_deprecated_config_and_env(
     raw_config: dict | None = None,
     env_map: dict | None = None,
@@ -2578,6 +2621,31 @@ def run_doctor(args):
             check_warn(f"{q_count} skill(s) in quarantine", "(pending review)")
     else:
         check_warn("Skills Hub directory not initialized", "(run: hermes skills list)")
+
+    # Wrong-case skill.md packages are never loaded (case-sensitive SKILL.md).
+    try:
+        from agent.skill_utils import find_wrong_case_skill_md_files
+
+        wrong_case = find_wrong_case_skill_md_files(HERMES_HOME / "skills")
+        if wrong_case:
+            sample = ", ".join(p.parent.name for p in wrong_case[:5])
+            more = f" (+{len(wrong_case) - 5} more)" if len(wrong_case) > 5 else ""
+            check_warn(
+                f"{len(wrong_case)} skill package(s) use wrong-case skill.md",
+                f"(not loaded — rename to SKILL.md: {sample}{more})",
+            )
+        else:
+            check_ok("No wrong-case skill.md packages")
+    except Exception as e:
+        check_warn("Could not scan for wrong-case skill.md", f"({e})")
+
+    # Manifest/source-present but installed-missing bundled skills.
+    # Warn only for unexpected absences; all-intentional (opt_out /
+    # curator_suppressed) is healthy with provenance counts.
+    try:
+        report_missing_bundled_skills_check()
+    except Exception as e:
+        check_warn("Could not check bundled skill install drift", f"({e})")
 
     from hermes_cli.config import get_env_value
 

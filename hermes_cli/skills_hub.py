@@ -1039,29 +1039,98 @@ def do_list(source_filter: str = "all",
         summary += f" — {enabled_count} enabled, {disabled_count} disabled"
     summary += "[/]\n"
     c.print(summary)
+    _warn_wrong_case_skill_md(c)
+
+
+def _warn_wrong_case_skill_md(console: Optional[Console] = None) -> None:
+    """Warn about wrong-case skill.md packages without loading them."""
+    from agent.skill_utils import (
+        find_wrong_case_skill_md_files,
+        format_wrong_case_skill_md_warning,
+    )
+    from hermes_constants import get_skills_dir
+
+    c = console or _console
+    skills_dir = get_skills_dir()
+    wrong = find_wrong_case_skill_md_files(skills_dir)
+    if not wrong:
+        return
+    warning = format_wrong_case_skill_md_warning(wrong, skills_dir=skills_dir)
+    c.print(f"[yellow]{warning}[/]\n")
+
+
+def _report_missing_bundled_skills(
+    console: Optional[Console] = None,
+    *,
+    name: Optional[str] = None,
+) -> int:
+    """Print bundled source/manifest-present but installed-missing diagnostics.
+
+    Returns the number of missing entries reported.
+    """
+    from tools.skills_sync import list_missing_bundled_skills
+
+    c = console or _console
+    missing = list_missing_bundled_skills()
+    if name:
+        missing = [e for e in missing if e["name"] == name]
+    if not missing:
+        return 0
+
+    table = Table(title="Bundled Skills Missing From Install")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Folder", style="dim")
+    table.add_column("Manifest", style="dim")
+    table.add_column("Source", style="dim")
+    table.add_column("Provenance", style="yellow")
+
+    for entry in missing:
+        folder = entry.get("folder_slug") or ""
+        declared = entry.get("name") or ""
+        folder_cell = folder if folder and folder != declared else ""
+        table.add_row(
+            declared,
+            folder_cell,
+            "yes" if entry.get("in_manifest") else "no",
+            "yes" if entry.get("in_source") else "no",
+            str(entry.get("provenance") or ""),
+        )
+
+    c.print(table)
+    from tools.skills_sync import format_missing_bundled_restore_guidance
+
+    c.print(f"[dim]{format_missing_bundled_restore_guidance(missing)}[/]\n")
+    return len(missing)
 
 
 def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> None:
-    """Check hub-installed skills for upstream updates."""
+    """Check hub updates and bundled install/manifest drift diagnostics."""
     from tools.skills_hub import check_for_skill_updates
 
     c = console or _console
     results = check_for_skill_updates(name=name)
     if not results:
         c.print("[dim]No hub-installed skills to check.[/]\n")
-        return
+    else:
+        table = Table(title="Skill Updates")
+        table.add_column("Name", style="bold cyan")
+        table.add_column("Source", style="dim")
+        table.add_column("Status", style="dim")
 
-    table = Table(title="Skill Updates")
-    table.add_column("Name", style="bold cyan")
-    table.add_column("Source", style="dim")
-    table.add_column("Status", style="dim")
+        for entry in results:
+            table.add_row(entry.get("name", ""), entry.get("source", ""), entry.get("status", ""))
 
-    for entry in results:
-        table.add_row(entry.get("name", ""), entry.get("source", ""), entry.get("status", ""))
+        c.print(table)
+        update_count = sum(1 for entry in results if entry.get("status") == "update_available")
+        c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
 
-    c.print(table)
-    update_count = sum(1 for entry in results if entry.get("status") == "update_available")
-    c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
+    # Existing-surface bundled drift diagnostic (manifest/source present,
+    # installed missing) with curator/seeding provenance when available.
+    missing_count = _report_missing_bundled_skills(c, name=name)
+    if missing_count == 0 and not name:
+        c.print("[dim]No bundled skills missing from the local install.[/]\n")
+
+    _warn_wrong_case_skill_md(c)
 
 
 def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:

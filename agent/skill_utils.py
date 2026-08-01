@@ -857,6 +857,71 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 
 # ── File iteration ────────────────────────────────────────────────────────
 
+# Canonical skill entry filename. Wrong-case variants (``skill.md``,
+# ``Skill.md``) are never loaded — discovery is intentionally case-sensitive
+# so macOS/Windows case-insensitive volumes cannot silently activate a package
+# that would be invisible on Linux.
+CANONICAL_SKILL_MD = "SKILL.md"
+
+
+def find_wrong_case_skill_md_files(skills_dir: Path) -> List[Path]:
+    """Return skill packages that use a non-canonical ``skill.md`` spelling.
+
+    Hermes only indexes the exact filename ``SKILL.md``. On case-insensitive
+    filesystems a lowercase ``skill.md`` looks installed but is undiscoverable
+    by ``iter_skill_index_files``. This helper surfaces those packages for
+    diagnostics — it never treats wrong-case names as loadable skills.
+    """
+    if not skills_dir or not Path(skills_dir).exists():
+        return []
+
+    skills_dir_str = str(skills_dir)
+    active_org = read_active_org_id(skills_dir)
+    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
+    found: list[str] = []
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        has_canonical = CANONICAL_SKILL_MD in files
+        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+            dirs.remove(ORG_MIRROR_DIR_NAME)
+        elif root == org_root:
+            dirs[:] = [d for d in dirs if d == active_org]
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in EXCLUDED_SKILL_DIRS
+            and not (has_canonical and d in SKILL_SUPPORT_DIRS)
+        ]
+        # Skip support dirs even when only a wrong-case skill.md is present —
+        # those are progressive-disclosure payloads, not skill roots.
+        rel_parts = Path(root).relative_to(skills_dir).parts if root != skills_dir_str else ()
+        if any(part in SKILL_SUPPORT_DIRS for part in rel_parts):
+            continue
+        for name in files:
+            if name.lower() == "skill.md" and name != CANONICAL_SKILL_MD:
+                # Only warn when the canonical file is absent; a dual listing
+                # on a case-insensitive FS is the same inode and already loads.
+                if not has_canonical:
+                    found.append(os.path.join(root, name))
+    return [Path(p) for p in sorted(found)]
+
+
+def format_wrong_case_skill_md_warning(paths: List[Path], *, skills_dir: Optional[Path] = None) -> str:
+    """Human-readable warning for wrong-case skill.md packages (never loaded)."""
+    if not paths:
+        return ""
+    lines = [
+        "Warning: skill package(s) use non-canonical skill.md filename casing "
+        "and will NOT be loaded. Rename to exact SKILL.md (two-step rename on "
+        "case-insensitive filesystems):",
+    ]
+    for path in paths:
+        try:
+            display = path.relative_to(skills_dir) if skills_dir else path
+        except ValueError:
+            display = path
+        lines.append(f"  - {display}")
+    return "\n".join(lines)
+
 
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
@@ -866,6 +931,10 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     scripts) can contain arbitrary markdown and even archived package
     ``SKILL.md`` files, but they are progressive-disclosure data loaded through
     ``skill_view(..., file_path=...)`` rather than active skill roots.
+
+    Matching is case-sensitive: only the exact ``filename`` string is yielded.
+    Wrong-case ``skill.md`` packages are never silently loaded — use
+    ``find_wrong_case_skill_md_files`` for diagnostics.
 
     M2 org mirrors (``_org/``): TOKEN-GATED resolution. Only the active org's
     subdir (per the sync-client-written ``.active_org`` marker) is walked;

@@ -11015,7 +11015,11 @@ def cmd_tools(args):
 
         sys.exit(run_post_setup_command(args))
     else:
-        _require_tty("tools")
+        # ``--summary`` is a read-only non-interactive diagnostic; it must work
+        # without a TTY so audits/CI can capture tool configuration. The
+        # interactive curses UI still requires a terminal.
+        if not getattr(args, "summary", False):
+            _require_tty("tools")
         from hermes_cli.tools_config import tools_command
 
         tools_command(args)

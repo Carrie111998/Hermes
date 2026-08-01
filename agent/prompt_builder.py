@@ -1478,10 +1478,17 @@ def _build_snapshot_entry(
     if isinstance(platforms, str):
         platforms = [platforms]
 
+    # ``skill_name`` historically held the folder slug; keep it for backward
+    # compatibility with existing snapshot consumers. Expose unambiguous
+    # aliases so diagnostics can distinguish folder slug from declared name
+    # (e.g. folder ``audiocraft`` declaring ``audiocraft-audio-generation``).
+    declared_name = str(frontmatter.get("name", skill_name) or skill_name)
     entry = {
         "skill_name": skill_name,
+        "folder_slug": skill_name,
+        "declared_name": declared_name,
+        "frontmatter_name": declared_name,
         "category": category,
-        "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),

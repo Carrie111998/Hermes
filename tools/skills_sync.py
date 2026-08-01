@@ -1145,6 +1145,157 @@ def list_user_modified_bundled_skills() -> List[dict]:
     return modified
 
 
+# Absences that are deliberate policy — doctor treats an all-intentional set as
+# healthy/informational. skills check still lists them with full provenance.
+INTENTIONAL_MISSING_BUNDLED_PROVENANCE = frozenset({"opt_out", "curator_suppressed"})
+
+# Absences that warrant a doctor warning when present. ``unknown`` is handled
+# as actionable via the negative check in is_actionable_missing_bundled_provenance.
+ACTIONABLE_MISSING_BUNDLED_PROVENANCE = frozenset(
+    {
+        "manifest_tracked_absent",
+        "source_present_never_installed",
+        "manifest_orphan_no_source",
+        "unknown",
+    }
+)
+
+
+def is_actionable_missing_bundled_provenance(provenance: Optional[str]) -> bool:
+    """Return True when a missing-bundled absence should warn in doctor.
+
+    Intentional ``opt_out`` / ``curator_suppressed`` absences do not warn.
+    Recognized unexpected provenances and any unrecognized/blank value
+    (normalized to ``unknown``) do.
+    """
+    prov = (provenance or "").strip() or "unknown"
+    return prov not in INTENTIONAL_MISSING_BUNDLED_PROVENANCE
+
+
+def partition_missing_bundled_skills(
+    missing: List[dict],
+) -> Tuple[List[dict], List[dict]]:
+    """Split missing-bundled entries into (intentional, actionable) lists."""
+    intentional: List[dict] = []
+    actionable: List[dict] = []
+    for entry in missing:
+        if is_actionable_missing_bundled_provenance(
+            str(entry.get("provenance") or "")
+        ):
+            actionable.append(entry)
+        else:
+            intentional.append(entry)
+    return intentional, actionable
+
+
+def provenance_counts(missing: List[dict]) -> dict:
+    """Count missing-bundled entries by provenance key (blank → ``unknown``)."""
+    by_prov: dict = {}
+    for entry in missing:
+        key = str(entry.get("provenance") or "").strip() or "unknown"
+        by_prov[key] = by_prov.get(key, 0) + 1
+    return by_prov
+
+
+def format_missing_bundled_restore_guidance(missing: List[dict]) -> str:
+    """Footer guidance for ``hermes skills check`` missing-bundled output.
+
+    Always describes every provenance category. Restore instructions apply only
+    to unexpected absences — never imply opt_out / curator_suppressed should
+    be restored.
+    """
+    _, actionable = partition_missing_bundled_skills(missing)
+    base = (
+        f"{len(missing)} bundled skill(s) present in source/manifest but "
+        "not installed locally. Provenance: curator_suppressed (curator prune), "
+        "opt_out (.no-bundled-skills), manifest_tracked_absent (seeded then "
+        "removed — sync will not re-seed), source_present_never_installed, "
+        "manifest_orphan_no_source."
+    )
+    if not actionable:
+        return (
+            base
+            + " All listed absences are intentional "
+            "(opt_out / curator_suppressed); restore is not recommended."
+        )
+    return (
+        base
+        + " Restore unexpected absences "
+        "(manifest_tracked_absent / source_present_never_installed / "
+        "manifest_orphan_no_source / unknown) with "
+        "`hermes skills reset <name> --restore`. "
+        "Do not restore opt_out or curator_suppressed entries unless you "
+        "intentionally reverse that choice."
+    )
+
+
+def list_missing_bundled_skills() -> List[dict]:
+    """Return bundled skills present in source (and/or manifest) but not installed.
+
+    Diagnostic for the audit case where ``.bundled_manifest`` / the repo
+    ``skills/`` tree know about a skill but the active profile's skills root
+    does not have a discoverable copy. Includes seeding/curator provenance when
+    available so operators can tell deliberate prune from accidental absence.
+
+    Each entry:
+        ``name``, ``folder_slug``, ``bundled_src``, ``expected_dest``,
+        ``in_manifest``, ``in_source``, ``provenance`` where provenance is one
+        of ``curator_suppressed``, ``opt_out``, ``manifest_tracked_absent``
+        (was seeded, now missing — sync treats as user-deleted), or
+        ``source_present_never_installed``.
+    """
+    bundled_dir = _get_bundled_dir()
+    manifest = _read_manifest()
+    suppressed = _read_suppressed_names()
+    opted_out = is_bundled_skills_opt_out()
+    missing: List[dict] = []
+
+    for skill_name, skill_dir in _discover_bundled_skills(bundled_dir):
+        dest = _compute_relative_dest(skill_dir, bundled_dir)
+        if dest.exists() and (dest / "SKILL.md").exists():
+            continue
+        in_manifest = skill_name in manifest
+        if skill_name in suppressed:
+            provenance = "curator_suppressed"
+        elif opted_out:
+            provenance = "opt_out"
+        elif in_manifest:
+            provenance = "manifest_tracked_absent"
+        else:
+            provenance = "source_present_never_installed"
+        missing.append(
+            {
+                "name": skill_name,
+                "folder_slug": skill_dir.name,
+                "bundled_src": skill_dir,
+                "expected_dest": dest,
+                "in_manifest": in_manifest,
+                "in_source": True,
+                "provenance": provenance,
+            }
+        )
+
+    # Manifest entries whose bundled source was removed upstream are cleaned
+    # by sync; still surface orphaned manifest keys with no source as a
+    # separate diagnostic so operators can see stale tracking.
+    bundled_names = {name for name, _ in _discover_bundled_skills(bundled_dir)}
+    for skill_name in sorted(set(manifest) - bundled_names):
+        missing.append(
+            {
+                "name": skill_name,
+                "folder_slug": skill_name,
+                "bundled_src": None,
+                "expected_dest": SKILLS_DIR / skill_name,
+                "in_manifest": True,
+                "in_source": False,
+                "provenance": "manifest_orphan_no_source",
+            }
+        )
+
+    missing.sort(key=lambda e: e["name"])
+    return missing
+
+
 def _read_for_diff(path: Path) -> Tuple[Optional[bytes], Optional[str]]:
     """Read a file once for diffing.
 
