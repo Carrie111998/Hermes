@@ -1,0 +1,24 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+name: schedulala
+description: >
+  Schedule and publish social media posts to 12 platforms (Instagram, TikTok,
+  X, LinkedIn, YouTube, Facebook, Threads, Bluesky, Pinterest, Mastodon,
+  Telegram, Google Business) with first comments on 8 of them, analytics,
+  comment management, and keyword listening.
+source: https://schedulala.com/developers/docs
+transport:
+  type: http
+  url: https://schedulala.com/api/mcp
+auth:
+  # Native MCP OAuth 2.1 with dynamic client registration
+  # (/.well-known/oauth-authorization-server on schedulala.com).
+  type: oauth
+post_install:
+  notes: >
+    Sign-in happens in the browser via OAuth; no API key handling. A free
+    account can connect 2 social accounts and make 4 lifetime posts; paid
+    plans from $29/mo include full API/MCP access. Tool-count tip: the nine
+    show_* widget tools and the attach_media widget path render only on
+    claude.ai/ChatGPT and are safe to disable here.
