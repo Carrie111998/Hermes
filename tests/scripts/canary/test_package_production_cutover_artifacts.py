@@ -3049,8 +3049,8 @@ def test_deploy_packages_and_verifies_before_release_activation():
     install_wheel = run_deploy.index(
         'install_target_release_wheel "$tmp" "$active"'
     )
-    build = run_deploy.index("package_production_cutover_artifacts.py\" build")
-    verify = run_deploy.index("package_production_cutover_artifacts.py\" verify")
+    build = run_deploy.index('"build" "$tmp" "$new" "$sha"')
+    verify = run_deploy.index('"verify" "$tmp" "$new" "$sha"')
     publish = run_deploy.index(
         'publish_release_staging_directory "$tmp" "$new" "$short"'
     )
@@ -3095,7 +3095,14 @@ def test_deploy_packages_and_verifies_before_release_activation():
         < cutover_attest
         < activate
     )
-    assert run_deploy.count('--unit-inputs "$CUTOVER_UNIT_INPUTS_PATH"') >= 2
+    assert run_deploy.count("run_cutover_artifact_step \\\n") == 2
+    delegated_step = source[
+        source.index("run_cutover_artifact_step() {") : source.index(
+            "prepare_release_staging_directory() {"
+        )
+    ]
+    assert '"$CUTOVER_UNIT_INPUTS_PATH"' in delegated_step
+    assert '"--unit-inputs",' in delegated_step
     assert 'cutover_artifacts_match "$new" "$sha"' in run_deploy
     assert 'blocked_target_cutover_artifacts_invalid' in run_deploy
     install = source[
