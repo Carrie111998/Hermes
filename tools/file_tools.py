@@ -593,6 +593,18 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+def _posix_form_for_sensitive_check(path: str) -> str:
+    """Return *path* with separators normalized for POSIX denylist matching.
+
+    On Windows hosts, ``ntpath.normpath`` / ``Path`` turn ``/etc/hosts`` into
+    ``\\etc\\hosts``. The denylist entries are POSIX-form (``/etc/``,
+    ``/var/run/docker.sock``), so comparisons must use a shared separator or
+    the write guard fails open while the shell layer later restores the POSIX
+    path via ``_bash_safe_path``.
+    """
+    return path.replace("\\", "/")
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -600,14 +612,18 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    # Compare denylist entries against slash-normalized forms so Windows
+    # backslash rewriting cannot bypass the POSIX prefixes / exact paths.
+    resolved_posix = _posix_form_for_sensitive_check(resolved)
+    normalized_posix = _posix_form_for_sensitive_check(normalized)
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if resolved_posix.startswith(prefix) or normalized_posix.startswith(prefix):
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    if resolved_posix in _SENSITIVE_EXACT_PATHS or normalized_posix in _SENSITIVE_EXACT_PATHS:
         return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or

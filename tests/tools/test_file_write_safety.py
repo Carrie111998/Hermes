@@ -213,6 +213,76 @@ class TestCheckSensitivePathMacOSBypass:
         assert _check_sensitive_path("/tmp/safe_file.txt") is None
 
 
+class TestCheckSensitivePathWindowsHostSemantics:
+    """POSIX denylist entries must still match after Windows path rewriting.
+
+    On win32, ``_resolve_path_for_task`` / ``os.path.normpath`` turn
+    ``/etc/hosts`` into ``\\etc\\hosts``. Without separator normalization the
+    write guard fails open while the shell layer restores the POSIX path.
+    """
+
+    def test_prefix_blocked_when_resolution_uses_backslashes(self, monkeypatch):
+        from tools import file_tools as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_resolve_path_for_task",
+            lambda filepath, task_id="default": Path(str(filepath).replace("/", "\\")),
+        )
+        monkeypatch.setattr(
+            mod.os.path,
+            "normpath",
+            lambda path: str(path).replace("/", "\\"),
+        )
+
+        assert mod._check_sensitive_path("/etc/hosts") is not None
+        assert mod._check_sensitive_path("/boot/grub/grub.cfg") is not None
+        assert mod._check_sensitive_path("/usr/lib/systemd/system/x.service") is not None
+        assert mod._check_sensitive_path("/private/etc/hosts") is not None
+
+    def test_exact_docker_sock_blocked_when_resolution_uses_backslashes(self, monkeypatch):
+        from tools import file_tools as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_resolve_path_for_task",
+            lambda filepath, task_id="default": Path(str(filepath).replace("/", "\\")),
+        )
+        monkeypatch.setattr(
+            mod.os.path,
+            "normpath",
+            lambda path: str(path).replace("/", "\\"),
+        )
+
+        assert mod._check_sensitive_path("/var/run/docker.sock") is not None
+        assert mod._check_sensitive_path("/run/docker.sock") is not None
+
+    def test_safe_path_still_allowed_with_backslash_normalization(self, monkeypatch):
+        from tools import file_tools as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_resolve_path_for_task",
+            lambda filepath, task_id="default": Path(str(filepath).replace("/", "\\")),
+        )
+        monkeypatch.setattr(
+            mod.os.path,
+            "normpath",
+            lambda path: str(path).replace("/", "\\"),
+        )
+
+        assert mod._check_sensitive_path("/tmp/safe_file.txt") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="native Windows path rewriting")
+    def test_native_windows_host_blocks_posix_sensitive_targets(self):
+        from tools.file_tools import _check_sensitive_path
+
+        assert _check_sensitive_path("/etc/hosts") is not None
+        assert _check_sensitive_path("/boot/grub/grub.cfg") is not None
+        assert _check_sensitive_path("/var/run/docker.sock") is not None
+        assert _check_sensitive_path("/tmp/safe_file.txt") is None
+
+
 class TestAtomicWrite:
     """write_file / patch land via a temp-file + atomic rename.
 
