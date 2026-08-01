@@ -49,7 +49,17 @@ def _skin_set(key: str, value: str, skin: str | None) -> int:
     path = _skins_dir() / f"{name}.yaml"
 
     if path.exists():
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, OSError) as exc:
+            print(
+                f"Error: Cannot parse skin file {path}: {exc}\n"
+                f"  The file contains a YAML syntax error. Fix the error\n"
+                f"  manually or restore from a backup, then retry.",
+                file=sys.stderr,
+            )
+            return 1
+        data = data if isinstance(data, dict) else {}
         target = name
     else:
         # Built-in (or missing): fork into an editable copy that keeps its full
