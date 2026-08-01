@@ -127,6 +127,11 @@ def _normalize_line_endings(text: str, target: str) -> str:
 # preservation above (detect on disk, preserve across the edit).
 _UTF8_BOM = "\ufeff"
 
+# Internal reads are interactive tool calls. Do not let an unresponsive cloud,
+# network, or FUSE filesystem inherit the much longer terminal/gateway timeout
+# and wedge the entire agent turn.
+_FILE_READ_TIMEOUT_SECONDS = 30
+
 
 def _strip_bom(text: str) -> tuple[str, bool]:
     """Return (text-without-leading-BOM, had_bom).
@@ -864,6 +869,15 @@ class ShellFileOperations(FileOperations):
             stdout=result.get("output", ""),
             exit_code=result.get("returncode", 0)
         )
+
+    @staticmethod
+    def _read_timeout_result(path: str) -> ReadResult:
+        return ReadResult(
+            error=(
+                f"Timed out reading {path} after {_FILE_READ_TIMEOUT_SECONDS} seconds. "
+                "The file or its filesystem may be temporarily unavailable."
+            )
+        )
     
     def _has_command(self, cmd: str) -> bool:
         """Check if a command exists in the environment (cached)."""
@@ -1114,7 +1128,10 @@ class ShellFileOperations(FileOperations):
         
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(stat_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if stat_result.exit_code == 124:
+            return self._read_timeout_result(path)
         
         if stat_result.exit_code != 0:
             # File not found - try to suggest similar files
@@ -1145,7 +1162,9 @@ class ShellFileOperations(FileOperations):
         
         # Read a sample to check for binary content
         sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
+        sample_result = self._exec(sample_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if sample_result.exit_code == 124:
+            return self._read_timeout_result(path)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
         if self._is_likely_binary(path, sample_output):
@@ -1158,7 +1177,10 @@ class ShellFileOperations(FileOperations):
         # Read with pagination using sed
         end_line = offset + limit - 1
         read_cmd = f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)}"
-        read_result = self._exec(read_cmd)
+        read_result = self._exec(read_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if read_result.exit_code == 124:
+            return self._read_timeout_result(path)
         
         if read_result.exit_code != 0:
             return ReadResult(error=f"Failed to read file: {read_result.stdout}")
@@ -1171,7 +1193,9 @@ class ShellFileOperations(FileOperations):
         
         # Get total line count
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
-        wc_result = self._exec(wc_cmd)
+        wc_result = self._exec(wc_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if wc_result.exit_code == 124:
+            return self._read_timeout_result(path)
         wc_output = _strip_terminal_fence_leaks(wc_result.stdout)
         try:
             total_lines = int(wc_output.strip())
@@ -1202,7 +1226,10 @@ class ShellFileOperations(FileOperations):
 
         # List files in the target directory
         ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50"
-        ls_result = self._exec(ls_cmd)
+        ls_result = self._exec(ls_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if ls_result.exit_code == 124:
+            return self._read_timeout_result(path)
 
         scored: list = []  # (score, filepath) — higher is better
         if ls_result.exit_code == 0 and ls_result.stdout.strip():
@@ -1252,7 +1279,9 @@ class ShellFileOperations(FileOperations):
         """
         path = self._expand_path(path)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(stat_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if stat_result.exit_code == 124:
+            return self._read_timeout_result(path)
         if stat_result.exit_code != 0:
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
@@ -1262,14 +1291,24 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        sample_result = self._exec(
+            f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null",
+            timeout=_FILE_READ_TIMEOUT_SECONDS,
+        )
+        if sample_result.exit_code == 124:
+            return self._read_timeout_result(path)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."
             )
-        cat_result = self._exec(f"cat {self._escape_shell_arg(path)}")
+        cat_result = self._exec(
+            f"cat {self._escape_shell_arg(path)}",
+            timeout=_FILE_READ_TIMEOUT_SECONDS,
+        )
+        if cat_result.exit_code == 124:
+            return self._read_timeout_result(path)
         if cat_result.exit_code != 0:
             return ReadResult(error=f"Failed to read file: {cat_result.stdout}")
         # Strip a leading UTF-8 BOM so patch's fuzzy matcher operates on
