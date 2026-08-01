@@ -5,6 +5,7 @@ import {
   input, select, modal, setBusy, kv, fmt,
 } from '../ui.js';
 import { call } from '../api.js';
+import { startEmailOAuth } from '../oauth-popup.js';
 import { db, subscribe } from '../mocks/db.js';
 import {
   providerLabel, integrationLogo, countryOptions, languageOptions, leadFor,
@@ -12,8 +13,8 @@ import {
 } from './_page-utils.js';
 
 const EMAIL_PROVIDERS = [
-  { key: 'google', title: 'Google Workspace', route: 'emailIntegrations.connectGoogle', logo: 'G' },
-  { key: 'microsoft', title: 'Microsoft 365', route: 'emailIntegrations.connectMicrosoft', logo: 'M' },
+  { key: 'google', title: 'Google Workspace', oauth: true, logo: 'G' },
+  { key: 'microsoft', title: 'Microsoft 365', oauth: true, logo: 'M' },
   { key: 'smtp', title: 'Any email (SMTP)', route: 'emailIntegrations.connectSmtp', logo: '@', credential: 'smtp' },
   { key: 'browser', title: 'Any webmail (agent browser)', route: 'emailIntegrations.connectBrowser', logo: 'W', credential: 'browser' },
 ];
@@ -29,12 +30,42 @@ const SMTP_PRESETS = {
 
 export async function mount(root, ctx) {
   let disposed = false;
+  const oauthAttempts = new Map();
   const host = el('div', {});
   root.append(pageHead({
     title: 'Integrations',
     sub: 'Email, WhatsApp Business, LinkedIn actions, and lead data sources for this workspace.',
     actions: [button('Settings', { icon: 'gear', onClick: () => ctx.navigate('/app/settings') })],
   }), host);
+
+  function connectOauth(provider) {
+    oauthAttempts.get(provider.key)?.cancel();
+    const attempt = startEmailOAuth({
+      provider: provider.key,
+      startOAuth: key => call('emailIntegrations.startOAuth', {
+        params: { provider: key },
+      }),
+      listIntegrations: () => call('emailIntegrations.list'),
+      onConnected: () => {
+        oauthAttempts.delete(provider.key);
+        toast(`${provider.title} connected`, 'success');
+        render().catch(err => toast(err.message || 'Could not refresh integrations', 'error'));
+      },
+      onStatus: ({ status, error }) => {
+        oauthAttempts.delete(provider.key);
+        const messages = {
+          blocked: ['Allow popups for this site, then try Connect again.', 'warning'],
+          start_failed: [error?.message || `${provider.title} OAuth could not start`, 'error'],
+          cancelled: [`${provider.title} authorization was cancelled`, 'warning'],
+          failed: [`${provider.title} authorization failed. Read the popup, then try again.`, 'error'],
+          expired: [`${provider.title} authorization expired. Start again.`, 'warning'],
+        };
+        const [message, kind] = messages[status] || [`${provider.title} authorization stopped`, 'warning'];
+        toast(message, kind);
+      },
+    });
+    if (attempt) oauthAttempts.set(provider.key, attempt);
+  }
 
   async function render() {
     const [emailRes, whatsappRes, linkedInRes, sourcesRes, runtime] = await Promise.all([
@@ -64,7 +95,7 @@ export async function mount(root, ctx) {
           ['Profiles opened', linkedInRes.items.filter(a => ['opened', 'connection_sent', 'connected', 'replied'].includes(a.status)).length],
         ]) }),
         agentAdapterSection(runtime)),
-      emailSection(emailRes.items, render),
+      emailSection(emailRes.items, render, connectOauth),
       el('div', { class: 'ifz-grid cols-2 ifz-mt-4' },
         whatsappSection(whatsapp, render),
         linkedInSection(linkedInRes.items, render)),
@@ -73,10 +104,15 @@ export async function mount(root, ctx) {
 
   await render();
   const unsub = subscribe('*', () => render().catch(console.error));
-  return () => { disposed = true; unsub(); };
+  return () => {
+    disposed = true;
+    unsub();
+    for (const attempt of oauthAttempts.values()) attempt.cancel();
+    oauthAttempts.clear();
+  };
 }
 
-function emailSection(items, onChange) {
+function emailSection(items, onChange, onOauth) {
   const providers = items.some(item => item.provider === 'stub')
     ? [{ key: 'stub', title: 'Local test mailbox', route: null, logo: 'T' }, ...EMAIL_PROVIDERS]
     : EMAIL_PROVIDERS;
@@ -96,7 +132,7 @@ function emailSection(items, onChange) {
               const res = await call('emailIntegrations.test', { params: { integrationId: connected.id } });
               toast(res.message, 'success');
               onChange();
-            } }) : button('Connect', { size: 'sm', kind: 'primary', onClick: () => connectProvider(provider, onChange) }),
+            } }) : button('Connect', { size: 'sm', kind: 'primary', onClick: () => connectProvider(provider, onChange, onOauth) }),
             connected ? button('Disconnect', { size: 'sm', kind: 'danger', onClick: async () => {
               await call('emailIntegrations.delete', { params: { integrationId: connected.id } });
               toast(`${provider.title} disconnected`, 'warning');
@@ -106,15 +142,10 @@ function emailSection(items, onChange) {
   });
 }
 
-function connectProvider(provider, onChange) {
+function connectProvider(provider, onChange, onOauth) {
+  if (provider.oauth) return onOauth(provider);
   if (provider.credential === 'smtp') return connectSmtp(provider, onChange);
   if (provider.credential === 'browser') return connectBrowserWebmail(provider, onChange);
-  call(provider.route).then(() => {
-    toast(`${provider.title} connected`, 'success');
-    onChange();
-  }).catch(err => {
-    toast(err.message || `${provider.title} is not available on this server`, 'error');
-  });
 }
 
 function connectSmtp(provider, onChange) {

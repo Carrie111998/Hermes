@@ -237,3 +237,226 @@ test('invalid start responses fail closed and clean up', async () => {
     assert.equal(h.listeners.has('message'), false);
   }
 });
+
+class FakeNode {
+  constructor(tagName = null, text = '') {
+    this.nodeType = tagName ? 1 : 3;
+    this.tagName = tagName?.toUpperCase();
+    this._text = text;
+    this.childNodes = [];
+    this.parentNode = null;
+    this.dataset = {};
+    this.style = {};
+    this.listeners = new Map();
+    this.attributes = new Map();
+    this.className = '';
+    this.classList = {
+      add: (...names) => {
+        const current = new Set(this.className.split(/\s+/).filter(Boolean));
+        for (const name of names) current.add(name);
+        this.className = [...current].join(' ');
+      },
+    };
+  }
+
+  append(...children) {
+    for (const child of children) {
+      child.parentNode = this;
+      this.childNodes.push(child);
+    }
+  }
+
+  replaceChildren(...children) {
+    this.childNodes = [];
+    this.append(...children);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+    if (name === 'class') this.className = String(value);
+  }
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  dispatchEvent(event) {
+    event.target ||= this;
+    for (const listener of this.listeners.get(event.type) || []) listener(event);
+    return true;
+  }
+
+  click() { this.dispatchEvent({ type: 'click' }); }
+  focus() {}
+
+  remove() {
+    if (!this.parentNode) return;
+    this.parentNode.childNodes = this.parentNode.childNodes.filter(node => node !== this);
+    this.parentNode = null;
+  }
+
+  get textContent() {
+    return this.nodeType === 3
+      ? this._text
+      : this.childNodes.map(child => child.textContent).join('');
+  }
+
+  set textContent(value) {
+    this._text = String(value);
+    if (this.nodeType === 1) {
+      this.childNodes = [new FakeNode(null, this._text)];
+      this.childNodes[0].parentNode = this;
+    }
+  }
+}
+
+function nodesMatching(root, predicate) {
+  const matches = [];
+  function visit(node) {
+    if (predicate(node)) matches.push(node);
+    for (const child of node.childNodes || []) visit(child);
+  }
+  visit(root);
+  return matches;
+}
+
+function fakeDocument() {
+  const listeners = new Map();
+  return {
+    body: new FakeNode('body'),
+    createElement: tag => new FakeNode(tag),
+    createElementNS: (_namespace, tag) => new FakeNode(tag),
+    createTextNode: text => new FakeNode(null, String(text)),
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type);
+    },
+  };
+}
+
+function fakeBrowserWindow() {
+  const listeners = new Map();
+  const popup = {
+    closed: false,
+    location: { href: null, replace(url) { this.href = url; } },
+    close() { this.closed = true; },
+  };
+  return {
+    popup,
+    location: { origin: 'https://app.example.test' },
+    openCalls: [],
+    open(...args) { this.openCalls.push(args); return popup; },
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type);
+    },
+    postOAuth(data) {
+      listeners.get('message')?.({
+        origin: this.location.origin,
+        source: popup,
+        data,
+      });
+    },
+  };
+}
+
+async function flushUntil(predicate, message) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.fail(message);
+}
+
+test('Google Connect starts provider OAuth and refreshes Integrations once on success', async () => {
+  const originalDocument = globalThis.document;
+  const originalWindow = globalThis.window;
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalSetInterval = globalThis.setInterval;
+  const documentRef = fakeDocument();
+  const windowRef = fakeBrowserWindow();
+  const requests = [];
+  let emailLists = 0;
+  let dispose;
+
+  globalThis.document = documentRef;
+  globalThis.window = windowRef;
+  globalThis.setTimeout = (...args) => {
+    const timer = originalSetTimeout(...args);
+    timer.unref?.();
+    return timer;
+  };
+  globalThis.setInterval = (...args) => {
+    const timer = originalSetInterval(...args);
+    timer.unref?.();
+    return timer;
+  };
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, method: options.method || 'GET' });
+    if (url === '/health') return Response.json({ agent_runs_enabled: false });
+    if (url === '/api/v1/integrations/email') {
+      emailLists += 1;
+      return Response.json([]);
+    }
+    if (url === '/api/v1/integrations/whatsapp'
+        || url === '/api/v1/linkedin/actions'
+        || url === '/api/v1/data-sources') return Response.json([]);
+    if (url === '/api/v1/integrations/email/oauth/google/start') {
+      return Response.json({
+        authorize_url: 'https://accounts.example.test/authorize',
+        expires_in: 600,
+      });
+    }
+    return Response.json({ message: `Unexpected request: ${options.method} ${url}` }, { status: 404 });
+  };
+
+  try {
+    const { resetReal } = await import('../../../server/webui/js/mocks/db.js');
+    const { mount } = await import('../../../server/webui/js/pages/integrations.js');
+    resetReal();
+    const root = new FakeNode('main');
+    dispose = await mount(root, { navigate() {} });
+
+    const connectButtons = nodesMatching(
+      root,
+      node => node.tagName === 'BUTTON' && node.textContent === 'Connect',
+    );
+    assert.equal(connectButtons.length, 4);
+    connectButtons[0].click();
+
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(windowRef.openCalls.length, 1);
+    assert.equal(windowRef.popup.location.href, 'https://accounts.example.test/authorize');
+    assert.deepEqual(
+      requests.filter(request => request.url.includes('/integrations/email/') && request.method === 'POST'),
+      [{ url: '/api/v1/integrations/email/oauth/google/start', method: 'POST' }],
+    );
+
+    windowRef.postOAuth({
+      type: 'interfaze:oauth',
+      provider: 'google',
+      status: 'connected',
+    });
+    await flushUntil(() => emailLists === 2, 'Integrations did not refresh after OAuth success');
+
+    assert.equal(emailLists, 2);
+    assert.equal(nodesMatching(
+      documentRef.body,
+      node => node.tagName === 'SPAN' && node.textContent === 'Google Workspace connected',
+    ).length, 1);
+  } finally {
+    dispose?.();
+    globalThis.document = originalDocument;
+    globalThis.window = originalWindow;
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.setInterval = originalSetInterval;
+  }
+});
