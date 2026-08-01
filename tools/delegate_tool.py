@@ -51,6 +51,12 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
+        # Skills tools are blocked for leaf subagents: the ~2,800-token skill
+        # index bloats the child's system prompt and can cause context-overflow
+        # failures on models with smaller effective context windows (#42809).
+        "skills_list",
+        "skill_view",
+        "skill_manage",
     ]
 )
 

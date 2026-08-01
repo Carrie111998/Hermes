@@ -93,6 +93,19 @@ class TestStripBlockedTools(unittest.TestCase):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
         self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
 
+    def test_strips_skills_toolset(self):
+        """Regression for issue #42809: child subagents must not inherit
+        the skills toolset. The ~2,800-token skill index bloats the child's
+        system prompt and can cause context-overflow on smaller models.
+        """
+        result = _strip_blocked_tools(
+            ["terminal", "file", "skills", "web"]
+        )
+        self.assertNotIn("skills", result)
+        self.assertIn("terminal", result)
+        self.assertIn("file", result)
+        self.assertIn("web", result)
+
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
         the cronjob toolset from a parent running on a gateway platform.
@@ -591,6 +604,20 @@ class TestBlockedTools(unittest.TestCase):
         can batch mechanical work instead of burning reasoning iterations
         (Teknium, Jul 2026)."""
         self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
+
+    def test_skills_tools_blocked(self):
+        """Regression for issue #42809: skills tools are blocked for leaf
+        subagents to prevent the ~2,800-token skill index from bloating the
+        child's system prompt."""
+        for tool in ("skills_list", "skill_view", "skill_manage"):
+            self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
+
+    def test_skills_in_blocked_toolsets_for_role(self):
+        """The derived _blocked_toolsets_for_role must include 'skills' so
+        it's subtracted from mixed platform bundles too."""
+        from tools.delegate_tool import _blocked_toolsets_for_role
+        for role in ("leaf", "orchestrator"):
+            self.assertIn("skills", _blocked_toolsets_for_role(role))
 
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
