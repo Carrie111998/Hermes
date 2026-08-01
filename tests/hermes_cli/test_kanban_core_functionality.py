@@ -4442,18 +4442,35 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
 
 
 def test_detect_crashed_workers_increments_counter(kanban_home):
-    """A single crash increments the consecutive_failures counter."""
+    """A single worker-death crash is a recoverable re-dispatch (t_95178963).
+
+    A fake pid that was never registered in the reap registry falls through to
+    the ``unknown`` dead-worker form ("pid N not alive"). That is a process
+    death, not a content/tool refusal, so the breaker must NOT trip on the
+    first occurrence and the unified ``consecutive_failures`` budget must stay
+    untouched (the pid-crash budget is tracked separately, mirroring the
+    protocol-violation precedent).
+    """
+    import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
-        kb.claim_task(conn, tid)
-        kb._set_worker_pid(conn, tid, 99999)  # fake pid — not alive
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (99999, f"{host}:mock", tid),
+        )
+        conn.commit()
 
         kb.detect_crashed_workers(conn)
 
         task = kb.get_task(conn, tid)
-        assert task.consecutive_failures == 1
+        # Recoverable re-dispatch: stays ready, does NOT consume the unified
+        # failure counter (below the pid-crash retry budget).
+        assert task.consecutive_failures == 0
         assert task.status == "ready"
+        assert "not alive" in (task.last_failure_error or "")
     finally:
         conn.close()
 
@@ -4582,6 +4599,135 @@ def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_
         # Side channel consumed by dispatch_once — read through the same
         # (current) module object the reaper ran in, see _drive_worker_exit.
         assert tid in _kb.detect_crashed_workers._last_auto_blocked
+    finally:
+        conn.close()
+
+
+def _drive_pid_crash(conn, tid, fake_pid):
+    """One worker-death crash reaper pass for ``tid`` (pid-not-alive).
+
+    Records NO reap-registry entry for ``fake_pid`` so ``_classify_worker_exit``
+    returns ``unknown`` → ``detect_crashed_workers`` builds the "pid N not alive"
+    dead-worker error. This is the dominant pid-crash form in production
+    (harness/dispatcher fault where the worker pid vanished before the reap
+    registry saw it).
+    """
+    import hermes_cli.kanban_db as _kb
+    host_prefix = _kb._claimer_id().split(":", 1)[0]
+    claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+    assert claimed is not None, "task was not claimable for the next attempt"
+    _kb._set_worker_pid(conn, tid, fake_pid)
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda _p: False
+    try:
+        return _kb.detect_crashed_workers(conn)
+    finally:
+        _kb._pid_alive = original_alive
+
+
+def test_detect_crashed_workers_pid_crash_first_occurrence_retries(kanban_home):
+    """A single worker-death crash gets a recoverable re-dispatch, not a block.
+
+    t_95178963: a pid-not-alive crash is a dead worker, NOT a content/tool
+    refusal. The first occurrence must leave the task ``ready`` (respawn
+    allowed) with ``last_failure_error`` stamped, and must NOT consume the
+    unified ``consecutive_failures`` budget — mirroring the protocol-violation
+    bounded-retry precedent.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deadworker", assignee="worker")
+        result_crashed = _drive_pid_crash(conn, tid, 999997)
+        assert tid in result_crashed, "should be detected as crashed"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"first pid-crash should retry (recoverable re-dispatch), "
+            f"got status={task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "a below-budget pid-crash must not consume the unified failure "
+            f"budget, got consecutive_failures={task.consecutive_failures}"
+        )
+        assert "not alive" in (task.last_failure_error or ""), (
+            f"expected pid-crash message, got {task.last_failure_error!r}"
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "crashed" in kinds, f"expected 'crashed' event, got {kinds}"
+        assert "gave_up" not in kinds, (
+            f"breaker must not trip on the first pid-crash, got {kinds}"
+        )
+    finally:
+        conn.close()
+
+
+def test_detect_crashed_workers_pid_crash_streak_trips_at_limit(kanban_home):
+    """A consecutive pid-crash streak trips the breaker exactly at the bound.
+
+    Genuine repeat offenders (a seat whose workers keep dying — a real harness
+    defect) must still surface to a human: the ``_PID_CRASH_RETRY_LIMIT``-th
+    consecutive pid-crash blocks the task with a ``gave_up`` event carrying the
+    streak accounting, routed to devops.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deadworker", assignee="worker")
+        limit = _kb._PID_CRASH_RETRY_LIMIT
+        for i in range(limit - 1):
+            _drive_pid_crash(conn, tid, 970000 + i)
+            assert kb.get_task(conn, tid).status == "ready", (
+                f"pid-crash {i + 1}/{limit} should still retry"
+            )
+
+        _drive_pid_crash(conn, tid, 970900)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"pid-crash streak at the bound must block, got {task.status}"
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert kinds.count("crashed") == limit
+        gave_up = [e for e in events if e.kind == "gave_up"]
+        assert len(gave_up) == 1, f"expected exactly one gave_up, got {kinds}"
+        payload = gave_up[0].payload or {}
+        assert payload.get("pid_crashes") == limit
+        assert payload.get("pid_crash_limit") == limit
+        assert tid in _kb.detect_crashed_workers._last_auto_blocked
+    finally:
+        conn.close()
+
+
+def test_pid_crash_budget_not_consumed_by_success(kanban_home):
+    """A different failure mode between pid-crashes resets the dead-worker streak.
+
+    A success or a non-pid crash proves the seat is healthy, so the pid-crash
+    retry budget counts ONLY consecutive dead-worker crashes. After a real
+    (nonzero) crash breaks the streak, the next pid-crash must again be a
+    below-budget retry, not a trip.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="deadworker", assignee="worker")
+        # Two pid-crashes (below the limit of 3).
+        _drive_pid_crash(conn, tid, 991001)
+        _drive_pid_crash(conn, tid, 991002)
+        assert kb.get_task(conn, tid).status == "ready"
+        # A real nonzero crash in between: stays on the unified counter path
+        # and BREAKS the pid-crash streak (different failure kind).
+        _drive_nonzero_crash(conn, tid, 991050)
+        assert kb.get_task(conn, tid).status == "ready"
+        # Re-dispatch and pid-crash again — streak should have reset, so this
+        # is again a below-budget retry, not a trip.
+        _drive_pid_crash(conn, tid, 991003)
+        assert kb.get_task(conn, tid).status == "ready", (
+            "a pid-crash after a different failure mode must reset the streak "
+            "and retry"
+        )
     finally:
         conn.close()
 

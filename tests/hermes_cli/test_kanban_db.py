@@ -732,7 +732,15 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
 def test_detect_crashed_workers_systemic_failure_fast_block(
     kanban_home, monkeypatch,
 ):
-    """When many tasks crash with the same error, trip the breaker faster."""
+    """A cluster of identical dead-worker crashes must NOT hard-block (t_95178963).
+
+    Historical bug: many tasks crashing in one tick with the same
+    "pid N not alive" fingerprint were treated as systemic and blocked on the
+    first occurrence. Worker death is a recoverable re-dispatch (a fleet harness
+    fault, not a task-content defect), so a single-tick cluster now stays
+    ``ready`` (re-queued for respawn) and only trips the breaker after a
+    *consecutive* pid-crash streak past the retry budget.
+    """
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -755,8 +763,13 @@ def test_detect_crashed_workers_systemic_failure_fast_block(
 
         for tid in task_ids:
             task = kb.get_task(conn, tid)
-            assert task.status == "blocked", (
-                f"task {tid} should be blocked (systemic), got {task.status}"
+            assert task.status == "ready", (
+                f"task {tid} should stay ready (recoverable re-dispatch), "
+                f"got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"worker-death must not consume unified failure budget, "
+                f"got {task.consecutive_failures}"
             )
 
 

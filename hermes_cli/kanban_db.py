@@ -7815,6 +7815,90 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # can only mean "way past the bound" anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# Worker-death crashes (pid-not-alive: OOM, SIGKILL, harness/dispatcher
+# fault, host recycle) are NOT a task-content defect — the seat could do the
+# work, the process just died. Treated as recoverable re-dispatches, mirroring
+# the bounded-retry precedent for clean-exit protocol violations. A *single*
+# pid-crash historically blocked the card as ``gave_up`` (correct only for a
+# genuine content/tool refusal, never for a dead worker). The breaker instead
+# trips only after this many *consecutive* pid-crashes; a per-task
+# ``max_retries`` override still wins (same precedence as every other failure
+# kind). This clears the fleet's PID_CRASH backlog (e.g. t_95178963) without
+# disabling the circuit breaker — true repeat offenders still surface to
+# devops as a genuine harness defect.
+_PID_CRASH_RETRY_LIMIT = 3
+
+# How far back to walk a task's closed runs when counting the pid-crash streak.
+_PID_CRASH_SCAN_LIMIT = 50
+
+
+def _pid_crash_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of worker-death crashes.
+
+    Walks the task's closed runs newest-first — including the pid-crash run
+    ``detect_crashed_workers`` just closed — and counts how many in a row were
+    a worker-death crash (outcome ``crashed`` whose error fingerprint is a
+    dead-worker crash, i.e. ``pid N not alive`` / ``killed by signal`` /
+    ``exited with code``):
+
+    * ``rate_limited`` runs are neutral and skipped (a quota wall says nothing
+      about the task), exactly as for the protocol-violation streak.
+    * A *completed* or clean-exit *protocol_violation* run breaks the streak:
+      a success or a different failure mode proves the seat is healthy, so the
+      retry budget counts ONLY dead-worker crashes — a prior successful run
+      neither consumes nor extends it, and a real content failure that
+      surfaces later trips on its own accounting.
+
+    This deliberately does NOT count non-pid crashes (timeouts, spawn failures,
+    judge outages) as part of the dead-worker streak; those have their own
+    failure modes and should not quietly extend a pid-crash budget.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PID_CRASH_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome == "completed" or outcome == "protocol_violation":
+            # A real success or a different failure mode breaks the
+            # dead-worker streak.
+            break
+        if outcome == "crashed":
+            err = row["error"] or ""
+            if _is_pid_crash(err):
+                streak += 1
+                continue
+        # Any other run (timeout, spawn_failed, judge outage, …) breaks the
+        # streak — it is not a dead-worker crash.
+        break
+    return streak
+
+
+def _is_pid_crash(error_text: str) -> bool:
+    """True only for the harness/dispatcher ``pid-not-alive`` crash form.
+
+    This is the exact recoverable re-dispatch class the t_95178963 fix targets:
+    the worker PID vanished before the reap registry saw it, so
+    ``_classify_worker_exit`` returns ``unknown`` and ``detect_crashed_workers``
+    builds the "pid N not alive" error. That is a process death (harness /
+    dispatcher fault, OOM, host recycle), not a task-content refusal, so it gets
+    a bounded retry instead of an immediate breaker trip.
+
+    Deliberately EXCLUDES non-zero worker exits ("pid N exited with code C")
+    and signal kills ("pid N killed by signal K"): those carry a real exit
+    status and stay on the existing unified-failure counter path (which trips at
+    ``DEFAULT_FAILURE_LIMIT`` and ticks ``consecutive_failures``), preserving the
+    two pre-existing guarantees — a genuine crash still counts/trips, and the
+    protocol-violation budget stays independent of real crashes.
+    """
+    fp = _error_fingerprint(error_text)
+    return fp == "pid n not alive"
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
@@ -8114,6 +8198,63 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
+            if _is_pid_crash(error_text):
+                # Worker-death crash (pid-not-alive / signal / non-zero exit):
+                # the seat could do the work, the process just died. Treat it
+                # like a clean-exit protocol violation — a BOUNDED retry, not an
+                # immediate trip — because a single dead worker is a recoverable
+                # re-dispatch, not a task-content defect. Only a *consecutive*
+                # pid-crash streak past the bound trips the breaker (a genuine
+                # harness defect, routed to devops). A per-task ``max_retries``
+                # override still wins. Below budget the task is already ``ready``
+                # with ``last_failure_error`` stamped; do NOT consume the unified
+                # ``consecutive_failures`` budget (same discipline as the
+                # violation branch above).
+                trow = conn.execute(
+                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
+                ).fetchone()
+                if trow is None:
+                    continue  # task deleted mid-loop
+                task_override = (
+                    trow["max_retries"] if "max_retries" in trow.keys() else None
+                )
+                pid_limit = (
+                    int(task_override)
+                    if task_override is not None
+                    else _PID_CRASH_RETRY_LIMIT
+                )
+                streak = _pid_crash_streak(conn, tid)
+                if streak < pid_limit:
+                    # Below budget: the task is already back at ``ready``
+                    # (respawn allowed). Stamp ``last_failure_error`` with the
+                    # dead-worker message so the retry worker's context carries
+                    # the corrective guidance (same as the protocol-violation
+                    # branch). Deliberately no ``_record_task_failure`` call — a
+                    # below-budget pid-crash must not consume the unified
+                    # ``consecutive_failures`` budget.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], tid),
+                    )
+                    continue
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=pid_limit,
+                    force_trip=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "claimer": claimer,
+                        "pid_crashes": streak,
+                        "pid_crash_limit": pid_limit,
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
