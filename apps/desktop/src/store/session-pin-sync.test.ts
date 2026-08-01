@@ -47,6 +47,15 @@ describe('watchSessionPins', () => {
     expect(patch).toHaveBeenCalledWith('a', true, 'work')
   })
 
+  it('keeps a new local pin while the loaded row still reports pinned=false', async () => {
+    $sessions.set([row('stale-pin', { pinned: false, profile: 'work' })])
+    $pinnedSessionIds.set(['stale-pin'])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toContain('stale-pin')
+    expect(patch).toHaveBeenCalledWith('stale-pin', true, 'work')
+  })
+
   it('mirrors an unpin as pinned=false', async () => {
     $sessions.set([row('b')])
     $pinnedSessionIds.set(['b'])
@@ -57,6 +66,18 @@ describe('watchSessionPins', () => {
     await flush()
 
     expect(patch).toHaveBeenCalledWith('b', false, undefined)
+  })
+
+  it('keeps a local unpin while the loaded row still reports pinned=true', async () => {
+    $sessions.set([row('stale-unpin', { pinned: true, profile: 'work' })])
+    await flush()
+    patch.mockClear()
+
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('stale-unpin')
+    expect(patch).toHaveBeenCalledWith('stale-unpin', false, 'work')
   })
 
   it('defers a pin whose row is not loaded, then flushes once it appears', async () => {
@@ -164,5 +185,139 @@ describe('watchSessionPins remote pull', () => {
     await flush()
 
     expect($pinnedSessionIds.get()).not.toContain('race')
+  })
+
+  it('does not let an older successful pin clear a newer unpin guard', async () => {
+    const settle: Array<(v: { ok: boolean }) => void> = []
+    patch.mockImplementation(
+      () => new Promise(resolve => settle.push(resolve))
+    )
+
+    $sessions.set([row('rapid', { pinned: false })])
+    $pinnedSessionIds.set(['rapid'])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect(settle).toHaveLength(2)
+    settle[0]?.({ ok: true })
+    await flush()
+    await flush()
+
+    $sessions.set([row('rapid', { pinned: true })])
+    await flush()
+    const remainedUnpinned = !$pinnedSessionIds.get().includes('rapid')
+
+    settle[1]?.({ ok: true })
+    await flush()
+    await flush()
+
+    expect(remainedUnpinned).toBe(true)
+  })
+
+  it('does not let an older successful unpin clear a newer pin guard', async () => {
+    const settle: Array<(v: { ok: boolean }) => void> = []
+    patch.mockImplementation(
+      () => new Promise(resolve => settle.push(resolve))
+    )
+
+    $sessions.set([row('rapid-repin', { pinned: true })])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+    $pinnedSessionIds.set(['rapid-repin'])
+    await flush()
+
+    expect(settle).toHaveLength(2)
+    settle[0]?.({ ok: true })
+    await flush()
+    await flush()
+
+    $sessions.set([row('rapid-repin', { pinned: false })])
+    await flush()
+    const remainedPinned = $pinnedSessionIds.get().includes('rapid-repin')
+
+    settle[1]?.({ ok: true })
+    await flush()
+    await flush()
+
+    expect(remainedPinned).toBe(true)
+  })
+
+  it('does not let an older failed pin restart a newer unpin write', async () => {
+    const settle: Array<{ reject: (error: Error) => void; resolve: (v: { ok: boolean }) => void }> = []
+    patch.mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          settle.push({ reject, resolve })
+        })
+    )
+
+    $sessions.set([row('rapid-failure', { pinned: false })])
+    $pinnedSessionIds.set(['rapid-failure'])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect(settle).toHaveLength(2)
+    settle[0]?.reject(new Error('older write failed'))
+    await flush()
+    await flush()
+
+    $sessions.set([row('rapid-failure', { pinned: true })])
+    await flush()
+    const remainedUnpinned = !$pinnedSessionIds.get().includes('rapid-failure')
+    const writeCount = settle.length
+
+    for (const deferred of settle.slice(1)) {
+      deferred.resolve({ ok: true })
+    }
+
+    await flush()
+    await flush()
+
+    expect(remainedUnpinned).toBe(true)
+    expect(writeCount).toBe(2)
+  })
+
+  it('retries the latest failed unpin without re-pinning locally', async () => {
+    patch.mockRejectedValueOnce(new Error('unpin failed'))
+
+    $sessions.set([row('retry-unpin', { pinned: true })])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(1)
+    expect(patch).toHaveBeenLastCalledWith('retry-unpin', false, undefined)
+
+    $sessions.set([row('retry-unpin', { pinned: true }), row('other')])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(2)
+    expect(patch).toHaveBeenLastCalledWith('retry-unpin', false, undefined)
+    expect($pinnedSessionIds.get()).not.toContain('retry-unpin')
+  })
+
+  it('retries the latest failed pin without unpinning locally', async () => {
+    patch.mockRejectedValueOnce(new Error('pin failed'))
+
+    $sessions.set([row('retry-pin', { pinned: false })])
+    $pinnedSessionIds.set(['retry-pin'])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(1)
+    expect(patch).toHaveBeenLastCalledWith('retry-pin', true, undefined)
+
+    $sessions.set([row('retry-pin', { pinned: false }), row('other')])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(2)
+    expect(patch).toHaveBeenLastCalledWith('retry-pin', true, undefined)
+    expect($pinnedSessionIds.get()).toContain('retry-pin')
   })
 })
