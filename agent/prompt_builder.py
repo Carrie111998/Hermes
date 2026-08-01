@@ -2534,6 +2534,25 @@ def build_context_files_prompt(
         )
     if project_context:
         sections.append(project_context)
+    else:
+        # Global fallback (Patrick 2026-08-01): HERMES_HOME/.hermes.md (ou
+        # AGENTS.md) quando o cwd nao tem context file proprio. Regras globais
+        # do Hermes valem em qualquer diretorio, com precedencia local.
+        _global_ctx = get_hermes_home() / ".hermes.md"
+        if not _global_ctx.exists():
+            _global_ctx = get_hermes_home() / "AGENTS.md"
+        if _global_ctx.exists():
+            try:
+                content = _global_ctx.read_text(encoding="utf-8").strip()
+                if content:
+                    content = _scan_context_content(content, _global_ctx.name)
+                    content = _truncate_content(
+                        content, _global_ctx.name, context_length=context_length,
+                        read_path=str(_global_ctx),
+                    )
+                    sections.append(content)
+            except Exception as e:
+                logger.debug("Could not read global context file %s: %s", _global_ctx, e)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
