@@ -4501,7 +4501,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
-        self._provider_allow_fallbacks = pr.get("allow_fallbacks", True)
 
         # OpenRouter Pareto Code router knob — coding-score floor (0.0-1.0).
         # Only applied when model.model == "openrouter/pareto-code".
@@ -5352,37 +5351,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             snapshot["session_cache_rate"] = None
 
-        # Cost estimation for the status bar (only when show_cost is enabled)
+        # Cost for the status bar (only when show_cost is enabled). We render
+        # the per-call accumulator that conversation_loop already maintains:
+        # each API call is priced on its resolved route (so fallbacks, model
+        # switches, and MoA sessions are accounted correctly) and accumulated
+        # into agent.session_estimated_cost_usd / session_cost_status /
+        # session_cost_source. Repricing the cumulative lifetime totals here
+        # against the *current* model/provider would be wrong, and calling
+        # estimate_usage_cost() during synchronous status-bar rendering could
+        # cold-fetch /models metadata and block chrome repaint.
         if getattr(self, '_show_cost', False):
             try:
-                total_tok = snapshot["session_total_tokens"]
-                if total_tok > 0:
-                    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-                    usage = CanonicalUsage(
-                        input_tokens=snapshot["session_input_tokens"],
-                        output_tokens=snapshot["session_output_tokens"],
-                        cache_read_tokens=snapshot["session_cache_read_tokens"],
-                        cache_write_tokens=snapshot["session_cache_write_tokens"],
-                        request_count=snapshot["session_api_calls"],
-                    )
-                    cost_result = estimate_usage_cost(
-                        model_name,
-                        usage,
-                        provider=getattr(agent, "provider", None),
-                        base_url=getattr(agent, "base_url", None),
-                        api_key=getattr(agent, "api_key", None),
-                    )
-                    snapshot["session_cost_label"] = cost_result.label
-                    snapshot["session_cost_status"] = cost_result.status
+                cost_status = getattr(agent, "session_cost_status", "unknown") or "unknown"
+                cost_source = getattr(agent, "session_cost_source", "none") or "none"
+                snapshot["session_cost_status"] = cost_status
+                snapshot["session_cost_source"] = cost_source
+                amount = getattr(agent, "session_estimated_cost_usd", None)
+                if amount is not None and float(amount) > 0:
+                    snapshot["session_cost_label"] = f"~${float(amount):.2f}"
+                elif cost_status == "included":
+                    snapshot["session_cost_label"] = "included"
                 else:
                     snapshot["session_cost_label"] = ""
-                    snapshot["session_cost_status"] = "unknown"
             except Exception:
                 snapshot["session_cost_label"] = ""
                 snapshot["session_cost_status"] = "unknown"
+                snapshot["session_cost_source"] = "none"
         else:
             snapshot["session_cost_label"] = ""
             snapshot["session_cost_status"] = "unknown"
+            snapshot["session_cost_source"] = "none"
 
         compressor = getattr(agent, "context_compressor", None)
         if compressor:

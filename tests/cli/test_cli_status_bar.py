@@ -30,6 +30,9 @@ def _attach_agent(
     context_tokens: int,
     context_length: int,
     compressions: int = 0,
+    estimated_cost_usd: float = 0.0,
+    cost_status: str = "unknown",
+    cost_source: str = "none",
 ):
     cli_obj.agent = SimpleNamespace(
         model=cli_obj.model,
@@ -43,6 +46,9 @@ def _attach_agent(
         session_completion_tokens=completion_tokens,
         session_total_tokens=total_tokens,
         session_api_calls=api_calls,
+        session_estimated_cost_usd=estimated_cost_usd,
+        session_cost_status=cost_status,
+        session_cost_source=cost_source,
         get_rate_limit_state=lambda: None,
         context_compressor=SimpleNamespace(
             last_prompt_tokens=context_tokens,
@@ -333,16 +339,73 @@ class TestShowCostStatusBar:
             context_tokens=12_000,
             context_length=200_000,
             cache_read_tokens=50_000,
+            estimated_cost_usd=0.0234,
+            cost_status="estimated",
+            cost_source="official_docs_snapshot",
         )
         cli_obj._show_cost = True
         text = cli_obj._build_status_bar_text(width=120)
         # Should show provider, cost label, tokens, and cache rate
         assert "anthropic" in text  # provider from _attach_agent
+        assert "~$0.02" in text  # estimated cost label from the accumulator
         assert "↓" in text  # input tokens arrow
         assert "↑" in text  # output tokens arrow
         assert "cache" in text  # cache rate
         # Should NOT show the old "tok" suffix (replaced by ↓↑ arrows)
         assert "tok" not in text.replace("↓", "").replace("↑", "")
+
+    def test_show_cost_renders_accumulated_cost_not_reprice(self):
+        """Regression: cost must come from the per-call accumulator, not a
+        reprice of cumulative token totals against the current model/provider.
+
+        A session that fell back to a cheaper model (or switched models / ran
+        MoA) has earlier calls priced on their own resolved routes; the status
+        bar must render that accumulated value verbatim and never recompute it
+        from the lifetime token totals with the *current* model.
+        """
+        # Lifetime totals are large and would price high if repriced against
+        # the current anthropic model. The accumulated cost is small because
+        # most of the session ran on a cheap fallback model.
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=1_000_000,
+            completion_tokens=200_000,
+            total_tokens=1_200_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+            cache_read_tokens=500_000,
+            estimated_cost_usd=0.0142,
+            cost_status="estimated",
+            cost_source="official_docs_snapshot",
+        )
+        cli_obj._show_cost = True
+        text = cli_obj._build_status_bar_text(width=120)
+        # The accumulated (fallback-priced) value wins; no reprice against the
+        # current model. An estimate_usage_cost reprice of 1.2M tokens on
+        # claude-sonnet would show dollars, not cents.
+        assert "~$0.01" in text  # the exact accumulated label
+
+    def test_show_cost_included_status_shows_included_label(self):
+        """When the accumulator reports an included (bundled-plan) status, the
+        status bar must show the 'included' label rather than an empty string,
+        so a swallowed pricing error or missing label cannot pass silently."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_000,
+            total_tokens=12_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+            estimated_cost_usd=0.0,
+            cost_status="included",
+            cost_source="none",
+        )
+        cli_obj._show_cost = True
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "included" in text
+        assert "~$" not in text
 
     def test_show_cost_disabled_hides_cost_and_tokens_default(self):
         """When show_cost is not set (default False), cost/tokens should not appear."""
@@ -354,10 +417,13 @@ class TestShowCostStatusBar:
             api_calls=5,
             context_tokens=12_000,
             context_length=200_000,
+            estimated_cost_usd=0.0234,
+            cost_status="estimated",
         )
         # _show_cost not set — defaults to False via getattr
         text = cli_obj._build_status_bar_text(width=120)
         assert "claude-sonnet-4-20250514" in text
+        assert "~$0.02" not in text
         assert "↓" not in text
         assert "↑" not in text
         assert "cache" not in text
