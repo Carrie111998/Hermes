@@ -5363,6 +5363,25 @@ _PLATFORMS = [
 ]
 
 
+_WINDOWS_MATRIX_UNAVAILABLE_REASON = (
+    "Matrix setup is unavailable on native Windows because the encrypted Matrix "
+    "client dependency (python-olm) has no Windows wheel. Run Hermes in WSL to "
+    "configure Matrix."
+)
+
+
+def _windows_matrix_placeholder(entry=None) -> dict:
+    """Return the disabled Matrix setup row shown on native Windows."""
+    return {
+        "key": "matrix",
+        "label": getattr(entry, "label", "Matrix"),
+        "emoji": getattr(entry, "emoji", "🔐"),
+        "token_var": "MATRIX_ACCESS_TOKEN",
+        "unavailable_reason": _WINDOWS_MATRIX_UNAVAILABLE_REASON,
+        "_registry_entry": entry,
+    }
+
+
 def _all_platforms() -> list[dict]:
     """Return the full list of platforms for setup menus.
 
@@ -5375,12 +5394,11 @@ def _all_platforms() -> list[dict]:
 
     Platform-specific gating: some platforms can't be configured on
     every host. Currently:
-      - Matrix is hidden on Windows. The [matrix] extra pulls
+      - Matrix is visible but disabled on Windows. The [matrix] extra pulls
         ``mautrix[encryption]`` -> ``python-olm``, which has no Windows
         wheel and needs ``make`` + libolm to build from sdist. There's
-        no native Windows path that works, so we don't offer it in the
-        picker. Users who want Matrix on Windows can run hermes under
-        WSL.
+        no native Windows path that works, so the picker explains that users
+        who want Matrix on Windows can run hermes under WSL.
     """
     # Populate the registry so plugin platforms are visible. Idempotent.
     # Bundled platform plugins (``kind: platform``) auto-load unconditionally,
@@ -5396,9 +5414,11 @@ def _all_platforms() -> list[dict]:
 
     platforms = [dict(p) for p in _PLATFORMS]
 
-    # Drop platforms that can't function on this host. See docstring.
-    if sys.platform == "win32":
-        platforms = [p for p in platforms if p.get("key") != "matrix"]
+    # Keep platforms that can't function on this host visible when the absence
+    # would be confusing, but mark them unavailable so selecting the row gives
+    # an actionable explanation instead of attempting setup. See docstring.
+    if sys.platform == "win32" and not any(p.get("key") == "matrix" for p in platforms):
+        platforms.append(_windows_matrix_placeholder())
 
     by_key = {p["key"]: p for p in platforms}
 
@@ -5410,10 +5430,12 @@ def _all_platforms() -> list[dict]:
     for entry in platform_registry.all_entries():
         if entry.name in by_key:
             continue  # built-in already covers it
-        # Drop platforms that can't function on this host. Matrix is hidden on
-        # Windows (python-olm has no Windows wheel) — applies whether matrix is
-        # a built-in or, post-#41112, a registry-discovered plugin.
+        # Matrix cannot function on native Windows (python-olm has no Windows
+        # wheel), but keep it visible with an unavailable status so users know
+        # why the setup target exists in docs yet cannot be configured here.
         if sys.platform == "win32" and entry.name == "matrix":
+            by_key[entry.name] = _windows_matrix_placeholder(entry)
+            platforms = [by_key[p["key"]] if p.get("key") == entry.name else p for p in platforms]
             continue
         platforms.append(
             {
@@ -5434,6 +5456,9 @@ def _platform_status(platform: dict) -> str:
     Returns uncolored text so it can safely be embedded in
     curses menu items (ANSI codes break width calculation).
     """
+    if platform.get("unavailable_reason"):
+        return "unavailable on this OS"
+
     entry = platform.get("_registry_entry")
     if entry is not None:
         configured = False
@@ -6327,6 +6352,17 @@ def _configure_platform(platform: dict) -> None:
     is needed here. User-installed platform plugins under ~/.hermes/plugins/
     must already be in ``plugins.enabled`` before they appear in this menu.
     """
+    if platform.get("unavailable_reason"):
+        print()
+        print(
+            color(
+                f"  ─── {platform.get('emoji', '🔌')} {platform.get('label', platform['key'])} Setup ───",
+                Colors.CYAN,
+            )
+        )
+        print_warning(f"  {platform['unavailable_reason']}")
+        return
+
     entry = platform.get("_registry_entry")
 
     if entry is not None and entry.setup_fn is not None:
