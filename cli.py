@@ -6754,7 +6754,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             rendered = self._md_stream_processor.feed_line(line)
             if rendered is not None:
-                _cprint(f"{_STREAM_PAD}{rendered}")
+                for rendered_line in rendered.split("\n"):
+                    _cprint(f"{_STREAM_PAD}{rendered_line}")
 
         def _flush_table_buf() -> None:
             buf = self._stream_table_buf
@@ -6886,7 +6887,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                 rendered = self._md_stream_processor.feed_line(self._stream_buf)
                 if rendered is not None:
-                    _cprint(f"{_STREAM_PAD}{rendered}")
+                    for rendered_line in rendered.split("\n"):
+                        _cprint(f"{_STREAM_PAD}{rendered_line}")
             else:
                 line = _strip_markdown_syntax(self._stream_buf) if _mode == "strip" else self._stream_buf
                 _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
@@ -6895,7 +6897,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if _mode == "render" and getattr(self, "_md_stream_processor", None) is not None:
             tail = self._md_stream_processor.flush()
             if tail:
-                _cprint(f"{_STREAM_PAD}{tail}")
+                for rendered_line in tail.split("\n"):
+                    _cprint(f"{_STREAM_PAD}{rendered_line}")
             self._md_stream_processor = None
 
         # Close the response box
