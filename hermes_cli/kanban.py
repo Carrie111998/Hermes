@@ -1867,34 +1867,28 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task = kb.get_task(conn, args.task_id)
-        if not task:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
-            return 1
-        comments = kb.list_comments(conn, args.task_id)
-        events = kb.list_events(conn, args.task_id)
-        parents = kb.parent_ids(conn, args.task_id)
-        dependency_snapshot = kb.dependency_snapshot(conn, args.task_id)
-        children = kb.child_ids(conn, args.task_id)
-        runs = kb.list_runs(conn, args.task_id, **rsk)
-        # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
-        # ``result=``. Surfacing the latest summary here keeps ``show`` from
-        # looking like a no-op when the worker actually did real work.
-        latest_summary = kb.latest_summary(conn, args.task_id)
+        with kb.read_txn(conn):
+            task = kb.get_task(conn, args.task_id)
+            if not task:
+                print(f"no such task: {args.task_id}", file=sys.stderr)
+                return 1
+            comments = kb.list_comments(conn, args.task_id)
+            events = kb.list_events(conn, args.task_id)
+            parents = kb.parent_ids(conn, args.task_id)
+            expected_state = kb.expected_state_snapshot(conn, args.task_id)
+            children = kb.child_ids(conn, args.task_id)
+            runs = kb.list_runs(conn, args.task_id, **rsk)
+            # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
+            # ``result=``. Surfacing the latest summary here keeps ``show`` from
+            # looking like a no-op when the worker actually did real work.
+            latest_summary = kb.latest_summary(conn, args.task_id)
 
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
             "parents": parents,
-            "expected_state": {
-                "status": task.status,
-                "assignee": task.assignee,
-                "run": task.current_run_id,
-                "claim": task.claim_lock,
-                "dependencies": dependency_snapshot,
-                "event": events[-1].id if events else None,
-            },
+            "expected_state": expected_state,
             "children": children,
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}

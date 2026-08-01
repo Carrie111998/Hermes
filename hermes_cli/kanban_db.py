@@ -2791,6 +2791,19 @@ def write_txn(conn: sqlite3.Connection):
         _check_file_length_invariant(conn)
 
 
+@contextlib.contextmanager
+def read_txn(conn: sqlite3.Connection):
+    """Hold one consistent SQLite read snapshot across related evidence."""
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
 class KanbanStateConflict(RuntimeError):
     """Raised when an atomic expected-state guard does not match the board."""
 
@@ -2824,6 +2837,89 @@ def dependency_snapshot(
     return [{"id": row["id"], "status": row["status"]} for row in rows]
 
 
+def latest_event_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Return the canonical monotonic task-event CAS token."""
+    row = conn.execute(
+        "SELECT MAX(id) AS latest FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["latest"] is None:
+        return None
+    return int(row["latest"])
+
+
+def expected_state_snapshot(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    """Return canonical expected-state evidence for one task."""
+    row = conn.execute(
+        "SELECT status, assignee, current_run_id, claim_lock "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "status": row["status"],
+        "assignee": row["assignee"],
+        "run": row["current_run_id"],
+        "claim": row["claim_lock"],
+        "dependencies": dependency_snapshot(conn, task_id),
+        "event": latest_event_id(conn, task_id),
+    }
+
+
+def _raise_transition_conflict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allowed_statuses: Iterable[str],
+    expected_run_id: Optional[int] = None,
+) -> None:
+    """Raise structured evidence for a guarded intrinsic transition miss."""
+    actual = expected_state_snapshot(conn, task_id)
+    if actual is None:
+        raise KanbanStateConflict(
+            [{
+                "task_id": task_id,
+                "field": "task",
+                "expected": "present",
+                "actual": "missing",
+            }]
+        )
+
+    allowed = sorted(set(allowed_statuses))
+    conflicts: list[dict[str, Any]] = []
+    if actual["status"] not in allowed:
+        conflicts.append(
+            {
+                "task_id": task_id,
+                "field": "status",
+                "expected": {"one_of": allowed},
+                "actual": actual["status"],
+            }
+        )
+    if expected_run_id is not None and actual["run"] != int(expected_run_id):
+        conflicts.append(
+            {
+                "task_id": task_id,
+                "field": "run",
+                "expected": int(expected_run_id),
+                "actual": actual["run"],
+            }
+        )
+    if not conflicts:
+        conflicts.append(
+            {
+                "task_id": task_id,
+                "field": "transition",
+                "expected": "eligible",
+                "actual": "rejected",
+            }
+        )
+    raise KanbanStateConflict(conflicts)
+
+
 def _validate_expected_task_states(
     conn: sqlite3.Connection,
     expected_states: Optional[Mapping[str, Mapping[str, Any]]],
@@ -2846,12 +2942,8 @@ def _validate_expected_task_states(
             raise ValueError(
                 f"unknown expected-state field(s) for {task_id}: {', '.join(unknown)}"
             )
-        row = conn.execute(
-            "SELECT status, assignee, current_run_id, claim_lock "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
+        actual = expected_state_snapshot(conn, task_id)
+        if actual is None:
             conflicts.append(
                 {
                     "task_id": task_id,
@@ -2861,21 +2953,6 @@ def _validate_expected_task_states(
                 }
             )
             continue
-
-        actual: dict[str, Any] = {
-            "status": row["status"],
-            "assignee": row["assignee"],
-            "run": row["current_run_id"],
-            "claim": row["claim_lock"],
-        }
-        if "dependencies" in expected:
-            actual["dependencies"] = dependency_snapshot(conn, task_id)
-        if "event" in expected:
-            event_row = conn.execute(
-                "SELECT MAX(id) AS latest FROM task_events WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            actual["event"] = event_row["latest"] if event_row else None
 
         for field_name, expected_value in expected.items():
             actual_value = actual[field_name]
@@ -4749,10 +4826,13 @@ def reassign_task(
     """
     profile = _canonical_assignee(profile)
     if expected_states:
+        reservation: Optional[str] = None
+        reserved_row: Optional[sqlite3.Row] = None
         with write_txn(conn):
             _validate_expected_task_states(conn, expected_states)
             row = conn.execute(
-                "SELECT status, claim_lock, worker_pid, assignee "
+                "SELECT status, claim_lock, claim_expires, worker_pid, "
+                "assignee, current_run_id "
                 "FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
@@ -4769,50 +4849,116 @@ def reassign_task(
                 reclaim_first
                 and (row["status"] == "running" or row["claim_lock"] is not None)
             )
-            if reclaimed:
-                termination = _terminate_reclaimed_worker(
-                    row["worker_pid"], row["claim_lock"]
-                )
-                conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
-                    (task_id,),
-                )
-                run_id = _end_run(
+            if not reclaimed:
+                if row["assignee"] != profile:
+                    conn.execute(
+                        "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                        "last_failure_error = NULL WHERE id = ?",
+                        (profile, task_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET assignee = ? WHERE id = ?",
+                        (profile, task_id),
+                    )
+                _append_event(conn, task_id, "assigned", {"assignee": profile})
+                return True
+
+            # Reserve the exact claimed run under the validated CAS snapshot,
+            # then release SQLite's board-wide writer lock before signalling or
+            # polling the worker. The synthetic claim keeps dispatchers and
+            # claim renewals from taking this task while termination is in
+            # flight; the final transaction must still own this exact token.
+            reservation = f"reassign:{secrets.token_hex(16)}"
+            reserve_expires = int(time.time()) + RECLAIM_DEFER_GRACE_SECONDS
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = ?, claim_expires = ? "
+                "WHERE id = ? AND status = ? AND claim_lock IS ? "
+                "AND current_run_id IS ?",
+                (
+                    reservation,
+                    reserve_expires,
+                    task_id,
+                    row["status"],
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                _raise_transition_conflict(
                     conn,
                     task_id,
-                    outcome="reclaimed",
-                    status="reclaimed",
-                    error=(
-                        f"manual_reclaim: {reason or 'reassign'}"
-                        if reason
-                        else f"manual_reclaim lock={row['claim_lock']}"
-                    ),
-                    metadata=termination,
+                    allowed_statuses=(row["status"],),
+                    expected_run_id=row["current_run_id"],
                 )
-                payload = {
-                    "manual": True,
-                    "reason": reason or "reassign",
-                    "prev_lock": row["claim_lock"],
-                }
-                payload.update(termination)
-                _append_event(
-                    conn, task_id, "reclaimed", payload, run_id=run_id
+            if row["current_run_id"] is not None:
+                conn.execute(
+                    "UPDATE task_runs SET claim_lock = ?, claim_expires = ? "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (reservation, reserve_expires, int(row["current_run_id"])),
                 )
+            reserved_row = row
 
-            if reclaimed or row["assignee"] != profile:
-                conn.execute(
-                    "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                    "last_failure_error = NULL WHERE id = ?",
-                    (profile, task_id),
+        assert reservation is not None and reserved_row is not None
+        termination = _terminate_reclaimed_worker(
+            reserved_row["worker_pid"], reserved_row["claim_lock"]
+        )
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = ? AND claim_lock = ? "
+                "AND current_run_id IS ?",
+                (
+                    task_id,
+                    reserved_row["status"],
+                    reservation,
+                    reserved_row["current_run_id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                actual = expected_state_snapshot(conn, task_id)
+                raise KanbanStateConflict(
+                    [{
+                        "task_id": task_id,
+                        "field": "reassign_reservation",
+                        "expected": "owned",
+                        "actual": (
+                            "missing" if actual is None
+                            else {
+                                "status": actual["status"],
+                                "run": actual["run"],
+                                "claim": actual["claim"],
+                            }
+                        ),
+                    }]
                 )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET assignee = ? WHERE id = ?",
-                    (profile, task_id),
-                )
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                error=(
+                    f"manual_reclaim: {reason or 'reassign'}"
+                    if reason
+                    else f"manual_reclaim lock={reserved_row['claim_lock']}"
+                ),
+                metadata=termination,
+            )
+            payload = {
+                "manual": True,
+                "reason": reason or "reassign",
+                "prev_lock": reserved_row["claim_lock"],
+            }
+            payload.update(termination)
+            _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                "last_failure_error = NULL WHERE id = ?",
+                (profile, task_id),
+            )
             _append_event(conn, task_id, "assigned", {"assignee": profile})
-            return True
+        return True
 
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
@@ -5814,6 +5960,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    guarded = bool(expected_states)
     recurrences = 0
     with write_txn(conn):
         _validate_expected_task_states(conn, expected_states)
@@ -5822,11 +5969,19 @@ def block_task(
             (task_id,),
         ).fetchone()
         if cur_row is None:
+            if guarded:
+                _raise_transition_conflict(
+                    conn,
+                    task_id,
+                    allowed_statuses=("ready", "running"),
+                    expected_run_id=expected_run_id,
+                )
             return False
         if comment_body:
             if not comment_author or not comment_author.strip():
                 raise ValueError("comment author is required")
-            _add_comment_in_txn(conn, task_id, comment_author, comment_body)
+            if not guarded:
+                _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -5855,7 +6010,16 @@ def block_task(
                 else (kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
+                if guarded:
+                    _raise_transition_conflict(
+                        conn,
+                        task_id,
+                        allowed_statuses=("ready", "running"),
+                        expected_run_id=expected_run_id,
+                    )
                 return False
+            if comment_body:
+                _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -5908,7 +6072,16 @@ def block_task(
                 else (kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
+                if guarded:
+                    _raise_transition_conflict(
+                        conn,
+                        task_id,
+                        allowed_statuses=("ready", "running"),
+                        expected_run_id=expected_run_id,
+                    )
                 return False
+            if comment_body:
+                _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -5961,7 +6134,16 @@ def block_task(
                     (kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
+                if guarded:
+                    _raise_transition_conflict(
+                        conn,
+                        task_id,
+                        allowed_statuses=("ready", "running"),
+                        expected_run_id=expected_run_id,
+                    )
                 return False
+            if comment_body:
+                _add_comment_in_txn(conn, task_id, comment_author or "", comment_body)
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
