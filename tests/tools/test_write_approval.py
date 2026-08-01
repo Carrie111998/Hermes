@@ -567,6 +567,7 @@ def test_gateway_pending_list_keeps_cleanup_notice_when_gate_is_off(hermes_home,
     out = asyncio.run(runner._handle_skills_command(MessageEvent(text=command)))
 
     assert "Cleanup removed 1 expired pending skill write(s)." in out
+    assert out.count("Cleanup removed 1 expired pending skill write(s).") == 1
 
 
 def test_skill_pending_legacy_record_uses_filename_as_id(hermes_home):
