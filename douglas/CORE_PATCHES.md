@@ -337,4 +337,81 @@ descartó.
   build` + relanzamiento real de la app — capturado visualmente:
   "DOUGLAS AGENT" en verde esmeralda, fuente Dimitri Swank, en la
   pantalla de nueva sesión.
+
+## apps/desktop/electron/main.ts (7 — aviso de `dist/` desfasado)
+
+- **Qué:** `warnIfRendererBundleStale()`, llamada desde
+  `resolveRendererIndex()` cada vez que se resuelve sin servidor de
+  desarrollo. Compara la fecha de `dist/index.html` contra el archivo
+  `.ts`/`.tsx` más reciente bajo `src/` (escaneo acotado a 4000
+  archivos); si `src/` es más nuevo por más de 5 minutos, escribe un
+  aviso (consola + `desktop.log`) indicando que puede haber un bundle
+  desfasado y sugiriendo `npm run build`. Nunca bloquea el arranque.
+- **Por qué:** hallazgo de esta sesión — un `dist/` de 6 días de
+  antigüedad produjo un `ReferenceError` en el renderer que parecía
+  "el gateway no arranca" (ver `douglas/README.md`, "Si la app arranca
+  y muere"). `npm run dev` nunca lee `dist/`, así que nada más en el
+  proyecto podía haber avisado de esto.
+- **Decisión de diseño (importante):** gateado en el `app.isPackaged`
+  **real** de Electron, no en el `IS_PACKAGED` combinado del módulo —
+  intencional. La primera versión de este parche usaba `IS_PACKAGED`
+  y el aviso nunca disparaba en la prueba, precisamente porque
+  `HERMES_DESKTOP_IS_PACKAGED=1` (el override manual usado para probar
+  el código de modo empaquetado desde un checkout de desarrollo) hace
+  `IS_PACKAGED` verdadero — exactamente el patrón que este aviso
+  existe para detectar. Corregido antes de mergear, verificado con una
+  prueba end-to-end real (ver abajo).
+- **Alternativa descartada:** comparar contra el `install-stamp.json`
+  o el bundle de `electron-main.mjs` en vez de escanear `src/` —
+  descartada porque ninguno de los dos se actualiza al mismo ritmo que
+  el renderer específicamente; un desfase entre `electron-main.mjs`
+  (que sí se regenera en cada `npm run dev`) y `dist/assets` habría
+  dado falsos positivos constantes en flujo de desarrollo normal.
+- **Riesgo de merge:** bajo — función nueva, aislada, solo logging,
+  ningún cambio de comportamiento de arranque.
+- **Verificado end-to-end:** tocar `src/main.tsx` + retrasar
+  artificialmente `dist/index.html` 1 hora + lanzar con
+  `HERMES_DESKTOP_IS_PACKAGED=1 electron .` → el aviso apareció
+  correctamente ("dist/ looks stale: ... ~1.0 hour(s) newer..."). Tras
+  corregir el bug de gating (`IS_PACKAGED` → `app.isPackaged`),
+  re-probado y confirmado. `tsc --build tsconfig.electron.json` (0
+  errores) en cada iteración.
+
+## Verificación real — Fase 1, cierre
+
+- **Migración de userData contra datos reales (autorizada
+  explícitamente):** copia completa de `%APPDATA%\Douglas Agent\` a
+  `.backup-manual` (verificada byte a byte: 1215 archivos, mismo
+  tamaño total, muestreo de archivos clave idéntico) antes de tocar
+  nada; renombrado a `.pre-test`; arranque real de la app.
+  Resultado: migró 80/80 archivos desde `%APPDATA%\Hermes\` real,
+  `.migrated-from-hermes` con el contenido esperado (`migratedFrom`,
+  `migratedAt`, `fileCount`, lista completa de archivos), y
+  `%APPDATA%\Hermes\` quedó exactamente igual que antes (80 archivos,
+  mismo tamaño en bytes) — confirmando que fue copia, no movimiento.
+  `native-oauth-tokens.json` no existe en los datos reales de esta
+  máquina (OAuth nativo nunca se usó) — la preservación de permisos
+  para ese archivo específico sigue solo cubierta por el test unitario
+  sintético, no por esta prueba real. Carpeta original restaurada y
+  verificada idéntica al backup; backup manual dejado en disco para
+  que el usuario decida si lo borra.
+- **Cadena de resolución en "máquina limpia" simulada:** no se pudo
+  probar lanzando la app real sin tocar el registro — dos intentos
+  (`ln -s`/shadow de `reg.exe` vía PATH, y exclusión de
+  `System32` del PATH del proceso hijo) fallaron por razones no
+  relacionadas con el registro (el shadow no interceptó de forma
+  fiable; excluir `System32` rompió el arranque interno de
+  Electron/Chromium — `Error: Failed to get 'appData' path` — antes de
+  llegar siquiera al código de la app). En su lugar, se verificó la
+  lógica exacta con una réplica fiel del algoritmo de
+  `resolveHermesHome()` (rama Windows), usando la función real
+  `readWindowsUserEnvVar()` sin modificar (importada de su módulo,
+  con un `exec` inyectado que simula "valor no encontrado" — el mismo
+  resultado que un `reg query` real fallaría en una máquina limpia,
+  sin tocar `HKCU\Environment` en ningún momento) y rutas de sandbox
+  para `%LOCALAPPDATA%`/home. Las tres ramas (solo `douglas`, solo
+  `hermes`, ninguna) resolvieron correctamente. Documentado como
+  verificación parcial en "Riesgos abiertos" — la réplica prueba el
+  algoritmo, no la app real arrancando en una máquina sin el valor de
+  registro heredado.
 - **Commit:** *(pendiente)*

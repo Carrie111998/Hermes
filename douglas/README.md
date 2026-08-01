@@ -143,6 +143,40 @@ mantiene "hey hermes" tal cual: es la opción honesta, no un descuido.
    contra audio ambiente, y empaquetar el `.onnx`/`.tflite` resultante en
    `tools/wakewords/`.
 
+### Si la app arranca y muere: `dist/` desfasado
+
+`apps/desktop/dist/` (el build de producción del renderer) ya está en
+`.gitignore` — nunca fue un problema de git. El problema real: **`npm run
+dev` nunca lee `dist/`** (el renderer se sirve en vivo desde Vite), así que
+un `dist/` reconstruido una vez y luego abandonado puede quedarse desfasado
+días sin que nada lo note — hasta que alguien arranca en modo empaquetado
+(un build real, o `HERMES_DESKTOP_IS_PACKAGED=1 electron .` para probar ese
+código a mano, como en la sesión que persiguió esto) y el bundle viejo
+referencia algo que el código fuente actual ya no tiene. El síntoma es
+engañoso: el backend arranca bien, el renderer es el que revienta —
+"parece" que el gateway no arranca.
+
+**Si la app arranca y muere:**
+```bash
+cd apps/desktop && npm run build
+```
+luego reintenta. `npm run pack`/`npm run dist*` ya hacen esto automáticamente
+(`"pack": "npm run build && npm run builder -- --dir"`) — un build empaquetado
+real nunca puede quedar desfasado así. Solo afecta checkouts locales
+arrancados en modo empaquetado sin pasar por esos scripts.
+
+**Guardia añadida:** `apps/desktop/electron/main.ts`
+(`warnIfRendererBundleStale()`) compara, cada vez que se resuelve
+`resolveRendererIndex()` sin servidor de desarrollo, la fecha de
+`dist/index.html` contra el archivo `.ts`/`.tsx` más reciente bajo `src/`. Si
+`src/` es más nuevo por más de 5 minutos, escribe una advertencia clara en
+consola y en `desktop.log` — nunca bloquea el arranque, es solo una pista.
+Deliberadamente gateado en el `app.isPackaged` **real** de Electron, no en el
+`IS_PACKAGED` combinado — un build realmente empaquetado nunca necesita el
+aviso (`dist/` siempre se reconstruye fresco al empaquetar), pero
+`HERMES_DESKTOP_IS_PACKAGED=1` (el override manual) sí debe seguir
+disparándolo, porque ese override es exactamente el patrón que causó esto.
+
 ### Fuente de marca
 
 El wordmark (`assets/logo.svg`) usa **Dimitri Swank Normal** — los TTF
@@ -279,6 +313,51 @@ que pasan. **CI con runner Linux es la fuente de verdad** para estos —
 Hermes ya trae 21 workflows en `.github/workflows/`, probablemente solo haga
 falta activarlos en el fork antes de confiar en la señal verde/roja de un
 PR que los toque.
+
+## Riesgos abiertos
+
+Índice de todo lo pendiente de verificar antes de la primera release
+pública, consolidado en un solo lugar. Cada uno tiene su detalle completo
+en la sección enlazada — esto es solo el resumen de una línea.
+
+1. **Cadena de resolución (`HERMES_HOME`/`DOUGLAS_HOME`) sin verificar en
+   máquina limpia real.** Verificada con una réplica fiel del algoritmo
+   (misma función `readWindowsUserEnvVar` real, registro simulado como
+   ausente sin tocar `HKCU\Environment`) — las tres ramas
+   (solo `~/.douglas`, solo `~/.hermes`, ninguna) pasan. Pero eso es una
+   réplica de la lógica, no la app real arrancando en una máquina que de
+   verdad no tenga el valor de registro heredado. Sigue sin confirmarse en
+   una instalación nueva de verdad.
+2. **`safeStorage` en macOS (Keychain) y Linux (libsecret) sin verificar.**
+   Ver "Verificar en hardware real" #1. El blindaje (try/catch, mensaje
+   explícito, nunca borra el archivo) está en el código; que el fallo de
+   descifrado realmente ocurra tras el rebrand no se ha confirmado en
+   hardware real.
+3. **Causa del incidente del worktree sin confirmar.** Ver "Procedimiento
+   seguro para worktrees de verificación". Dos intentos de reproducción
+   aislada no lo reprodujeron; el mecanismo de symlink quedó prohibido por
+   ser demostrablemente poco fiable, no porque se haya probado que fue la
+   causa.
+4. **Instalador NSIS / identidad `appId` sin resolver.** Ver
+   "Instalador NSIS / identidad appId sin resolver". Deliberadamente sin
+   tocar — va junto con el renombrado de `hermes-setup` antes de la
+   primera release pública.
+5. **Wake word sigue diciendo "hey hermes".** Ver "Wake word sigue diciendo
+   'hey hermes'". El texto de configuración es cosmético; el motor
+   (`openWakeWord`) tiene un modelo entrenado específicamente para ese
+   patrón acústico — cambiarlo sin retrenar no cambiaría lo que el motor
+   realmente escucha.
+6. ~~La versión muestra v0.19.1 pero package.json dice 0.17.0~~ —
+   **investigado, no es un riesgo.** `pyproject.toml` y
+   `hermes_cli/__init__.py` dicen `0.19.1` (coincide con lo que muestra la
+   barra de estado); `apps/desktop/package.json` dice `0.17.0`
+   deliberadamente sin sincronizar — `resolveHermesVersion()` en
+   `main.ts` ya documenta por qué: el panel "Acerca de" muestra a
+   propósito la versión canónica de Python (la que `release.py` incrementa),
+   no la del `package.json` del Electron, que históricamente se
+   desincronizaba (se quedó atascada en `0.0.2`). Comportamiento
+   intencional, documentado en el propio código, no un hueco de esta
+   sesión.
 
 ## Estructura
 
