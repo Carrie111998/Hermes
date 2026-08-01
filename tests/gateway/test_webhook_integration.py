@@ -271,8 +271,7 @@ class TestGitHubCommentDelivery:
 
     @pytest.mark.asyncio
     async def test_github_comment_delivery(self):
-        """When deliver='github_comment', the adapter invokes
-        ``gh pr comment`` via subprocess.run (mocked)."""
+        """PR conversation comments use the shared GitHub issue-comments API."""
         routes = {
             "pr-bot": {
                 "secret": _INSECURE_NO_AUTH,
@@ -325,9 +324,9 @@ class TestGitHubCommentDelivery:
         assert result.success is True
         mock_run.assert_called_once_with(
             [
-                "gh", "pr", "comment", "42",
-                "--repo", "org/repo",
-                "--body", "LGTM! The code looks great.",
+                "gh", "api", "repos/org/repo/issues/42/comments",
+                "--method", "POST",
+                "--raw-field", "body=LGTM! The code looks great.",
             ],
             capture_output=True,
             text=True,
@@ -338,3 +337,122 @@ class TestGitHubCommentDelivery:
         # Delivery info is retained after send() so interim status messages
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info
+
+    @pytest.mark.asyncio
+    async def test_issue_comment_delivery_uses_issue_comments_api(self):
+        """Issue comments use the same conversation endpoint as PR comments."""
+        routes = {
+            "issue-bot": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Issue: {issue.title}",
+                "deliver": "github_comment",
+                "deliver_extra": {
+                    "repo": "{repository.full_name}",
+                    "issue_number": "{issue.number}",
+                    "comment_type": "conversation",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        issue_payload = {
+            "action": "opened",
+            "issue": {"number": 464, "title": "Fix webhook comments"},
+            "repository": {"full_name": "org/repo"},
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/issue-bot",
+                json=issue_payload,
+                headers={
+                    "X-GitHub-Event": "issues",
+                    "X-GitHub-Delivery": "gh-issue-comment-001",
+                },
+            )
+            assert resp.status == 202
+
+        mock_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            return_value=mock_result,
+        ) as mock_run:
+            result = await adapter.send(
+                "webhook:issue-bot:gh-issue-comment-001", "Issue response"
+            )
+
+        assert result.success is True
+        mock_run.assert_called_once_with(
+            [
+                "gh", "api", "repos/org/repo/issues/464/comments",
+                "--method", "POST",
+                "--raw-field", "body=Issue response",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+
+    @pytest.mark.asyncio
+    async def test_review_comment_delivery_replies_to_review_thread(self):
+        """Review comments use the pulls-comments API and in_reply_to."""
+        routes = {
+            "review-bot": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Review comment: {comment.body}",
+                "deliver": "github_comment",
+                "deliver_extra": {
+                    "repo": "{repository.full_name}",
+                    "pr_number": "{pull_request.number}",
+                    "comment_type": "review",
+                    "review_comment_id": "{comment.id}",
+                },
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        review_payload = {
+            "action": "created",
+            "pull_request": {"number": 42},
+            "comment": {"id": 9001, "body": "Please handle this error"},
+            "repository": {"full_name": "org/repo"},
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/review-bot",
+                json=review_payload,
+                headers={
+                    "X-GitHub-Event": "pull_request_review_comment",
+                    "X-GitHub-Delivery": "gh-review-comment-001",
+                },
+            )
+            assert resp.status == 202
+
+        mock_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            return_value=mock_result,
+        ) as mock_run:
+            result = await adapter.send(
+                "webhook:review-bot:gh-review-comment-001", "Review response"
+            )
+
+        assert result.success is True
+        mock_run.assert_called_once_with(
+            [
+                "gh", "api", "repos/org/repo/pulls/42/comments",
+                "--method", "POST",
+                "--raw-field", "body=Review response",
+                "--field", "in_reply_to=9001",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )

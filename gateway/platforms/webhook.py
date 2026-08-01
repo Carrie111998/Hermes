@@ -1283,74 +1283,112 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _deliver_github_comment(
         self, content: str, delivery: dict
     ) -> SendResult:
-        """Post agent response as a GitHub PR/issue comment via ``gh`` CLI."""
+        """Post a GitHub conversation or review-thread reply via ``gh api``.
+
+        GitHub stores both Issue and PR conversation comments under the Issues
+        comments endpoint. Inline PR review comments are a separate resource;
+        ``review_comment_id`` makes the response a reply in that review thread.
+        ``pr_number`` remains supported for existing PR conversation routes.
+        """
         extra = delivery.get("deliver_extra", {})
         repo = extra.get("repo", "")
-        pr_number = extra.get("pr_number", "")
+        number = (
+            extra.get("number")
+            or extra.get("issue_number")
+            or extra.get("pr_number")
+        )
+        comment_type = str(
+            extra.get("comment_type")
+            or extra.get("target")
+            or ("review" if extra.get("review_comment_id") else "conversation")
+        ).lower()
+        review_comment_id = extra.get("review_comment_id")
 
-        if not repo or not pr_number:
+        if not repo or not number:
             logger.error(
-                "[webhook] github_comment delivery missing repo or pr_number"
+                "[webhook] github_comment delivery missing repo or issue/PR number"
             )
             return SendResult(
-                success=False, error="Missing repo or pr_number"
+                success=False, error="Missing repo or issue/PR number"
             )
+
+        if comment_type not in {
+            "conversation", "issue", "pr", "review", "review_comment",
+            "review_thread",
+        }:
+            logger.error("[webhook] invalid github comment type: %r", comment_type)
+            return SendResult(success=False, error="Invalid comment_type")
 
         # --- Input validation (prevent CLI argument injection) ---
-        # pr_number must be a positive integer.
         try:
-            pr_int = int(pr_number)
-            if pr_int <= 0:
+            number_int = int(number)
+            if number_int <= 0:
                 raise ValueError("non-positive")
         except (ValueError, TypeError):
-            logger.error(
-                "[webhook] invalid pr_number: %r", pr_number
-            )
-            return SendResult(
-                success=False, error="Invalid pr_number"
-            )
+            logger.error("[webhook] invalid issue/PR number: %r", number)
+            return SendResult(success=False, error="Invalid issue/PR number")
 
-        # repo must match owner/name (alphanumeric, hyphens, underscores, dots).
         if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
             logger.error("[webhook] invalid repo format: %r", repo)
-            return SendResult(
-                success=False, error="Invalid repo format"
-            )
+            return SendResult(success=False, error="Invalid repo format")
+
+        endpoint = f"repos/{repo}/issues/{number_int}/comments"
+        args = [
+            "gh", "api", endpoint,
+            "--method", "POST",
+            "--raw-field", f"body={content}",
+        ]
+
+        if comment_type in {"review", "review_comment", "review_thread"}:
+            if not review_comment_id:
+                logger.error(
+                    "[webhook] review comment delivery missing review_comment_id"
+                )
+                return SendResult(
+                    success=False, error="Missing review_comment_id"
+                )
+            try:
+                review_id_int = int(review_comment_id)
+                if review_id_int <= 0:
+                    raise ValueError("non-positive")
+            except (ValueError, TypeError):
+                logger.error(
+                    "[webhook] invalid review_comment_id: %r", review_comment_id
+                )
+                return SendResult(
+                    success=False, error="Invalid review_comment_id"
+                )
+            endpoint = f"repos/{repo}/pulls/{number_int}/comments"
+            args = [
+                "gh", "api", endpoint,
+                "--method", "POST",
+                "--raw-field", f"body={content}",
+                "--field", f"in_reply_to={review_id_int}",
+            ]
 
         try:
             result = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "comment",
-                    str(pr_int),
-                    "--repo",
-                    repo,
-                    "--body",
-                    content,
-                ],
+                args,
                 capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
+                text=True, encoding="utf-8", errors="replace",
                 timeout=30,
             )
             if result.returncode == 0:
                 logger.info(
-                    "[webhook] Posted comment on %s#%s", repo, pr_number
+                    "[webhook] Posted %s comment on %s#%s",
+                    "review" if comment_type in {"review", "review_comment", "review_thread"} else "conversation",
+                    repo,
+                    number_int,
                 )
                 return SendResult(success=True)
-            else:
-                logger.error(
-                    "[webhook] gh pr comment failed: %s", result.stderr
-                )
-                return SendResult(success=False, error=result.stderr)
+            logger.error("[webhook] gh api comment failed: %s", result.stderr)
+            return SendResult(success=False, error=result.stderr)
         except FileNotFoundError:
             logger.error(
                 "[webhook] 'gh' CLI not found — install GitHub CLI for "
                 "github_comment delivery"
             )
-            return SendResult(
-                success=False, error="gh CLI not installed"
-            )
+            return SendResult(success=False, error="gh CLI not installed")
         except Exception as e:
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))

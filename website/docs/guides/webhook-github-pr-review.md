@@ -71,10 +71,41 @@ platforms:
             3. Write a concise, actionable review comment and post it.
 
           deliver: github_comment
+          # GitHub conversation comments (works for both Issues and PRs).
           deliver_extra:
             repo: "{repository.full_name}"
-            pr_number: "{number}"
+            number: "{number}"
+            comment_type: "conversation"
 ```
+
+For a GitHub Issue route, use the same conversation endpoint with the Issue
+number:
+
+```yaml
+          deliver: github_comment
+          deliver_extra:
+            repo: "{repository.full_name}"
+            issue_number: "{issue.number}"
+            comment_type: "conversation"
+```
+
+For a `pull_request_review_comment` event, reply in the existing inline review
+thread by providing the PR number and the original review comment ID:
+
+```yaml
+          events:
+            - pull_request_review_comment
+          deliver: github_comment
+          deliver_extra:
+            repo: "{repository.full_name}"
+            pr_number: "{pull_request.number}"
+            comment_type: "review"
+            review_comment_id: "{comment.id}"
+```
+
+`github_comment` uses `gh api`, not a raw HTTP client. Conversation comments
+are posted to `repos/{repo}/issues/{number}/comments`; review-thread replies
+are posted to `repos/{repo}/pulls/{number}/comments` with `in_reply_to`.
 
 **Key fields:**
 
@@ -83,9 +114,11 @@ platforms:
 | `secret` (route-level) | HMAC secret for this route. Falls back to `extra.secret` global if omitted. |
 | `events` | List of `X-GitHub-Event` header values to accept. Empty list = accept all. |
 | `prompt` | Template; `{field}` and `{nested.field}` resolve from the GitHub payload. |
-| `deliver` | `github_comment` posts via `gh pr comment`. `log` just writes to the gateway log. |
+| `deliver` | `github_comment` posts through the GitHub CLI/API; `log` just writes to the gateway log. |
 | `deliver_extra.repo` | Resolves to e.g. `org/repo` from the payload. |
-| `deliver_extra.pr_number` | Resolves to the PR number from the payload. |
+| `deliver_extra.number` / `issue_number` / `pr_number` | Issue or PR number. `pr_number` remains supported for existing routes. |
+| `deliver_extra.comment_type` | `conversation` (default) for Issue/PR comments, or `review` for an inline PR review-thread reply. |
+| `deliver_extra.review_comment_id` | Original inline review comment ID required when `comment_type` is `review`. |
 
 :::note The payload does not contain code
 The GitHub webhook payload includes PR metadata (title, description, branch names, URLs) but **not the diff**. The prompt above instructs the agent to run `gh pr diff` to fetch the actual changes. The `terminal` tool is included in the default `hermes-webhook` toolset, so no extra configuration is needed.
