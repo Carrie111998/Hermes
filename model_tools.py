@@ -1171,9 +1171,9 @@ def handle_function_call(
     """
     if not isinstance(function_args, dict):
         function_args = {}
-    from tools.budget_config import extract_result_token_budget
+    from tools.budget_config import extract_result_token_budget_for_tool
     function_args, _result_budget, _result_budget_error = (
-        extract_result_token_budget(function_args)
+        extract_result_token_budget_for_tool(function_name, function_args)
     )
     if _result_budget_error is not None:
         return json.dumps({"error": _result_budget_error}, ensure_ascii=False)
@@ -1255,7 +1255,7 @@ def handle_function_call(
                     tool_error(err or "tool_call could not be resolved")
                 )
             underlying_args, _inner_budget, _inner_budget_error = (
-                extract_result_token_budget(underlying_args)
+                extract_result_token_budget_for_tool(underlying_name, underlying_args)
             )
             if _inner_budget_error is not None:
                 return _return_bridge_result(
@@ -1336,7 +1336,7 @@ def handle_function_call(
     # A middleware must not be able to smuggle the reserved model-visible
     # budget into a business handler or silently alter the validated request.
     function_args, _middleware_budget, _middleware_budget_error = (
-        extract_result_token_budget(function_args)
+        extract_result_token_budget_for_tool(function_name, function_args)
     )
     if _middleware_budget_error is not None or _middleware_budget.override_requested:
         return json.dumps(
