@@ -31,9 +31,14 @@ def _fmt_state(subsystem: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _fmt_pending_list(subsystem: str) -> str:
-    records = wa.list_pending(subsystem)
+    snapshot = wa.pending_snapshot(subsystem)
+    records = snapshot["records"]
+    cleanup = _fmt_cleanup_notice(subsystem, snapshot)
     if not records:
-        return f"No pending {subsystem} writes."
+        out = f"No pending {subsystem} writes."
+        if cleanup:
+            out += f"\n\n{cleanup}"
+        return out
     lines = [f"Pending {subsystem} writes ({len(records)}):"]
     for r in records:
         origin = r.get("origin", "foreground")
@@ -44,7 +49,23 @@ def _fmt_pending_list(subsystem: str) -> str:
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
         lines.append("Review full diff: /skills diff <id>")
+    if cleanup:
+        lines.extend(["", cleanup])
     return "\n".join(lines)
+
+
+def _fmt_cleanup_notice(subsystem: str, snapshot) -> str:
+    expired = len(snapshot.get("expired_ids", []))
+    overflow = len(snapshot.get("overflow_ids", []))
+    if not expired and not overflow:
+        return ""
+    subject = "skill" if subsystem == wa.SKILLS else subsystem
+    parts = []
+    if expired:
+        parts.append(f"{expired} expired")
+    if overflow:
+        parts.append(f"{overflow} overflow")
+    return f"Cleanup removed {' and '.join(parts)} pending {subject} write(s)."
 
 
 # ---------------------------------------------------------------------------
