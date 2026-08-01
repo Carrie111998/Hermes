@@ -461,6 +461,33 @@ def check_discord_requirements() -> bool:
     return True
 
 
+def _needs_members_intent(allowed_user_ids, allowed_role_ids) -> bool:
+    """Whether the privileged Server Members intent must be requested.
+
+    Requesting a privileged intent that is not enabled in the Discord Developer
+    Portal stops the bot coming online at all, so it is only asked for when
+    something actually reads ``guild.members``:
+
+    * a non-numeric allowlist entry, which has to be resolved by username;
+    * any role allowlist, since role checks walk the member list;
+    * outbound ``@Name`` resolution (``discord.resolve_outbound_mentions``),
+      which matches against ``guild.members`` and would silently resolve
+      nothing without it.
+
+    ``"*"`` is the open-mode wildcard honored in ``_is_allowed_user``, not a
+    username to resolve, so it must NOT pull the intent in — that is the
+    migrate-from-OpenClaw path, which would otherwise fail to come online.
+
+    Extracted as a module-level helper so the condition is testable without a
+    live client.
+    """
+    return (
+        any(entry != "*" and not entry.isdigit() for entry in (allowed_user_ids or ()))
+        or bool(allowed_role_ids)
+        or _env_bool("DISCORD_RESOLVE_MENTIONS", False)
+    )
+
+
 def _build_allowed_mentions():
     """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
 
@@ -1278,14 +1305,8 @@ class DiscordAdapter(BasePlatformAdapter):
             intents.message_content = True
             intents.dm_messages = True
             intents.guild_messages = True
-            intents.members = (
-                # ``"*"`` is the open-mode wildcard (honored in _is_allowed_user),
-                # not a username to resolve, so it must not pull in the privileged
-                # Server Members intent — exactly the migrate-from-OpenClaw path
-                # the wildcard fix targets would otherwise silently fail to come
-                # online when Members Intent isn't enabled in the Developer Portal.
-                any(entry != "*" and not entry.isdigit() for entry in self._allowed_user_ids)
-                or bool(self._allowed_role_ids)  # Need members intent for role lookup
+            intents.members = _needs_members_intent(
+                self._allowed_user_ids, self._allowed_role_ids
             )
             intents.voice_states = True
 
@@ -3064,6 +3085,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            # Resolve readable @Name references into real <@id> mentions (opt-in
+            # via discord.resolve_outbound_mentions) so the model can actually ping
+            # a user or another bot by name; a bare "@Name" from an LLM is otherwise
+            # inert text. Done before the forum branch so a forum thread's starter
+            # post gets the same treatment as an ordinary channel message.
+            content = await self._resolve_outbound_mentions(content, channel)
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -3076,10 +3104,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return result
 
-            # Resolve readable @Name references into real <@id> mentions (opt-in
-            # via DISCORD_RESOLVE_MENTIONS) so the model can actually ping a user or
-            # another bot by name; a bare "@Name" from an LLM is otherwise inert text.
-            content = await self._resolve_outbound_mentions(content, channel)
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -3327,7 +3351,21 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
+            # Keep upstream's partial message -- it avoids an API fetch. The
+            # resolution below reads ``channel``, not ``msg``, so it is
+            # unaffected by which form this is.
             msg = channel.get_partial_message(int(message_id))
+
+            # Resolve @Name -> <@id> on the FINAL edit only, so a streamed
+            # response ends up with real mentions like a plain send() does.
+            # Deliberately skipped mid-stream: the text is still partial there,
+            # so a member named "Al" would match while "@Alice" is only
+            # half-written, and an edit can deliver that ping. Resolving once at
+            # finalize means the message the user keeps is the correct one.
+            # Doing it here also covers _edit_overflow_split below, which
+            # re-formats this same ``content``.
+            if finalize:
+                content = await self._resolve_outbound_mentions(content, channel)
             formatted = self.format_message(content)
 
             _preview_key = (str(chat_id), str(message_id))
@@ -5254,7 +5292,12 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _resolve_outbound_mentions(self, content: str, channel: Any) -> str:
         """Rewrite readable ``@Name`` references in an OUTGOING message into real
         Discord mentions (``<@id>``) so the bot can actually ping a user or another
-        bot by name. Opt-in via ``DISCORD_RESOLVE_MENTIONS`` (unset/false = no change).
+        bot by name.
+
+        Gated on ``discord.resolve_outbound_mentions`` in config.yaml (bridged to
+        the ``DISCORD_RESOLVE_MENTIONS`` env var by ``_apply_yaml_config``, the
+        same way ``discord.approval_mentions`` is). Default off, so an existing
+        deployment sees no change until it opts in.
 
         LLMs reliably emit a friendly ``@Display Name`` instead of the raw ``<@id>``
         Discord requires, so without this a bot's attempt to tag someone is inert
@@ -5262,7 +5305,7 @@ class DiscordAdapter(BasePlatformAdapter):
         global_name, case-insensitive, longest name first so ``@neko bot`` wins over a
         member named ``neko``); ``@everyone``/roles stay governed by ``allowed_mentions``.
         """
-        if os.getenv("DISCORD_RESOLVE_MENTIONS", "false").strip().lower() not in ("1", "true", "yes"):
+        if not _env_bool("DISCORD_RESOLVE_MENTIONS", False):
             return content
         if not content or "@" not in content:
             return content
@@ -9995,6 +10038,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     )
     if approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
         os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
+    resolve_mentions_cfg = (
+        discord_cfg["resolve_outbound_mentions"] if "resolve_outbound_mentions" in discord_cfg
+        else platform_extra_cfg.get("resolve_outbound_mentions")
+    )
+    if resolve_mentions_cfg is not None and not os.getenv("DISCORD_RESOLVE_MENTIONS"):
+        os.environ["DISCORD_RESOLVE_MENTIONS"] = str(resolve_mentions_cfg).lower()
     frc = discord_cfg.get("free_response_channels")
     if frc is not None:
         if isinstance(frc, list):
