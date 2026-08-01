@@ -32,7 +32,6 @@ test('HERMES_GIT_BASH_PATH invalid path falls through to candidates', () => {
   assert.ok(result && result.toLowerCase().includes('git') && result.toLowerCase().endsWith('bash.exe'))
 })
 
-
 test('HERMES_GIT_BASH_PATH empty string is ignored', () => {
   const result = findGitBash({
     isWindows: true,
