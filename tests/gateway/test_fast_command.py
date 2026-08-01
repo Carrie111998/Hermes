@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
+from agent.agent_init import _merge_custom_provider_extra_body
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -18,9 +19,27 @@ from gateway.session import SessionSource
 class _CapturingAgent:
     last_init = None
     last_run = None
+    init_count = 0
+    turn_request_overrides = []
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        type(self).init_count += 1
+        self.model = kwargs["model"]
+        self.provider = kwargs["provider"]
+        self.base_url = kwargs["base_url"]
+        self.request_overrides = dict(kwargs.get("request_overrides") or {})
+        self._custom_providers = [
+            {
+                "base_url": self.base_url,
+                "extra_body": {
+                    "reasoning_effort": "xhigh",
+                    "service_tier": "flex",
+                },
+            }
+        ]
+        _merge_custom_provider_extra_body(self, self._custom_providers)
+        self.context_compressor = None
         self.tools = []
 
     def run_conversation(
@@ -38,6 +57,8 @@ class _CapturingAgent:
             "persist_user_message": persist_user_message,
             "persist_user_timestamp": persist_user_timestamp,
         }
+        _merge_custom_provider_extra_body(self, self._custom_providers)
+        type(self).turn_request_overrides.append(dict(self.request_overrides))
         return {
             "final_response": "ok",
             "messages": [],
@@ -170,3 +191,59 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
 
 
+@pytest.mark.asyncio
+async def test_cached_custom_provider_overrides_survive_fast_then_normal_turn(monkeypatch):
+    _CapturingAgent.init_count = 0
+    _CapturingAgent.turn_request_overrides = []
+    _install_fake_agent(monkeypatch)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda *_args: set())
+
+    runner = _make_runner()
+    runner.config.multiplex_profiles = False
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "gpt-5.4",
+        {
+            "api_key": "***",
+            "base_url": "http://my-endpoint/v1",
+            "provider": "custom",
+            "api_mode": "chat_completions",
+        },
+    )
+    tiers = iter(["priority", None])
+    runner._resolve_session_service_tier = lambda **_kwargs: next(tiers)
+    runner._resolve_session_reasoning_config = lambda **_kwargs: None
+    runner._get_system_prompt_for_channel = lambda *_args, **_kwargs: ""
+    runner._refresh_fallback_model = lambda: None
+    runner._enforce_agent_cache_cap = lambda: None
+
+    source = _make_source()
+    run_kwargs = {
+        "context_prompt": "",
+        "history": [],
+        "source": source,
+        "session_id": "session-1",
+        "session_key": "agent:main:telegram:dm:12345",
+    }
+
+    await runner._run_agent(message="fast turn", **run_kwargs)
+    await runner._run_agent(message="normal turn", **run_kwargs)
+
+    assert _CapturingAgent.init_count == 1
+    assert _CapturingAgent.turn_request_overrides == [
+        {
+            "service_tier": "priority",
+            "extra_body": {"reasoning_effort": "xhigh"},
+        },
+        {
+            "extra_body": {
+                "reasoning_effort": "xhigh",
+                "service_tier": "flex",
+            }
+        },
+    ]

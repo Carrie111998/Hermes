@@ -11,6 +11,7 @@ def test_custom_provider_extra_body_preserves_caller_override():
         model="google/gemma-4-31b-it",
         base_url="https://example.test/v1",
         request_overrides={
+            "service_tier": "priority",
             "extra_body": {
                 "reasoning_effort": "low",
                 "caller_only": True,
@@ -28,15 +29,19 @@ def test_custom_provider_extra_body_preserves_caller_override():
                 "extra_body": {
                     "enable_thinking": True,
                     "reasoning_effort": "high",
+                    "service_tier": "flex",
                 },
             }
         ],
     )
 
-    assert agent.request_overrides["extra_body"] == {
-        "enable_thinking": True,
-        "reasoning_effort": "low",
-        "caller_only": True,
+    assert agent.request_overrides == {
+        "service_tier": "priority",
+        "extra_body": {
+            "enable_thinking": True,
+            "reasoning_effort": "low",
+            "caller_only": True,
+        },
     }
 
 

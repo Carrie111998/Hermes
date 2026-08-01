@@ -208,6 +208,31 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+@pytest.mark.parametrize("restore_primary", [True, False])
+def test_custom_provider_extra_body_uses_active_runtime(restore_primary):
+    agent = _FakeAgent()
+    agent.model = "fallback/model"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.request_overrides = {}
+    agent._custom_providers = [{
+        "base_url": "https://custom.example/v1",
+        "extra_body": {"reasoning_effort": "xhigh"},
+    }]
+
+    def restore():
+        if restore_primary:
+            agent.model = "primary/model"
+            agent.provider = "custom"
+            agent.base_url = "https://custom.example/v1"
+
+    agent._restore_primary_runtime = restore
+    _build(agent)
+
+    expected = {"extra_body": {"reasoning_effort": "xhigh"}} if restore_primary else {}
+    assert agent.request_overrides == expected
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
@@ -331,7 +356,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

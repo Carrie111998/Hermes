@@ -436,11 +436,20 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
         return
 
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
+    # Avoid durable defaults overriding typed kwargs after OpenAI flattens extra_body.
+    top_level_keys = overrides.keys() - {"extra_body"}
+    merged_extra_body = {
+        key: value
+        for key, value in extra_body.items()
+        if key not in top_level_keys
+    }
     existing_extra_body = overrides.get("extra_body")
     if isinstance(existing_extra_body, dict):
         merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
+    if merged_extra_body:
+        overrides["extra_body"] = merged_extra_body
+    else:
+        overrides.pop("extra_body", None)
     agent.request_overrides = overrides
 
 

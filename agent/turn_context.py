@@ -379,6 +379,10 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+    custom_providers = getattr(agent, "_custom_providers", None)
+    if custom_providers:
+        from agent.agent_init import _merge_custom_provider_extra_body
+        _merge_custom_provider_extra_body(agent, custom_providers)
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
