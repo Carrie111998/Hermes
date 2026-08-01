@@ -123,6 +123,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           let
             system = pkgs.stdenv.hostPlatform.system;
             mkSystem = modules: inputs.nixpkgs.lib.nixosSystem { inherit system modules; };
+            testPackage = pkgs.writeShellScriptBin "hermes" "exit 0";
             native = mkSystem [
               inputs.self.nixosModules.default
               inputs.self.nixosModules.instances
@@ -130,14 +131,17 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
                 system.stateVersion = "24.11";
                 services.hermes-agent = {
                   enable = true;
+                  package = testPackage;
                   settings.model = "test";
                 };
                 services.hermes-agent.instances.iris = {
                   enable = true;
+                  package = testPackage;
                   settings.model = "iris";
                 };
                 services.hermes-agent.instances.argus = {
                   enable = true;
+                  package = testPackage;
                   settings.model = "argus";
                 };
               }
@@ -148,6 +152,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
                 system.stateVersion = "24.11";
                 services.hermes-agent = {
                   enable = true;
+                  package = testPackage;
                   container.enable = true;
                   allowedToolsets = [ "web" ];
                   readOnlyState = true;
