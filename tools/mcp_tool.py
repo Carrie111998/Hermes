@@ -6548,6 +6548,12 @@ def refresh_agent_mcp_tools(
         if new_names == current:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
+            # Still publish the pre-assembly view: when tool_search assembly is
+            # already active, a newly registered description_only server keeps
+            # the POST-assembly name set unchanged (its tools were bridged away)
+            # yet widens the granted pre-assembly surface — without this publish
+            # the system-prompt inventory would silently miss it. (#66826 P2)
+            agent._pre_assembly_tool_names = new_pre_assembly
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
         agent.tools = new_defs

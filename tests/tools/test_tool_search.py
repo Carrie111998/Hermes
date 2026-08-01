@@ -1013,6 +1013,81 @@ class TestDescriptionOnly:
     # Bridge dispatch: tool_search finds and tool_call invokes description_only tools
     # ------------------------------------------------------------------
 
+    def test_refresh_publishes_pre_assembly_on_no_post_change(self):
+        """P2 regression: when tool_search assembly is ALREADY active, a
+        late-registered description_only server leaves the POST-assembly name
+        set unchanged (its tools were bridged away), so
+        ``refresh_agent_mcp_tools`` early-returns without publishing. The
+        pre-assembly view must still be published, or the system-prompt
+        inventory silently misses the new server's tools. (#66826 P2)"""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools import mcp_tool
+
+        server_name = "late_bridge_server"
+        tool_name = "mcp__late_bridge_server__lookup"
+
+        fake_tool = SimpleNamespace(
+            name="lookup",
+            description="Late-registered description_only tool",
+            inputSchema={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+        fake_server = SimpleNamespace(
+            name=server_name,
+            _tools=[fake_tool],
+            tool_timeout=30.0,
+            session=object(),
+            initialize_result=None,
+        )
+
+        # Baseline refresh BEFORE the server exists: assembly is already
+        # active (bridge tools present in the live POST-assembly set) and the
+        # published pre-assembly view does NOT include the future server.
+        agent = SimpleNamespace(
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+            tools=[],
+            valid_tool_names=set(),
+            _tool_snapshot_generation=0,
+            _memory_manager=None,
+            context_compressor=None,
+            _context_engine_tool_names=set(),
+        )
+        with patch.dict(mcp_tool._servers, {}):
+            mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            assert "tool_search" in agent.valid_tool_names  # assembly active
+            assert tool_name not in agent._pre_assembly_tool_names
+
+        # Register a description_only server AFTER the baseline: its tool is
+        # bridged away, so the POST-assembly name set is unchanged from the
+        # baseline (modulo the new deferred name), and a naive refresh would
+        # early-return without publishing the widened pre-assembly view.
+        with patch.dict(mcp_tool._servers, {server_name: fake_server}):
+            mcp_tool._register_server_tools(
+                server_name, fake_server, {"tool_injection": "description_only"}
+            )
+            added = mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            # The description_only tool is deferred (bridged away) in the live
+            # POST-assembly snapshot, but the pre-assembly inventory tracks it.
+            assert tool_name not in agent.valid_tool_names
+            assert tool_name in agent._pre_assembly_tool_names
+
+            # Repeat refresh with the SAME published POST-assembly snapshot:
+            # early return (added == set()) must still republish the
+            # pre-assembly view so the system-prompt inventory stays correct.
+            added2 = mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            assert added2 == set()
+            assert tool_name in agent._pre_assembly_tool_names
+
+        # Deregister to avoid leaking marks into later tests.
+        task = mcp_tool.MCPServerTask(server_name)
+        task._registered_tool_names = [tool_name]
+        task._deregister_tools()
+
+    # ------------------------------------------------------------------
+    # Bridge dispatch: tool_search finds and tool_call invokes description_only tools
+    # ------------------------------------------------------------------
+
     def test_bridge_dispatch_finds_description_only_tool(self):
         """tool_search returns description_only tools in the catalog and
         tool_describe returns their full schema."""
