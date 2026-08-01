@@ -1356,6 +1356,24 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     assert "still here" in titles
 
 
+def _skip_unless_board_is_wal(db_path: Path) -> None:
+    """Skip when this SQLite build left the board in a rollback journal.
+
+    ``hermes_state`` refuses to enable WAL on builds carrying the WAL-reset
+    corruption bug and falls back to ``journal_mode=DELETE`` (it says so once
+    per process in the log). Such a board has no ``-wal`` to preserve and no
+    ``-shm`` a read-only open could fail to create, so the WAL behaviour these
+    tests pin down simply isn't in play — that is a skip, not a failure.
+    """
+    probe = sqlite3.connect(db_path)
+    try:
+        mode = probe.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        probe.close()
+    if str(mode).lower() != "wal":
+        pytest.skip(f"board is in journal_mode={mode}, not WAL; nothing to assert")
+
+
 def _crash_a_writer(db_path: Path) -> None:
     """Leave the board with an uncheckpointed WAL, the way a killed worker does.
 
@@ -1387,6 +1405,7 @@ def test_integrity_probe_does_not_rewrite_the_db_it_judges(tmp_path):
     """
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path=db_path)
+    _skip_unless_board_is_wal(db_path)
     _crash_a_writer(db_path)
     wal = db_path.with_name(db_path.name + "-wal")
     assert wal.exists() and wal.stat().st_size > 0, "expected an uncheckpointed WAL"
@@ -1419,6 +1438,7 @@ def test_probe_stands_aside_when_it_may_not_read(tmp_path):
     board.mkdir()
     db_path = board / "kanban.db"
     kb.init_db(db_path=db_path)
+    _skip_unless_board_is_wal(db_path)
     for sidecar in ("-wal", "-shm"):
         db_path.with_name(db_path.name + sidecar).unlink(missing_ok=True)
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
