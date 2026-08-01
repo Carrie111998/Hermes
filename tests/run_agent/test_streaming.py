@@ -15,14 +15,14 @@ import pytest
 
 def _make_stream_chunk(
     content=None, tool_calls=None, finish_reason=None,
-    model=None, reasoning_content=None, usage=None,
+    model=None, reasoning_content=None, reasoning=None, usage=None,
 ):
     """Build a mock streaming chunk matching OpenAI's ChatCompletionChunk shape."""
     delta = SimpleNamespace(
         content=content,
         tool_calls=tool_calls,
         reasoning_content=reasoning_content,
-        reasoning=None,
+        reasoning=reasoning,
     )
     choice = SimpleNamespace(
         index=0,
@@ -514,7 +514,43 @@ class TestReasoningStreaming:
         assert reasoning_deltas == ["Let me think", " about this"]
         assert text_deltas == ["The answer is 42"]
         assert response.choices[0].message.reasoning_content == "Let me think about this"
+        assert response.choices[0].message.reasoning is None
         assert response.choices[0].message.content == "The answer is 42"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_mutable_reasoning_keeps_distinct_provenance(
+        self, mock_close, mock_create
+    ):
+        """delta.reasoning must not be promoted to raw replay content."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(reasoning="ordinary "),
+            _make_stream_chunk(reasoning="thinking"),
+            _make_stream_chunk(content="answer", finish_reason="stop"),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=lambda _text: None,
+        )
+        setattr(agent, "api_mode", "chat_completions")
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        message = response.choices[0].message
+        assert message.reasoning == "ordinary thinking"
+        assert message.reasoning_content is None
 
 
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
@@ -1634,4 +1670,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-

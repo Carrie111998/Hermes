@@ -626,7 +626,10 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
         content="".join(text_pieces) if text_pieces else None,
         tool_calls=tool_calls or None,
         reasoning=reasoning,
-        reasoning_content=reasoning,
+        # Native Gemini thought text is an ordinary, mutable copy. Replay
+        # continuity is carried by thought_signature on tool calls, not by an
+        # OpenAI-compatible reasoning_content echo.
+        reasoning_content=None,
         reasoning_details=None,
     )
     choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
@@ -677,7 +680,6 @@ def _make_stream_chunk(
         delta_kwargs["tool_calls"] = [tool_delta]
     if reasoning:
         delta_kwargs["reasoning"] = reasoning
-        delta_kwargs["reasoning_content"] = reasoning
     delta = SimpleNamespace(**delta_kwargs)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
     return _GeminiStreamChunk(

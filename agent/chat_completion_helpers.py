@@ -1387,7 +1387,6 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     )
 
 
-
 def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
     """Build a normalized assistant message dict from an API response message.
 
@@ -1407,6 +1406,13 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         if think_blocks:
             combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
             reasoning_text = combined or None
+
+    # Mutable reasoning is safe to mask before it reaches non-streaming
+    # callbacks or persistence. Provider-native replay carriers are handled
+    # separately below and remain unchanged.
+    if isinstance(reasoning_text, str) and reasoning_text:
+        from agent.redact import redact_sensitive_text
+        reasoning_text = redact_sensitive_text(reasoning_text)
 
     if reasoning_text and agent.verbose_logging:
         logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
@@ -1482,6 +1488,8 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
             raw_reasoning_content = model_extra["reasoning_content"]
     if raw_reasoning_content is not None:
+        # DeepSeek, Kimi, and MiMo may require this exact provider-owned value
+        # on the next turn, so only retain the existing surrogate cleanup.
         msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
     elif assistant_tool_calls and agent._needs_thinking_reasoning_pad():
         # DeepSeek v4 thinking mode and Kimi / Moonshot thinking mode
@@ -1525,8 +1533,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
         # Pass reasoning_details back unmodified so providers (OpenRouter,
         # Anthropic, OpenAI) can maintain reasoning continuity across turns.
-        # Each provider may include opaque fields (signature, encrypted_content)
-        # that must be preserved exactly.
+        # Even an unsigned text/summary block is provider-owned replay state;
+        # changing it can invalidate a later request. Opaque fields such as
+        # signatures and encrypted_content make this requirement obvious, but
+        # are not the only shapes that require exact preservation.
         raw_details = assistant_message.reasoning_details
         preserved = []
         for d in raw_details:
@@ -2446,7 +2456,13 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def _build_partial_stream_stub(
-    role, full_content, full_reasoning, model_name, usage_obj, *,
+    role,
+    full_content,
+    full_reasoning,
+    model_name,
+    usage_obj,
+    *,
+    full_reasoning_content=None,
     dropped_tool_names=None,
 ):
     """Build a partial-stream-stub response for mid-stream drop scenarios.
@@ -2461,7 +2477,8 @@ def _build_partial_stream_stub(
         role=role,
         content=full_content,
         tool_calls=None,
-        reasoning_content=full_reasoning,
+        reasoning=full_reasoning,
+        reasoning_content=full_reasoning_content,
     )
     mock_choice = SimpleNamespace(
         index=0,
@@ -3024,6 +3041,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         model_name = None
         role = "assistant"
         reasoning_parts: list = []
+        reasoning_content_parts: list = []
         usage_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -3103,7 +3121,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         "message": {
                             "role": role,
                             "content": "".join(content_parts) or None,
-                            "reasoning_content": "".join(reasoning_parts) or None,
+                            "reasoning": "".join(reasoning_parts) or None,
+                            "reasoning_content": "".join(reasoning_content_parts) or None,
                             "tool_calls": tool_calls or None,
                         },
                         "finish_reason": finish_reason or "stop",
@@ -3206,9 +3225,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 model_name = chunk.model
 
             # Accumulate reasoning content
-            reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            provider_reasoning_text = getattr(delta, "reasoning_content", None)
+            mutable_reasoning_text = getattr(delta, "reasoning", None)
+            reasoning_text = provider_reasoning_text or mutable_reasoning_text
             if reasoning_text:
-                reasoning_parts.append(reasoning_text)
+                if provider_reasoning_text:
+                    reasoning_content_parts.append(provider_reasoning_text)
+                if mutable_reasoning_text:
+                    reasoning_parts.append(mutable_reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
@@ -3403,6 +3427,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             finish_reason is None
             and not content_parts
             and not reasoning_parts
+            and not reasoning_content_parts
             and not tool_calls_acc
         ):
             raise EmptyStreamError(
@@ -3446,6 +3471,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
+                full_reasoning_content="".join(reasoning_content_parts) or None,
                 dropped_tool_names=_dropped_names or None,
             )
 
@@ -3468,6 +3494,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
+                full_reasoning_content="".join(reasoning_content_parts) or None,
             )
 
         effective_finish_reason = finish_reason or "stop"
@@ -3475,11 +3502,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             effective_finish_reason = "length"
 
         full_reasoning = "".join(reasoning_parts) or None
+        full_reasoning_content = "".join(reasoning_content_parts) or None
         mock_message = SimpleNamespace(
             role=role,
             content=full_content,
             tool_calls=mock_tool_calls,
-            reasoning_content=full_reasoning,
+            reasoning=full_reasoning,
+            reasoning_content=full_reasoning_content,
         )
         mock_choice = SimpleNamespace(
             index=0,

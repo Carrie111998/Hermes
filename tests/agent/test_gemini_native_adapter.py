@@ -109,6 +109,7 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     choice = response.choices[0]
     assert choice.finish_reason == "tool_calls"
     assert choice.message.reasoning == "thinking..."
+    assert choice.message.reasoning_content is None
     assert choice.message.tool_calls[0].function.name == "search"
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
@@ -240,6 +241,33 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
     assert first[-1].choices[0].finish_reason == "tool_calls"
 
 
+def test_stream_event_keeps_native_thought_out_of_reasoning_content():
+    from agent.gemini_native_adapter import translate_stream_event
+
+    chunks = translate_stream_event(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"thought": True, "text": "thinking..."}]
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        },
+        model="gemini-2.5-flash",
+        tool_call_indices={},
+    )
+
+    thought_delta = next(
+        chunk.choices[0].delta
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].delta.reasoning
+    )
+    assert thought_delta.reasoning == "thinking..."
+    assert thought_delta.reasoning_content is None
+
+
 
 
 
@@ -251,7 +279,6 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 # ---------------------------------------------------------------------------
 # X-Goog-Api-Client header tests
 # ---------------------------------------------------------------------------
-
 
 
 
