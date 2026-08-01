@@ -93,6 +93,47 @@ def test_explicit_dispatch_composes_board_limit_with_existing_running_tasks(fres
         assert result.skipped_wip_capped == []
 
 
+def test_dispatch_honors_installation_cap_without_max_spawn(fresh_home):
+    kb.create_board("installation")
+    with kb.connect(board="installation") as conn:
+        running_ids = [
+            kb.create_task(conn, title=f"running-{index}", assignee="default")
+            for index in range(2)
+        ]
+        ready_ids = [
+            kb.create_task(conn, title=f"ready-{index}", assignee="default")
+            for index in range(3)
+        ]
+        for task_id in running_ids:
+            assert kb.claim_task(conn, task_id, claimer="default") is not None
+
+        result = kb.dispatch_once(
+            conn,
+            board="installation",
+            spawn_fn=_spawn,
+            dry_run=True,
+            max_in_progress=4,
+        )
+
+        assert [item[0] for item in result.spawned] == ready_ids[:2]
+
+
+def test_dry_run_reports_board_wip_deferrals(fresh_home):
+    kb.create_board("dry-run", wip_limit=2)
+    with kb.connect(board="dry-run") as conn:
+        ready_ids = [
+            kb.create_task(conn, title=f"ready-{index}", assignee="default")
+            for index in range(3)
+        ]
+
+        result = kb.dispatch_once(
+            conn, board="dry-run", spawn_fn=_spawn, dry_run=True, max_spawn=8
+        )
+
+        assert [item[0] for item in result.spawned] == ready_ids[:2]
+        assert result.skipped_wip_capped == ready_ids[2:]
+
+
 def test_dispatch_falls_back_after_malformed_board_selector(fresh_home, monkeypatch):
     kb.create_board("fallback", wip_limit=2)
     kb.set_current_board("fallback")
@@ -109,11 +150,19 @@ def test_dispatch_falls_back_after_malformed_board_selector(fresh_home, monkeypa
             ),
         )
 
-        result = kb.dispatch_once(
-            conn, board="malformed", spawn_fn=_spawn, dry_run=True
-        )
+        workspace = fresh_home / "workspace"
+        seen_board = {}
+
+        def resolve_workspace(_task, board=None):
+            seen_board["value"] = board
+            workspace.mkdir(exist_ok=True)
+            return workspace
+
+        monkeypatch.setattr(kb, "resolve_workspace", resolve_workspace)
+        result = kb.dispatch_once(conn, board="malformed", spawn_fn=_spawn)
 
         assert [item[0] for item in result.spawned] == [ready]
+        assert seen_board["value"] == "fallback"
 
 
 def test_implicit_or_precedence_current_board(fresh_home, monkeypatch):

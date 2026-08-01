@@ -1286,10 +1286,11 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _ready_nonempty(board: "Optional[str]" = None) -> bool:
+            """Cheap probe for ready work on one board, or across all boards.
+
+            The board argument keeps health accounting aligned with the
+            dispatch result that supplied an intentional WIP deferral.
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
             ``orion-research``) are pulled by terminals via
@@ -1298,10 +1299,13 @@ class GatewayKanbanWatchersMixin:
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            if board is not None:
+                boards = [{"slug": board}]
+            else:
+                try:
+                    boards = _kb.list_boards(include_archived=False)
+                except Exception:
+                    boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
@@ -1442,11 +1446,9 @@ class GatewayKanbanWatchersMixin:
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
-                any_spawned = False
-                any_wip_capped = False
+                health_failure = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
-                        any_spawned = True
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent.
                         logger.info(
@@ -1461,15 +1463,21 @@ class GatewayKanbanWatchersMixin:
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
                     if res is not None and getattr(res, "skipped_wip_capped", None):
-                        any_wip_capped = True
                         logger.info(
                             "kanban dispatcher [%s]: deferred=%d due to board WIP limit",
                             slug,
                             len(res.skipped_wip_capped),
                         )
+                    if res is not None:
+                        board_ready = await asyncio.to_thread(_ready_nonempty, slug)
+                        if (
+                            board_ready
+                            and not getattr(res, "spawned", None)
+                            and not getattr(res, "skipped_wip_capped", None)
+                        ):
+                            health_failure = True
                 # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned and not any_wip_capped:
+                if health_failure:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0

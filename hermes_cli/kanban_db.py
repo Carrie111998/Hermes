@@ -8277,7 +8277,8 @@ def _dispatch_once_locked(
     except (TypeError, ValueError):
         resolved_board = None
     resolved_board = resolved_board or get_current_board()
-    board_wip_limit = read_board_metadata(resolved_board).get("wip_limit")
+    dispatch_board = resolved_board
+    board_wip_limit = read_board_metadata(dispatch_board).get("wip_limit")
     if board_wip_limit is not None:
         if (isinstance(max_in_progress, int) and not isinstance(max_in_progress, bool)
                 and max_in_progress > 0):
@@ -8295,7 +8296,7 @@ def _dispatch_once_locked(
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
-    if max_spawn is not None:
+    if max_spawn is not None or effective_max_in_progress is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -8311,10 +8312,8 @@ def _dispatch_once_locked(
     # enough running tasks, skip spawning this tick so workers can finish.
     wip_running_count = 0
     if effective_max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        wip_running_count = int(in_progress)
+        in_progress = running_count
+        wip_running_count = in_progress
         if in_progress >= effective_max_in_progress:
             if board_wip_limit is not None and in_progress >= board_wip_limit:
                 result.skipped_wip_capped.extend(row["id"] for row in ready_rows)
@@ -8471,6 +8470,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -8486,9 +8486,11 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=dispatch_board
+                )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(claimed, board=dispatch_board)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -8511,7 +8513,7 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    pid = _spawn(claimed, str(workspace), board=dispatch_board)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
@@ -8571,6 +8573,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8578,9 +8581,11 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=dispatch_board
+                )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(claimed, board=dispatch_board)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -8606,7 +8611,7 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    pid = _spawn(claimed, str(workspace), board=dispatch_board)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
