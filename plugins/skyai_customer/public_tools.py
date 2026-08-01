@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -1174,6 +1175,10 @@ def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
         "provider": _provider_name(item.get("provider")),
         "image": _first_image(item),
     }
+
+
+def _normalize_search_text(value: Any) -> str:
+    return str(value or "").casefold()
 
 
 def _structured_cancellation_policy(policy: Any, *, fetch_failed: bool = False) -> dict[str, Any]:
