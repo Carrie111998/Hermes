@@ -764,7 +764,7 @@ hermes kanban boards set-wip-limit feature-work 3
 hermes kanban boards set-wip-limit feature-work  # clear the board limit
 ```
 
-The board limit and `kanban.max_in_progress` compose by minimum. An unset or cleared value is unlimited for that layer. The limit applies only to new automatic `ready` → `running` claims; cleanup, readiness promotion, dependency and assignment checks, per-profile limits, existing workers, manual status changes, and `max_spawn` continue to operate. The board REST API accepts a positive integer, preserves the current value when `wip_limit` is omitted from `PATCH`, and clears it when the field is explicitly `null`. Class-of-Service task fields are a separate follow-up and are not part of board WIP limits.
+The board limit and `kanban.max_in_progress` compose by minimum. An unset or cleared value is unlimited for that layer. The limit applies only to new automatic `ready` → `running` and `review` → `running` claims; cleanup, readiness promotion, dependency and assignment checks, per-profile limits, existing workers, manual status changes, and `max_spawn` continue to operate. The board REST API accepts a positive integer, preserves the current value when `wip_limit` is omitted from `PATCH`, and clears it when the field is explicitly `null`. Class-of-Service task fields are a separate follow-up and are not part of board WIP limits.
 
 ```yaml
 kanban:

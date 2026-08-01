@@ -124,6 +124,38 @@ def test_review_only_dispatch_respects_board_limit(fresh_home):
         assert len(result.skipped_wip_capped) == 1
 
 
+def test_mixed_ready_and_review_dispatch_shares_board_limit(fresh_home):
+    kb.create_board("mixed", wip_limit=1)
+    with kb.connect(board="mixed") as conn:
+        ready = kb.create_task(conn, title="ready", assignee="default")
+        review = kb.create_task(conn, title="review", assignee="default")
+        assert _set_status_direct(conn, review, "review")
+
+        result = kb.dispatch_once(
+            conn, board="mixed", spawn_fn=_spawn, max_spawn=8
+        )
+
+        assert [item[0] for item in result.spawned] == [ready]
+        assert kb.get_task(conn, review).status == "review"
+        assert result.skipped_wip_capped == [review]
+
+
+def test_narrower_caller_cap_limits_mixed_dispatch(fresh_home):
+    kb.create_board("caller-cap", wip_limit=3)
+    with kb.connect(board="caller-cap") as conn:
+        ready = kb.create_task(conn, title="ready", assignee="default")
+        review = kb.create_task(conn, title="review", assignee="default")
+        assert _set_status_direct(conn, review, "review")
+
+        result = kb.dispatch_once(
+            conn, board="caller-cap", spawn_fn=_spawn, max_spawn=1
+        )
+
+        assert [item[0] for item in result.spawned] == [ready]
+        assert kb.get_task(conn, review).status == "review"
+        assert result.skipped_wip_capped == []
+
+
 def test_dispatch_honors_installation_cap_without_max_spawn(fresh_home):
     kb.create_board("installation")
     with kb.connect(board="installation") as conn:
