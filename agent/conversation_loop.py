@@ -73,6 +73,41 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+
+def _classify_tool_call_response(finish_reason, assistant_message):
+    """Classify an assistant response for the empty-tool_calls guard.
+
+    Returns ``(declared_tool_calls, has_tool_calls)``.
+
+    Some providers (observed on GitHub Copilot with claude-opus-4.7 / 4.8)
+    return ``finish_reason="tool_calls"`` while the ``tool_calls`` array is
+    empty or absent, carrying only a preamble in ``content``. Because ``[]``
+    is falsy, the dispatch check treated these as final text responses and
+    ended the turn — stranding agentic runs at 1 API call out of 60.
+
+    Split out of the loop body so the behaviour is unit-testable against the
+    real production code path rather than a re-implemented copy.
+    """
+    declared = finish_reason == "tool_calls"
+    has_calls = bool(getattr(assistant_message, "tool_calls", None))
+    return declared, has_calls
+
+
+def should_end_turn_on_text(finish_reason, assistant_message) -> bool:
+    """True when this response may be treated as a final text answer.
+
+    False means the loop must keep going: either real tool calls are present,
+    or the model declared tool calls it never emitted (the guard case).
+    """
+    declared, has_calls = _classify_tool_call_response(
+        finish_reason, assistant_message
+    )
+    if declared and not has_calls:
+        return False
+    if has_calls:
+        return False
+    return True
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -4443,6 +4478,59 @@ def run_conversation(
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
+            # --- Guard: finish_reason=tool_calls with an EMPTY tool_calls array ---
+            # Some providers (observed on GitHub Copilot + claude-opus-4.7/4.8)
+            # return finish_reason="tool_calls" while the tool_calls array is
+            # empty or absent, with only a short preamble in content
+            # ("I'll read the brief file first."). The truthiness check below
+            # is falsy for [], so the turn fell through to the final-text-response
+            # branch and ENDED — stranding the run at 1 API call out of 60 with a
+            # plan instead of a result. The model announced a tool call it never
+            # emitted; the correct response is to let it try again, not to treat
+            # the preamble as the final answer.
+            _declared_tool_calls, _has_tool_calls = _classify_tool_call_response(
+                finish_reason, assistant_message
+            )
+            if _declared_tool_calls and not _has_tool_calls:
+                _empty_tc_retries = getattr(agent, "_empty_tool_calls_retries", 0)
+                if _empty_tc_retries < 3:
+                    agent._empty_tool_calls_retries = _empty_tc_retries + 1
+                    logger.warning(
+                        "finish_reason=tool_calls with empty tool_calls array "
+                        "(model=%s, attempt %d/3) — re-prompting instead of "
+                        "ending the turn",
+                        getattr(agent, "model", "?"),
+                        agent._empty_tool_calls_retries,
+                    )
+                    # Preserve the preamble so the model keeps its own context,
+                    # but strip the phantom tool_calls key so the outbound
+                    # sanitizer and strict role alternation stay happy.
+                    _stub = {
+                        "role": "assistant",
+                        "content": getattr(assistant_message, "content", "") or "",
+                    }
+                    if _stub["content"].strip():
+                        messages.append(_stub)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You indicated a tool call but none was emitted. "
+                                "Continue by actually invoking the tool now, or "
+                                "give your final answer if no tool is needed."
+                            ),
+                            "_empty_tool_calls_synthetic": True,
+                        })
+                    agent._session_messages = messages
+                    continue
+                logger.warning(
+                    "finish_reason=tool_calls with empty tool_calls array "
+                    "persisted after 3 attempts (model=%s) — accepting text "
+                    "response",
+                    getattr(agent, "model", "?"),
+                )
+            else:
+                agent._empty_tool_calls_retries = 0
+
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
