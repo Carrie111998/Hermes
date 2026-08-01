@@ -79,3 +79,26 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+def test_atomic_specify_rejects_block_loop_recovery_triage(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already executed", assignee="mike")
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="review", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="review", kind="needs_input")
+
+        assert kb.specify_triage_task(
+            conn,
+            tid,
+            title="stale bootstrap",
+            body="repeat old side effects",
+            assignee="default",
+        ) is False
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert task.title == "already executed"
+        assert task.assignee == "mike"
+
+

@@ -72,6 +72,9 @@ heading, in this order:
       obvious; never invent scope creep).
 
 Rules:
+  - Treat comments as later task updates. Later comments override conflicting
+    older body text. Never recreate or replay work or side effects that a later
+    comment says are already complete.
   - Keep the tightened title close in meaning to the original idea — do
     NOT invent a different project.
   - If the original idea is already detailed, preserve its substance and
@@ -86,6 +89,9 @@ _USER_TEMPLATE = """Task id: {task_id}
 Current title: {title}
 Current body:
 {body}
+
+Recent comments (chronological; later comments override conflicting older body):
+{comments}
 """
 
 
@@ -103,6 +109,24 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def _format_recent_comments(comments: list[kb.Comment]) -> str:
+    """Render a bounded chronological tail of task updates."""
+    if not comments:
+        return "  (none)"
+    rendered = []
+    remaining = 4000
+    for comment in comments[-10:]:
+        line = f"  - {comment.author}: {_truncate(comment.body, 1000)}"
+        if len(line) > remaining:
+            line = _truncate(line, remaining)
+        if line:
+            rendered.append(line)
+            remaining -= len(line)
+        if remaining <= 0:
+            break
+    return "\n".join(rendered) or "  (none)"
 
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
@@ -154,11 +178,19 @@ def specify_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        continuation_event = kb.triage_continuation_event(conn, task_id)
+        comments = kb.list_comments(conn, task_id) if task is not None else []
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return SpecifyOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if continuation_event is not None:
+        return SpecifyOutcome(
+            task_id,
+            False,
+            f"explicit continuation required after {continuation_event}",
         )
 
     try:
@@ -171,6 +203,7 @@ def specify_task(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        comments=_format_recent_comments(comments),
     )
 
     try:
@@ -261,4 +294,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             include_archived=False,
         )
-    return [t.id for t in tasks]
+        return [
+            task.id
+            for task in tasks
+            if kb.triage_continuation_event(conn, task.id) is None
+        ]

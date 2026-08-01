@@ -88,5 +88,54 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_atomic_decompose_rejects_block_loop_recovery_triage(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already executed", assignee="mike")
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="review", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="review", kind="needs_input")
+
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="default",
+            children=[{"title": "stale bootstrap", "assignee": "researcher"}],
+            author="auto-decomposer",
+        )
+        assert child_ids is None
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "mike"
+        assert kb.child_ids(conn, tid) == []
+
+
+def test_atomic_decompose_does_not_rematerialize_prior_work_graph(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="materialized workflow", triage=True)
+        first = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="mike",
+            children=[{"title": "first child", "assignee": "researcher"}],
+            author="decomposer",
+        )
+        assert first is not None
+        assert kb.triage_continuation_event(conn, tid) == "decomposed"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+
+        replay = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="default",
+            children=[{"title": "duplicate child", "assignee": "researcher"}],
+            author="auto-decomposer",
+        )
+        assert replay is None
+        assert kb.parent_ids(conn, tid) == first
+
+
 
 

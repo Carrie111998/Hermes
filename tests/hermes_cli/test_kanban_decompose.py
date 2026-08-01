@@ -161,3 +161,111 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def _drive_block_loop_to_triage(tid: str) -> None:
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="await review", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="still await review", kind="needs_input")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+
+
+def test_block_loop_triage_requires_explicit_continuation_without_llm_or_children(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="existing development workflow",
+            body="old bootstrap instructions",
+            assignee="mike",
+        )
+    _drive_block_loop_to_triage(tid)
+    with kb.connect() as conn:
+        kb.add_comment(conn, tid, author="karim", body="Approved: bounded continuation only")
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+
+    assert outcome.ok is False
+    assert "explicit continuation" in outcome.reason
+    call_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert task.assignee == "mike"
+        assert kb.child_ids(conn, tid) == []
+        assert kb.list_comments(conn, tid)[-1].body == "Approved: bounded continuation only"
+
+
+def test_recent_comments_follow_body_and_are_declared_authoritative(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="bounded change",
+            body="Old scope: replay the bootstrap",
+            assignee="mike",
+            triage=True,
+        )
+        kb.add_comment(conn, tid, author="karim", body="New scope: do not replay bootstrap")
+
+    payload = jsonlib.dumps(
+        {
+            "fanout": False,
+            "rationale": "single continuation",
+            "title": "Bounded continuation",
+            "body": "Do not replay bootstrap.",
+            "assignee": "mike",
+        }
+    )
+    with patch(
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(payload),
+    ) as call_llm:
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is True
+    messages = call_llm.call_args.kwargs["messages"]
+    assert "later comments override conflicting" in messages[0]["content"].lower()
+    user_prompt = messages[1]["content"]
+    assert user_prompt.index("Old scope") < user_prompt.index("New scope")
+
+
+def test_fanout_preserves_existing_root_owner(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="development root", assignee="mike", triage=True
+        )
+    payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "rationale": "parallel units",
+            "tasks": [
+                {"title": "inspect", "assignee": "researcher", "parents": []}
+            ],
+        }
+    )
+    patches = _patch_list_profiles(["default", "mike", "researcher"])
+    for patcher in patches:
+        patcher.start()
+    try:
+        with _patch_aux_client(payload), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"orchestrator_profile": "default"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for patcher in patches:
+            patcher.stop()
+
+    assert outcome.ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "mike"
+
+

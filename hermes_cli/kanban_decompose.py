@@ -57,6 +57,7 @@ matching profile from the available roster.
 
 You will be given:
   - The original task title and body
+  - Recent task comments, in chronological order
   - The list of available profiles (each with name + description)
   - The fallback "default_assignee" used when no profile fits
 
@@ -77,6 +78,9 @@ Output a single JSON object with this exact shape:
   }
 
 Rules:
+  - Treat comments as later task updates. Later comments override conflicting
+    older body text. Never recreate or replay work or side effects that a later
+    comment says are already complete.
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
@@ -113,6 +117,9 @@ _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
 Body:
 {body}
+
+Recent comments (chronological; later comments override conflicting older body):
+{comments}
 
 Available profiles (assignees you may pick from):
 {roster}
@@ -249,6 +256,24 @@ def _format_roster(roster: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_recent_comments(comments: list[kb.Comment]) -> str:
+    """Render a bounded chronological tail of task updates."""
+    if not comments:
+        return "  (none)"
+    rendered = []
+    remaining = 4000
+    for comment in comments[-10:]:
+        line = f"  - {comment.author}: {_truncate(comment.body, 1000)}"
+        if len(line) > remaining:
+            line = _truncate(line, remaining)
+        if line:
+            rendered.append(line)
+            remaining -= len(line)
+        if remaining <= 0:
+            break
+    return "\n".join(rendered) or "  (none)"
+
+
 def _normalize_assignee_choice(
     assignee: object,
     *,
@@ -283,11 +308,19 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        continuation_event = kb.triage_continuation_event(conn, task_id)
+        comments = kb.list_comments(conn, task_id) if task is not None else []
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if continuation_event is not None:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            f"explicit continuation required after {continuation_event}",
         )
 
     cfg = _load_config()
@@ -307,6 +340,7 @@ def decompose_task(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        comments=_format_recent_comments(comments),
         roster=_format_roster(roster),
         default_assignee=default_assignee,
     )
@@ -434,7 +468,7 @@ def decompose_task(
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
-                root_assignee=orchestrator,
+                root_assignee=task.assignee or orchestrator,
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
@@ -457,7 +491,7 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return fresh triage ids, excluding recovery/materialized roots."""
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +499,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [
+            row.id
+            for row in rows
+            if kb.triage_continuation_event(conn, row.id) is None
+        ]

@@ -138,3 +138,47 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+def test_specifier_refuses_block_loop_recovery_without_calling_llm(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already executed", assignee="mike")
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="review", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="mike") is not None
+        assert kb.block_task(conn, tid, reason="review", kind="needs_input")
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = spec.specify_task(tid, author="auto-specifier")
+
+    assert outcome.ok is False
+    assert "explicit continuation required" in outcome.reason
+    call_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "triage"
+        assert task.assignee == "mike"
+
+
+def test_specifier_prompt_uses_recent_comments_as_authoritative(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="bounded task",
+            body="Old scope: replay bootstrap",
+            triage=True,
+        )
+        kb.add_comment(conn, tid, author="karim", body="New scope: do not replay bootstrap")
+
+    content = jsonlib.dumps({"title": "Bounded task", "body": "Do not replay."})
+    patcher, call_llm = _patch_aux_client(content)
+    with patcher:
+        outcome = spec.specify_task(tid)
+
+    assert outcome.ok is True
+    messages = call_llm.call_args.kwargs["messages"]
+    assert "Later comments override conflicting" in messages[0]["content"]
+    user_prompt = messages[1]["content"]
+    assert user_prompt.index("Old scope") < user_prompt.index("New scope")
+
+

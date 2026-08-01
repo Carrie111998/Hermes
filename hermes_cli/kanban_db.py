@@ -132,6 +132,9 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+TRIAGE_CONTINUATION_EVENT_KINDS = frozenset(
+    {"block_loop_detected", "decomposed"}
+)
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -3857,6 +3860,25 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def triage_continuation_event(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Return the latest event that makes triage unsafe to auto-specify.
+
+    Loop-breaker roots await an explicit continuation decision; roots with a
+    prior decomposition already materialized a work graph. The append-only
+    event remains authoritative even after child links are cleaned up.
+    """
+    kinds = sorted(TRIAGE_CONTINUATION_EVENT_KINDS)
+    placeholders = ", ".join("?" for _ in kinds)
+    row = conn.execute(
+        f"SELECT kind FROM task_events WHERE task_id = ? AND kind IN ({placeholders}) "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, *kinds),
+    ).fetchone()
+    return str(row["kind"]) if row is not None else None
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5905,6 +5927,8 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        if triage_continuation_event(conn, task_id) is not None:
+            return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -6061,6 +6085,8 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        if triage_continuation_event(conn, task_id) is not None:
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
