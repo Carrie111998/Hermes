@@ -2246,6 +2246,25 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_does_not_print_duplicate_lifecycle_banner(self, agent, capsys):
+        """The turn finalizer owns iteration-limit status output.
+
+        The summary helper must not also print directly, or delegated runs show
+        both an unscoped banner and the routed ``[subagent-N]`` status line.
+        """
+        resp = _mock_response(content="Summary")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        capsys.readouterr()
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}],
+            60,
+        )
+
+        assert result == "Summary"
+        assert "Reached maximum iterations" not in capsys.readouterr().out
+
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
