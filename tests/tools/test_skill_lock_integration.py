@@ -37,8 +37,9 @@ def _make_profile(home: Path) -> None:
 
 def _child_env(home: Path) -> None:
     os.environ["HERMES_HOME"] = str(home)
-    # Keep a contended run bounded; the production default is 30s.
-    os.environ["HERMES_SKILL_LOCK_TIMEOUT"] = "0.25"
+    # Internal bridge (not a user-facing setting): keep a contended run
+    # bounded without writing a config file into the temp profile.
+    os.environ["HERMES_INTERNAL_SKILL_LOCK_TIMEOUT"] = "0.25"
 
 
 # --- child entry points (module level: required by the spawn start method) ---
@@ -80,7 +81,7 @@ def profile(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     _make_profile(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_SKILL_LOCK_TIMEOUT", "0.25")
+    monkeypatch.setenv("HERMES_INTERNAL_SKILL_LOCK_TIMEOUT", "0.25")
     return home
 
 
@@ -137,6 +138,48 @@ def test_skill_manage_reports_busy_while_a_structural_pass_holds_the_lock(profil
 
     # The contended write must not have landed.
     assert "carefully" not in (profile / "skills" / "alpha" / "SKILL.md").read_text()
+
+
+def _run_curator_rollback(home: str, queue) -> None:
+    _child_env(Path(home))
+    from agent.curator_backup import rollback
+
+    ok, msg, _ = rollback()
+    queue.put((ok, msg))
+
+
+def test_curator_rollback_refuses_while_a_skill_write_is_in_flight(profile):
+    """The most destructive writer must not empty the tree mid-write.
+
+    ``rollback`` moves every top-level entry out of ``skills/`` and extracts an
+    archive over it. Without the lock it would do that while ``skill_manage``
+    holds a skill open, silently discarding the write.
+    """
+    from agent.curator_backup import snapshot_skills
+    from agent.skill_lock import skill_write_lock, skills_namespace_lock
+
+    # A restorable snapshot must exist, or rollback bails out early on "no
+    # matching backup" and the test would pass without the lock doing anything.
+    assert snapshot_skills(reason="test") is not None
+    skill_md = profile / "skills" / "alpha" / "SKILL.md"
+    skill_md.write_text(SKILL_MD.replace("Do nothing.", "Do something."), encoding="utf-8")
+
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    with skills_namespace_lock(exclusive=False):
+        with skill_write_lock(profile / "skills" / "alpha"):
+            child = context.Process(
+                target=_run_curator_rollback, args=(str(profile), queue)
+            )
+            child.start()
+            ok, msg = queue.get(timeout=30)
+            child.join(timeout=30)
+
+    assert ok is False
+    assert "busy" in msg.lower()
+    # Without the lock the rollback would restore the snapshot over the tree
+    # and this post-snapshot edit would be gone.
+    assert "Do something." in skill_md.read_text()
 
 
 def test_skill_manage_patch_still_succeeds_uncontended(profile):

@@ -227,23 +227,68 @@ def test_nested_structural_transaction_is_reentrant(tmp_path, monkeypatch):
         assert inner() == "ok"
 
 
-def test_timeout_env_override_is_honoured(tmp_path, monkeypatch):
-    """Operators can tune the wait without a code change."""
-    home = tmp_path / "hermes"
-    (home / "skills").mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(home))
+def test_lock_timeout_comes_from_config(tmp_path, monkeypatch):
+    """``skills.lock_timeout`` is the user-facing knob (AGENTS.md: no new env vars)."""
+    import agent.skill_lock as skill_lock
 
-    from agent.skill_lock import DEFAULT_TIMEOUT, TIMEOUT_ENV_VAR, _resolve_timeout
+    monkeypatch.delenv(skill_lock._INTERNAL_TIMEOUT_ENV, raising=False)
+    monkeypatch.setattr(skill_lock, "_configured_timeout", lambda: 45.0)
+    assert skill_lock._resolve_timeout(None, skill_lock.DEFAULT_TIMEOUT) == 45.0
 
-    monkeypatch.setenv(TIMEOUT_ENV_VAR, "0.5")
-    assert _resolve_timeout(None, DEFAULT_TIMEOUT) == 0.5
-    # An explicit caller argument still wins.
-    assert _resolve_timeout(9.0, DEFAULT_TIMEOUT) == 9.0
-    # Garbage and non-positive values fall back to the default.
-    monkeypatch.setenv(TIMEOUT_ENV_VAR, "not-a-number")
-    assert _resolve_timeout(None, DEFAULT_TIMEOUT) == DEFAULT_TIMEOUT
-    monkeypatch.setenv(TIMEOUT_ENV_VAR, "0")
-    assert _resolve_timeout(None, DEFAULT_TIMEOUT) == DEFAULT_TIMEOUT
+    # An explicit caller argument still wins over configuration.
+    assert skill_lock._resolve_timeout(9.0, skill_lock.DEFAULT_TIMEOUT) == 9.0
+
+    # The opportunistic waits ignore it: a generous configured wait must not
+    # turn "defer and retry" into "stall startup".
+    assert (
+        skill_lock._resolve_timeout(
+            None, skill_lock.OPPORTUNISTIC_TIMEOUT, configurable=False
+        )
+        == skill_lock.OPPORTUNISTIC_TIMEOUT
+    )
+
+
+def test_config_lock_timeout_is_read_through_cfg_get(tmp_path, monkeypatch):
+    """The real config path resolves, not just the patched seam."""
+    import agent.skill_lock as skill_lock
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"skills": {"lock_timeout": 12.5}},
+    )
+    assert skill_lock._configured_timeout() == 12.5
+
+    # A section that isn't a mapping, or a missing key, must not raise.
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"skills": "nope"})
+    assert skill_lock._configured_timeout() is None
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+    assert skill_lock._configured_timeout() is None
+
+
+def test_unusable_timeout_values_fall_back(monkeypatch):
+    """Garbage and non-positive waits are ignored rather than applied."""
+    import agent.skill_lock as skill_lock
+
+    assert skill_lock._coerce_timeout("not-a-number", "src") is None
+    assert skill_lock._coerce_timeout("0", "src") is None
+    assert skill_lock._coerce_timeout(-1, "src") is None
+    assert skill_lock._coerce_timeout(None, "src") is None
+    assert skill_lock._coerce_timeout("", "src") is None
+    assert skill_lock._coerce_timeout("2.5", "src") == 2.5
+
+
+def test_internal_env_bridge_outranks_config(monkeypatch):
+    """The bridge exists for bootstrap and spawned subprocesses only.
+
+    It is not documented in cli-config.yaml.example and must stay internal;
+    this pins the precedence so a future change doesn't quietly make it the
+    de facto user-facing setting.
+    """
+    import agent.skill_lock as skill_lock
+
+    monkeypatch.setenv(skill_lock._INTERNAL_TIMEOUT_ENV, "0.25")
+    monkeypatch.setattr(skill_lock, "_configured_timeout", lambda: 45.0)
+    assert skill_lock._resolve_timeout(None, skill_lock.DEFAULT_TIMEOUT) == 0.25
 
 
 def test_unknown_backend_is_rejected():

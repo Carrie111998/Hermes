@@ -11,6 +11,10 @@ that cooperate.  The audited writer set is:
                                     prune of pristine bundled skills
   * ``tools.skills_sync_client``  — personal and org pulls (tree materialize,
                                     org-mirror replace)
+  * ``agent.curator_backup``      — snapshot_skills / rollback (the rollback
+                                    empties the tree and extracts an archive
+                                    over it, so the lock spans the whole
+                                    transaction, staging move included)
 
 Deliberately NOT covered, so the claim above stays honest:
 
@@ -50,6 +54,13 @@ override before falling back to platform detection.  That override is the test
 seam: :func:`use_lock_backend` lets the sentinel path be exercised on POSIX CI
 instead of only on Windows, where this code would otherwise never be run by a
 test.
+
+Configuration
+-------------
+``skills.lock_timeout`` in ``config.yaml`` sets how long a blocking write waits
+before reporting "skill library is busy" (default 30s).  It does not apply to
+the opportunistic waits, which exist precisely to give up quickly and retry —
+see :func:`_resolve_timeout`.
 """
 
 from __future__ import annotations
@@ -63,7 +74,7 @@ import contextvars
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -87,11 +98,19 @@ DEFAULT_TIMEOUT = 30.0
 #: Contention wait for background/startup passes that can safely run later.
 OPPORTUNISTIC_TIMEOUT = 2.0
 
-#: Operator override for both waits, in seconds.  A deployment that runs many
-#: Hermes processes against one profile may need a longer wait than 30s before
-#: a user-facing write reports "skill library is busy"; a test needs a much
-#: shorter one.  Invalid or non-positive values are ignored.
-TIMEOUT_ENV_VAR = "HERMES_SKILL_LOCK_TIMEOUT"
+#: User-facing setting for the blocking wait, in seconds.  A deployment that
+#: runs many Hermes processes against one profile may want longer than 30s
+#: before a write reports "skill library is busy".  Invalid or non-positive
+#: values are ignored with a warning.
+TIMEOUT_CONFIG_KEYS = ("skills", "lock_timeout")
+
+#: INTERNAL bridge only — not a user-facing setting, and deliberately not
+#: documented in ``cli-config.yaml.example``.  Two callers need to set the wait
+#: without a config file:  the installer/bootstrap path runs ``sync_skills``
+#: before a profile config exists, and spawned test/worker subprocesses need a
+#: short wait without mutating the user's config.  Users configure
+#: ``skills.lock_timeout`` (see AGENTS.md: ``.env`` is for secrets only).
+_INTERNAL_TIMEOUT_ENV = "HERMES_INTERNAL_SKILL_LOCK_TIMEOUT"
 
 BACKEND_FLOCK = "flock"
 BACKEND_SENTINEL = "sentinel"
@@ -112,20 +131,61 @@ def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
-def _resolve_timeout(timeout: Optional[float], default: float) -> float:
-    """Caller argument first, then the operator override, then *default*."""
+def _coerce_timeout(raw: Any, source: str) -> Optional[float]:
+    """Validate one configured wait.  Returns None when unusable."""
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("ignoring invalid %s=%r (expected seconds)", source, raw)
+        return None
+    if value <= 0:
+        logger.warning("ignoring non-positive %s=%r", source, raw)
+        return None
+    return value
+
+
+def _configured_timeout() -> Optional[float]:
+    """Read ``skills.lock_timeout`` from config, or None if unset/unreadable.
+
+    Deliberately not cached: lock acquisitions are a handful per skill write,
+    not a hot path, and a cache would make a config edit require a restart for
+    no measurable gain.  ``load_config_readonly`` skips the deepcopy that the
+    mutable loader performs.  Imported lazily — the installer runs
+    ``sync_skills`` (and therefore this module) before the CLI config layer is
+    necessarily importable.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        raw = cfg_get(load_config_readonly(), *TIMEOUT_CONFIG_KEYS)
+    except Exception:
+        logger.debug("skill lock timeout: config unavailable", exc_info=True)
+        return None
+    return _coerce_timeout(raw, "skills.lock_timeout")
+
+
+def _resolve_timeout(
+    timeout: Optional[float], default: float, *, configurable: bool = True
+) -> float:
+    """Caller argument, then the internal bridge, then config, then *default*.
+
+    ``configurable=False`` skips the config lookup for the opportunistic waits.
+    ``skills.lock_timeout`` is how long a user is willing to *wait* before a
+    write reports "busy"; applying it to a path whose whole purpose is to give
+    up quickly and retry later would invert the setting — a generous 60s would
+    stall startup for a minute instead of deferring the pass.
+    """
     if timeout is not None:
         return timeout
-    raw = os.environ.get(TIMEOUT_ENV_VAR)
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            logger.warning("ignoring invalid %s=%r", TIMEOUT_ENV_VAR, raw)
-        else:
-            if value > 0:
-                return value
-            logger.warning("ignoring non-positive %s=%r", TIMEOUT_ENV_VAR, raw)
+    from_env = _coerce_timeout(os.environ.get(_INTERNAL_TIMEOUT_ENV), _INTERNAL_TIMEOUT_ENV)
+    if from_env is not None:
+        return from_env
+    if configurable:
+        from_config = _configured_timeout()
+        if from_config is not None:
+            return from_config
     return default
 
 
@@ -338,7 +398,7 @@ def try_namespace_lock(
     # Only the *acquisition* may be swallowed.  Wrapping the caller's body in
     # the same ``try`` would convert an unrelated SkillLockTimeout raised
     # inside it into a second ``yield``, which a context manager cannot do.
-    timeout = _resolve_timeout(timeout, OPPORTUNISTIC_TIMEOUT)
+    timeout = _resolve_timeout(timeout, OPPORTUNISTIC_TIMEOUT, configurable=False)
     stack = ExitStack()
     try:
         stack.enter_context(skills_namespace_lock(exclusive=exclusive, timeout=timeout))
@@ -370,7 +430,7 @@ def skill_materialize_lock(
     Yields ``True`` when the lock was taken, ``False`` when the caller should
     skip this skill and let the next pull retry it.
     """
-    timeout = _resolve_timeout(timeout, OPPORTUNISTIC_TIMEOUT)
+    timeout = _resolve_timeout(timeout, OPPORTUNISTIC_TIMEOUT, configurable=False)
     stack = ExitStack()
     try:
         if replace or not dest.is_dir():
