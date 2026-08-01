@@ -353,8 +353,14 @@ export function mergeRepoWorktreeGroups(
 // needs the backend common-root probe, so those rows are left for the next
 // tree refresh; the common case (a new main-checkout session) overlays here.
 
-/** True when `target` equals `folder` or is nested under it (segment-wise). */
-function isPathUnder(folder: string, target: string): boolean {
+/**
+ * True when `target` equals `folder` or is nested under it (segment-wise).
+ *
+ * Exported so `store/projects.ts` resolves project membership with the SAME
+ * path identity the sidebar overlay uses — a `/`-only, case-sensitive prefix
+ * test disagrees with this one on every Windows cwd.
+ */
+export function isPathUnder(folder: string, target: string): boolean {
   const f = comparisonSegments(folder)
   const t = comparisonSegments(target)
 

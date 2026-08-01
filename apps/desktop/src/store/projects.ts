@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import {
+  isPathUnder,
   liveSessionProjectId,
   NO_PROJECT_ID,
   type SidebarProjectTree
@@ -281,8 +282,13 @@ function focusedSessionWorkspaceCwd(): string {
   return $currentCwd.get().trim()
 }
 
-const underPath = (parent: string, child: string): boolean =>
-  child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`)
+// Path membership for BOTH lookups below (`projectIdForCwd`, `projectNameForCwd`).
+// This was a `/`-only, case-sensitive prefix test, so on Windows a `C:\Users\me\
+// repo\sub` cwd never matched its `C:/Users/me/repo` project root — and a drive
+// letter or segment cased differently broke it on any spelling. Delegate to the
+// sidebar's segment-wise helper instead of keeping a second, weaker notion of
+// "is this cwd inside that project" in the same app.
+const underPath = (parent: string, child: string): boolean => isPathUnder(parent, child)
 
 // The project (explicit or auto) that owns `cwd`, by longest path match across
 // the live tree. Null when no project covers it (it'll surface as a fresh

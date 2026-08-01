@@ -27,6 +27,7 @@ import {
   exitProjectScope,
   openProjectCreate,
   pickProjectFolder,
+  projectIdForCwd,
   projectNameForCwd,
   refreshProjects,
   refreshProjectTree,
@@ -259,6 +260,63 @@ describe('projectNameForCwd', () => {
 
     expect(projectNameForCwd('/somewhere/else')).toBeNull()
     expect(projectNameForCwd('')).toBeNull()
+  })
+})
+
+// Both lookups above share one `underPath` helper, so a membership bug hits the
+// project a session is filed under AND the name the status bar shows for it.
+describe('project cwd membership uses Windows path identity', () => {
+  const treeNode = (id: string, label: string, path: string): SidebarProjectTree => ({
+    id,
+    label,
+    path,
+    repos: [],
+    sessionCount: 0
+  })
+
+  beforeEach(() => {
+    $projectTree.set([])
+  })
+
+  it('matches a backslash-separated nested cwd to its forward-slash project root', () => {
+    $projectTree.set([treeNode('p_win', 'Repo', 'C:/Users/me/repo')])
+
+    // The old `/`-only prefix test missed every nested Windows cwd: the backend
+    // hands back `C:/…` while the OS reports the session cwd as `C:\…`.
+    expect(projectIdForCwd('C:\\Users\\me\\repo\\sub')).toBe('p_win')
+  })
+
+  it('folds drive-letter case on Windows', () => {
+    $projectTree.set([treeNode('p_win', 'Repo', 'C:\\Users\\me\\repo')])
+
+    expect(projectIdForCwd('c:\\Users\\me\\repo\\sub')).toBe('p_win')
+  })
+
+  it('folds mid-path segment case on Windows', () => {
+    $projectTree.set([treeNode('p_win', 'Repo', 'C:\\Users\\me\\repo')])
+
+    expect(projectIdForCwd('C:\\Users\\ME\\Repo\\sub')).toBe('p_win')
+  })
+
+  it('names the project for a Windows cwd too (same helper, second call site)', () => {
+    $projectTree.set([treeNode('p_win', 'Repo', 'C:/Users/me/repo')])
+
+    expect(projectNameForCwd('C:\\Users\\me\\repo\\sub')).toBe('Repo')
+  })
+
+  it('keeps POSIX membership case-sensitive', () => {
+    $projectTree.set([treeNode('p_posix', 'Repo', '/Users/me/repo')])
+
+    // POSIX paths are genuinely case-sensitive: `/Users/me/Repo` is a DIFFERENT
+    // directory, so folding case here would file sessions under the wrong project.
+    expect(projectIdForCwd('/Users/me/Repo/sub')).toBeNull()
+    expect(projectIdForCwd('/Users/me/repo/sub')).toBe('p_posix')
+  })
+
+  it('does not match a sibling directory sharing a name prefix', () => {
+    $projectTree.set([treeNode('p_win', 'Repo', 'C:\\Users\\me\\repo')])
+
+    expect(projectIdForCwd('C:\\Users\\me\\repo-retry\\sub')).toBeNull()
   })
 })
 
