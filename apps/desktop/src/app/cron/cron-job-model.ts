@@ -43,6 +43,8 @@ export interface CronEditorSaveValues {
   /** Provider for the model override ('' = none). Always paired with model. */
   provider: string
   schedule: string
+  /** null = clear/follow global; 0 = unlimited; positive = per-job seconds. */
+  scriptTimeoutSeconds: null | number
 }
 
 /** Build the API update payload, preserving an empty prompt on script-only jobs. */
@@ -50,7 +52,8 @@ export function cronEditorUpdates(values: CronEditorSaveValues, options: { scrip
   const updates: CronJobUpdates = {
     deliver: values.deliver,
     name: values.name,
-    schedule: values.schedule.trim()
+    schedule: values.schedule.trim(),
+    script_timeout_seconds: values.scriptTimeoutSeconds
   }
 
   const trimmedPrompt = values.prompt.trim()
