@@ -99,3 +99,40 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
         assert kb.schedule_task(conn, scheduled_id, reason="wait for release")
         assert kb.claim_task(conn, scheduled_id) is None
         assert kb.get_task(conn, scheduled_id).status == "scheduled"
+
+
+def test_transient_block_requeues_once_then_records_exhaustion(board):
+    with board as conn:
+        task_id = kb.create_task(conn, title="provider flaky", assignee="dev")
+        first = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert first is not None
+
+        assert kb.block_task(
+            conn, task_id, kind="transient", reason="provider timeout",
+            expected_run_id=first.current_run_id,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.block_kind == "transient"
+        assert task.block_recurrences == 1
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='recovery_scheduled'",
+            (task_id,),
+        ).fetchone()
+
+        second = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert second is not None
+        assert kb.block_task(
+            conn, task_id, kind="transient", reason="provider timeout again",
+            expected_run_id=second.current_run_id,
+        )
+        exhausted = kb.get_task(conn, task_id)
+        # The existing recurrence breaker escalates exhausted repeated
+        # blockers to triage rather than spinning in Blocked forever.
+        assert exhausted.status == "triage"
+        assert exhausted.block_kind == "transient"
+        gave_up = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='block_loop_detected' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        assert gave_up is not None

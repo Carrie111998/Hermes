@@ -5686,6 +5686,45 @@ def block_task(
             )
             return True
 
+        # Transient/provider/runtime failures are recoverable work, not a
+        # human gate. Requeue one fresh attempt before the normal exhaustion
+        # path parks the task for an operator.
+        if kind == "transient":
+            recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+            if recurrences < BLOCK_RECURRENCE_LIMIT:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'ready', claim_lock = NULL,
+                           claim_expires = NULL, worker_pid = NULL,
+                           block_kind = ?, block_recurrences = ?
+                     WHERE id = ? AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, recurrences, task_id)
+                    if expected_run_id is None
+                    else (kind, recurrences, task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id, outcome="transient", status="released",
+                    summary=reason,
+                )
+                _append_event(
+                    conn, task_id, "recovery_scheduled",
+                    {"reason": reason, "kind": kind, "attempt": recurrences,
+                     "retry_budget": BLOCK_RECURRENCE_LIMIT - 1},
+                    run_id=run_id,
+                )
+                _blocked_task = get_task(conn, task_id)
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_recovery_scheduled", task_id,
+                    board=get_current_board(),
+                    assignee=_blocked_task.assignee if _blocked_task else None,
+                    run_id=run_id, reason=reason,
+                )
+                return True
+
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
         # fires from running/ready (i.e. AFTER an unblock returned the task to
