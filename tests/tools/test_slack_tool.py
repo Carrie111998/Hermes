@@ -523,6 +523,7 @@ def test_gateway_propagates_slack_workspace_scope_to_tools():
         source=SimpleNamespace(
             platform=Platform.SLACK,
             chat_id=CHANNEL_ID,
+            chat_type="channel",
             chat_name="general",
             thread_id=THREAD_TS,
             scope_id=TEAM_ID,
@@ -556,7 +557,9 @@ def test_tool_is_registered_in_slack_platform_bundle_without_global_token(monkey
     schema = next(
         tool
         for tool in model_tools.get_tool_definitions(
-            enabled_toolsets=["hermes-slack"], quiet_mode=True
+            enabled_toolsets=["hermes-slack"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
         )
         if tool["function"]["name"] == "slack_history"
     )
