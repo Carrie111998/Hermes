@@ -1,0 +1,13 @@
+{
+  "issue": 13582,
+  "host_os": "Windows 10",
+  "platform": "telegram",
+  "transport": "polling",
+  "multiplex_profiles": true,
+  "restart_command": "/restart",
+  "require_mention": true,
+  "initial_free_response_chats": ["-1001"],
+  "updated_free_response_chats": ["-1001", "-1002"],
+  "ordinary_message_chat": "-1002",
+  "observed_stale_gating_log": "ordinary message in the newly added group remained mention-gated"
+}

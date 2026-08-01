@@ -9657,12 +9657,28 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     remains only for existing callers that construct adapters without config
     extras. Returns canonical WebSocket liveness settings to seed that extra.
     """
-    if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
-        os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
-    if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
-        os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
-    if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
-        os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "discord"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(name, value, source_for(leaf), predicate=predicate)
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
+    for key, env in (
+        ("require_mention", "DISCORD_REQUIRE_MENTION"),
+        ("thread_require_mention", "DISCORD_THREAD_REQUIRE_MENTION"),
+        ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
+    ):
+        if key in discord_cfg:
+            _write(env, str(discord_cfg[key]).lower(), key, lambda env=env: not os.getenv(env))
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
@@ -9675,55 +9691,57 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")
     )
-    if allowed_users_cfg is not None and not os.getenv("DISCORD_ALLOWED_USERS"):
+    if allowed_users_cfg is not None:
         if isinstance(allowed_users_cfg, list):
             allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
-        os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
+        leaf = "allow_from" if "allow_from" in discord_cfg else "extra.allow_from"
+        _write("DISCORD_ALLOWED_USERS", str(allowed_users_cfg), leaf, lambda: not os.getenv("DISCORD_ALLOWED_USERS"))
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
     )
-    if approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
-        os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
+    if approval_mentions_cfg is not None:
+        leaf = "approval_mentions" if "approval_mentions" in discord_cfg else "extra.approval_mentions"
+        _write("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower(), leaf, lambda: not os.getenv("DISCORD_APPROVAL_MENTIONS"))
     frc = discord_cfg.get("free_response_channels")
-    if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
+    if frc is not None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
-    if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
-        os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
-        os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+        _write("DISCORD_FREE_RESPONSE_CHANNELS", str(frc), "free_response_channels", lambda: not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"))
+    if "auto_thread" in discord_cfg:
+        _write("DISCORD_AUTO_THREAD", str(discord_cfg["auto_thread"]).lower(), "auto_thread", lambda: not os.getenv("DISCORD_AUTO_THREAD"))
+    if "reactions" in discord_cfg:
+        _write("DISCORD_REACTIONS", str(discord_cfg["reactions"]).lower(), "reactions", lambda: not os.getenv("DISCORD_REACTIONS"))
     seeded_extra = {}
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
     # ignored_channels: channels where bot never responds (even when mentioned)
     ic = discord_cfg.get("ignored_channels")
-    if ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):
+    if ic is not None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
-        os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
+        _write("DISCORD_IGNORED_CHANNELS", str(ic), "ignored_channels", lambda: not os.getenv("DISCORD_IGNORED_CHANNELS"))
     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
     ac = discord_cfg.get("allowed_channels")
-    if ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
+    if ac is not None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
-        os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+        _write("DISCORD_ALLOWED_CHANNELS", str(ac), "allowed_channels", lambda: not os.getenv("DISCORD_ALLOWED_CHANNELS"))
     # no_thread_channels: channels where bot responds directly without creating thread
     ntc = discord_cfg.get("no_thread_channels")
-    if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
+    if ntc is not None:
         if isinstance(ntc, list):
             ntc = ",".join(str(v) for v in ntc)
-        os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
+        _write("DISCORD_NO_THREAD_CHANNELS", str(ntc), "no_thread_channels", lambda: not os.getenv("DISCORD_NO_THREAD_CHANNELS"))
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.
-    if "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
-        os.environ["DISCORD_HISTORY_BACKFILL"] = str(discord_cfg["history_backfill"]).lower()
+    if "history_backfill" in discord_cfg:
+        _write("DISCORD_HISTORY_BACKFILL", str(discord_cfg["history_backfill"]).lower(), "history_backfill", lambda: not os.getenv("DISCORD_HISTORY_BACKFILL"))
     hbl = discord_cfg.get("history_backfill_limit")
-    if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
-        os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
+    if hbl is not None:
+        _write("DISCORD_HISTORY_BACKFILL_LIMIT", str(hbl), "history_backfill_limit", lambda: not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"))
     # allow_mentions: granular control over what the bot can ping.
     # Safe defaults (no @everyone/roles) are applied in the adapter;
     # these YAML keys only override when set and let users opt back
@@ -9736,8 +9754,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             ("users", "DISCORD_ALLOW_MENTION_USERS"),
             ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
         ):
-            if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
-                os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
+            if yaml_key in allow_mentions_cfg:
+                _write(env_key, str(allow_mentions_cfg[yaml_key]).lower(), f"allow_mentions.{yaml_key}", lambda env_key=env_key: not os.getenv(env_key))
     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
     _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}
@@ -9745,9 +9763,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg
         else _discord_extra.get("reply_to_mode")
     )
-    if _discord_rtm is not None and not os.getenv("DISCORD_REPLY_TO_MODE"):
+    if _discord_rtm is not None:
         _rtm_str = "off" if _discord_rtm is False else str(_discord_rtm).lower()
-        os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
+        _write("DISCORD_REPLY_TO_MODE", _rtm_str, "reply_to_mode" if "reply_to_mode" in discord_cfg else "extra.reply_to_mode", lambda: not os.getenv("DISCORD_REPLY_TO_MODE"))
     _websocket_extra_cfg = discord_cfg.get("extra")
     if not isinstance(_websocket_extra_cfg, dict):
         _websocket_extra_cfg = {}
@@ -9776,12 +9794,22 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     )
     for primary_key, legacy_key, env_key in _websocket_liveness_keys:
         value = _websocket_liveness_cfg.get(primary_key)
+        source_leaf = (
+            primary_key
+            if primary_key in discord_cfg
+            else f"extra.{primary_key}"
+        )
         if value is None and legacy_key:
             value = _websocket_liveness_cfg.get(legacy_key)
+            source_leaf = (
+                legacy_key
+                if legacy_key in discord_cfg
+                else f"extra.{legacy_key}"
+            )
         if value is not None:
             seeded_extra[primary_key] = value
-            if env_key and not os.getenv(env_key):
-                os.environ[env_key] = str(value)
+            if env_key:
+                _write(env_key, str(value), source_leaf, lambda env_key=env_key: not os.getenv(env_key))
     return seeded_extra or None
 
 

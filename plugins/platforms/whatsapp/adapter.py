@@ -1778,29 +1778,44 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
     take precedence over YAML. Returns None — everything flows through env.
     """
     import json as _json
-    if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
-        os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
-    if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
-        os.environ["WHATSAPP_MENTION_PATTERNS"] = _json.dumps(whatsapp_cfg["mention_patterns"])
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "whatsapp"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(name, value, source_for(leaf), predicate=predicate)
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
+    if "require_mention" in whatsapp_cfg:
+        _write("WHATSAPP_REQUIRE_MENTION", str(whatsapp_cfg["require_mention"]).lower(), "require_mention", lambda: not os.getenv("WHATSAPP_REQUIRE_MENTION"))
+    if "mention_patterns" in whatsapp_cfg:
+        _write("WHATSAPP_MENTION_PATTERNS", _json.dumps(whatsapp_cfg["mention_patterns"]), "mention_patterns", lambda: not os.getenv("WHATSAPP_MENTION_PATTERNS"))
     frc = whatsapp_cfg.get("free_response_chats")
-    if frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
+    if frc is not None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
-    if "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
-        os.environ["WHATSAPP_DM_POLICY"] = str(whatsapp_cfg["dm_policy"]).lower()
+        _write("WHATSAPP_FREE_RESPONSE_CHATS", str(frc), "free_response_chats", lambda: not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"))
+    if "dm_policy" in whatsapp_cfg:
+        _write("WHATSAPP_DM_POLICY", str(whatsapp_cfg["dm_policy"]).lower(), "dm_policy", lambda: not os.getenv("WHATSAPP_DM_POLICY"))
     af = whatsapp_cfg.get("allow_from")
-    if af is not None and not os.getenv("WHATSAPP_ALLOWED_USERS"):
+    if af is not None:
         if isinstance(af, list):
             af = ",".join(str(v) for v in af)
-        os.environ["WHATSAPP_ALLOWED_USERS"] = str(af)
-    if "group_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_GROUP_POLICY"):
-        os.environ["WHATSAPP_GROUP_POLICY"] = str(whatsapp_cfg["group_policy"]).lower()
+        _write("WHATSAPP_ALLOWED_USERS", str(af), "allow_from", lambda: not os.getenv("WHATSAPP_ALLOWED_USERS"))
+    if "group_policy" in whatsapp_cfg:
+        _write("WHATSAPP_GROUP_POLICY", str(whatsapp_cfg["group_policy"]).lower(), "group_policy", lambda: not os.getenv("WHATSAPP_GROUP_POLICY"))
     gaf = whatsapp_cfg.get("group_allow_from")
-    if gaf is not None and not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"):
+    if gaf is not None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
-        os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
+        _write("WHATSAPP_GROUP_ALLOWED_USERS", str(gaf), "group_allow_from", lambda: not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"))
     return None
 
 

@@ -24,7 +24,54 @@ def test_schtasks_encoding_falls_back_to_utf8(monkeypatch):
     assert gateway_windows._schtasks_encoding() == "utf-8"
 
 
+def test_spawn_detached_uses_shared_restart_environment(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+    from gateway.yaml_env import YamlEnvLoad, clear_records
 
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_build_gateway_argv", lambda: (["python", "-m", "gateway"], str(tmp_path), {"HERMES_HOME": str(tmp_path)}))
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/windows")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", lambda *args, **kwargs: calls.append(kwargs) or MagicMock(pid=42))
+    monkeypatch.setattr(gateway_windows, "windows_detach_flags", lambda: 0)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    assert gateway_windows._spawn_detached() == 42
+    assert calls[0]["env"].get("GENERATED_RESTART_VALUE") is None
+    assert calls[0]["env"]["HERMES_HOME"] == str(tmp_path)
+    clear_records()
+
+
+def test_spawn_detached_retries_without_breakaway(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_build_gateway_argv", lambda: (["python", "-m", "gateway"], str(tmp_path), {"HERMES_HOME": str(tmp_path)}))
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/windows-fallback")
+    load.set_env_from_yaml(
+        "GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True
+    )
+    monkeypatch.setattr(gateway_windows, "windows_detach_flags", lambda: 1)
+    monkeypatch.setattr(gateway_windows, "windows_detach_flags_without_breakaway", lambda: 2)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+
+    def fake_popen(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise OSError("breakaway denied")
+        return MagicMock(pid=42)
+
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", fake_popen)
+    assert gateway_windows._spawn_detached() == 42
+    assert len(calls) == 2
+    assert calls[0]["env"] == calls[1]["env"]
+    assert calls[1]["creationflags"] == 2
+    assert calls[1]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
 
 def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, tmp_path):
     """No pythonw / base-interpreter detour: the venv console python.exe is

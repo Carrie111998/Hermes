@@ -1249,7 +1249,10 @@ def is_connected(config) -> bool:
     return validate_config(config)
 
 
-def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
+def _apply_yaml_config(
+    yaml_cfg: dict,
+    buzz_cfg: dict,
+) -> Optional[dict]:
     """Translate ``config.yaml`` ``buzz.extra`` keys into ``BUZZ_*`` env vars.
 
     Implements the ``apply_yaml_config_fn`` contract.  ``check_requirements``
@@ -1262,7 +1265,25 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
     it is never sourced from config.yaml here.
     """
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "buzz"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(
+                name, value, source_for(leaf), predicate=predicate
+            )
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
     extra = buzz_cfg.get("extra", buzz_cfg) or {}
+    _extra_prefix = "extra." if isinstance(buzz_cfg.get("extra"), dict) else ""
     if not isinstance(extra, dict):
         return None
     _str_keys = {
@@ -1273,25 +1294,25 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     }
     for src, env in _str_keys.items():
         val = extra.get(src)
-        if val and not os.getenv(env):
-            os.environ[env] = str(val)
+        if val:
+            _write(env, str(val), f"{_extra_prefix}{src}", lambda env=env: not os.getenv(env))
     interval = extra.get("poll_interval")
-    if interval is not None and not os.getenv("BUZZ_POLL_INTERVAL"):
-        os.environ["BUZZ_POLL_INTERVAL"] = str(interval)
+    if interval is not None:
+        _write("BUZZ_POLL_INTERVAL", str(interval), f"{_extra_prefix}poll_interval", lambda: not os.getenv("BUZZ_POLL_INTERVAL"))
     channels = extra.get("channels")
-    if channels is not None and not os.getenv("BUZZ_CHANNELS"):
+    if channels is not None:
         if isinstance(channels, (list, tuple)):
             channels = ",".join(str(c) for c in channels)
-        os.environ["BUZZ_CHANNELS"] = str(channels)
+        _write("BUZZ_CHANNELS", str(channels), f"{_extra_prefix}channels", lambda: not os.getenv("BUZZ_CHANNELS"))
     allowed = extra.get("allowed_users")
-    if allowed is not None and not os.getenv("BUZZ_ALLOWED_USERS"):
+    if allowed is not None:
         if isinstance(allowed, (list, tuple)):
             allowed = ",".join(str(a) for a in allowed)
-        os.environ["BUZZ_ALLOWED_USERS"] = str(allowed)
-    if "allow_all_users" in extra and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
-        os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
-    if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
-        os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+        _write("BUZZ_ALLOWED_USERS", str(allowed), f"{_extra_prefix}allowed_users", lambda: not os.getenv("BUZZ_ALLOWED_USERS"))
+    if "allow_all_users" in extra:
+        _write("BUZZ_ALLOW_ALL_USERS", str(extra["allow_all_users"]).lower(), f"{_extra_prefix}allow_all_users", lambda: not os.getenv("BUZZ_ALLOW_ALL_USERS"))
+    if "require_mention" in extra:
+        _write("BUZZ_REQUIRE_MENTION", str(extra["require_mention"]).lower(), f"{_extra_prefix}require_mention", lambda: not os.getenv("BUZZ_REQUIRE_MENTION"))
     return None
 
 

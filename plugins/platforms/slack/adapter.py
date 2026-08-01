@@ -8975,56 +8975,64 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     survive a config.yaml update. Returns ``None`` because no extras are
     seeded into ``PlatformConfig.extra`` directly (everything flows through env).
     """
-    if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
-        os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
-    if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):
-        os.environ["SLACK_STRICT_MENTION"] = str(slack_cfg["strict_mention"]).lower()
-    if "ignore_other_user_mentions" in slack_cfg and not os.getenv("SLACK_IGNORE_OTHER_USER_MENTIONS"):
-        os.environ["SLACK_IGNORE_OTHER_USER_MENTIONS"] = str(
-            slack_cfg["ignore_other_user_mentions"]
-        ).lower()
-    if "thread_require_mention" in slack_cfg and not os.getenv(
-        "SLACK_THREAD_REQUIRE_MENTION"
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "slack"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(name, value, source_for(leaf), predicate=predicate)
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
+    for key, env in (
+        ("require_mention", "SLACK_REQUIRE_MENTION"),
+        ("strict_mention", "SLACK_STRICT_MENTION"),
+        ("ignore_other_user_mentions", "SLACK_IGNORE_OTHER_USER_MENTIONS"),
+        ("thread_require_mention", "SLACK_THREAD_REQUIRE_MENTION"),
+        ("allow_bots", "SLACK_ALLOW_BOTS"),
     ):
-        os.environ["SLACK_THREAD_REQUIRE_MENTION"] = str(
-            slack_cfg["thread_require_mention"]
-        ).lower()
-    if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
-        os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+        if key in slack_cfg:
+            _write(env, str(slack_cfg[key]).lower(), key, lambda env=env: not os.getenv(env))
     frc = slack_cfg.get("free_response_channels")
-    if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
+    if frc is not None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
+        _write("SLACK_FREE_RESPONSE_CHANNELS", str(frc), "free_response_channels", lambda: not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"))
     rmc = slack_cfg.get("require_mention_channels")
-    if rmc is not None and not os.getenv("SLACK_REQUIRE_MENTION_CHANNELS"):
+    if rmc is not None:
         if isinstance(rmc, list):
             rmc = ",".join(str(v) for v in rmc)
-        os.environ["SLACK_REQUIRE_MENTION_CHANNELS"] = str(rmc)
-    if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
-        os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
+        _write("SLACK_REQUIRE_MENTION_CHANNELS", str(rmc), "require_mention_channels", lambda: not os.getenv("SLACK_REQUIRE_MENTION_CHANNELS"))
+    if "reactions" in slack_cfg:
+        _write("SLACK_REACTIONS", str(slack_cfg["reactions"]).lower(), "reactions", lambda: not os.getenv("SLACK_REACTIONS"))
     rt = slack_cfg.get("reaction_triggers")
-    if rt is not None and not os.getenv("SLACK_REACTION_TRIGGERS"):
+    if rt is not None:
         if isinstance(rt, (list, tuple, set)):
             rt = ",".join(str(v) for v in rt)
-        os.environ["SLACK_REACTION_TRIGGERS"] = str(rt)
+        _write("SLACK_REACTION_TRIGGERS", str(rt), "reaction_triggers", lambda: not os.getenv("SLACK_REACTION_TRIGGERS"))
     rtt = slack_cfg.get("reaction_trigger_target")
-    if rtt is not None and not os.getenv("SLACK_REACTION_TRIGGER_TARGET"):
-        os.environ["SLACK_REACTION_TRIGGER_TARGET"] = str(rtt)
+    if rtt is not None:
+        _write("SLACK_REACTION_TRIGGER_TARGET", str(rtt), "reaction_trigger_target", lambda: not os.getenv("SLACK_REACTION_TRIGGER_TARGET"))
 
-    if "disable_dms" in slack_cfg and not os.getenv("SLACK_DISABLE_DMS"):
-        os.environ["SLACK_DISABLE_DMS"] = str(slack_cfg["disable_dms"]).lower()
+    if "disable_dms" in slack_cfg:
+        _write("SLACK_DISABLE_DMS", str(slack_cfg["disable_dms"]).lower(), "disable_dms", lambda: not os.getenv("SLACK_DISABLE_DMS"))
     ac = slack_cfg.get("allowed_channels")
-    if ac is not None and not os.getenv("SLACK_ALLOWED_CHANNELS"):
+    if ac is not None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
-        os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+        _write("SLACK_ALLOWED_CHANNELS", str(ac), "allowed_channels", lambda: not os.getenv("SLACK_ALLOWED_CHANNELS"))
     # ignored_channels: blacklist channels where Slack must never respond.
     ic = slack_cfg.get("ignored_channels")
-    if ic is not None and not os.getenv("SLACK_IGNORED_CHANNELS"):
+    if ic is not None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
-        os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
+        _write("SLACK_IGNORED_CHANNELS", str(ic), "ignored_channels", lambda: not os.getenv("SLACK_IGNORED_CHANNELS"))
     return None  # all settings flow through env; nothing to merge into extras
 
 

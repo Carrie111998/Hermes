@@ -1184,3 +1184,496 @@ class TestApiServerEnvOverride:
         assert config.platforms[Platform.API_SERVER].enabled is False
         # The key is still wired through for the shared listener.
         assert config.platforms[Platform.API_SERVER].extra.get("key") == api_server_key
+
+
+class TestYamlEnvProvenance:
+    @pytest.fixture(autouse=True)
+    def _clear_yaml_env_records(self):
+        from gateway.yaml_env import clear_records
+
+        clear_records()
+        yield
+        clear_records()
+
+    def test_load_identity_guards_refresh_and_source(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot
+
+        monkeypatch.delenv("TEST_YAML_VALUE", raising=False)
+        load = YamlEnvLoad("gateway-config:/profile", lambda path: "managed-config")
+        assert load.set_env_from_yaml(
+            "TEST_YAML_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True
+        )
+        record = records_snapshot()["TEST_YAML_VALUE"]
+        assert record.owner == "gateway-config:/profile"
+        assert record.value == "A"
+        assert record.source == "managed-config:telegram.free_response_chats"
+
+    def test_successful_load_reconciles_removed_generated_writers(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home) / ".hermes"
+            home.mkdir()
+            config_path = home / "config.yaml"
+            config_path.write_text(
+                "telegram:\n  free_response_chats:\n    - -1001\n",
+                encoding="utf-8",
+            )
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+            load_gateway_config()
+            assert os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-1001"
+            config_path.write_text("telegram:\n  require_mention: true\n", encoding="utf-8")
+            load_gateway_config()
+            assert "TELEGRAM_FREE_RESPONSE_CHATS" not in os.environ
+
+        monkeypatch.delenv("TEST_YAML_VALUE", raising=False)
+        load = YamlEnvLoad("gateway-config:/profile")
+        load.set_env_from_yaml("TEST_YAML_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+        load2 = YamlEnvLoad("gateway-config:/profile")
+        load2.finish()
+        assert "TEST_YAML_VALUE" not in os.environ
+        assert "TEST_YAML_VALUE" not in records_snapshot()
+
+        os.environ["TEST_YAML_VALUE"] = "external"
+        load3 = YamlEnvLoad("gateway-config:/other")
+        load3.finish()
+        assert os.environ["TEST_YAML_VALUE"] == "external"
+
+    def test_incomplete_load_aborts_absence_cleanup(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot
+
+        monkeypatch.delenv("TEST_YAML_VALUE", raising=False)
+        first = YamlEnvLoad("gateway-config:/profile")
+        first.set_env_from_yaml("TEST_YAML_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+        second = YamlEnvLoad("gateway-config:/profile")
+        second.abort()
+        second.finish()
+        assert os.environ["TEST_YAML_VALUE"] == "A"
+        assert records_snapshot()["TEST_YAML_VALUE"].value == "A"
+
+    def test_plugin_discovery_failure_aborts_absence_cleanup(self, tmp_path, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, clear_records, records_snapshot
+        from hermes_cli import plugins
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text("telegram: {}\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TEST_YAML_VALUE", "A")
+        prior = YamlEnvLoad(f"gateway-config:{home.resolve()}")
+        prior.set_env_from_yaml(
+            "TEST_YAML_VALUE", "A", "test.value", predicate=lambda: True
+        )
+
+        monkeypatch.setattr(
+            plugins,
+            "discover_plugins",
+            lambda: (_ for _ in ()).throw(RuntimeError("discovery failed")),
+        )
+        load_gateway_config()
+
+        assert os.environ["TEST_YAML_VALUE"] == "A"
+        assert records_snapshot()["TEST_YAML_VALUE"].value == "A"
+        clear_records()
+
+    def test_yaml_env_writer_preserves_original_guard_semantics(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad
+
+        load = YamlEnvLoad("gateway-config:/guards")
+        monkeypatch.setenv("PRESENCE_VALUE", "")
+        assert not load.set_env_from_yaml("PRESENCE_VALUE", "new", "a", predicate=lambda: "PRESENCE_VALUE" not in os.environ)
+        monkeypatch.setenv("FALSY_VALUE", "")
+        assert load.set_env_from_yaml("FALSY_VALUE", "new", "b", predicate=lambda: not os.getenv("FALSY_VALUE"))
+        monkeypatch.setenv("BLANK_VALUE", "  ")
+        assert load.set_env_from_yaml("BLANK_VALUE", "new", "c", predicate=lambda: not os.environ.get("BLANK_VALUE", "").strip())
+
+    def test_same_owner_reload_refreshes_and_reconciles(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad
+
+        monkeypatch.delenv("TEST_YAML_VALUE", raising=False)
+        first = YamlEnvLoad("gateway-config:/profile")
+        first.set_env_from_yaml("TEST_YAML_VALUE", "A", "a", predicate=lambda: True)
+        second = YamlEnvLoad("gateway-config:/profile")
+        second.set_env_from_yaml("TEST_YAML_VALUE", "B", "b", predicate=lambda: False)
+        assert os.environ["TEST_YAML_VALUE"] == "B"
+        third = YamlEnvLoad("gateway-config:/profile")
+        third.finish()
+        assert "TEST_YAML_VALUE" not in os.environ
+
+    def test_profile_load_does_not_adopt_or_reconcile_other_owner_record(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot
+
+        monkeypatch.delenv("TEST_YAML_VALUE", raising=False)
+        first = YamlEnvLoad("gateway-config:/one")
+        first.set_env_from_yaml("TEST_YAML_VALUE", "A", "a", predicate=lambda: True)
+        second = YamlEnvLoad("gateway-config:/two")
+        second.set_env_from_yaml("TEST_YAML_VALUE", "B", "b", predicate=lambda: not os.getenv("TEST_YAML_VALUE"))
+        assert os.environ["TEST_YAML_VALUE"] == "A"
+        assert records_snapshot()["TEST_YAML_VALUE"].owner == "gateway-config:/one"
+
+    def test_equal_external_values_never_acquire_provenance(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot, without_yaml_generated_env
+
+        monkeypatch.setenv("TEST_YAML_VALUE", "same")
+        load = YamlEnvLoad("gateway-config:/equal")
+        load.set_env_from_yaml("TEST_YAML_VALUE", "same", "a", predicate=lambda: not os.getenv("TEST_YAML_VALUE"))
+        assert "TEST_YAML_VALUE" not in records_snapshot()
+        assert without_yaml_generated_env(dict(os.environ))["TEST_YAML_VALUE"] == "same"
+
+    def test_managed_source_selection_does_not_override_external_environment(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot
+
+        monkeypatch.setenv("TEST_YAML_VALUE", "external")
+        load = YamlEnvLoad("gateway-config:/managed", lambda path: "managed-config")
+        load.set_env_from_yaml("TEST_YAML_VALUE", "managed", "telegram.free_response_chats", predicate=lambda: not os.getenv("TEST_YAML_VALUE"))
+        assert os.environ["TEST_YAML_VALUE"] == "external"
+        assert "TEST_YAML_VALUE" not in records_snapshot()
+
+    def test_nested_platform_source_matches_effective_merge_precedence(self, tmp_path, monkeypatch):
+        from hermes_cli import managed_scope
+        from gateway.yaml_env import records_snapshot
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      free_response_chats: [user]\n",
+            encoding="utf-8",
+        )
+
+        managed_path = "platforms.telegram.free_response_chats"
+
+        def apply_overlay(config):
+            config = dict(config)
+            platforms = dict(config.get("platforms") or {})
+            platforms["telegram"] = {"free_response_chats": ["managed"]}
+            config["platforms"] = platforms
+            return config
+
+        monkeypatch.setattr(managed_scope, "apply_managed_overlay", apply_overlay)
+        monkeypatch.setattr(managed_scope, "managed_config_keys", lambda: {managed_path})
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "managed"
+        assert records_snapshot()["TELEGRAM_FREE_RESPONSE_CHATS"].source == (
+            "managed-config:platforms.telegram.free_response_chats"
+        )
+
+    def test_mixed_platform_blocks_resolve_source_per_leaf(self, tmp_path, monkeypatch):
+        from hermes_cli import managed_scope
+        from gateway.yaml_env import records_snapshot
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      free_response_chats: [user-nested]\n"
+            "platforms:\n"
+            "  telegram:\n"
+            "    require_mention: true\n"
+            "telegram:\n"
+            "  reply_to_mode: thread\n",
+            encoding="utf-8",
+        )
+
+        managed_path = "gateway.platforms.telegram.free_response_chats"
+
+        def apply_overlay(config):
+            config = dict(config)
+            gateway = dict(config.get("gateway") or {})
+            gateway_platforms = dict(gateway.get("platforms") or {})
+            telegram = dict(gateway_platforms.get("telegram") or {})
+            telegram["free_response_chats"] = ["managed"]
+            gateway_platforms["telegram"] = telegram
+            gateway["platforms"] = gateway_platforms
+            config["gateway"] = gateway
+            return config
+
+        monkeypatch.setattr(managed_scope, "apply_managed_overlay", apply_overlay)
+        monkeypatch.setattr(managed_scope, "managed_config_keys", lambda: {managed_path})
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for name in (
+            "TELEGRAM_FREE_RESPONSE_CHATS",
+            "TELEGRAM_REQUIRE_MENTION",
+            "TELEGRAM_REPLY_TO_MODE",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        load_gateway_config()
+
+        records = records_snapshot()
+        assert records["TELEGRAM_FREE_RESPONSE_CHATS"].source == (
+            "managed-config:gateway.platforms.telegram.free_response_chats"
+        )
+        assert records["TELEGRAM_REQUIRE_MENTION"].source == (
+            "user-config:platforms.telegram.require_mention"
+        )
+        assert records["TELEGRAM_REPLY_TO_MODE"].source == (
+            "user-config:telegram.reply_to_mode"
+        )
+
+    def test_discord_websocket_liveness_extra_sources_resolve_per_leaf(self, tmp_path, monkeypatch):
+        from hermes_cli import managed_scope
+        from gateway.yaml_env import records_snapshot
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    require_mention: true\n",
+            encoding="utf-8",
+        )
+
+        managed_paths = {
+            "gateway.platforms.discord.extra.websocket_liveness_interval_seconds",
+            "gateway.platforms.discord.extra.websocket_liveness_failure_threshold",
+        }
+
+        def apply_overlay(config):
+            config = dict(config)
+            gateway = dict(config.get("gateway") or {})
+            gateway_platforms = dict(gateway.get("platforms") or {})
+            discord = dict(gateway_platforms.get("discord") or {})
+            discord["extra"] = {
+                **(discord.get("extra") or {}),
+                "websocket_liveness_interval_seconds": 11,
+                "websocket_liveness_failure_threshold": 8,
+            }
+            gateway_platforms["discord"] = discord
+            gateway["platforms"] = gateway_platforms
+            config["gateway"] = gateway
+            return config
+
+        monkeypatch.setattr(managed_scope, "apply_managed_overlay", apply_overlay)
+        monkeypatch.setattr(managed_scope, "managed_config_keys", lambda: managed_paths)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for name in (
+            "HERMES_DISCORD_LIVENESS_INTERVAL_SECONDS",
+            "HERMES_DISCORD_LIVENESS_FAILURE_THRESHOLD",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        load_gateway_config()
+
+        records = records_snapshot()
+        assert records["HERMES_DISCORD_LIVENESS_INTERVAL_SECONDS"].source == (
+            "managed-config:gateway.platforms.discord.extra.websocket_liveness_interval_seconds"
+        )
+        assert records["HERMES_DISCORD_LIVENESS_FAILURE_THRESHOLD"].source == (
+            "managed-config:gateway.platforms.discord.extra.websocket_liveness_failure_threshold"
+        )
+        assert records["DISCORD_REQUIRE_MENTION"].source == (
+            "user-config:platforms.discord.require_mention"
+        )
+
+    def test_telegram_group_extra_sources_resolve_per_leaf(self, tmp_path, monkeypatch):
+        from hermes_cli import managed_scope
+        from gateway.yaml_env import records_snapshot
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    require_mention: true\n",
+            encoding="utf-8",
+        )
+
+        managed_paths = {
+            "gateway.platforms.telegram.extra.group_allow_from",
+            "gateway.platforms.telegram.extra.group_allowed_chats",
+        }
+
+        def apply_overlay(config):
+            config = dict(config)
+            gateway = dict(config.get("gateway") or {})
+            gateway_platforms = dict(gateway.get("platforms") or {})
+            telegram = dict(gateway_platforms.get("telegram") or {})
+            telegram["extra"] = {
+                **(telegram.get("extra") or {}),
+                "group_allow_from": ["alice"],
+                "group_allowed_chats": ["-1001"],
+            }
+            gateway_platforms["telegram"] = telegram
+            gateway["platforms"] = gateway_platforms
+            config["gateway"] = gateway
+            return config
+
+        monkeypatch.setattr(managed_scope, "apply_managed_overlay", apply_overlay)
+        monkeypatch.setattr(managed_scope, "managed_config_keys", lambda: managed_paths)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for name in (
+            "TELEGRAM_GROUP_ALLOWED_USERS",
+            "TELEGRAM_GROUP_ALLOWED_CHATS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        load_gateway_config()
+
+        records = records_snapshot()
+        assert records["TELEGRAM_GROUP_ALLOWED_USERS"].source == (
+            "managed-config:gateway.platforms.telegram.extra.group_allow_from"
+        )
+        assert records["TELEGRAM_GROUP_ALLOWED_CHATS"].source == (
+            "managed-config:gateway.platforms.telegram.extra.group_allowed_chats"
+        )
+        assert records["TELEGRAM_REQUIRE_MENTION"].source == (
+            "user-config:platforms.telegram.require_mention"
+        )
+
+    def test_external_overrides_remain_unmarked_under_all_sources(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot
+
+        for name, value in (("SHELL_VALUE", "shell"), ("SERVICE_VALUE", "service"), ("MANAGED_VALUE", "managed")):
+            monkeypatch.setenv(name, value)
+            load = YamlEnvLoad(f"gateway-config:/{name}")
+            load.set_env_from_yaml(name, value, name.lower(), predicate=lambda name=name: name not in os.environ)
+        assert all(name not in records_snapshot() for name in ("SHELL_VALUE", "SERVICE_VALUE", "MANAGED_VALUE"))
+
+    def test_sensitive_values_are_never_registered_or_scrubbed(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, records_snapshot, without_yaml_generated_env
+
+        monkeypatch.delenv("TEST_API_KEY", raising=False)
+        load = YamlEnvLoad("gateway-config:/secret")
+        assert not load.set_env_from_yaml("TEST_API_KEY", "secret", "api_key", predicate=lambda: True)
+        os.environ["TEST_API_KEY"] = "secret"
+        assert without_yaml_generated_env(dict(os.environ))["TEST_API_KEY"] == "secret"
+        assert "TEST_API_KEY" not in records_snapshot()
+
+    def test_legacy_unmarked_value_requires_clean_external_restart(self, monkeypatch):
+        from gateway.yaml_env import YamlEnvLoad, without_yaml_generated_env
+
+        monkeypatch.setenv("TEST_YAML_VALUE", "legacy")
+        load = YamlEnvLoad("gateway-config:/legacy")
+        load.finish()
+        assert without_yaml_generated_env(dict(os.environ))["TEST_YAML_VALUE"] == "legacy"
+
+    def test_all_nonsecret_platform_yaml_writers_route_with_exact_source(self, monkeypatch):
+        from gateway.yaml_env import (
+            YamlEnvLoad,
+            get_yaml_env_context,
+            records_snapshot,
+            yaml_env_context,
+        )
+        from plugins.platforms.buzz.adapter import _apply_yaml_config as buzz_apply
+        from plugins.platforms.dingtalk.adapter import _apply_yaml_config as dingtalk_apply
+        from plugins.platforms.discord.adapter import _apply_yaml_config as discord_apply
+        from plugins.platforms.feishu.adapter import _apply_yaml_config as feishu_apply
+        from plugins.platforms.matrix.adapter import _apply_yaml_config as matrix_apply
+        from plugins.platforms.mattermost.adapter import _apply_yaml_config as mattermost_apply
+        from plugins.platforms.slack.adapter import _apply_yaml_config as slack_apply
+        from plugins.platforms.telegram.adapter import _apply_yaml_config as telegram_apply
+        from plugins.platforms.whatsapp.adapter import _apply_yaml_config as whatsapp_apply
+
+        cases = [
+            ("buzz", buzz_apply, {"extra": {"relay_url": "https://buzz"}}, "BUZZ_RELAY_URL", "extra.relay_url"),
+            ("dingtalk", dingtalk_apply, {"require_mention": True}, "DINGTALK_REQUIRE_MENTION", "require_mention"),
+            ("discord", discord_apply, {"require_mention": True}, "DISCORD_REQUIRE_MENTION", "require_mention"),
+            ("feishu", feishu_apply, {"allow_bots": True}, "FEISHU_ALLOW_BOTS", "allow_bots"),
+            ("matrix", matrix_apply, {"require_mention": True}, "MATRIX_REQUIRE_MENTION", "require_mention"),
+            ("mattermost", mattermost_apply, {"require_mention": True}, "MATTERMOST_REQUIRE_MENTION", "require_mention"),
+            ("slack", slack_apply, {"require_mention": True}, "SLACK_REQUIRE_MENTION", "require_mention"),
+            ("telegram", telegram_apply, {"free_response_chats": ["A", "B"]}, "TELEGRAM_FREE_RESPONSE_CHATS", "free_response_chats"),
+            ("whatsapp", whatsapp_apply, {"require_mention": True}, "WHATSAPP_REQUIRE_MENTION", "require_mention"),
+        ]
+        for platform, hook, platform_cfg, env_name, leaf in cases:
+            monkeypatch.delenv(env_name, raising=False)
+            load = YamlEnvLoad("gateway-config:/platform")
+            with yaml_env_context(load, f"platforms.{platform}"):
+                hook({}, platform_cfg)
+            context = get_yaml_env_context()
+            assert context is None
+            record = records_snapshot()[env_name]
+            assert record.source.endswith(f"platforms.{platform}.{leaf}")
+
+    def test_core_guarded_writers_route_through_yaml_env_load(self, tmp_path, monkeypatch):
+        from gateway.yaml_env import records_snapshot, clear_records
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "require_mention: true\nsignal:\n  require_mention: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
+        monkeypatch.delenv("SIGNAL_REQUIRE_MENTION", raising=False)
+        clear_records()
+        load_gateway_config()
+        assert {"TELEGRAM_REQUIRE_MENTION", "SIGNAL_REQUIRE_MENTION"} <= set(records_snapshot())
+
+
+def _run_yaml_env_proof(name, monkeypatch, tmp_path=None):
+    from gateway.yaml_env import clear_records
+
+    clear_records()
+    try:
+        target = getattr(TestYamlEnvProvenance(), name)
+        if tmp_path is None:
+            target(monkeypatch)
+        else:
+            target(tmp_path, monkeypatch)
+    finally:
+        clear_records()
+
+
+def test_successful_load_reconciles_removed_generated_writers(monkeypatch):
+    _run_yaml_env_proof("test_successful_load_reconciles_removed_generated_writers", monkeypatch)
+
+
+def test_incomplete_load_aborts_absence_cleanup(monkeypatch):
+    _run_yaml_env_proof("test_incomplete_load_aborts_absence_cleanup", monkeypatch)
+
+
+def test_all_nonsecret_platform_yaml_writers_route_with_exact_source(monkeypatch):
+    _run_yaml_env_proof("test_all_nonsecret_platform_yaml_writers_route_with_exact_source", monkeypatch)
+
+
+def test_core_guarded_writers_route_through_yaml_env_load(tmp_path, monkeypatch):
+    _run_yaml_env_proof("test_core_guarded_writers_route_through_yaml_env_load", monkeypatch, tmp_path)
+
+
+def test_yaml_env_writer_preserves_original_guard_semantics(monkeypatch):
+    _run_yaml_env_proof("test_yaml_env_writer_preserves_original_guard_semantics", monkeypatch)
+
+
+def test_managed_source_selection_does_not_override_external_environment(monkeypatch):
+    _run_yaml_env_proof("test_managed_source_selection_does_not_override_external_environment", monkeypatch)
+
+
+def test_equal_external_values_never_acquire_provenance(monkeypatch):
+    _run_yaml_env_proof("test_equal_external_values_never_acquire_provenance", monkeypatch)
+
+
+def test_same_owner_reload_refreshes_and_reconciles(monkeypatch):
+    _run_yaml_env_proof("test_same_owner_reload_refreshes_and_reconciles", monkeypatch)
+
+
+def test_profile_load_does_not_adopt_or_reconcile_other_owner_record(monkeypatch):
+    _run_yaml_env_proof("test_profile_load_does_not_adopt_or_reconcile_other_owner_record", monkeypatch)
+
+
+def test_mixed_platform_blocks_resolve_source_per_leaf(tmp_path, monkeypatch):
+    _run_yaml_env_proof("test_mixed_platform_blocks_resolve_source_per_leaf", monkeypatch, tmp_path)
+
+
+def test_external_overrides_remain_unmarked_under_all_sources(monkeypatch):
+    _run_yaml_env_proof("test_external_overrides_remain_unmarked_under_all_sources", monkeypatch)
+
+
+def test_sensitive_values_are_never_registered_or_scrubbed(monkeypatch):
+    _run_yaml_env_proof("test_sensitive_values_are_never_registered_or_scrubbed", monkeypatch)
+
+
+def test_legacy_unmarked_value_requires_clean_external_restart(monkeypatch):
+    _run_yaml_env_proof("test_legacy_unmarked_value_requires_clean_external_restart", monkeypatch)

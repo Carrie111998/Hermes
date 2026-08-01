@@ -3621,3 +3621,28 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
 
 
+
+def test_dashboard_replacement_actions_use_restart_environment_only(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+    import hermes_cli.web_server as web_server
+
+    calls = []
+    monkeypatch.setattr(web_server, "_ACTION_LOG_DIR", tmp_path)
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/dashboard")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+
+    def fake_popen(cmd, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(pid=len(calls), poll=lambda: None)
+
+    monkeypatch.setattr(web_server.subprocess, "Popen", fake_popen)
+    web_server._spawn_hermes_action(["gateway", "restart"], "gateway-restart")
+    web_server._spawn_hermes_action(["update"], "hermes-update")
+    web_server._spawn_hermes_action(["doctor"], "doctor")
+    assert calls[0]["env"].get("GENERATED_RESTART_VALUE") is None
+    assert calls[1]["env"].get("GENERATED_RESTART_VALUE") is None
+    assert calls[2]["env"]["GENERATED_RESTART_VALUE"] == "A"
+    assert all(call["env"]["HERMES_NONINTERACTIVE"] == "1" for call in calls)
+    clear_records()

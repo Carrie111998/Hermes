@@ -176,6 +176,65 @@ class TestHandleUpdateCommand:
         assert call_kwargs.get("start_new_session") is True
         assert "Starting Hermes update" in result
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("platform", "setsid_path"),
+        [("win32", "/usr/bin/setsid"), ("linux", "/usr/bin/setsid"), ("linux", None)],
+    )
+    async def test_update_replacement_spawn_uses_shared_restart_environment(
+        self, tmp_path, monkeypatch, platform, setsid_path
+    ):
+        from gateway.yaml_env import YamlEnvLoad, clear_records
+        import gateway.run as gateway_run
+
+        runner = _make_runner()
+        event = _make_event()
+        fake_root = tmp_path / "project"
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway").mkdir()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        calls = []
+
+        def which(name):
+            if name == "hermes":
+                return "/usr/bin/hermes"
+            if name == "setsid":
+                return setsid_path
+            return None
+
+        monkeypatch.setattr(gateway_run.sys, "platform", platform)
+        monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+        monkeypatch.setenv("EXTERNAL_RESTART_VALUE", "external")
+        load = YamlEnvLoad("gateway-config:/update")
+        load.set_env_from_yaml(
+            "GENERATED_RESTART_VALUE",
+            "A",
+            "telegram.free_response_chats",
+            predicate=lambda: True,
+        )
+
+        def fake_popen(*args, **kwargs):
+            calls.append((args, kwargs))
+            return MagicMock()
+
+        try:
+            with patch("gateway.run._hermes_home", hermes_home), \
+                 patch("gateway.slash_commands.__file__", fake_file), \
+                 patch("shutil.which", side_effect=which), \
+                 patch("subprocess.Popen", side_effect=fake_popen):
+                await runner._handle_update_command(event)
+        finally:
+            clear_records()
+
+        assert calls
+        for _args, kwargs in calls:
+            assert kwargs["env"].get("GENERATED_RESTART_VALUE") is None
+            assert kwargs["env"]["EXTERNAL_RESTART_VALUE"] == "external"
+
 
 # ---------------------------------------------------------------------------
 # Platform allowlist gate

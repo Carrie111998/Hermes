@@ -7,8 +7,20 @@ from types import SimpleNamespace
 
 import pytest
 
-pwd = pytest.importorskip("pwd")
-grp = pytest.importorskip("grp")
+try:
+    import pwd
+except ImportError:
+    class _UnavailablePwd:
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: pytest.skip("pwd is unavailable on this platform")
+    pwd = _UnavailablePwd()
+try:
+    import grp
+except ImportError:
+    class _UnavailableGrp:
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: pytest.skip("grp is unavailable on this platform")
+    grp = _UnavailableGrp()
 
 import hermes_cli.gateway as gateway_cli
 from gateway import status
@@ -37,6 +49,88 @@ class TestUserSystemdPrivateSocketPreflight:
 
         assert gateway_cli._wait_for_user_dbus_socket(timeout=0.1) is True
         assert calls == ["env"]
+
+
+def test_update_restart_watcher_uses_shared_restart_environment(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    calls = []
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/watcher")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+    monkeypatch.setattr(gateway_cli.subprocess, "Popen", lambda cmd, **kwargs: calls.append(kwargs) or SimpleNamespace())
+    assert gateway_cli._spawn_gateway_restart_watcher(321, ["hermes", "gateway", "run"]) is True
+    assert calls[0]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
+
+
+def test_update_restart_watcher_retries_without_breakaway(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+    import hermes_cli._subprocess_compat as subprocess_compat
+
+    calls = []
+    monkeypatch.setattr(gateway_cli.sys, "platform", "win32")
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/watcher-fallback")
+    load.set_env_from_yaml(
+        "GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True
+    )
+    monkeypatch.setattr(subprocess_compat, "windows_detach_popen_kwargs", lambda: {"creationflags": 1})
+    monkeypatch.setattr(subprocess_compat, "windows_detach_flags_without_breakaway", lambda: 2)
+
+    def fake_popen(cmd, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise OSError("breakaway denied")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(gateway_cli.subprocess, "Popen", fake_popen)
+    assert gateway_cli._spawn_gateway_restart_watcher(321, ["hermes", "gateway", "run"]) is True
+    assert len(calls) == 2
+    assert calls[0]["env"] == calls[1]["env"]
+    assert calls[1]["creationflags"] == 2
+    assert calls[1]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
+
+
+def test_update_restart_watcher_returns_false_when_both_spawns_fail(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    monkeypatch.setattr(gateway_cli.sys, "platform", "win32")
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/watcher-error")
+    load.set_env_from_yaml(
+        "GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True
+    )
+    monkeypatch.setattr(gateway_cli.subprocess, "Popen", lambda *a, **kw: (_ for _ in ()).throw(OSError("denied")))
+    assert gateway_cli._spawn_gateway_restart_watcher(321, ["hermes", "gateway", "run"]) is False
+    clear_records()
+
+
+def test_detached_launchd_fallback_uses_shared_restart_environment(monkeypatch, tmp_path):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    home = tmp_path / ".hermes"
+    (home / "logs").mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway_cli, "_gateway_run_command", lambda: ["hermes", "gateway", "run"])
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/launchd")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+    monkeypatch.setattr(gateway_cli.subprocess, "Popen", lambda cmd, **kwargs: calls.append(kwargs) or SimpleNamespace())
+    assert gateway_cli._spawn_detached_gateway() is True
+    assert calls[0]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
+
+
+def test_detached_launchd_fallback_reports_spawn_error(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    (home / "logs").mkdir(parents=True)
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway_cli, "_gateway_run_command", lambda: ["hermes", "gateway", "run"])
+    monkeypatch.setattr(gateway_cli.subprocess, "Popen", lambda *a, **kw: (_ for _ in ()).throw(OSError("denied")))
+    assert gateway_cli._spawn_detached_gateway() is False
 
 
 class TestSystemdServiceRefresh:

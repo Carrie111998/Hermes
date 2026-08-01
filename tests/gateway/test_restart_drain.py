@@ -235,6 +235,115 @@ async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch
     assert kwargs["creationflags"] == 0x08000200
 
 
+@pytest.mark.asyncio
+async def test_windows_detached_restart_uses_shared_restart_environment(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    runner, _adapter = make_restart_runner()
+    calls = []
+    monkeypatch.setattr(gateway_run.sys, "platform", "win32")
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    monkeypatch.setenv("EXTERNAL_RESTART_VALUE", "external")
+    load = YamlEnvLoad("gateway-config:/restart")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+    import hermes_cli._subprocess_compat as subprocess_compat
+    monkeypatch.setattr(subprocess_compat, "windows_detach_popen_kwargs", lambda: {})
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(kwargs) or MagicMock())
+    await runner._launch_detached_restart_command()
+    assert calls[0]["env"].get("GENERATED_RESTART_VALUE") is None
+    assert calls[0]["env"]["EXTERNAL_RESTART_VALUE"] == "external"
+    clear_records()
+
+
+@pytest.mark.asyncio
+async def test_windows_detached_restart_retries_with_same_environment_after_spawn_error(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    runner, _adapter = make_restart_runner()
+    calls = []
+    monkeypatch.setattr(gateway_run.sys, "platform", "win32")
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/restart-fallback")
+    load.set_env_from_yaml(
+        "GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True
+    )
+    import hermes_cli._subprocess_compat as subprocess_compat
+    monkeypatch.setattr(subprocess_compat, "windows_detach_popen_kwargs", lambda: {"creationflags": 1})
+    monkeypatch.setattr(subprocess_compat, "windows_detach_flags_without_breakaway", lambda: 2)
+
+    def fake_popen(cmd, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise OSError("breakaway denied")
+        return MagicMock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    await runner._launch_detached_restart_command()
+
+    assert len(calls) == 2
+    assert calls[0]["env"] == calls[1]["env"]
+    assert calls[1]["creationflags"] == 2
+    assert calls[1]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
+
+
+@pytest.mark.asyncio
+async def test_posix_detached_restart_uses_setsid_when_available(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    runner, _adapter = make_restart_runner()
+    calls = []
+    monkeypatch.setattr(gateway_run.sys, "platform", "linux")
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/setsid")
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/restart-setsid")
+    load.set_env_from_yaml(
+        "GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append((cmd, kwargs)) or MagicMock())
+    await runner._launch_detached_restart_command()
+
+    assert calls[0][0][0] == "/usr/bin/setsid"
+    assert calls[0][1]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
+
+
+@pytest.mark.asyncio
+async def test_posix_detached_restart_uses_shared_restart_environment(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+
+    runner, _adapter = make_restart_runner()
+    calls = []
+    monkeypatch.setattr(gateway_run.sys, "platform", "linux")
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/restart")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(kwargs) or MagicMock())
+    await runner._launch_detached_restart_command()
+    assert calls[0]["env"].get("GENERATED_RESTART_VALUE") is None
+    clear_records()
+
+
+def test_restart_filter_does_not_change_generic_subprocess_env(monkeypatch):
+    from gateway.yaml_env import YamlEnvLoad, clear_records
+    from tools.environments.local import build_subprocess_env
+
+    monkeypatch.setenv("GENERATED_RESTART_VALUE", "A")
+    load = YamlEnvLoad("gateway-config:/generic")
+    load.set_env_from_yaml("GENERATED_RESTART_VALUE", "A", "telegram.free_response_chats", predicate=lambda: True)
+    assert build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)["GENERATED_RESTART_VALUE"] == "A"
+    clear_records()
+
+
 # ── Shutdown notification tests ──────────────────────────────────────
 
 

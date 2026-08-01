@@ -1257,7 +1257,39 @@ def load_gateway_config() -> GatewayConfig:
     4. Built-in defaults
     """
     _home = get_hermes_home()
+    from gateway.yaml_env import YamlEnvLoad
+
+    _managed_keys: set[str] = set()
+    try:
+        from hermes_cli import managed_scope
+
+        _managed_snapshot = managed_scope.apply_managed_overlay({})
+        def _materialized_leaves(value: Any, prefix: str = "") -> set[str]:
+            if not isinstance(value, dict):
+                return {prefix} if prefix else set()
+            leaves: set[str] = set()
+            for key, child in value.items():
+                dotted = f"{prefix}.{key}" if prefix else str(key)
+                leaves.update(_materialized_leaves(child, dotted))
+            return leaves
+
+        _managed_keys = managed_scope.managed_config_keys() & _materialized_leaves(
+            _managed_snapshot
+        )
+    except Exception:
+        _managed_snapshot = {}
+
+    def _source_kind(path: str) -> str:
+        if path in _managed_keys:
+            return "managed-config"
+        return "user-config"
+
+    _yaml_env = YamlEnvLoad(
+        f"gateway-config:{Path(_home).resolve()}",
+        source_resolver=_source_kind,
+    )
     gw_data: dict = {}
+    _yaml_hook_complete = True
 
     # Legacy fallback: gateway.json provides the base layer.
     # config.yaml keys always win when both specify the same setting.
@@ -1487,17 +1519,31 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["platforms"] = platforms_data
             # Iterate built-in platforms plus any registered plugin platforms
             # so plugin authors get the same shared-key bridging (#24836).
+            _yaml_hook_complete = True
             try:
                 from hermes_cli.plugins import discover_plugins
                 discover_plugins()  # idempotent
                 from gateway.platform_registry import platform_registry as _pr
             except Exception as e:
-                logger.debug("plugin discovery skipped: %s", e)
+                _yaml_hook_complete = False
+                logger.debug("plugin discovery incomplete: %s", e)
                 _pr = None
 
             _shared_loop_targets: list = list(Platform)
             if _pr is not None:
-                for _entry in _pr.plugin_entries():
+                try:
+                    _plugin_entries = _pr.plugin_entries()
+                    if _pr.deferred_load_errors:
+                        _yaml_hook_complete = False
+                        logger.debug(
+                            "deferred platform discovery incomplete: %s",
+                            sorted(_pr.deferred_load_errors),
+                        )
+                except Exception as e:
+                    _yaml_hook_complete = False
+                    logger.debug("plugin registry enumeration incomplete: %s", e)
+                    _plugin_entries = []
+                for _entry in _plugin_entries:
                     try:
                         _plat = Platform(_entry.name)
                     except (ValueError, KeyError):
@@ -1646,27 +1692,111 @@ def load_gateway_config() -> GatewayConfig:
             # blocks (below; no-op when a hook already set their env var) →
             # ``_apply_env_overrides()`` after ``GatewayConfig.from_dict``.
             if _pr is not None:
-                for entry in _pr.all_entries():
+                try:
+                    _all_entries = _pr.all_entries()
+                    if _pr.deferred_load_errors:
+                        _yaml_hook_complete = False
+                except Exception as e:
+                    _yaml_hook_complete = False
+                    logger.debug("plugin hook enumeration incomplete: %s", e)
+                    _all_entries = []
+
+                def _record_platform_leaf_sources(
+                    value: dict,
+                    path: str,
+                    source_prefix: str,
+                    source_paths: dict[str, str],
+                ) -> None:
+                    if isinstance(value, dict) and value:
+                        for key, child in value.items():
+                            child_path = f"{path}.{key}" if path else str(key)
+                            _record_platform_leaf_sources(
+                                child, child_path, source_prefix, source_paths
+                            )
+                        return
+                    source_paths[path] = f"{source_prefix}.{path}"
+
+                def _merge_platform_hook_block(
+                    platform_cfg: dict | None,
+                    source_paths: dict[str, str],
+                    candidate: dict,
+                    source_prefix: str,
+                ) -> tuple[dict, dict[str, str]]:
+                    merged = dict(platform_cfg or {})
+                    merged_sources = dict(source_paths)
+                    for key, value in candidate.items():
+                        key = str(key)
+                        if key == "extra" and isinstance(value, dict):
+                            old_extra = merged.get("extra")
+                            merged["extra"] = {
+                                **(old_extra if isinstance(old_extra, dict) else {}),
+                                **value,
+                            }
+                            _record_platform_leaf_sources(
+                                value, "extra", source_prefix, merged_sources
+                            )
+                            continue
+                        for path in list(merged_sources):
+                            if path == key or path.startswith(f"{key}."):
+                                merged_sources.pop(path)
+                        merged[key] = value
+                        _record_platform_leaf_sources(
+                            value, key, source_prefix, merged_sources
+                        )
+                    return merged, merged_sources
+
+                for entry in _all_entries:
                     if entry.apply_yaml_config_fn is None:
                         continue
-                    platform_cfg = yaml_cfg.get(entry.name)
-                    # Fall back to the platform's block under ``platforms`` /
-                    # ``gateway.platforms`` so adapter hooks still run when the
-                    # user configured the platform only under those nested paths
-                    # (e.g. ``platforms.discord.extra.allow_from``) and not via a
-                    # top-level ``discord:`` block.
-                    if not isinstance(platform_cfg, dict):
-                        for _src in (gateway_platforms, yaml_cfg.get("platforms")):
-                            if isinstance(_src, dict):
-                                _candidate = _src.get(entry.name)
-                                if isinstance(_candidate, dict):
-                                    platform_cfg = _candidate
-                                    break
+                    # The effective merge order is gateway.platforms, then
+                    # top-level platforms, then a direct gateway.<platform>
+                    # block.  Build the same effective block for the hook and
+                    # retain the source of every effective leaf for provenance.
+                    platform_cfg = None
+                    _source_paths: dict[str, str] = {}
+                    _source_prefix = entry.name
+                    _platform_sources = (
+                        ("gateway.platforms", gateway_platforms),
+                        ("platforms", yaml_cfg.get("platforms")),
+                        ("gateway", {
+                            entry.name: gateway_cfg.get(entry.name)
+                            if isinstance(gateway_cfg, dict)
+                            else None,
+                        }),
+                    )
+                    for _prefix, _src in _platform_sources:
+                        if not isinstance(_src, dict):
+                            continue
+                        _candidate = _src.get(entry.name)
+                        if not isinstance(_candidate, dict):
+                            continue
+                        platform_cfg, _source_paths = _merge_platform_hook_block(
+                            platform_cfg,
+                            _source_paths,
+                            _candidate,
+                            f"{_prefix}.{entry.name}",
+                        )
+                        _source_prefix = f"{_prefix}.{entry.name}"
+                    _direct_cfg = yaml_cfg.get(entry.name)
+                    if isinstance(_direct_cfg, dict):
+                        platform_cfg, _source_paths = _merge_platform_hook_block(
+                            platform_cfg,
+                            _source_paths,
+                            _direct_cfg,
+                            entry.name,
+                        )
+                        _source_prefix = entry.name
                     if not isinstance(platform_cfg, dict):
                         continue
                     try:
-                        seeded = entry.apply_yaml_config_fn(yaml_cfg, platform_cfg)
+                        from gateway.yaml_env import yaml_env_context
+
+                        with yaml_env_context(
+                            _yaml_env, _source_prefix, _source_paths
+                        ):
+                            seeded = entry.apply_yaml_config_fn(yaml_cfg, platform_cfg)
                     except Exception as e:
+                        _yaml_hook_complete = False
                         logger.debug(
                             "apply_yaml_config_fn for %s raised: %s",
                             entry.name, e,
@@ -1699,8 +1829,12 @@ def load_gateway_config() -> GatewayConfig:
                     # require_mention (not a telegram: block), so the telegram plugin's
                     # apply_yaml_config_fn hook — which only runs when a telegram config
                     # block exists — can't cover the no-telegram-block case (#3979).
-                    if not os.getenv("TELEGRAM_REQUIRE_MENTION"):
-                        os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_tl_require_mention).lower()
+                    _yaml_env.set_env_from_yaml(
+                        "TELEGRAM_REQUIRE_MENTION",
+                        str(_tl_require_mention).lower(),
+                        "require_mention",
+                        predicate=lambda: not os.getenv("TELEGRAM_REQUIRE_MENTION"),
+                    )
 
             # Telegram settings → env vars / extra: migrated to the telegram
             # plugin's apply_yaml_config_fn hook
@@ -1713,8 +1847,13 @@ def load_gateway_config() -> GatewayConfig:
             # Signal settings → env vars (env vars take precedence)
             signal_cfg = yaml_cfg.get("signal", {})
             if isinstance(signal_cfg, dict):
-                if "require_mention" in signal_cfg and not os.getenv("SIGNAL_REQUIRE_MENTION"):
-                    os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
+                if "require_mention" in signal_cfg:
+                    _yaml_env.set_env_from_yaml(
+                        "SIGNAL_REQUIRE_MENTION",
+                        str(signal_cfg["require_mention"]).lower(),
+                        "signal.require_mention",
+                        predicate=lambda: not os.getenv("SIGNAL_REQUIRE_MENTION"),
+                    )
 
             # DingTalk settings → env vars: migrated to the dingtalk plugin's
             # apply_yaml_config_fn hook (plugins/platforms/dingtalk/adapter.py).
@@ -1732,6 +1871,8 @@ def load_gateway_config() -> GatewayConfig:
             # #41112 / #3823.
 
     except Exception as e:
+        _yaml_hook_complete = False
+        _yaml_env.abort()
         logger.warning(
             "Failed to process config.yaml — falling back to .env / gateway.json values. "
             "Check %s for syntax errors. Error: %s",
@@ -1739,13 +1880,22 @@ def load_gateway_config() -> GatewayConfig:
             e,
         )
 
-    config = GatewayConfig.from_dict(gw_data)
+    try:
+        config = GatewayConfig.from_dict(gw_data)
 
-    # Override with environment variables
-    _apply_env_overrides(config)
-    
-    # --- Validate loaded values ---
-    _validate_gateway_config(config)
+        # Override with environment variables
+        _apply_env_overrides(config)
+
+        # --- Validate loaded values ---
+        _validate_gateway_config(config)
+    except Exception:
+        _yaml_env.abort()
+        raise
+
+    if _yaml_hook_complete:
+        _yaml_env.finish()
+    else:
+        _yaml_env.abort()
 
     return config
 

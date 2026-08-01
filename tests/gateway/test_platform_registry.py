@@ -241,7 +241,7 @@ class TestApplyYamlConfigFnDispatch:
 
 
     def test_hook_exception_swallowed(self, tmp_path, monkeypatch):
-        """A misbehaving hook never aborts load_gateway_config()."""
+        """A misbehaving hook aborts reconciliation but doesn't abort loading."""
 
         def _bad_hook(yaml_cfg, platform_cfg):
             raise RuntimeError("plugin author bug")
@@ -249,9 +249,13 @@ class TestApplyYamlConfigFnDispatch:
         # Also register a well-behaved hook to ensure dispatch continues
         # iterating after a bad one.
         good_called = {"count": 0}
+        context_seen = {}
 
         def _good_hook(yaml_cfg, platform_cfg):
             good_called["count"] += 1
+            from gateway.yaml_env import get_yaml_env_context
+
+            context_seen["value"] = get_yaml_env_context()
             return None
 
         from gateway.platform_registry import platform_registry as _reg
@@ -279,11 +283,25 @@ class TestApplyYamlConfigFnDispatch:
             )
             monkeypatch.setenv("HERMES_HOME", str(home))
 
+            from gateway.yaml_env import YamlEnvLoad, clear_records, records_snapshot
+
+            monkeypatch.setenv("TEST_YAML_VALUE", "A")
+            prior = YamlEnvLoad(f"gateway-config:{home.resolve()}")
+            prior.set_env_from_yaml(
+                "TEST_YAML_VALUE", "A", "test.value", predicate=lambda: True
+            )
+
             # Must not raise.
             from gateway.config import load_gateway_config
             load_gateway_config()
 
             assert good_called["count"] == 1
+            assert context_seen["value"].source_prefix == "mygoodplat"
+            assert context_seen["value"].source_for("k") == "mygoodplat.k"
+            assert context_seen["value"].load.owner.startswith("gateway-config:")
+            assert os.environ["TEST_YAML_VALUE"] == "A"
+            assert records_snapshot()["TEST_YAML_VALUE"].value == "A"
+            clear_records()
         finally:
             _reg.unregister("mybadplat")
             _reg.unregister("mygoodplat")

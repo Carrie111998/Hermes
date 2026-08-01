@@ -5435,6 +5435,11 @@ class GatewaySlashCommandsMixin:
         # so the simplest correct thing is: launch an inline Python helper
         # that runs the command and writes both outputs.
         try:
+            from hermes_cli.gateway import build_gateway_restart_environment
+
+            update_env = build_gateway_restart_environment(
+                extra={"PYTHONUNBUFFERED": "1"}
+            )
             if sys.platform == "win32":
                 import textwrap
                 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
@@ -5464,6 +5469,7 @@ class GatewaySlashCommandsMixin:
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=update_env,
                     **windows_detach_popen_kwargs(),
                 )
             else:
@@ -5484,6 +5490,7 @@ class GatewaySlashCommandsMixin:
                         [setsid_bin, "bash", "-c", update_cmd],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        env=update_env,
                         start_new_session=True,
                     )
                 else:
@@ -5492,6 +5499,7 @@ class GatewaySlashCommandsMixin:
                         ["bash", "-c", update_cmd],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        env=update_env,
                         start_new_session=True,
                     )
         except Exception as e:

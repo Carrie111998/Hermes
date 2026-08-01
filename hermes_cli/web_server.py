@@ -3717,8 +3717,15 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     # trip the in-process restart-loop guard and exit 1 — silently failing the
     # dashboard's auto-restart paths. The gateway's own restart watcher already
     # drops it (gateway/run.py); mirror that here (#52470).
-    action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
-    action_env.pop("_HERMES_GATEWAY", None)
+    if name in {"gateway-restart", "hermes-update"}:
+        from hermes_cli.gateway import build_gateway_restart_environment
+
+        action_env = build_gateway_restart_environment(
+            extra={"HERMES_NONINTERACTIVE": "1"}
+        )
+    else:
+        action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+        action_env.pop("_HERMES_GATEWAY", None)
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
