@@ -1321,7 +1321,7 @@ def test_token_is_wiped_and_all_capabilities_rechecked_on_compute_failure(
     assert checks["ssh"] == 2
 
 
-def test_unpinned_consumer_starts_no_process_or_compute(
+def test_explicitly_unpinned_consumer_starts_no_process_or_compute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1339,6 +1339,7 @@ def test_unpinned_consumer_starts_no_process_or_compute(
         match="owner_gate_iap_identity_receipt_unpinned",
     ):
         launcher.PinnedOwnerGateHostIdentityReceipt(
+            expected_receipt_sha256=None,
             pinning_source_revision=PINNING_REVISION,
         )
 

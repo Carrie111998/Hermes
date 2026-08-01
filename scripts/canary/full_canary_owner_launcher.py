@@ -296,11 +296,11 @@ OWNER_GATE_ACTIVATION_SEAL_PATH = (
 OWNER_GATE_ACTIVATION_RECEIPT_BASE = (
     "/var/lib/muncho-owner-gate/activation-receipts"
 )
-# Intentionally unset.  The inert owner-gate bootstrap must first yield the
-# exact numeric instance ID and SSH host key in an externally owner-signed
-# receipt.  A reviewed follow-up pins that receipt digest; until then the
-# production IAP transport cannot be constructed and no Cloud call is made.
-OWNER_GATE_HOST_IDENTITY_RECEIPT_SHA256: str | None = None
+# Pinned only after the inert bootstrap published the externally owner-signed
+# v3 identity receipt and a distinct release verified its exact contents.
+OWNER_GATE_HOST_IDENTITY_RECEIPT_SHA256: str | None = (
+    "8bfb77d30913f0a437fa8e406857bc2d5866c2378bd8774adc8ff8200b338291"
+)
 PHASE_B_PINNED_APPROVAL_SOURCE_SHA256 = hashlib.sha256(
     PHASE_B_OWNER_PUBLIC_KEY_FINGERPRINT.encode("ascii")
 ).hexdigest()
