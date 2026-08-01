@@ -243,6 +243,64 @@ json_escape() {
         -e 's/"/\\"/g'
 }
 
+# Check if uv output indicates a TLS certificate error.
+# Returns 0 (true) if a cert error is detected, 1 (false) otherwise.
+uv_is_cert_error() {
+    local output="$1"
+    if [ -z "$output" ]; then return 1; fi
+    echo "$output" | grep -qE \
+        -e "invalid peer certificate" \
+        -e "UnknownIssuer" \
+        -e "certificate verify failed" \
+        -e "CERTIFICATE_VERIFY_FAILED" \
+        -e "UNABLE_TO_GET_ISSUER_CERT" \
+        -e "SELF_SIGNED_CERT_IN_CHAIN" \
+        -e "CERT_HAS_EXPIRED"
+}
+
+# Run a uv command with automatic retry using UV_SYSTEM_CERTS=1 on TLS failure.
+# The first attempt streams stdout+stderr live to the user (the happy path —
+# `uv sync` can take 1-5 minutes and must show progress, not swallow it).
+# On failure, the command is re-run once silently to capture output for
+# cert-error inspection, and retried with UV_SYSTEM_CERTS=1. Only the
+# captured-then-retried output is echoed on the final attempt path; on the
+# success path the user already saw everything live.
+# Usage: uv_with_system_certs_retry <uv command and args...>
+uv_with_system_certs_retry() {
+    # Happy path: stream live.  uv's own progress UI (resolver bars, download
+    # meters) writes to stderr; capturing it makes `uv sync` look frozen.
+    if "$UV_CMD" "$@"; then
+        return 0
+    fi
+    local _first_exit=$?
+
+    # Re-run silently to capture stderr+stdout for cert-error inspection.
+    local _output
+    _output="$("$UV_CMD" "$@" 2>&1)" || true
+    local _exit=$?
+
+    # Check for TLS certificate error
+    if uv_is_cert_error "$_output"; then
+        log_warn "This looks like a TLS certificate-trust failure, not a generic network problem." >&2
+        log_info "  A corporate proxy or antivirus is likely intercepting HTTPS and presenting a" >&2
+        log_info "  certificate the OS trusts but uv's bundled trust store does not." >&2
+        log_info "  Retrying with UV_SYSTEM_CERTS=1 (uses OS certificate store)..." >&2
+
+        if UV_SYSTEM_CERTS=1 "$UV_CMD" "$@"; then
+            log_success "Retry with UV_SYSTEM_CERTS=1 succeeded." >&2
+            log_info "For future runs, you can set UV_SYSTEM_CERTS=1 before invoking uv." >&2
+            return 0
+        fi
+        local _retry_exit=$?
+        log_error "Retry with UV_SYSTEM_CERTS=1 also failed. The issue may be unrelated to certificates." >&2
+        return $_retry_exit
+    fi
+
+    # Not a cert error — surface the original failure to the user.
+    echo "$_output" >&2
+    return $_first_exit
+}
+
 # npm rewrites tracked package-lock.json files non-deterministically during
 # `npm install` / `npm run pack`. On a managed install those diffs are never
 # intentional, but they leave the checkout dirty — which forces `hermes update`
@@ -585,6 +643,11 @@ install_uv() {
     fi
     # UV_UNMANAGED_INSTALL tells the astral installer to place the binary
     # directly into $HERMES_HOME/bin instead of ~/.local/bin.
+    # The astral installer is a shell script that downloads uv over HTTPS.
+    # On corporate networks with TLS inspection, the download (performed by
+    # curl inside the installer shell script, not by uv itself) can fail.
+    # UV_SYSTEM_CERTS=1 won't help here (curl uses the OS store already),
+    # so we don't retry — surface the error clearly instead.
     if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
@@ -633,7 +696,7 @@ check_python() {
 
     # Let uv handle Python — it can download and manage Python versions
     # First check if a suitable Python is already available
-    if PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION" 2>/dev/null)"; then
+    if PYTHON_PATH=$(uv_with_system_certs_retry python find "$PYTHON_VERSION" 2>/dev/null); then
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         log_success "Python found: $PYTHON_FOUND_VERSION"
         return 0
@@ -641,8 +704,8 @@ check_python() {
 
     # Python not found — use uv to install it (no sudo needed!)
     log_info "Python $PYTHON_VERSION not found, installing via uv..."
-    if "$UV_CMD" python install "$PYTHON_VERSION"; then
-        PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION")"
+    if uv_with_system_certs_retry python install "$PYTHON_VERSION"; then
+        PYTHON_PATH=$(uv_with_system_certs_retry python find "$PYTHON_VERSION")
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         log_success "Python installed: $PYTHON_FOUND_VERSION"
     else
@@ -1394,7 +1457,10 @@ setup_venv() {
     fi
 
     # uv creates the venv and pins the Python version in one step
-    $UV_CMD venv venv --python "$PYTHON_VERSION"
+    if ! uv_with_system_certs_retry venv venv --python "$PYTHON_VERSION"; then
+        log_error "Failed to create virtual environment"
+        exit 1
+    fi
 
     # Neutralize any inherited UV_PYTHON (e.g. UV_PYTHON=3.14 left in the
     # user's shell env). uv honours UV_PYTHON over an existing venv for the
@@ -1548,7 +1614,7 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" uv_with_system_certs_retry sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -1629,7 +1695,7 @@ PY
     install_tier() {
         local name="$1"; local spec="$2"
         log_info "Trying tier: $name ..."
-        if $UV_CMD pip install -e "$spec" 2>"$ALL_INSTALL_LOG"; then
+        if uv_with_system_certs_retry pip install -e "$spec" 2>"$ALL_INSTALL_LOG"; then
             log_success "Main package installed ($name)"
             _installed=true
             _tier_name="$name"
