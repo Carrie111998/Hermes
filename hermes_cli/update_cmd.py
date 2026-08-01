@@ -3551,6 +3551,82 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
+
+# Marker string embedded in the Windows Tauri updater binary by the
+# HANDOFF_PID fix (upstream commit 8c76fe19f, "fix(update): let the GUI
+# updater's hermes update child pass the lock it already holds"). A
+# Hermes-Setup.exe built BEFORE that commit does not contain it, and such a
+# stale updater deadlocks every in-app update on Windows: the desktop
+# pre-writes the update marker with the updater's own PID, the updater spawns
+# `hermes update`, and the child refuses because it cannot distinguish its
+# parent's marker from a foreign concurrent updater ("Another Hermes update
+# is already running" / "Hermes is still running"), leaving a stale marker
+# behind that poisons subsequent attempts.
+#
+# `hermes update` never rebuilds this installer (it rebuilds the desktop app
+# and web UI, not the Tauri bootstrap binary), so a stale staged updater
+# survives code updates silently. We detect it here -- on the only code path
+# that is guaranteed to run the FRESH checkout -- and tell the user exactly
+# how to repair it, instead of letting the next in-app update deadlock.
+_WINDOWS_UPDATER_HANDOFF_MARKER = b"HERMES_UPDATE_HANDOFF_PID"
+
+
+# Windows updater binary name under HERMES_HOME (mirrors
+# apps/bootstrap-installer/src-tauri/src/paths.rs `installer_dest()`).
+_WINDOWS_UPDATER_BINARY_NAME = "hermes-setup.exe"
+
+
+def _windows_updater_is_stale() -> bool:
+    """True when the staged Windows updater predates the HANDOFF_PID fix.
+
+    Read-only best-effort probe: locates HERMES_HOME/hermes-setup.exe (the
+    binary the desktop launches with `--update`) and checks whether it embeds
+    the handoff marker string. Any error (missing file, unreadable binary,
+    non-Windows) returns False so a healthy install is never nagged and a
+    broken probe never blocks an update.
+    """
+    if not _m()._is_windows():
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+
+        updater = get_hermes_home() / _WINDOWS_UPDATER_BINARY_NAME
+        if not updater.is_file():
+            return False
+        with open(updater, "rb") as fh:
+            head = fh.read(16 * 1024 * 1024)
+        return _WINDOWS_UPDATER_HANDOFF_MARKER not in head
+    except Exception as exc:
+        logger.debug("Windows updater staleness probe failed: %s", exc)
+        return False
+
+
+def _print_windows_updater_stale_notice() -> None:
+    """Warn when the staged Windows updater binary is too old to complete
+    an in-app update, with the exact repair steps.
+
+    Printed after a successful `hermes update` so the user learns about the
+    stale binary at the moment they are already thinking about their install.
+    Kept non-fatal: the code update itself succeeded; only the next desktop
+    in-app update would deadlock.
+    """
+    print()
+    print(
+        "⚠ Stale Windows updater detected: the installed Hermes-Setup.exe "
+        "was built before the lock-handoff fix (upstream commit 8c76fe19f)."
+    )
+    print(
+        "  The desktop in-app Update will fail with \"Another Hermes update "
+        "is already running\" until this binary is replaced."
+    )
+    print(
+        "  Fix: download the latest installer from "
+        "https://hermes-agent.nousresearch.com/ and run it, or re-run the "
+        "installer you originally used. `hermes update` cannot replace this "
+        "binary itself."
+    )
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -4592,6 +4668,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("  be in a mixed state until the Node deps are rebuilt.")
         else:
             print("✓ Update complete!")
+
+        # Windows: the staged hermes-setup.exe is NOT rebuilt by `hermes
+        # update` (only the desktop app + web UI are). If it predates the
+        # HANDOFF_PID fix (8c76fe19f), the next desktop in-app update will
+        # deadlock with "Another Hermes update is already running". Surface
+        # the repair steps now, on the one path guaranteed to run fresh code.
+        try:
+            if _windows_updater_is_stale():
+                _print_windows_updater_stale_notice()
+        except Exception as _updater_probe_exc:
+            # Never let the probe break an otherwise-good update.
+            logger.debug(
+                "Windows updater staleness notice failed: %s", _updater_probe_exc
+            )
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
