@@ -7388,12 +7388,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         feedback_text = (
             "The gateway rejected the following MEDIA path(s) before upload, "
-            "so no attachment was sent:\n"
+            "so the listed attachment(s) were not sent:\n"
             + "\n".join(f"- {path}" for path in paths)
             + "\nMove, copy, translate, or regenerate the file at a host-visible "
             "path under an allowed root, then retry with a new MEDIA directive. "
             "If no valid path exists, report the delivery failure plainly."
         )
+        feedback_metadata = dict(event.metadata or {})
+        feedback_metadata["media_delivery_feedback"] = True
         feedback_event = MessageEvent(
             text=feedback_text,
             message_type=MessageType.TEXT,
@@ -7403,7 +7405,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_prompt=event.channel_prompt,
             channel_context=event.channel_context,
             internal=True,
-            metadata={"media_delivery_feedback": True},
+            metadata=feedback_metadata,
         )
         self._enqueue_fifo(session_key, feedback_event, adapter)
 
@@ -8359,6 +8361,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if existing is not None and (
+            getattr(existing, "metadata", None) or {}
+        ).get("media_delivery_feedback"):
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return
+            self._enqueue_fifo(session_key, event, adapter)
+            return
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -17344,7 +17358,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter, session_key=_quick_key,
+                            response, event, _media_adapter, session_key=session_key,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -18476,7 +18490,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             media_files, cleaned = adapter.extract_media(response)
             media_files, rejected_media = BasePlatformAdapter.partition_media_delivery_paths(media_files)
             runner = getattr(adapter, "gateway_runner", None)
-            if rejected_media and runner is not None:
+            if rejected_media and runner is not None and not event.internal:
                 try:
                     runner._queue_media_delivery_feedback(
                         event,

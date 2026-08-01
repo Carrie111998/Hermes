@@ -130,7 +130,7 @@ async def test_rejected_nonstream_media_reenters_origin_session_and_recovers(tmp
     assert events[1].internal is True
     assert events[1].metadata["media_delivery_feedback"] is True
     assert json.dumps(str(rejected), ensure_ascii=True) in events[1].text
-    assert "no attachment" in events[1].text.lower()
+    assert "listed attachment(s) were not sent" in events[1].text.lower()
     assert adapter.sent_text == [
         "Here is the report.",
         "I could not deliver the report because the host rejected its path.",
@@ -277,3 +277,48 @@ async def test_adapter_without_runner_preserves_filtering_and_delivery(tmp_path,
     assert adapter.sent_text == ["Safe"]
     assert adapter.sent_documents == [str(safe)]
     assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_internal_media_response_keeps_non_foreground_boundary(tmp_path, monkeypatch):
+    _, rejected = _media_paths(tmp_path, monkeypatch)
+    runner = _runner()
+    adapter = _MediaFeedbackAdapter()
+    adapter.gateway_runner = runner
+    event = _event(metadata={"internal_source": "watch"})
+    event.internal = True
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{rejected}")
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+    await _drain_background_tasks(adapter)
+
+    assert adapter._message_handler.await_count == 1
+    assert adapter._pending_messages == {}
+    assert runner._sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_user_followup_after_feedback_keeps_turn_boundary(tmp_path, monkeypatch):
+    _, rejected = _media_paths(tmp_path, monkeypatch)
+    runner = _runner()
+    adapter = _MediaFeedbackAdapter()
+    adapter.gateway_runner = runner
+    runner._adapter_for_source = lambda source: adapter
+    session_key = build_session_key(_source())
+    primary_event = _event()
+    runner._queue_media_delivery_feedback(
+        primary_event,
+        session_key,
+        adapter,
+        [(str(rejected), False)],
+    )
+    adapter._busy_text_mode = "queue"
+
+    await adapter._queue_text_debounce(session_key, _event("follow-up"))
+    await adapter._flush_text_debounce_now(session_key)
+
+    feedback_event = adapter._pending_messages[session_key]
+    assert feedback_event.metadata["media_delivery_feedback"] is True
+    queued = runner._sessions[session_key].conversation.queued_events
+    assert len(queued) == 1
+    assert queued[0].text == "follow-up"

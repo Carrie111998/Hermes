@@ -5271,6 +5271,21 @@ class BasePlatformAdapter(ABC):
         existing_pending = self._pending_messages.get(session_key)
         if (
             existing_pending is not None
+            and (getattr(existing_pending, "metadata", None) or {}).get(
+                "media_delivery_feedback"
+            )
+        ):
+            state = store.pop(session_key, None)
+            if state is None:
+                return False
+            runner = getattr(self, "gateway_runner", None)
+            queue_pending = getattr(runner, "_queue_or_replace_pending_event", None)
+            if callable(queue_pending):
+                queue_pending(session_key, state.event)
+                return True
+            return False
+        if (
+            existing_pending is not None
             and not self._can_merge_text_debounce_events(existing_pending, state.event)
         ):
             return False
@@ -5869,7 +5884,7 @@ class BasePlatformAdapter(ABC):
                 media_files, response = self.extract_media(response)
                 media_files, rejected_media = self.partition_media_delivery_paths(media_files)
                 runner = getattr(self, "gateway_runner", None)
-                if rejected_media and runner is not None:
+                if rejected_media and runner is not None and not event.internal:
                     try:
                         runner._queue_media_delivery_feedback(
                             event,
