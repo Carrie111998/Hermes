@@ -450,6 +450,7 @@ export function StatusRule({
   lastTurnEndedAt,
   liveSessionCount,
   sessionStartedAt,
+  showCost,
   turnStartedAt,
   voiceLabel,
   onSessionCountClick,
@@ -471,6 +472,17 @@ export function StatusRule({
 
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
+
+  // Cost read-out — shown only when display.show_cost is on and the session
+  // has a real dollar figure. Formats `0.0234` → `$0.02`; whole dollars drop
+  // the cents. Hidden entirely otherwise (no empty `$` stub).
+  const costUsd = usage.cost_usd
+  const showCostVal = showCost && typeof costUsd === 'number' && costUsd > 0
+  const costText = showCostVal
+    ? costUsd >= 1
+      ? `$${costUsd.toFixed(2)}`
+      : `$${costUsd.toFixed(3)}`
+    : ''
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null
@@ -507,7 +519,8 @@ export function StatusRule({
     slotWidth +
     stringWidth(' │ ') +
     stringWidth(modelText) +
-    (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
+    (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0) +
+    (costText ? stringWidth(' │ ') + stringWidth(costText) : 0)
 
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, cwdLabel, essentialWidth)
 
@@ -637,6 +650,12 @@ export function StatusRule({
             <Text color={t.color.muted} wrap="truncate-end">
               {' │ '}
               {ctxLabel}
+            </Text>
+          ) : null}
+          {costText ? (
+            <Text color={t.color.ok} wrap="truncate-end">
+              {' │ '}
+              {costText}
             </Text>
           ) : null}
         </Box>
@@ -837,6 +856,7 @@ interface StatusRuleProps {
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
   sessionStartedAt?: null | number
+  showCost?: boolean
   status: string
   statusColor: string
   t: Theme
