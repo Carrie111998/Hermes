@@ -1,8 +1,8 @@
+import { pathToFileURL } from 'node:url'
 
-import { pathToFileURL } from 'node:url';
-
-// returns true if the passsed file is being invoked from node,
+// Returns true if the passed file is being invoked from Node,
 // not imported.
 export function isMain(importMetaUrl) {
-    return   importMetaUrl === pathToFileURL(process.argv[1]).href;
+  const entrypoint = process.argv[1]
+  return typeof entrypoint === 'string' && importMetaUrl === pathToFileURL(entrypoint).href
 }

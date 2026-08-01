@@ -191,6 +191,7 @@ import {
   redactSecrets,
   SshConnection
 } from './ssh-connection'
+import { installStdioPipeErrorGuards } from './stdio-pipe-guards'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'

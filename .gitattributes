@@ -8,3 +8,6 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Vitest cannot import Node shebang modules with CRLF on Windows.
+apps/desktop/scripts/*.mjs text eol=lf
