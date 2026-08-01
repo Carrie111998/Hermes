@@ -13991,7 +13991,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             try:
                                 _dbg = _hermes_home / "interrupt_debug.log"
                                 with open(_dbg, "a", encoding="utf-8") as _f:
-                                    _f.write(f"{time.strftime('%H:%M:%S')} interrupt fired: msg={str(interrupt_msg)[:60]!r}, "
+                                    from agent.redact import redact_sensitive_text
+                                    _redacted_msg = redact_sensitive_text(str(interrupt_msg))[:60]
+                                    _f.write(f"{time.strftime('%H:%M:%S')} interrupt fired: msg={_redacted_msg!r}, "
                                              f"children={len(self.agent._active_children)}, "
                                              f"parent._interrupt={self.agent._interrupt_requested}\n")
                                     for _ci, _ch in enumerate(self.agent._active_children):
@@ -15319,7 +15321,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             try:
                                 _dbg = _hermes_home / "interrupt_debug.log"
                                 with open(_dbg, "a", encoding="utf-8") as _f:
-                                    _f.write(f"{time.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
+                                    from agent.redact import redact_sensitive_text
+                                    _redacted_msg = redact_sensitive_text(str(payload))[:60]
+                                    _f.write(f"{time.strftime('%H:%M:%S')} ENTER: queued interrupt msg={_redacted_msg!r}, "
                                              f"agent_running={self._agent_running}\n")
                             except Exception:
                                 pass
