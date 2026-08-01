@@ -4,6 +4,7 @@ Builds the loadable tokenizer from native/fts5_cjk/fts5_cjk.c on the fly;
 skips when no C toolchain / extension loading is available.
 """
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -49,12 +50,26 @@ def test_build_script_installs_loadable_extension(tmp_path):
     if shutil.which("gcc") is None or bash is None:
         pytest.skip("no C toolchain / bash")
 
+    # Emulate a system header that preprocesses successfully but disables the
+    # loadable-extension API. The build must prefer -Ivendor over CPATH.
+    hostile_include = tmp_path / "host-include"
+    hostile_include.mkdir()
+    vendored_ext = VENDOR / "sqlite3ext.h"
+    (hostile_include / "sqlite3ext.h").write_text(
+        "#define SQLITE_OMIT_LOAD_EXTENSION 1\n"
+        f'#include "{vendored_ext.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["CPATH"] = str(hostile_include)
+
     dest = tmp_path / "lib"
     subprocess.run(
         [bash, str(BUILD), str(dest)],
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     installed = dest / "libfts5_cjk.so"
     assert installed.is_file()
