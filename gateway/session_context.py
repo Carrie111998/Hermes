@@ -37,7 +37,8 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from copy import deepcopy
+from typing import Any, Dict, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -93,6 +94,13 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+# Full SessionSource snapshot for detached work.  This is deliberately not in
+# _VAR_MAP: it is structured in-process routing state, not an environment
+# variable that child processes should inherit.  Callers receive a copy so a
+# later turn cannot mutate the origin captured by a background producer.
+_SESSION_SOURCE_SNAPSHOT: ContextVar = ContextVar(
+    "HERMES_SESSION_SOURCE_SNAPSHOT", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -171,6 +179,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    source_snapshot: Optional[Dict[str, Any]] = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -206,6 +215,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _SESSION_SOURCE_SNAPSHOT.set(dict(source_snapshot or {})),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -242,6 +252,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_SOURCE_SNAPSHOT,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -293,6 +304,7 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _SESSION_SOURCE_SNAPSHOT.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -381,6 +393,39 @@ def session_is_messaging_surface() -> bool:
         if identity and identity not in NON_MESSAGING_SESSION_SURFACES:
             return True
     return False
+
+
+def get_session_source_snapshot() -> Optional[Dict[str, Any]]:
+    """Return a detached copy of the current turn's SessionSource payload."""
+    value = _SESSION_SOURCE_SNAPSHOT.get()
+    if value is _UNSET or not isinstance(value, dict) or not value:
+        return None
+    return deepcopy(value)
+
+
+def capture_session_origin() -> Dict[str, Any]:
+    """Capture immutable routing identity for a detached producer."""
+    source_payload = get_session_source_snapshot()
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+    profile = get_session_env("HERMES_SESSION_PROFILE", "") or ""
+    if source_payload:
+        message_id = message_id or str(source_payload.get("message_id") or "")
+        profile = profile or str(source_payload.get("profile") or "")
+    if source_payload and not profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name() or "default"
+        except Exception:
+            profile = "default"
+    return {
+        "origin_message_id": str(message_id),
+        "origin_source": deepcopy(source_payload) if source_payload else None,
+        "origin_profile": str(profile),
+        "parent_session_id": str(
+            get_session_env("HERMES_SESSION_ID", "") or ""
+        ),
+    }
 
 
 def declare_stateless_channel() -> None:

@@ -158,7 +158,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            origin_message_id TEXT NOT NULL DEFAULT '',
+            origin_source_json TEXT,
+            origin_profile TEXT NOT NULL DEFAULT ''
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -173,6 +176,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("origin_message_id", "TEXT NOT NULL DEFAULT ''"),
+        ("origin_source_json", "TEXT"),
+        ("origin_profile", "TEXT NOT NULL DEFAULT ''"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -215,13 +221,17 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id,
+                origin_message_id, origin_source_json, origin_profile)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+             record.get("origin_session_id", ""),
+             record.get("origin_message_id", ""),
+             json.dumps(record.get("origin_source")) if record.get("origin_source") else None,
+             record.get("origin_profile", "")),
         )
     _prune_durable_records()
 
@@ -302,12 +312,14 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id
+                      owner_started_at, task_json, origin_session_id,
+                      origin_message_id, origin_source_json, origin_profile
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-             pid, started, task_json, origin_session_id) = row
+             pid, started, task_json, origin_session_id, origin_message_id,
+             origin_source_json, origin_profile) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -316,12 +328,15 @@ def recover_abandoned_delegations() -> int:
             if live:
                 continue
             task = json.loads(task_json or "{}")
+            origin_source = json.loads(origin_source_json) if origin_source_json else None
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
                 "origin_session_id": origin_session_id or "",
+                "origin_message_id": origin_message_id or "",
+                "origin_profile": origin_profile or "",
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -330,6 +345,8 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
+            if origin_source:
+                event["origin_source"] = origin_source
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -499,7 +516,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, origin_message_id,
+                      origin_source_json, origin_profile
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -510,6 +528,9 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "origin_message_id": row[8] or "",
+        "origin_source": json.loads(row[9]) if row[9] else None,
+        "origin_profile": row[10] or "",
     }
 
 
@@ -621,6 +642,41 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def capture_current_origin() -> Dict[str, Any]:
+    """Capture immutable routing identity from the currently-bound turn.
+
+    The returned payload is detached from the live ``SessionSource`` and from
+    the gateway's mutable source cache.  Legacy/CLI callers without a bound
+    source return empty fields and continue through the existing fail-safe
+    session-key routing path.
+    """
+    try:
+        from gateway.session_context import (
+            capture_session_origin,
+        )
+
+        captured = capture_session_origin()
+        source_payload = captured.get("origin_source")
+        if source_payload:
+            # Validate and normalize the snapshot through the public wire
+            # contract, then copy it again for ownership by the producer.
+            from gateway.session import SessionSource
+
+            source_payload = SessionSource.from_dict(source_payload).to_dict()
+        return {
+            "origin_message_id": captured["origin_message_id"],
+            "origin_source": dict(source_payload) if source_payload else None,
+            "origin_profile": captured["origin_profile"],
+        }
+    except Exception:
+        logger.debug("Could not capture async delegation origin", exc_info=True)
+        return {
+            "origin_message_id": "",
+            "origin_source": None,
+            "origin_profile": "",
+        }
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -633,6 +689,9 @@ def dispatch_async_delegation(
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
+    origin_message_id: str = "",
+    origin_source: Optional[Dict[str, Any]] = None,
+    origin_profile: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
@@ -691,6 +750,9 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        "origin_message_id": origin_message_id,
+        "origin_source": dict(origin_source) if origin_source else None,
+        "origin_profile": origin_profile,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -838,6 +900,8 @@ def _push_completion_event(
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
+        "origin_message_id": record.get("origin_message_id", ""),
+        "origin_profile": record.get("origin_profile", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -855,6 +919,8 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    if record.get("origin_source"):
+        evt["origin_source"] = dict(record["origin_source"])
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (
@@ -888,6 +954,9 @@ def dispatch_async_delegation_batch(
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
+    origin_message_id: str = "",
+    origin_source: Optional[Dict[str, Any]] = None,
+    origin_profile: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -931,6 +1000,9 @@ def dispatch_async_delegation_batch(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        "origin_message_id": origin_message_id,
+        "origin_source": dict(origin_source) if origin_source else None,
+        "origin_profile": origin_profile,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1043,6 +1115,8 @@ def _push_batch_completion_event(
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
+        "origin_message_id": event_record.get("origin_message_id", ""),
+        "origin_profile": event_record.get("origin_profile", ""),
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
@@ -1064,6 +1138,8 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    if event_record.get("origin_source"):
+        evt["origin_source"] = dict(event_record["origin_source"])
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (

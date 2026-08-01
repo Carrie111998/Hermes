@@ -9,12 +9,13 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +36,9 @@ class _FakeRegistry:
 
     def is_completion_consumed(self, session_id):
         return self._consumed
+
+    def mark_notification_delivered(self, session_id):
+        self.delivered_session_id = session_id
 
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
@@ -155,6 +159,140 @@ async def test_consumed_completion_skips_raw_notification_without_agent_notify(
     await runner._run_process_watcher(_watcher_dict())
 
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_periodic_output_is_throttled_profile_safe_and_final_only_synthetic(
+    monkeypatch, tmp_path,
+):
+    """Running output is direct/coalesced; only completion re-enters Hermes."""
+    import gateway.run as gateway_run
+    import tools.process_registry as pr_module
+
+    sessions = [
+        SimpleNamespace(
+            output_buffer="phase 1\n", exited=False, exit_code=None,
+            command="codex exec task", started_at=1.0,
+        ),
+        SimpleNamespace(
+            output_buffer="phase 1\nphase 2\n", exited=False, exit_code=None,
+            command="codex exec task", started_at=1.0,
+        ),
+        SimpleNamespace(
+            output_buffer="phase 1\nphase 2\nphase latest\n", exited=False,
+            exit_code=None, command="codex exec task", started_at=1.0,
+        ),
+        SimpleNamespace(
+            output_buffer="done\n", exited=True, exit_code=0,
+            command="codex exec task", started_at=1.0,
+            completion_reason="exited", termination_source="",
+        ),
+    ]
+    registry = _FakeRegistry(sessions)
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    watcher_clock = MagicMock(side_effect=[100.0, 110.0, 130.0])
+
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  background_process_notifications: all\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner = GatewayRunner(GatewayConfig())
+    monkeypatch.setattr(gateway_run, "time", SimpleNamespace(monotonic=watcher_clock))
+
+    default_adapter = SimpleNamespace(
+        supports_async_delivery=True,
+        send=AsyncMock(),
+        send_or_update_status=AsyncMock(return_value=SimpleNamespace(success=True)),
+        handle_message=AsyncMock(),
+    )
+    coder_adapter = SimpleNamespace(
+        supports_async_delivery=True,
+        send=AsyncMock(),
+        send_or_update_status=AsyncMock(return_value=SimpleNamespace(success=True)),
+        handle_message=AsyncMock(),
+    )
+    runner.adapters = {Platform.FEISHU: default_adapter}
+    runner._profile_adapters = {"coder": {Platform.FEISHU: coder_adapter}}
+    runner._active_profile_name = lambda: "default"
+    thread_metadata = {
+        "reply_in_thread": True,
+        "reply_to_message_id": "om-origin",
+    }
+    runner._thread_metadata_for_source = MagicMock(return_value=thread_metadata)
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="chat-origin",
+        chat_type="dm",
+        user_id="user-origin",
+        message_id="om-origin",
+        profile="coder",
+    )
+    await runner._run_process_watcher({
+        "session_id": "proc-codex",
+        "check_interval": 0,
+        "session_key": "agent:coder:feishu:dm:chat-origin",
+        "notify_on_complete": True,
+        "origin_source": source.to_dict(),
+        "origin_message_id": "om-origin",
+        "origin_profile": "coder",
+    })
+
+    assert coder_adapter.send_or_update_status.await_count == 2
+    first, second = coder_adapter.send_or_update_status.await_args_list
+    assert first.args[1] == second.args[1] == "process:proc-codex:running"
+    assert "phase 1" in first.args[2]
+    assert "phase latest" in second.args[2]
+    assert first.kwargs["metadata"]["reply_in_thread"] is True
+    assert first.kwargs["metadata"]["reply_to_message_id"] == "om-origin"
+    runner._thread_metadata_for_source.assert_called_with(source, "om-origin")
+
+    coder_adapter.handle_message.assert_awaited_once()
+    final_event = coder_adapter.handle_message.await_args.args[0]
+    assert final_event.internal is True
+    assert final_event.message_id == "om-origin"
+    assert final_event.source.profile == "coder"
+    assert "done" in final_event.text
+    assert registry.delivered_session_id == "proc-codex"
+
+    default_adapter.send.assert_not_awaited()
+    default_adapter.send_or_update_status.assert_not_awaited()
+    default_adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unroutable_final_is_not_acknowledged(monkeypatch, tmp_path):
+    """Missing routing/profile adapter must leave durable completion pending."""
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="done\n", exited=True, exit_code=0,
+        command="codex exec task", started_at=1.0,
+        completion_reason="exited", termination_source="",
+    )
+    registry = _FakeRegistry([session, None])
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._deliver_completion_notification = AsyncMock(return_value=None)
+
+    await runner._run_process_watcher({
+        **_watcher_dict("proc-unroutable"),
+        "notify_on_complete": True,
+    })
+
+    runner._deliver_completion_notification.assert_awaited_once()
+    assert not hasattr(registry, "delivered_session_id")
 
 
 @pytest.mark.asyncio
