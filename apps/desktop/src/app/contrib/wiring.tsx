@@ -44,7 +44,7 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
-import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
+import { $startWorkSessionRequest, followActiveSessionCwd, refreshProjectTree } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -400,6 +400,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,
+    refreshProjectTree,
     refreshSessions,
     sessionStateByRuntimeIdRef,
     updateSessionState

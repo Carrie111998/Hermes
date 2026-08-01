@@ -42,6 +42,7 @@ interface MessageStreamOptions {
   ) => Promise<void>
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
+  refreshProjectTree?: () => Promise<void>
   refreshSessions: () => Promise<void>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
   updateSessionState: (
@@ -69,6 +70,7 @@ export function useMessageStream({
   hydrateFromStoredSession,
   queryClient,
   refreshHermesConfig,
+  refreshProjectTree,
   refreshSessions,
   sessionStateByRuntimeIdRef,
   updateSessionState
@@ -158,6 +160,11 @@ export function useMessageStream({
     const run = () => {
       sessionsRefreshTimerRef.current = null
       void refreshSessions().catch(() => undefined)
+      // The Projects overview renders its disclosure toggle and preview rows
+      // from projects.tree, not from the flat session list. A project-scoped
+      // `+` opens an unlisted tile, so its first completed turn must refresh
+      // both authorities or the persisted chat remains unreachable there.
+      void refreshProjectTree?.().catch(() => undefined)
       // Sync freshly-titled rows to other windows (e.g. main, when the turn
       // ran in the pop-out).
       broadcastSessionsChanged()
@@ -170,7 +177,7 @@ export function useMessageStream({
     }
 
     sessionsRefreshTimerRef.current = window.setTimeout(run, 300)
-  }, [refreshSessions])
+  }, [refreshProjectTree, refreshSessions])
 
   useEffect(
     () => () => {

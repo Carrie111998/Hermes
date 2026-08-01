@@ -20,6 +20,7 @@ const ACTIVE_SID = 'session-active'
 const ACTIVE_PROFILE = 'compass'
 let handleEvent: ((event: RpcEvent) => void) | null = null
 let refreshHermesConfig: ReturnType<typeof vi.fn<() => Promise<void>>>
+let refreshProjectTree: ReturnType<typeof vi.fn<() => Promise<void>>>
 let refreshSessions: ReturnType<typeof vi.fn<() => Promise<void>>>
 let queryClient: QueryClient
 
@@ -33,6 +34,7 @@ function Harness() {
     hydrateFromStoredSession: vi.fn(async () => undefined),
     queryClient,
     refreshHermesConfig,
+    refreshProjectTree,
     refreshSessions,
     sessionStateByRuntimeIdRef,
     updateSessionState: (sessionId, updater) => {
@@ -62,6 +64,7 @@ const sessionInfo = (sessionId: string, payload: Record<string, unknown>) =>
 beforeEach(() => {
   handleEvent = null
   refreshHermesConfig = vi.fn<() => Promise<void>>(async () => undefined)
+  refreshProjectTree = vi.fn<() => Promise<void>>(async () => undefined)
   refreshSessions = vi.fn<() => Promise<void>>(async () => undefined)
   queryClient = new QueryClient()
   setCurrentModel('')
@@ -140,7 +143,7 @@ describe('session.info model-options invalidation gating', () => {
 })
 
 describe('message.complete sidebar refresh coalescing', () => {
-  it('collapses near-simultaneous completions into one refresh', async () => {
+  it('collapses near-simultaneous completions into one flat-session and project-tree refresh', async () => {
     await mountStream()
     vi.useFakeTimers()
 
@@ -148,11 +151,13 @@ describe('message.complete sidebar refresh coalescing', () => {
     act(() => handleEvent!({ payload: { text: 'b' }, session_id: 's2', type: 'message.complete' }))
 
     expect(refreshSessions).not.toHaveBeenCalled()
+    expect(refreshProjectTree).not.toHaveBeenCalled()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(400)
     })
 
     expect(refreshSessions).toHaveBeenCalledTimes(1)
+    expect(refreshProjectTree).toHaveBeenCalledTimes(1)
   })
 })
