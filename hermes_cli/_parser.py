@@ -11,6 +11,7 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 """
 
 import argparse
+from typing import Iterable, Optional, TypeVar
 
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
@@ -21,6 +22,50 @@ PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [
     ("--profile", True),
     ("-p", True),
 ]
+
+_N = TypeVar("_N", bound=argparse.Namespace)
+
+
+class HermesArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser with post-parse normalization for inherited append flags."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._inherited_append_groups: list[tuple[str, str, str, object]] = []
+
+    def register_inherited_append(
+        self,
+        *,
+        dest: str,
+        parent_dest: str,
+        chat_dest: str,
+        default: object = None,
+    ) -> None:
+        self._inherited_append_groups.append((dest, parent_dest, chat_dest, default))
+
+    def _normalize_inherited_appends(self, namespace) -> None:
+        for dest, parent_dest, chat_dest, default in self._inherited_append_groups:
+            merged: list = []
+            parent_values = getattr(namespace, parent_dest, None)
+            chat_values = getattr(namespace, chat_dest, None) if hasattr(namespace, chat_dest) else None
+            if parent_values:
+                merged.extend(list(parent_values))
+            if chat_values:
+                merged.extend(list(chat_values))
+            setattr(namespace, dest, merged or default)
+            for raw_dest in (parent_dest, chat_dest):
+                if hasattr(namespace, raw_dest):
+                    delattr(namespace, raw_dest)
+
+    def parse_known_args(
+        self,
+        args: Optional[Iterable[str]] = None,
+        namespace: Optional[_N] = None,
+    ) -> tuple[_N, list[str]]:  # pyright: ignore[reportIncompatibleMethodOverride]
+        ns, extras = super().parse_known_args(args, namespace)
+        assert ns is not None
+        self._normalize_inherited_appends(ns)
+        return ns, extras
 
 
 def _inherited_flag(parser, *args, **kwargs):
@@ -35,6 +80,12 @@ def _inherited_flag(parser, *args, **kwargs):
     action = parser.add_argument(*args, **kwargs)
     action.inherit_on_relaunch = True
     return action
+
+
+def _inherited_append_flag(parser, *args, shadow_dest: str, **kwargs):
+    kwargs["dest"] = shadow_dest
+    kwargs["action"] = "append"
+    return _inherited_flag(parser, *args, **kwargs)
 
 
 _EPILOGUE = """
@@ -89,11 +140,23 @@ def build_top_level_parser():
     ``chat_parser.set_defaults(func=cmd_chat)`` and continues registering
     other subparsers via ``subparsers.add_parser(...)``.
     """
-    parser = argparse.ArgumentParser(
+    parser = HermesArgumentParser(
         prog="hermes",
         description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
+    )
+    parser.register_inherited_append(
+        dest="fallbacks",
+        parent_dest="_top_level_fallbacks",
+        chat_dest="_chat_fallbacks",
+        default=None,
+    )
+    parser.register_inherited_append(
+        dest="skills",
+        parent_dest="_top_level_skills",
+        chat_dest="_chat_skills",
+        default=None,
     )
 
     parser.add_argument(
@@ -147,6 +210,18 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    _inherited_append_flag(
+        parser,
+        "--fallback",
+        shadow_dest="_top_level_fallbacks",
+        default=None,
+        metavar="PROVIDER/MODEL",
+        help=(
+            "Invocation-scoped fallback route. Repeat to define an exact ordered chain; "
+            "when supplied, replaces the primary agent fallback chain for this invocation "
+            "(and inherited subagents)."
+        ),
+    )
     parser.add_argument(
         "-t",
         "--toolsets",
@@ -195,12 +270,13 @@ def build_top_level_parser():
             "runs that can't prompt."
         ),
     )
-    _inherited_flag(
+    _inherited_append_flag(
         parser,
         "--skills",
         "-s",
-        action="append",
+        shadow_dest="_top_level_skills",
         default=None,
+        metavar="SKILLS",
         help="Preload one or more skills for the session (repeat flag or comma-separate)",
     )
     _inherited_flag(
@@ -299,12 +375,13 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         help="Comma-separated toolsets to enable",
     )
-    _inherited_flag(
+    _inherited_append_flag(
         chat_parser,
         "-s",
         "--skills",
-        action="append",
+        shadow_dest="_chat_skills",
         default=argparse.SUPPRESS,
+        metavar="SKILLS",
         help="Preload one or more skills for the session (repeat flag or comma-separate)",
     )
     _inherited_flag(
@@ -316,6 +393,17 @@ def build_top_level_parser():
         # `--provider` flag.
         default=argparse.SUPPRESS,
         help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
+    )
+    _inherited_append_flag(
+        chat_parser,
+        "--fallback",
+        shadow_dest="_chat_fallbacks",
+        default=argparse.SUPPRESS,
+        metavar="PROVIDER/MODEL",
+        help=(
+            "Invocation-scoped fallback route; repeat for an exact ordered chain "
+            "for the primary agent and inherited subagents."
+        ),
     )
     chat_parser.add_argument(
         "-v",

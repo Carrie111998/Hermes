@@ -68,14 +68,61 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Return the effective fallback chain merged across old and new config keys.
+def _parse_invocation_fallbacks(overrides: Any) -> list[dict[str, Any]] | None:
+    """Parse repeatable ``PROVIDER/MODEL`` invocation overrides.
 
-    ``fallback_providers`` remains the primary source of truth and keeps its
-    order. Legacy ``fallback_model`` entries are appended afterwards unless
-    they target the same provider/model/base_url route as an earlier entry.
-    The returned list always contains fresh dict copies.
+    ``None`` means no CLI override and preserves the profile chain. Any supplied
+    list replaces the primary agent's configured fallback chain exactly (and is
+    inherited by subagents); malformed or duplicate routes fail closed so
+    automation cannot silently run with a different fallback order.
     """
+
+    if overrides is None:
+        return None
+    if isinstance(overrides, str):
+        values = [overrides]
+    elif isinstance(overrides, (list, tuple)):
+        values = list(overrides)
+    else:
+        raise ValueError("fallback overrides must be PROVIDER/MODEL strings")
+
+    chain: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in values:
+        value = str(raw or "").strip()
+        provider, separator, model = value.partition("/")
+        provider = provider.strip()
+        model = model.strip()
+        if not separator or not provider or not model:
+            raise ValueError(
+                f"invalid fallback override {value!r}; expected PROVIDER/MODEL"
+            )
+        entry = {"provider": provider, "model": model}
+        identity = _entry_identity(entry)
+        if identity in seen:
+            raise ValueError(f"duplicate fallback override: {provider}/{model}")
+        seen.add(identity)
+        chain.append(entry)
+    return chain
+
+
+def get_fallback_chain(
+    config: dict[str, Any] | None,
+    invocation_overrides: Any = None,
+) -> list[dict[str, Any]]:
+    """Return the effective fallback chain.
+
+    Repeatable invocation overrides replace the primary agent's configured
+    fallback chain in exact order, and inherited subagents see the same chain.
+    Without overrides, ``fallback_providers`` remains the primary source of
+    truth and keeps its order; legacy ``fallback_model`` entries are appended
+    unless they target an existing provider/model/base_url route. Returned
+    entries are fresh dict copies.
+    """
+
+    override_chain = _parse_invocation_fallbacks(invocation_overrides)
+    if override_chain is not None:
+        return override_chain
 
     config = config or {}
     chain: list[dict[str, Any]] = []

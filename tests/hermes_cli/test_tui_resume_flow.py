@@ -37,18 +37,116 @@ def main_mod(monkeypatch):
     return mod
 
 
+def test_launch_tui_fallback_rejection_mentions_cli(monkeypatch, capsys, main_mod):
+    with pytest.raises(SystemExit) as exc:
+        main_mod._launch_tui(fallbacks=["openai-codex/gpt-5.6-sol"])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--cli" in err
+    assert "-z" in err
 
 
+def test_termux_fast_cli_launch_oneshot_forwards_fallback_list(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("TERMUX_VERSION", "1")
+    monkeypatch.delenv("HERMES_TUI", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "-z",
+            "hello",
+            "--fallback",
+            "openai-codex/gpt-5.6-sol",
+            "--fallback",
+            "gemini/gemini-3.1-pro-preview",
+        ],
+    )
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda args: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 0
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod._try_termux_fast_cli_launch()
+
+    assert exc.value.code == 0
+    assert captured["prompt"] == "hello"
+    assert captured["fallbacks"] == [
+        "openai-codex/gpt-5.6-sol",
+        "gemini/gemini-3.1-pro-preview",
+    ]
 
 
+def test_main_top_level_oneshot_forwards_fallback_list(monkeypatch, main_mod):
+    captured = {}
 
+    import hermes_cli.config as config_mod
 
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "-z",
+            "hello",
+            "--fallback",
+            "openai-codex/gpt-5.6-sol",
+            "--fallback",
+            "gemini/gemini-3.1-pro-preview",
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(discover_plugins=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(discover_mcp_tools=lambda: None),
+    )
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: None
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(
+            run_oneshot=lambda prompt, **kwargs: captured.update(
+                {"prompt": prompt, **kwargs}
+            )
+            or 0
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
 
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
 
-
-
-
-
+    assert exc.value.code == 0
+    assert captured["prompt"] == "hello"
+    assert captured["fallbacks"] == [
+        "openai-codex/gpt-5.6-sol",
+        "gemini/gemini-3.1-pro-preview",
+    ]
 
 
 def test_termux_skips_bundled_skill_sync_when_stamp_fresh(monkeypatch, tmp_path, main_mod):

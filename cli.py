@@ -4204,6 +4204,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         model: str = None,
         toolsets: List[str] = None,
         provider: str = None,
+        fallbacks: Optional[List[str]] = None,
         api_key: str = None,
         base_url: str = None,
         max_turns: int = None,
@@ -4221,6 +4222,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
             provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+            fallbacks: Optional exact invocation-scoped PROVIDER/MODEL fallback chain
+                for the primary agent and inherited subagents
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
@@ -4514,9 +4517,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
         
         # Fallback provider chain — tried in order when primary fails after retries.
-        # Merge new ``fallback_providers`` entries with any legacy
-        # ``fallback_model`` entries so old configs still participate.
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        # Invocation-scoped overrides replace the primary-agent chain exactly
+        # (and inherited subagents see the same chain); otherwise new and
+        # legacy profile fallback keys are merged.
+        self._fallback_model = get_fallback_chain(CLI_CONFIG, fallbacks)
 
         # Signature of the currently-initialised agent's runtime.  Used to
         # rebuild the agent when provider / model / base_url changes across
@@ -17460,6 +17464,7 @@ def main(
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
     provider: str = None,
+    fallbacks: Optional[List[str]] = None,
     api_key: str = None,
     base_url: str = None,
     max_turns: int = None,
@@ -17488,6 +17493,8 @@ def main(
         skills: Comma-separated or repeated list of skills to preload for the session
         model: Model to use (default: anthropic/claude-opus-4-20250514)
         provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
+        fallbacks: Repeatable invocation-scoped PROVIDER/MODEL fallback routes
+            for the primary agent and inherited subagents
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
@@ -17602,6 +17609,7 @@ def main(
         model=model,
         toolsets=toolsets_list,
         provider=provider,
+        fallbacks=fallbacks,
         api_key=api_key,
         base_url=base_url,
         max_turns=max_turns,

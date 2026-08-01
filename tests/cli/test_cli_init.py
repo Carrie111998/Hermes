@@ -113,6 +113,24 @@ class TestFallbackChainInit:
             {"provider": "nous", "model": "Hermes-4"},
         ]
 
+    def test_invocation_fallbacks_replace_profile_chain_for_primary_agent(self):
+        cli = _make_cli(
+            config_overrides={
+                "fallback_providers": [
+                    {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+                ],
+                "fallback_model": {"provider": "nous", "model": "Hermes-4"},
+            },
+            fallbacks=[
+                "openai-codex/gpt-5.6-sol",
+                "gemini/gemini-3.1-pro-preview",
+            ],
+        )
+        assert cli._fallback_model == [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
+        ]
+
 
 class TestBusyInputMode:
     def test_default_busy_input_mode_is_interrupt(self):

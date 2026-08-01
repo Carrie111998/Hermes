@@ -171,6 +171,7 @@ def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    fallbacks: object = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
 ) -> int:
@@ -182,6 +183,8 @@ def run_oneshot(
             env var, then config.yaml's model.default / model.model.
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
+        fallbacks: Optional repeatable PROVIDER/MODEL invocation fallback chain
+            for the primary agent and inherited subagents.
         toolsets: Optional comma-separated string or iterable of toolsets.
         usage_file: Optional path; when set, a JSON usage report (estimated
             cost, token counts, model, api_calls) is written there after the
@@ -246,6 +249,7 @@ def run_oneshot(
                     prompt,
                     model=model,
                     provider=provider,
+                    fallbacks=fallbacks,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                 )
@@ -314,6 +318,7 @@ def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    fallbacks: object = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
 ) -> tuple[str, dict]:
@@ -402,10 +407,10 @@ def _run_agent(
     # os._exit and skips finalizers, so an un-closed connection here would leak.
     agent = None
     try:
-        # Read the effective fallback chain from profile config so oneshot
-        # workers honour the same merge semantics as interactive CLI and
-        # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        # Read the effective fallback chain for the primary agent so oneshot
+        # runs honour the same merge semantics as interactive CLI and gateway
+        # sessions, with inherited subagents seeing the same chain.
+        _fb = get_fallback_chain(cfg, fallbacks)
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),

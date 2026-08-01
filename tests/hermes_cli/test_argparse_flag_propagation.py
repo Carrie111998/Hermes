@@ -271,3 +271,222 @@ class TestChatSubparserInheritedValueFlags:
             + "\n  ".join(f"{opts} dest={dest} default={d!r}"
                           for opts, dest, d in offenders)
         )
+
+
+class TestInvocationFallbackFlags:
+    @pytest.fixture
+    def real_parser(self):
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, _chat = build_top_level_parser()
+        return parser
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--fallback", "openai-codex/gpt-5.6-sol", "chat"],
+            ["chat", "--fallback", "openai-codex/gpt-5.6-sol"],
+        ],
+    )
+    def test_single_fallback_survives_parent_and_chat_positions(self, real_parser, argv):
+        args = real_parser.parse_args(argv)
+        assert args.fallbacks == ["openai-codex/gpt-5.6-sol"]
+
+    def test_repeated_fallbacks_preserve_order(self, real_parser):
+        args = real_parser.parse_args(
+            [
+                "chat",
+                "--fallback",
+                "openai-codex/gpt-5.6-sol",
+                "--fallback",
+                "gemini/gemini-3.1-pro-preview",
+            ]
+        )
+        assert args.fallbacks == [
+            "openai-codex/gpt-5.6-sol",
+            "gemini/gemini-3.1-pro-preview",
+        ]
+
+    def test_mixed_parent_and_chat_fallbacks_preserve_exact_order(self, real_parser):
+        args = real_parser.parse_args(
+            [
+                "--fallback",
+                "openai-codex/gpt-5.6-sol",
+                "chat",
+                "--fallback",
+                "gemini/gemini-3.1-pro-preview",
+            ]
+        )
+        assert args.fallbacks == [
+            "openai-codex/gpt-5.6-sol",
+            "gemini/gemini-3.1-pro-preview",
+        ]
+
+    def test_cmd_chat_forwards_fallbacks(self, monkeypatch, real_parser):
+        import types
+
+        import hermes_cli.main as main_mod
+
+        args = real_parser.parse_args(
+            ["chat", "--fallback", "openai-codex/gpt-5.6-sol"]
+        )
+        captured = {}
+        fake_cli = types.ModuleType("cli")
+        setattr(fake_cli, "main", lambda **kwargs: captured.update(kwargs))
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "cli", fake_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+
+        main_mod.cmd_chat(args)
+
+        assert captured["fallbacks"] == ["openai-codex/gpt-5.6-sol"]
+
+    def test_cmd_chat_forwards_mixed_position_fallbacks_in_order(
+        self, monkeypatch, real_parser
+    ):
+        import types
+
+        import hermes_cli.main as main_mod
+
+        args = real_parser.parse_args(
+            [
+                "--fallback",
+                "openai-codex/gpt-5.6-sol",
+                "chat",
+                "--fallback",
+                "gemini/gemini-3.1-pro-preview",
+            ]
+        )
+        captured = {}
+        fake_cli = types.ModuleType("cli")
+        setattr(fake_cli, "main", lambda **kwargs: captured.update(kwargs))
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "cli", fake_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+
+        main_mod.cmd_chat(args)
+
+        assert captured["fallbacks"] == [
+            "openai-codex/gpt-5.6-sol",
+            "gemini/gemini-3.1-pro-preview",
+        ]
+
+    @pytest.mark.parametrize(
+        "fallback_argv,expected_message",
+        [
+            (["--fallback", "missing-slash"], "invalid fallback override"),
+            (
+                [
+                    "--fallback",
+                    "openai-codex/gpt-5.6-sol",
+                    "--fallback",
+                    "openai-codex/gpt-5.6-sol",
+                ],
+                "duplicate fallback override",
+            ),
+        ],
+    )
+    def test_cmd_chat_reports_invalid_fallbacks_as_cli_usage_errors(
+        self,
+        monkeypatch,
+        real_parser,
+        capsys,
+        fallback_argv,
+        expected_message,
+    ):
+        import types
+
+        import hermes_cli.main as main_mod
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        args = real_parser.parse_args(["chat", *fallback_argv])
+        fake_cli = types.ModuleType("cli")
+
+        def fake_main(**kwargs):
+            get_fallback_chain({}, kwargs["fallbacks"])
+
+        setattr(fake_cli, "main", fake_main)
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "cli", fake_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main_mod.cmd_chat(args)
+
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert expected_message in captured.err
+        assert captured.err.startswith("Error: ")
+
+
+class TestInheritedAppendFlags:
+    @pytest.fixture
+    def real_parser(self):
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, _chat = build_top_level_parser()
+        return parser
+
+    def test_mixed_parent_and_chat_skills_preserve_exact_order(self, real_parser):
+        args = real_parser.parse_args(
+            ["--skills", "github-auth", "chat", "--skills", "hermes-agent-dev"]
+        )
+        assert args.skills == ["github-auth", "hermes-agent-dev"]
+
+
+class TestInheritedAppendFlagHelpMetavars:
+    @pytest.fixture
+    def real_parsers(self):
+        from hermes_cli._parser import build_top_level_parser
+
+        return build_top_level_parser()
+
+    def test_top_level_help_uses_public_metavars_for_inherited_append_flags(
+        self, real_parsers
+    ):
+        parser, _subparsers, _chat = real_parsers
+
+        help_text = parser.format_help()
+
+        assert "[--skills SKILLS]" in help_text
+        assert "--skills SKILLS, -s SKILLS" in help_text
+        assert "[--fallback PROVIDER/MODEL]" in help_text
+        assert "--fallback PROVIDER/MODEL" in help_text
+        assert "_TOP_LEVEL_SKILLS" not in help_text
+        assert "_TOP_LEVEL_FALLBACKS" not in help_text
+
+    def test_chat_help_uses_public_metavars_for_inherited_append_flags(
+        self, real_parsers
+    ):
+        _parser, _subparsers, chat_parser = real_parsers
+
+        help_text = chat_parser.format_help()
+
+        assert "[-s SKILLS]" in help_text
+        assert "-s SKILLS, --skills SKILLS" in help_text
+        assert "[--fallback PROVIDER/MODEL]" in help_text
+        assert "--fallback PROVIDER/MODEL" in help_text
+        assert "_CHAT_SKILLS" not in help_text
+        assert "_CHAT_FALLBACKS" not in help_text
