@@ -1,0 +1,4 @@
+name: agnes-provider
+kind: model-provider
+version: 1.0.0
+description: Agnes AI provider (agnes-2.0-flash)
