@@ -2325,6 +2325,12 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "broker",
         "last_visible_task_id",
         "recent_error_codes",
+        "reconciliation_counts",
+        "reconciliation_blocked_codes",
+        "oldest_reconciliation_wait_age_seconds",
+        "reconciliation_scan_age_seconds",
+        "recovered_existing_total",
+        "created_new_total",
         "delivery_latency_seconds",
         "stage_latency_seconds",
         "scheduler",
@@ -2625,6 +2631,51 @@ def test_sidebar_status_shapes_placement_without_secret_identity_fields() -> Non
         "a" * 64,
     ):
         assert secret not in encoded
+
+
+def test_sidebar_status_shapes_bounded_reconciliation_health() -> None:
+    status = _sidebar_status({
+        "counts": {},
+        "reconciliation_counts": {
+            "recovered": 1,
+            "absence_proven": 2,
+            "blocked": 3,
+            "private_state": 999,
+        },
+        "reconciliation_blocked_codes": {
+            "marker_conflict": 1,
+            "native_create_ambiguous": 2,
+            "bridge_temporarily_unavailable": 0,
+            "provider-secret-error": 999,
+        },
+        "oldest_reconciliation_wait_age_seconds": 40.0,
+        "reconciliation_scan_age_seconds": 10.0,
+        "recovered_existing_total": 4,
+        "created_new_total": 5,
+        "signed_marker": "HERMES_SESSION_BRIDGE_V1:secret",
+        "proof_digest": "a" * 64,
+        "reconciliation_generation": "private-generation",
+    })
+
+    assert status["reconciliation_counts"] == {
+        "recovered": 1,
+        "absence_proven": 2,
+        "blocked": 3,
+    }
+    assert status["reconciliation_blocked_codes"] == {
+        "marker_conflict": 1,
+        "native_create_ambiguous": 2,
+        "bridge_temporarily_unavailable": 0,
+    }
+    assert status["oldest_reconciliation_wait_age_seconds"] == 40.0
+    assert status["reconciliation_scan_age_seconds"] == 10.0
+    assert status["recovered_existing_total"] == 4
+    assert status["created_new_total"] == 5
+    encoded = json.dumps(status)
+    assert "HERMES_SESSION_BRIDGE_V1" not in encoded
+    assert "proof_digest" not in encoded
+    assert "private-generation" not in encoded
+    assert "provider-secret-error" not in encoded
 
 
 @pytest.mark.parametrize(

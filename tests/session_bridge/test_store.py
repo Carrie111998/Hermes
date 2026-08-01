@@ -8823,6 +8823,105 @@ def test_sidebar_reconciliation_proof_is_durable_append_only_and_replay_safe(
         db._conn.execute("DELETE FROM session_sidebar_reconciliation_proofs")
 
 
+def test_sidebar_status_reports_sanitized_reconciliation_health(db) -> None:
+    store = SessionBridgeStore(db)
+    proof_states = (
+        ("recovered", None, "codex-recovered", "sidebar_visible", None, 130.0),
+        ("absence_proven", None, None, "sidebar_visible", None, 130.0),
+        ("absence_proven", None, None, "sidebar_pending", None, 99.0),
+        ("blocked", "marker_conflict", None, "sidebar_failed", "marker_conflict", 130.0),
+        (
+            "blocked",
+            "bridge_temporarily_unavailable",
+            None,
+            "sidebar_failed",
+            "native_create_ambiguous",
+            130.0,
+        ),
+        (
+            "blocked",
+            "bridge_temporarily_unavailable",
+            None,
+            "sidebar_failed",
+            "native_create_ambiguous",
+            130.0,
+        ),
+    )
+    for index, (state, reason, thread_id, job_state, error_code, expires_at) in enumerate(
+        proof_states
+    ):
+        candidate = _sidebar_candidate(
+            db,
+            native_id=f"reconciliation-status-{index}",
+            eligible_at=60.0,
+        )
+        job = store.enqueue_sidebar_job(candidate)
+        proof_digest = hashlib.sha256(f"proof-{index}".encode()).hexdigest()
+        db._conn.execute(
+            """INSERT INTO session_sidebar_reconciliation_proofs (
+                   proof_digest, job_id, source_session_id, bridge_id,
+                   marker_digest, placement_generation, delivery_generation,
+                   reconciliation_generation, completed_at, expires_at,
+                   inventory_digest, state, match_count, recovered_thread_id,
+                   fixed_reason, created_at
+               ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, 90, ?, ?, ?, ?, ?, ?, 90)""",
+            (
+                proof_digest,
+                job["id"],
+                candidate.source_session_id,
+                candidate.bridge_id,
+                hashlib.sha256(f"marker-{index}".encode()).hexdigest(),
+                f"scan:private:{index}",
+                expires_at,
+                hashlib.sha256(f"inventory-{index}".encode()).hexdigest(),
+                state,
+                1 if state == "recovered" else (2 if state == "blocked" else 0),
+                thread_id,
+                reason,
+            ),
+        )
+        visible = job_state == "sidebar_visible"
+        db._conn.execute(
+            """UPDATE session_sidebar_jobs
+               SET state = ?, codex_thread_id = ?, error_code = ?,
+                   visible_at = ?, completion_digest = ?,
+                   reconciliation_proof_digest = ?
+               WHERE id = ?""",
+            (
+                job_state,
+                f"codex-visible-{index}" if visible else None,
+                error_code,
+                95.0 if visible else None,
+                hashlib.sha256(f"complete-{index}".encode()).hexdigest()
+                if visible
+                else None,
+                proof_digest,
+                job["id"],
+            ),
+        )
+
+    status = store.sidebar_delivery_status(now=100.0)
+
+    assert status["reconciliation_counts"] == {
+        "recovered": 1,
+        "absence_proven": 2,
+        "blocked": 3,
+    }
+    assert status["reconciliation_blocked_codes"] == {
+        "marker_conflict": 1,
+        "native_create_ambiguous": 2,
+        "bridge_temporarily_unavailable": 0,
+    }
+    assert status["oldest_reconciliation_wait_age_seconds"] == 40.0
+    assert status["reconciliation_scan_age_seconds"] == 10.0
+    assert status["recovered_existing_total"] == 1
+    assert status["created_new_total"] == 1
+    encoded = json.dumps(status)
+    assert "scan:private" not in encoded
+    assert "proof_digest" not in encoded
+    assert "marker_digest" not in encoded
+
+
 @pytest.mark.parametrize(
     ("state", "match_count", "thread_id", "reason"),
     [

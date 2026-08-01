@@ -8450,6 +8450,73 @@ class SessionBridgeStore:
                     SidebarJobState.VISIBLE.value,
                 ),
             ).fetchone()
+            reconciliation_rows = conn.execute(
+                """SELECT proof.state, COUNT(*) AS proof_count
+                     FROM session_sidebar_jobs AS job
+                     JOIN session_sidebar_reconciliation_proofs AS proof
+                       ON proof.proof_digest = job.reconciliation_proof_digest
+                    GROUP BY proof.state"""
+            ).fetchall()
+            reconciliation_blocked_rows = conn.execute(
+                """SELECT CASE
+                              WHEN job.error_code IN (
+                                  'marker_conflict',
+                                  'native_create_ambiguous',
+                                  'bridge_temporarily_unavailable'
+                              ) THEN job.error_code
+                              WHEN proof.fixed_reason IN (
+                                  'marker_conflict',
+                                  'native_create_ambiguous',
+                                  'bridge_temporarily_unavailable'
+                              ) THEN proof.fixed_reason
+                              ELSE 'bridge_temporarily_unavailable'
+                          END AS reason_code,
+                          COUNT(*) AS reason_count
+                     FROM session_sidebar_jobs AS job
+                     JOIN session_sidebar_reconciliation_proofs AS proof
+                       ON proof.proof_digest = job.reconciliation_proof_digest
+                    WHERE proof.state = 'blocked'
+                    GROUP BY reason_code"""
+            ).fetchall()
+            reconciliation_wait_row = conn.execute(
+                """SELECT MIN(job.eligible_at) AS eligible_at
+                     FROM session_sidebar_jobs AS job
+                     LEFT JOIN session_sidebar_reconciliation_proofs AS proof
+                       ON proof.proof_digest = job.reconciliation_proof_digest
+                    WHERE job.state IN (?, ?, ?)
+                      AND (proof.proof_digest IS NULL OR proof.expires_at <= ?)""",
+                (
+                    SidebarJobState.PENDING.value,
+                    SidebarJobState.RETRY.value,
+                    SidebarJobState.LEASED.value,
+                    status_time,
+                ),
+            ).fetchone()
+            reconciliation_scan_row = conn.execute(
+                """SELECT MAX(proof.completed_at) AS completed_at
+                     FROM session_sidebar_jobs AS job
+                     JOIN session_sidebar_reconciliation_proofs AS proof
+                       ON proof.proof_digest = job.reconciliation_proof_digest"""
+            ).fetchone()
+            reconciliation_outcomes = conn.execute(
+                """SELECT
+                       SUM(CASE
+                               WHEN job.state = ? AND proof.state = 'recovered'
+                               THEN 1 ELSE 0
+                           END) AS recovered_existing_total,
+                       SUM(CASE
+                               WHEN job.state = ?
+                                AND proof.state = 'absence_proven'
+                               THEN 1 ELSE 0
+                           END) AS created_new_total
+                     FROM session_sidebar_jobs AS job
+                     JOIN session_sidebar_reconciliation_proofs AS proof
+                       ON proof.proof_digest = job.reconciliation_proof_digest""",
+                (
+                    SidebarJobState.VISIBLE.value,
+                    SidebarJobState.VISIBLE.value,
+                ),
+            ).fetchone()
 
         expired_leases = int(expired_row["job_count"])
         counts[SidebarJobState.LEASED.value] -= expired_leases
@@ -8458,6 +8525,37 @@ class SessionBridgeStore:
         counts["needs_attention"] = resolution_stats["blocking_failed_count"]
         counts["projectless_legacy_count"] = int(
             health_counts["projectless_legacy_count"] or 0
+        )
+        reconciliation_counts = {
+            state: 0 for state in ("recovered", "absence_proven", "blocked")
+        }
+        for row in reconciliation_rows:
+            if row["state"] in reconciliation_counts:
+                reconciliation_counts[row["state"]] = int(row["proof_count"])
+        reconciliation_blocked_codes = {
+            code: 0
+            for code in (
+                "marker_conflict",
+                "native_create_ambiguous",
+                "bridge_temporarily_unavailable",
+            )
+        }
+        for row in reconciliation_blocked_rows:
+            if row["reason_code"] in reconciliation_blocked_codes:
+                reconciliation_blocked_codes[row["reason_code"]] = int(
+                    row["reason_count"]
+                )
+        reconciliation_wait_at = reconciliation_wait_row["eligible_at"]
+        oldest_reconciliation_wait_age = (
+            max(0.0, status_time - float(reconciliation_wait_at))
+            if reconciliation_wait_at is not None
+            else None
+        )
+        reconciliation_completed_at = reconciliation_scan_row["completed_at"]
+        reconciliation_scan_age = (
+            max(0.0, status_time - float(reconciliation_completed_at))
+            if reconciliation_completed_at is not None
+            else None
         )
 
         eligible_by_provider = {
@@ -8580,6 +8678,18 @@ class SessionBridgeStore:
                 last_visible["codex_thread_id"] if last_visible is not None else None
             ),
             "recent_error_codes": recent_codes,
+            "reconciliation_counts": reconciliation_counts,
+            "reconciliation_blocked_codes": reconciliation_blocked_codes,
+            "oldest_reconciliation_wait_age_seconds": (
+                oldest_reconciliation_wait_age
+            ),
+            "reconciliation_scan_age_seconds": reconciliation_scan_age,
+            "recovered_existing_total": int(
+                reconciliation_outcomes["recovered_existing_total"] or 0
+            ),
+            "created_new_total": int(
+                reconciliation_outcomes["created_new_total"] or 0
+            ),
             "delivery_latency_seconds": {
                 "p50": _nearest_rank_percentile(latencies, 0.50),
                 "p95": _nearest_rank_percentile(latencies, 0.95),

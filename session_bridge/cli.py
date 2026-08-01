@@ -95,6 +95,7 @@ from .sidebar import (
     sidebar_bridge_id,
     sidebar_create_recovery_key,
     sidebar_idempotency_key,
+    validate_sidebar_create_reservation,
 )
 from .preview import build_session_preview
 from .sidebar_skill import install_sidebar_skill
@@ -1859,25 +1860,13 @@ class ProductionBackend:
                 marker_secret,
             )
             reservation = store.get_sidebar_create_reservation(source_session_id)
-            if (
-                reservation is None
-                or set(reservation)
-                != {
-                    "version",
-                    "job_id",
-                    "source_session_id",
-                    "bridge_id",
-                    "recovery_key",
-                    "reserved_at",
-                }
-                or reservation.get("version") != 1
-                or reservation.get("job_id") != job_id
-                or reservation.get("source_session_id") != source_session_id
-                or reservation.get("bridge_id") != expected_bridge_id
-                or reservation.get("recovery_key") != expected_recovery_key
-                or not _is_finite_number(reservation.get("reserved_at"))
-            ):
-                raise ValueError("sidebar unbound reservation mismatch")
+            validate_sidebar_create_reservation(
+                reservation,
+                job_id=job_id,
+                source_session_id=source_session_id,
+                bridge_id=expected_bridge_id,
+                expected_recovery_key=expected_recovery_key,
+            )
         except (KeyError, TypeError, ValueError):
             raise RolloutGateBlocked("sidebar_unbound_snapshot_mismatch") from None
 
@@ -4583,6 +4572,40 @@ def _public_sidebar_status(
         or (recovery_lane is None) != (recovery_at is None)
     ):
         raise ConfigurationFailure("invalid_sidebar_status")
+    raw_reconciliation_counts = raw.get("reconciliation_counts")
+    if raw_reconciliation_counts is None:
+        reconciliation_counts_source: Mapping[str, Any] = {}
+    elif isinstance(raw_reconciliation_counts, Mapping):
+        reconciliation_counts_source = raw_reconciliation_counts
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    reconciliation_counts = {
+        state: _status_count(reconciliation_counts_source.get(state, 0))
+        for state in ("recovered", "absence_proven", "blocked")
+    }
+    raw_reconciliation_blocked_codes = raw.get("reconciliation_blocked_codes")
+    if raw_reconciliation_blocked_codes is None:
+        reconciliation_blocked_source: Mapping[str, Any] = {}
+    elif isinstance(raw_reconciliation_blocked_codes, Mapping):
+        reconciliation_blocked_source = raw_reconciliation_blocked_codes
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    reconciliation_blocked_codes = {
+        code: _status_count(reconciliation_blocked_source.get(code, 0))
+        for code in (
+            "marker_conflict",
+            "native_create_ambiguous",
+            "bridge_temporarily_unavailable",
+        )
+    }
+    oldest_reconciliation_wait_age = _optional_status_number(
+        raw.get("oldest_reconciliation_wait_age_seconds")
+    )
+    reconciliation_scan_age = _optional_status_number(
+        raw.get("reconciliation_scan_age_seconds")
+    )
+    recovered_existing_total = _status_count(raw.get("recovered_existing_total", 0))
+    created_new_total = _status_count(raw.get("created_new_total", 0))
     task_id = raw.get("last_visible_task_id")
     placement = (
         _public_sidebar_placement_status(raw.get("placement"))
@@ -4626,6 +4649,12 @@ def _public_sidebar_status(
         },
         "last_visible_task_id": redact_codex_thread_id(task_id),
         "recent_error_codes": recent_codes,
+        "reconciliation_counts": reconciliation_counts,
+        "reconciliation_blocked_codes": reconciliation_blocked_codes,
+        "oldest_reconciliation_wait_age_seconds": oldest_reconciliation_wait_age,
+        "reconciliation_scan_age_seconds": reconciliation_scan_age,
+        "recovered_existing_total": recovered_existing_total,
+        "created_new_total": created_new_total,
         "delivery_latency_seconds": {
             percentile: _optional_status_number(latency.get(percentile))
             for percentile in ("p50", "p95", "p99")

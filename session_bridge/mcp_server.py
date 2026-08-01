@@ -1576,6 +1576,10 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         recovery_lane = None
         recovery_status = None
         recovery_at = None
+    reconciliation_source = _status_mapping(source.get("reconciliation_counts"))
+    reconciliation_blocked_source = _status_mapping(
+        source.get("reconciliation_blocked_codes")
+    )
     placement = _sidebar_placement_status(source.get("placement"))
     broker_source = _status_mapping(source.get("broker"))
     broker = {
@@ -1652,6 +1656,32 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         "last_visible_task_id": task_id,
         "recent_error_codes": (
             _fixed_status_codes(recent) if isinstance(recent, (list, tuple)) else []
+        ),
+        "reconciliation_counts": {
+            state: _nonnegative_status_int(reconciliation_source.get(state), 0)
+            for state in ("recovered", "absence_proven", "blocked")
+        },
+        "reconciliation_blocked_codes": {
+            code: _nonnegative_status_int(
+                reconciliation_blocked_source.get(code), 0
+            )
+            for code in (
+                "marker_conflict",
+                "native_create_ambiguous",
+                "bridge_temporarily_unavailable",
+            )
+        },
+        "oldest_reconciliation_wait_age_seconds": _finite_status_number(
+            source.get("oldest_reconciliation_wait_age_seconds")
+        ),
+        "reconciliation_scan_age_seconds": _finite_status_number(
+            source.get("reconciliation_scan_age_seconds")
+        ),
+        "recovered_existing_total": _nonnegative_status_int(
+            source.get("recovered_existing_total"), 0
+        ),
+        "created_new_total": _nonnegative_status_int(
+            source.get("created_new_total"), 0
         ),
         "delivery_latency_seconds": {
             percentile: _finite_status_number(latency_values.get(percentile))

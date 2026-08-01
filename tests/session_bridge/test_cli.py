@@ -84,6 +84,10 @@ from session_bridge.sidebar_hydration_executor import (
     SidebarHydrationExecutor,
     SidebarHydrationExecutionResult,
 )
+from session_bridge.sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from session_bridge.sidebar_runtime import sidebar_registration_app_server_args
 from session_bridge.store import SessionBridgeStore
 
@@ -2008,6 +2012,33 @@ class _TerminalProbeClient:
         self.closed = True
 
 
+def _record_cli_absence_proof(
+    store: SessionBridgeStore,
+    lease_token: str,
+    *,
+    completed_at: float = 100.0,
+) -> dict[str, Any]:
+    evidence = SidebarReconciliationEvidence.create(
+        state=SidebarReconciliationState.ABSENCE_PROVEN,
+        generation=f"cli-scan:{completed_at}",
+        completed_at=completed_at,
+        expires_at=completed_at + 1_000.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=0,
+        recovered_thread_id=None,
+        fixed_reason=None,
+    )
+    return store.record_sidebar_reconciliation_proof(
+        lease_token=lease_token,
+        evidence=evidence,
+        marker_digest=evidence.marker_digest,
+        placement_generation=1,
+        delivery_generation=1,
+        now=completed_at,
+    )
+
+
 def _production_terminal_resolution_backend(
     tmp_path: Path,
     *,
@@ -2038,9 +2069,12 @@ def _production_terminal_resolution_backend(
     )
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_cli_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key=f"hermes-session-bridge-create-v1:terminal-{scenario}",
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=110.0,
     )
     thread_id = f"019f-terminal-provider-{scenario}"
@@ -2094,9 +2128,12 @@ def _production_bound_retry_backend(
     )
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_cli_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key="hermes-session-bridge-create-v1:bound-retry",
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=110.0,
     )
     thread_id = "019f-production-bound-retry"
@@ -2539,9 +2576,12 @@ def _production_unbound_resolution_backend(
         ),
         marker_secret,
     )
+    proof = _record_cli_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key=sidebar_create_recovery_key(marker, marker_secret),
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=105.0,
     )
     retry = store.fail_sidebar_job(
@@ -3484,6 +3524,59 @@ def test_sidebar_status_exposes_fixed_health_counts_without_private_payloads(
     assert "HERMES_SESSION_BRIDGE_V1" not in rendered
 
 
+def test_sidebar_status_exposes_only_bounded_reconciliation_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "counts": {},
+        "reconciliation_counts": {
+            "recovered": 1,
+            "absence_proven": 2,
+            "blocked": 3,
+            "private": 99,
+        },
+        "reconciliation_blocked_codes": {
+            "marker_conflict": 1,
+            "native_create_ambiguous": 2,
+            "bridge_temporarily_unavailable": 0,
+            "provider-private": 99,
+        },
+        "oldest_reconciliation_wait_age_seconds": 40.0,
+        "reconciliation_scan_age_seconds": 10.0,
+        "recovered_existing_total": 4,
+        "created_new_total": 5,
+        "signed_marker": "HERMES_SESSION_BRIDGE_V1:secret",
+        "proof_digest": "a" * 64,
+        "reconciliation_generation": "private-generation",
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["reconciliation_counts"] == {
+        "recovered": 1,
+        "absence_proven": 2,
+        "blocked": 3,
+    }
+    assert status["reconciliation_blocked_codes"] == {
+        "marker_conflict": 1,
+        "native_create_ambiguous": 2,
+        "bridge_temporarily_unavailable": 0,
+    }
+    assert status["oldest_reconciliation_wait_age_seconds"] == 40.0
+    assert status["reconciliation_scan_age_seconds"] == 10.0
+    assert status["recovered_existing_total"] == 4
+    assert status["created_new_total"] == 5
+    rendered = json.dumps(status)
+    for private in (
+        "HERMES_SESSION_BRIDGE_V1",
+        "proof_digest",
+        "private-generation",
+        "provider-private",
+    ):
+        assert private not in rendered
+
+
 def test_sidebar_status_exposes_only_sanitized_placement_health(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3829,7 +3922,7 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
     }
     assert "019f-secret-thread-identifier" not in rendered
     assert "lease_token" not in rendered
-    assert "marker" not in rendered
+    assert "HERMES_SESSION_BRIDGE_V1:" not in rendered
 
 
 @pytest.mark.parametrize(

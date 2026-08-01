@@ -225,7 +225,7 @@ def validate_sidebar_create_reservation(
 ) -> str:
     """Validate the exact durable reservation record returned by the store."""
 
-    expected_fields = {
+    base_fields = {
         "version",
         "job_id",
         "source_session_id",
@@ -233,11 +233,19 @@ def validate_sidebar_create_reservation(
         "recovery_key",
         "reserved_at",
     }
-    if not isinstance(reservation, Mapping) or set(reservation) != expected_fields:
+    if not isinstance(reservation, Mapping):
         raise ValueError("sidebar create reservation is malformed")
     reservation_map = cast(Mapping[str, object], reservation)
     version = reservation_map.get("version")
-    if type(version) is not int or version != 1:
+    expected_fields = (
+        base_fields
+        if version == 1
+        else base_fields
+        | {"reconciliation_proof_digest", "reconciliation_generation"}
+        if version == 2
+        else set()
+    )
+    if type(version) is not int or set(reservation_map) != expected_fields:
         raise ValueError("sidebar create reservation is malformed")
     if (
         reservation_map.get("job_id") != job_id
@@ -263,6 +271,19 @@ def validate_sidebar_create_reservation(
         raise ValueError("sidebar create reservation is malformed")
     if not hmac.compare_digest(recovery_key, expected_recovery_key):
         raise ValueError("sidebar create reservation key mismatch")
+    if version == 2:
+        proof_digest = reservation_map.get("reconciliation_proof_digest")
+        generation = reservation_map.get("reconciliation_generation")
+        if (
+            type(proof_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", proof_digest) is None
+            or type(generation) is not str
+            or not generation
+            or generation != generation.strip()
+            or "\n" in generation
+            or "\r" in generation
+        ):
+            raise ValueError("sidebar create reservation is malformed")
     return recovery_key
 
 

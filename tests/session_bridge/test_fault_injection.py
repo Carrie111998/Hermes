@@ -32,14 +32,20 @@ from session_bridge.mirror import (
     retry_delay_seconds,
 )
 from session_bridge.models import (
+    BridgeMarkerPayload,
     MirrorJobState,
     OriginKind,
     ProjectedMessage,
     Provider,
     SessionProjection,
+    encode_bridge_marker,
 )
+from session_bridge.sidebar import build_registration_prompt
 from session_bridge.store import SessionBridgeStore
-from tests.session_bridge.test_end_to_end import _SidebarEndToEndHarness
+from tests.session_bridge.test_end_to_end import (
+    _MARKER_SECRET,
+    _SidebarEndToEndHarness,
+)
 from tests.session_bridge.test_claude_registrar import (
     FakeFactory as _ClaudeFactory,
     FakePty as _ClaudePty,
@@ -797,6 +803,132 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
         assert len(app_server_calls) == 1
     finally:
         fallback.close()
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        "after_scan_before_proof",
+        "after_proof_before_lease_return",
+        "after_lease_before_reserve_recheck",
+        "after_reservation_before_create",
+        "after_create_before_bind",
+        "after_bind_before_commit",
+    ],
+)
+def test_authoritative_reconciliation_restart_never_authorizes_second_create(
+    tmp_path: Path,
+    crash_point: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_id = harness.seed_source(
+            Provider.HERMES,
+            f"crash-{crash_point}",
+            cwd=tmp_path / crash_point,
+        )
+        assert harness.register().queued == 1
+        candidate = harness.store.get_sidebar_candidate_for_delivery(source_id)
+        expected = BridgeMarkerPayload(
+            bridge_id=candidate.bridge_id,
+            source_session_id=source_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        )
+        marker = encode_bridge_marker(expected, _MARKER_SECRET)
+        prompt = build_registration_prompt(candidate, marker)
+
+        claim = None
+        if crash_point == "after_scan_before_proof":
+            raw_claims = harness.store.claim_sidebar_jobs(
+                now=harness.now,
+                limit=1,
+            )
+            assert len(raw_claims) == 1
+        else:
+            claims = asyncio.run(
+                harness.coordinator.claim_sidebar_jobs_for_delivery(limit=1)
+            )
+            assert len(claims) == 1
+            claim = claims[0]
+            assert claim.source_session_id == source_id
+
+        if crash_point in {
+            "after_reservation_before_create",
+            "after_create_before_bind",
+            "after_bind_before_commit",
+        }:
+            assert claim is not None
+            reserved = asyncio.run(
+                harness.coordinator.reserve_sidebar_create_authoritatively(
+                    lease_token=claim.lease_token,
+                    reconciliation_proof_digest=(
+                        claim.reconciliation_proof_digest
+                    ),
+                    reconciliation_generation=claim.reconciliation_generation,
+                )
+            )
+            assert reserved == {
+                "state": "sidebar_leased",
+                "create_reserved": True,
+            }
+
+        created_thread_id = None
+        if crash_point in {
+            "after_create_before_bind",
+            "after_bind_before_commit",
+        }:
+            created_thread_id = harness.native.create_thread(
+                prompt=prompt,
+                target={
+                    "type": "project",
+                    "projectId": "session-inbox",
+                    "environment": {"type": "local"},
+                },
+            )
+
+        if crash_point == "after_bind_before_commit":
+            assert claim is not None
+            assert created_thread_id is not None
+            bound = asyncio.run(
+                harness.coordinator.bind_sidebar_thread(
+                    lease_token=claim.lease_token,
+                    codex_thread_id=created_thread_id,
+                )
+            )
+            assert bound["codex_thread_id"] == created_thread_id
+
+        harness.advance_lease_expiry()
+        harness.restart_bridge()
+        with harness.client() as client:
+            outcome = harness.run_worker_once(client)
+
+        matching_threads = [
+            thread
+            for thread in harness.native.threads.values()
+            if thread["payload"] == expected
+        ]
+        assert len(harness.native.create_calls) <= 1
+        assert len(matching_threads) <= 1
+        durable = harness.store.get_sidebar_job_for_source(source_id)
+        assert durable is not None
+        if crash_point == "after_reservation_before_create":
+            assert outcome == []
+            assert matching_threads == []
+            assert durable["state"] == "sidebar_failed"
+            assert durable["error_code"] == "native_create_ambiguous"
+        else:
+            assert outcome == [
+                {
+                    "state": "sidebar_visible",
+                    "codex_thread_id": "native-sidebar-1",
+                }
+            ]
+            assert len(matching_threads) == 1
+            assert durable["state"] == "sidebar_visible"
+            assert durable["codex_thread_id"] == matching_threads[0]["thread_id"]
+    finally:
+        harness.close()
 
 
 @pytest.mark.parametrize(

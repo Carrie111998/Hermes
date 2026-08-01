@@ -1357,9 +1357,8 @@ class SessionBridgeCoordinator:
                         reconcile_method,
                         expected,
                         now=claim_time,
-                        ttl_seconds=min(
-                            30.0,
-                            float(self._config.service.reconcile_seconds),
+                        ttl_seconds=_sidebar_reconciliation_proof_ttl_seconds(
+                            self._config.service.reconcile_seconds
                         ),
                     )
                     if not isinstance(evidence, SidebarReconciliationEvidence):
@@ -1964,9 +1963,8 @@ class SessionBridgeCoordinator:
                 verifier.reconcile_marker,
                 expected,
                 now=reserve_time,
-                ttl_seconds=min(
-                    30.0,
-                    float(self._config.service.reconcile_seconds),
+                ttl_seconds=_sidebar_reconciliation_proof_ttl_seconds(
+                    self._config.service.reconcile_seconds
                 ),
             )
             if not isinstance(evidence, SidebarReconciliationEvidence):
@@ -5048,6 +5046,13 @@ def _exact_sidebar_proof_digest(value: object) -> str:
     ):
         raise ValueError("sidebar claim reconciliation proof digest is malformed")
     return digest
+
+
+def _sidebar_reconciliation_proof_ttl_seconds(value: object) -> float:
+    interval = _finite_number(value, "sidebar reconciliation interval")
+    if interval < 0:
+        raise ValueError("sidebar reconciliation interval must be non-negative")
+    return 30.0 if interval == 0 else min(30.0, interval)
 
 
 def _sidebar_reconciliation_failure_code(code: object) -> str:
