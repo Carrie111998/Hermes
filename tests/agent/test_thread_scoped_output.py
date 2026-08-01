@@ -147,3 +147,21 @@ def test_many_concurrent_silenced_and_loud_threads():
     for i in range(5):
         assert f"S{i}" not in captured, f"silenced S{i} leaked"
         assert f"L{i}" in captured, f"loud L{i} swallowed"
+
+
+def test_sequential_silence_calls_both_silence_correctly():
+    """Regression: sequential calls must both silence — the old code opened a
+    fresh /dev/null per call but only the first was wired into the proxy.
+    After the first call closed its handle, the proxy's sink was stale and
+    subsequent silenced writes silently failed."""
+    def body():
+        with thread_scoped_silence():
+            print("first-silenced")
+        with thread_scoped_silence():
+            print("second-silenced")
+        print("loud")
+
+    captured = _run_with_real_stream(body)
+    assert "first-silenced" not in captured
+    assert "second-silenced" not in captured
+    assert "loud" in captured
