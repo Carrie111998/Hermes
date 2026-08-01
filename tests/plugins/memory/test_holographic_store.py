@@ -154,6 +154,35 @@ class TestCloseSemantics:
         assert [f["content"] for f in facts] == ["first lifetime"]
 
 
+class TestSemanticEmbeddings:
+    @staticmethod
+    def _fake_embedder(monkeypatch):
+        import numpy as np
+
+        monkeypatch.setattr(
+            "plugins.memory.holographic.embeddings.get_embedder",
+            lambda: lambda texts: [np.ones(384, dtype=np.float32) for _ in texts],
+        )
+
+    def test_add_fact_persists_sbert_vector(self, db_path, monkeypatch):
+        self._fake_embedder(monkeypatch)
+        with MemoryStore(db_path) as store:
+            fact_id = store.add_fact("durable captured fact")
+            blob = store._conn.execute(
+                "SELECT sbert_vector FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()["sbert_vector"]
+            assert blob is not None
+            assert len(blob) == 384 * 4
+
+    def test_distinct_numeric_facts_are_not_semantically_merged(self, db_path, monkeypatch):
+        self._fake_embedder(monkeypatch)
+        with MemoryStore(db_path) as store:
+            first = store.add_fact("fact thread=0 seq=0", category="load")
+            second = store.add_fact("fact thread=0 seq=1", category="load")
+            assert first != second
+            assert len(store.list_facts(category="load", limit=10)) == 2
+
+
 class TestConcurrency:
     def test_concurrent_multi_instance_writers(self, db_path):
         """Many instances writing from many threads must never hit

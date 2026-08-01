@@ -201,7 +201,7 @@ class FactRetriever:
             f"""
             SELECT fact_id, content, category, tags, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
+                   hrr_vector, sbert_vector
             FROM facts
             {where}
             """,
@@ -263,7 +263,7 @@ class FactRetriever:
             f"""
             SELECT fact_id, content, category, tags, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
+                   hrr_vector, sbert_vector
             FROM facts
             {where}
             """,
@@ -344,7 +344,7 @@ class FactRetriever:
             f"""
             SELECT fact_id, content, category, tags, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
+                   hrr_vector, sbert_vector
             FROM facts
             {where}
             """,
@@ -505,7 +505,7 @@ class FactRetriever:
             f"""
             SELECT fact_id, content, category, tags, trust_score,
                    retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
+                   hrr_vector, sbert_vector
             FROM facts
             {where}
             """,

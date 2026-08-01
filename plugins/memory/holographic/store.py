@@ -193,13 +193,11 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
-    ) -> dict:
-        """Insert a fact. Returns dict with fact_id and status.
+    ) -> int:
+        """Insert a fact and return its fact_id.
 
-        Deduplicates by content (UNIQUE constraint). On duplicate, returns
-        the existing fact_id with status "duplicate". If sentence-transformers
-        is available, also checks semantic similarity — merges near-duplicates
-        (cosine > 0.85) with status "merged".
+        Deduplicates by exact content. When the optional embedder is available,
+        stores an SBERT vector and merges only semantic near-duplicates.
         """
         with self._lock:
             content = content.strip()
@@ -217,13 +215,10 @@ class MemoryStore:
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                return {
-                    "fact_id": self._conn.execute(
-                        "SELECT fact_id FROM facts WHERE content = ?",
-                        (content,),
-                    ).fetchone()["fact_id"],
-                    "status": "duplicate",
-                }
+                return self._conn.execute(
+                    "SELECT fact_id FROM facts WHERE content = ?",
+                    (content,),
+                ).fetchone()["fact_id"]
 
             # Entity extraction and linking
             for name in self._extract_entities(content):
@@ -244,7 +239,17 @@ class MemoryStore:
                         "WHERE sbert_vector IS NOT NULL AND fact_id != ?",
                         (fact_id,),
                     ).fetchall()
+                    new_numbers = tuple(re.findall(r"\b\d+(?:\.\d+)?\b", content))
                     for other_id, other_blob in existing:
+                        other_row = self._conn.execute(
+                            "SELECT content FROM facts WHERE fact_id = ?", (other_id,)
+                        ).fetchone()
+                        other_content = other_row["content"] if other_row else ""
+                        other_numbers = tuple(
+                            re.findall(r"\b\d+(?:\.\d+)?\b", other_content)
+                        )
+                        if new_numbers and other_numbers and new_numbers != other_numbers:
+                            continue
                         other_vec = unpack_vector(other_blob)
                         sim = cosine_similarity(new_vec, other_vec)
                         if sim > 0.92:
@@ -257,12 +262,7 @@ class MemoryStore:
                                 "DELETE FROM facts WHERE fact_id = ?", (fact_id,)
                             )
                             self._conn.commit()
-                            return {
-                                "fact_id": other_id,
-                                "status": "merged",
-                                "merged_with": other_id,
-                                "similarity": round(sim, 3),
-                            }
+                            return other_id
                     # No near-duplicate — store the embedding
                     blob = pack_vector(new_vec)
                     self._conn.execute(
@@ -277,7 +277,7 @@ class MemoryStore:
                     )
 
             self._rebuild_bank(category)
-            return {"fact_id": fact_id, "status": "added"}
+            return fact_id
 
     def search_facts(
         self,
