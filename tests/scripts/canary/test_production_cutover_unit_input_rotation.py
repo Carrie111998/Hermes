@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import stat
+from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -721,6 +722,130 @@ def test_legacy_rotate_wrapper_can_finish_an_exact_prepared_transaction(
         receipt["prepared_receipt_sha256"]
         == prepared["receipt_sha256"]
     )
+
+
+def test_legacy_rotate_accepts_exact_pre_edge_expansion_v3_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000
+    evidence = (tmp_path / "evidence").resolve()
+    evidence.mkdir(mode=0o700)
+    evidence.chmod(0o700)
+    os.chown(evidence, os.geteuid(), os.getegid())
+    staged = evidence / "staged"
+    staged.mkdir(mode=0o700)
+    _patch_staged_paths(monkeypatch, staged)
+    monkeypatch.setattr(cutover, "EVIDENCE_ROOT", evidence)
+
+    private_key = Ed25519PrivateKey.generate()
+    predecessor = owner.build_unit_input_authority(
+        release_revision="a" * 40,
+        unit_inputs=_unit_input_payload("a" * 40),
+        owner_subject_sha256="a" * 64,
+        private_key=private_key,
+        owner_runtime_attestation=_runtime_attestation("a" * 40),
+        now_unix=now,
+    )
+    successor = owner.build_unit_input_authority(
+        release_revision="b" * 40,
+        unit_inputs=_unit_input_payload("b" * 40),
+        owner_subject_sha256="a" * 64,
+        private_key=private_key,
+        owner_runtime_attestation=_runtime_attestation("b" * 40),
+        now_unix=now,
+    )
+
+    plan = deepcopy(predecessor[0])
+    removed = set(package.CREDENTIALS_BY_DOMAIN) - set(
+        package.LEGACY_V3_OPERATIONAL_EDGE_DOMAINS
+    )
+    assert removed == {"skyvision_backup", "skyvision_seo"}
+    for field in (
+        "operational_edge_identities",
+        "operational_edge_socket_groups",
+        "operational_edge_receipt_public_key_ids",
+    ):
+        for domain in removed:
+            del plan["unit_inputs"][field][domain]
+    plan_without_hash = {
+        name: item for name, item in plan.items() if name != "plan_sha256"
+    }
+    plan["plan_sha256"] = hashlib.sha256(
+        _canonical(plan_without_hash)
+    ).hexdigest()
+    plan = dict(
+        package.validate_unit_input_plan(
+            plan,
+            operational_edge_domains=(
+                package.LEGACY_V3_OPERATIONAL_EDGE_DOMAINS
+            ),
+        )
+    )
+
+    approval = deepcopy(predecessor[1])
+    approval["plan_sha256"] = plan["plan_sha256"]
+    approval["signature_ed25519_hex"] = "0" * 128
+    approval["approval_sha256"] = "0" * 64
+    approval["signature_ed25519_hex"] = private_key.sign(
+        package.unit_input_approval_signature_payload(approval)
+    ).hex()
+    approval["approval_sha256"] = hashlib.sha256(
+        _canonical(
+            {
+                name: item
+                for name, item in approval.items()
+                if name != "approval_sha256"
+            }
+        )
+    ).hexdigest()
+    approval = dict(
+        package.validate_unit_input_approval(
+            approval,
+            plan=plan,
+            now_unix=now,
+        )
+    )
+    fixed = package._unit_inputs_from_authority(
+        plan,
+        approval,
+        operational_edge_domains=package.LEGACY_V3_OPERATIONAL_EDGE_DOMAINS,
+    )
+    for path, payload, mode in (
+        (package.STAGED_UNIT_INPUT_PLAN_PATH, _canonical(plan), 0o400),
+        (
+            package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+            _canonical(approval),
+            0o400,
+        ),
+        (
+            package.FIXED_UNIT_INPUTS_PATH,
+            _canonical(fixed) + b"\n",
+            package.FIXED_UNIT_INPUTS_MODE,
+        ),
+    ):
+        path.write_bytes(payload)
+        path.chmod(mode)
+
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now,
+        lock_factory=nullcontext,
+    )
+
+    assert receipt["predecessor_revision"] == plan["release_revision"]
+    assert receipt["successor_revision"] == successor[0]["release_revision"]
+    assert _live_triplet() == {
+        "plan": _canonical(successor[0]),
+        "approval": _canonical(successor[1]),
+        "fixed": _canonical(
+            package._unit_inputs_from_authority(successor[0], successor[1])
+        )
+        + b"\n",
+    }
+    archived = Path(receipt["audit_transaction_path"]) / "predecessor"
+    assert json.loads((archived / "unit-input-plan.json").read_bytes()) == plan
 
 
 @pytest.mark.parametrize(

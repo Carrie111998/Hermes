@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 _REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPOSITORY_ROOT not in sys.path:
@@ -127,6 +127,19 @@ UNIT_INPUT_STAGING_SCHEMA = "muncho-production-cutover-unit-input-staging.v3"
 UNIT_INPUT_PAYLOAD_SCHEMA = "muncho-production-cutover-unit-input-payload.v3"
 UNIT_INPUT_PLAN_SCHEMA = "muncho-production-cutover-unit-input-plan.v3"
 UNIT_INPUT_APPROVAL_SCHEMA = "muncho-production-cutover-unit-input-approval.v3"
+LEGACY_V3_OPERATIONAL_EDGE_DOMAINS = frozenset(
+    {
+        "adventico_email",
+        "bitrix",
+        "canonical",
+        "github",
+        "infrastructure",
+        "skyvision_db",
+        "skyvision_email",
+        "skyvision_gitlab",
+        "skyvision_panel",
+    }
+)
 DISCORD_RECONCILIATION_INTENT_SCHEMA = (
     "muncho-production-discord-reconciliation-intent.v1"
 )
@@ -269,6 +282,17 @@ class PackagingError(RuntimeError):
     """Stable packaging failure."""
 
 
+def _v3_operational_edge_domains(
+    value: Collection[str] | None,
+) -> frozenset[str]:
+    if value is None:
+        return frozenset(CREDENTIALS_BY_DOMAIN)
+    domains = frozenset(value)
+    if domains != LEGACY_V3_OPERATIONAL_EDGE_DOMAINS:
+        raise PackagingError("cutover_packaging_unit_inputs_invalid")
+    return domains
+
+
 def _exact_mapping(
     value: Any,
     fields: frozenset[str],
@@ -302,8 +326,19 @@ def _identity_input(value: Any, label: str) -> dict[str, Any]:
 def _operational_edge_identity_inputs(
     identities_value: Any,
     socket_groups_value: Any,
+    *,
+    operational_edge_domains: Collection[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    domains = set(CREDENTIALS_BY_DOMAIN)
+    domains = set(_v3_operational_edge_domains(operational_edge_domains))
+    if (
+        not domains
+        or any(
+            not isinstance(domain, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", domain) is None
+            for domain in domains
+        )
+    ):
+        raise PackagingError("cutover_packaging_unit_inputs_invalid")
     identities_raw = _exact_mapping(
         identities_value,
         frozenset(domains),
@@ -474,7 +509,11 @@ def _target_input(value: Any, *, database_ip: str) -> dict[str, Any]:
     return raw
 
 
-def _unit_input_payload(value: Any) -> dict[str, Any]:
+def _unit_input_payload(
+    value: Any,
+    *,
+    operational_edge_domains: Collection[str] | None = None,
+) -> dict[str, Any]:
     raw = _exact_mapping(
         value,
         _UNIT_INPUT_PAYLOAD_FIELDS,
@@ -506,8 +545,10 @@ def _unit_input_payload(value: Any) -> dict[str, Any]:
         _operational_edge_identity_inputs(
             raw["operational_edge_identities"],
             raw["operational_edge_socket_groups"],
+            operational_edge_domains=operational_edge_domains,
         )
     )
+    domains = set(_v3_operational_edge_domains(operational_edge_domains))
     target = _target_input(raw["target"], database_ip=str(raw["database_ip"]))
     receipt_key_ids = raw["operational_edge_receipt_public_key_ids"]
     expected_identity_names = {
@@ -544,7 +585,7 @@ def _unit_input_payload(value: Any) -> dict[str, Any]:
         )
         is None
         or not isinstance(receipt_key_ids, Mapping)
-        or set(receipt_key_ids) != set(CREDENTIALS_BY_DOMAIN)
+        or set(receipt_key_ids) != domains
         or any(
             re.fullmatch(r"[0-9a-f]{64}", str(key_id)) is None
             for key_id in receipt_key_ids.values()
@@ -601,6 +642,7 @@ def _unit_inputs(
     value: Any,
     *,
     revision: str | None = None,
+    operational_edge_domains: Collection[str] | None = None,
 ) -> dict[str, Any]:
     raw = _exact_mapping(
         value,
@@ -648,7 +690,8 @@ def _unit_inputs(
                 }
             },
             "schema": UNIT_INPUT_PAYLOAD_SCHEMA,
-        }
+        },
+        operational_edge_domains=operational_edge_domains,
     )
     if payload["discord_reconciliation_intent"]["release_revision"] != raw[
         "release_revision"
@@ -969,14 +1012,21 @@ def _self_hashed(
     return raw
 
 
-def validate_unit_input_plan(value: Any) -> Mapping[str, Any]:
+def validate_unit_input_plan(
+    value: Any,
+    *,
+    operational_edge_domains: Collection[str] | None = None,
+) -> Mapping[str, Any]:
     raw = _self_hashed(
         value,
         fields=_UNIT_INPUT_PLAN_FIELDS,
         digest_field="plan_sha256",
         code="cutover_unit_input_plan_invalid",
     )
-    payload = _unit_input_payload(raw["unit_inputs"])
+    payload = _unit_input_payload(
+        raw["unit_inputs"],
+        operational_edge_domains=operational_edge_domains,
+    )
     public = raw["owner_public_key_ed25519_hex"]
     try:
         runtime_attestation = (
@@ -1096,6 +1146,8 @@ def build_unit_input_plan(
 def _unit_inputs_from_authority(
     plan: Mapping[str, Any],
     approval: Mapping[str, Any],
+    *,
+    operational_edge_domains: Collection[str] | None = None,
 ) -> Mapping[str, Any]:
     payload = plan["unit_inputs"]
     return _unit_inputs(
@@ -1107,6 +1159,7 @@ def _unit_inputs_from_authority(
             **{key: item for key, item in payload.items() if key != "schema"},
         },
         revision=plan["release_revision"],
+        operational_edge_domains=operational_edge_domains,
     )
 
 
