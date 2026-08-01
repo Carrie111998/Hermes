@@ -54,4 +54,30 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 
+    def test_disabled_primary_uses_configured_fallback(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: or\n"
+            "providers:\n"
+            "  openrouter:\n"
+            "    enabled: false\n"
+            "fallback_model:\n"
+            "  provider: custom\n"
+            "  model: fallback-model\n"
+            "  base_url: https://fallback.example/v1\n"
+            "  api_key: fallback-key\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        result = _resolve_runtime_agent_kwargs()
+
+        assert result["provider"] == "custom"
+        assert result["api_key"] == "fallback-key"
+        assert result["base_url"] == "https://fallback.example/v1"
+        assert result["model"] == "fallback-model"
+
 
