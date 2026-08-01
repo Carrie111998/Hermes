@@ -750,6 +750,16 @@ def _stage_candidate_venv(
         logger.warning("candidate dependency sync refused: uv.lock is missing")
         _remove_tree(candidate, boundary=runtime_root)
         return None
+    # ``uv.lock`` records resolver settings from ``[tool.uv]`` (notably
+    # ``exclude-newer``).  Keep the interpreter/bootstrap steps isolated from
+    # ambient uv config, but let the locked project sync read its own
+    # pyproject.toml. Otherwise UV_NO_CONFIG/--no-config removes those settings,
+    # while an ambient UV_CONFIG_FILE can redirect discovery away from the
+    # checkout; either case makes uv reject the current lockfile as stale before
+    # a replacement venv can be built.
+    sync_env = dict(env)
+    for key in ("UV_NO_CONFIG", "UV_CONFIG_FILE"):
+        sync_env.pop(key, None)
     synced = subprocess.run(
         [
             uv_bin,
@@ -759,10 +769,9 @@ def _stage_candidate_venv(
             "--locked",
             "--python",
             str(_venv_python(candidate)),
-            "--no-config",
         ],
         cwd=project_root,
-        env=env,
+        env=sync_env,
         check=False,
     )
     if synced.returncode != 0:

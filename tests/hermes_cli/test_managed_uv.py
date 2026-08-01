@@ -366,6 +366,57 @@ class TestManagedPythonStore:
         assert base_env["PYTHONHOME"] == "/poison/home"
 
 
+class TestCandidateVenvStaging:
+    def test_sync_loads_project_uv_config_while_venv_creation_stays_isolated(
+        self, tmp_path, monkeypatch
+    ):
+        """The locked sync must read [tool.uv] from pyproject.toml.
+
+        In particular, ``exclude-newer`` is recorded in uv.lock. Running sync
+        with UV_NO_CONFIG/--no-config makes uv ignore the project setting and
+        reject the otherwise-current lockfile.
+        """
+        from hermes_cli.managed_uv import _stage_candidate_venv
+
+        # An explicit ambient config file must not override the checkout's
+        # pyproject.toml when the replacement environment is resolved.
+        monkeypatch.setenv("UV_CONFIG_FILE", "/poison/uv.toml")
+
+        root = tmp_path / "checkout"
+        root.mkdir()
+        (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+        generation = root / ".hermes-runtime" / "python" / "generation-test"
+        python = generation / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("candidate", encoding="utf-8")
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, dict(kwargs["env"])))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "hermes_cli.managed_uv.subprocess.run", side_effect=fake_run
+        ), patch(
+            "hermes_cli.managed_uv._smoke_candidate_venv",
+            return_value=(True, "", None),
+        ):
+            candidate = _stage_candidate_venv(
+                "uv", project_root=root, generation=generation, python=python
+            )
+
+        assert candidate is not None
+        assert len(calls) == 2
+        venv_cmd, venv_env = calls[0]
+        sync_cmd, sync_env = calls[1]
+        assert "--no-config" in venv_cmd
+        assert venv_env["UV_NO_CONFIG"] == "1"
+        assert "--no-config" not in sync_cmd
+        assert "UV_NO_CONFIG" not in sync_env
+        assert "UV_CONFIG_FILE" not in sync_env
+
+
 class TestRuntimeRepair:
     def test_safe_runtime_is_a_noop(self, tmp_path):
         from hermes_cli.managed_uv import repair_vulnerable_runtime
