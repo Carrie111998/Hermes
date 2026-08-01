@@ -112,7 +112,12 @@ class _CapabilityProbeChild:
     def run_conversation(self, *, user_message, task_id, stream_callback):
         self.observed = {
             "session_key": approval.get_current_session_key(default=""),
-            "session_id": get_session_env("HERMES_SESSION_ID", ""),
+            # Operational identity belongs to the child. Commissioning
+            # authority remains the parent's exact session key + capability
+            # epoch, which are the inputs consumed by the approval boundary.
+            "operational_session_id": get_session_env(
+                "HERMES_SESSION_ID", ""
+            ),
             "capability_epoch_sha256": get_session_env(
                 "HERMES_CAPABILITY_EPOCH_SHA256", ""
             ),
@@ -175,8 +180,8 @@ def _run_delegation(
         child = _CapabilityProbeChild(task_index)
         children.append(child)
         # Simulate the real AIAgent constructor assigning its own session id.
-        # The commissioning snapshot must still carry the parent's id into the
-        # child execution/privileged-receipt context.
+        # delegate_task restores the commissioning snapshot after construction
+        # and then gives the child this id only for its execution scope.
         session_context._SESSION_ID.set(child.session_id)
         return child
 
@@ -244,7 +249,7 @@ def test_single_child_consumes_exact_parent_capability_without_minting(
 
         assert child.observed == {
             "session_key": SESSION_KEY,
-            "session_id": PARENT_SESSION_ID,
+            "operational_session_id": "child-session-0",
             "capability_epoch_sha256": CAPABILITY_EPOCH_SHA256,
             "consume_only": True,
             "mismatch_plan_id": None,
@@ -314,7 +319,7 @@ def test_background_child_keeps_commissioning_authority_across_async_executor(
         )
 
         assert child.observed["session_key"] == SESSION_KEY
-        assert child.observed["session_id"] == PARENT_SESSION_ID
+        assert child.observed["operational_session_id"] == "child-session-0"
         assert child.observed["capability_epoch_sha256"] == CAPABILITY_EPOCH_SHA256
         assert child.observed["consume_only"] is True
         assert child.observed["exact_plan_id"] == PLAN_ID

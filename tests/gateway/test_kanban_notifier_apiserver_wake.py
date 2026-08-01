@@ -10,7 +10,6 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
-from unittest.mock import patch
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
@@ -87,11 +86,7 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    with patch(
-        "hermes_cli.config.load_config",
-        return_value={"kanban": {"dispatch_in_gateway": True}},
-    ):
-        await runner._kanban_notifier_watcher(interval=1)
+    await runner._kanban_notifier_watcher(interval=1)
 
 
 def _make_runner(adapters):
@@ -99,6 +94,7 @@ def _make_runner(adapters):
     runner._running = True
     runner.adapters = adapters
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 
@@ -182,7 +178,6 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
     assert _unseen_terminal_events(tid, "api_server", "raw-sid-123") == []
-
 
 def test_apiserver_failed_self_post_rewinds_cursor(tmp_path, monkeypatch):
     """A failed/exhausted wake self-post must NOT advance the cursor: on the

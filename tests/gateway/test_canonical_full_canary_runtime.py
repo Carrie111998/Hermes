@@ -1333,7 +1333,7 @@ async def test_isolated_startup_skips_session_mutations_and_background_watchers(
 
 
 @pytest.mark.asyncio
-async def test_disabled_kanban_watchers_return_before_db_import_or_dispatch(
+async def test_disabled_kanban_dispatcher_returns_before_db_import_or_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import gateway.kanban_watchers as watchers
@@ -1365,7 +1365,10 @@ async def test_disabled_kanban_watchers_return_before_db_import_or_dispatch(
         ),
     )
     target = SimpleNamespace()
-    await watchers.GatewayKanbanWatchersMixin._kanban_notifier_watcher(target)
+    # Notifier and dispatcher ownership are intentionally separate: a profile
+    # gateway must still deliver subscriptions for its own adapters even when
+    # another process owns dispatch. Only the dispatcher is gated here; the
+    # notifier's non-dispatch behavior has its own regression coverage.
     await watchers.GatewayKanbanWatchersMixin._kanban_dispatcher_watcher(target)
     assert db_imports == []
 

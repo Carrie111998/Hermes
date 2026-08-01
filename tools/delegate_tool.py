@@ -2255,7 +2255,7 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context():
+            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2964,10 +2964,11 @@ def delegate_task(
 
     # Snapshot the authenticated commissioning turn before constructing child
     # AIAgent objects. Agent construction assigns each child a fresh durable
-    # session id and may update session-related ContextVars; none of that may
-    # replace the parent's routing key, owner identity, or capability epoch for
-    # exact-plan consumption. Context.copy() below gives every parallel child
-    # an independent, concurrently enterable copy of this same authority.
+    # session id. Child execution receives that operational id, while none of
+    # it may replace the parent's routing key, owner identity, or capability
+    # epoch used for exact-plan consumption. Context.copy() below gives every
+    # parallel child an independent, concurrently enterable copy of this same
+    # commissioning authority.
     _commissioning_turn_context = contextvars.copy_context()
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -3095,20 +3096,17 @@ def delegate_task(
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
-    # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
-    # set_current_session_id(child.session_id), which clobbers the
-    # HERMES_SESSION_ID ContextVar and os.environ with the subagent's internal
-    # id before the background-dispatch code below would read it. The
+    # constructed. Child construction and execution are now scope-safe, but
+    # capturing the wake address at the commissioning boundary also makes the
+    # detached-delivery contract independent of child identity. The
     # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
-    # api_server) is untouched by child construction, so read it here and
-    # thread it through the dispatch.
+    # api_server) is read here and threaded through the dispatch.
     from tools.async_delegation import _current_origin_session_id
 
     _origin_wake_sid = _current_origin_session_id()
     # Capture the host-authored API execution envelope at the same pre-child
-    # boundary as the raw wake session id.  Child construction rewrites
-    # session ContextVars, while this parent-owned attribute is immutable for
-    # the current API turn.  Ephemeral prompts are explicitly never persisted,
+    # boundary as the raw wake session id. This parent-owned attribute is
+    # immutable for the current API turn. Ephemeral prompts are never persisted,
     # so such turns are forced synchronous instead of writing prompt text into
     # the durable delegation ledger.
     _api_execution_context = None
@@ -3422,9 +3420,8 @@ def delegate_task(
             # still reach the session by self-POSTing /v1/chat/completions
             # with that id in X-Hermes-Session-Id once the batch completes.
             # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
-            # construction (see _origin_wake_sid above) — reading
-            # HERMES_SESSION_ID here would return the subagent's internal id.
+            # session id to wake. Uses the origin captured at commissioning
+            # (see _origin_wake_sid above), independently of child identity.
             _wake_sid = _origin_wake_sid
             if _wake_sid:
                 logger.info(
