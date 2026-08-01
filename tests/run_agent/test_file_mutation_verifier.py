@@ -49,6 +49,13 @@ class TestExtractFileMutationTargets:
         assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
 
+    def test_patch_multi_edit_mode_returns_path(self):
+        args = {"mode": "multi_edit", "path": "/tmp/a.md", "edits": [
+            {"old_string": "x", "new_string": "y"},
+        ]}
+        assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
+
+
 
     def test_patch_v4a_multi_file(self):
         body = (

@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -158,6 +159,61 @@ class TestPatchHandler:
         result = json.loads(patch_tool(mode="patch", patch="*** Begin Patch\n..."))
         assert result["status"] == "ok"
         mock_ops.patch_v4a.assert_called_once()
+
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_multi_edit_mode_calls_patch_multi_edit(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "status": "ok",
+            "edit_results": [{"index": 0, "status": "ok"}],
+        }
+        mock_ops.patch_multi_edit.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        edits = [{"old_string": "foo", "new_string": "bar"}]
+        result = json.loads(patch_tool(mode="multi_edit", path="/tmp/f.py", edits=edits))
+        assert result["status"] == "ok"
+        _args = mock_ops.patch_multi_edit.call_args[0]
+        assert _args[1] == edits
+        assert str(Path(_args[0])).replace("\\", "/").endswith("tmp/f.py")
+
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_multi_edit_mode_requires_path(self, mock_get):
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="multi_edit", edits=[{"old_string": "a", "new_string": "b"}]
+        ))
+        assert "path required" in result["error"]
+
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_multi_edit_preserves_cross_platform_filename_characters(self, mock_get, tmp_path):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"success": True}
+        mock_ops.patch_multi_edit.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+
+        edits = [{"old_string": "foo", "new_string": "bar"}]
+        names = [
+            "file with spaces.py",
+            "café-東京.py",
+            "apostrophe's file.py",
+            "[draft] (final) $file.py",
+        ]
+        for name in names:
+            target = tmp_path / name
+            result = json.loads(patch_tool(mode="multi_edit", path=str(target), edits=edits))
+            assert result["success"] is True
+            actual_path, actual_edits = mock_ops.patch_multi_edit.call_args.args
+            assert Path(actual_path) == target.resolve()
+            assert actual_edits == edits
 
 
     @patch("tools.file_tools._get_file_ops")

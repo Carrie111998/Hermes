@@ -407,10 +407,11 @@ def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
 def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
     """Return the file paths a ``write_file`` or ``patch`` call is targeting.
 
-    For ``write_file`` and ``patch`` in replace mode this is just ``args["path"]``.
-    For ``patch`` in V4A patch mode we parse the patch content for
-    ``*** Update File:`` / ``*** Add File:`` / ``*** Delete File:`` headers so
-    the verifier can track each file in a multi-file patch separately.
+    For ``write_file`` and ``patch`` in replace/multi_edit mode this is just
+    ``args["path"]``.  For ``patch`` in V4A patch mode we parse the patch
+    content for ``*** Update File:`` / ``*** Add File:`` / ``*** Delete File:``
+    headers so the verifier can track each file in a multi-file patch
+    separately.
     """
     if tool_name not in _FILE_MUTATING_TOOLS:
         return []
@@ -419,7 +420,7 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
         return [str(p)] if p else []
     # tool_name == "patch"
     mode = args.get("mode") or "replace"
-    if mode == "replace":
+    if mode in ("replace", "multi_edit"):
         p = args.get("path")
         return [str(p)] if p else []
     if mode == "patch":
