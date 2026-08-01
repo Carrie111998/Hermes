@@ -1,7 +1,8 @@
 """Gateway lifecycle guard for cron job creation (#30719).
 
 An agent running inside a gateway can schedule a cron job that calls
-``hermes gateway restart`` (or ``launchctl kickstart ai.hermes.gateway``
+``hermes gateway restart`` (or ``hermes gateway start --all``,
+``launchctl kickstart ai.hermes.gateway``
 or ``systemctl restart hermes-gateway``).  When the cron fires, the
 gateway dies, the supervisor (launchd KeepAlive / systemd Restart=)
 revives it, auto-resume picks up the offending session, and the resumed
@@ -25,7 +26,8 @@ command shape.
 
 This is a defence-in-depth layer.  ``tools/terminal_tool.py`` already
 blocks these commands at *execution* time when ``_HERMES_GATEWAY=1``, and
-``hermes gateway stop|restart`` refuse to self-target from inside the
+``hermes gateway stop|restart`` and ``gateway start --all`` refuse to
+self-target from inside the
 gateway.  Blocking at *creation* time as well means the agent gets an
 immediate, informative rejection instead of scheduling a job that will
 only fail (silently) when it fires.
@@ -42,16 +44,32 @@ class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
 
 
+# The CLI intentionally accepts -p/--profile anywhere before ``--`` and strips
+# it before argparse sees the remaining command (hermes_cli.main:556-596).
+# Normalize the same valid profile selectors before lifecycle matching so
+# equivalent spellings such as ``hermes gateway -p alex restart`` cannot bypass
+# the cron/terminal defense-in-depth layer.
+_PROFILE_SELECTOR_PATTERN = re.compile(
+    r"(?i)(?<!\S)(?:(?:-p|--profile)\s+[a-z0-9][a-z0-9_-]{0,63}"
+    r"|--profile=[a-z0-9][a-z0-9_-]{0,63})(?!\S)"
+)
+
+
 # Shell-level command shapes that target the gateway lifecycle. Each branch
 # is anchored on a concrete command identifier so a match can only fire on
 # actual shell-command-shaped strings, not on prose.
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
-    # Branch A: `hermes gateway restart|stop` — the canonical foot-gun.
-    # `start` is intentionally excluded: starting a gateway from inside a
-    # gateway is benign (a no-op or "already running" error), and a
-    # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    # Branch A: `hermes gateway restart|stop` — the canonical foot-gun —
+    # Profile selectors are normalized out before this pattern runs. Plain
+    # `start` stays allowed because a legitimate job may start a stopped
+    # sibling profile.
+    # `start --all` is different: it kills gateway processes across every
+    # profile before starting the selected profile's service, so it belongs in
+    # the lifecycle block. Accept options before/after --all and common shell
+    # delimiters after it without broadening the match to plain start.
+    r"(?:hermes\s+gateway\s+"
+    r"(?:(?:restart|stop)\b|start\b[^\n;&|]*\s--a(?:l(?:l)?)?(?:\s|[;&|)]|$)))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -70,7 +88,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(text))
+    normalized = _PROFILE_SELECTOR_PATTERN.sub(" ", text)
+    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
 
 
 def _resolve_script_path(script_path: str) -> Path:
@@ -134,8 +153,8 @@ def check_gateway_lifecycle(
     if contains_gateway_lifecycle_command(combined):
         raise GatewayLifecycleBlocked(
             "Blocked: cron job contains a gateway lifecycle command "
-            "(restart/stop/kill). This is blocked to prevent agent-driven "
+            "(restart/stop/start --all/kill). This is blocked to prevent agent-driven "
             "SIGTERM-respawn loops under launchd/systemd supervision "
-            "(#30719). Run `hermes gateway restart` from a shell outside "
-            "the running gateway instead."
+            "(#30719). Run destructive gateway lifecycle commands from a "
+            "shell outside the running gateway instead."
         )

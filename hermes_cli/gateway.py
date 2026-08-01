@@ -6935,6 +6935,22 @@ def _gateway_command_inner(args):
         system = getattr(args, "system", False)
         start_all = getattr(args, "all", False)
 
+        # Plain start is intentionally allowed from a gateway session: it is
+        # profile-scoped, so an operator/cron job may start a stopped sibling
+        # profile. `start --all` is not profile-scoped — it calls
+        # kill_gateway_processes(all_profiles=True) below and can terminate the
+        # gateway running this command plus every sibling. Refuse only that
+        # destructive variant, preserving the legitimate sibling-start path.
+        if start_all and os.getenv("_HERMES_GATEWAY") == "1":
+            print_error(
+                "Refusing to start all gateways from inside a gateway process.\n"
+                "`gateway start --all` stops gateway processes across every profile "
+                "before starting one service.\n"
+                "Use plain `hermes -p <profile> gateway start` for a stopped sibling, "
+                "or run `hermes gateway start --all` from an external shell."
+            )
+            sys.exit(1)
+
         # Phase 4: inside a container with s6, dispatch via the service
         # manager instead of falling through to systemd/launchd/windows.
         # `--all` isn't meaningful here (each profile has its own service
