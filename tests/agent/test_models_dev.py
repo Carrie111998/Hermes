@@ -312,12 +312,17 @@ class TestFetchModelsDev:
         mock_get.assert_not_called()
 
     @patch("agent.models_dev.requests.get")
-    def test_hermes_offline_env_never_fetches(self, mock_get, monkeypatch):
-        """HERMES_OFFLINE=1 must suppress all network access, even on
+    def test_offline_mode_never_fetches(self, mock_get):
+        """agent.offline: true must suppress all network access, even on
         force_refresh, falling back to any disk cache regardless of age."""
         import agent.models_dev as md
+        from hermes_constants import get_hermes_home
 
-        monkeypatch.setenv("HERMES_OFFLINE", "1")
+        home = get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("agent:\n  offline: true\n")
+
+        md._models_dev_cache = {}
         with patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY):
             result = fetch_models_dev(force_refresh=True)
 

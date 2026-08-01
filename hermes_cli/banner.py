@@ -284,10 +284,13 @@ def check_for_updates() -> Optional[int]:
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply. Cached for 6 hours.
 
-    ``HERMES_OFFLINE=1`` short-circuits the check entirely — intranet /
-    air-gapped deployments must never touch the network.
+    ``agent.offline: true`` in config.yaml short-circuits the check
+    entirely — intranet / air-gapped deployments must never touch the
+    network.
     """
-    if os.environ.get("HERMES_OFFLINE"):
+    from hermes_cli.config import offline_mode_enabled
+
+    if offline_mode_enabled():
         return None
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
