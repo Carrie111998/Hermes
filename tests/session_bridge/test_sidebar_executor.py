@@ -32,6 +32,10 @@ from session_bridge.sidebar_placement import (
     SidebarPlacementError,
     resolve_sidebar_placement,
 )
+from session_bridge.sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
     NativeCreateAmbiguous,
@@ -1564,7 +1568,13 @@ class FakeStore:
         return self.reservations.get(source_session_id)
 
     def reserve_sidebar_create(
-        self, *, lease_token: str, recovery_key: str, now: float
+        self,
+        *,
+        lease_token: str,
+        recovery_key: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+        now: float,
     ) -> dict[str, Any]:
         del lease_token
         source_session_id = next(iter(self.candidates))
@@ -1575,16 +1585,39 @@ class FakeStore:
                 raise ValueError("conflicting sidebar create reservation")
             return existing
         reservation = {
-            "version": 1,
+            "version": 2,
             "job_id": f"sidebar-job:{source_session_id}",
             "source_session_id": source_session_id,
             "bridge_id": candidate.bridge_id,
             "recovery_key": recovery_key,
+            "reconciliation_proof_digest": reconciliation_proof_digest,
+            "reconciliation_generation": reconciliation_generation,
             "reserved_at": now,
         }
         self.events.append(("reserve", recovery_key))
         self.reservations[source_session_id] = reservation
         return reservation
+
+    def record_sidebar_reconciliation_proof(
+        self,
+        *,
+        lease_token: str,
+        evidence: SidebarReconciliationEvidence,
+        marker_digest: str,
+        placement_generation: int,
+        delivery_generation: int,
+        now: float,
+    ) -> dict[str, Any]:
+        del lease_token, marker_digest, placement_generation, delivery_generation, now
+        evidence.validate()
+        return {
+            "proof_digest": hashlib.sha256(
+                evidence.generation.encode("utf-8")
+            ).hexdigest(),
+            "reconciliation_generation": evidence.generation,
+            "state": evidence.state.value,
+            "recovered_thread_id": evidence.recovered_thread_id,
+        }
 
     def clear_sidebar_create_reservation(
         self, *, lease_token: str, recovery_key: str, now: float
@@ -1667,6 +1700,35 @@ class FakeVerifier:
     ) -> VerifiedSidebarThread | None:
         self.events.append(("find", expected.source_session_id))
         return self.find_result
+
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        recovered = self.find_by_marker(expected)
+        marker = encode_bridge_marker(expected, SECRET)
+        return SidebarReconciliationEvidence.create(
+            state=(
+                SidebarReconciliationState.RECOVERED
+                if recovered is not None
+                else SidebarReconciliationState.ABSENCE_PROVEN
+            ),
+            generation=f"fake:{expected.source_session_id}:{now}",
+            completed_at=now,
+            expires_at=now + ttl_seconds,
+            inventory_digest=hashlib.sha256(
+                repr(recovered).encode("utf-8")
+            ).hexdigest(),
+            marker_digest=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+            match_count=int(recovered is not None),
+            recovered_thread_id=(
+                recovered.thread_id if recovered is not None else None
+            ),
+            fixed_reason=None,
+        )
 
     def find_by_recovery_key(
         self,

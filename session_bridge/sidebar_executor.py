@@ -29,6 +29,10 @@ from .sidebar_placement import (
     filesystem_path_identity,
     placement_paths_equivalent,
 )
+from .sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
@@ -935,7 +939,32 @@ class SidebarExecutor:
                     error_code="broker_time_budget",
                 )
             try:
-                recovered = self._verifier.find_by_marker(expected)
+                proof_time = _finite_time(self._clock())
+                evidence = self._verifier.reconcile_marker(
+                    expected,
+                    now=proof_time,
+                    ttl_seconds=30.0,
+                )
+                if not isinstance(evidence, SidebarReconciliationEvidence):
+                    raise TypeError("sidebar reconciliation evidence is malformed")
+                proof = self._store.record_sidebar_reconciliation_proof(
+                    lease_token=lease_token,
+                    evidence=evidence,
+                    marker_digest=evidence.marker_digest,
+                    placement_generation=placement.placement_generation,
+                    delivery_generation=1,
+                    now=proof_time,
+                )
+                if not isinstance(proof, Mapping):
+                    raise TypeError("sidebar reconciliation proof is malformed")
+                reconciliation_proof_digest = _required_text(
+                    proof.get("proof_digest"),
+                    "sidebar reconciliation proof digest",
+                )
+                reconciliation_generation = _required_text(
+                    proof.get("reconciliation_generation"),
+                    "sidebar reconciliation generation",
+                )
             except (KeyboardInterrupt, SystemExit):
                 raise
             except SidebarVerificationError as exc:
@@ -950,6 +979,29 @@ class SidebarExecutor:
                     lease_token=lease_token,
                     error_code="bridge_temporarily_unavailable",
                 )
+            if evidence.state is SidebarReconciliationState.BLOCKED:
+                return self._settle(
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    error_code=_verification_code(
+                        SidebarVerificationError(
+                            evidence.fixed_reason
+                            or "bridge_temporarily_unavailable"
+                        )
+                    ),
+                )
+            recovered = (
+                VerifiedSidebarThread(
+                    thread_id=_required_text(
+                        evidence.recovered_thread_id,
+                        "recovered Codex thread ID",
+                    ),
+                    source_session_id=source_session_id,
+                    bridge_id=bridge_id,
+                )
+                if evidence.state is SidebarReconciliationState.RECOVERED
+                else None
+            )
             if recovered is not None:
                 if not isinstance(
                     recovered, VerifiedSidebarThread
@@ -1026,6 +1078,10 @@ class SidebarExecutor:
                         reservation = self._store.reserve_sidebar_create(
                             lease_token=lease_token,
                             recovery_key=expected_recovery_key,
+                            reconciliation_proof_digest=(
+                                reconciliation_proof_digest
+                            ),
+                            reconciliation_generation=reconciliation_generation,
                             now=_finite_time(self._clock()),
                         )
                         recovery_key = validate_sidebar_create_reservation(

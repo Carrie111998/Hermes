@@ -17,6 +17,7 @@ from session_bridge.models import (
     Provider,
     SessionProjection,
     decode_bridge_marker,
+    encode_bridge_marker,
 )
 from session_bridge.sidebar import (
     SidebarCandidate,
@@ -31,6 +32,10 @@ from session_bridge.sidebar_executor import (
     SidebarExecutor,
 )
 from session_bridge.sidebar_placement import SidebarPlacement
+from session_bridge.sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -209,6 +214,35 @@ class _Verifier:
         if not matches:
             return None
         return _verified(matches[0], expected)
+
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        recovered = self.find_by_marker(expected)
+        marker = encode_bridge_marker(expected, _MARKER_SECRET)
+        return SidebarReconciliationEvidence.create(
+            state=(
+                SidebarReconciliationState.RECOVERED
+                if recovered is not None
+                else SidebarReconciliationState.ABSENCE_PROVEN
+            ),
+            generation=f"restart:{len(self._world.find_by_marker_calls)}:{now}",
+            completed_at=now,
+            expires_at=now + ttl_seconds,
+            inventory_digest=hashlib.sha256(
+                "\0".join(sorted(self._world.threads)).encode("utf-8")
+            ).hexdigest(),
+            marker_digest=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+            match_count=int(recovered is not None),
+            recovered_thread_id=(
+                recovered.thread_id if recovered is not None else None
+            ),
+            fixed_reason=None,
+        )
 
     def find_by_recovery_key(
         self,
