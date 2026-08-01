@@ -213,25 +213,44 @@ def test_sibling_and_traversal_mutations_are_denied(monkeypatch, tmp_path):
 
     direct = sibling / "direct.txt"
     traversal = sibling / "traversal.txt"
+    sibling_write = sibling / "sibling-write.txt"
+    sibling_delete = sibling / "sibling-delete.txt"
+    own_move = workspace / "own-move.txt"
+    moved = sibling / "moved.txt"
     direct.write_text("before", encoding="utf-8")
     traversal.write_text("before", encoding="utf-8")
+    sibling_delete.write_text("before", encoding="utf-8")
+    own_move.write_text("before", encoding="utf-8")
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
     with mock.patch.dict(os.environ, captured["env"], clear=True):
         ops = _shell_file_operations(workspace)
+        write_result = ops.write_file(str(sibling_write), "blocked")
         direct_result = ops.patch_replace(str(direct), "before", "after")
         traversal_result = ops.patch_replace(
             str(workspace / ".." / "scratch-b" / "traversal.txt"),
             "before",
             "after",
         )
+        delete_result = ops.delete_file(str(sibling_delete))
+        move_result = ops.move_file(str(own_move), str(moved))
 
+    assert write_result.error is not None
+    assert "outside HERMES_WRITE_SAFE_ROOT" in write_result.error
     assert direct_result.error is not None
     assert "outside HERMES_WRITE_SAFE_ROOT" in direct_result.error
     assert traversal_result.error is not None
     assert "outside HERMES_WRITE_SAFE_ROOT" in traversal_result.error
+    assert delete_result.error is not None
+    assert "outside HERMES_WRITE_SAFE_ROOT" in delete_result.error
+    assert move_result.error is not None
+    assert "outside HERMES_WRITE_SAFE_ROOT" in move_result.error
+    assert not sibling_write.exists()
     assert direct.read_text(encoding="utf-8") == "before"
     assert traversal.read_text(encoding="utf-8") == "before"
+    assert sibling_delete.read_text(encoding="utf-8") == "before"
+    assert own_move.read_text(encoding="utf-8") == "before"
+    assert not moved.exists()
 
 
 def test_symlink_escape_is_denied(monkeypatch, tmp_path):
