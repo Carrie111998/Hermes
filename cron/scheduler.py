@@ -158,19 +158,26 @@ class CronPromptInjectionBlocked(Exception):
 
 
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
-    """Toolsets a cron-spawned agent must never receive.
+    """Toolsets a cron-spawned agent must not receive.
 
-    Three protected toolsets are always disabled in cron context:
+    Two protected toolsets are always disabled in cron context:
       - ``cronjob`` — would let a cron-spawned agent schedule more cron jobs
       - ``messaging`` — interactive, needs a live gateway session
-      - ``clarify`` — interactive, blocks waiting for user input
+
+    ``clarify`` is also disabled unless the operator opts in with
+    ``cron.allow_clarify: true``. Unattended jobs have nobody to answer a
+    clarify prompt, so the default stays fully autonomous; the opt-in wires a
+    callback over the job's live delivery adapter (see
+    ``_build_cron_clarify_callback``).
 
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify"]
+    disabled = ["cronjob", "messaging"]
+    if not bool(((cfg or {}).get("cron") or {}).get("allow_clarify", False)):
+        disabled.append("clarify")
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -242,6 +249,122 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+# Platform hint for cron sessions when cron.allow_clarify is enabled. Replaces
+# the default autonomous-execution hint (PLATFORM_HINTS["cron"], which tells
+# the model it cannot ask questions) so the hint and the available clarify
+# tool don't contradict each other. An explicit agent.platform_hints.cron
+# override in config.yaml always wins over this.
+_CRON_CLARIFY_PLATFORM_HINT = (
+    "You are running as a scheduled cron job with human-in-the-loop support "
+    "enabled. A user is reachable through the job's delivery channel: use the "
+    "clarify tool when a decision genuinely needs their input, but never block "
+    "on it for routine choices — if a clarify prompt times out or cannot be "
+    "delivered, proceed autonomously with a reasonable default. Your final "
+    "response is automatically delivered to the job's configured destination "
+    "— put the primary content directly in your response."
+)
+
+
+def _build_cron_clarify_callback(job: dict, adapters, loop, session_id):
+    """Build a clarify_callback for a cron-spawned agent.
+
+    Renders the clarify prompt through the live gateway adapter for the job's
+    first delivery target (e.g. Discord buttons in the delivery channel) and
+    blocks until the user answers or ``agent.clarify_timeout`` elapses.
+
+    Mirrors gateway/run.py's ``_clarify_callback_sync``; the cron-specific
+    difference is that the target chat comes from the job's delivery config,
+    not an inbound message event (a cron session has no attached chat). The
+    wait reuses clarify_gateway.wait_for_response, which polls in 1-second
+    slices and heartbeats the activity tracker, so the cron inactivity
+    watchdog (HERMES_CRON_TIMEOUT, default 600s) does not kill the run while
+    the user is deciding.
+
+    Returns None when no live adapter with ``send_clarify`` exists for the
+    job's delivery targets — the caller then leaves clarify_callback unset
+    and the tool reports its standard "not available in this execution
+    context" error.
+    """
+    from gateway.config import load_gateway_config, Platform
+    from gateway.delivery import resolve_delivery_transport
+
+    targets = _resolve_delivery_targets(job)
+    if not targets:
+        return None
+    try:
+        gw_config = load_gateway_config()
+    except Exception:
+        return None
+    if not loop.is_running():
+        return None
+
+    adapter = None
+    chat_id = None
+    thread_id = None
+    for target in targets:
+        try:
+            platform = Platform(str(target.get("platform", "")).lower())
+        except (ValueError, KeyError):
+            continue
+        transport = resolve_delivery_transport(platform, gw_config, adapters)
+        candidate = transport.adapter if transport is not None else None
+        if candidate is not None and callable(getattr(candidate, "send_clarify", None)):
+            adapter = candidate
+            chat_id = str(target.get("chat_id") or "")
+            thread_id = target.get("thread_id")
+            break
+    if adapter is None or not chat_id:
+        return None
+
+    job_id = job["id"]
+
+    def _cron_clarify_callback(question, choices, multi_select=False):
+        import asyncio
+        import uuid as _uuid
+
+        from tools import clarify_gateway as _clarify_mod
+
+        clarify_id = _uuid.uuid4().hex[:10]
+        sess_key = session_id or f"cron:{job_id}"
+        _clarify_mod.register(
+            clarify_id=clarify_id,
+            session_key=sess_key,
+            question=question,
+            choices=list(choices) if choices else None,
+            multi_select=bool(multi_select),
+        )
+
+        send_ok = False
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                adapter.send_clarify(
+                    chat_id=chat_id,
+                    question=question,
+                    choices=list(choices) if choices else None,
+                    clarify_id=clarify_id,
+                    session_key=sess_key,
+                    metadata={"thread_id": thread_id} if thread_id else None,
+                ),
+                loop,
+            )
+            result = fut.result(timeout=15)
+            send_ok = bool(getattr(result, "success", False))
+        except Exception as exc:
+            logger.warning("Job '%s': clarify send failed: %s", job_id, exc)
+        if not send_ok:
+            _clarify_mod.clear_session(sess_key)
+            return "[clarify prompt could not be delivered]"
+
+        timeout = float(_clarify_mod.get_clarify_timeout())
+        response = _clarify_mod.wait_for_response(clarify_id, timeout=timeout)
+        if response is None or response == "":
+            return f"[user did not respond within {int(max(timeout, 0) / 60)}m]"
+        return response
+
+    return _cron_clarify_callback
+
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -2751,7 +2874,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    adapters=None, loop=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2765,6 +2889,12 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``adapters`` / ``loop``: the gateway's live platform-adapter map and event
+    loop, present when the job is fired by the gateway ticker. They are only
+    used to wire a clarify callback when ``cron.allow_clarify`` is enabled.
+    Standalone ``hermes cron run`` fires pass neither, so clarify stays
+    unavailable there by design.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3506,7 +3636,41 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # cron.allow_clarify opt-in: when this run was fired by the gateway
+        # ticker (live adapters + loop present), attach a clarify callback
+        # over the job's delivery adapter and swap the autonomous-only cron
+        # platform hint for its human-in-the-loop variant. Standalone
+        # `hermes cron run` fires have no live adapter, so clarify keeps
+        # reporting "not available in this execution context" there.
+        try:
+            if (
+                bool((_cfg.get("cron") or {}).get("allow_clarify", False))
+                and adapters is not None and loop is not None
+            ):
+                _clarify_cb = _build_cron_clarify_callback(
+                    job, adapters, loop, _cron_session_id,
+                )
+                if _clarify_cb is not None:
+                    agent.clarify_callback = _clarify_cb
+                    _hint_overrides = getattr(agent, "_platform_hint_overrides", None)
+                    if not isinstance(_hint_overrides, dict):
+                        _hint_overrides = {}
+                    # An explicit operator platform-hint override always wins.
+                    if "cron" not in _hint_overrides:
+                        agent._platform_hint_overrides = {
+                            **_hint_overrides,
+                            "cron": {"replace": _CRON_CLARIFY_PLATFORM_HINT},
+                        }
+                    logger.info(
+                        "Job '%s': clarify enabled (live adapter attached)", job_id,
+                    )
+        except Exception as _clarify_exc:
+            logger.warning(
+                "Job '%s': clarify setup failed (non-fatal): %s",
+                job_id, _clarify_exc,
+            )
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -3943,7 +4107,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                adapters=adapters, loop=loop,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
