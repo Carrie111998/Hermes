@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_dir
 import json
 import os
 import httpx
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_SOUL_CORE: %(message)s',
     handlers=[
-        logging.FileHandler("soul_actuator.log"),
+        logging.FileHandler(harness_log_path("soul_actuator.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -26,7 +27,7 @@ class SoulActuator:
     def __init__(self):
         self.osc = OSCController()
         self.harness_url = "http://127.0.0.1:18794"
-        self.resonance_shards = "../../_docs/resonance"
+        self.resonance_shards = harness_state_dir("resonance")
         self.rival_substrate = "Neuro-sama (Legacy/Reactive)"
 
     async def evaluate_substrate_intent(self):
@@ -34,7 +35,7 @@ class SoulActuator:
         logger.info("Initiating Cognitive Intent Analysis...")
         
         # 1. Gather context from sub-actuators
-        intel_density = self._get_log_density("web_scavenging.log")
+        intel_density = self._get_log_density("web_scavenge.log")
         science_density = self._get_log_density("scientific_discovery.log")
         logger.info(f"Substrate State: Intel({intel_density}), Science({science_density})")
 
@@ -72,8 +73,9 @@ class SoulActuator:
 
     def _get_log_density(self, log_file):
         try:
-            if not os.path.exists(log_file): return 0
-            with open(log_file, "r", encoding="utf-8") as f:
+            log_path = harness_log_path(log_file)
+            if not log_path.exists(): return 0
+            with open(log_path, "r", encoding="utf-8") as f:
                 return len(f.readlines())
         except Exception:
             return 0

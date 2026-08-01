@@ -125,6 +125,26 @@ def test_get_harness_script_path_falls_back_to_repo_cwd(monkeypatch, tmp_path):
     assert harness_mod.get_harness_script_path() == script_path.resolve()
 
 
+def test_start_command_keeps_uv_lockfile_frozen(monkeypatch, tmp_path):
+    script_path = tmp_path / "harness_daemon.py"
+    script_path.write_text("# test daemon\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+    monkeypatch.delenv("HYPURA_HARNESS_PYTHON", raising=False)
+    monkeypatch.setattr(harness_mod, "_harness_config", lambda: {})
+    monkeypatch.setattr(
+        harness_mod.shutil, "which", lambda name: name if name == "uv" else None
+    )
+
+    assert harness_mod._start_command(script_path) == [
+        "uv",
+        "run",
+        "--frozen",
+        "python",
+        str(script_path),
+    ]
+
+
 def test_is_harness_running_uses_lightweight_health(monkeypatch):
     calls = []
 

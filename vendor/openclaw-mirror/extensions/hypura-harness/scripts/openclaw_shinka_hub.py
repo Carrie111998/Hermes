@@ -3,6 +3,7 @@
 # ///
 import asyncio
 import logging
+from harness_logging import harness_log_path
 import os
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_HUB: %(message)s',
     handlers=[
-        logging.FileHandler("openclaw_shinka_hub.log"),
+        logging.FileHandler(harness_log_path("openclaw_shinka_hub.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

@@ -9,13 +9,13 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from harness_logging import harness_state_dir
+
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "harness.config.json"
-GENERATED_DIR = ROOT / "generated"
-EVOLVED_DIR = ROOT / "evolved"
-GENERATED_DIR.mkdir(exist_ok=True)
-EVOLVED_DIR.mkdir(exist_ok=True)
+GENERATED_DIR = harness_state_dir("generated")
+EVOLVED_DIR = harness_state_dir("evolved")
 
 _config: dict = {}
 if CONFIG_PATH.exists():

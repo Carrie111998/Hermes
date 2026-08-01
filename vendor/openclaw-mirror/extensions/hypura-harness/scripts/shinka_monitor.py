@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path
 import requests
 import psutil
 import os
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] SHINKA_MONITOR: %(message)s',
     handlers=[
-        logging.FileHandler("shinka_monitor.log"),
+        logging.FileHandler(harness_log_path("shinka_monitor.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -108,8 +109,9 @@ class ShinkaMonitor:
 
     def _analyze_log_density(self, log_file):
         try:
-            if not os.path.exists(log_file): return
-            with open(log_file, "r", encoding="utf-8") as f:
+            log_path = harness_log_path(log_file)
+            if not log_path.exists(): return
+            with open(log_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 density = len(lines)
                 logger.info(f"Intelligence Density ({log_file}): {density} pulses recorded.")

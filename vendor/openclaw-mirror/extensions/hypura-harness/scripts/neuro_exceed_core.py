@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path
 import requests
 import os
 import random
@@ -14,7 +15,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] NEURO_EXCEED: %(message)s',
     handlers=[
-        logging.FileHandler("neuro_exceed.log"),
+        logging.FileHandler(harness_log_path("neuro_exceed.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

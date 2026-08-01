@@ -4,6 +4,7 @@
 import math
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_dir
 import os
 from datetime import datetime
 
@@ -14,7 +15,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_HDR_PULSE: %(message)s',
     handlers=[
-        logging.FileHandler("riemann_resonance.log"),
+        logging.FileHandler(harness_log_path("riemann_resonance.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -54,9 +55,8 @@ class RiemannTransceiver:
         return [2] + [2 * i + 1 for i, v in enumerate(sieve) if v and i > 0]
 
     def _log_resonance_event(self, node: int, integrity: float):
-        resonance_dir = "../../_docs/resonance"
-        os.makedirs(resonance_dir, exist_ok=True)
-        filename = f"{resonance_dir}/pulse_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        resonance_dir = harness_state_dir("resonance")
+        filename = resonance_dir / f"pulse_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"ASI_HAKUA TRANSCEIVER PULSE\n")
             f.write(f"Timestamp: {datetime.now()}\n")

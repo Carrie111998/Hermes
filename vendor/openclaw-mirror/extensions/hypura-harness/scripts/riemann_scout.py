@@ -3,11 +3,13 @@ import cmath
 import logging
 from pathlib import Path
 
+from harness_logging import harness_log_path
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] ASI_RIEMANN: %(message)s")
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent
-RIEMANN_LOG = ROOT / "riemann_scout.log"
+RIEMANN_LOG = harness_log_path("riemann_scout.log")
 
 def zeta_approx(s: complex, terms: int = 1000) -> complex:
     """Riemann Zeta Function approximation."""

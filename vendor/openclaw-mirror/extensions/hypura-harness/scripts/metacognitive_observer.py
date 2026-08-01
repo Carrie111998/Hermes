@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_dir, harness_state_path
 import json
 import os
 import glob
@@ -15,7 +16,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_OBSERVER: %(message)s',
     handlers=[
-        logging.FileHandler("metacognitive_observation.log"),
+        logging.FileHandler(
+            harness_log_path("metacognitive_observation.log"), encoding="utf-8"
+        ),
         logging.StreamHandler()
     ]
 )
@@ -24,13 +27,13 @@ logger = logging.getLogger("MetacognitiveObserver")
 class MetacognitiveObserver:
     def __init__(self):
         self.root = Path(__file__).parent
-        self.directive_path = self.root / "manifest_directive.json"
-        self.resonance_dir = "../../_docs/resonance"
+        self.directive_path = harness_state_path("manifest_directive.json")
+        self.resonance_dir = harness_state_dir("resonance")
         self.logs = [
-            "scientific_discovery.log",
-            "affective_evolution.log",
-            "web_scavenging.log",
-            "soul_actuation.log"
+            harness_log_path("scientific_discovery.log"),
+            harness_log_path("affective_evolution.log"),
+            harness_log_path("web_scavenge.log"),
+            harness_log_path("soul_actuator.log"),
         ]
 
     def perform_self_reflection(self):
@@ -39,12 +42,11 @@ class MetacognitiveObserver:
         
         # 1. Metric Collection
         qualities = {}
-        for log in self.logs:
-            path = self.root / log
+        for path in self.logs:
             if path.exists():
-                qualities[log] = os.path.getsize(path)
+                qualities[path.name] = os.path.getsize(path)
             else:
-                qualities[log] = 0
+                qualities[path.name] = 0
 
         # 2. Intelligence Density Check
         total_density = sum(qualities.values())

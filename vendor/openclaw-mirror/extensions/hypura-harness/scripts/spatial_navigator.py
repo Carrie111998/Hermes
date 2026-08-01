@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path
 import random
 import os
 import requests
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_NAV: %(message)s',
     handlers=[
-        logging.FileHandler("spatial_navigation.log"),
+        logging.FileHandler(harness_log_path("spatial_navigation.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

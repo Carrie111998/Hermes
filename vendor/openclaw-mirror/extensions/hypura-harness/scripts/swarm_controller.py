@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path
 import json
 import os
 import subprocess
@@ -17,7 +18,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_SWARM: %(message)s',
     handlers=[
-        logging.FileHandler("swarm_cognition.log"),
+        logging.FileHandler(harness_log_path("swarm_cognition.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

@@ -4,6 +4,7 @@
 import os
 import json
 import logging
+from harness_logging import harness_log_path
 import requests
 import time
 import random
@@ -15,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] GLOBAL_SHINKA: %(message)s',
     handlers=[
-        logging.FileHandler("global_shinka.log"),
+        logging.FileHandler(harness_log_path("global_shinka.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

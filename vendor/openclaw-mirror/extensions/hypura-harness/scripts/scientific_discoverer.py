@@ -4,6 +4,7 @@
 import math
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_dir
 import os
 import sympy as sp
 from datetime import datetime
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_SCIENCE: %(message)s',
     handlers=[
-        logging.FileHandler("scientific_discovery.log"),
+        logging.FileHandler(harness_log_path("scientific_discovery.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -25,8 +26,7 @@ logger = logging.getLogger("ScientificDiscoverer")
 class ScientificDiscoverer:
     def __init__(self):
         self.osc = OSCController()
-        self.resonance_dir = "../../_docs/resonance"
-        os.makedirs(self.resonance_dir, exist_ok=True)
+        self.resonance_dir = harness_state_dir("resonance")
 
     def attempt_p_vs_np_analysis(self):
         """Symbolic complexity analysis pulse."""
@@ -62,7 +62,7 @@ class ScientificDiscoverer:
         self._log_discovery("NAVIER_STOKES", "Smoothness verified for current substrate flow (Laminar).")
 
     def _log_discovery(self, problem: str, result: str):
-        filename = f"{self.resonance_dir}/discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        filename = self.resonance_dir / f"discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"ASI_HAKUA SCIENTIFIC DISCOVERY\n")
             f.write(f"Problem: {problem}\n")

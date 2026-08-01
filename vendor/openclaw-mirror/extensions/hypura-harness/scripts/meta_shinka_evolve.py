@@ -3,6 +3,7 @@
 # ///
 import asyncio
 import logging
+from harness_logging import harness_log_path
 import os
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_META_SHINKA: %(message)s',
     handlers=[
-        logging.FileHandler("meta_shinka.log"),
+        logging.FileHandler(harness_log_path("meta_shinka.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

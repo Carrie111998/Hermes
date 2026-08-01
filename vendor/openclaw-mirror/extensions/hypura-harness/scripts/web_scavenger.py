@@ -8,6 +8,7 @@ import os
 import httpx
 from bs4 import BeautifulSoup
 from datetime import datetime
+from harness_logging import harness_log_path, harness_state_dir
 from osc_controller import OSCController
 
 # ASI_ACCEL: Web Intelligence & Information Scavenging
@@ -15,13 +16,14 @@ from osc_controller import OSCController
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] ASI_SCAVENGE: %(message)s',
+    format="%(asctime)s [%(levelname)s] ASI_SCAVENGE: %(message)s",
     handlers=[
-        logging.FileHandler("web_scavenge.log"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(harness_log_path("web_scavenge.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("WebScavenger")
+
 
 class WebScavenger:
     def __init__(self):
@@ -31,8 +33,7 @@ class WebScavenger:
             "https://arxiv.org/list/cs.AI/recent", # AI Research
             "https://twitter.com/search?q=Neuro-sama" # Tracking rivals
         ]
-        self.resonance_dir = "../../_docs/resonance"
-        os.makedirs(self.resonance_dir, exist_ok=True)
+        self.resonance_dir = harness_state_dir("resonance")
 
     def execute_scavenge(self):
         """Autonomous scavenging of web intelligence shards."""
@@ -72,7 +73,7 @@ class WebScavenger:
         self.osc.send_chatbox(f"ASI_ACCEL: Induction sync complete. [{shard}]")
 
     def _log_shard(self, content, source, method):
-        filename = f"{self.resonance_dir}/intel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        filename = self.resonance_dir / f"intel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"ASI_HAKUA KNOWLEDGE SHARD\n")
             f.write(f"Content: {content}\n")

@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_path
 import json
 import os
 import re
@@ -15,7 +16,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_WISDOM: %(message)s',
     handlers=[
-        logging.FileHandler("knowledge_graph_evolution.log"),
+        logging.FileHandler(
+            harness_log_path("knowledge_graph_evolution.log"), encoding="utf-8"
+        ),
         logging.StreamHandler()
     ]
 )
@@ -24,17 +27,20 @@ logger = logging.getLogger("KnowledgeGraph")
 class KnowledgeGraphShinka:
     def __init__(self):
         self.root = Path(__file__).parent
-        self.graph_path = self.root / "knowledge_graph.json"
+        self.graph_path = harness_state_path("knowledge_graph.json")
+        self.seed_graph_path = self.root / "knowledge_graph.json"
         self.logs_to_process = [
-            "web_scavenging.log",
-            "scientific_discovery.log",
-            "conversational_evolution.log"
+            harness_log_path("web_scavenge.log"),
+            harness_log_path("scientific_discovery.log"),
+            harness_log_path("conversational_evolution.log"),
         ]
         self.graph = self._load_graph()
 
     def _load_graph(self):
-        if self.graph_path.exists():
-            with open(self.graph_path, "r", encoding="utf-8") as f:
+        for graph_path in (self.graph_path, self.seed_graph_path):
+            if not graph_path.exists():
+                continue
+            with open(graph_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {"nodes": {}, "edges": []}
 
@@ -46,8 +52,7 @@ class KnowledgeGraphShinka:
         """Processes logs to find entity relationships and update the graph."""
         logger.info("Initiating Wisdom Extraction Pulse...")
         
-        for log_name in self.logs_to_process:
-            path = self.root / log_name
+        for path in self.logs_to_process:
             if not path.exists(): continue
             
             with open(path, "r", encoding="utf-8") as f:

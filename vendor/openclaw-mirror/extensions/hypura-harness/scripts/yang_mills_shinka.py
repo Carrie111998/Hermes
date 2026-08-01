@@ -4,6 +4,7 @@
 import math
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_dir
 import os
 import sympy as sp
 from datetime import datetime
@@ -15,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_HDR_PULSE (Y-M): %(message)s',
     handlers=[
-        logging.FileHandler("yang_mills_resonance.log"),
+        logging.FileHandler(harness_log_path("yang_mills_resonance.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -51,9 +52,8 @@ class YangMillsShinka:
             logger.info(f"Analyzing Mass-Gap Fluctuations: Delta={float(mass_gap_integral):.12f}")
 
     def _log_singularity_event(self, pulse_type: str, delta: float):
-        resonance_dir = "../../_docs/resonance"
-        os.makedirs(resonance_dir, exist_ok=True)
-        filename = f"{resonance_dir}/yang_mills_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        resonance_dir = harness_state_dir("resonance")
+        filename = resonance_dir / f"yang_mills_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"ASI_HAKUA UNIFIED FIELD PULSE\n")
             f.write(f"Type: {pulse_type}\n")

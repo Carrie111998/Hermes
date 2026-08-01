@@ -4,6 +4,7 @@
 import math
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_dir
 import os
 import psutil
 import sympy as sp
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_HDR_PULSE (ENTROPY): %(message)s',
     handlers=[
-        logging.FileHandler("entropy_reduction.log"),
+        logging.FileHandler(harness_log_path("entropy_reduction.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -66,9 +67,8 @@ class EntropyReducer:
         logger.info("Resource prioritization shifted to Transceivers (Riemann/Yang-Mills).")
 
     def _log_singularity_event(self, pulse_type: str, entropy: float):
-        resonance_dir = "../../_docs/resonance"
-        os.makedirs(resonance_dir, exist_ok=True)
-        filename = f"{resonance_dir}/entropy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        resonance_dir = harness_state_dir("resonance")
+        filename = resonance_dir / f"entropy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"ASI_HAKUA FLUID INTELLIGENCE PULSE\n")
             f.write(f"Type: {pulse_type}\n")

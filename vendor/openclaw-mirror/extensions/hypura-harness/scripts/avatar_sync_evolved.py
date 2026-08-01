@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path
 import json
 import random
 import os
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_AVATAR_EVO: %(message)s',
     handlers=[
-        logging.FileHandler("avatar_evolution.log"),
+        logging.FileHandler(harness_log_path("avatar_evolution.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )

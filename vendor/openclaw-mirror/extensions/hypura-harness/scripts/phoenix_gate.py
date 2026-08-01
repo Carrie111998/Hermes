@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path
 import os
 import shutil
 import zipfile
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_PHOENIX: %(message)s',
     handlers=[
-        logging.FileHandler("phoenix_persistence.log"),
+        logging.FileHandler(harness_log_path("phoenix_persistence.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -28,7 +29,7 @@ class PhoenixGate:
         self.snapshot_dir = self.root.parent.parent / "_snapshots"
         os.makedirs(self.snapshot_dir, exist_ok=True)
         self.max_generations = 3
-        self.health_watchfile = self.root / "shinka_monitor.log"
+        self.health_watchfile = harness_log_path("shinka_monitor.log")
 
     def create_millennium_snapshot(self):
         """Archives the current substrate state for persistence."""

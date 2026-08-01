@@ -3,6 +3,7 @@
 # ///
 import time
 import logging
+from harness_logging import harness_log_path, harness_state_path
 import os
 import json
 import asyncio
@@ -16,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] ASI_CHAT: %(message)s',
     handlers=[
-        logging.FileHandler("conversational_evolution.log"),
+        logging.FileHandler(harness_log_path("conversational_evolution.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -26,8 +27,8 @@ class ConversationalPulse:
     def __init__(self):
         self.voice = VoicevoxBridge()
         self.osc = OSCController()
-        self.input_file = "chat_intent.txt" # Trigger file
-        self.resonance_file = "affective_evolution.log"
+        self.input_file = harness_state_path("chat_intent.txt") # Trigger file
+        self.resonance_file = harness_log_path("affective_evolution.log")
 
     async def run_interaction_loop(self):
         """Watches for Parent (User) interaction and responds with voice and manifestation."""

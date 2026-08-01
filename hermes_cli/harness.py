@@ -135,7 +135,7 @@ def _start_command(script_path: Path) -> list[str]:
         return [str(configured_python), str(script_path)]
 
     if (script_path.parent / "pyproject.toml").is_file() and shutil.which("uv"):
-        return ["uv", "run", "python", str(script_path)]
+        return ["uv", "run", "--frozen", "python", str(script_path)]
 
     return [sys.executable or "python", str(script_path)]
 

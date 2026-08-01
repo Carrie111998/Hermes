@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import logging
+from harness_logging import harness_log_path, harness_state_dir
 import time
 import requests
 from datetime import datetime
@@ -28,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] AI_SCIENTIST: %(message)s',
     handlers=[
-        logging.FileHandler("ai_scientist.log"),
+        logging.FileHandler(harness_log_path("ai_scientist.log"), encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -39,7 +40,7 @@ ROOT = Path(__file__).parent.parent.parent.parent
 load_env_file(ROOT / ".env")
 
 HARNESS_URL = os.getenv("HARNESS_URL", "http://127.0.0.1:18800")
-RESONANCE_DIR = ROOT / "_docs" / "resonance"
+RESONANCE_DIR = harness_state_dir("resonance")
 
 class AIScientist:
     def __init__(self):
