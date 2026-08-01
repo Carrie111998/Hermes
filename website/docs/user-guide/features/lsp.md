@@ -72,6 +72,7 @@ agent sees a syntax-clean file with semantic problems as
 | YAML | `yaml-language-server` | npm |
 | Lua | `lua-language-server` | manual (GitHub releases) |
 | PHP | `intelephense` | npm |
+| Laravel Blade | `laravel-lsp` | manual (composer) |
 | OCaml | `ocaml-lsp` | manual (opam) |
 | Dockerfile | `dockerfile-language-server-nodejs` | npm |
 | Terraform | `terraform-ls` | manual |
