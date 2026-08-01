@@ -36,8 +36,8 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
-import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
@@ -770,9 +770,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
         }
       };
-      const markCompositionEnd = (ev: Event) => {
+      const markCompositionEnd = (ev: CompositionEvent) => {
         mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
-        compositionForwarder.onCompositionEnd((ev as CompositionEvent).data);
+        compositionForwarder.onCompositionEnd(ev.data);
       };
 
       textarea.addEventListener("beforeinput", markReplacementInput, true);
@@ -1187,7 +1187,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // behave normally.
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-      const forwardPtyData = (data: string) => {
+      const forwardPtyData = (data: string, useMobileReplacement = true) => {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
         // terminal doesn't trip the "reconnecting" notice.
@@ -1211,7 +1211,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         const normalized = normalizePtyMobileInput(
           data,
           ptyInputLineRef.current,
-          Date.now() <= mobileReplacementInputUntilRef.current,
+          useMobileReplacement && Date.now() <= mobileReplacementInputUntilRef.current,
         );
         ptyInputLineRef.current = normalized.nextLine;
         if (normalized.normalized) {
@@ -1219,11 +1219,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         }
         ws.send(normalized.data);
       };
-      sendComposedText = forwardPtyData;
+      // The deferred composition fallback is already committed text, so it
+      // must not consume the mobile replacement window intended for xterm's
+      // normal onData path.
+      sendComposedText = (data) => forwardPtyData(data, false);
       onDataDisposable = term.onData((data) => {
-        if (compositionForwarder.shouldForwardTerminalData(data)) {
-          forwardPtyData(data);
-        }
+        compositionForwarder.noteTerminalData(data);
+        forwardPtyData(data);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
@@ -1245,6 +1247,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       mobileInputCleanup?.();
+      compositionForwarder.dispose();
       host.removeEventListener("paste", handleBrowserPaste, true);
       host.removeEventListener("dragover", handleBrowserDragOver, true);
       host.removeEventListener("drop", handleBrowserDrop, true);
