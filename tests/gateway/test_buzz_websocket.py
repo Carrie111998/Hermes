@@ -9,7 +9,6 @@ lifecycle as wired into BuzzAdapter.
 import asyncio
 import json
 import time
-from collections import OrderedDict
 
 import pytest
 
