@@ -104,6 +104,10 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
+def test_worker_lineage_marker_isolated_from_test_process():
+    assert os.environ.get("HERMES_KANBAN_SAFE_ROOT_ACTIVE") is None
+
+
 def test_narrow_inherited_root_replaced_for_scratch_workspace_write(
     monkeypatch, tmp_path
 ):
