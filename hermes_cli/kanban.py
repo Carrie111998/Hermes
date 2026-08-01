@@ -2395,43 +2395,66 @@ def _cmd_promote(args: argparse.Namespace) -> int:
             ids.append(tid)
             seen.add(tid)
 
+    expected_status = getattr(args, "expect_status", None)
+    expected_current_run_id = getattr(
+        args, "expect_current_run_id", kb.PROMOTE_EXPECTATION_UNSET
+    )
+    expected_latest_run_id = getattr(
+        args, "expect_latest_run_id", kb.PROMOTE_EXPECTATION_UNSET
+    )
+    expected_latest_event_id = getattr(
+        args, "expect_latest_event_id", kb.PROMOTE_EXPECTATION_UNSET
+    )
+    has_expectations = expected_status is not None or any(
+        value is not kb.PROMOTE_EXPECTATION_UNSET
+        for value in (
+            expected_current_run_id,
+            expected_latest_run_id,
+            expected_latest_event_id,
+        )
+    )
+
     results: list[dict[str, object]] = []
-    with kb.connect_closing() as conn:
-        for tid in ids:
-            ok, err = kb.promote_task(
-                conn,
-                tid,
-                actor=author,
-                reason=reason,
-                force=bool(args.force),
-                dry_run=bool(args.dry_run),
-                expected_status=getattr(args, "expect_status", None),
-                expected_current_run_id=getattr(
-                    args,
-                    "expect_current_run_id",
-                    kb.PROMOTE_EXPECTATION_UNSET,
-                ),
-                expected_latest_run_id=getattr(
-                    args,
-                    "expect_latest_run_id",
-                    kb.PROMOTE_EXPECTATION_UNSET,
-                ),
-                expected_latest_event_id=getattr(
-                    args,
-                    "expect_latest_event_id",
-                    kb.PROMOTE_EXPECTATION_UNSET,
-                ),
-            )
-            results.append({
+    if len(ids) > 1 and has_expectations:
+        message = "CAS expectations require exactly one task"
+        results = [
+            {
                 "task_id": tid,
-                "promoted": ok,
+                "promoted": False,
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
                 "reason": reason,
-                "error": str(err) if err is not None else None,
-                "code": getattr(err, "code", None),
-                "refusal_reason": str(err) if err is not None else None,
-            })
+                "error": message,
+                "code": "cas_expectations_require_single_task",
+                "refusal_reason": message,
+            }
+            for tid in ids
+        ]
+    else:
+        with kb.connect_closing() as conn:
+            for tid in ids:
+                ok, err = kb.promote_task(
+                    conn,
+                    tid,
+                    actor=author,
+                    reason=reason,
+                    force=bool(args.force),
+                    dry_run=bool(args.dry_run),
+                    expected_status=expected_status,
+                    expected_current_run_id=expected_current_run_id,
+                    expected_latest_run_id=expected_latest_run_id,
+                    expected_latest_event_id=expected_latest_event_id,
+                )
+                results.append({
+                    "task_id": tid,
+                    "promoted": ok,
+                    "dry_run": bool(args.dry_run),
+                    "forced": bool(args.force),
+                    "reason": reason,
+                    "error": str(err) if err is not None else None,
+                    "code": getattr(err, "code", None),
+                    "refusal_reason": str(err) if err is not None else None,
+                })
 
     failed = [r for r in results if not r["promoted"]]
     if as_json:
