@@ -423,6 +423,8 @@ def create_app(db_path: str | Path, curator_interval_s: int = 6 * 3600) -> FastA
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     if (_DIST / "assets").exists():
         app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
+    if (_DIST / "art").exists():
+        app.mount("/art", StaticFiles(directory=_DIST / "art"), name="art")
     return app
 
 

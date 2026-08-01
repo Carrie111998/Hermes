@@ -51,7 +51,30 @@ export function DataView({ c, data, err }: { c: Component; data: any; err: strin
     case "table": return <TableView data={data} />;
     case "timeseries": return <ChartView data={data} />;
     case "links": return <LinksView data={data} />;
-    case "feed": return <FeedView data={data} />;
+    case "feed":
+      return data.items.length ? (
+        <div className="relative pl-5">
+          <div className="absolute left-[7px] top-1 bottom-1 w-px bg-line" />
+          {data.items.map((it: any, i: number) => (
+            <div key={i} className="relative py-1.5 text-[13px]">
+              <span className="absolute -left-5 top-[9px] w-[15px] h-[15px] rounded-full bg-surface-2 border border-line-2 flex items-center justify-center">
+                {it.icon === "⚙" ? <Workflow size={12} className="text-blue-2" />
+                  : it.icon === "◎" ? <MessageSquare size={12} className="text-ink-3" />
+                  : <MousePointerClick size={12} className="text-ink-3" />}
+              </span>
+              <div className="flex items-baseline gap-2 min-w-0">
+                <span className="text-ink-2 truncate flex-1">{it.text}</span>
+                <span className="text-ink-3 text-[11px] tabular-nums shrink-0">{when(it.when)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <EmptyState
+          title="Nothing yet"
+          body="Activity appears here as you run workflows and talk to Hermes."
+        />
+      );
     case "notes":
       return <div className="text-[13.5px] leading-relaxed text-ink-2 whitespace-pre-wrap">{data.markdown}</div>;
     case "connections": return <ConnectionsView data={data} />;
@@ -279,28 +302,13 @@ function LinksView({ data }: { data: any }) {
   );
 }
 
-/* ---------- feed with icon timeline ---------- */
-function FeedView({ data }: { data: any }) {
-  if (!data.items.length)
-    return <div className="text-[13px] text-ink-3 leading-relaxed">No activity yet — run a workflow or chat with Hermes.</div>;
-  const iconFor = (icon: string) =>
-    icon === "⚙" ? <Workflow size={12} className="text-blue-2" />
-      : icon === "◎" ? <MessageSquare size={12} className="text-ink-3" />
-      : <MousePointerClick size={12} className="text-ink-3" />;
+/* ---------- empty state with engraved identity ---------- */
+export function EmptyState({ title, body }: { title: string; body: string }) {
   return (
-    <div className="relative pl-5">
-      <div className="absolute left-[7px] top-1 bottom-1 w-px bg-line" />
-      {data.items.map((it: any, i: number) => (
-        <div key={i} className="relative py-1.5 text-[13px]">
-          <span className="absolute -left-5 top-[9px] w-[15px] h-[15px] rounded-full bg-surface-2 border border-line-2 flex items-center justify-center">
-            {iconFor(it.icon)}
-          </span>
-          <div className="flex items-baseline gap-2 min-w-0">
-            <span className="text-ink-2 truncate flex-1">{it.text}</span>
-            <span className="text-ink-3 text-[11px] tabular-nums shrink-0">{when(it.when)}</span>
-          </div>
-        </div>
-      ))}
+    <div className="h-full flex flex-col items-center justify-center text-center gap-1.5 py-2">
+      <img src="/art/hermes-helm.png" alt="" className="w-10 h-10 opacity-50" style={{ mixBlendMode: "screen" }} />
+      <div className="text-[13px] w510 text-ink-2">{title}</div>
+      <div className="text-[12px] text-ink-4 leading-relaxed max-w-[220px]">{body}</div>
     </div>
   );
 }

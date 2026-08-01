@@ -3,17 +3,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ReactGridLayout, WidthProvider } from "react-grid-layout/legacy";
 import type { LayoutItem } from "react-grid-layout";
 import {
-  FlaskConical, LayoutGrid, MessageSquare, Eye, Check, X as XIcon, Plus,
+  FlaskConical, LayoutGrid, MessageSquare, Eye, Check, X as XIcon, Plus, PanelRight,
 } from "lucide-react";
 import Card from "./components/Card";
 import ChatDock, { type ChatMsg } from "./components/ChatDock";
 import Onboarding from "./Onboarding";
+import Inspector from "./components/Inspector";
 import { api, post, track, when, USER, type Component, type Proposal, type StationState } from "./lib/api";
 
 export default function App() {
   const [state, setState] = useState<StationState | null>(null);
   const [preview, setPreview] = useState<{ p: Proposal; spec: any; diff: any[] } | null>(null);
   const [trayOpen, setTrayOpen] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth >= 1280);
   const [dockPos, setDockPos] = useState<"bottom" | "right">("bottom");
   const [dockCollapsed, setDockCollapsed] = useState(false);
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
@@ -182,6 +184,8 @@ export default function App() {
           <SideItem icon={<FlaskConical size={15} />} label="Evolve now" onClick={evolveNow} />
           <SideItem icon={<Eye size={15} />} label={`Proposals`} badge={state.proposals.length}
                     onClick={() => setTrayOpen(!trayOpen)} />
+          <SideItem icon={<PanelRight size={15} />} label="Inspector"
+                    onClick={() => setInspectorOpen(!inspectorOpen)} />
           <div className="microlabel px-4 pb-1.5 pt-4">Connections</div>
           {state.connections.slice(0, 7).map((cn) => (
             <div key={cn.id} className="flex items-center gap-2.5 px-4 py-[5px] text-[12.5px] text-ink-3">
@@ -192,7 +196,7 @@ export default function App() {
         </nav>
         <div className="border-t border-line px-4 py-3 shrink-0">
           <div className="flex items-center gap-2.5">
-            <span className="w-7 h-7 rounded-full bg-blue/20 text-blue-2 flex items-center justify-center text-[11px] w590 uppercase">{USER.slice(0, 2)}</span>
+            <img src="/art/hermes-bust.png" alt="" className="w-7 h-7 rounded-full border border-line-2 object-cover" style={{ mixBlendMode: "screen" }} />
             <div className="leading-tight min-w-0">
               <div className="text-[12.5px] w510 truncate">{USER}</div>
               <div className="text-[10.5px] text-ink-4 truncate">{state.agent.model || "agent"}</div>
@@ -259,7 +263,9 @@ export default function App() {
         </div>
       )}
 
-      {/* grid — scrolls between stats strip and docked chat */}
+      {/* content row: grid+console | inspector */}
+      <div className="flex-1 min-h-0 flex">
+      <div className="flex-1 min-w-0 flex flex-col">
       <main style={{ paddingRight: gridPadRight }} className="flex-1 min-h-0 overflow-y-auto">
         <div>
         <GridBody
@@ -294,6 +300,9 @@ export default function App() {
         onMove={moveDock}
         onCollapse={() => setDockCollapsed(!dockCollapsed)}
       />
+      </div>
+      {inspectorOpen && <Inspector state={state} onClose={() => setInspectorOpen(false)} />}
+      </div>
 
       {/* proposals tray */}
       {trayOpen && (
