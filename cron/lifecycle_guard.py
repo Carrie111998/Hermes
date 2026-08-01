@@ -39,7 +39,7 @@ import os
 import re
 import shlex
 import stat
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Callable, Iterator, Optional
 
 
@@ -122,6 +122,11 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                 posix=True,
                 punctuation_chars=";&|()",
             )
+            if os.name == "nt":
+                # Native Windows paths use backslashes as separators, not
+                # POSIX escapes. Preserve them so referenced scripts are
+                # resolved and scanned before execution.
+                lexer.escape = ""
             lexer.whitespace_split = True
             lexer.commenters = "#"
             tokens = list(lexer)
@@ -170,10 +175,16 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
-def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> PurePath:
+    if os.name == "nt" and candidate.startswith("/"):
+        path: PurePath = PurePosixPath(candidate)
+    else:
+        path = Path(candidate).expanduser()
     if not path.is_absolute():
-        path = Path(cwd or Path.cwd()) / path
+        if os.name == "nt" and cwd and cwd.startswith("/"):
+            path = PurePosixPath(cwd) / path
+        else:
+            path = Path(cwd or Path.cwd()) / path
     return path
 
 
@@ -181,7 +192,7 @@ def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
-) -> Iterator[Path]:
+) -> Iterator[PurePath]:
     """Yield scripts executed directly or through a POSIX shell."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
@@ -236,18 +247,7 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
                 break
 
 
-def _resolve_script_directory(script_path: str) -> Optional[str]:
-    """Return the directory *script_path* resolves to, handling relative names."""
-    try:
-        path = _resolve_script_path(script_path)
-        if path.is_absolute():
-            return str(path.parent)
-    except Exception:
-        pass
-    return None
-
-
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
+def _read_referenced_script(path: PurePath) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -275,7 +275,7 @@ def _contains_unsafe_gateway_action(
     *,
     cwd: Optional[str],
     depth: int,
-    visited: set[Path],
+    visited: set[PurePath],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
     if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(
@@ -296,9 +296,12 @@ def _contains_unsafe_gateway_action(
             return True
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
-        try:
-            resolved = script_path.resolve(strict=False)
-        except OSError:
+        if isinstance(script_path, Path):
+            try:
+                resolved: PurePath = script_path.resolve(strict=False)
+            except OSError:
+                resolved = script_path
+        else:
             resolved = script_path
         if resolved in visited:
             continue
@@ -313,7 +316,7 @@ def _contains_unsafe_gateway_action(
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
-        script_dir = _resolve_script_directory(str(resolved)) or cwd
+        script_dir = str(resolved.parent) if resolved.parent != resolved else cwd
         if script_text and _contains_unsafe_gateway_action(
             script_text,
             cwd=script_dir,
@@ -360,6 +363,17 @@ def _resolve_script_path(script_path: str) -> Path:
     if raw.is_absolute():
         return raw
     return get_hermes_home() / "scripts" / raw
+
+
+def _resolve_script_directory(script_path: str) -> Optional[str]:
+    """Return the directory *script_path* resolves to, handling relative names."""
+    try:
+        path = _resolve_script_path(script_path)
+        if path.is_absolute():
+            return str(path.parent)
+    except Exception:
+        pass
+    return None
 
 
 def _read_script_for_scanning(script_path: str) -> str:

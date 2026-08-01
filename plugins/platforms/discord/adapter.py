@@ -984,7 +984,6 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
-        self._allow_all_users = False  # DISCORD_ALLOWED_USERS=* / allow-all envs
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
         # Per-adapter snapshot of authorization gate env vars, captured inside
         # the owning profile's runtime scope during connect(). None until then;
@@ -4542,13 +4541,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
         allowed_users = getattr(self, "_allowed_user_ids", set())
         allowed_roles = getattr(self, "_allowed_role_ids", set())
-        if (
-            getattr(self, "_allow_all_users", False)
-            or _env_flag("DISCORD_ALLOW_ALL_USERS")
-            or _env_flag("GATEWAY_ALLOW_ALL_USERS")
-            or _DISCORD_ALLOWLIST_WILDCARD in allowed_users
-        ):
-            return True
         has_users = bool(allowed_users)
         has_roles = bool(allowed_roles)
 
