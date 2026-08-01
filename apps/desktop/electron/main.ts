@@ -6327,7 +6327,7 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
   }
 
   try {
-    const plaintext = decryptDesktopSecret(secret)
+    const plaintext = decryptDesktopSecret(secret, `native OAuth tokens (${baseUrl})`)
 
     if (!plaintext) {
       return null
@@ -6789,7 +6789,38 @@ function encryptDesktopSecret(value) {
   return encryptDesktopSecretStrict(value, safeStorage)
 }
 
-function decryptDesktopSecret(secret) {
+// safeStorage.decryptString() is a native call into the OS credential store
+// (DPAPI on Windows, Keychain on macOS, libsecret on Linux). On macOS/Linux
+// that lookup is scoped to the app's identity (bundle id / app name), which
+// changed as part of the Douglas rebrand -- a ciphertext written by an old
+// Hermes-identified build may not decrypt under the new identity (unverified,
+// no macOS/Linux hardware available; see douglas/README.md "Verificar en
+// hardware real"). Treat any decrypt failure as "not authenticated", never as
+// a crash or corrupted state: swallow it here, log why, and surface a single
+// explicit one-time notice so the user knows to reconnect rather than silently
+// wondering why a saved connection stopped working. Never delete the
+// encrypted file on failure -- it may still decrypt fine if the user rolls
+// back to an older build.
+let credentialDecryptFailureNotified = false
+
+function notifyCredentialDecryptFailure() {
+  if (credentialDecryptFailureNotified) {
+    return
+  }
+
+  credentialDecryptFailureNotified = true
+
+  const message = 'Tus credenciales guardadas no pudieron leerse tras la actualización. Vuelve a conectar tus cuentas.'
+  const show = () => dialog.showErrorBox('Douglas Agent', message)
+
+  if (app.isReady()) {
+    show()
+  } else {
+    app.whenReady().then(show)
+  }
+}
+
+function decryptDesktopSecret(secret, context = 'saved credential') {
   if (!secret || typeof secret !== 'object') {
     return ''
   }
@@ -6803,7 +6834,10 @@ function decryptDesktopSecret(secret) {
   if (secret.encoding === 'safeStorage') {
     try {
       return safeStorage.decryptString(Buffer.from(value, 'base64'))
-    } catch {
+    } catch (error) {
+      rememberLog(`[safeStorage] failed to decrypt ${context}: ${error instanceof Error ? error.message : error}`)
+      notifyCredentialDecryptFailure()
+
       return ''
     }
   }
@@ -6992,7 +7026,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   const savedSsh = savedMode === 'local' ? (key ? savedProfileSsh(config, key) : normalizeSshConfig(block)) : null
 
-  const remoteToken = decryptDesktopSecret(block.token)
+  const remoteToken = decryptDesktopSecret(block.token, 'remote gateway token')
   const authMode = normAuthMode(block.authMode)
   const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
   const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
@@ -7043,7 +7077,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 // under — persisted so Settings can reopen into the same org; omitted from the
 // block when empty so plain remote connections stay unchanged.
 function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
-  if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
+  if (authMode !== 'oauth' && !decryptDesktopSecret(token, 'remote gateway token')) {
     throw new Error('Remote gateway session token is required.')
   }
 
@@ -7563,7 +7597,10 @@ async function resolveRemoteBackend(profile) {
   const sshOverride = profileSshOverride(config, profile)
 
   if (sshOverride) {
-    const reuseToken = decryptDesktopSecret(config.profiles?.[connectionScopeKey(profile)]?.token)
+    const reuseToken = decryptDesktopSecret(
+      config.profiles?.[connectionScopeKey(profile)]?.token,
+      `SSH token (profile ${profile})`
+    )
 
     return bootstrapSshConnection(profile, sshOverride, reuseToken, 'profile')
   }
@@ -7571,7 +7608,7 @@ async function resolveRemoteBackend(profile) {
   const override = profileRemoteOverride(config, profile)
 
   if (override) {
-    const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token)
+    const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token, `remote gateway token (profile ${profile})`)
 
     return buildRemoteConnection(
       override.url,
@@ -7606,7 +7643,7 @@ async function resolveRemoteBackend(profile) {
       throw new Error('SSH remote mode is selected but no host is configured.')
     }
 
-    const reuseToken = decryptDesktopSecret(config.remote?.token)
+    const reuseToken = decryptDesktopSecret(config.remote?.token, 'SSH token (global)')
 
     return bootstrapSshConnection(null, ssh, reuseToken, 'settings')
   }
@@ -7617,7 +7654,7 @@ async function resolveRemoteBackend(profile) {
   }
 
   const authMode = normAuthMode(config.remote?.authMode)
-  const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
+  const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token, 'remote gateway token (global)')
 
   return buildRemoteConnection(
     config.remote?.url,
@@ -7867,7 +7904,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
     authMode = normAuthMode(block.authMode)
 
     if (authMode !== 'oauth') {
-      token = decryptDesktopSecret(block.token)
+      token = decryptDesktopSecret(block.token, 'remote gateway token')
     }
   } else {
     const remote = (await resolveRemoteBackend(key)) || (await startHermes())
