@@ -39,6 +39,58 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gateway_status_home(tmp_path, monkeypatch):
+    """Fall back gateway/status.py's runtime-status writes to a per-test tempdir
+    whenever ``HERMES_HOME`` resolves blank — never override an explicit value.
+
+    Regression guard (2026-08-01): a real gateway's live
+    ``~/.hermes/gateway_state.json`` picked up a stale ``feishu: connected``
+    platform entry with a genuine timestamp, written by a test run rather
+    than the actual gateway process. Root cause traced to
+    ``TestFeishuAdapterMessaging::test_connect_websocket_sets_channel_ua_tag``
+    (and ~19 sibling tests in this file) decorated with
+    ``@patch.dict(os.environ, {...}, clear=True)``. That decorator replaces
+    the *entire* environment for the duration of the test call — including
+    ``HERMES_HOME`` — which runs AFTER pytest fixture setup, so it silently
+    strips whatever ``tests/conftest.py``'s session-wide ``_hermetic_environment``
+    autouse fixture had already set via ``monkeypatch.setenv``. Any test that
+    exercises a real platform adapter's ``connect()``/``_mark_connected()``
+    path (which calls ``gateway.status.write_runtime_status()``) then resolves
+    ``HERMES_HOME`` from the cleared, unpatched real environment and writes
+    straight into the operator's live gateway state file.
+
+    IMPORTANT: this must be a *fallback*, not an override. Several tests in
+    this directory (``test_status.py``'s ``TestGatewayPidState`` /
+    ``TestScopedLockTakeover`` classes) legitimately call
+    ``monkeypatch.setenv("HERMES_HOME", ...)`` themselves to exercise
+    ``_get_process_hermes_home()``'s real env-reading behavior with specific,
+    distinct home paths (e.g. simulating a "replacer" vs "target" gateway
+    process). Unconditionally replacing the function with a fixed
+    ``lambda: tmp_path`` — as an earlier version of this fixture did — breaks
+    those tests by ignoring the value they explicitly set. The wrapper below
+    reads the real ``HERMES_HOME`` env var first (mirroring the original
+    function's own logic) and only substitutes ``tmp_path`` when that value is
+    genuinely absent/blank — i.e. exactly the ``clear=True``-wiped-it-out
+    scenario this guard exists for, and no other.
+    """
+    try:
+        import gateway.status as _status
+    except ImportError:
+        return
+
+    import os as _os
+
+    _original = _status._get_process_hermes_home
+
+    def _fallback_hermes_home():
+        if _os.environ.get("HERMES_HOME", "").strip():
+            return _original()
+        return tmp_path
+
+    monkeypatch.setattr(_status, "_get_process_hermes_home", _fallback_hermes_home)
+
+
 def make_async_session_db(sync_mock=None):
     """Wrap a sync mock SessionDB in AsyncSessionDB so gateway code that awaits
     the facade works in tests. Returns (facade, sync_mock); configure return
