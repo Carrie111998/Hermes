@@ -798,13 +798,10 @@ def test_activation_factory_accepts_no_host_path_or_command(
 
 
 
-def test_production_host_identity_gate_is_deliberately_unpinned() -> None:
-    assert launcher.OWNER_GATE_HOST_IDENTITY_RECEIPT_SHA256 is None
-    with pytest.raises(
-        launcher.OwnerLauncherError,
-        match="owner_gate_iap_identity_receipt_unpinned",
-    ):
-        launcher.PinnedOwnerGateHostIdentityReceipt()
+def test_production_host_identity_gate_pins_reviewed_receipt() -> None:
+    assert launcher.OWNER_GATE_HOST_IDENTITY_RECEIPT_SHA256 == (
+        "8bfb77d30913f0a437fa8e406857bc2d5866c2378bd8774adc8ff8200b338291"
+    )
 
 
 def test_signed_pinned_owner_gate_identity_binds_numeric_id_and_host_key(
@@ -1572,19 +1569,21 @@ def test_factory_defers_readiness_until_terminal_state_is_ruled_out(
     assert constructed == 1
 
 
-def test_real_factory_stops_at_unpinned_host_identity_before_process(
+def test_real_factory_validates_pinned_host_identity_before_process(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configuration = _Configuration()
     identity = _Identity(configuration)
 
     def forbidden_process(*_args: Any, **_kwargs: Any) -> None:
-        raise AssertionError("unpinned owner-gate identity must precede process start")
+        raise AssertionError("pinned owner-gate identity must precede process start")
 
+    monkeypatch.setattr(launcher, "_canonical_owner_home", lambda: str(tmp_path))
     monkeypatch.setattr(launcher.subprocess, "Popen", forbidden_process)
     with pytest.raises(
         launcher.OwnerLauncherError,
-        match="owner_gate_iap_identity_receipt_unpinned",
+        match="owner_gate_iap_identity_receipt_unavailable",
     ):
         launcher._require_storage_growth_privileged_boundary(
             release_sha=RELEASE,
