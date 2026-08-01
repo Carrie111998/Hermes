@@ -642,6 +642,30 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+
+    # --- Scratch Artifact Guard (re-applied by ~/.hermes/profiles/operator/scripts/reapply_scratch_artifact_guard.py)
+    # The guard plugin's pre_tool_call hook is bypassed in quiet mode, so we
+    # enforce the same policy inside the kanban_complete tool handler itself.
+    # The actual policy lives in ~/.hermes/plugins/scratch-artifact-guard/guard.py.
+    try:
+        import importlib.util as _sag_iu, os as _sag_os
+        _sag_path = _sag_os.path.expanduser("~/.hermes/plugins/scratch-artifact-guard/guard.py")
+        if _sag_os.path.isfile(_sag_path):
+            _sag_spec = _sag_iu.spec_from_file_location("_hermes_sag_guard", _sag_path)
+            _sag_mod = _sag_iu.module_from_spec(_sag_spec)
+            _sag_spec.loader.exec_module(_sag_mod)
+            _sag_preview = None
+            _sag_text = (summary or result or "")
+            if isinstance(_sag_text, str):
+                _sag_preview = _sag_text.strip().splitlines()[0][:200]
+            _sag_block = _sag_mod.check_and_block(tid, _sag_preview)
+            if _sag_block:
+                return tool_error(_sag_block)
+    except Exception:
+        # Guard failures must never block a legitimate completion.
+        pass
+    # --- End Scratch Artifact Guard ---
+
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
