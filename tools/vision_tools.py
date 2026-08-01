@@ -1104,6 +1104,9 @@ async def vision_analyze_tool(
     Args:
         image_url (str): The URL or local file path of the image to analyze.
                          Accepts http://, https:// URLs or absolute/relative file paths.
+                         For local paths, copy the exact path bytes from the user
+                         message / @image directive verbatim — macOS screenshot
+                         names embed a narrow no-break space (U+202F) before AM/PM.
         user_prompt (str): The pre-formatted prompt for the vision model
         model (str): The vision model to use (default: google/gemini-3-flash-preview)
     
@@ -1483,7 +1486,13 @@ VISION_ANALYZE_SCHEMA = {
         "properties": {
             "image_url": {
                 "type": "string",
-                "description": "Image URL (http/https), local file path, or data: URL to load."
+                "description": (
+                    "Image URL (http/https), local file path, or data: URL to "
+                    "load. For local paths, copy the exact path bytes from the "
+                    "user message or @image directive verbatim — macOS "
+                    "screenshot filenames embed a narrow no-break space "
+                    "(U+202F) before AM/PM that must be preserved."
+                ),
             },
             "question": {
                 "type": "string",
