@@ -1,0 +1,3 @@
+name: session_guard
+description: 会话守卫 — 检测长会话并在达到压缩阈值时主动向用户建议新建会话并总结进度
+version: "1.0.0"
