@@ -75,6 +75,7 @@ import { isRedoShortcut, isUndoShortcut } from './undo-history'
 import { UrlDialog } from './url-dialog'
 import { chipTypedUrlOnSpace, linkifyUrls } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
+import { WorkspaceTargetPicker } from './workspace-target-picker'
 
 export function ChatBar({
   busy,
@@ -1210,6 +1211,11 @@ export function ChatBar({
                     additions beside the "+" menu and before the controls.
                     All four render nothing until something contributes. */}
                   <ContribSlot area={COMPOSER_AREAS.top} />
+                  <WorkspaceTargetPicker
+                    cwd={cwd ?? ''}
+                    hasMessages={scope.$messages.get().length > 0}
+                    sessionId={sessionId}
+                  />
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />
                   {queueEdit && editingQueuedPrompt && (
