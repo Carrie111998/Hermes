@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1133,6 +1133,53 @@ def _resolve_named_custom_runtime(
     return result
 
 
+class _OpenRouterEndpoint(NamedTuple):
+    base_url: str
+    source: str
+    requested_provider: str
+
+
+def _resolve_openrouter_endpoint(
+    *,
+    requested_provider: str,
+    explicit_base_url: Optional[str] = None,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> _OpenRouterEndpoint:
+    model_cfg = _get_model_config() if model_cfg is None else model_cfg
+    cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
+    cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
+    requested_norm = (requested_provider or "").strip().lower()
+    cfg_provider = cfg_provider.strip().lower()
+
+    if requested_norm and requested_norm != "custom":
+        try:
+            from hermes_cli.auth import resolve_provider as _resolve_provider
+
+            if _resolve_provider(requested_norm) == "custom":
+                requested_norm = "custom"
+        except Exception:
+            pass
+
+    use_config_base_url = False
+    if cfg_base_url.strip() and not explicit_base_url:
+        if requested_norm == "auto":
+            use_config_base_url = not cfg_provider or cfg_provider == "auto"
+        elif requested_norm == "custom" and _config_base_url_trustworthy_for_bare_custom(
+            cfg_base_url, cfg_provider
+        ):
+            use_config_base_url = True
+
+    candidates = (
+        ("explicit", (explicit_base_url or "").strip()),
+        ("custom_env", _getenv("CUSTOM_BASE_URL", "").strip()),
+        ("config", cfg_base_url.strip() if use_config_base_url else ""),
+        ("openrouter_env", _getenv("OPENROUTER_BASE_URL", "").strip()),
+        ("default", OPENROUTER_BASE_URL),
+    )
+    source, base_url = next((source, value) for source, value in candidates if value)
+    return _OpenRouterEndpoint(base_url.rstrip("/"), source, requested_norm)
+
+
 def _resolve_openrouter_runtime(
     *,
     requested_provider: str,
@@ -1140,52 +1187,18 @@ def _resolve_openrouter_runtime(
     explicit_base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_cfg = _get_model_config()
-    cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
-    cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
     cfg_api_key = ""
     for k in ("api_key", "api"):
         v = model_cfg.get(k)
         if isinstance(v, str) and v.strip():
             cfg_api_key = v.strip()
             break
-    requested_norm = (requested_provider or "").strip().lower()
-    cfg_provider = cfg_provider.strip().lower()
-    # GitHub #27132: provider aliases follow the same base_url trust + routing
-    # rules as their canonical custom/OpenRouter provider. Normalising here
-    # keeps every check below alias-aware without duplicating the alias map.
-    if requested_norm and requested_norm not in {"auto", "custom"}:
-        try:
-            from hermes_cli.auth import resolve_provider as _resolve_provider
-
-            resolved_requested = _resolve_provider(requested_norm)
-            if resolved_requested in {"custom", "openrouter"}:
-                requested_norm = resolved_requested
-        except Exception:
-            pass
-
-    env_openrouter_base_url = _getenv("OPENROUTER_BASE_URL", "").strip()
-    env_custom_base_url = _getenv("CUSTOM_BASE_URL", "").strip()
-
-    # Use config base_url when available and the provider context matches.
-    # OPENAI_BASE_URL env var is no longer consulted — config.yaml is
-    # the single source of truth for endpoint URLs.
-    use_config_base_url = False
-    if cfg_base_url.strip() and not explicit_base_url:
-        if requested_norm == "auto":
-            if not cfg_provider or cfg_provider == "auto":
-                use_config_base_url = True
-        elif requested_norm == "custom" and _config_base_url_trustworthy_for_bare_custom(
-            cfg_base_url, cfg_provider
-        ):
-            use_config_base_url = True
-
-    base_url = (
-        (explicit_base_url or "").strip()
-        or env_custom_base_url
-        or (cfg_base_url.strip() if use_config_base_url else "")
-        or env_openrouter_base_url
-        or OPENROUTER_BASE_URL
-    ).rstrip("/")
+    endpoint = _resolve_openrouter_endpoint(
+        requested_provider=requested_provider,
+        explicit_base_url=explicit_base_url,
+        model_cfg=model_cfg,
+    )
+    base_url = endpoint.base_url
 
     # Choose API key based on whether the resolved base_url targets OpenRouter.
     # When hitting OpenRouter, prefer OPENROUTER_API_KEY (issue #289).
@@ -1193,14 +1206,7 @@ def _resolve_openrouter_runtime(
     # OPENAI_API_KEY so the OpenRouter key doesn't leak to an unrelated
     # provider (issues #420, #560).
     _is_openrouter_url = base_url_host_matches(base_url, "openrouter.ai")
-    # Also treat explicitly-configured OpenRouter mirrors/proxies as OpenRouter
-    # for key selection — if the user set OPENROUTER_BASE_URL or requested
-    # provider=openrouter explicitly, OPENROUTER_API_KEY should still be used.
-    _is_openrouter_context = _is_openrouter_url or (
-        requested_norm == "openrouter"
-        and (env_openrouter_base_url or base_url == env_openrouter_base_url)
-        and base_url == (env_openrouter_base_url or "").rstrip("/")
-    )
+    _is_openrouter_context = _is_openrouter_url or endpoint.source == "openrouter_env"
     if _is_openrouter_context:
         api_key_candidates = [
             explicit_api_key,
@@ -1224,7 +1230,7 @@ def _resolve_openrouter_runtime(
         # Mirrors the OLLAMA_API_KEY host-gate added in GHSA-76xc-57q6-vm5m.
         api_key_candidates = [
             explicit_api_key,
-            (cfg_api_key if use_config_base_url else ""),
+            (cfg_api_key if endpoint.source == "config" else ""),
             (_getenv("OLLAMA_API_KEY")     if _is_ollama_url                       else ""),
             (_getenv("OPENAI_API_KEY")     if (_is_openai_url or _is_openai_azure) else ""),
             (_getenv("OPENROUTER_API_KEY") if _is_openrouter_url                   else ""),
@@ -1245,7 +1251,7 @@ def _resolve_openrouter_runtime(
     # name instead of silently relabeling to "openrouter" (#2562).
     # Also provide a placeholder API key for local servers that don't require
     # authentication — the OpenAI SDK requires a non-empty api_key string.
-    effective_provider = "custom" if requested_norm == "custom" else "openrouter"
+    effective_provider = "custom" if endpoint.requested_provider == "custom" else "openrouter"
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
@@ -1253,7 +1259,7 @@ def _resolve_openrouter_runtime(
         # fixing credential mix-ups when multiple custom providers share a base_url.
         pool_result = _try_resolve_from_custom_pool(
             base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
-            provider_name=requested_provider if requested_norm != "custom" else None,
+            provider_name=requested_provider if endpoint.requested_provider != "custom" else None,
         )
         if pool_result:
             return pool_result
@@ -1637,23 +1643,26 @@ def resolve_runtime_provider(
     from hermes_cli.config import is_provider_enabled, load_config
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
+    resolved_provider_hint = None
     if isinstance(_provs_cfg, dict):
-        _provider_config_key = requested_provider
-        _block = _provs_cfg.get(_provider_config_key)
+        provider_config_key = requested_provider
+        _block = _provs_cfg.get(provider_config_key)
         if (
             not isinstance(_block, dict)
             and requested_provider != "auto"
             and _get_named_custom_provider(requested_provider) is None
         ):
             try:
-                _provider_config_key = auth_mod.resolve_provider(requested_provider)
+                resolved_provider_hint = auth_mod.resolve_provider(requested_provider)
             except AuthError:
-                _provider_config_key = requested_provider
-            _block = _provs_cfg.get(_provider_config_key)
+                pass
+            else:
+                provider_config_key = resolved_provider_hint
+                _block = _provs_cfg.get(provider_config_key)
         if isinstance(_block, dict) and not is_provider_enabled(_block):
             raise ValueError(
                 f"provider {requested_provider!r} is disabled in config "
-                f"(providers.{_provider_config_key}.enabled: false)"
+                f"(providers.{provider_config_key}.enabled: false)"
             )
 
     if requested_provider == "moa":
@@ -1780,7 +1789,7 @@ def resolve_runtime_provider(
                 runtime["requested_provider"] = requested_provider
                 return runtime
 
-    provider = resolve_provider(
+    provider = resolved_provider_hint or resolve_provider(
         requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
@@ -1799,25 +1808,16 @@ def resolve_runtime_provider(
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
-        explicit_openrouter_request = (
-            requested_provider != "auto"
-            and auth_mod.resolve_provider(requested_provider) == "openrouter"
+        explicit_openrouter_request = requested_provider not in {"auto", "custom"}
+        endpoint = _resolve_openrouter_endpoint(
+            requested_provider=requested_provider,
+            explicit_base_url=explicit_base_url,
+            model_cfg=model_cfg,
         )
-        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
-        cfg_base_url = str(model_cfg.get("base_url") or "").strip()
-        env_openrouter_base_url = _getenv("OPENROUTER_BASE_URL", "").strip()
-        has_custom_endpoint = bool(explicit_base_url or env_openrouter_base_url)
-        if (
-            not explicit_openrouter_request
-            and cfg_base_url
-            and cfg_provider in {"auto", "custom"}
-        ):
-            has_custom_endpoint = True
-        has_runtime_override = bool(explicit_api_key or explicit_base_url)
         should_use_pool = (
-            (explicit_openrouter_request or requested_provider == "auto")
-            and not has_custom_endpoint
-            and not has_runtime_override
+            (requested_provider == "auto" or explicit_openrouter_request)
+            and not explicit_api_key
+            and endpoint.source == "default"
         )
 
     try:
