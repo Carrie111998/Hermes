@@ -2305,6 +2305,34 @@ def run_conversation(
                     # interrupt-and-return shape used elsewhere in this loop
                     # (e.g. the retry-backoff interrupt above) rather than the
                     # flag-and-break shape, since there is no retry to resume.
+                    #
+                    # A middleware that calls next_call() before raising may
+                    # already have opened a deferred Relay logical call via
+                    # _perform_api_call's relay_llm.execute(...,
+                    # defer_logical_completion=True); complete_logical_call is a
+                    # no-op if none was opened, so it's safe to call
+                    # unconditionally rather than tracking whether next_call ran.
+                    # Also emit the same terminal api_request_error lifecycle
+                    # hook the other early-exit error paths in this function use
+                    # — pre_api_request already fired before middleware dispatch,
+                    # so without this, enabled observers see a start event with
+                    # no post/error counterpart.
+                    from agent import relay_llm
+                    relay_llm.complete_logical_call(api_request_id, outcome="failed")
+                    agent._invoke_api_request_error_hook(
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        api_call_count=api_call_count,
+                        api_start_time=api_start_time,
+                        api_kwargs=api_kwargs,
+                        error_type="LLMExecutionBlocked",
+                        error_message=_blocked.reason,
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        retryable=False,
+                        reason=_blocked.reason,
+                    )
                     _block_text = (
                         f"This request was blocked before reaching the model: {_blocked.reason}"
                     )
