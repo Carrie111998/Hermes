@@ -439,7 +439,7 @@ def test_write_config_key_refuses_unparseable_yaml(server, tmp_path):
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(original, encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="invalid YAML"):
+    with pytest.raises(RuntimeError, match="not valid YAML"):
         server._write_config_key("display.busy_input_mode", "steer")
 
     assert cfg_path.read_text(encoding="utf-8") == original
@@ -453,7 +453,7 @@ def test_save_cfg_refuses_non_mapping_root(server, tmp_path):
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(original, encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="mapping"):
+    with pytest.raises(RuntimeError, match="must be a mapping"):
         server._save_cfg({"display": {"busy_input_mode": "steer"}})
 
     assert cfg_path.read_text(encoding="utf-8") == original
@@ -478,9 +478,41 @@ def test_config_set_rpc_refuses_unparseable_yaml(server, tmp_path):
 
     assert resp is not None
     assert "error" in resp
-    assert "invalid YAML" in resp["error"]["message"]
+    assert "not valid YAML" in resp["error"]["message"]
     assert cfg_path.read_text(encoding="utf-8") == original
     assert list(tmp_path.glob("config.yaml.corrupt.*.bak"))
+
+
+def test_tools_configure_rpc_refuses_unparseable_yaml(server, tmp_path, monkeypatch):
+    """tools.configure uses save_config(), which must share the refuse gate."""
+    server._hermes_home = tmp_path
+    _reset_cfg_cache(server)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    original = (
+        "model:\n"
+        "  default: precious/model\n"
+        "platform_toolsets:\n"
+        "  cli: [web, terminal]\n"
+        "broken: [unterminated\n"
+    )
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(original, encoding="utf-8")
+
+    resp = server.dispatch(
+        {
+            "id": "1",
+            "method": "tools.configure",
+            "params": {"action": "disable", "names": ["web"]},
+        }
+    )
+
+    assert resp is not None
+    assert "error" in resp
+    assert "not valid YAML" in resp["error"]["message"]
+    assert cfg_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("config.yaml.corrupt.*.bak")), (
+        "tools.configure bypass must still snapshot a corrupt backup"
+    )
 
 
 def test_write_config_key_allows_valid_empty_mapping(server, tmp_path):
