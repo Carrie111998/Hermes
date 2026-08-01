@@ -1794,6 +1794,80 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 # (_send_matrix_via_adapter below stays — it's the native-media upload path.)
 
 
+def _matrix_adapter_loop_matches(adapter) -> bool:
+    """Only reuse a live gateway adapter on its own event loop.
+
+    The gateway-bound adapter's mautrix aiohttp session is created on the
+    gateway loop. When a caller runs the send from a DIFFERENT loop — the
+    cron standalone delivery path does ``asyncio.run()`` on a fresh loop in
+    the scheduler thread — aiohttp's ``TimerContext`` cannot find the current
+    task on the session's loop and every request dies with "Timeout context
+    manager should be used inside a task". Detecting the mismatch lets the
+    caller bridge the send onto the adapter's own loop
+    (``_matrix_bridge_to_adapter_loop``) instead. The persistent-session
+    benefit (#46310) is kept for the normal gateway-loop path.
+    """
+    try:
+        import asyncio
+
+        session = getattr(
+            getattr(getattr(adapter, "_client", None), "api", None), "session", None
+        )
+        session_loop = getattr(session, "_loop", None)
+        if session_loop is None:
+            return True  # unknown loop — keep legacy behaviour
+        return session_loop is asyncio.get_running_loop()
+    except Exception:
+        return True  # a detection failure must never block the happy path
+
+
+async def _matrix_bridge_to_adapter_loop(adapter, chat_id, message, media_files, metadata):
+    """Run ``_matrix_send_core`` on the live adapter's own event loop.
+
+    Called when the current call executes on a DIFFERENT loop than the
+    gateway-bound adapter's session — the cron standalone delivery path runs
+    ``asyncio.run()`` on a fresh loop in the scheduler thread. Awaiting the
+    adapter's send directly in that context makes aiohttp's ``TimerContext``
+    raise "Timeout context manager should be used inside a task", because the
+    session is bound to the gateway loop. Scheduling the send onto the
+    adapter's own loop keeps the persistent E2EE session (#46310) — an
+    ephemeral adapter cannot open the shared crypto store (BAD_ACCOUNT_KEY)
+    and would break encrypted-room delivery.
+
+    Blocks the calling thread until the send completes (or times out), the
+    same contract the scheduler's live-adapter path uses. Returns a dict so
+    cron's standalone delivery path can inspect ``.get("error")``.
+    """
+    from agent.async_utils import safe_schedule_threadsafe
+
+    session = getattr(
+        getattr(getattr(adapter, "_client", None), "api", None), "session", None
+    )
+    loop = getattr(session, "_loop", None)
+    if loop is None:
+        # Cannot determine the adapter's loop — fall back to the legacy
+        # direct await rather than failing the delivery.
+        return await _matrix_send_core(adapter, chat_id, message, media_files, metadata)
+
+    future = safe_schedule_threadsafe(
+        _matrix_send_core(adapter, chat_id, message, media_files, metadata), loop
+    )
+    if future is None:
+        return _error("Matrix send failed: could not schedule send on adapter loop")
+    try:
+        result = future.result(timeout=90)
+    except TimeoutError:
+        future.cancel()
+        return _error("Matrix send timed out on adapter loop")
+    if isinstance(result, dict):
+        return result
+    return {
+        "success": bool(getattr(result, "success", False)),
+        "error": getattr(result, "error", None),
+        "message_id": getattr(result, "message_id", None),
+    }
+
+
 async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
     """Send via the Matrix adapter so native Matrix media uploads are preserved.
 
@@ -1841,7 +1915,16 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         # disconnect it. Correctness here depends on this branch returning
         # before the ephemeral ``adapter`` is constructed below, so the
         # ephemeral ``finally`` disconnect never touches the live session.
-        return await _matrix_send_core(
+        if _matrix_adapter_loop_matches(live_adapter):
+            return await _matrix_send_core(
+                live_adapter, chat_id, message, media_files, metadata
+            )
+        # Loop mismatch (e.g. cron standalone delivery runs ``asyncio.run()``
+        # on a fresh loop in the scheduler thread): bridge the send onto the
+        # adapter's own loop instead of awaiting it here — direct cross-loop
+        # awaits make aiohttp's TimerContext explode, and an ephemeral
+        # adapter cannot open the shared crypto store (BAD_ACCOUNT_KEY).
+        return await _matrix_bridge_to_adapter_loop(
             live_adapter, chat_id, message, media_files, metadata
         )
 
