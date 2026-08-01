@@ -178,6 +178,70 @@ def test_changed_uv_accepts_fixed_same_version_artifact(tmp_path, monkeypatch):
     assert not (root / ".hermes-runtime" / "python" / "unavailable-artifact.json").exists()
 
 
+def test_uncertain_bare_candidate_does_not_block_fixed_patch_retry(tmp_path, monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+    from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo
+
+    root, _ = _runtime_install(tmp_path)
+    current = _runtime_info(root / "venv" / "bin" / "python")
+    state = {"generation": None, "requests": []}
+
+    def fake_run(command, **kwargs):
+        if "install" in command:
+            state["generation"] = Path(kwargs["env"]["UV_PYTHON_INSTALL_DIR"])
+            state["requests"].append(command[3])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "find" in command:
+            python = state["generation"] / "cpython" / "bin" / "python3"
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text(command[3], encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout=str(python), stderr="")
+        if "list" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    {
+                        "implementation": "cpython",
+                        "variant": "default",
+                        "version_parts": {"major": 3, "minor": 11, "patch": 16},
+                    }
+                ]),
+                stderr="",
+            )
+        raise AssertionError(command)
+
+    def fake_probe(executable, **_kwargs):
+        executable = Path(executable)
+        requested = executable.read_text(encoding="utf-8")
+        if requested == "3.11":
+            return SQLiteRuntimeInfo(
+                executable=executable,
+                base_prefix=executable.parent.parent,
+                python_version=(3, 11, 14),
+                sqlite_version=(3, 50, 4),
+                sqlite_version_string="3.50.4",
+                sqlite_source_id="vulnerable",
+            )
+        return SQLiteRuntimeInfo(
+            executable=executable,
+            base_prefix=executable.parent.parent,
+            python_version=(3, 11, 16),
+            sqlite_version=(3, 53, 1),
+            sqlite_version_string="3.53.1",
+            sqlite_source_id="fixed",
+        )
+
+    monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
+    monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe)
+
+    result = managed_uv._install_safe_python_generation(
+        "uv.exe", project_root=root, current=current
+    )
+
+    assert result.status == "ready"
+    assert state["requests"] == ["3.11", "3.11.16"]
+
+
 @pytest.mark.parametrize(
     "failure", ["install", "lookup", "probe", "probe_exception", "catalog"]
 )
@@ -249,6 +313,24 @@ def test_malformed_unavailable_marker_fails_open(tmp_path, monkeypatch):
     assert result.status == "unavailable"
     assert len([call for call in calls if "install" in call]) == 1
     assert marker.read_bytes() != b"\xff"
+
+
+def test_deeply_malformed_unavailable_marker_fails_open(tmp_path, monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+
+    _windows_hermetic(monkeypatch)
+    root, _ = _runtime_install(tmp_path)
+    marker = root / ".hermes-runtime" / "python" / "unavailable-artifact.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("[" * 2000 + "0" + "]" * 2000, encoding="utf-8")
+    _, calls = _uv_process(monkeypatch, uv_version="0.8.4", candidate_sqlite=(3, 50, 4))
+    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", lambda *_: False)
+
+    result = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
+
+    assert result.status == "unavailable"
+    assert len([call for call in calls if "install" in call]) == 1
+    assert marker.read_bytes() != b"[" * 2000 + b"0" + b"]" * 2000
 
 
 def test_malformed_catalog_is_not_cached(tmp_path, monkeypatch):

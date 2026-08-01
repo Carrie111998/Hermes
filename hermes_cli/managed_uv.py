@@ -705,13 +705,14 @@ def _install_safe_python_generation(
     )
     rejected: list[SQLiteRuntimeInfo] = []
     attempted_versions: set[tuple[int, int, int]] = set()
+    failure_reason = ""
     if result.status == "ready":
         return _ProvisioningResult.ready(result.generation, result.python, result.runtime)
     if result.status == "vulnerable":
         rejected.append(result.runtime)
         attempted_versions.add(result.runtime.python_version[:3])
     else:
-        return _ProvisioningResult.failed(result.reason or "candidate attempt failed")
+        failure_reason = result.reason or "candidate attempt failed"
 
     # The bare minor-line request resolved to a still-vulnerable (or
     # otherwise rejected) candidate. Rather than giving up immediately,
@@ -751,14 +752,17 @@ def _install_safe_python_generation(
         if result.status == "vulnerable":
             rejected.append(result.runtime)
             continue
-        return _ProvisioningResult.failed(result.reason or "candidate attempt failed")
+        if not failure_reason:
+            failure_reason = result.reason or "candidate attempt failed"
 
     if not hasattr(patches, "complete") and attempts >= _MAX_PATCH_RETRIES:
         # Keep compatibility with older in-process callers that supplied a
         # plain patch list before catalog completeness became structured.
         return None
     if not getattr(patches, "complete", True):
-        return _ProvisioningResult.failed("Python catalog query failed")
+        return _ProvisioningResult.failed(failure_reason or "Python catalog query failed")
+    if failure_reason:
+        return _ProvisioningResult.failed(failure_reason)
     if rejected:
         return _ProvisioningResult.unavailable(tuple(rejected))
     return _ProvisioningResult.failed("no eligible Python candidate")
@@ -1166,7 +1170,7 @@ def _read_matching_unavailable_marker(
         if len(candidates) != len(raw_candidates):
             return None
         return _UnavailableMarker(key=key, rejected_candidates=candidates)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except Exception:
         return None
 
 
