@@ -141,6 +141,38 @@ def _scrub_surrogates(value: Any) -> Any:
     return _sanitize_surrogates(value) if isinstance(value, str) else value
 
 
+def _canonical_message_value(value: Any) -> str:
+    """Return a stable comparison form for a persisted message field."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _message_signature(message: Dict[str, Any]) -> tuple[str, ...]:
+    """Identify a replayed compacted row without using content alone."""
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, str):
+        try:
+            tool_calls = json.loads(tool_calls)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return tuple(
+        _canonical_message_value(message.get(key))
+        for key in (
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "effect_disposition",
+            "finish_reason",
+        )
+    )
+
+
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
     """A session's workspace grouping key: its git repo root when known, else
     its cwd.
@@ -6215,6 +6247,65 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            active_rows = conn.execute(
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                "effect_disposition, finish_reason, api_content "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            replayed_counts: Dict[tuple[str, ...], int] = {}
+            for row in active_rows:
+                stored_tool_calls = row["tool_calls"]
+                if isinstance(stored_tool_calls, str):
+                    try:
+                        stored_tool_calls = json.loads(stored_tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                replayed = {
+                    "role": row["role"],
+                    "content": self._decode_content(row["content"]),
+                    "tool_call_id": row["tool_call_id"],
+                    "tool_calls": stored_tool_calls,
+                    "tool_name": row["tool_name"],
+                    "effect_disposition": row["effect_disposition"],
+                    "finish_reason": row["finish_reason"],
+                    "api_content": row["api_content"],
+                }
+                signature = _message_signature(replayed)
+                replayed_counts[signature] = replayed_counts.get(signature, 0) + 1
+
+            # The model snapshot contains a summary and usually copies protected
+            # head/tail rows. Keep those rows in the active model projection, but
+            # make their display-only status explicit before persistence so the
+            # archived originals can be rendered exactly once.
+            try:
+                from agent.context_compressor import (
+                    COMPRESSED_SUMMARY_METADATA_KEY,
+                    ContextCompressor,
+                )
+            except ImportError:  # pragma: no cover - scaffold/import bootstrap
+                COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+                ContextCompressor = None
+
+            prepared_messages = []
+            for message in compacted_messages:
+                prepared = dict(message)
+                is_summary = bool(prepared.get(COMPRESSED_SUMMARY_METADATA_KEY))
+                if not is_summary and ContextCompressor is not None:
+                    is_summary = (
+                        ContextCompressor.classify_summary_content(
+                            prepared.get("content")
+                        )
+                        == "standalone"
+                    )
+                signature = _message_signature(prepared)
+                if is_summary:
+                    prepared["display_kind"] = "hidden"
+                elif replayed_counts.get(signature, 0) > 0:
+                    prepared["display_kind"] = "hidden"
+                    replayed_counts[signature] -= 1
+                prepared_messages.append(prepared)
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -6227,7 +6318,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, prepared_messages
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
@@ -6555,7 +6646,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, active, compacted"
     )
 
     def _rows_to_conversation(
@@ -6566,6 +6657,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_ancestors: bool,
         repair_alternation: bool,
         include_row_ids: bool = False,
+        include_storage_state: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -6580,6 +6672,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if include_storage_state:
+                msg["_db_active"] = bool(row["active"])
+                msg["_db_compacted"] = bool(row["compacted"])
             # Durable per-message identity for surfaces that need to address a
             # specific row later (desktop reactions). OPT-IN: only the gateway
             # asks for it — every other consumer (ACP restore, export,
@@ -6708,7 +6803,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
                 f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                "AND (active = 1 OR compacted = 1) "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
                 "ORDER BY id",
@@ -6718,7 +6814,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Tip rows are exactly the model-fed set (get_messages_as_conversation
         # with session_ids=[session_id]); filtering the lineage fetch preserves
         # their relative id order.
-        tip_rows = [r for r in rows if r["session_id"] == session_id]
+        tip_rows = [
+            row
+            for row in rows
+            if row["session_id"] == session_id and row["active"]
+        ]
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,
@@ -6732,8 +6832,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_ancestors=True,
             repair_alternation=False,
             include_row_ids=True,
+            include_storage_state=True,
         )
+        display_history = self._filter_display_history(display_history)
         return model_history, display_history
+
+    @staticmethod
+    def _filter_display_history(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Remove model-only compaction rows from a user-visible projection."""
+        try:
+            from agent.context_compressor import ContextCompressor
+        except ImportError:  # pragma: no cover - scaffold/import bootstrap
+            ContextCompressor = None
+
+        # Older compacted rows predate the explicit hidden marker. Use the
+        # durable compacted flag as a migration fallback, but only suppress the
+        # replay block before the first genuinely new active turn.
+        archived_counts: Dict[tuple[str, ...], int] = {}
+        for message in messages:
+            if message.get("_db_compacted") and not message.get("_db_active"):
+                signature = _message_signature(message)
+                archived_counts[signature] = archived_counts.get(signature, 0) + 1
+        replay_open = bool(archived_counts)
+
+        display = []
+        for message in messages:
+            if message.get("display_kind") == "hidden":
+                continue
+            content = message.get("content")
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and content.lstrip().startswith("[System:")
+            ):
+                continue
+            if ContextCompressor is not None:
+                if (
+                    ContextCompressor.classify_summary_content(message.get("content"))
+                    == "standalone"
+                ):
+                    continue
+                message = ContextCompressor._strip_context_summary_handoff_message(message)
+                if message is None:
+                    continue
+            if replay_open and message.get("_db_active") and not message.get("_db_compacted"):
+                signature = _message_signature(message)
+                if archived_counts.get(signature, 0) > 0:
+                    archived_counts[signature] -= 1
+                    continue
+                replay_open = False
+            display.append(message)
+        return display
 
     def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
         """Return the ancestor-only display messages for a session lineage.
@@ -6762,19 +6913,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
                 f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                "AND (active = 1 OR compacted = 1) "
                 "ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
         ancestor_rows = [r for r in rows if r["session_id"] != session_id]
         if not ancestor_rows:
             return []
-        return self._rows_to_conversation(
+        return self._filter_display_history(self._rows_to_conversation(
             ancestor_rows,
             session_id=session_id,
             include_ancestors=True,
             repair_alternation=False,
-        )
+            include_storage_state=True,
+        ))
 
     def get_conversation_root(self, session_id: str) -> str:
         """Return the ROOT id of *session_id*'s lineage chain.

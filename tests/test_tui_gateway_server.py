@@ -2513,6 +2513,21 @@ def test_live_visible_history_prefers_db_display_with_candidate():
     assert result == display_with_candidate
 
 
+def test_live_visible_history_uses_shared_resume_display_projection():
+    in_memory = [{"role": "user", "content": "model-only view"}]
+    display = [{"role": "user", "content": "archived visible turn"}]
+
+    class DB:
+        def get_resume_conversations(self, key):
+            assert key == "s1"
+            return in_memory, display
+
+        def get_messages_as_conversation(self, *args, **kwargs):
+            raise AssertionError("live history must use the shared resume projection")
+
+    assert server._live_visible_history({"session_key": "s1"}, DB(), in_memory) == display
+
+
 def test_live_visible_history_falls_back_without_db_or_key():
     in_memory = [{"role": "user", "content": "hi"}]
     # No DB handle available.
@@ -2660,6 +2675,169 @@ def test_live_visible_history_keeps_candidate_and_new_flushed_turn_real_db(tmp_p
         "turn 2",
         "turn 2 reply",
     ]
+
+
+def test_compaction_display_history_keeps_archived_turns_without_summary_or_copies(tmp_path):
+    """Compaction must reduce model context without reducing the user transcript.
+
+    The active compacted snapshot contains a summary and a protected tail copy.
+    The display projection must instead show the original archived transcript
+    exactly once and omit the model-only summary.
+    """
+    from agent.context_compressor import SUMMARY_PREFIX
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s1", source="tui")
+        original = [
+            ("user", "VISIBLE_HEAD"),
+            ("assistant", "HEAD_REPLY"),
+            ("user", "VISIBLE_MIDDLE"),
+            ("assistant", "MIDDLE_REPLY"),
+            ("user", "VISIBLE_TAIL"),
+            ("assistant", "TAIL_REPLY"),
+        ]
+        for role, content in original:
+            db.append_message("s1", role=role, content=content)
+
+        db.archive_and_compact(
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": f"{SUMMARY_PREFIX}\nsummary",
+                    "_compressed_summary": True,
+                },
+                {"role": "user", "content": "VISIBLE_TAIL"},
+                {"role": "assistant", "content": "TAIL_REPLY"},
+            ],
+        )
+
+        model_history, display_history = db.get_resume_conversations("s1")
+        model_texts = [message.get("content") for message in model_history]
+        display_texts = [message.get("content") for message in display_history]
+
+        assert model_texts == [
+            f"{SUMMARY_PREFIX}\nsummary",
+            "VISIBLE_TAIL",
+            "TAIL_REPLY",
+        ]
+        assert display_texts == [content for _, content in original]
+
+        db.append_message("s1", role="user", content="[System: internal bookkeeping]")
+        _, marker_display_history = db.get_resume_conversations("s1")
+        assert [message.get("content") for message in marker_display_history] == [
+            content for _, content in original
+        ]
+
+        # Simulate a database written before the explicit hidden marker was
+        # added: the compacted flag alone must still suppress replay copies.
+        db._conn.execute("UPDATE messages SET display_kind = NULL WHERE session_id = ?", ("s1",))
+        db._conn.commit()
+        _, legacy_display_history = db.get_resume_conversations("s1")
+        assert [message.get("content") for message in legacy_display_history] == [
+            content for _, content in original
+        ]
+    finally:
+        db.close()
+
+
+def test_compaction_display_history_survives_multiple_compactions(tmp_path):
+    """Each archived compacted generation contributes to one visible timeline."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s1", source="tui")
+        for role, content in [
+            ("user", "FIRST"),
+            ("assistant", "FIRST_REPLY"),
+            ("user", "SECOND"),
+            ("assistant", "SECOND_REPLY"),
+        ]:
+            db.append_message("s1", role=role, content=content)
+
+        db.archive_and_compact(
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": "[CONTEXT COMPACTION — REFERENCE ONLY] summary 1",
+                    "_compressed_summary": True,
+                },
+                {"role": "user", "content": "SECOND"},
+                {"role": "assistant", "content": "SECOND_REPLY"},
+            ],
+        )
+        db.append_message("s1", role="user", content="AFTER_FIRST_COMPACTION")
+        db.append_message("s1", role="assistant", content="AFTER_FIRST_REPLY")
+
+        db.archive_and_compact(
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": "[CONTEXT COMPACTION — REFERENCE ONLY] summary 2",
+                    "_compressed_summary": True,
+                },
+                {"role": "user", "content": "SECOND"},
+                {"role": "assistant", "content": "SECOND_REPLY"},
+                {"role": "user", "content": "AFTER_FIRST_COMPACTION"},
+                {"role": "assistant", "content": "AFTER_FIRST_REPLY"},
+            ],
+        )
+
+        _, display_history = db.get_resume_conversations("s1")
+        assert [message.get("content") for message in display_history] == [
+            "FIRST",
+            "FIRST_REPLY",
+            "SECOND",
+            "SECOND_REPLY",
+            "AFTER_FIRST_COMPACTION",
+            "AFTER_FIRST_REPLY",
+        ]
+    finally:
+        db.close()
+
+
+def test_compaction_display_history_keeps_legitimate_repeated_user_turns(tmp_path):
+    """Replay-copy suppression must not collapse two real identical prompts."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s1", source="tui")
+        original = [
+            ("user", "repeat this"),
+            ("assistant", "first answer"),
+            ("user", "different turn"),
+            ("assistant", "middle answer"),
+            ("user", "repeat this"),
+            ("assistant", "second answer"),
+        ]
+        for role, content in original:
+            db.append_message("s1", role=role, content=content)
+
+        db.archive_and_compact(
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
+                    "_compressed_summary": True,
+                },
+                {"role": "user", "content": "repeat this"},
+                {"role": "assistant", "content": "second answer"},
+            ],
+        )
+
+        _, display_history = db.get_resume_conversations("s1")
+        assert [message.get("content") for message in display_history] == [
+            content for _, content in original
+        ]
+    finally:
+        db.close()
 
 
 def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch, tmp_path):

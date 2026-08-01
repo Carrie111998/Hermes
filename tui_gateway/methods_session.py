@@ -2445,6 +2445,17 @@ def _(rid, params: dict) -> dict:
                 agent,
                 committed=True,
             )
+            # The in-memory history is the model projection. Use the shared
+            # persisted display projection for transcript replacement so manual
+            # /compress behaves exactly like session.resume.
+            display_messages = messages
+            try:
+                with _session_db(session) as db:
+                    display_session_id = session.get("session_key") or sid
+                    if db is not None and db.get_session(display_session_id):
+                        _, display_messages = db.get_resume_conversations(display_session_id)
+            except Exception:
+                logger.debug("manual compression display projection read failed", exc_info=True)
             return _ok(
                 rid,
                 {
@@ -2461,7 +2472,7 @@ def _(rid, params: dict) -> dict:
                     # raw tool results can contain large or sensitive payloads
                     # that belong in persisted history, not the transcript
                     # replacement response.
-                    "messages": _history_to_messages(messages),
+                    "messages": _history_to_messages(display_messages),
                 },
             )
         finally:
