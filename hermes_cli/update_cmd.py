@@ -3055,6 +3055,44 @@ def _leftover_pausable_gateway_pids(
     return pids
 
 
+def _windows_serve_backend_is_running() -> bool:
+    """Return whether this install already has a live ``hermes serve`` backend.
+
+    Hermes Desktop launches its Python backend as ``hermes serve`` rather than
+    ``gateway run``. Gateway PID discovery intentionally matches only gateway
+    commands, so the desktop backend is invisible to the Windows update
+    cold-start path. When a stale Scheduled Task or Startup-folder launcher is
+    still installed, that mismatch makes ``hermes update`` spawn a second
+    standalone gateway alongside the desktop backend.
+
+    Reuse the venv-holder scan because it is already scoped to this checkout's
+    interpreter and handles uv/base-interpreter trampolines. That avoids a
+    ``hermes serve`` process from another Hermes installation suppressing this
+    install's legitimate gateway restart. Detection is best-effort; on scan
+    failure the updater preserves the existing cold-start behaviour.
+    """
+    if not _m()._is_windows():
+        return False
+
+    try:
+        matches = _detect_venv_python_processes()
+    except Exception as exc:
+        logger.debug("Could not scan for a Windows serve backend: %s", exc)
+        return False
+
+    serve_markers = (
+        "hermes serve",
+        "hermes.exe serve",
+        "hermes_cli.main serve",
+        "hermes_cli/main.py serve",
+    )
+    for _pid, _name, cmdline in matches:
+        normalized = str(cmdline).replace("\\", "/").lower()
+        if any(marker in normalized for marker in serve_markers):
+            return True
+    return False
+
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -3084,6 +3122,17 @@ def _pause_windows_gateways_for_update() -> dict | None:
         logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
         return None
     if not running_pids:
+        # Hermes Desktop owns the same messaging/runtime role through its
+        # ``hermes serve`` backend. A vestigial gateway autostart artifact must
+        # not turn that healthy desktop-owned runtime into a second standalone
+        # gateway after every update (#76129).
+        if _windows_serve_backend_is_running():
+            logger.debug(
+                "Skipping Windows gateway cold-start token because hermes serve "
+                "is already running"
+            )
+            return None
+
         # No gateway is running right now, but the user may have installed an
         # autostart entry (Scheduled Task or Startup-folder login item) — that
         # is an explicit "I want a gateway" signal. A gateway that died between
@@ -3233,6 +3282,11 @@ def _cold_start_windows_gateway_after_update() -> None:
     # process may have re-registered. Don't double-start.
     try:
         if list(find_gateway_pids(all_profiles=True)):
+            return
+        # The desktop backend may have started while the update was in
+        # progress. Treat ``hermes serve`` as gateway-equivalent at the final
+        # pre-spawn check too, closing the race between pause and resume.
+        if _windows_serve_backend_is_running():
             return
     except Exception as exc:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
