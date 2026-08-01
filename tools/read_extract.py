@@ -114,44 +114,47 @@ def _extract_docx(path: str) -> str:
         raise ExtractionError(str(exc)) from exc
 
     w = f"{{{_NS_W}}}"
-    p_tag = f"{w}p"
-    text_tags = {f"{w}t", f"{w}tab", f"{w}br", f"{w}cr"}
+    p_tag, t_tag, tab_tag = f"{w}p", f"{w}t", f"{w}tab"
+    break_tags = {f"{w}br", f"{w}cr"}
 
     # Paragraphs can nest: a text box (<w:txbxContent>) or block-level content
-    # control holds its own <w:p> elements. root.iter(p_tag) yields those nested
-    # paragraphs too, and an ancestor paragraph's iter() also descends into
-    # them — so without attribution a text box's text is emitted twice (once
-    # inline by the ancestor, once when the nested paragraph is visited).
-    # ElementTree has no parent pointers, so build one and attribute each text
-    # node to its *nearest* enclosing <w:p>.
-    parent = {child: node for node in root.iter() for child in node}
-
-    def _nearest_para(node: ET.Element) -> "ET.Element | None":
-        cur = parent.get(node)
-        while cur is not None:
-            if cur.tag == p_tag:
-                return cur
-            cur = parent.get(cur)
-        return None
-
+    # control holds its own <w:p> elements, and a plain root.iter() would see
+    # that text both inline (via the ancestor paragraph) and again as its own
+    # paragraph — duplicating it. Walk the tree once in document order, treating
+    # every <w:p> as a line boundary: a nested paragraph flushes the line it
+    # interrupts, emits its own line(s), then the enclosing paragraph resumes.
+    # Each run is emitted exactly once and stays in reading order
+    # (e.g. "Before" -> box text -> "After").
     lines: list[str] = []
-    for para in root.iter(p_tag):
-        buf: list[str] = []
-        for node in para.iter():
-            tag = node.tag
-            if tag not in text_tags:
-                continue
-            # Skip text owned by a nested paragraph; it is emitted when that
-            # paragraph is visited on its own, keeping each <w:p> a single line.
-            if _nearest_para(node) is not para:
-                continue
-            if tag == f"{w}t":
-                buf.append(node.text or "")
-            elif tag == f"{w}tab":
+    buf: list[str] = []
+
+    def _flush() -> bool:
+        if buf:
+            lines.extend("".join(buf).split("\n"))
+            buf.clear()
+            return True
+        return False
+
+    def _walk(node: ET.Element) -> None:
+        for child in node:
+            tag = child.tag
+            if tag == p_tag:
+                _flush()
+                marker = len(lines)
+                _walk(child)
+                if not _flush() and len(lines) == marker:
+                    lines.append("")  # preserve an empty paragraph as a blank line
+            elif tag == t_tag:
+                buf.append(child.text or "")
+            elif tag == tab_tag:
                 buf.append("\t")
-            else:  # w:br / w:cr
+            elif tag in break_tags:
                 buf.append("\n")
-        lines.extend("".join(buf).split("\n"))
+            else:
+                _walk(child)
+
+    _walk(root)
+    _flush()
     if not any(line.strip() for line in lines):
         raise ExtractionError("DOCX contains no extractable text")
     return "\n".join(lines).rstrip("\n") + "\n"
