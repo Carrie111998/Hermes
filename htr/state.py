@@ -831,6 +831,61 @@ class RecoveryRunReconcileResult:
     notes: tuple[str, ...] = ()
 
 
+ERROR_CODE_BOUNDED_ACTION_VALIDATION: Final = "BOUNDED_ACTION_VALIDATION_FAILED"
+ERROR_CODE_BOUNDED_ACTION_CONFLICT: Final = "BOUNDED_ACTION_CONFLICT"
+ERROR_CODE_BOUNDED_ACTION_STATE: Final = "BOUNDED_ACTION_ILLEGAL_STATE"
+ERROR_CODE_BOUNDED_ACTION_DURABILITY: Final = "BOUNDED_ACTION_DURABILITY_FAILED"
+ERROR_CODE_BOUNDED_ACTION_PRECONDITION: Final = "BOUNDED_ACTION_PRECONDITION_FAILED"
+
+
+class BoundedActionStateError(HTRStateError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = ERROR_CODE_BOUNDED_ACTION_STATE,
+        proposal_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.proposal_id = proposal_id
+
+
+class BoundedActionValidationError(BoundedActionStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_BOUNDED_ACTION_VALIDATION, **kwargs)
+
+
+class BoundedActionConflictError(BoundedActionStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_BOUNDED_ACTION_CONFLICT, **kwargs)
+
+
+class BoundedActionPreconditionError(BoundedActionStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_BOUNDED_ACTION_PRECONDITION, **kwargs)
+
+
+class BoundedActionDurabilityError(BoundedActionStateError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        proposal_id: str,
+        record_name: str,
+        durability_stage: str,
+        record_may_have_committed: bool,
+    ) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_BOUNDED_ACTION_DURABILITY,
+            proposal_id=proposal_id,
+        )
+        self.record_name = record_name
+        self.durability_stage = durability_stage
+        self.record_may_have_committed = record_may_have_committed
+
+
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:
     """Return True when *to_status* is legal from *from_status*."""
     if from_status not in TASK_STATUSES or to_status not in TASK_STATUSES:

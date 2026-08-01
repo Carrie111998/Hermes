@@ -190,6 +190,57 @@ def recovery_origin_path(run_id: str, base_dir: Path | None = None) -> Path:
     return run_root(run_id, base_dir) / "recovery_origin.json"
 
 
+BOUNDED_ACTIONS_DIR_NAME = "bounded_actions"
+PUBLICATION_COORD_DIR_NAME = "_publication_coord"
+SUCCESSOR_COORD_DIR_NAME = "_successor_coord"
+
+
+def control_bounded_actions_root(base_dir: Path | None = None) -> Path:
+    return control_root(base_dir) / BOUNDED_ACTIONS_DIR_NAME
+
+
+def publication_coord_dir(base_dir: Path | None = None) -> Path:
+    return control_bounded_actions_root(base_dir) / PUBLICATION_COORD_DIR_NAME
+
+
+def bounded_action_publication_coord_dir(base_dir: Path | None = None) -> Path:
+    return publication_coord_dir(base_dir)
+
+
+def successor_coord_dir(base_dir: Path | None = None) -> Path:
+    return control_bounded_actions_root(base_dir) / SUCCESSOR_COORD_DIR_NAME
+
+
+def bounded_action_successor_coord_root(base_dir: Path | None = None) -> Path:
+    return successor_coord_dir(base_dir)
+
+
+def bounded_action_successor_coord_dir(successor_run_id: str, base_dir: Path | None = None) -> Path:
+    _validate_path_component(successor_run_id, "successor_run_id")
+    if not validate_id(successor_run_id, "run"):
+        raise ValueError(f"invalid successor_run_id format: {successor_run_id!r}")
+    return bounded_action_successor_coord_root(base_dir) / successor_run_id
+
+
+def bounded_action_case_dir(proposal_id: str, base_dir: Path | None = None) -> Path:
+    _validate_path_component(proposal_id, "proposal_id")
+    if not validate_id(proposal_id, "bounded_action_proposal"):
+        raise ValueError(f"invalid proposal_id format: {proposal_id!r}")
+    return control_bounded_actions_root(base_dir) / proposal_id
+
+
+def bounded_action_proposal_path(proposal_id: str, base_dir: Path | None = None) -> Path:
+    return bounded_action_case_dir(proposal_id, base_dir) / "proposal.json"
+
+
+def bounded_action_review_decision_path(proposal_id: str, base_dir: Path | None = None) -> Path:
+    return bounded_action_case_dir(proposal_id, base_dir) / "review_decision.json"
+
+
+def bounded_action_escalation_path(proposal_id: str, base_dir: Path | None = None) -> Path:
+    return bounded_action_case_dir(proposal_id, base_dir) / "escalation.json"
+
+
 def reports_dir(run_id: str, base_dir: Path | None = None) -> Path:
     return run_root(run_id, base_dir) / "reports"
 

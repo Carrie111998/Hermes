@@ -27,6 +27,9 @@ IdKind = Literal[
     "recovery_run_approval",
     "recovery_run_claim",
     "recovery_run_attempt",
+    "bounded_action_proposal",
+    "bounded_action_review_decision",
+    "bounded_action_escalation",
 ]
 
 ID_PREFIXES: dict[IdKind, str] = {
@@ -49,10 +52,13 @@ ID_PREFIXES: dict[IdKind, str] = {
     "recovery_run_approval": "rap_",
     "recovery_run_claim": "rcl_",
     "recovery_run_attempt": "rat_",
+    "bounded_action_proposal": "bar_",
+    "bounded_action_review_decision": "brd_",
+    "bounded_action_escalation": "bes_",
 }
 
 _ID_BODY_RE = re.compile(
-    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat|rcr|rap|rcl|rat)_(\d{8})_([a-f0-9]{6})$"
+    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat|rcr|rap|rcl|rat|bar|brd|bes)_(\d{8})_([a-f0-9]{6})$"
 )
 
 
@@ -176,3 +182,15 @@ def generate_recovery_attempt_id() -> str:
 
 def generate_successor_run_id() -> str:
     return new_run_id()
+
+
+def generate_bounded_action_proposal_id() -> str:
+    return generate_id("bounded_action_proposal")
+
+
+def generate_bounded_action_review_decision_id() -> str:
+    return generate_id("bounded_action_review_decision")
+
+
+def generate_bounded_action_escalation_id() -> str:
+    return generate_id("bounded_action_escalation")
