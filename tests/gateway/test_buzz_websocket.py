@@ -131,7 +131,7 @@ async def test_membership_event_adopts_new_named_channel_when_unpinned():
     async def run_cli(args, **_kwargs):
         nonlocal messages_get_calls
         if args == ["dms", "list"]:
-            return 0, "[]", ""
+            return 0, json.dumps([{"dm_id": new_channel}]), ""
         if args == ["channels", "list"]:
             return 0, json.dumps([
                 {"channel_id": new_channel, "name": "release-team", "description": "Announcements"}
