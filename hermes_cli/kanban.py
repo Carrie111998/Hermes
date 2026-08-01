@@ -495,6 +495,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json", action="store_true",
         help="Emit JSON (structured) instead of the default human table",
     )
+    p_backend_status = sub.add_parser(
+        "backend-status",
+        help="Show execution-backend circuits, routing, polling, and cost state",
+    )
+    p_backend_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON instead of the default operator table",
+    )
 
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
@@ -947,6 +956,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "backend-status": _cmd_backend_status,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1299,6 +1309,38 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         counts = entry["counts"] or {}
         count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
         print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
+    return 0
+
+
+def _cmd_backend_status(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        snapshot = kb.backend_runtime_snapshot(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        return 0
+    circuits = snapshot["circuits"]
+    if circuits:
+        print("Circuits:")
+        for backend_id, state in sorted(circuits.items()):
+            print(f"  {backend_id:12s} {state}")
+    else:
+        print("Circuits: all closed (no persisted failures)")
+    active_runs = snapshot["active_runs"]
+    if not active_runs:
+        print("Active backend runs: none")
+        return 0
+    print("Active backend runs:")
+    for run in active_runs:
+        route = run["routing_decision"] or {}
+        print(
+            f"  {run['task_id']} run={run['run_id']} "
+            f"backend={run['executor_backend']} status={run['backend_status']} "
+            f"poll_age={run['poll_age_seconds']}s "
+            f"cost={run['observed_cost_units']!r}"
+        )
+        print(f"    route: {route.get('selection_reason') or '(not recorded)'}")
+        if run["last_error"]:
+            print(f"    last_error: {run['last_error']}")
     return 0
 
 

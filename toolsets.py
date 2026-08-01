@@ -48,6 +48,11 @@ _HERMES_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    # File uploads are a contract-mandated browser primitive for audited
+    # ClawOps listing workflows. Keep its schema model-visible whenever the
+    # selected toolsets enable it; tool-search must never defer it after the
+    # runtime capability preflight has attested that it is present.
+    "browser_upload_files",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory

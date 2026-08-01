@@ -1696,6 +1696,16 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Trusted per-lane stateless translation config. Platform adapters may
+    # populate this only from operator-controlled config (never user payloads).
+    # Kept at the end to preserve positional compatibility for older plugins.
+    fast_translation: Optional[Dict[str, Any]] = None
+
+    # Trusted named Topic response profile resolved from operator config.
+    # This is the generic successor to ``fast_translation`` and remains at the
+    # end for positional compatibility with third-party platform plugins.
+    response_profile: Optional[Dict[str, Any]] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -1801,6 +1811,10 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # True only when the adapter has evidence that the platform may have
+    # accepted the message even though no acknowledgement was received.
+    # Consumers must suppress blind retries in this state.
+    delivery_ambiguous: bool = False
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -5201,6 +5215,7 @@ class BasePlatformAdapter(ABC):
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
         role_authorized: bool = False,
+        display_overrides: Optional[Dict[str, Any]] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -5222,6 +5237,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             role_authorized=role_authorized,
+            display_overrides=dict(display_overrides) if display_overrides else None,
         )
     
     @abstractmethod

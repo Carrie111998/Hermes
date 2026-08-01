@@ -9,7 +9,10 @@ import secrets
 import time
 from typing import Any
 
-from gateway.session_context import get_session_env
+from gateway.session_context import (
+    get_session_env,
+    record_cron_functional_error,
+)
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import compile_and_delegate
 from proactive.hubops_routing import (
@@ -71,10 +74,42 @@ def _approval_token_candidate(message_text: str) -> str:
     return match.group(1) if match is not None else ""
 
 
+def _requires_structured_facebook_crosspost(
+    task_type: str,
+    external_targets: list[str],
+) -> bool:
+    """Identify Marketplace-to-group publishing before issuing approval."""
+    if str(task_type or "").strip().casefold() != "browser_publish":
+        return False
+    target_text = " ".join(external_targets).casefold()
+    has_marketplace_source = (
+        "marketplace" in target_text
+        or "市集" in target_text
+        or "/marketplace/item/" in target_text
+    )
+    has_group_destination = (
+        "group" in target_text
+        or "社團" in target_text
+        or "/groups/" in target_text
+    )
+    return (
+        "facebook" in target_text
+        and has_marketplace_source
+        and has_group_destination
+    )
+
+
 _GOAL = {
     "type": "object",
     "properties": {
-        "objective": {"type": "string"},
+        "objective": {
+            "type": "string",
+            "description": (
+                "Post-approval task outcome for the delegated worker. Never "
+                "use approval challenge, checkpoint, or token creation as the "
+                "worker objective; clawops_delegate creates that artifact."
+            ),
+        },
         "deliverables": _LIST,
         "non_goals": _LIST,
     },
@@ -160,6 +195,35 @@ CLAWOPS_DELEGATE_PARAMETERS = {
             "description": (
                 "Exact external platforms or destinations affected by a "
                 "controlled external action; required when approval is needed."
+            ),
+        },
+        "facebook_crosspost": {
+            "type": "object",
+            "properties": {
+                "marketplace_listing_id": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$",
+                    "description": (
+                        "Exact existing Facebook Marketplace listing id."
+                    ),
+                },
+                "group_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[0-9]+$"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": (
+                        "Exact Facebook group ids selected through List in "
+                        "more places."
+                    ),
+                },
+            },
+            "required": ["marketplace_listing_id", "group_ids"],
+            "additionalProperties": False,
+            "description": (
+                "Required for an existing Marketplace listing cross-post to "
+                "Facebook groups. The approval fingerprint binds both the "
+                "source listing and every destination group."
             ),
         },
         "request_instance_id": {
@@ -286,7 +350,7 @@ def _canonical_sections(args: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _resolve_completed_callback_board(
+def _resolve_callback_approval_board(
     *,
     review_task_id: str,
     event_id: int,
@@ -301,7 +365,7 @@ def _resolve_completed_callback_board(
         slug = str(metadata.get("slug") or kb.DEFAULT_BOARD)
         try:
             with kb.connect_closing(board=slug) as conn:
-                kb.validate_completed_approval_blocker(
+                kb.validate_delivered_grace_callback_approval_origin(
                     conn,
                     review_task_id=review_task_id,
                     event_id=event_id,
@@ -313,9 +377,13 @@ def _resolve_completed_callback_board(
         except (ValueError, OSError):
             continue
         matches.append(slug)
-    if len(matches) != 1:
+    if not matches:
         raise ValueError(
-            "Fresh callback approval must resolve to exactly one durable board."
+            "Fresh callback approval origin is not valid on any durable board."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Fresh callback approval origin resolved to multiple durable boards."
         )
     return matches[0]
 
@@ -337,6 +405,24 @@ def _resolve_approval_challenge(token: str) -> tuple[str, dict[str, Any]]:
             "Approval token must resolve to exactly one durable board."
         )
     return matches[0]
+
+
+def recover_clawops_approval_args(token: str) -> dict[str, Any] | None:
+    """Recover the exact delegate arguments persisted with a durable token."""
+    _board, challenge = _resolve_approval_challenge(token)
+    raw_args = str(challenge.get("delegation_args") or "").strip()
+    if not raw_args:
+        return None
+    try:
+        recovered = json.loads(raw_args)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(recovered, dict):
+        return None
+    recovered.pop("approval_token", None)
+    recovered.pop("_approval_refresh_token", None)
+    recovered["approved"] = False
+    return recovered
 
 
 def _queued_delegation_replay(
@@ -392,11 +478,14 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     ).strip()
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
     session_platform = platform
+    session_source = get_session_env("HERMES_SESSION_SOURCE", "").strip().lower()
+    scheduled_turn = session_source == "cron" or session_platform == "cron"
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
     user_id = get_session_env("HERMES_SESSION_USER_ID", "")
     session_key = get_session_env("HERMES_SESSION_KEY", "")
     session_id = get_session_env("HERMES_SESSION_ID", "")
+    trusted_cron_session_id = session_id if session_source == "cron" else ""
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
     internal_turn = (
@@ -462,11 +551,24 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "approval_token; it cannot be treated as a fresh request."
             )
         approval_challenge: dict[str, Any] | None = None
+        approval_board = ""
         challenge_lookup_token = approval_token or approval_refresh_token
         if challenge_lookup_token and not internal_turn:
             approval_board, approval_challenge = _resolve_approval_challenge(
                 challenge_lookup_token,
             )
+            if (
+                approval_challenge.get("platform") != platform
+                or approval_challenge.get("chat_id") != chat_id
+                or approval_challenge.get("thread_id") != thread_id
+                or approval_challenge.get("session_key") != session_key
+            ):
+                raise ValueError(
+                    "Approval token is bound to another conversation lane: "
+                    f"{approval_challenge.get('platform')}/"
+                    f"{approval_challenge.get('chat_id')}/thread/"
+                    f"{approval_challenge.get('thread_id')}."
+                )
             challenge_review_id = str(
                 approval_challenge.get("origin_review_task_id") or ""
             ).strip()
@@ -512,19 +614,33 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         project = str(context["project"])
         topic_name = str(context["topic_name"])
         namespace = str(context.get("memory_namespace") or f"topic:{chat_id}:{thread_id}/{project}")
+        scheduled_identity = (
+            {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "project": project,
+                "topic_name": topic_name,
+                "memory_namespace": namespace,
+            }
+            if scheduled_turn
+            else {}
+        )
         if (
             not internal_turn
             and origin_review_id
             and origin_event_id is not None
         ):
-            resolved_board = _resolve_completed_callback_board(
-                review_task_id=origin_review_id,
-                event_id=origin_event_id,
-                platform=platform,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                session_id=session_id,
-            )
+            resolved_board = approval_board
+            if approval_challenge is None:
+                resolved_board = _resolve_callback_approval_board(
+                    review_task_id=origin_review_id,
+                    event_id=origin_event_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    session_id=session_id,
+                )
             if (
                 requested_callback_board
                 and requested_callback_board != resolved_board
@@ -535,13 +651,37 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             board = None if resolved_board == kb.DEFAULT_BOARD else resolved_board
         elif requested_callback_board:
             board = requested_callback_board
-        if session_platform == "cron":
-            scheduled_identity = str(args.get("context_alias") or project).strip()
-            session_key = session_key or f"cron:{scheduled_identity}"
-            session_id = session_id or f"cron:{scheduled_identity}"
+        if scheduled_turn:
+            session_key = session_key or f"cron:{project}"
+            session_id = session_id or f"cron:{project}"
         goal, scope, verification, stop_rules, memory = _canonical_sections(args)
         task_type = str(args.get("task_type") or "")
         risk_level = str(args.get("risk_level") or "")
+        external_targets = [
+            str(item).strip()
+            for item in list(args.get("external_targets") or [])
+            if str(item).strip()
+        ]
+        raw_facebook_crosspost = args.get("facebook_crosspost")
+        facebook_crosspost = (
+            json.loads(json.dumps(raw_facebook_crosspost))
+            if isinstance(raw_facebook_crosspost, dict)
+            else None
+        )
+        if _requires_structured_facebook_crosspost(
+            task_type,
+            external_targets,
+        ) and facebook_crosspost is None:
+            raise ValueError(
+                "Facebook Marketplace group cross-post approval requires "
+                "facebook_crosspost.marketplace_listing_id and exact "
+                "facebook_crosspost.group_ids before an approval token can "
+                "be issued."
+            )
+        if facebook_crosspost is not None and task_type != "browser_publish":
+            raise ValueError(
+                "facebook_crosspost is only valid for task_type=browser_publish."
+            )
         supplied_request_instance = str(
             args.get("request_instance_id") or ""
         ).strip()
@@ -575,7 +715,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     f"{origin_review_id}:{origin_event_id}"
                 ).encode("utf-8")
             ).hexdigest()[:32]
-        elif session_platform != "cron" and message_id:
+        elif not scheduled_turn and message_id:
             request_instance_id = "gri_" + hashlib.sha256(
                 (
                     f"message:{session_platform}:{session_key}:{message_id}"
@@ -589,7 +729,54 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "Chat request_instance_id must match the authenticated "
                     "message-derived instance."
                 )
-        elif session_platform == "cron" and supplied_request_instance:
+        elif scheduled_turn and trusted_cron_session_id:
+            scheduled_contract_discriminator = hashlib.sha256(
+                json.dumps(
+                    {
+                        "identity": scheduled_identity,
+                        "board": str(board or "default"),
+                        "original_request": str(
+                            args.get("original_request") or ""
+                        ).strip(),
+                        "grace_interpretation": str(
+                            args.get("grace_interpretation") or ""
+                        ).strip(),
+                        "trigger": str(args.get("trigger") or "").strip(),
+                        "goal": goal,
+                        "scope": scope,
+                        "verification": verification,
+                        "stop_rules": stop_rules,
+                        "memory": memory,
+                        "task_type": task_type,
+                        "risk_level": risk_level,
+                        "completion_mode": str(
+                            args.get("completion_mode") or ""
+                        ).strip(),
+                        "external_targets": external_targets,
+                        "facebook_crosspost": facebook_crosspost,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            request_instance_id = "gri_" + hashlib.sha256(
+                (
+                    f"cron:{trusted_cron_session_id}:"
+                    f"{scheduled_contract_discriminator}"
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            if (
+                supplied_request_instance
+                and supplied_request_instance != request_instance_id
+            ):
+                raise ValueError(
+                    "Scheduled request_instance_id must match the trusted "
+                    "scheduler-derived instance."
+                )
+        elif scheduled_turn and supplied_request_instance:
+            # Compatibility for direct scheduled callers that predate the
+            # trusted HERMES_SESSION_SOURCE/session-id binding.
             request_instance_id = supplied_request_instance
         else:
             raise ValueError(
@@ -607,7 +794,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "request_instance_id": request_instance_id,
                 "requested_by": (
                     "trusted_scheduled_job"
-                    if session_platform == "cron"
+                    if scheduled_turn
                     else "authenticated_user"
                 ),
                 "compiled_by": "Grace",
@@ -630,13 +817,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             },
             "completion_mode": str(args.get("completion_mode") or "").strip(),
         }
-        external_targets = [
-            str(item).strip()
-            for item in list(args.get("external_targets") or [])
-            if str(item).strip()
-        ]
         if external_targets:
             contract["external_targets"] = external_targets
+        if facebook_crosspost is not None:
+            contract["facebook_crosspost"] = facebook_crosspost
         preliminary_contract = validate_loop_contract(contract)
         preliminary_fingerprint = contract_fingerprint(preliminary_contract)
         routing_preview = route_clawops_objective(
@@ -657,7 +841,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         contract["routing"]["resolved"] = resolved_route_binding(routing_preview)
         normalized_contract = validate_loop_contract(contract)
         exact_fingerprint = contract_fingerprint(normalized_contract)
-        approval_needed = route_requires_owner_approval(routing_preview)
+        approval_needed = (
+            bool(external_targets)
+            or route_requires_owner_approval(routing_preview)
+        )
         approval_scope = list(scope.get("allowed") or [])
         approval_platform = "、".join(external_targets)
         approval_scope_json = json.dumps(
@@ -778,7 +965,6 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 or approval_challenge.get("chat_id") != chat_id
                 or approval_challenge.get("thread_id") != thread_id
                 or approval_challenge.get("session_key") != session_key
-                or approval_challenge.get("session_id") != session_id
                 or approval_challenge.get("user_id_sha256")
                 != expected_user_hash
                 or approval_challenge.get("approval_platform")
@@ -818,16 +1004,73 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     session_id=session_id,
                     lease_owner=callback_lease_owner,
                 )
-                kb.validate_accepted_grace_callback_origin(
-                    conn,
-                    review_task_id=origin_review_id,
-                    event_id=origin_event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                    lease_owner=callback_lease_owner,
+                execution_blocker_origin = (
+                    kb.is_grace_callback_execution_blocker_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
                 )
+                if execution_blocker_origin:
+                    approval_needed = True
+                if approval_needed:
+                    kb.validate_grace_callback_approval_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
+                    (
+                        source_crosspost_listing_id,
+                        source_crosspost_group_ids,
+                    ) = kb.accepted_grace_callback_facebook_crosspost_scope(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                    )
+                    if (
+                        source_crosspost_listing_id is not None
+                        and source_crosspost_group_ids
+                        and facebook_crosspost is None
+                    ):
+                        raise ValueError(
+                            "Origin callback locks an exact Facebook cross-post "
+                            "scope; facebook_crosspost cannot be omitted."
+                        )
+                    if facebook_crosspost is not None:
+                        kb.validate_grace_callback_facebook_crosspost_scope(
+                            conn,
+                            review_task_id=origin_review_id,
+                            event_id=origin_event_id,
+                            listing_id=str(
+                                facebook_crosspost.get(
+                                    "marketplace_listing_id"
+                                ) or ""
+                            ),
+                            group_ids=list(
+                                facebook_crosspost.get("group_ids") or []
+                            ),
+                        )
+                else:
+                    kb.validate_accepted_grace_callback_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
         elif (
             origin_review_id
             or origin_event_id is not None
@@ -841,19 +1084,20 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 raise ValueError(
                     "Fresh callback approval requires review id, event id, and board."
                 )
-            with kb.connect_closing(board=board) as conn:
-                kb.validate_completed_approval_blocker(
-                    conn,
-                    review_task_id=origin_review_id,
-                    event_id=origin_event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                )
+            if approval_challenge is None:
+                with kb.connect_closing(board=board) as conn:
+                    kb.validate_delivered_grace_callback_approval_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                    )
         effective_approved = False
         approval_provenance: dict[str, Any] = {}
-        if session_platform == "cron" and approval_needed:
+        if scheduled_turn and approval_needed:
             raise ValueError(
                 "Scheduled jobs cannot authorize external actions with approved=true. "
                 "A persisted owner approval bound to this exact contract is required."
@@ -862,8 +1106,23 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             raise ValueError(
                 "External-action delegation requires explicit external_targets."
             )
-        if session_platform != "cron" and approval_needed:
-            if not message_id or not session_key or not session_id:
+        if not scheduled_turn and approval_needed:
+            approval_request_message_id = message_id
+            if (
+                internal_turn
+                and not approval_request_message_id
+                and origin_review_id
+                and origin_event_id is not None
+            ):
+                approval_request_message_id = (
+                    f"callback:{board or kb.DEFAULT_BOARD}:"
+                    f"{origin_review_id}:{origin_event_id}"
+                )
+            if (
+                not approval_request_message_id
+                or not session_key
+                or not session_id
+            ):
                 raise ValueError(
                     "External-action approval requires an authenticated user context "
                     "and durable session/message identifiers."
@@ -898,7 +1157,19 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     board=board,
                 )
                 if replay is not None:
+                    if scheduled_turn:
+                        record_cron_functional_error("")
                     return replay
+                approval_replay_args = dict(args)
+                approval_replay_args.pop("approval_token", None)
+                approval_replay_args.pop("_approval_refresh_token", None)
+                approval_replay_args["approved"] = False
+                approval_replay_args_json = json.dumps(
+                    approval_replay_args,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
                 with kb.connect_closing(board=board) as conn:
                     challenge = kb.create_grace_approval_challenge(
                         conn,
@@ -910,10 +1181,11 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_key=session_key,
                         session_id=session_id,
                         user_id_sha256=user_id_sha256,
-                        requested_message_id=message_id,
+                        requested_message_id=approval_request_message_id,
                         action_summary=str(goal.get("objective") or "").strip(),
                         approval_platform=approval_platform,
                         approval_scope=approval_scope_json,
+                        delegation_args=approval_replay_args_json,
                         origin_review_task_id=origin_review_id,
                         origin_event_id=origin_event_id,
                         callback_lease_owner=(
@@ -1008,6 +1280,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             board=board,
         )
         if replay is not None:
+            if scheduled_turn:
+                record_cron_functional_error("")
             return replay
         delegation_id = str(delegation["delegation_id"])
         build_owner = "builder_" + secrets.token_hex(12)
@@ -1052,10 +1326,21 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             raise
     except (ValueError, TypeError, RuntimeError) as exc:
+        reason = str(exc).strip() or type(exc).__name__
+        if scheduled_turn:
+            record_cron_functional_error(reason)
         return json.dumps(
-            {"status": "rejected", "reason": str(exc), "task_created": False},
+            {"status": "rejected", "reason": reason, "task_created": False},
             ensure_ascii=False,
         )
+    except Exception as exc:
+        if scheduled_turn:
+            record_cron_functional_error(
+                str(exc).strip() or type(exc).__name__
+            )
+        raise
+    if scheduled_turn:
+        record_cron_functional_error("")
     return json.dumps(
         {
             "status": "queued",

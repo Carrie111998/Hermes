@@ -863,5 +863,3 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
 
-
-

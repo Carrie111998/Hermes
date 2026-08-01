@@ -39,7 +39,12 @@ def _resolve_cdp_endpoint() -> str:
 
 
 def _node_command() -> Optional[str]:
-    return shutil.which("node")
+    try:
+        from hermes_constants import find_node_executable
+
+        return find_node_executable("node")
+    except Exception:
+        return shutil.which("node")
 
 
 def _normalise_files(files: Iterable[str]) -> List[str]:
@@ -114,7 +119,55 @@ async function main() {
       throw new Error(`input_index=${inputIndex} is outside the ${count} matching inputs`);
     }
     const locator = page.locator(payload.selector).nth(inputIndex);
+    const elementHandle = await locator.elementHandle();
+    if (!elementHandle) {
+      throw new Error("Selected file input disappeared before safety inspection");
+    }
+    const pageIdentity = await elementHandle.evaluate((element) => {
+      const view = element.ownerDocument.defaultView;
+      if (!view) {
+        throw new Error("Selected file input is detached from a live document");
+      }
+      return `${view.location.href}|${view.performance.timeOrigin}`;
+    });
 
+    if (payload.inspectOnly) {
+      return {
+        success: true,
+        inspectOnly: true,
+        selector: payload.selector,
+        matchingPages: matchingPages.length,
+        pageIndex,
+        matchingInputs: count,
+        inputIndex,
+        targetUrl: page.url(),
+        pageIdentity,
+        targetTitle: await page.title().catch(() => ""),
+      };
+    }
+    if (payload.guardedTargetUrl && page.url() !== payload.guardedTargetUrl) {
+      throw new Error(
+        `Selected page changed after safety inspection: ` +
+        `${JSON.stringify(payload.guardedTargetUrl)} -> ${JSON.stringify(page.url())}`
+      );
+    }
+    const currentPageIdentity = await elementHandle.evaluate((element) => {
+      const view = element.ownerDocument.defaultView;
+      if (!view) {
+        throw new Error("Selected file input is detached from a live document");
+      }
+      return `${view.location.href}|${view.performance.timeOrigin}`;
+    });
+    if (
+      payload.guardedPageIdentity &&
+      currentPageIdentity !== payload.guardedPageIdentity
+    ) {
+      throw new Error(
+        `Selected page load changed after safety inspection: ` +
+        `${JSON.stringify(payload.guardedPageIdentity)} -> ` +
+        `${JSON.stringify(currentPageIdentity)}`
+      );
+    }
     if (payload.verifyTextContains) {
       const markerAlreadyPresent = await page.evaluate(
         (expected) => (document.body ? document.body.innerText : "").includes(expected),
@@ -127,7 +180,7 @@ async function main() {
         );
       }
     }
-    await locator.setInputFiles(payload.files);
+    await elementHandle.setInputFiles(payload.files);
     await page.waitForTimeout(payload.settleMs);
     if (payload.verifyTextContains) {
       await page.waitForFunction(
@@ -293,14 +346,100 @@ def browser_upload_files(
         "verifyTextContains": str(verify_text_contains or ""),
         "verifyTimeoutMs": max(1000, min(int(verify_timeout_ms or 0), 120000)),
         "settleMs": max(0, min(int(settle_ms or 0), 30000)),
+        "inspectOnly": False,
+        "guardedTargetUrl": "",
+        "guardedPageIdentity": "",
     }
 
-    try:
-        proc = _run_playwright_upload(payload, safe_timeout)
-    except subprocess.TimeoutExpired:
-        return tool_error(f"browser_upload_files timed out after {safe_timeout}s")
-    except Exception as exc:
-        return tool_error(f"browser_upload_files failed before upload: {exc}")
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    grace_execution_task = False
+    if kanban_task_id:
+        try:
+            from hermes_cli import kanban_db as _kanban_db
+
+            with _kanban_db.connect_closing() as _scope_conn:
+                grace_execution_task = _kanban_db.is_grace_execution_task(
+                    _scope_conn,
+                    kanban_task_id,
+                )
+        except Exception as exc:
+            return tool_error(
+                "Upload safety scope check failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    proc = None
+    if grace_execution_task:
+        inspection_payload = dict(payload)
+        inspection_payload["files"] = []
+        inspection_payload["verifyTextContains"] = ""
+        inspection_payload["inspectOnly"] = True
+        try:
+            inspection_proc = _run_playwright_upload(
+                inspection_payload, safe_timeout,
+            )
+            inspection = (
+                json.loads((inspection_proc.stdout or "").strip())
+                if inspection_proc.stdout else {}
+            )
+        except subprocess.TimeoutExpired:
+            return tool_error(
+                f"browser_upload_files safety inspection timed out after "
+                f"{safe_timeout}s"
+            )
+        except Exception as exc:
+            return tool_error(
+                "External create safety inspection failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if inspection_proc.returncode != 0 or not inspection.get("success"):
+            return tool_error(
+                inspection.get("error")
+                or (inspection_proc.stderr or "").strip()
+                or "Upload target safety inspection failed"
+            )
+        actual_target_url = str(inspection.get("targetUrl") or "")
+        actual_page_identity = str(inspection.get("pageIdentity") or "")
+        if not actual_target_url or not actual_page_identity:
+            return tool_error(
+                "External create safety inspection failed closed: "
+                "selected page identity was unavailable"
+            )
+        payload["guardedTargetUrl"] = actual_target_url
+        payload["guardedPageIdentity"] = actual_page_identity
+        try:
+            raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+            expected_run_id = int(raw_run_id) if raw_run_id else None
+            with _kanban_db.connect_closing() as _guard_conn:
+                with _kanban_db.write_txn(_guard_conn):
+                    guard_error = _kanban_db.external_create_mutation_guard(
+                        _guard_conn,
+                        kanban_task_id,
+                        actual_target_url,
+                        expected_run_id=expected_run_id,
+                        page_identity=actual_page_identity,
+                    )
+                    if guard_error:
+                        return tool_error(guard_error)
+                    proc = _run_playwright_upload(payload, safe_timeout)
+        except subprocess.TimeoutExpired:
+            return tool_error(
+                f"browser_upload_files timed out after {safe_timeout}s"
+            )
+        except Exception as exc:
+            return tool_error(
+                "External create safety check failed closed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if proc is None:
+        try:
+            proc = _run_playwright_upload(payload, safe_timeout)
+        except subprocess.TimeoutExpired:
+            return tool_error(
+                f"browser_upload_files timed out after {safe_timeout}s"
+            )
+        except Exception as exc:
+            return tool_error(f"browser_upload_files failed before upload: {exc}")
 
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
@@ -387,7 +526,13 @@ BROWSER_UPLOAD_FILES_SCHEMA: Dict[str, Any] = {
 
 
 def _browser_upload_files_check() -> bool:
-    return bool(_resolve_cdp_endpoint() and _node_command())
+    # Tool schemas are fixed when an agent is initialized, while both the CDP
+    # endpoint and the effective Node PATH can settle later in the worker
+    # startup sequence. Hiding this tool on a transient check failure makes it
+    # permanently unavailable for the rest of that turn. Keep the schema
+    # visible and let browser_upload_files report a concrete call-time error
+    # for a missing endpoint or Node executable.
+    return True
 
 
 registry.register(

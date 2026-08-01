@@ -105,6 +105,11 @@ _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY"
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+# Mutable per-run state shared with copied tool-executor contexts. ContextVar
+# assignments made inside a copied thread context do not flow back to the
+# scheduler, but mutations to this per-job dict do. This lets a scheduled tool
+# surface a functional failure even when the model turn itself ends normally.
+_CRON_RUN_STATE: ContextVar = ContextVar("HERMES_CRON_RUN_STATE", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -204,6 +209,33 @@ def set_session_vars(
     return tokens
 
 
+def begin_cron_run_state() -> dict[str, str]:
+    """Create isolated mutable outcome state for one scheduled agent run."""
+    state: dict[str, str] = {}
+    _CRON_RUN_STATE.set(state)
+    return state
+
+
+def record_cron_functional_error(message: str = "") -> None:
+    """Record or clear the current cron run's tool-level functional error."""
+    state = _CRON_RUN_STATE.get()
+    if not isinstance(state, dict):
+        return
+    normalized = str(message or "").strip()
+    if normalized:
+        state["functional_error"] = normalized
+    else:
+        state.pop("functional_error", None)
+
+
+def get_cron_functional_error() -> str:
+    """Return a tool-level functional error recorded for this cron run."""
+    state = _CRON_RUN_STATE.get()
+    if not isinstance(state, dict):
+        return ""
+    return str(state.get("functional_error") or "").strip()
+
+
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared.
 
@@ -238,6 +270,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CRON_RUN_STATE.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

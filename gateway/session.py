@@ -140,6 +140,12 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Trusted, process-local display overrides resolved from operator config
+    # for the current channel/topic. Deliberately excluded from wire and
+    # persistence serialization so inbound payloads cannot choose presentation
+    # behavior such as token streaming. Kept last for positional compatibility.
+    display_overrides: Optional[Dict[str, Any]] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other

@@ -3104,6 +3104,11 @@ def test_default_spawn_records_passing_capability_preflight(
         assert audit["ok"] is True
         assert audit["toolsets"] == ["file"]
         assert audit["command"] == captured["cmd"]
+        query = captured["cmd"][-1]
+        assert "RUNTIME_CAPABILITY_ATTESTATION" in query
+        assert "read_file" in query
+        assert "Prior attempt summaries or blocker reports" in query
+        assert "actual tool call returns a concrete error" in query
     finally:
         conn.close()
 
@@ -3960,6 +3965,160 @@ def test_gateway_dispatcher_watcher_env_truthy_uses_config(monkeypatch):
             timeout=3.0,
         )
     )
+
+
+def test_gateway_backend_poller_runs_without_gateway_dispatch(
+    monkeypatch,
+):
+    """External polling stays active when Hermes dispatch is external."""
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+    import proactive.backend_poll_worker as _poll_worker
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    poll_calls = []
+    poll_completed = threading.Event()
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {"kanban": None},
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    def _poll(*, board, limit):
+        assert limit == 1
+        poll_calls.append(board)
+        poll_completed.set()
+        runner._running = False
+        return SimpleNamespace(
+            claimed=1,
+            observed=1,
+            terminal=0,
+            retried=0,
+            errors=(),
+        )
+
+    monkeypatch.setattr(_poll_worker, "poll_due_openclaw_runs", _poll)
+
+    asyncio.run(runner._kanban_backend_poller_watcher())
+
+    assert poll_completed.wait(timeout=1)
+    assert poll_calls == [_kb.DEFAULT_BOARD]
+
+
+def test_gateway_backend_poller_bounds_cross_board_workers(monkeypatch):
+    """The watcher never creates more active workers than configured."""
+    import asyncio
+
+    from gateway import kanban_watchers
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    submitted = []
+    shutdown_calls = []
+    pending_futures = []
+    sleep_calls = 0
+
+    class PendingFuture:
+        def __init__(self):
+            self.completed = False
+
+        def done(self):
+            return self.completed
+
+    class FakePool:
+        def __init__(self, *, max_workers, thread_name_prefix):
+            assert max_workers == 2
+            assert thread_name_prefix == "kanban-backend-poll"
+
+        def submit(self, function, slug):
+            submitted.append((function, slug))
+            future = PendingFuture()
+            pending_futures.append(future)
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            shutdown_calls.append((wait, cancel_futures))
+
+    async def finish_first_batch_then_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        for future in pending_futures:
+            future.completed = True
+        if sleep_calls >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "backend_poll_interval_seconds": 1,
+                "backend_poll_max_workers": 2,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [
+            {"slug": f"board-{index}"} for index in range(10)
+        ],
+    )
+    monkeypatch.setattr(
+        kanban_watchers.concurrent.futures,
+        "ThreadPoolExecutor",
+        FakePool,
+    )
+    monkeypatch.setattr(
+        kanban_watchers.asyncio,
+        "sleep",
+        finish_first_batch_then_stop,
+    )
+
+    asyncio.run(runner._kanban_backend_poller_watcher())
+
+    assert [slug for _function, slug in submitted] == [
+        "board-0",
+        "board-1",
+        "board-2",
+        "board-3",
+    ]
+    assert shutdown_calls == [(False, True)]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 2.0),
+        (0, 2.0),
+        (0.25, 1.0),
+        (5, 5.0),
+        (float("nan"), 2.0),
+        (float("inf"), 2.0),
+        (10**1000, 2.0),
+        ("not-a-number", 2.0),
+    ],
+)
+def test_gateway_backend_poll_interval_is_finite(value, expected):
+    from gateway.kanban_watchers import _resolve_backend_poll_interval
+
+    assert _resolve_backend_poll_interval(
+        {"backend_poll_interval_seconds": value}
+    ) == expected
 
 
 @pytest.mark.parametrize("corrupt_exc", ["sqlite", "guard"])

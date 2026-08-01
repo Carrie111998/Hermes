@@ -1096,6 +1096,24 @@ def _find_bound_clawops_approval_args(
     return None
 
 
+def _recover_bound_clawops_approval_args(
+    messages: List[Dict[str, Any]],
+    approval_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Recover approval args from history, then the authoritative durable row."""
+    recovered = _find_bound_clawops_approval_args(messages, approval_token)
+    if recovered is not None:
+        return recovered
+    try:
+        from plugins.openclaw_bridge.clawops_delegate import (
+            recover_clawops_approval_args,
+        )
+
+        return recover_clawops_approval_args(approval_token)
+    except (OSError, ValueError):
+        return None
+
+
 def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
@@ -6624,6 +6642,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
+        # External backend polling owns separate leases and must remain active
+        # even when Hermes dispatch is hosted by an external daemon.
+        asyncio.create_task(self._kanban_backend_poller_watcher())
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -9747,6 +9768,353 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _start_response_fast_lane(
+        self,
+        event: MessageEvent,
+    ) -> Optional[Dict[str, Any]]:
+        """Start a configured stateless response lane outside the agent session."""
+        event_text = getattr(event, "text", None)
+        if bool(event.is_command()):
+            return None
+
+        # Approval tokens are protocol messages, not translation content. They
+        # must bypass response-profile validation so a broken Topic binding
+        # cannot block the authorization protocol itself.
+        try:
+            from proactive.prompt_policy import approval_token_candidate
+
+            if approval_token_candidate(str(event_text or "").strip()):
+                return None
+        except Exception:
+            logger.debug(
+                "Fast translation approval-token check failed; skipping lane",
+                exc_info=True,
+            )
+            return None
+
+        from gateway.response_profiles import (
+            ResponseProfileConfigurationError,
+            eligible_fast_lane_text,
+            legacy_fast_translation_profile,
+            normalized_fast_lane_source,
+            normalize_response_profile,
+            prepare_fast_lane,
+        )
+
+        raw_profile = getattr(event, "response_profile", None)
+        if (
+            isinstance(raw_profile, dict)
+            and raw_profile.get("strategy") == "configuration_error"
+        ):
+            profile_name = str(raw_profile.get("name") or "unknown")
+            error = str(raw_profile.get("error") or "invalid configuration")
+            raise ResponseProfileConfigurationError(
+                f"{profile_name}: {error}",
+            )
+        profile = normalize_response_profile(
+            raw_profile,
+        )
+        if raw_profile is not None and profile is None:
+            raise ResponseProfileConfigurationError(
+                "explicit response_profile is invalid",
+            )
+        if raw_profile is None:
+            profile = legacy_fast_translation_profile(
+                getattr(event, "fast_translation", None),
+            )
+        if profile is None or profile["strategy"] != "fast_then_default":
+            return None
+
+        text = eligible_fast_lane_text(
+            profile,
+            event_text,
+            is_command=bool(event.is_command()),
+            has_media=bool(getattr(event, "media_urls", None)),
+        )
+        started_at = time.monotonic()
+        fallback_text = str(event_text or "").strip()
+        if not fallback_text:
+            return None
+        runner, config, failed_lane_prompt = prepare_fast_lane(
+            profile,
+            text or fallback_text,
+        )
+        source_text = normalized_fast_lane_source(
+            profile,
+            text or fallback_text,
+        )
+        if text is None:
+            logger.info(
+                "Response fast lane ineligible; routing configured fallback: "
+                "profile=%s platform=%s chat=%s thread=%s chars=%d",
+                profile.get("name", "legacy"),
+                getattr(getattr(event.source, "platform", None), "value", ""),
+                getattr(event.source, "chat_id", ""),
+                getattr(event.source, "thread_id", ""),
+                len(fallback_text),
+            )
+            return {
+                "task": None,
+                "started_at": started_at,
+                "delivery_timeout": config["delivery_timeout"],
+                "failed_lane_prompt": failed_lane_prompt,
+                "profile": profile,
+                "source_text": source_text,
+            }
+        task = asyncio.create_task(
+            runner(text, config),
+        )
+        logger.info(
+            "Response fast lane started: profile=%s handler=%s "
+            "platform=%s chat=%s thread=%s chars=%d",
+            profile.get("name", "legacy"),
+            config["handler"],
+            getattr(getattr(event.source, "platform", None), "value", ""),
+            getattr(event.source, "chat_id", ""),
+            getattr(event.source, "thread_id", ""),
+            len(text),
+        )
+        return {
+            "task": task,
+            "started_at": started_at,
+            "delivery_timeout": config["delivery_timeout"],
+            "failed_lane_prompt": failed_lane_prompt,
+            "profile": profile,
+            "source_text": source_text,
+        }
+
+    def _start_fast_translation(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Backward-compatible alias for tests and third-party extensions."""
+        return self._start_response_fast_lane(event)
+
+    def _load_response_detail_skill_prompt(
+        self,
+        profile: Dict[str, Any],
+        delivery_status: Optional[str],
+        *,
+        task_id: str,
+    ) -> Optional[str]:
+        """Load the outcome-selected detail skill as an ephemeral system prompt."""
+        from gateway.response_profiles import (
+            ResponseProfileConfigurationError,
+            detail_lane_skill,
+        )
+
+        skill_name = detail_lane_skill(profile, delivery_status)
+        if not skill_name:
+            return None
+        try:
+            from agent.skill_commands import (
+                _build_skill_message,
+                _load_skill_payload,
+            )
+
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                raise ResponseProfileConfigurationError(
+                    f"required detail-lane skill not found: {skill_name}",
+                )
+            loaded_skill, skill_dir, display_name = loaded
+            note = (
+                f'[IMPORTANT: The "{display_name}" skill is selected '
+                "ephemerally by the trusted Topic response profile for this "
+                "turn. Follow it without changing the durable session skill.]"
+            )
+            prompt = _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                note,
+            )
+            logger.info(
+                "Response detail lane selected ephemeral skill: "
+                "profile=%s status=%s skill=%s",
+                profile.get("name", "legacy"),
+                delivery_status or "failed",
+                skill_name,
+            )
+            if not prompt:
+                raise ResponseProfileConfigurationError(
+                    f"required detail-lane skill is empty: {skill_name}",
+                )
+            return prompt
+        except ResponseProfileConfigurationError:
+            raise
+        except Exception as exc:
+            raise ResponseProfileConfigurationError(
+                f"failed to load required detail-lane skill {skill_name}: {exc}",
+            ) from exc
+
+    async def _deliver_response_fast_lane(
+        self,
+        job: Optional[Dict[str, Any]],
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Return ``delivered``, ``ambiguous``, or ``None`` for definite failure."""
+        if not job:
+            return None
+
+        task = job["task"]
+        if task is None:
+            return None
+        elapsed = time.monotonic() - float(job["started_at"])
+        remaining = max(0.05, float(job["delivery_timeout"]) - elapsed)
+        try:
+            raw_output = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            task.cancel()
+            # Await cancellation so the async HTTP request is torn down before
+            # the ordinary lane continues; unlike to_thread, this does not
+            # leave provider work running in a shared executor.
+            await asyncio.gather(task, return_exceptions=True)
+            logger.warning(
+                "Fast translation exceeded %.1fs delivery budget; "
+                "continuing with conversational lane",
+                float(job["delivery_timeout"]),
+            )
+            return None
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Fast translation failed; continuing with conversational lane: %s",
+                exc,
+            )
+            return None
+
+        from gateway.response_profiles import (
+            clean_fast_lane_output,
+            format_fast_lane_output,
+        )
+
+        profile = job["profile"]
+        fast_output = clean_fast_lane_output(profile, raw_output)
+        if fast_output is None:
+            logger.warning(
+                "Response fast lane returned unusable output; "
+                "continuing with conversational lane",
+            )
+            return None
+        formatted_fast_output = format_fast_lane_output(
+            profile,
+            fast_output,
+        )
+        job["formatted_output"] = formatted_fast_output
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            logger.warning(
+                "Fast translation adapter unavailable; "
+                "continuing with conversational lane",
+            )
+            return None
+
+        metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        )
+        metadata = dict(metadata or {})
+        metadata["plain_text"] = True
+        send_remaining = (
+            float(job["delivery_timeout"])
+            - (time.monotonic() - float(job["started_at"]))
+        )
+        if send_remaining <= 0:
+            logger.warning(
+                "Fast translation exhausted its delivery budget before send; "
+                "continuing with conversational lane",
+            )
+            return None
+        metadata["send_timeout"] = send_remaining
+        bounded_send = getattr(
+            adapter,
+            "send_with_delivery_deadline",
+            None,
+        )
+        if not callable(bounded_send):
+            logger.warning(
+                "Response fast-lane adapter has no classified delivery "
+                "deadline capability; continuing with conversational lane",
+            )
+            return None
+        try:
+            send_result = await bounded_send(
+                source.chat_id,
+                formatted_fast_output,
+                metadata=metadata,
+                timeout=send_remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Response fast-lane classified adapter unexpectedly raised a "
+                "timeout; continuing with the definite-failure fallback",
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Response fast-lane classified adapter raised instead of "
+                "returning delivery evidence; "
+                "continuing with the definite-failure translation fallback: %s",
+                exc,
+            )
+            return None
+        if not getattr(send_result, "success", False):
+            if getattr(send_result, "delivery_ambiguous", False):
+                logger.warning(
+                    "Fast translation adapter reported ambiguous delivery; "
+                    "continuing without a duplicate standalone translation: %s",
+                    getattr(send_result, "error", "unknown error"),
+                )
+                return "ambiguous"
+            logger.warning(
+                "Fast translation delivery rejected; "
+                "continuing with conversational lane: %s",
+                getattr(send_result, "error", "unknown error"),
+            )
+            return None
+
+        logger.info(
+            "Response fast lane delivered: profile=%s handler=%s "
+            "platform=%s chat=%s thread=%s "
+            "time=%.1fs chars=%d",
+            profile.get("name", "legacy"),
+            profile["fast_lane"]["handler"],
+            getattr(source.platform, "value", ""),
+            source.chat_id,
+            getattr(source, "thread_id", ""),
+            time.monotonic() - float(job["started_at"]),
+            len(fast_output),
+        )
+        return "delivered"
+
+    async def _deliver_fast_translation(
+        self,
+        job: Optional[Dict[str, Any]],
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Backward-compatible alias for the generic response fast lane."""
+        if job and "profile" not in job:
+            from gateway.response_profiles import legacy_fast_translation_profile
+
+            legacy_profile = legacy_fast_translation_profile({"enabled": True})
+            if legacy_profile is None:
+                return None
+            job = {**job, "profile": legacy_profile}
+        return await self._deliver_response_fast_lane(
+            job,
+            event=event,
+            source=source,
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -9759,6 +10127,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+        _response_profile_user_text = str(getattr(event, "text", None) or "")
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -9775,6 +10144,120 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source = source
             except Exception:
                 pass
+
+        # Deliver the isolated first pass before loading transcript history or
+        # constructing the full Grace prompt. This keeps pathological history
+        # hygiene/compression work from delaying the user-visible translation.
+        from gateway.response_profiles import ResponseProfileConfigurationError
+
+        try:
+            _response_fast_lane_job = self._start_response_fast_lane(event)
+        except ResponseProfileConfigurationError as exc:
+            logger.error(
+                "Rejecting message with invalid Topic response profile: %s",
+                exc,
+            )
+            adapter = self.adapters.get(source.platform)
+            if adapter is not None:
+                metadata = self._thread_metadata_for_source(
+                    source,
+                    self._reply_anchor_for_event(event),
+                )
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        (
+                            "這個 Topic 的回覆設定目前無法使用。"
+                            "請檢查 response_profile 設定後再試一次。"
+                        ),
+                        metadata=metadata,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to report invalid Topic response profile",
+                    )
+            return
+        _response_fast_lane_status = await self._deliver_response_fast_lane(
+            _response_fast_lane_job,
+            event=event,
+            source=source,
+        )
+        if _response_fast_lane_job:
+            _response_profile_user_text = str(
+                _response_fast_lane_job.get("source_text")
+                or _response_profile_user_text
+            )
+        _detail_contract_name = None
+        _learning_history_note = ""
+        if _response_fast_lane_job:
+            from gateway.response_profiles import (
+                detail_lane_contract_prompt,
+                detail_lane_prompt,
+            )
+
+            if _response_fast_lane_status:
+                _detail_prompt = detail_lane_prompt(
+                    _response_fast_lane_job["profile"],
+                    delivery_ambiguous=(
+                        _response_fast_lane_status == "ambiguous"
+                    ),
+                )
+            else:
+                _detail_prompt = str(
+                    _response_fast_lane_job["failed_lane_prompt"],
+                )
+            try:
+                _detail_skill_prompt = self._load_response_detail_skill_prompt(
+                    _response_fast_lane_job["profile"],
+                    _response_fast_lane_status,
+                    task_id=_quick_key,
+                )
+            except ResponseProfileConfigurationError as exc:
+                logger.error(
+                    "Rejecting detail turn with invalid response profile: %s",
+                    exc,
+                )
+                adapter = self.adapters.get(source.platform)
+                if adapter is not None:
+                    metadata = self._thread_metadata_for_source(
+                        source,
+                        self._reply_anchor_for_event(event),
+                    )
+                    if _response_fast_lane_status:
+                        error_message = (
+                            "快速翻譯已處理，但詳細解說設定目前無法載入。"
+                            "請檢查 response_profile 的 detail skill。"
+                        )
+                    else:
+                        error_message = (
+                            "這個 Topic 的翻譯設定目前無法使用。"
+                            "請檢查 response_profile 的 detail skill。"
+                        )
+                    try:
+                        await adapter.send(
+                            source.chat_id,
+                            error_message,
+                            metadata=metadata,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to report invalid detail-lane skill",
+                        )
+                return
+            _detail_contract_prompt = detail_lane_contract_prompt(
+                _response_fast_lane_job["profile"],
+                _response_fast_lane_status,
+            )
+            event.channel_prompt = "\n\n".join(
+                part
+                for part in (
+                    event.channel_prompt,
+                    _detail_prompt,
+                    _detail_skill_prompt,
+                    _detail_contract_prompt,
+                )
+                if part
+            )
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -10053,6 +10536,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "(session=%s)",
                 session_entry.session_id,
             )
+
+        if _response_fast_lane_job:
+            from gateway.response_profiles import (
+                build_learning_history_note,
+                detail_lane_output_contract,
+            )
+
+            _detail_contract_name = detail_lane_output_contract(
+                _response_fast_lane_job["profile"],
+                _response_fast_lane_status,
+            )
+            if _detail_contract_name in {
+                "translator_mastery",
+                "translator_mastery_after_fast",
+                "translator_mastery_self_contained",
+            }:
+                _learning_history_note = build_learning_history_note(
+                    _response_profile_user_text,
+                    history,
+                )
+                event.channel_prompt = "\n\n".join(
+                    part
+                    for part in (
+                        event.channel_prompt,
+                        _learning_history_note,
+                    )
+                    if part
+                )
+                logger.info(
+                    "Translator learning-history precheck: profile=%s "
+                    "status=%s result=%s",
+                    _response_fast_lane_job["profile"].get("name", "legacy"),
+                    _response_fast_lane_status or "failed",
+                    (
+                        "verified_match"
+                        if "result=verified_match" in _learning_history_note
+                        else "no_match"
+                    ),
+                )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -10554,7 +11076,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _approval_token = approval_token_candidate(str(event.text or ""))
         if _approval_token:
-            recovered_args = _find_bound_clawops_approval_args(
+            recovered_args = _recover_bound_clawops_approval_args(
                 history, _approval_token,
             )
             _approval_records: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -10793,6 +11315,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                response_fast_lane_job=_response_fast_lane_job,
+                response_fast_lane_status=_response_fast_lane_status,
+                response_profile_user_text=_response_profile_user_text,
+                detail_contract_name=_detail_contract_name,
+                learning_history_note=_learning_history_note,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -15495,9 +16022,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         platform_key = _platform_config_key(source.platform)
         user_config = _load_gateway_config()
-        from gateway.display_config import resolve_display_setting
-        _plat_streaming = resolve_display_setting(
-            user_config, platform_key, "streaming"
+        from gateway.display_config import resolve_source_display_setting
+        _plat_streaming = resolve_source_display_setting(
+            user_config, platform_key, "streaming", source
         )
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off"
@@ -15709,6 +16236,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        response_fast_lane_job: Optional[dict] = None,
+        response_fast_lane_status: Optional[str] = None,
+        response_profile_user_text: str = "",
+        detail_contract_name: Optional[str] = None,
+        learning_history_note: str = "",
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -15727,6 +16259,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                response_fast_lane_job=response_fast_lane_job,
+                response_fast_lane_status=response_fast_lane_status,
+                response_profile_user_text=response_profile_user_text,
+                detail_contract_name=detail_contract_name,
+                learning_history_note=learning_history_note,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -15738,6 +16275,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                response_fast_lane_job=response_fast_lane_job,
+                response_fast_lane_status=response_fast_lane_status,
+                response_profile_user_text=response_profile_user_text,
+                detail_contract_name=detail_contract_name,
+                learning_history_note=learning_history_note,
             )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
@@ -15770,6 +16312,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        response_fast_lane_job: Optional[dict] = None,
+        response_fast_lane_status: Optional[str] = None,
+        response_profile_user_text: str = "",
+        detail_contract_name: Optional[str] = None,
+        learning_history_note: str = "",
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -16774,8 +17321,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Per-platform streaming gate: display.platforms.<plat>.streaming
             # can disable streaming for specific platforms even when the global
             # streaming config is enabled.
-            _plat_streaming = resolve_display_setting(
-                user_config, platform_key, "streaming"
+            from gateway.display_config import resolve_source_display_setting
+            _plat_streaming = resolve_source_display_setting(
+                user_config, platform_key, "streaming", source
             )
             # None = no per-platform override → follow global config
             _streaming_enabled = (
@@ -16783,8 +17331,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            _buffer_validated_detail = detail_contract_name in {
+                "translator_mastery",
+                "translator_mastery_after_fast",
+                "translator_mastery_self_contained",
+            }
+            if _buffer_validated_detail and _streaming_enabled:
+                logger.info(
+                    "Buffering validated Translator detail response despite "
+                    "display streaming configuration: contract=%s",
+                    detail_contract_name,
+                )
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            # Interim assistant bubbles can expose a rejected draft just as
+            # token streaming can. Keep the entire validated detail turn
+            # buffered until the contract checker accepts the final answer.
+            _want_interim_messages = (
+                interim_assistant_messages_enabled
+                and not _buffer_validated_detail
+            )
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -17080,6 +17646,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_callback = _notice_callback_sync
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
+            agent.final_response_validator = None
+            agent.final_response_repair_limit = 1
+            agent._response_contract_repair_attempts = 0
+            agent._response_contract_repair_start_index = None
+            if response_fast_lane_status == "ambiguous":
+                agent.final_response_validation_failure_message = (
+                    "⚠️ Telegram 未能確認第一則快速翻譯是否送達，"
+                    "而詳細教學回覆也未通過完整性檢查。請再傳一次，"
+                    "我會重新提供完整翻譯與解析。"
+                )
+            else:
+                agent.final_response_validation_failure_message = (
+                    "⚠️ 快速翻譯已完成，但詳細教學回覆未通過完整性檢查。"
+                    "請再傳一次，我會重新整理完整內容。"
+                )
+            if detail_contract_name in {
+                "translator_mastery",
+                "translator_mastery_after_fast",
+                "translator_mastery_self_contained",
+            }:
+                from gateway.response_profiles import (
+                    build_translator_detail_repair_prompt,
+                    translator_detail_validation_errors,
+                )
+
+                def _translator_detail_validator(
+                    draft: str,
+                    *,
+                    _contract_name=detail_contract_name,
+                    _current_text=response_profile_user_text,
+                    _history_note=learning_history_note,
+                    _fast_output=str(
+                        (response_fast_lane_job or {}).get("formatted_output")
+                        or ""
+                    ),
+                ) -> Optional[str]:
+                    errors = translator_detail_validation_errors(
+                        _contract_name,
+                        _current_text,
+                        draft,
+                        _history_note,
+                        fast_output=_fast_output,
+                    )
+                    if not errors:
+                        return None
+                    logger.warning(
+                        "Translator detail response rejected before delivery: "
+                        "contract=%s errors=%s",
+                        _contract_name,
+                        errors,
+                    )
+                    return build_translator_detail_repair_prompt(errors)
+
+                agent.final_response_validator = _translator_detail_validator
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}

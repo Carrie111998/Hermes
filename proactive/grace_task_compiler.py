@@ -26,6 +26,7 @@ class DelegationResult:
 def render_execution_body(contract: Mapping[str, Any]) -> str:
     worker_contract = _worker_safe_contract(contract)
     authorization_guidance = _render_authorization_guidance(worker_contract)
+    crosspost_guidance = _render_facebook_crosspost_guidance(worker_contract)
     return "\n".join(
         [
             "GRACE_LOOP_CONTRACT_STAGE: execution",
@@ -34,6 +35,11 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "Do not search unrelated chats, topics, projects, or global history for intent.",
             "Use working memory only inside the declared namespace.",
             "Before completion, provide every required verification item and evidence.",
+            "For each external draft/object you find or create, call kanban_external_effect "
+            "immediately after readback. Also include the same records in "
+            "kanban_complete metadata.external_effects using platform, effect_key, "
+            "state, external_id "
+            "(when available), and details. This durable ledger is the create-idempotency gate.",
             "When every deliverable and verification item is complete, call kanban_complete "
             "even if Grace or KJ must still review or approve a later public/external action. "
             "Record those downstream gates in metadata.approval_needed; they are not execution blockers.",
@@ -42,12 +48,45 @@ def render_execution_body(contract: Mapping[str, Any]) -> str:
             "capability, or a specific human decision prevents completion of the contracted deliverables.",
             "Stop on success, approval boundary, blocker, no-progress limit, iteration limit, or runtime limit.",
             *authorization_guidance,
+            *crosspost_guidance,
             "",
             "```json",
             json.dumps(worker_contract, ensure_ascii=False, indent=2, sort_keys=True),
             "```",
         ]
     )
+
+
+def _render_facebook_crosspost_guidance(
+    contract: Mapping[str, Any],
+) -> list[str]:
+    crosspost = contract.get("facebook_crosspost")
+    if not isinstance(crosspost, Mapping):
+        return []
+    listing_id = str(crosspost.get("marketplace_listing_id") or "").strip()
+    group_ids = [
+        str(group_id or "").strip()
+        for group_id in list(crosspost.get("group_ids") or [])
+    ]
+    if not listing_id or not group_ids:
+        return [
+            "Facebook cross-post scope is malformed. Block without clicking "
+            "Marketplace mutation controls.",
+        ]
+    return [
+        "Facebook existing-listing cross-post scope (authoritative): use only "
+        f"Marketplace listing {listing_id}. First inspect "
+        f"https://www.facebook.com/marketplace/item/{listing_id}; if that "
+        "page does not expose List in more places, inspect Marketplace "
+        "Selling / Your listings and use only a control atomically bound to "
+        "that same listing ID.",
+        "More options → List in more places and a listing-bound direct List "
+        "in more places control are equivalent authorized entry paths. "
+        "Read-only navigation and snapshots may locate either path, but Share, "
+        "Sell Something, Edit, Boost, stock changes, and create-item routes "
+        "remain forbidden. The guarded dialog may select only these group "
+        f"ids: {', '.join(group_ids)}.",
+    ]
 
 
 def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> str:
@@ -58,7 +97,10 @@ def render_review_body(contract: Mapping[str, Any], execution_task_id: str) -> s
             "GRACE_LOOP_CONTRACT_STAGE: grace_review",
             f"Review parent execution task: {execution_task_id}",
             "You are Grace's final acceptance gate, running on Grace's primary model.",
-            "Compare the parent result and evidence against every contract criterion.",
+            "Compare the parent result and all cumulative evidence against every contract "
+            "criterion. Evidence from earlier runs, parent comments, and the external-effect "
+            "ledger remains valid until contradicted by a newer readback; never infer absence "
+            "from a correction run merely saying it did not touch that platform.",
             "If accepted, complete with metadata review_outcome=accepted and list verified evidence.",
             "If rejected but safely correctable, do not call kanban_complete. Call kanban_block with "
             "kind=dependency and a precise correction contract that preserves the same project, scope, "

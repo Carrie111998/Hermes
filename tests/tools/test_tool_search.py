@@ -95,6 +95,7 @@ class TestClassification:
         # Sample of core tools from _HERMES_CORE_TOOLS.
         for core_name in ["terminal", "read_file", "write_file", "patch",
                           "search_files", "todo", "memory", "browser_navigate",
+                          "browser_upload_files",
                           "web_search", "session_search", "clarify",
                           "execute_code", "delegate_task", "send_message"]:
             assert not is_deferrable_tool_name(core_name), (
@@ -535,4 +536,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-

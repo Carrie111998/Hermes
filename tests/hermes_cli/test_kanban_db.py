@@ -778,6 +778,573 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_openclaw_backend_run_is_bound_to_exact_active_attempt(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Read public page",
+            assignee="clawops-browser",
+            executor_backend="openclaw",
+            executor_profile="browser-readonly",
+            project_namespace="hub_ops",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test-router")
+        assert claimed is not None
+        assert claimed.executor_backend == "openclaw"
+        assert claimed.executor_profile == "browser-readonly"
+        assert claimed.project_namespace == "hub_ops"
+        run_id = int(claimed.current_run_id or 0)
+
+        assert kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            backend_run_id="openclaw-run-1",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="2.0",
+            workspace_ref="/tmp/openclaw-readonly",
+        )
+        assert kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            backend_run_id="openclaw-run-1",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="2.0",
+            workspace_ref="/tmp/openclaw-readonly",
+        )
+        assert not kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            backend_run_id="different-run",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="2.0",
+        )
+        assert not kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            backend_run_id="openclaw-run-1",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="1.0",
+            workspace_ref="/tmp/openclaw-readonly",
+        )
+        assert not kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            backend_run_id="openclaw-run-1",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="2.0",
+            workspace_ref="/tmp/different-workspace",
+        )
+        assert not kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            backend_run_id="openclaw-run-1",
+            backend_agent_id="missioncrew-browser-readonly",
+            protocol_version="2.0",
+            workspace_ref="/tmp/openclaw-readonly",
+            result_digest="different-digest",
+        )
+
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.executor_backend == "openclaw"
+        assert run.backend_run_id == "openclaw-run-1"
+        assert run.backend_agent_id == "missioncrew-browser-readonly"
+        assert run.protocol_version == "2.0"
+        assert run.workspace_ref == "/tmp/openclaw-readonly"
+        events = kb.list_events(conn, task_id)
+        assert [event.kind for event in events].count("backend_run_bound") == 1
+
+
+def test_backend_run_cannot_bind_to_legacy_hermes_task(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Hermes work")
+        claimed = kb.claim_task(conn, task_id, claimer="test-router")
+        assert claimed is not None
+        assert not kb.bind_backend_run(
+            conn,
+            task_id,
+            expected_run_id=int(claimed.current_run_id or 0),
+            backend_run_id="external-run",
+            backend_agent_id="external-agent",
+            protocol_version="2.0",
+        )
+
+
+def test_backend_lifecycle_is_monotonic_and_routing_decision_is_per_attempt(
+    kanban_home,
+):
+    decision = {
+        "version": 1,
+        "mode": "shadow",
+        "selected_backend": "openclaw",
+        "selection_reason": "isolated browser requirements matched",
+        "candidates": [
+            {
+                "backend": "openclaw",
+                "eligible": True,
+                "reasons": ["requirements_matched"],
+            }
+        ],
+        "fallback_order": [],
+    }
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Async browser read",
+            executor_backend="openclaw",
+            routing_decision=decision,
+        )
+        task = kb.claim_task(conn, task_id, claimer="router")
+        assert task is not None
+        run_id = int(task.current_run_id or 0)
+
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="queued",
+            backend_run_id="backend-async-1",
+            backend_agent_id="readonly-agent",
+            protocol_version="2.0",
+            next_poll_seconds=2,
+        )
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="running",
+            backend_run_id="backend-async-1",
+            backend_agent_id="readonly-agent",
+            protocol_version="2.0",
+            next_poll_seconds=4,
+        )
+        assert not kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="queued",
+            backend_run_id="backend-async-1",
+        )
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="succeeded",
+            backend_run_id="backend-async-1",
+            backend_agent_id="readonly-agent",
+            protocol_version="2.0",
+            result_digest="digest-1",
+        )
+        assert not kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="failed",
+            backend_run_id="backend-async-1",
+        )
+        assert not kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="succeeded",
+            backend_run_id="backend-async-1",
+            result_digest="different-terminal-digest",
+        )
+
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.routing_decision == decision
+        assert run.backend_status == "succeeded"
+        assert run.backend_poll_count == 2
+        assert run.backend_next_poll_at is None
+        assert run.result_digest == "digest-1"
+        assert [event.kind for event in kb.list_events(conn, task_id)].count(
+            "backend_lifecycle"
+        ) == 3
+
+
+def test_backend_circuit_opens_then_half_opens_and_success_resets(kanban_home):
+    with kb.connect() as conn:
+        for timestamp in (100, 101, 102):
+            state = kb.record_backend_circuit_outcome(
+                conn,
+                "openclaw",
+                succeeded=False,
+                error="gateway unavailable",
+                failure_threshold=3,
+                cooldown_seconds=10,
+                now=timestamp,
+            )
+        assert state == {
+            "backend_id": "openclaw",
+            "state": "open",
+            "consecutive_failures": 3,
+            "opened_until": 112,
+        }
+        assert kb.backend_circuit_states(conn, now=111)["openclaw"] == "open"
+        assert kb.backend_circuit_states(conn, now=112)["openclaw"] == "half_open"
+        assert kb.claim_backend_circuit_probe(
+            conn,
+            "openclaw",
+            lease_seconds=30,
+            now=112,
+        )
+        assert not kb.claim_backend_circuit_probe(
+            conn,
+            "openclaw",
+            lease_seconds=30,
+            now=112,
+        )
+        assert kb.claim_backend_circuit_probe(
+            conn,
+            "openclaw",
+            lease_seconds=30,
+            now=142,
+        )
+
+        reset = kb.record_backend_circuit_outcome(
+            conn,
+            "openclaw",
+            succeeded=True,
+            now=113,
+        )
+        assert reset["state"] == "closed"
+        assert reset["consecutive_failures"] == 0
+        assert kb.backend_circuit_states(conn, now=113)["openclaw"] == "closed"
+
+
+def test_backend_circuit_counts_concurrent_failures_from_same_generation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        generation = int(
+            kb.backend_circuit_snapshot(conn, "openclaw")["generation"]
+        )
+        outcomes = [
+            kb.record_backend_circuit_outcome(
+                conn,
+                "openclaw",
+                succeeded=False,
+                error=f"concurrent failure {index}",
+                failure_threshold=3,
+                cooldown_seconds=10,
+                now=100 + index,
+                expected_generation=generation,
+            )
+            for index in range(3)
+        ]
+
+        assert [outcome["applied"] for outcome in outcomes] == [
+            True,
+            True,
+            True,
+        ]
+        assert outcomes[-1]["state"] == "open"
+        assert outcomes[-1]["consecutive_failures"] == 3
+
+
+def test_backend_circuit_rejects_delayed_failure_from_previous_epoch(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        initial_generation = int(
+            kb.backend_circuit_snapshot(conn, "openclaw")["generation"]
+        )
+        first_failure = kb.record_backend_circuit_outcome(
+            conn,
+            "openclaw",
+            succeeded=False,
+            error="old epoch failure",
+            expected_generation=initial_generation,
+            now=100,
+        )
+        reset = kb.record_backend_circuit_outcome(
+            conn,
+            "openclaw",
+            succeeded=True,
+            expected_generation=initial_generation + 1,
+            now=101,
+        )
+        new_failure = kb.record_backend_circuit_outcome(
+            conn,
+            "openclaw",
+            succeeded=False,
+            error="new epoch failure",
+            expected_generation=initial_generation + 2,
+            now=102,
+        )
+        delayed = kb.record_backend_circuit_outcome(
+            conn,
+            "openclaw",
+            succeeded=False,
+            error="delayed old epoch failure",
+            expected_generation=initial_generation,
+            now=103,
+        )
+
+        assert first_failure["applied"] is True
+        assert reset["applied"] is True
+        assert new_failure["applied"] is True
+        assert delayed["applied"] is False
+        snapshot = kb.backend_circuit_snapshot(conn, "openclaw")
+        assert snapshot["consecutive_failures"] == 1
+        assert snapshot["state"] == "closed"
+
+
+def test_due_backend_poll_claim_is_leased_and_operator_visible(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Async backend visibility",
+            executor_backend="openclaw",
+            routing_decision={
+                "selected_backend": "openclaw",
+                "selection_reason": "async test",
+                "candidates": [
+                    {
+                        "backend": "openclaw",
+                        "cost_tier": "medium",
+                    }
+                ],
+            },
+        )
+        task = kb.claim_task(conn, task_id, claimer="router")
+        assert task is not None and task.current_run_id is not None
+        run_id = int(task.current_run_id)
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="queued",
+            backend_run_id="async-visible-1",
+            backend_agent_id="readonly-agent",
+            protocol_version="2.0",
+            next_poll_seconds=0,
+        )
+        due_at = int(kb.get_run(conn, run_id).backend_next_poll_at or 0)
+        claimed = kb.claim_due_backend_polls(
+            conn,
+            owner="poller-a",
+            lease_seconds=30,
+            now=due_at,
+        )
+        assert [run.id for run in claimed] == [run_id]
+        assert (
+            kb.claim_due_backend_polls(
+                conn,
+                owner="poller-b",
+                lease_seconds=30,
+                now=due_at,
+            )
+            == []
+        )
+        shadow_report = {
+            "selected_backend": "openclaw",
+            "semantic_class": "browser_readonly",
+            "observations": [
+                {
+                    "backend": "openclaw",
+                    "cost_units": 1.25,
+                },
+                {
+                    "backend": "codex",
+                    "cost_units": 2.5,
+                },
+            ],
+            "summary": {"observed_backends": 2},
+        }
+        assert kb.record_backend_shadow_report(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            report=shadow_report,
+        )
+        snapshot = kb.backend_runtime_snapshot(conn, now=due_at + 5)
+        assert snapshot["active_runs"] == [
+            {
+                "task_id": task_id,
+                "title": "Async backend visibility",
+                "run_id": run_id,
+                "executor_backend": "openclaw",
+                "backend_run_id": "async-visible-1",
+                "backend_status": "queued",
+                "poll_count": 0,
+                "next_poll_at": due_at,
+                "poll_age_seconds": 5,
+                "poll_owner": "poller-a",
+                "poll_lease_until": due_at + 30,
+                "last_error": None,
+                "selected_cost_tier": "medium",
+                "observed_cost_units": 3.75,
+                "routing_decision": {
+                    "selected_backend": "openclaw",
+                    "selection_reason": "async test",
+                    "candidates": [
+                        {
+                            "backend": "openclaw",
+                            "cost_tier": "medium",
+                        }
+                    ],
+                    "shadow_report": shadow_report,
+                },
+            }
+        ]
+        assert [event.kind for event in kb.list_events(conn, task_id)].count(
+            "backend_shadow_report"
+        ) == 1
+        assert kb.release_backend_poll_claim(
+            conn,
+            run_id=run_id,
+            owner="poller-a",
+            retry_seconds=4,
+            error="temporary",
+            now=due_at + 5,
+        )
+        released = kb.get_run(conn, run_id)
+        assert released is not None
+        assert released.backend_poll_owner is None
+        assert released.backend_poll_count == 1
+        assert released.backend_next_poll_at == due_at + 9
+        assert released.backend_last_error == "temporary"
+        retry_events = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "backend_poll_retry"
+        ]
+        assert len(retry_events) == 1
+        assert retry_events[0].run_id == run_id
+        assert retry_events[0].payload == {
+            "executor_backend": "openclaw",
+            "backend_status": "queued",
+            "poll_count": 1,
+            "retry_at": due_at + 9,
+            "error": "temporary",
+        }
+
+
+def test_due_backend_poll_claim_can_isolate_executor_profile(kanban_home):
+    with kb.connect() as conn:
+        run_ids: dict[str, int] = {}
+        due_times: list[int] = []
+        for profile in ("zero-effect-async", "browser-readonly"):
+            task_id = kb.create_task(
+                conn,
+                title=f"Async backend {profile}",
+                executor_backend="openclaw",
+                executor_profile=profile,
+            )
+            task = kb.claim_task(conn, task_id, claimer="router")
+            assert task is not None and task.current_run_id is not None
+            run_id = int(task.current_run_id)
+            run_ids[profile] = run_id
+            assert kb.record_backend_lifecycle(
+                conn,
+                task_id,
+                expected_run_id=run_id,
+                status="queued",
+                backend_run_id=f"backend-{profile}",
+                backend_agent_id="readonly-agent",
+                protocol_version="2.0",
+                next_poll_seconds=0,
+            )
+            run = kb.get_run(conn, run_id)
+            assert run is not None and run.backend_next_poll_at is not None
+            due_times.append(int(run.backend_next_poll_at))
+
+        claimed = kb.claim_due_backend_polls(
+            conn,
+            owner="async-profile-poller",
+            executor_backends=("openclaw",),
+            executor_profiles=("zero-effect-async",),
+            now=max(due_times),
+        )
+
+        assert [run.id for run in claimed] == [run_ids["zero-effect-async"]]
+        browser_run = kb.get_run(conn, run_ids["browser-readonly"])
+        assert browser_run is not None
+        assert browser_run.backend_poll_owner is None
+
+
+def test_backend_runtime_snapshot_includes_terminal_handler_pending_run(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Terminal handler pending",
+            executor_backend="openclaw",
+        )
+        task = kb.claim_task(conn, task_id, claimer="router")
+        assert task is not None and task.current_run_id is not None
+        run_id = int(task.current_run_id)
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=run_id,
+            status="succeeded",
+            backend_run_id="terminal-pending-1",
+            backend_agent_id="readonly-agent",
+            protocol_version="2.0",
+            result_digest="terminal-digest",
+        )
+
+        snapshot = kb.backend_runtime_snapshot(conn)
+
+        assert len(snapshot["active_runs"]) == 1
+        assert snapshot["active_runs"][0]["task_id"] == task_id
+        assert snapshot["active_runs"][0]["backend_status"] == "succeeded"
+
+
+def test_nested_write_transaction_uses_savepoint_and_outer_rollback(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match="abort outer"):
+            with kb.write_txn(conn):
+                task_id = kb.create_task(conn, title="Nested transaction")
+                assert kb.get_task(conn, task_id) is not None
+                raise RuntimeError("abort outer")
+
+        assert kb.get_task(conn, task_id) is None
+
+
+def test_migration_backfills_routing_evidence_for_historical_attempts(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Historical OpenClaw task",
+            executor_backend="openclaw",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="legacy-router")
+        assert claimed is not None
+        run_id = int(claimed.current_run_id or 0)
+        conn.execute(
+            "UPDATE tasks SET routing_decision = NULL WHERE id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET routing_decision = NULL WHERE id = ?",
+            (run_id,),
+        )
+
+    kb.init_db()
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task is not None
+        assert task.routing_decision["selected_backend"] == "openclaw"
+        assert task.routing_decision["mode"] == "legacy_explicit"
+        assert run is not None
+        assert run.routing_decision == task.routing_decision
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")
@@ -2307,6 +2874,40 @@ def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
         assert kb.has_spawnable_ready(conn) is False
 
 
+def test_dispatch_only_spawns_hermes_backend_tasks(
+    kanban_home, all_assignees_spawnable
+):
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        external = kb.create_task(
+            conn,
+            title="external",
+            assignee="alice",
+            executor_backend="openclaw",
+        )
+        hermes = kb.create_task(
+            conn,
+            title="hermes",
+            assignee="alice",
+            executor_backend="hermes",
+        )
+
+        assert kb.has_spawnable_ready(conn) is True
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert spawns == [hermes]
+        assert [item[0] for item in result.spawned] == [hermes]
+        assert kb.get_task(conn, hermes).status == "running"
+        assert kb.get_task(conn, external).status == "ready"
+
+        kb.complete_task(conn, hermes)
+        assert kb.has_spawnable_ready(conn) is False
+
+
 def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable):
     spawns = []
 
@@ -2364,6 +2965,74 @@ def test_dispatch_max_spawn_counts_existing_running_tasks(
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
 
         assert res.spawned == []
+        assert spawns == []
+        assert kb.get_task(conn, ready).status == "ready"
+
+
+def test_dispatch_max_in_progress_counts_external_backend_tasks(
+    kanban_home, all_assignees_spawnable
+):
+    spawns = []
+
+    with kb.connect() as conn:
+        external = kb.create_task(
+            conn,
+            title="external-running",
+            assignee="alice",
+            executor_backend="openclaw",
+        )
+        assert kb.claim_task(
+            conn,
+            external,
+            claimer="openclaw-router",
+        ) is not None
+        ready = kb.create_task(
+            conn,
+            title="hermes-ready",
+            assignee="bob",
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(task.id),
+            max_in_progress=1,
+        )
+
+        assert result.spawned == []
+        assert spawns == []
+        assert kb.get_task(conn, ready).status == "ready"
+
+
+def test_dispatch_max_spawn_counts_external_backend_tasks(
+    kanban_home, all_assignees_spawnable
+):
+    spawns = []
+
+    with kb.connect() as conn:
+        external = kb.create_task(
+            conn,
+            title="external-running",
+            assignee="alice",
+            executor_backend="openclaw",
+        )
+        assert kb.claim_task(
+            conn,
+            external,
+            claimer="openclaw-router",
+        ) is not None
+        ready = kb.create_task(
+            conn,
+            title="hermes-ready",
+            assignee="bob",
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(task.id),
+            max_spawn=1,
+        )
+
+        assert result.spawned == []
         assert spawns == []
         assert kb.get_task(conn, ready).status == "ready"
 

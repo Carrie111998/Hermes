@@ -222,6 +222,32 @@ def resolve_display_setting(
     return fallback
 
 
+def resolve_source_display_setting(
+    user_config: dict,
+    platform_key: str,
+    setting: str,
+    source: Any,
+    fallback: Any = None,
+) -> Any:
+    """Resolve a setting with trusted per-source overrides taking precedence.
+
+    Platform adapters may attach ``display_overrides`` to a ``SessionSource``
+    after matching operator-owned channel/topic config. The field is
+    process-local and is not accepted from serialized inbound source data.
+    """
+    overrides = getattr(source, "display_overrides", None)
+    if isinstance(overrides, dict):
+        value = overrides.get(setting)
+        if value is not None:
+            return _normalise(setting, value)
+    return resolve_display_setting(
+        user_config,
+        platform_key,
+        setting,
+        fallback,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

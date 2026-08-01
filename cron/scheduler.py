@@ -2161,7 +2161,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        _VAR_MAP,
+        begin_cron_run_state,
+        clear_session_vars,
+        get_cron_functional_error,
+        set_session_vars,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -2186,9 +2192,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # below, so clearing HERMES_SESSION_* here does not affect delivery.
     _ctx_tokens = set_session_vars(
         platform="",
+        source="cron",
         chat_id="",
         chat_name="",
+        session_key=f"cron:{job_id}",
+        session_id=_cron_session_id,
     )
+    begin_cron_run_state()
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -2622,6 +2632,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
+        functional_error = get_cron_functional_error()
+        if functional_error:
+            raise RuntimeError(
+                f"Scheduled delegation did not establish a task: {functional_error}"
+            )
         if max_iteration_summary:
             logger.warning(
                 "Job '%s' reached the iteration limit but produced a final fallback response; "

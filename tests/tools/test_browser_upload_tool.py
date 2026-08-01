@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 
+from hermes_cli import kanban_db as kb
 from tools import browser_upload_tool
 
 
@@ -82,6 +83,60 @@ def test_success_invokes_upload_helper(monkeypatch, tmp_path):
     assert captured["timeout"] == 12
 
 
+def test_ordinary_kanban_upload_skips_grace_identity_probe(
+    monkeypatch, tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ordinary upload",
+            body="Upload an internal report",
+            assignee="clawops-browser",
+        )
+        run = kb.claim_task(conn, task_id)
+        assert run is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(
+        browser_upload_tool,
+        "_resolve_cdp_endpoint",
+        lambda: "http://127.0.0.1:9222",
+    )
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"jpg")
+    calls = []
+
+    def single_upload(payload, timeout):
+        calls.append(payload)
+        assert payload["inspectOnly"] is False
+        return subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({
+                "success": True,
+                "uploadedFiles": 1,
+                "targetUrl": "https://example.com/upload",
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        browser_upload_tool,
+        "_run_playwright_upload",
+        single_upload,
+    )
+    result = json.loads(
+        browser_upload_tool.browser_upload_files(files=[str(image)])
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 1
+
+
 def test_helper_failure_returns_error(monkeypatch, tmp_path):
     image = tmp_path / "photo.jpg"
     image.write_bytes(b"jpg")
@@ -103,13 +158,16 @@ def test_helper_failure_returns_error(monkeypatch, tmp_path):
     assert result["stderr"] == "stack trace"
 
 
-def test_check_requires_cdp_and_node(monkeypatch):
+def test_check_keeps_schema_available_for_call_time_checks(monkeypatch):
     monkeypatch.setattr(browser_upload_tool, "_resolve_cdp_endpoint", lambda: "http://127.0.0.1:9222")
     monkeypatch.setattr(browser_upload_tool, "_node_command", lambda: "/usr/bin/node")
     assert browser_upload_tool._browser_upload_files_check() is True
 
     monkeypatch.setattr(browser_upload_tool, "_resolve_cdp_endpoint", lambda: "")
-    assert browser_upload_tool._browser_upload_files_check() is False
+    assert browser_upload_tool._browser_upload_files_check() is True
+
+    monkeypatch.setattr(browser_upload_tool, "_node_command", lambda: None)
+    assert browser_upload_tool._browser_upload_files_check() is True
 
 
 def test_helper_script_fails_closed_on_ambiguous_pages_and_inputs():
@@ -120,5 +178,64 @@ def test_helper_script_fails_closed_on_ambiguous_pages_and_inputs():
     assert "provide input_index" in script
     assert "Upload postcondition was not observed" in script
     assert "verification marker was already present before upload" in script
+    assert "guardedPageIdentity" in script
+    assert "performance.timeOrigin" in script
     assert "selectedInput" in script
     assert "locator.evaluate((selectedInput, inputIndex)" in script
+
+
+def test_upload_to_protected_create_page_requires_task_reservation(
+    monkeypatch, tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="external draft",
+            body="GRACE_LOOP_CONTRACT_STAGE: execution",
+            assignee="clawops-browser",
+        )
+        run = kb.claim_task(conn, task_id)
+        assert run is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(
+        browser_upload_tool,
+        "_resolve_cdp_endpoint",
+        lambda: "http://127.0.0.1:9222",
+    )
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"jpg")
+
+    def inspect_target(payload, timeout):
+        assert payload["inspectOnly"] is True
+        return subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({
+                "success": True,
+                "inspectOnly": True,
+                "targetUrl": "https://seller.shopee.tw/portal/product/new",
+                "pageIdentity": (
+                    "https://seller.shopee.tw/portal/product/new|123"
+                ),
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        browser_upload_tool, "_run_playwright_upload", inspect_target,
+    )
+    result = json.loads(
+        browser_upload_tool.browser_upload_files(
+            files=[str(image)],
+            target_url_contains="seller.shopee.tw",
+        )
+    )
+
+    assert "error" in result
+    assert "no active task-scoped reservation" in result["error"]
+    assert "exact page load" in result["error"]

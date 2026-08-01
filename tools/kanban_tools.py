@@ -714,6 +714,39 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return tool_error(f"kanban_heartbeat: {e}")
 
 
+def _handle_external_effect(args: dict, **kw) -> str:
+    """Record read-back evidence that controls external create idempotency."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            effect = kb.record_external_effect(
+                conn,
+                tid,
+                platform=str(args.get("platform") or ""),
+                state=str(args.get("state") or ""),
+                effect_key=str(args.get("effect_key") or "create"),
+                external_id=args.get("external_id"),
+                details=args.get("details"),
+                expected_run_id=_worker_run_id(tid),
+            )
+            return _ok(task_id=tid, external_effect=effect)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_external_effect: {e}")
+    except Exception as e:
+        logger.exception("kanban_external_effect failed")
+        return tool_error(f"kanban_external_effect: {e}")
+
+
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
     tid = args.get("task_id")
@@ -1304,6 +1337,76 @@ KANBAN_COMMENT_SCHEMA = {
     },
 }
 
+KANBAN_EXTERNAL_EFFECT_SCHEMA = {
+    "name": "kanban_external_effect",
+    "description": (
+        "Record a read-only reconciliation or verified external effect for "
+        "this exact task and platform. Grace correction runs must call this "
+        "before opening a protected create route. Use absent_verified only "
+        "after a real read-only search found no matching object; use existing, "
+        "created, or verified as soon as the object is read back. Durable "
+        "existing/created/verified evidence prevents duplicate creation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "platform": {
+                "type": "string",
+                "enum": ["facebook", "shopee"],
+                "description": "Protected external platform.",
+            },
+            "state": {
+                "type": "string",
+                "enum": [
+                    "absent_verified",
+                    "existing",
+                    "created",
+                    "verified",
+                    "not_joined_verified",
+                    "join_started",
+                    "joined",
+                    "pending_approval",
+                    "needs_questions",
+                    "failed",
+                ],
+                "description": (
+                    "Observed state. absent_verified unlocks one create route "
+                    "for this correction run. Join states require a non-create "
+                    "effect_key scoped to one exact group."
+                ),
+            },
+            "effect_key": {
+                "type": "string",
+                "description": (
+                    "Stable object key within the platform. Defaults to create "
+                    "for product/draft idempotency; use group:<group_id> for "
+                    "Facebook membership effects."
+                ),
+                "default": "create",
+            },
+            "external_id": {
+                "type": "string",
+                "description": (
+                    "Platform object/product/draft id when the UI exposes one."
+                ),
+            },
+            "details": {
+                "type": "object",
+                "description": (
+                    "Small machine-readable readback facts such as title, "
+                    "status, URL, image count, and published=false."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["platform", "state"],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -1559,6 +1662,15 @@ registry.register(
     handler=_handle_comment,
     check_fn=_check_kanban_mode,
     emoji="💬",
+)
+
+registry.register(
+    name="kanban_external_effect",
+    toolset="kanban",
+    schema=KANBAN_EXTERNAL_EFFECT_SCHEMA,
+    handler=_handle_external_effect,
+    check_fn=_check_kanban_mode,
+    emoji="🧾",
 )
 
 registry.register(

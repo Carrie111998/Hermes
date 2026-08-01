@@ -311,6 +311,7 @@ class CDPSupervisor:
         self._pending_calls: Dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        self._page_target_id: Optional[str] = None
         self._child_sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> info
 
         # Dialog auto-dismiss watchdog handles (per dialog id).
@@ -566,6 +567,1390 @@ class CDPSupervisor:
 
         return {"ok": True, "result": value, "result_type": result_type}
 
+    def call_page_cdp(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Send one CDP command to this supervisor's attached page session."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active:
+                return {"ok": False, "error": "supervisor is not active"}
+            session_id = self._page_session_id
+        if not session_id:
+            return {"ok": False, "error": "supervisor has no attached page session"}
+
+        async def _do_call() -> Dict[str, Any]:
+            return await self._cdp(
+                method,
+                params or {},
+                session_id=session_id,
+                timeout=timeout,
+            )
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            fut = safe_schedule_threadsafe(_do_call(), loop)
+            if fut is None:
+                return {"ok": False, "error": "Browser supervisor loop unavailable"}
+            response = fut.result(timeout=timeout + 1)
+            return {"ok": True, "result": response.get("result", {})}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def capture_ax_tree_for_url(
+        self,
+        expected_url: str,
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Bind and capture one AX tree from the unique page at ``expected_url``.
+
+        A browser-level CDP endpoint can expose several ``page`` targets
+        (for example the user's Facebook tab plus Chrome's New Tab page).
+        The agent-browser CLI selects the active web page independently, so
+        selection, attachment, configuration, and AX capture run as one
+        event-loop operation with one deadline. The returned session id is
+        part of the guarded ref capability, so a later snapshot cannot
+        redirect its action. Missing or duplicate targets fail closed.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active:
+                return {"ok": False, "error": "supervisor is not active"}
+        deadline = time.monotonic() + timeout
+
+        async def _capture() -> Dict[str, Any]:
+            session_id = ""
+            adopted = False
+            response = await self._cdp("Target.getTargets")
+            targets = response.get("result", {}).get("targetInfos", [])
+            matches = [
+                target for target in targets
+                if target.get("type") == "page"
+                and str(target.get("url") or "") == expected_url
+            ]
+            if len(matches) != 1:
+                return {
+                    "ok": False,
+                    "error": (
+                        "expected exactly one browser page target for "
+                        f"{expected_url!r}, found {len(matches)}"
+                    ),
+                }
+            target_id = str(matches[0].get("targetId") or "")
+            if not target_id:
+                return {
+                    "ok": False,
+                    "error": "matched browser page target had no targetId",
+                }
+            attach = await self._cdp(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True},
+            )
+            session_id = str(attach.get("result", {}).get("sessionId") or "")
+            if not session_id:
+                return {
+                    "ok": False,
+                    "error": "browser page target attach returned no sessionId",
+                }
+            try:
+                await self._configure_page_session(session_id)
+                ax_response = await self._cdp(
+                    "Accessibility.getFullAXTree",
+                    session_id=session_id,
+                )
+                with self._state_lock:
+                    old_session_id = self._page_session_id
+                if old_session_id and old_session_id != session_id:
+                    await self._cdp(
+                        "Target.detachFromTarget",
+                        {"sessionId": old_session_id},
+                    )
+                # No await occurs between adoption and return, so deadline
+                # cancellation cannot report failure and mutate state later.
+                with self._state_lock:
+                    self._page_target_id = target_id
+                    self._page_session_id = session_id
+                    self._frames.clear()
+                adopted = True
+                return {
+                    "ok": True,
+                    "target_id": target_id,
+                    "session_id": session_id,
+                    "result": ax_response.get("result", {}),
+                }
+            finally:
+                if session_id and not adopted:
+                    try:
+                        await self._cdp(
+                            "Target.detachFromTarget",
+                            {"sessionId": session_id},
+                            timeout=2.0,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "unadopted page session cleanup failed: %s",
+                            exc,
+                        )
+
+        async def _capture_with_deadline() -> Dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("AX capture deadline expired before dispatch")
+            return await asyncio.wait_for(_capture(), timeout=remaining)
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            fut = safe_schedule_threadsafe(_capture_with_deadline(), loop)
+            if fut is None:
+                return {"ok": False, "error": "Browser supervisor loop unavailable"}
+            try:
+                return fut.result(timeout=timeout + 1)
+            except TimeoutError:
+                fut.cancel()
+                return {
+                    "ok": False,
+                    "error": (
+                        "browser page AX capture timed out and its queued "
+                        "operation was cancelled"
+                    ),
+                }
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def call_session_cdp(
+        self,
+        session_id: str,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Send one CDP command to an explicitly captured page session."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return {"ok": False, "error": "supervisor loop is not running"}
+        with self._state_lock:
+            if not self._active:
+                return {"ok": False, "error": "supervisor is not active"}
+        if not session_id:
+            return {"ok": False, "error": "captured page session is unavailable"}
+        deadline = time.monotonic() + timeout
+
+        async def _do_call() -> Dict[str, Any]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "captured page action deadline expired before dispatch"
+                )
+            return await self._cdp(
+                method,
+                params or {},
+                session_id=session_id,
+                timeout=remaining,
+            )
+
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            fut = safe_schedule_threadsafe(_do_call(), loop)
+            if fut is None:
+                return {"ok": False, "error": "Browser supervisor loop unavailable"}
+            try:
+                response = fut.result(timeout=timeout + 1)
+            except TimeoutError:
+                fut.cancel()
+                return {
+                    "ok": False,
+                    "error": (
+                        "captured page CDP action timed out; dispatch outcome "
+                        "is indeterminate and must not be retried"
+                    ),
+                    "dispatch_ambiguous": True,
+                }
+            return {"ok": True, "result": response.get("result", {})}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def guarded_dom_action(
+        self,
+        *,
+        backend_node_id: int,
+        expected_page_identity: str,
+        action: str,
+        expected_role: str,
+        expected_name: str,
+        required_group_id: Optional[str] = None,
+        text: Optional[str] = None,
+        captured_session_id: Optional[str] = None,
+        require_group_composer: bool = False,
+        required_marketplace_listing_id: Optional[str] = None,
+        allowed_crosspost_group_ids: Optional[List[str]] = None,
+        selected_crosspost_group_ids: Optional[List[str]] = None,
+        crosspost_stage: Optional[str] = None,
+        crosspost_source_token: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Mutate one captured AX node after an in-turn page identity check."""
+        def guarded_call(
+            method: str,
+            params: Optional[Dict[str, Any]] = None,
+            *,
+            timeout: float = timeout,
+        ) -> Dict[str, Any]:
+            if captured_session_id:
+                return self.call_session_cdp(
+                    captured_session_id,
+                    method,
+                    params,
+                    timeout=timeout,
+                )
+            return self.call_page_cdp(method, params, timeout=timeout)
+
+        resolved = guarded_call(
+            "DOM.resolveNode",
+            {"backendNodeId": int(backend_node_id)},
+            timeout=timeout,
+        )
+        if not resolved.get("ok"):
+            return resolved
+        object_id = resolved.get("result", {}).get("object", {}).get("objectId")
+        if not object_id:
+            return {
+                "ok": False,
+                "error": "captured snapshot node is no longer resolvable",
+            }
+        guard_token = f"{time.time_ns()}-{threading.get_ident()}"
+        armed = guarded_call(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                function(token, requireGroupComposer, requireCrosspostDialog) {
+                  const prior = this.__hermesAtomicGuard;
+                  if (prior?.observer) prior.observer.disconnect();
+                  if (prior?.listener && prior?.eventTypes) {
+                    for (const type of prior.eventTypes) {
+                      window.removeEventListener(type, prior.listener, true);
+                    }
+                  }
+                  const state = {token, dirty: false, observer: null};
+                  state.observer = new MutationObserver(() => {
+                    state.dirty = true;
+                  });
+                  const targets = [this];
+                  const labelledBy = (
+                    this.getAttribute("aria-labelledby") || ""
+                  ).split(/\\s+/).filter(Boolean);
+                  for (const id of labelledBy) {
+                    const target = this.ownerDocument.getElementById(id);
+                    if (target) targets.push(target);
+                  }
+                  if (this.id) {
+                    for (const label of this.ownerDocument.querySelectorAll(
+                      `label[for="${CSS.escape(this.id)}"]`
+                    )) targets.push(label);
+                  }
+                  const wrappingLabel = this.closest?.("label");
+                  if (wrappingLabel) targets.push(wrappingLabel);
+                  if (requireGroupComposer) {
+                    const dialog = this.closest?.('[role="dialog"]');
+                    if (dialog) targets.push(dialog);
+                  }
+                  if (requireCrosspostDialog) {
+                    const dialog = this.closest?.('[role="dialog"]');
+                    if (dialog) targets.push(dialog);
+                  }
+                  for (const target of new Set(targets)) {
+                    state.observer.observe(target, {
+                      subtree: true,
+                      childList: true,
+                      attributes: true,
+                      characterData: true
+                    });
+                  }
+                  Object.defineProperty(this, "__hermesAtomicGuard", {
+                    value: state, configurable: true
+                  });
+                  return true;
+                }
+                """,
+                "arguments": [
+                    {"value": guard_token},
+                    {"value": bool(require_group_composer)},
+                    {
+                        "value": crosspost_stage in {
+                            "select_group", "submit",
+                        }
+                    },
+                ],
+                "returnByValue": True,
+            },
+            timeout=timeout,
+        )
+        if not armed.get("ok"):
+            return armed
+        arm_payload = armed.get("result", {})
+        if arm_payload.get("exceptionDetails"):
+            return {
+                "ok": False,
+                "error": "failed to arm exact-node mutation guard",
+            }
+
+        def _cleanup_guard() -> None:
+            guarded_call(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                    function(token) {
+                      const guard = this.__hermesAtomicGuard;
+                      if (guard?.token === token) {
+                        if (guard.listener && guard.eventTypes) {
+                          for (const type of guard.eventTypes) {
+                            window.removeEventListener(
+                              type, guard.listener, true
+                            );
+                          }
+                        }
+                        guard.observer?.disconnect();
+                        delete this.__hermesAtomicGuard;
+                      }
+                    }
+                    """,
+                    "arguments": [{"value": guard_token}],
+                },
+                timeout=timeout,
+            )
+
+        live_ax = guarded_call(
+            "Accessibility.getPartialAXTree",
+            {
+                "backendNodeId": int(backend_node_id),
+                "fetchRelatives": False,
+            },
+            timeout=timeout,
+        )
+        if not live_ax.get("ok"):
+            _cleanup_guard()
+            return live_ax
+        live_nodes = live_ax.get("result", {}).get("nodes", [])
+        live_node = next(
+            (
+                node for node in live_nodes
+                if int(node.get("backendDOMNodeId") or 0)
+                == int(backend_node_id)
+                and not node.get("ignored")
+            ),
+            None,
+        )
+        normalize = lambda value: " ".join(str(value or "").split()).casefold()
+        live_role = (
+            live_node.get("role", {}).get("value") if live_node else None
+        )
+        live_name = (
+            live_node.get("name", {}).get("value") if live_node else None
+        )
+        if (
+            live_node is None
+            or normalize(live_role) != normalize(expected_role)
+            or normalize(live_name) != normalize(expected_name)
+        ):
+            _cleanup_guard()
+            return {
+                "ok": False,
+                "error": (
+                    "Captured snapshot node semantics changed before "
+                    "atomic action"
+                ),
+            }
+        if action == "click":
+            clicked = guarded_call(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                    function(
+                      expected, token, requiredGroupId, requireGroupComposer,
+                      requiredListingId, allowedCrosspostGroupIds,
+                      selectedCrosspostGroupIds, crosspostStage,
+                      crosspostSourceToken, expectedControlName
+                    ) {
+                      const guard = this.__hermesAtomicGuard;
+                      const fail = message => {
+                        guard?.observer?.disconnect();
+                        if (guard?.token === token) {
+                          delete this.__hermesAtomicGuard;
+                        }
+                        throw new Error(message);
+                      };
+                      const identity = () =>
+                        `${location.href}|${performance.timeOrigin}`;
+                      const targetAt = (x, y) => {
+                        const hit = this.ownerDocument.elementFromPoint(x, y);
+                        return hit === this || (hit && this.contains(hit));
+                      };
+                      if (
+                        !guard
+                        || guard.token !== token
+                        || guard.dirty
+                        || guard.observer.takeRecords().length
+                      ) fail("Captured snapshot node changed after validation");
+                      if (identity() !== expected || !this.isConnected) {
+                        fail("Protected page load changed before atomic click");
+                      }
+                      if (requireGroupComposer) {
+                        const dialog = this.closest?.('[role="dialog"]');
+                        const dialogText = [
+                          dialog?.getAttribute("aria-label") || "",
+                          dialog?.innerText || ""
+                        ].join(" ").replace(/\\s+/g, " ").toLowerCase();
+                        const createPost = (
+                          dialogText.includes("create post")
+                          || dialogText.includes("建立貼文")
+                        );
+                        const forbiddenMode = (
+                          dialogText.includes("anonymous post")
+                          || dialogText.includes("匿名貼文")
+                          || dialogText.includes("share post")
+                          || dialogText.includes("分享貼文")
+                        );
+                        if (!dialog || !createPost || forbiddenMode) {
+                          fail(
+                            "Target is not the authorized group post composer"
+                          );
+                        }
+                      }
+                      let crosspostGroupId = null;
+                      let crosspostPreselectedGroupIds = [];
+                      let sourceControl = null;
+                      if (requiredListingId) {
+                        const listingMatch = location.pathname.match(
+                          /^\\/marketplace\\/item\\/([0-9]+)\\/?$/
+                        );
+                        const sellingRoute = (
+                          /^\\/marketplace\\/you\\/selling\\/?$/
+                            .test(location.pathname)
+                        );
+                        if (
+                          (!listingMatch && !sellingRoute)
+                          || (
+                            listingMatch
+                            && listingMatch[1] !== String(requiredListingId)
+                          )
+                        ) {
+                          fail(
+                            "Current route is not an authorized Marketplace listing source"
+                          );
+                        }
+                        const allowedIds = new Set(
+                          (allowedCrosspostGroupIds || []).map(String)
+                        );
+                        const expectedSelectedIds = new Set(
+                          (selectedCrosspostGroupIds || []).map(String)
+                        );
+                        if (
+                          ![
+                            "open_menu", "open_dialog_from_menu",
+                            "open_dialog_direct",
+                            "select_group", "submit"
+                          ].includes(crosspostStage)
+                        ) fail("Unsupported Marketplace cross-post stage");
+                        if (!crosspostSourceToken) {
+                          fail("Marketplace source capability token is missing");
+                        }
+                        const listingIdsIn = container => {
+                          const ids = new Set();
+                          for (const candidate of [container, ...(
+                            container.querySelectorAll?.(
+                              '[data-listing-id], '
+                              + '[data-marketplace-listing-id], '
+                              + 'a[href*="/marketplace/item/"], '
+                              + 'a[href*="/ad_center/create/listingad/"]'
+                            ) || []
+                          )]) {
+                            for (const attribute of [
+                              "data-listing-id",
+                              "data-marketplace-listing-id"
+                            ]) {
+                              const value = candidate.getAttribute?.(attribute);
+                              if (/^[0-9]+$/.test(value || "")) ids.add(value);
+                            }
+                            const href = candidate.getAttribute?.("href") || "";
+                            const match = href.match(
+                              /\\/marketplace\\/item\\/([0-9]+)(?:\\/|[?#]|$)/
+                            );
+                            if (match) ids.add(match[1]);
+                            if (
+                              /\\/ad_center\\/create\\/listingad\\/(?:[?#]|$)/
+                                .test(href)
+                            ) {
+                              const targetMatch = href.match(
+                                /[?&]target_id=([0-9]+)(?:[&#]|$)/
+                              );
+                              if (targetMatch) ids.add(targetMatch[1]);
+                            }
+                          }
+                          return ids;
+                        };
+                        const flow = this.ownerDocument.__hermesCrosspostFlow;
+                        const bindSourceControl = () => {
+                          const listingScopeSelector = [
+                            "[data-listing-id]",
+                            "[data-marketplace-listing-id]",
+                            'a[href*="/marketplace/item/"]',
+                            "article", "li", '[role="listitem"]'
+                          ].join(", ");
+                          const pageScopeSelector = [
+                            "html", "body", "main", '[role="main"]',
+                            '[role="feed"]', '[role="list"]'
+                          ].join(", ");
+                          const normalizeLabel = value => String(value || "")
+                            .replace(/\\s+/g, " ").trim().toLowerCase();
+                          const hasSellingActionAssociation = candidate => {
+                            const controlName = normalizeLabel(
+                              expectedControlName
+                            );
+                            const controlPrefix = "more options for ";
+                            if (!controlName.startsWith(controlPrefix)) {
+                              return false;
+                            }
+                            const listingName = controlName.slice(
+                              controlPrefix.length
+                            ).trim();
+                            if (!listingName) return false;
+                            for (const link of candidate.querySelectorAll(
+                              'a[href*="/ad_center/create/listingad/"]'
+                              + '[href*="target_id="]'
+                            )) {
+                              const href = link.getAttribute("href") || "";
+                              if (
+                                !/\\/ad_center\\/create\\/listingad\\/(?:[?#]|$)/
+                                  .test(href)
+                              ) continue;
+                              const targetMatch = href.match(
+                                /[?&]target_id=([0-9]+)(?:[&#]|$)/
+                              );
+                              if (
+                                !targetMatch
+                                || targetMatch[1]
+                                  !== String(requiredListingId)
+                              ) continue;
+                              for (const value of [
+                                link.getAttribute("aria-label"),
+                                link.getAttribute("title"), link.innerText
+                              ]) {
+                                const actionName = normalizeLabel(value);
+                                const expectedPrefix = (
+                                  `boost listing for ${listingName}`
+                                );
+                                if (
+                                  actionName === expectedPrefix
+                                  || actionName.startsWith(`${expectedPrefix}.`)
+                                ) return true;
+                              }
+                            }
+                            return false;
+                          };
+                          let sourceBound = false;
+                          let sawAuthorizedListing = false;
+                          let listingNode = this;
+                          while (listingNode) {
+                            // Facebook's Selling rows are deeply nested generic
+                            // divs.  A row is proven by a numeric item/data id or
+                            // by the same-row Boost target id plus matching full
+                            // action labels. Shared listing wrappers fail closed.
+                            const sourceIds = listingIdsIn(listingNode);
+                            if (sourceIds.size > 1) {
+                              fail(
+                                "Cross-post control belongs to a shared listing container"
+                              );
+                            }
+                            if (sourceIds.size === 1) {
+                              if (!sourceIds.has(String(requiredListingId))) {
+                                fail(
+                                  "Cross-post control belongs to a different listing"
+                                );
+                              }
+                              sawAuthorizedListing = true;
+                              if (listingNode.matches?.(pageScopeSelector)) {
+                                fail(
+                                  "Cross-post control lacks a bounded listing row"
+                                );
+                              }
+                              if (
+                                listingNode.matches?.(listingScopeSelector)
+                                || hasSellingActionAssociation(listingNode)
+                              ) {
+                                sourceBound = true;
+                                break;
+                              }
+                            }
+                            listingNode = listingNode.parentElement;
+                          }
+                          if (!sourceBound) {
+                            fail(
+                              sawAuthorizedListing
+                                ? "Cross-post control lacks a bounded listing row"
+                                : "Cross-post control is not bound to the authorized listing"
+                            );
+                          }
+                        };
+                        if (
+                          crosspostStage === "open_menu"
+                          || crosspostStage === "open_dialog_direct"
+                        ) {
+                          bindSourceControl();
+                          sourceControl = this;
+                        } else {
+                          if (
+                            !flow
+                            || flow.token !== crosspostSourceToken
+                            || flow.listingId !== String(requiredListingId)
+                          ) {
+                            fail(
+                              "Marketplace cross-post source flow is not bound"
+                            );
+                          }
+                          const markedSources = [...this.ownerDocument.querySelectorAll(
+                            'button, a, [role="button"], [role="link"], '
+                            + '[role="menuitem"]'
+                          )].filter(candidate =>
+                            candidate.__hermesCrosspostSource?.token
+                              === crosspostSourceToken
+                            && candidate.__hermesCrosspostSource?.listingId
+                              === String(requiredListingId)
+                          );
+                          if (markedSources.length !== 1) {
+                            fail(
+                              "Marketplace source control is no longer unique"
+                            );
+                          }
+                          sourceControl = markedSources[0];
+                        }
+                        if (crosspostStage === "open_dialog_from_menu") {
+                          if (flow.stage !== "menu_open") {
+                            fail("Marketplace source menu state changed");
+                          }
+                          const menu = this.closest?.('[role="menu"]');
+                          const controlledId = sourceControl.getAttribute(
+                            "aria-controls"
+                          );
+                          if (controlledId) {
+                            if (
+                              !menu
+                              || this.ownerDocument.getElementById(controlledId)
+                                !== menu
+                            ) {
+                              fail(
+                                "List in more places is not in the source menu"
+                              );
+                            }
+                          } else {
+                            const visibleMenus = [...(
+                              this.ownerDocument.querySelectorAll('[role="menu"]')
+                            )].filter(candidate => {
+                              const style = getComputedStyle(candidate);
+                              const rect = candidate.getBoundingClientRect();
+                              return (
+                                rect.width > 0 && rect.height > 0
+                                && style.display !== "none"
+                                && style.visibility !== "hidden"
+                              );
+                            });
+                            if (
+                              sourceControl.getAttribute("aria-expanded")
+                                !== "true"
+                              || !menu
+                              || visibleMenus.length !== 1
+                              || visibleMenus[0] !== menu
+                            ) {
+                              fail(
+                                "List in more places is not uniquely bound to the source menu"
+                              );
+                            }
+                          }
+                        } else if (crosspostStage === "open_dialog_direct") {
+                          if (flow) {
+                            fail(
+                              "Direct List in more places did not start a fresh source flow"
+                            );
+                          }
+                        }
+                        if (
+                          crosspostStage === "select_group"
+                          || crosspostStage === "submit"
+                        ) {
+                          const normalizeGroupName = value => String(value || "")
+                            .replace(/\\s+/g, " ").trim().toLowerCase();
+                          const dialog = this.closest?.('[role="dialog"]');
+                          const dialogText = [
+                            dialog?.getAttribute("aria-label") || "",
+                            dialog?.innerText || ""
+                          ].join(" ").replace(/\\s+/g, " ").toLowerCase();
+                          const isCrosspostDialog = (
+                            dialogText.includes("list in more places")
+                            || dialogText.includes("list your item in more places")
+                            || dialogText.includes("刊登到更多地方")
+                            || dialogText.includes("更多地方")
+                          );
+                          if (!dialog || !isCrosspostDialog) {
+                            fail(
+                              "Target is not the authorized List in more places dialog"
+                            );
+                          }
+                          if (
+                            crosspostStage === "select_group"
+                            && !["dialog_requested", "selecting"].includes(
+                              flow.stage
+                            )
+                          ) {
+                            fail("Marketplace source dialog state changed");
+                          }
+                          if (
+                            crosspostStage === "submit"
+                            && !["dialog_requested", "selecting"].includes(
+                              flow.stage
+                            )
+                          ) {
+                            fail("Marketplace source selection state changed");
+                          }
+                          let authoritativeCrosspostRows = null;
+                          const bindAuthoritativeCrosspostRows = () => {
+                            if (authoritativeCrosspostRows) {
+                              return authoritativeCrosspostRows;
+                            }
+                            let records;
+                            try {
+                              records = require("RelayFBEnvironment")
+                                .getStore().getSource().toJSON();
+                            } catch {
+                              fail(
+                                "Facebook cross-post Relay data is unavailable"
+                              );
+                            }
+                            const productItem = records?.[
+                              String(requiredListingId)
+                            ];
+                            const forSaleItemId = productItem
+                              ?.for_sale_item?.__ref;
+                            if (
+                              productItem?.__typename !== "ProductItem"
+                              || String(productItem.id) !== String(
+                                requiredListingId
+                              )
+                              || !/^[0-9]+$/.test(forSaleItemId || "")
+                            ) {
+                              fail(
+                                "Facebook cross-post listing has no authoritative for-sale item binding"
+                              );
+                            }
+                            const connectionNeedle = (
+                              `for_sale_item_id:\"${forSaleItemId}\"`
+                            );
+                            const connections = Object.entries(records || {})
+                              .filter(([key, record]) => (
+                                record?.__typename
+                                  === "MarketplaceSuggestedCrosspostTargetsEdgeViewConnection"
+                                && key.includes(
+                                  "marketplace_suggested_crosspost_targets("
+                                )
+                                && key.includes(connectionNeedle)
+                              ));
+                            if (connections.length !== 1) {
+                              fail(
+                                "Facebook cross-post destination connection is not bound to the active listing"
+                              );
+                            }
+                            const [, connection] = connections[0];
+                            const edgeRefs = connection.edges?.__refs;
+                            const pageInfo = connection.page_info?.__ref
+                              ? records[connection.page_info.__ref]
+                              : connection.page_info;
+                            if (
+                              !Array.isArray(edgeRefs)
+                              || !edgeRefs.length
+                              || pageInfo?.has_next_page !== false
+                            ) {
+                              fail(
+                                "Facebook cross-post destination connection may be truncated"
+                              );
+                            }
+                            const groupDescriptors = edgeRefs.map(edgeRef => {
+                              const edge = records[edgeRef];
+                              const groupId = edge?.node?.__ref;
+                              const group = records[groupId];
+                              if (
+                                !/^[0-9]+$/.test(groupId || "")
+                                || group?.__typename !== "Group"
+                                || String(group.id) !== groupId
+                              ) {
+                                fail(
+                                  "Facebook cross-post connection contains an invalid group record"
+                                );
+                              }
+                              const picturePaths = new Set();
+                              for (const [key, value] of Object.entries(group)) {
+                                if (
+                                  !key.startsWith("profile_picture(")
+                                  || typeof value?.__ref !== "string"
+                                ) continue;
+                                const raw = records[value.__ref]?.uri || "";
+                                try {
+                                  const parsed = new URL(raw, location.href);
+                                  if (parsed.hostname.endsWith("fbcdn.net")) {
+                                    picturePaths.add(parsed.pathname);
+                                  }
+                                } catch {}
+                              }
+                              if (!picturePaths.size) {
+                                fail(
+                                  "Facebook cross-post group record has no profile image identity"
+                                );
+                              }
+                              return {
+                                groupId,
+                                name: normalizeGroupName(group.name),
+                                picturePaths
+                              };
+                            });
+                            if (
+                              new Set(groupDescriptors.map(
+                                descriptor => descriptor.groupId
+                              )).size !== groupDescriptors.length
+                            ) {
+                              fail(
+                                "Facebook cross-post connection repeats a group record"
+                              );
+                            }
+                            const allSelectionControls = [...(
+                              dialog.querySelectorAll([
+                                '[role="checkbox"]',
+                                '[role="menuitemcheckbox"]',
+                                '[role="switch"]', '[role="option"]',
+                                'input[type="checkbox"]'
+                              ].join(", "))
+                            )];
+                            const optionRoots = allSelectionControls.filter(
+                              candidate => !allSelectionControls.some(other =>
+                                other !== candidate && other.contains(candidate)
+                              )
+                            );
+                            if (optionRoots.length !== edgeRefs.length) {
+                              fail(
+                                "Facebook cross-post rows do not match the authoritative destination connection"
+                              );
+                            }
+                            const rowMap = new Map();
+                            const seenGroupIds = new Set();
+                            optionRoots.forEach(option => {
+                              const rowAssetPaths = new Set();
+                              for (const asset of option.querySelectorAll(
+                                "img[src], image"
+                              )) {
+                                const raw = asset.getAttribute("src")
+                                  || asset.getAttribute("xlink:href")
+                                  || asset.getAttributeNS?.(
+                                    "http://www.w3.org/1999/xlink", "href"
+                                  )
+                                  || asset.getAttribute("href") || "";
+                                try {
+                                  const parsed = new URL(raw, location.href);
+                                  if (parsed.hostname.endsWith("fbcdn.net")) {
+                                    rowAssetPaths.add(parsed.pathname);
+                                  }
+                                } catch {}
+                              }
+                              const rowElements = [
+                                option, ...option.querySelectorAll("span, div")
+                              ];
+                              const rowNames = new Set(rowElements.map(
+                                element => normalizeGroupName(element.innerText)
+                              ).filter(Boolean));
+                              const matches = groupDescriptors.filter(
+                                descriptor => (
+                                  rowNames.has(descriptor.name)
+                                  && [...descriptor.picturePaths].some(
+                                    path => rowAssetPaths.has(path)
+                                  )
+                                )
+                              );
+                              if (matches.length !== 1) {
+                                fail(
+                                  "Facebook cross-post row has no unique authoritative group identity"
+                                );
+                              }
+                              const groupId = matches[0].groupId;
+                              if (seenGroupIds.has(groupId)) {
+                                fail(
+                                  "Facebook cross-post rows repeat an authoritative group"
+                                );
+                              }
+                              seenGroupIds.add(groupId);
+                              rowMap.set(option, groupId);
+                            });
+                            const missingAllowedIds = [...allowedIds].filter(
+                              groupId => !seenGroupIds.has(groupId)
+                            );
+                            if (missingAllowedIds.length) {
+                              fail(
+                                "Authorized cross-post groups are absent from Facebook's destination connection"
+                              );
+                            }
+                            authoritativeCrosspostRows = rowMap;
+                            return rowMap;
+                          };
+                          const discoverGroupId = control => {
+                            const containerSelector = [
+                              "label", "li", '[role="checkbox"]',
+                              '[role="menuitemcheckbox"]', '[role="option"]',
+                              '[role="switch"]', "[data-group-id]",
+                              "[data-groupid]"
+                            ].join(", ");
+                            const selectionSelector = [
+                              '[role="checkbox"]',
+                              '[role="menuitemcheckbox"]', '[role="option"]',
+                              '[role="switch"]', 'input[type="checkbox"]'
+                            ].join(", ");
+                            let node = control;
+                            let sawUniqueSelectionRow = false;
+                            for (
+                              let depth = 0;
+                              node && node !== dialog && depth < 8;
+                              depth += 1, node = node.parentElement
+                            ) {
+                              const selectionControls = [
+                                ...(node.matches?.(selectionSelector)
+                                  ? [node] : []),
+                                ...node.querySelectorAll(selectionSelector)
+                              ];
+                              const roots = selectionControls.filter(candidate =>
+                                !selectionControls.some(other =>
+                                  other !== candidate
+                                  && other.contains(candidate)
+                                )
+                              );
+                              // Snapshot references often resolve to the
+                              // visible text or image inside Facebook's
+                              // checkbox row. Keep walking until an ancestor
+                              // actually contains the selection control; an
+                              // empty descendant is not ambiguous.
+                              if (!roots.length) continue;
+                              if (roots.length > 1 && sawUniqueSelectionRow) {
+                                return null;
+                              }
+                              if (
+                                roots.length > 1
+                                || !(
+                                  roots[0] === control
+                                  || roots[0].contains(control)
+                                  || control.contains?.(roots[0])
+                                )
+                              ) {
+                                fail(
+                                  "Cross-post option is not a unique selection row"
+                                );
+                              }
+                              sawUniqueSelectionRow = true;
+                              const identityNode = node.matches?.(
+                                containerSelector
+                              ) ? node : roots[0].matches?.(containerSelector)
+                                ? roots[0] : null;
+                              if (!identityNode) continue;
+                              const ids = new Set();
+                              for (const link of identityNode.querySelectorAll(
+                                'a[href*="/groups/"]'
+                              )) {
+                                const href = link.getAttribute("href") || "";
+                                const match = href.match(
+                                  /\\/groups\\/([0-9]+)(?:\\/|[?#]|$)/
+                                );
+                                if (match) ids.add(match[1]);
+                              }
+                              for (const candidate of [identityNode, ...(
+                                identityNode.querySelectorAll(
+                                  "[data-group-id], [data-groupid]"
+                                )
+                              )]) {
+                                for (const attribute of [
+                                  "data-group-id", "data-groupid"
+                                ]) {
+                                  const value = candidate.getAttribute?.(
+                                    attribute
+                                  );
+                                  if (/^[0-9]+$/.test(value || "")) {
+                                    ids.add(value);
+                                  }
+                                }
+                              }
+                              if (ids.size > 1) {
+                                fail(
+                                  "Cross-post option maps to multiple group ids"
+                                );
+                              }
+                              if (!ids.size) {
+                                const authoritativeId = (
+                                  bindAuthoritativeCrosspostRows().get(roots[0])
+                                );
+                                if (authoritativeId) ids.add(authoritativeId);
+                              }
+                              if (ids.size > 1) {
+                                fail(
+                                  "Cross-post option maps to multiple authoritative groups"
+                                );
+                              }
+                              if (ids.size === 1) return [...ids][0];
+                            }
+                            return null;
+                          };
+                          const selectedControls = [...dialog.querySelectorAll(
+                            '[role="checkbox"][aria-checked="true"], '
+                            + '[role="menuitemcheckbox"][aria-checked="true"], '
+                            + '[role="switch"][aria-checked="true"], '
+                            + '[role="option"][aria-selected="true"], '
+                            + 'input[type="checkbox"]:checked'
+                          )];
+                          const controlIsSelected = control => (
+                            control.matches?.('input[type="checkbox"]')
+                              ? Boolean(control.checked)
+                              : control.getAttribute?.("aria-checked") === "true"
+                                || control.getAttribute?.("aria-selected") === "true"
+                          );
+                          const actualSelectedIds = new Set();
+                          for (const selectedControl of selectedControls) {
+                            const selectedId = discoverGroupId(selectedControl);
+                            if (!selectedId || !allowedIds.has(selectedId)) {
+                              fail(
+                                "Selected cross-post option is not bound to an authorized group id"
+                              );
+                            }
+                            actualSelectedIds.add(selectedId);
+                          }
+                          if (crosspostStage === "submit") {
+                            const allSelectionControls = [...(
+                              dialog.querySelectorAll([
+                                '[role="checkbox"]',
+                                '[role="menuitemcheckbox"]',
+                                '[role="switch"]', '[role="option"]',
+                                'input[type="checkbox"]'
+                              ].join(", "))
+                            )];
+                            const optionRoots = allSelectionControls.filter(
+                              candidate => !allSelectionControls.some(other =>
+                                other !== candidate && other.contains(candidate)
+                              )
+                            );
+                            if (!optionRoots.length) {
+                              fail("Cross-post destination list is empty");
+                            }
+                            const unknownStateControls = [...(
+                              dialog.querySelectorAll(
+                                "[aria-checked], [aria-selected]"
+                              )
+                            )].filter(candidate =>
+                              !candidate.matches([
+                                '[role="checkbox"]',
+                                '[role="menuitemcheckbox"]',
+                                '[role="switch"]', '[role="option"]'
+                              ].join(", "))
+                            );
+                            if (unknownStateControls.length) {
+                              fail(
+                                "Cross-post dialog has an unknown selection control"
+                              );
+                            }
+                            const enumeratedGroupIds = new Set();
+                            for (const optionRoot of optionRoots) {
+                              const optionId = discoverGroupId(optionRoot);
+                              if (!optionId && controlIsSelected(optionRoot)) {
+                                fail(
+                                  "Selected cross-post destination has no authorized identity"
+                                );
+                              }
+                              if (optionId && enumeratedGroupIds.has(optionId)) {
+                                fail(
+                                  "Cross-post destination rows are not uniquely enumerable"
+                                );
+                              }
+                              if (optionId) enumeratedGroupIds.add(optionId);
+                            }
+                            bindAuthoritativeCrosspostRows();
+                          }
+                          if (crosspostStage === "select_group") {
+                            const discovered = discoverGroupId(this);
+                            if (!discovered || !allowedIds.has(discovered)) {
+                              fail(
+                                "Cross-post option is not bound to an authorized group id"
+                              );
+                            }
+                            crosspostGroupId = discovered;
+                            crosspostPreselectedGroupIds = [
+                              ...actualSelectedIds
+                            ];
+                          } else if (crosspostStage === "submit") {
+                            if (
+                              actualSelectedIds.size !== expectedSelectedIds.size
+                              || [...expectedSelectedIds].some(
+                                id => !actualSelectedIds.has(id)
+                              )
+                            ) {
+                              fail(
+                                "Selected cross-post groups changed before final Post"
+                              );
+                            }
+                          }
+                        }
+                      }
+                      const rect = this.getBoundingClientRect();
+                      const x = rect.left + rect.width / 2;
+                      const y = rect.top + rect.height / 2;
+                      const style = getComputedStyle(this);
+                      if (
+                        rect.width <= 0 || rect.height <= 0
+                        || x < 0 || y < 0
+                        || x > innerWidth || y > innerHeight
+                        || style.display === "none"
+                        || style.visibility === "hidden"
+                        || style.pointerEvents === "none"
+                        || Number(style.opacity) === 0
+                        || this.disabled
+                        || this.getAttribute("aria-disabled") === "true"
+                        || !targetAt(x, y)
+                      ) fail("Captured snapshot node is not interactable");
+                      if (requiredGroupId) {
+                        const match = location.pathname.match(
+                          /^\\/groups\\/([0-9]+)(?:\\/|$)/
+                        );
+                        if (
+                          !match
+                          || match[1] !== String(requiredGroupId)
+                        ) {
+                          fail(
+                            "Current route is not the authorized group"
+                          );
+                        }
+                      }
+                      guard.observer.disconnect();
+                      delete this.__hermesAtomicGuard;
+                      if (requiredListingId) {
+                        if (
+                          crosspostStage === "open_menu"
+                          || crosspostStage === "open_dialog_direct"
+                        ) {
+                          Object.defineProperty(
+                            this, "__hermesCrosspostSource", {
+                              value: {
+                                token: crosspostSourceToken,
+                                listingId: String(requiredListingId)
+                              },
+                              configurable: true
+                            }
+                          );
+                          Object.defineProperty(
+                            this.ownerDocument, "__hermesCrosspostFlow", {
+                              value: {
+                                token: crosspostSourceToken,
+                                listingId: String(requiredListingId),
+                                stage: (
+                                  crosspostStage === "open_menu"
+                                    ? "menu_open" : "dialog_requested"
+                                )
+                              },
+                              configurable: true,
+                              writable: true
+                            }
+                          );
+                        } else if (
+                          crosspostStage === "open_dialog_from_menu"
+                        ) {
+                          this.ownerDocument.__hermesCrosspostFlow.stage =
+                            "dialog_requested";
+                        } else if (crosspostStage === "select_group") {
+                          this.ownerDocument.__hermesCrosspostFlow.stage =
+                            "selecting";
+                        } else if (crosspostStage === "submit") {
+                          delete sourceControl.__hermesCrosspostSource;
+                          delete this.ownerDocument.__hermesCrosspostFlow;
+                        }
+                      }
+                      // The hit test, page identity check, group binding, and
+                      // dispatch run in one renderer task. This cannot click a
+                      // replacement document between separate CDP calls.
+                      this.click();
+                      return {
+                        ok: true, action: "click", pageIdentity: expected,
+                        crosspostGroupId, crosspostPreselectedGroupIds
+                      };
+                    }
+                    """,
+                    "arguments": [
+                        {"value": expected_page_identity},
+                        {"value": guard_token},
+                        {"value": required_group_id},
+                        {"value": bool(require_group_composer)},
+                        {"value": required_marketplace_listing_id},
+                        {"value": list(allowed_crosspost_group_ids or [])},
+                        {"value": list(selected_crosspost_group_ids or [])},
+                        {"value": crosspost_stage},
+                        {"value": crosspost_source_token},
+                        {"value": expected_name},
+                    ],
+                    "returnByValue": True,
+                    "userGesture": True,
+                },
+                timeout=timeout,
+            )
+            if not clicked.get("ok"):
+                _cleanup_guard()
+                clicked["dispatch_ambiguous"] = True
+                return clicked
+            payload = clicked.get("result", {})
+            exception = payload.get("exceptionDetails")
+            if exception:
+                return {
+                    "ok": False,
+                    "error": (
+                        exception.get("exception", {}).get("description")
+                        or exception.get("text")
+                        or "guarded atomic click failed"
+                    ),
+                }
+            return {
+                "ok": True,
+                "result": payload.get("result", {}).get("value"),
+            }
+        function_declaration = """
+        function(expected, action, text, token, requireGroupComposer) {
+          const guard = this.__hermesAtomicGuard;
+          const fail = message => {
+            guard?.observer?.disconnect();
+            if (guard?.token === token) delete this.__hermesAtomicGuard;
+            throw new Error(message);
+          };
+          const actual = `${location.href}|${performance.timeOrigin}`;
+          if (actual !== expected) {
+            fail("Protected page load changed before atomic action");
+          }
+          if (!this.isConnected) {
+            fail("Captured snapshot node is detached");
+          }
+          if (requireGroupComposer) {
+            const dialog = this.closest?.('[role="dialog"]');
+            const dialogText = [
+              dialog?.getAttribute("aria-label") || "",
+              dialog?.innerText || ""
+            ].join(" ").replace(/\\s+/g, " ").toLowerCase();
+            const createPost = (
+              dialogText.includes("create post")
+              || dialogText.includes("建立貼文")
+            );
+            const forbiddenMode = (
+              dialogText.includes("anonymous post")
+              || dialogText.includes("匿名貼文")
+              || dialogText.includes("share post")
+              || dialogText.includes("分享貼文")
+            );
+            if (!dialog || !createPost || forbiddenMode) {
+              fail("Target is not the authorized group post composer");
+            }
+          }
+          if (
+            !guard
+            || guard.token !== token
+            || guard.dirty
+            || guard.observer.takeRecords().length
+          ) {
+            fail("Captured snapshot node changed after semantic validation");
+          }
+          if (action === "fill") {
+            const proto = this instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype
+              : this instanceof HTMLInputElement
+                ? HTMLInputElement.prototype
+                : null;
+            const setter = proto
+              && Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            this.focus();
+            if (
+              `${location.href}|${performance.timeOrigin}` !== expected
+              || !this.isConnected
+              || guard.dirty
+              || guard.observer.takeRecords().length
+            ) {
+              fail("Fill target changed while receiving focus");
+            }
+            guard.observer.disconnect();
+            delete this.__hermesAtomicGuard;
+            if (this.isContentEditable) {
+              this.textContent = String(text ?? "");
+              this.dispatchEvent(new InputEvent("input", {
+                bubbles: true,
+                inputType: "insertText",
+                data: String(text ?? "")
+              }));
+              this.dispatchEvent(new Event("change", {bubbles: true}));
+            } else if (!setter) {
+              throw new Error("Guarded fill target has no native value setter");
+            } else {
+              setter.call(this, String(text ?? ""));
+              this.dispatchEvent(new InputEvent("input", {
+                bubbles: true, inputType: "insertText", data: String(text ?? "")
+              }));
+              this.dispatchEvent(new Event("change", {bubbles: true}));
+            }
+          } else {
+            fail(`Unsupported guarded action ${action}`);
+          }
+          return {ok: true, action, pageIdentity: actual};
+        }
+        """
+        called = guarded_call(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "arguments": [
+                    {"value": expected_page_identity},
+                    {"value": action},
+                    {"value": text},
+                    {"value": guard_token},
+                    {"value": bool(require_group_composer)},
+                ],
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+            timeout=timeout,
+        )
+        if not called.get("ok"):
+            _cleanup_guard()
+            return called
+        payload = called.get("result", {})
+        exception = payload.get("exceptionDetails")
+        if exception:
+            return {
+                "ok": False,
+                "error": (
+                    exception.get("exception", {}).get("description")
+                    or exception.get("text")
+                    or "guarded DOM action failed"
+                ),
+            }
+        return {
+            "ok": True,
+            "result": payload.get("result", {}).get("value"),
+        }
+
     # ── Supervisor loop internals ────────────────────────────────────────────
 
     def _thread_main(self) -> None:
@@ -637,6 +2022,7 @@ class CDPSupervisor:
                 # Reset per-connection session state so stale ids don't hang
                 # around after a reconnect.
                 self._page_session_id = None
+                self._page_target_id = None
                 self._child_sessions.clear()
                 # We deliberately keep `_pending_dialogs` and `_frames` —
                 # they're reconciled as the supervisor resubscribes and
@@ -699,7 +2085,14 @@ class CDPSupervisor:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        pages = [t for t in targets if t.get("type") == "page"]
+        page_target = next(
+            (
+                target for target in pages
+                if str(target.get("url") or "").startswith(("http://", "https://"))
+            ),
+            pages[0] if pages else None,
+        )
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
             target_id = created["result"]["targetId"]
@@ -710,19 +2103,25 @@ class CDPSupervisor:
             "Target.attachToTarget",
             {"targetId": target_id, "flatten": True},
         )
-        self._page_session_id = attach["result"]["sessionId"]
-        await self._cdp("Page.enable", session_id=self._page_session_id)
-        await self._cdp("Runtime.enable", session_id=self._page_session_id)
+        session_id = attach["result"]["sessionId"]
+        self._page_target_id = target_id
+        self._page_session_id = session_id
+        await self._configure_page_session(session_id)
+
+    async def _configure_page_session(self, session_id: str) -> None:
+        """Enable supervisor domains and dialog handling on one page session."""
+        await self._cdp("Page.enable", session_id=session_id)
+        await self._cdp("Runtime.enable", session_id=session_id)
         await self._cdp(
             "Target.setAutoAttach",
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
-            session_id=self._page_session_id,
+            session_id=session_id,
         )
         # Install the dialog bridge — overrides native alert/confirm/prompt with
         # a synchronous XHR we intercept via Fetch domain. This is how we make
         # dialog response work on Browserbase (whose CDP proxy auto-dismisses
         # real native dialogs before we can call handleJavaScriptDialog).
-        await self._install_dialog_bridge(self._page_session_id)
+        await self._install_dialog_bridge(session_id)
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session.

@@ -57,6 +57,7 @@ class _StubAgent:
             setattr(self, attr, 0)
         self.session_cost_status = "ok"
         self.session_cost_source = "stub"
+        self.persisted_messages = None
 
     # --- fallible cleanup surfaces -------------------------------------
     def _save_trajectory(self, *a, **k):
@@ -70,9 +71,10 @@ class _StubAgent:
     def _drop_trailing_empty_response_scaffolding(self, *a, **k):
         pass
 
-    def _persist_session(self, *a, **k):
+    def _persist_session(self, messages, *a, **k):
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
+        self.persisted_messages = list(messages)
 
     # --- harmless no-ops ------------------------------------------------
     def _emit_status(self, *a, **k):
@@ -182,3 +184,26 @@ def test_text_response_on_last_allowed_call_is_completed():
     )
     assert result["final_response"] == "final report"
     assert result["completed"] is True
+
+
+def test_private_contract_repair_exchange_is_removed_before_persistence():
+    agent = _StubAgent(raise_in=())
+    agent._response_contract_repair_start_index = 1
+    agent.final_response_validation_failure_message = "detail validation failed"
+    result = _run(
+        agent,
+        final_response="cancelled repair",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "detail validation failed"
+    assert agent.persisted_messages == [
+        {"role": "user", "content": "do a thing"},
+        {
+            "role": "assistant",
+            "content": "detail validation failed",
+            "finish_reason": "contract_repair_interrupted",
+        },
+    ]
+    assert agent._response_contract_repair_start_index is None

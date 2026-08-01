@@ -174,6 +174,47 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_run_slash_backend_status_exposes_routing_poll_and_cost(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Async operator view",
+            executor_backend="openclaw",
+            routing_decision={
+                "selected_backend": "openclaw",
+                "selection_reason": "semantic match",
+                "candidates": [
+                    {
+                        "backend": "openclaw",
+                        "cost_tier": "medium",
+                    }
+                ],
+            },
+        )
+        task = kb.claim_task(conn, task_id, claimer="router")
+        assert task is not None and task.current_run_id is not None
+        assert kb.record_backend_lifecycle(
+            conn,
+            task_id,
+            expected_run_id=int(task.current_run_id),
+            status="queued",
+            backend_run_id="backend-operator-1",
+            backend_agent_id="readonly-agent",
+            protocol_version="2.0",
+            next_poll_seconds=2,
+        )
+
+    payload = json.loads(kc.run_slash("backend-status --json"))
+
+    assert payload["active_runs"][0]["task_id"] == task_id
+    assert payload["active_runs"][0]["backend_status"] == "queued"
+    assert (
+        payload["active_runs"][0]["routing_decision"]["selection_reason"]
+        == "semantic match"
+    )
+    assert payload["active_runs"][0]["selected_cost_tier"] == "medium"
+
+
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re

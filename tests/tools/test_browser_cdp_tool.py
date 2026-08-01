@@ -161,6 +161,64 @@ def test_non_string_method_returns_error():
     assert "method" in result["error"].lower()
 
 
+def test_task_bound_grace_execution_blocks_runtime_evaluate(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_guarded")
+
+    class _Closing:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return None
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "connect_closing", lambda: _Closing())
+    monkeypatch.setattr(kb, "is_grace_execution_task", lambda _conn, _tid: True)
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Runtime.evaluate",
+            params={"expression": "document.querySelector('button').click()"},
+        )
+    )
+
+    assert "Task-bound raw CDP mutation blocked" in result["error"]
+    assert result["method"] == "Runtime.evaluate"
+
+
+def test_task_bound_grace_execution_allows_target_discovery(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_guarded")
+
+    class _Closing:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return None
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "connect_closing", lambda: _Closing())
+    monkeypatch.setattr(kb, "is_grace_execution_task", lambda _conn, _tid: True)
+    monkeypatch.setattr(
+        browser_cdp_tool,
+        "_resolve_cdp_endpoint",
+        lambda: "ws://localhost:9999",
+    )
+    monkeypatch.setattr(
+        browser_cdp_tool,
+        "_run_async",
+        lambda _coro: {"targetInfos": []},
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Target.getTargets")
+    )
+
+    assert result["success"] is True
+
+
 def test_non_dict_params_returns_error(monkeypatch):
     monkeypatch.setattr(
         browser_cdp_tool, "_resolve_cdp_endpoint", lambda: "ws://localhost:9999"

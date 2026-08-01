@@ -41,6 +41,15 @@ def test_raw_clawops_intake_cannot_create_dispatchable_task(tmp_path, monkeypatc
     assert not db_path.exists()
 
 
+@pytest.mark.parametrize("backend", ["openclaw", "codex"])
+def test_generic_clawops_intake_rejects_unowned_external_backend(backend):
+    with pytest.raises(ValueError, match="dedicated start adapter"):
+        create_clawops_task(
+            "run through an external backend",
+            executor_backend=backend,
+        )
+
+
 def test_hubops_routing_selects_dev_worker_from_yaml():
     envelope = route_clawops_objective(
         "修正 Hermes bridge health check",

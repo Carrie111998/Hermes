@@ -2,6 +2,7 @@ import json
 
 from gateway.run import (
     _find_bound_clawops_approval_args,
+    _recover_bound_clawops_approval_args,
 )
 
 
@@ -70,3 +71,19 @@ def test_recovery_ignores_unrelated_token():
         )
         is None
     )
+
+
+def test_recovery_falls_back_to_durable_challenge(monkeypatch):
+    token = "fe341e4c447cde20"
+    contract = {
+        "approved": False,
+        "goal": {"objective": "唯讀檢查 Facebook Marketplace"},
+        "scope": {"allowed": ["Facebook Marketplace 唯讀導覽"]},
+    }
+    monkeypatch.setattr(
+        "plugins.openclaw_bridge.clawops_delegate."
+        "recover_clawops_approval_args",
+        lambda candidate: contract if candidate == token else None,
+    )
+
+    assert _recover_bound_clawops_approval_args([], token) == contract

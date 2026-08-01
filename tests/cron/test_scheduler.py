@@ -963,6 +963,18 @@ class TestRunJobSessionPersistence:
             "prompt": "hello",
         }
         fake_db = MagicMock()
+        observed_context = {}
+
+        def run_conversation(*_args, **_kwargs):
+            from gateway.session_context import get_session_env
+
+            observed_context.update(
+                platform=get_session_env("HERMES_SESSION_PLATFORM"),
+                source=get_session_env("HERMES_SESSION_SOURCE"),
+                session_key=get_session_env("HERMES_SESSION_KEY"),
+                session_id=get_session_env("HERMES_SESSION_ID"),
+            )
+            return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -979,7 +991,7 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent.run_conversation.side_effect = run_conversation
             mock_agent_cls.return_value = mock_agent
 
             success, output, final_response, error = run_job(job)
@@ -993,12 +1005,61 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
+        assert observed_context == {
+            "platform": "",
+            "source": "cron",
+            "session_key": "cron:test-job",
+            "session_id": kwargs["session_id"],
+        }
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_run_job_marks_tool_level_functional_error_failed(self, tmp_path):
+        job = {
+            "id": "delegation-job",
+            "name": "delegation",
+            "prompt": "delegate work",
+        }
+        fake_db = MagicMock()
+
+        def run_conversation(*_args, **_kwargs):
+            from gateway.session_context import record_cron_functional_error
+
+            record_cron_functional_error("request instance rejected")
+            return {
+                "final_response": "Delegation was rejected safely.",
+                "completed": True,
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = run_conversation
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "Scheduled delegation did not establish a task" in str(error)
+        assert "request instance rejected" in str(error)
+        assert "(FAILED)" in output
 
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
