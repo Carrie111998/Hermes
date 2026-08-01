@@ -9577,6 +9577,16 @@ ipcMain.handle('hermes:pet-overlay:close', async () => {
 
   return { ok: true }
 })
+// Multi-display-safe desktop roam bounds. Browser `screen.availWidth` does not
+// expose a dependable global origin on secondary monitors, while Electron can
+// resolve the display containing the actual native overlay window.
+ipcMain.handle('hermes:pet-overlay:work-area', async () => {
+  if (!petOverlayWindow || petOverlayWindow.isDestroyed()) {
+    return null
+  }
+
+  return screen.getDisplayMatching(petOverlayWindow.getBounds()).workArea
+})
 // Drag/resize: the overlay reports new absolute screen bounds (it already knows
 // the pointer's screen coords). Drag keeps the size constant; the wheel-to-scale
 // gesture grows/shrinks it so the sprite is never cropped by the window edge.

@@ -359,7 +359,7 @@ export const ja = defineLocale({
         placementWindow: 'Hermes',
         placementDesktop: 'デスクトップ',
         roamTitle: '散歩',
-        roamDesc: 'アイドル中にペットがウィンドウ内を自由に歩き回ります。',
+        roamDesc: 'アイドル中にペットが Hermes ウィンドウ内でもデスクトップ上でも自由に歩き回ります。',
         on: 'オン',
         off: 'オフ',
         chooseTitle: 'ペットを選ぶ',

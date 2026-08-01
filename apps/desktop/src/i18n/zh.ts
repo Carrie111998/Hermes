@@ -471,7 +471,7 @@ export const zh: Translations = {
         placementWindow: 'Hermes 窗口',
         placementDesktop: '桌面',
         roamTitle: '漫游',
-        roamDesc: '空闲时让宠物自己在窗口内四处走动。',
+        roamDesc: '空闲时让宠物自己四处走动，在 Hermes 窗口内或桌面上都生效。',
         on: '开启',
         off: '关闭',
         chooseTitle: '选择宠物',

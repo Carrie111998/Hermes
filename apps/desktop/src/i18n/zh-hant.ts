@@ -347,7 +347,7 @@ export const zhHant = defineLocale({
         placementWindow: 'Hermes 視窗',
         placementDesktop: '桌面',
         roamTitle: '漫遊',
-        roamDesc: '閒置時讓寵物自己在視窗內四處走動。',
+        roamDesc: '閒置時讓寵物自己四處走動，在 Hermes 視窗內或桌面上都會生效。',
         on: '開啟',
         off: '關閉',
         chooseTitle: '選擇寵物',

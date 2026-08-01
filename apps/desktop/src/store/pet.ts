@@ -208,9 +208,9 @@ function deriveLivePetState(activity: PetActivity, busy: boolean): PetState {
 }
 
 /**
- * Opt-in: let the floating mascot wander around the window on its own while
- * idle. Pure desktop-client behavior (no agent/config dependency), so it lives
- * in localStorage like the pet's drag position — per-device, not per-profile.
+ * Opt-in: let the floating mascot wander on its current surface while idle —
+ * inside Hermes or across the current display when popped out. Pure desktop-
+ * client behavior, so it lives in localStorage per-device, not per-profile.
  */
 const ROAM_KEY = 'hermes.desktop.pet-roam.v1'
 export const $petRoam = atom<boolean>(storedBoolean(ROAM_KEY, false))

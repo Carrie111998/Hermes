@@ -483,7 +483,7 @@ export const en: Translations = {
         placementWindow: 'Hermes',
         placementDesktop: 'Desktop',
         roamTitle: 'Roam',
-        roamDesc: 'Let the pet wander the window on its own while idle.',
+        roamDesc: 'Let the pet wander on its own while idle, inside Hermes or on the desktop.',
         chooseTitle: 'Choose a pet',
         chooseDesc: 'Picking one installs it (if needed) and makes it active.',
         searchPlaceholder: 'Search pets…',

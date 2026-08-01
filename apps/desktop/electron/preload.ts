@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     // `{ bounds, screen }`; resolves with the screen bounds it actually used.
     open: request => ipcRenderer.invoke('hermes:pet-overlay:open', request),
     close: () => ipcRenderer.invoke('hermes:pet-overlay:close'),
+    getWorkArea: () => ipcRenderer.invoke('hermes:pet-overlay:work-area'),
     setBounds: bounds => ipcRenderer.send('hermes:pet-overlay:set-bounds', bounds),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:pet-overlay:ignore-mouse', ignore),
     // Flip the overlay focusable (and focus it) while the composer needs keys.

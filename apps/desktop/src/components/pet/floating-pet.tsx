@@ -407,9 +407,8 @@ export function FloatingPet() {
 
   const isDragging = useCallback(() => dragRef.current !== null, [])
 
-  // Roam only the in-window pet, only while it's idle (agent at rest) and not
-  // popped out into the OS overlay. Activity pauses the wander; the pet reacts
-  // in place, then resumes strolling when the turn ends.
+  // The in-window half of roaming: only while the agent is at rest and the pet
+  // is not popped out. The overlay owns its own display-aware wander loop.
   usePetRoam({
     commit: commitRoamPosition,
     containerRef,

@@ -7,9 +7,17 @@ const DEFAULT_FRAME_W = 192
 const DEFAULT_FRAME_H = 208
 const DEFAULT_FRAMES = 6
 const DEFAULT_LOOP_MS = 1100
+// Codex-like calm live-idle rhythm: hold the reduced-motion first cell for
+// several seconds, play one complete idle loop, then settle again. Explicit
+// preview overrides stay continuous so Settings can still inspect the row.
+export const IDLE_REST_MIN_MS = 4200
+export const IDLE_REST_MAX_MS = 9000
 // Mirrors agent.pet.constants.DEFAULT_SCALE — fallback only; the gateway sends
 // the configured scale.
 const DEFAULT_SCALE = 0.33
+
+export const idleRestMs = (rng: () => number = Math.random): number =>
+  IDLE_REST_MIN_MS + rng() * (IDLE_REST_MAX_MS - IDLE_REST_MIN_MS)
 
 function readDevicePixelRatio(): number {
   const ratio = window.devicePixelRatio
@@ -232,6 +240,9 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
     let drawnRow = -1
     let activeRow = -1
     let activeCount = -1
+    let activeSparseIdle = false
+    let idleResting = false
+    let idleRestUntil = 0
     let pauseController: ReturnType<typeof createRendererLoopPauseController> | null = null
 
     const rendererPaused = () => pauseController?.isPaused() ?? document.visibilityState === 'hidden'
@@ -338,13 +349,20 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
       }
 
       const forcedRow = rowOverrideRef.current
-      const { row, count } = forcedRow ? resolveRow(forcedRow) : resolve(overrideRef.current ?? stateRef.current)
+      const state = overrideRef.current ?? stateRef.current
+      const { row, count } = forcedRow ? resolveRow(forcedRow) : resolve(state)
+      // Only the live, ordinary idle state gets the long still beat. Settings
+      // previews and concrete roam rows intentionally keep looping.
+      const sparseIdle = !forcedRow && overrideRef.current === undefined && state === 'idle'
 
-      if (row !== activeRow || count !== activeCount) {
+      if (row !== activeRow || count !== activeCount || sparseIdle !== activeSparseIdle) {
         activeRow = row
         activeCount = count
+        activeSparseIdle = sparseIdle
         frame = 0
         lastStep = now
+        idleResting = sparseIdle
+        idleRestUntil = sparseIdle ? now + idleRestMs() : 0
         drawnFrame = -1
       }
 
@@ -352,12 +370,25 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
       // differ; counts vary per row so derive the cadence here, not once.
       const stepMs = loopMs / count
 
-      if (now - lastStep >= stepMs) {
+      if (sparseIdle && idleResting) {
+        frame = 0
+
+        if (now >= idleRestUntil) {
+          idleResting = false
+          lastStep = now
+        }
+      } else if (now - lastStep >= stepMs) {
         frame += 1
         lastStep = now
-      }
 
-      frame %= count
+        if (sparseIdle && frame >= count) {
+          frame = 0
+          idleResting = true
+          idleRestUntil = now + idleRestMs()
+        } else {
+          frame %= count
+        }
+      }
 
       if (!image.complete || image.naturalWidth <= 0) {
         return
@@ -375,7 +406,9 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
         drawnRow = row
       }
 
-      scheduleFrame(Math.max(0, stepMs - (now - lastStep)))
+      scheduleFrame(
+        sparseIdle && idleResting ? Math.max(0, idleRestUntil - now) : Math.max(0, stepMs - (now - lastStep))
+      )
     }
 
     kickAnimationRef.current = kickAnimation
