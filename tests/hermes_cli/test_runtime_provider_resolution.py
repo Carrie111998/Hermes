@@ -86,6 +86,39 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_resolve_runtime_provider_probe_admits_rate_limited_codex(monkeypatch):
+    calls = []
+
+    class _Entry:
+        access_token = "quota-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        last_status = "exhausted"
+        last_error_code = 429
+        last_error_reason = "usage_limit_reached"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self, *, allow_rate_limited=False):
+            calls.append(allow_rate_limited)
+            return _Entry() if allow_rate_limited else None
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-codex",
+        probe_rate_limited=True,
+    )
+
+    assert calls == [True]
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_key"] == "quota-token"
+    assert resolved["credential_pool"] is not None
+
+
 def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
     entry = SimpleNamespace(
         provider="nous",

@@ -10,6 +10,7 @@ import pytest
 
 from hermes_cli.auth import (
     AuthError,
+    CODEX_RATE_LIMITED_CODE,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
     _read_codex_tokens,
@@ -192,6 +193,64 @@ def test_resolve_codex_runtime_credentials_pool_fallback_skips_exhausted(tmp_pat
     resolved = resolve_codex_runtime_credentials()
     assert resolved["api_key"] == "usable-token"
     assert resolved["source"] == "credential_pool"
+
+
+def test_resolve_codex_runtime_credentials_probe_admits_rate_limit(tmp_path, monkeypatch):
+    """The explicit probe can test an early quota recovery."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "source": "device_code",
+                    "access_token": "quota-token",
+                    "last_status": "exhausted",
+                    "last_error_code": 429,
+                    "last_error_reason": "usage_limit_reached",
+                    "last_error_reset_at": time.time() + 3600,
+                },
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials(allow_rate_limited=True)
+
+    assert resolved["api_key"] == "quota-token"
+    assert resolved["source"] == "credential_pool"
+
+
+def test_resolve_codex_runtime_credentials_probe_rejects_terminal_auth(tmp_path, monkeypatch):
+    """The quota probe must not bypass a terminal authentication failure."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "source": "device_code",
+                    "access_token": "terminal-token",
+                    "last_status": "exhausted",
+                    "last_error_code": 401,
+                    "last_error_reason": "token_invalidated",
+                    "last_error_reset_at": time.time() + 3600,
+                },
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials(allow_rate_limited=True)
+
+    assert exc_info.value.code != CODEX_RATE_LIMITED_CODE
 
 
 def test_resolve_codex_runtime_credentials_pool_fallback_no_usable_entry(tmp_path, monkeypatch):

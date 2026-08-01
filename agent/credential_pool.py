@@ -384,6 +384,27 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     return None
 
 
+def _is_rate_limited_exhaustion(entry: PooledCredential) -> bool:
+    """Return whether an exhausted entry may recover without re-authentication."""
+    if entry.last_status != STATUS_EXHAUSTED:
+        return False
+    code = getattr(entry, "last_error_code", None)
+    if code == 429 or str(code or "").strip() == "429":
+        return True
+    if str(code or "").strip() in {"401", "403"}:
+        return False
+    reason = str(getattr(entry, "last_error_reason", None) or "").lower()
+    message = str(getattr(entry, "last_error_message", None) or "").lower()
+    markers = (
+        "rate_limit",
+        "rate limit",
+        "usage_limit",
+        "usage limit",
+        "quota",
+    )
+    return any(marker in reason or marker in message for marker in markers)
+
+
 def _normalize_custom_pool_name(name: str) -> str:
     """Normalize a custom provider name for use as a pool key suffix."""
     return name.strip().lower().replace(" ", "-")
@@ -1508,11 +1529,18 @@ class CredentialPool:
             return False
         return False
 
-    def select(self) -> Optional[PooledCredential]:
+    def select(self, *, allow_rate_limited: bool = False) -> Optional[PooledCredential]:
+        """Select a usable credential, optionally probing a quota cooldown."""
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(allow_rate_limited=allow_rate_limited)
 
-    def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
+    def _available_entries(
+        self,
+        *,
+        clear_expired: bool = False,
+        refresh: bool = False,
+        allow_rate_limited: bool = False,
+    ) -> List[PooledCredential]:
         """Return entries not currently in exhaustion cooldown.
 
         When *clear_expired* is True, entries whose cooldown has elapsed are
@@ -1604,9 +1632,13 @@ class CredentialPool:
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
-                if exhausted_until is not None and now < exhausted_until:
-                    continue
-                if clear_expired:
+                keep_exhausted = exhausted_until is not None and now < exhausted_until
+                if keep_exhausted:
+                    if not (allow_rate_limited and _is_rate_limited_exhaustion(entry)):
+                        continue
+                    # Keep the persisted exhausted marker. The caller is
+                    # probing the provider, not declaring the quota recovered.
+                if clear_expired and not keep_exhausted:
                     cleared = replace(
                         entry,
                         last_status=STATUS_OK,
@@ -1646,8 +1678,17 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Optional[PooledCredential]:
-        available = self._available_entries(clear_expired=True, refresh=refresh)
+    def _select_unlocked(
+        self,
+        *,
+        refresh: bool = True,
+        allow_rate_limited: bool = False,
+    ) -> Optional[PooledCredential]:
+        available = self._available_entries(
+            clear_expired=True,
+            refresh=refresh,
+            allow_rate_limited=allow_rate_limited,
+        )
         if not available:
             self._current_id = None
             self._log_no_available_entries()

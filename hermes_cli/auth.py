@@ -3727,6 +3727,7 @@ def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_rate_limited: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
@@ -3738,6 +3739,10 @@ def resolve_codex_runtime_credentials(
     pool seed, a partial re-auth, or pool-only restoration from a backup — gets a bare
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
+
+    ``allow_rate_limited`` is reserved for an active runtime probe. It admits
+    a credential whose persisted quota cooldown may be stale, while keeping
+    terminal auth failures excluded.
     """
     read_error: Optional[AuthError] = None
     try:
@@ -3758,7 +3763,9 @@ def resolve_codex_runtime_credentials(
             data = None
 
     if data is None:
-        pool_token = _pool_codex_access_token()
+        pool_token = _pool_codex_access_token(
+            allow_rate_limited=allow_rate_limited,
+        )
         if pool_token:
             base_url = (
                 os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
@@ -3911,7 +3918,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     return None
 
 
-def _pool_codex_access_token() -> str:
+def _pool_codex_access_token(*, allow_rate_limited: bool = False) -> str:
     """Return the most-recent usable access_token from the openai-codex pool.
 
     Used as a fallback by ``resolve_codex_runtime_credentials`` when the
@@ -3940,7 +3947,7 @@ def _pool_codex_access_token() -> str:
             # Skip entries currently in an exhaustion cooldown window.
             reset_at = entry.get("last_error_reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
-                return False
+                return allow_rate_limited and _codex_entry_is_rate_limited(entry)
             return True
 
         for entry in entries:
@@ -3949,6 +3956,27 @@ def _pool_codex_access_token() -> str:
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""
+
+
+def _codex_entry_is_rate_limited(entry: Dict[str, Any]) -> bool:
+    """Return whether a persisted Codex entry is a recoverable quota failure."""
+    if not isinstance(entry, dict) or entry.get("last_status") != "exhausted":
+        return False
+    code = entry.get("last_error_code")
+    if code == 429 or str(code or "").strip() == "429":
+        return True
+    if str(code or "").strip() in {"401", "403"}:
+        return False
+    reason = str(entry.get("last_error_reason") or "").lower()
+    message = str(entry.get("last_error_message") or "").lower()
+    markers = (
+        "rate_limit",
+        "rate limit",
+        "usage_limit",
+        "usage limit",
+        "quota",
+    )
+    return any(marker in reason or marker in message for marker in markers)
 
 
 # =============================================================================

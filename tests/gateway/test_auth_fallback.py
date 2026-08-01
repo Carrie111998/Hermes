@@ -54,6 +54,51 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 
+    def test_rate_limited_primary_is_retained_for_runtime_probe(self, tmp_path, monkeypatch):
+        """A quota cooldown must not freeze the gateway on its fallback."""
+        from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "model:\n  provider: openai-codex\n"
+            "fallback_model:\n  provider: minimax-oauth\n"
+            "  model: MiniMax-M3\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        calls = []
+
+        def _mock_resolve(**kwargs):
+            calls.append(kwargs)
+            if not kwargs.get("probe_rate_limited"):
+                raise AuthError(
+                    "quota exhausted",
+                    provider="openai-codex",
+                    code=CODEX_RATE_LIMITED_CODE,
+                    relogin_required=False,
+                )
+            return {
+                "api_key": "codex-token",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "command": None,
+                "args": None,
+                "credential_pool": "codex-pool",
+            }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=_mock_resolve,
+        ):
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            result = _resolve_runtime_agent_kwargs()
+
+        assert result["provider"] == "openai-codex"
+        assert result["api_key"] == "codex-token"
+        assert any(call.get("probe_rate_limited") is True for call in calls)
+
     def test_auth_error_no_fallback_raises(self, tmp_path, monkeypatch):
         """When primary fails and no fallback configured, RuntimeError is raised."""
         from hermes_cli.auth import AuthError

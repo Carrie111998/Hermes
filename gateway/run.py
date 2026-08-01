@@ -2070,16 +2070,35 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except AuthError as auth_exc:
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
-        # token). Both fall through to the fallback chain, but the log message
-        # must not mislabel a quota exhaustion as an auth failure (#32790).
+        # token). A quota exhaustion gets a runtime probe before fallback; the
+        # log message must not mislabel it as an auth failure (#32790).
         if is_rate_limited_auth_error(auth_exc):
-            logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
+            logger.warning("Primary provider rate-limited (429): %s", auth_exc)
+            try:
+                # Keep a quota-limited primary runtime alive so the first real
+                # request can test whether the provider recovered early. The
+                # existing per-turn fallback cooldown will retry this primary
+                # instead of freezing the session on the fallback provider.
+                runtime = resolve_runtime_provider(probe_rate_limited=True)
+            except Exception as probe_exc:
+                logger.info(
+                    "Primary rate-limit probe unavailable: %s; trying fallback",
+                    probe_exc,
+                )
+                fb_config = _try_resolve_fallback_provider()
+                if fb_config is not None:
+                    return fb_config
+                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+            logger.info(
+                "Primary provider retained after rate-limit probe: %s",
+                runtime.get("provider"),
+            )
         else:
-            logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
-        if fb_config is not None:
-            return fb_config
-        raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+            logger.warning("Primary provider auth failed: %s; trying fallback", auth_exc)
+            fb_config = _try_resolve_fallback_provider()
+            if fb_config is not None:
+                return fb_config
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 

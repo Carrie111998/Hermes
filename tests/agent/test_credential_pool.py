@@ -69,6 +69,62 @@ def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypat
     assert pool.current().id == "cred-2"
 
 
+def test_probe_selects_rate_limited_codex_but_not_terminal_auth(tmp_path, monkeypatch):
+    """A runtime probe may test quota recovery without bypassing auth failures."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    future_reset = time.time() + 3600
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "quota",
+                        "label": "quota",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "quota-token",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_reset_at": future_reset,
+                    },
+                    {
+                        "id": "terminal",
+                        "label": "terminal",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "terminal-token",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 401,
+                        "last_error_reason": "token_invalidated",
+                        "last_error_reset_at": future_reset,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.select() is None
+
+    probed = pool.select(allow_rate_limited=True)
+    assert probed is not None
+    assert probed.id == "quota"
+    assert probed.last_status == "exhausted"
+    assert [entry.id for entry in pool._available_entries(
+        refresh=False,
+        allow_rate_limited=True,
+    )] == ["quota"]
+
+
 def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(

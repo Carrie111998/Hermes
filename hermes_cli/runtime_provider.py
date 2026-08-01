@@ -1525,6 +1525,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    probe_rate_limited: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1535,6 +1536,10 @@ def resolve_runtime_provider(
     api_mode is derived from the model they are switching TO, not the stale
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
+
+    probe_rate_limited: admit a persisted Codex credential marked exhausted
+    only by a recoverable rate-limit/quota, so the caller can test whether the
+    provider recovered before activating a fallback. The default remains false.
     """
     requested_provider = resolve_requested_provider(requested)
 
@@ -1724,7 +1729,10 @@ def resolve_runtime_provider(
     except Exception:
         pool = None
     if pool and pool.has_credentials():
-        entry = pool.select()
+        if probe_rate_limited and provider == "openai-codex":
+            entry = pool.select(allow_rate_limited=True)
+        else:
+            entry = pool.select()
         pool_api_key = ""
         if entry is not None:
             pool_api_key = (
@@ -1811,7 +1819,10 @@ def resolve_runtime_provider(
 
     if provider == "openai-codex":
         try:
-            creds = resolve_codex_runtime_credentials()
+            if probe_rate_limited:
+                creds = resolve_codex_runtime_credentials(allow_rate_limited=True)
+            else:
+                creds = resolve_codex_runtime_credentials()
             return {
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
