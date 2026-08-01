@@ -134,17 +134,18 @@ export function normalize(node: LayoutNode): LayoutNode | null {
     }
 
     const active = node.panes.includes(node.active) ? node.active : node.panes[0]
-    // A zone down to one pane clears a redundant HIDDEN override (the lone-pane
-    // default is already headerless) but KEEPS an explicit SHOWN override —
-    // once a zone has ever had a tab bar, closing back to one tab leaves it
-    // shown (sticky bar; the off switch is "Hide tab bar"). `false` survives.
-    const headerHidden = node.panes.length <= 1 && node.headerHidden !== false ? undefined : node.headerHidden
 
-    if (active === node.active && headerHidden === node.headerHidden) {
+    // NOTE: `headerHidden` is deliberately untouched here. A zone down to one
+    // pane is headerless by default anyway, so a stored `true` is visually
+    // redundant *while it's alone* — but normalize used to DROP it, which threw
+    // away the user's standing choice: the bar came back the moment a pane
+    // rejoined (close a stacked tool panel, toggle it back on). `false` is
+    // sticky for the mirror reason — once a zone has had a tab bar, it keeps it.
+    if (active === node.active) {
       return node
     }
 
-    return { ...node, active, headerHidden }
+    return { ...node, active }
   }
 
   const children: LayoutNode[] = []
@@ -184,9 +185,9 @@ export function normalize(node: LayoutNode): LayoutNode | null {
   return { ...node, children, weights }
 }
 
-/** Remove a pane wherever it lives. Closing the ACTIVE tab activates its
- *  previous neighbor (the next one when it was first) — browser-tab feel,
- *  never a jump to the strip's start. */
+/** Remove a pane wherever it lives. Closing the ACTIVE tab leaves selection on
+ *  the neighbor that fills its slot (right; left when it was last) — same rule
+ *  as terminals and the preview rail. */
 export function removePane(node: LayoutNode, paneId: string): LayoutNode | null {
   const walk = (n: LayoutNode): LayoutNode => {
     if (n.type === 'group') {
@@ -198,7 +199,8 @@ export function removePane(node: LayoutNode, paneId: string): LayoutNode | null 
 
       const panes = n.panes.filter(p => p !== paneId)
 
-      return { ...n, panes, active: n.active === paneId ? panes[Math.max(0, at - 1)] : n.active }
+      // After splice, `at` indexes the old right neighbor (clamp left at end).
+      return { ...n, panes, active: n.active === paneId ? (panes[Math.min(at, panes.length - 1)] ?? '') : n.active }
     }
 
     return { ...n, children: n.children.map(walk) }
