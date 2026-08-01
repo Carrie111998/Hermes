@@ -1052,6 +1052,42 @@ class TestMediaDeliveryDiagnosability:
         ])
         assert out == [(str(f.resolve()), False)]
 
+    def test_lexical_variant_deduplicates_to_same_resolved_path(self, tmp_path, monkeypatch):
+        """Two raw strings that differ lexically but resolve to the same file
+        must collapse into one delivery.
+
+        ``tmp_path`` is absolute with no symlink, so ``str(f) == str(f.resolve())``
+        — the plain duplicate test above cannot exercise the normalization path.
+        A ``<parent>/<base>/../<base>/<name>`` spelling is a *different string*
+        that resolves to the same file, which is exactly what an orchestrator
+        plugin's path injection vs. the agent's hand-written tag looks like.
+        """
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 test")
+        lexical = str(tmp_path / ".." / tmp_path.name / "report.pdf")
+        assert lexical != str(f)  # the two raw strings genuinely differ
+        assert os.path.realpath(lexical) == os.path.realpath(f)  # but name the same file
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        out = BasePlatformAdapter.filter_media_delivery_paths([
+            (lexical, False),
+            (str(f), False),
+        ])
+        assert out == [(str(f.resolve()), False)]
+
+    def test_symlink_target_deduplicates_to_same_resolved_path(self, tmp_path, monkeypatch):
+        """A symlink and its target are distinct raw strings that resolve to the
+        same file; only one delivery should be produced."""
+        target = tmp_path / "report.pdf"
+        target.write_bytes(b"%PDF-1.4 test")
+        link = tmp_path / "report-link.pdf"
+        link.symlink_to(target)
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        out = BasePlatformAdapter.filter_media_delivery_paths([
+            (str(link), False),
+            (str(target), False),
+        ])
+        assert out == [(str(target.resolve()), False)]
+
     def test_distinct_paths_all_delivered(self, tmp_path, monkeypatch):
         """Dedup must not collapse distinct files sharing a common prefix."""
         a = tmp_path / "a.png"
