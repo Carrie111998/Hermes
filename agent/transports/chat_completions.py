@@ -431,6 +431,46 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        # Ollama Cloud: top-level reasoning_effort. The ollama-cloud provider
+        # profile (plugins/model-providers/ollama-cloud) handles this when the
+        # profile is loaded, but custom provider entries (e.g. "ollama-launch")
+        # bypass the profile path and land here. Ollama Cloud's
+        # /v1/chat/completions endpoint accepts top-level ``reasoning_effort``
+        # with values {low, medium, high, max, none} and IGNORES
+        # extra_body.reasoning — so without this block the effort setting is
+        # silently dropped and every chat runs at the server default.
+        # Detection mirrors the ollama-cloud profile: model id ends with
+        # ":cloud" (the Ollama Cloud naming convention) and the base_url points
+        # at an Ollama-compatible server.
+        _base_url_lower = str(params.get("base_url") or "").lower()
+        _is_ollama_cloud = (
+            ":cloud" in (model or "").lower()
+            and (
+                "ollama.com" in _base_url_lower
+                or "127.0.0.1:11434" in _base_url_lower
+                or "localhost:11434" in _base_url_lower
+            )
+        )
+        if _is_ollama_cloud and reasoning_config and isinstance(reasoning_config, dict):
+            _oc_thinking_off = reasoning_config.get("enabled") is False
+            if not _oc_thinking_off:
+                _oc_effort = (reasoning_config.get("effort") or "").strip().lower()
+                # Ollama Cloud accepts {low, medium, high, max, none}. Map
+                # Hermes' wider set onto it the same way the ollama-cloud
+                # profile does: xhigh/max/ultra → max, low/medium/high pass
+                # through, minimal → low. Anything else is omitted so the
+                # model applies its own default rather than HTTP 400.
+                if _oc_effort in {"xhigh", "max", "ultra"}:
+                    _oc_effort = "max"
+                elif _oc_effort in {"low", "medium", "high"}:
+                    pass  # passthrough
+                elif _oc_effort == "minimal":
+                    _oc_effort = "low"
+                else:
+                    _oc_effort = ""  # omit — let the server decide
+                if _oc_effort:
+                    api_kwargs["reasoning_effort"] = _oc_effort
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
