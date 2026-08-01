@@ -10,13 +10,6 @@ from unittest.mock import Mock
 import pytest
 
 
-FIXTURE = Path(
-    os.environ.get(
-        "HERMES_76106_REPRO",
-        r"D:\Repos\.claude\pr-sweep\agent-PR-TARGET-76106-REPRO.json",
-    )
-)
-
 _ISSUE_REPRODUCTION_FALLBACK = {
     "platform": "Windows 11",
     "command": "hermes update",
@@ -32,10 +25,9 @@ _ISSUE_REPRODUCTION_FALLBACK = {
 
 
 def _issue_reproduction() -> dict:
-    if FIXTURE.is_file():
-        return json.loads(FIXTURE.read_text(encoding="utf-8"))
-    if "HERMES_76106_REPRO" in os.environ:
-        raise FileNotFoundError(FIXTURE)
+    fixture_name = os.environ.get("HERMES_76106_REPRO")
+    if fixture_name:
+        return json.loads(Path(fixture_name).read_text(encoding="utf-8"))
     return _ISSUE_REPRODUCTION_FALLBACK
 
 
@@ -169,7 +161,7 @@ def test_changed_uv_accepts_fixed_same_version_artifact(tmp_path, monkeypatch):
     assert first.status == "unavailable"
 
     candidate = root / ".hermes-runtime" / "venv-candidate"
-    _, new_calls = _uv_process(
+    _uv_process(
         monkeypatch, uv_version="0.8.5", candidate_sqlite=(3, 53, 1)
     )
     staged = Mock(return_value=candidate)
