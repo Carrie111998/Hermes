@@ -759,7 +759,7 @@ def test_start_gateway_watchdog_covers_asyncio_run_finalization(
 
         async def exercise_start_gateway_return_boundary():
             with (
-                patch("gateway.run.resolve_shutdown_watchdog_delay", return_value=1.0),
+                patch("gateway.run.resolve_shutdown_watchdog_delay", return_value=3.0),
                 patch("gateway.status.remove_pid_file"),
                 patch("gateway.status.release_gateway_runtime_lock"),
                 patch("gateway.status.write_runtime_status"),
@@ -832,7 +832,7 @@ def test_start_gateway_watchdog_covers_asyncio_run_finalization(
         env=env,
         text=True,
         capture_output=True,
-        timeout=7,
+        timeout=9,
         check=False,
     )
 

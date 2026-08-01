@@ -3324,6 +3324,18 @@ def _normalize_managed_eol(git_cmd, repo_root):
     probe = git_cmd + ["-c", "core.autocrlf=false"]
 
     def _dirty(*extra):
+        # A just-checked-out CRLF file can look stat-clean even after changing
+        # the effective filter to ``autocrlf=false``. Force Git to compare
+        # content before asking for the diff so a large checkout is not only
+        # partially discovered according to timestamp/cache coincidence.
+        subprocess.run(
+            probe + ["update-index", "--really-refresh"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         out = subprocess.run(
             probe + ["diff", "-z", "--name-only", *extra],
             cwd=repo_root,
