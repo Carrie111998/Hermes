@@ -380,16 +380,19 @@ def sse_events():
 
 
 # ---------- pages ----------
+_NO_CACHE = {"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"}
+
+
 @app.get("/")
 def index(user: str = DEFAULT_USER):
     if store.get_active_layout(user) is None:
-        return RedirectResponse(f"/onboarding?user={user}")
-    return FileResponse(HERE / "static" / "index.html")
+        return RedirectResponse(f"/onboarding?user={user}", headers=_NO_CACHE)
+    return FileResponse(HERE / "static" / "index.html", headers=_NO_CACHE)
 
 
 @app.get("/onboarding")
 def onboarding_page():
-    return FileResponse(HERE / "static" / "onboarding.html")
+    return FileResponse(HERE / "static" / "onboarding.html", headers=_NO_CACHE)
 
 
 def _curator_loop():

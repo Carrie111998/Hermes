@@ -7,7 +7,7 @@ const USER = new URLSearchParams(location.search).get("user") || "demo";
 let STATE = null;
 let PREVIEW = null;
 const telemetryQueue = [];
-const ROW = 110, GAP = 8;
+const ROW = 128, GAP = 10;
 
 /* ---------------- utils ---------------- */
 function esc(s) {
@@ -71,6 +71,27 @@ function renderAll() {
   renderPreviewBanner();
   const dock = document.getElementById("chat-dock");
   dock.dataset.position = (activeSpec().chat_dock || {}).position || "bottom";
+  syncDockSpace();
+}
+
+/* Reserve layout space for the dock so it NEVER covers data. */
+function syncDockSpace() {
+  const dock = document.getElementById("chat-dock");
+  const root = document.documentElement.style;
+  const collapsed = dock.classList.contains("collapsed");
+  if (dock.dataset.position === "right") {
+    root.setProperty("--dock-space", "12px");
+    root.setProperty("--dock-right-space", "420px");
+  } else {
+    root.setProperty("--dock-space", collapsed ? "60px" : "244px");
+    root.setProperty("--dock-right-space", "0px");
+  }
+  renderGridSoon();
+}
+let gridSoonTimer = null;
+function renderGridSoon() {
+  clearTimeout(gridSoonTimer);
+  gridSoonTimer = setTimeout(() => STATE && renderGrid(), 60);
 }
 
 /* ---------------- grid ---------------- */
@@ -101,7 +122,10 @@ function renderGrid() {
           <button class="icon-btn a-hide" title="Hide">—</button>
         </span>
       </div>
-      <div class="card-body" id="body-${c.id}"><span style="color:var(--muted-2)">…</span></div>`;
+      <div class="card-body" id="body-${c.id}"></div>`;
+    card.querySelector(".card-body").innerHTML =
+      `<div class="skel">${[85, 60, 75, 50, 70, 40].slice(0, Math.min(c.h * 2 + 1, 6))
+        .map((wd) => `<div class="bar" style="width:${wd}%"></div>`).join("")}</div>`;
     grid.appendChild(card);
     attachDwell(card, c.id);
     card.addEventListener("click", () => track("click", c.id));
@@ -141,8 +165,34 @@ async function loadComponentData(c) {
     const d = await api(`/api/component/${c.id}/data?user_id=${USER}${pv}`);
     body.innerHTML = "";
     body.appendChild(renderData(c, d));
+    autoFit(c, body, d);
   } catch (e) {
     body.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+
+/* ---- auto-fit: size cards to their content, then re-pack once ---- */
+let fitTimer = null;
+const fitted = new Set();
+function autoFit(c, body, d) {
+  if (PREVIEW || fitted.has(c.id)) return;
+  if (d.kind === "timeseries") return; // charts fill whatever they get
+  const contentH = body.scrollHeight + 40 /*head*/ + 2 /*border*/;
+  const needRows = Math.max(1, Math.min(6, Math.ceil((contentH + GAP) / (ROW + GAP))));
+  const over = body.scrollHeight > body.clientHeight + 4;           // cut off
+  const under = c.h > 1 && body.scrollHeight < (c.h - 1) * ROW * 0.55; // mostly empty
+  if ((over && needRows > c.h) || (under && needRows < c.h)) {
+    c.h = needRows;
+    fitted.add(c.id);
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(async () => {
+      // one repack + quiet persist for all fitted components this cycle
+      await post("/api/layout", { user_id: USER, spec: STATE.layout });
+      STATE = await api(`/api/state?user_id=${USER}`);
+      renderGrid();
+    }, 350);
+  } else {
+    fitted.add(c.id);
   }
 }
 
@@ -165,7 +215,7 @@ function renderData(c, d) {
       const t = document.createElement("table");
       t.className = "data";
       t.innerHTML = `<thead><tr>${d.columns.map((x) => `<th>${esc(x)}</th>`).join("")}</tr></thead>
-        <tbody>${d.rows.map((r) => `<tr>${r.map((v) => `<td class="${/^[-+$0-9.,%#]/.test(String(v)) ? "num" : ""}">${esc(String(v))}</td>`).join("")}</tr>`).join("")}</tbody>`;
+        <tbody>${d.rows.map((r) => `<tr>${r.map((v) => `<td class="${/^[-+$0-9.,%#]/.test(String(v)) ? "num" : ""}" title="${esc(String(v))}">${esc(String(v))}</td>`).join("")}</tr>`).join("")}</tbody>`;
       el.appendChild(t);
       break;
     }
@@ -476,14 +526,19 @@ document.getElementById("chat-form").addEventListener("submit", async (e) => {
     pend.innerHTML = `<span class="who">hermes</span><span class="err">${esc(err.message)}</span>`;
   }
 });
-document.getElementById("chat-dock-hide").addEventListener("click", () =>
-  document.getElementById("chat-dock").classList.toggle("collapsed"));
-document.getElementById("btn-chat-toggle").addEventListener("click", () =>
-  document.getElementById("chat-dock").classList.toggle("collapsed"));
+document.getElementById("chat-dock-hide").addEventListener("click", () => {
+  document.getElementById("chat-dock").classList.toggle("collapsed");
+  syncDockSpace();
+});
+document.getElementById("btn-chat-toggle").addEventListener("click", () => {
+  document.getElementById("chat-dock").classList.toggle("collapsed");
+  syncDockSpace();
+});
 document.getElementById("chat-dock-move").addEventListener("click", async () => {
   const dock = document.getElementById("chat-dock");
   const next = dock.dataset.position === "bottom" ? "right" : "bottom";
   dock.dataset.position = next;
+  syncDockSpace();
   const spec = JSON.parse(JSON.stringify(STATE.layout));
   spec.chat_dock = spec.chat_dock || {}; spec.chat_dock.position = next;
   track("move", "chat-dock", { position: next });
