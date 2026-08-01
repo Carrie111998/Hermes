@@ -157,6 +157,97 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
                 return False, str(path), f"could not read: {exc}"
     return True, None, None
 
+
+# Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
+# is only parsed), these are actually *imported* so that cross-module breakage
+# is caught — a file can be syntactically perfect and still fail to import
+# because a name it pulls from a sibling module no longer exists.
+_UPDATE_CRITICAL_MODULES = (
+    "hermes_cli.main",
+    "run_agent",
+    "model_tools",
+    "toolsets",
+)
+
+
+def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
+    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+
+    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
+    cross-module breakage: a partially-updated tree where ``agent/`` is new but
+    ``tools/`` is old parses perfectly and still dies at startup with
+    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
+    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
+
+    That skew is reachable on the Windows ZIP-update path, whose copy loop
+    walks top-level entries in ``os.listdir`` order and replaces each one
+    independently — ``agent/`` lands long before ``tools/``, so a failure or
+    interruption between them leaves exactly that mismatch on disk.
+
+    Runs in a subprocess because importing these modules into the running
+    updater would pollute ``sys.modules`` and execute import-time side effects
+    against the half-updated tree. Costs ~0.4s.
+
+    Uses the project venv's interpreter when there is one (matching
+    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
+    different Python than the install's own, and probing the wrong
+    interpreter would test a tree the user never runs.
+
+    Returns ``(ok, failing_module, error_message)``.
+    """
+    from hermes_constants import FIRST_PARTY_MODULE_ROOTS
+
+    probe = (
+        "import importlib, sys\n"
+        "for name in %r:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ModuleNotFoundError as exc:\n"
+        # A missing *third-party* module means dependencies aren't installed
+        # yet, not a skewed checkout. Only our own packages count as breakage.
+        # The root set is injected from hermes_constants so this can't drift
+        # from the hint the user is shown (they disagreed once already).
+        "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
+        "        if missing in %r or missing.startswith('hermes_'):\n"
+        "            sys.stdout.write(name + '\\n' + str(exc))\n"
+        "            raise SystemExit(3)\n"
+        "    except ImportError as exc:\n"
+        "        sys.stdout.write(name + '\\n' + str(exc))\n"
+        "        raise SystemExit(3)\n"
+        "    except Exception:\n"
+        "        pass\n"  # non-import errors (config/env) aren't update breakage
+        "raise SystemExit(0)\n"
+        % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
+    )
+    try:
+        interpreter = sys.executable
+        try:
+            bin_dir = "Scripts" if _m()._is_windows() else "bin"
+            python_name = "python.exe" if _m()._is_windows() else "python"
+            venv_python = Path(root) / "venv" / bin_dir / python_name
+            if venv_python.exists():
+                interpreter = str(venv_python)
+        except Exception:
+            pass  # fall back to the running interpreter
+        result = subprocess.run(
+            [interpreter, "-c", probe],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Can't run the probe — don't block the update on our own tooling.
+        return True, None, None
+    if result.returncode == 3:
+        parts = (result.stdout or "").split("\n", 1)
+        module = parts[0].strip() or "unknown"
+        detail = parts[1].strip() if len(parts) > 1 else ""
+        return False, module, detail
+    return True, None, None
+
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.
 
@@ -627,6 +718,14 @@ def _update_via_zip(args):
 
     except Exception as e:
         print(f"✗ ZIP update failed: {e}")
+        print(
+            "  The install may be partially updated — some directories were "
+            "replaced and others were not."
+        )
+        print(
+            "  Re-run `hermes update` to finish; if the agent won't start, "
+            "reinstall from https://hermes-agent.nousresearch.com"
+        )
         _m().sys.exit(1)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -684,6 +783,27 @@ def _update_via_zip(args):
     # after the dependency reinstall, same as the git-pull path (#53272,
     # #70636).
     _m()._refresh_active_memory_provider_dependencies()
+
+    # Now that dependencies are installed, verify the tree actually imports.
+    # The copy loop above replaces top-level entries one at a time in
+    # os.listdir order, so an interruption between (say) `agent/` and `tools/`
+    # leaves a tree whose files all parse but cannot be imported together —
+    # the ImportError-on-startup class this guard exists to catch. Deliberately
+    # placed *after* the dependency reinstall so a genuinely-new third-party
+    # requirement isn't misreported as a partial copy. There is no SHA to roll
+    # back to here, so surface it with a concrete recovery step rather than
+    # reporting a successful update over a bricked install.
+    import_ok, failing_module, import_error = _validate_critical_modules_import(
+        _m().PROJECT_ROOT
+    )
+    if not import_ok:
+        print()
+        print("✗ Update left the install in an unimportable state:")
+        print(f"  {failing_module}: {import_error}")
+        print()
+        print("  This usually means the copy was interrupted partway through.")
+        print("  Re-run `hermes update` to complete it.")
+        _m().sys.exit(1)
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
@@ -3883,6 +4003,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # reinstall + lazy refresh above may have stripped or downgraded
         # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
         _m()._refresh_active_memory_provider_dependencies()
+
+        # Everything that can legitimately produce a transient ImportError has
+        # now run (bytecode sweep, dependency reinstall, lazy refresh), so a
+        # module that still won't import is real breakage. Warn only — never
+        # roll back here: `cannot import name X` is also the signature of the
+        # stale-bytecode class (#6207, #60242), and the launch-time sweep in
+        # _sweep_stale_bytecode_if_checkout_changed() self-heals that on the
+        # next run. A destructive reset would undo a good update over a state
+        # that fixes itself.
+        import_ok, failing_module, import_error = _validate_critical_modules_import(
+            _m().PROJECT_ROOT
+        )
+        if not import_ok:
+            print()
+            print(f"  ⚠ {failing_module} still fails to import after updating:")
+            print(f"      {import_error}")
+            print("    Run `hermes update` again — if it persists, reinstall:")
+            print("    https://hermes-agent.nousresearch.com")
 
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
