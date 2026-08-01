@@ -15,10 +15,45 @@ auth:
   # Native MCP OAuth 2.1 with dynamic client registration
   # (/.well-known/oauth-authorization-server on schedulala.com).
   type: oauth
+# The server also exposes ten widget tools (nine show_* panels plus
+# attach_media) that render only on claude.ai/ChatGPT — excluded from the
+# default set below. Names are pinned to the server source by a canary test
+# in the schedulala repo.
+tools:
+  default_enabled:
+    - list_accounts
+    - connect_account
+    - create_post
+    - bulk_create_posts
+    - create_thread
+    - validate_post
+    - update_post
+    - cancel_post
+    - retry_post
+    - get_post
+    - list_posts
+    - upload_media
+    - list_media
+    - begin_generated_media_upload
+    - append_generated_media_chunk
+    - finish_generated_media_upload
+    - get_post_analytics
+    - get_follower_growth
+    - get_best_posting_times
+    - get_video_transcript
+    - get_video_retention
+    - list_comments
+    - reply_to_comment
+    - hide_comment
+    - list_mentions
+    - search_feeds
+    - lookup_profile
+    - list_feed_keywords
+    - update_feed_keywords
+    - get_usage
+    - get_upgrade_link
 post_install:
   notes: >
     Sign-in happens in the browser via OAuth; no API key handling. A free
     account can connect 2 social accounts and make 4 lifetime posts; paid
-    plans from $29/mo include full API/MCP access. Tool-count tip: the nine
-    show_* widget tools and the attach_media widget path render only on
-    claude.ai/ChatGPT and are safe to disable here.
+    plans from $29/mo include full API/MCP access.
