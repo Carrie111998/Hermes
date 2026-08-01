@@ -773,6 +773,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "name": "ultra_media_job_create",
                 "description": "create media",
                 "input_schema": {"type": "object", "properties": {}},
+                "exposure": "deferred",
                 "route": "tokenrouter",
                 "allowed_skills": ["media-qa"],
                 "requires_skill_guidance": True,

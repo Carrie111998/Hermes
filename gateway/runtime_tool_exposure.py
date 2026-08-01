@@ -8,6 +8,7 @@ model. Exposure never grants execution authority and never depends on Skills.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,8 +17,11 @@ from tools.tool_search import (
     CatalogEntry,
     bridge_tool_schemas,
     build_catalog,
+    estimate_tokens_from_schemas,
     search_catalog,
 )
+
+logger = logging.getLogger("gateway.runtime_tool_exposure")
 
 _DIRECT_PLATFORM_TOOLS = frozenset({
     "ask_user_question",
@@ -25,6 +29,7 @@ _DIRECT_PLATFORM_TOOLS = frozenset({
 })
 _DEFAULT_SEARCH_LIMIT = 5
 _MAX_SEARCH_LIMIT = 20
+_AUTO_DEFER_THRESHOLD_TOKENS = 20_000
 
 
 @dataclass(frozen=True)
@@ -38,7 +43,25 @@ class RuntimeToolExposure:
     def model_schemas(self) -> list[dict[str, Any]]:
         visible = [dict(schema) for schema in self.direct_schemas]
         if self.deferred_catalog:
-            visible.extend(bridge_tool_schemas(len(self.deferred_catalog)))
+            bridge = bridge_tool_schemas(len(self.deferred_catalog))
+            for schema in bridge:
+                function = schema.get("function") or {}
+                if function.get("name") == "tool_search":
+                    query = (
+                        (function.get("parameters") or {})
+                        .get("properties", {})
+                        .get("query", {})
+                    )
+                    query["description"] = (
+                        "English capability keywords or an exact Tool name."
+                    )
+                elif function.get("name") == "tool_describe":
+                    function["description"] = (
+                        "Load the full JSON schema for a deferred Tool. If a Skill "
+                        "or task already supplies its exact Tool name, describe it "
+                        "directly without searching first."
+                    )
+            visible.extend(bridge)
         return visible
 
     def search(self, args: dict[str, Any]) -> str:
@@ -53,7 +76,18 @@ class RuntimeToolExposure:
         except (TypeError, ValueError):
             return _error("limit must be an integer")
         limit = max(1, min(_MAX_SEARCH_LIMIT, limit))
-        matches = search_catalog(list(self.deferred_catalog), query, limit)
+        normalized_query = query.casefold()
+        exact_matches = [
+            entry
+            for entry in self.deferred_catalog
+            if entry.name.casefold() == normalized_query
+            or entry.name.casefold() in normalized_query
+        ]
+        matches = exact_matches[:limit] or search_catalog(
+            list(self.deferred_catalog),
+            query,
+            limit,
+        )
         return json.dumps({
             "query": query,
             "total_available": len(self.deferred_catalog),
@@ -109,6 +143,8 @@ def build_runtime_tool_exposure(
 ) -> RuntimeToolExposure:
     if len(definitions) != len(schemas):
         raise ValueError("Tool definitions and schemas differ")
+    classified: list[tuple[str, dict[str, Any]]] = []
+    automatic: list[dict[str, Any]] = []
     direct: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     hidden: set[str] = set()
@@ -121,13 +157,35 @@ def build_runtime_tool_exposure(
             raise ValueError(f"Tool exposure is invalid for {name}")
         if requested == "hidden":
             hidden.add(name)
+            classified.append(("hidden", schema))
         elif requested == "direct" or (
             not requested and name in _DIRECT_PLATFORM_TOOLS
         ):
-            direct.append(schema)
+            classified.append(("direct", schema))
+        elif requested == "deferred":
+            classified.append(("deferred", schema))
         else:
+            classified.append(("automatic", schema))
+            automatic.append(schema)
+    automatic_tokens = estimate_tokens_from_schemas(automatic)
+    defer_automatic = automatic_tokens >= _AUTO_DEFER_THRESHOLD_TOKENS
+    for classification, schema in classified:
+        if classification == "direct" or (
+            classification == "automatic" and not defer_automatic
+        ):
+            direct.append(schema)
+        elif classification == "deferred" or classification == "automatic":
             deferred.append(schema)
     catalog = build_catalog(deferred)
+    logger.info(
+        "runtime Tool exposure: direct=%d deferred=%d hidden=%d "
+        "automatic_schema_tokens=%d automatic_deferred=%s",
+        len(direct),
+        len(catalog),
+        len(hidden),
+        automatic_tokens,
+        defer_automatic,
+    )
     return RuntimeToolExposure(
         direct_schemas=tuple(direct),
         deferred_catalog=tuple(catalog),

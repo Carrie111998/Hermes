@@ -35,7 +35,7 @@ def _schema(definition: dict) -> dict:
 def test_runtime_exposure_separates_direct_deferred_and_hidden_tools():
     definitions = [
         _definition("ask_user_question"),
-        _definition("media.generate_image"),
+        _definition("media.generate_image", exposure="deferred"),
         _definition("platform.internal_reconcile", exposure="hidden"),
     ]
     exposure = build_runtime_tool_exposure(
@@ -70,6 +70,58 @@ def test_runtime_exposure_separates_direct_deferred_and_hidden_tools():
         {"prompt": "a studio portrait"},
         None,
     )
+
+
+def test_small_runtime_tool_surface_stays_direct_without_search_bridges():
+    definitions = [
+        _definition("ask_user_question"),
+        _definition("media.generate_image"),
+        _definition("media.generate_video"),
+        _definition("platform.prompt_enhance"),
+    ]
+    exposure = build_runtime_tool_exposure(
+        definitions,
+        [_schema(item) for item in definitions],
+    )
+
+    assert [
+        item["function"]["name"] for item in exposure.model_schemas
+    ] == [item["name"] for item in definitions]
+    assert exposure.deferred_names == set()
+
+
+def test_large_runtime_tool_surface_defers_automatic_tools():
+    definition = _definition("media.generate_image")
+    definition["description"] = "generate image " + ("x" * 80_000)
+    exposure = build_runtime_tool_exposure(
+        [definition],
+        [_schema(definition)],
+    )
+
+    assert exposure.deferred_names == {"media.generate_image"}
+    assert {
+        item["function"]["name"] for item in exposure.model_schemas
+    } == {"tool_search", "tool_describe", "tool_call"}
+
+
+def test_deferred_tool_search_recognizes_exact_name_inside_chinese_query():
+    definition = _definition("media.generate_image", exposure="deferred")
+    exposure = build_runtime_tool_exposure(
+        [definition],
+        [_schema(definition)],
+    )
+
+    result = json.loads(exposure.search({
+        "query": "请找到 media.generate_image 这个图片生成工具",
+    }))
+    assert [item["name"] for item in result["matches"]] == [
+        "media.generate_image",
+    ]
+    describe_schema = next(
+        item for item in exposure.model_schemas
+        if item["function"]["name"] == "tool_describe"
+    )
+    assert "without searching first" in describe_schema["function"]["description"]
 
 
 def test_hidden_and_direct_tools_cannot_be_invoked_through_tool_call():
