@@ -1,22 +1,21 @@
 import { cn } from '@/lib/utils'
 
-// Brand badge: typographic placeholder ("DA" on emerald) until real Douglas
-// Agent iconography exists. Deliberately no external image -- the previous
-// mark was Nous Research's own illustrated mascot (nous-girl.jpg), which MIT
-// covers as code but not as artwork; it can't represent a different product.
-// Identical in light/dark; size via className (default size-14).
+import logoWhite from '@/assets/brand/logo_white.png'
+
+// Brand badge: the Douglas Agent mark (white line art, transparent
+// background) on the same emerald tile the old "DA" placeholder used, so
+// every call site's size/rounding/spacing stays unchanged. Identical in
+// light/dark; size via className (default size-14).
 export function BrandMark({ className, ...props }: React.ComponentProps<'span'>) {
   return (
     <span
       className={cn(
-        'font-display inline-flex size-14 shrink-0 items-center justify-center overflow-hidden rounded-md bg-emerald-600 font-bold text-white select-none',
+        'inline-flex size-14 shrink-0 items-center justify-center overflow-hidden rounded-md bg-emerald-600 select-none',
         className
       )}
       {...props}
     >
-      <span aria-hidden className="text-[0.4em] tracking-tight">
-        DA
-      </span>
+      <img aria-hidden src={logoWhite} alt="" className="size-[70%] object-contain" />
       <span className="sr-only">Douglas Agent</span>
     </span>
   )
