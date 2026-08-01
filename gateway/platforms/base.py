@@ -5716,6 +5716,19 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
+            pending_feedback = self._pending_messages.get(session_key)
+            if (
+                pending_feedback is not None
+                and (getattr(pending_feedback, "metadata", None) or {}).get(
+                    "media_delivery_feedback"
+                )
+            ):
+                runner = getattr(self, "gateway_runner", None)
+                queue_pending = getattr(runner, "_queue_or_replace_pending_event", None)
+                if callable(queue_pending):
+                    queue_pending(session_key, event)
+                    return
+
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
             # then process them immediately after the current task finishes.

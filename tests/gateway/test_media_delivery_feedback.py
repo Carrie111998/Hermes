@@ -322,3 +322,32 @@ async def test_user_followup_after_feedback_keeps_turn_boundary(tmp_path, monkey
     queued = runner._sessions[session_key].conversation.queued_events
     assert len(queued) == 1
     assert queued[0].text == "follow-up"
+
+
+@pytest.mark.asyncio
+async def test_feedback_head_keeps_photo_followup_out_of_feedback_turn(tmp_path, monkeypatch):
+    _, rejected = _media_paths(tmp_path, monkeypatch)
+    runner = _runner()
+    adapter = _MediaFeedbackAdapter()
+    adapter.gateway_runner = runner
+    runner._adapter_for_source = lambda source: adapter
+    session_key = build_session_key(_source())
+    runner._queue_media_delivery_feedback(
+        _event(),
+        session_key,
+        adapter,
+        [(str(rejected), False)],
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._busy_session_handler = AsyncMock(return_value=False)
+    adapter._message_handler = AsyncMock()
+    photo = _event("photo follow-up")
+    photo.message_type = MessageType.PHOTO
+
+    await adapter.handle_message(photo)
+
+    feedback_event = adapter._pending_messages[session_key]
+    assert feedback_event.metadata["media_delivery_feedback"] is True
+    queued = runner._sessions[session_key].conversation.queued_events
+    assert len(queued) == 1
+    assert queued[0] is photo
