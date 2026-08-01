@@ -618,6 +618,48 @@ def test_same_provider_named_provider_does_not_force_session_url(
     assert result.api_key == "sk-rotated"
 
 
+def test_same_provider_empty_resolve_does_not_refill_from_session(
+    tmp_path, monkeypatch
+):
+    """Empty resolver output must not be refilled from current_* here.
+
+    Broad empty-result credential preservation is owned by #44502. This PR
+    only blocks non-empty OpenRouter fallthrough for bare custom/local via
+    explicit_*; non-custom same-provider switches keep resolver values as-is.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "opencode-go",
+            "api_key": "",
+            "base_url": "",
+            "api_mode": "",
+        },
+    )
+
+    result = switch_model(
+        raw_input="kimi-k2.5",
+        current_provider="opencode-go",
+        current_model="mimo-v2.5",
+        current_api_key="sk-session-key",
+        current_base_url="https://api.opencode-go.com/v1",
+    )
+
+    assert result.success is True
+    assert result.api_key != "sk-session-key"
+    assert (result.base_url or "") != "https://api.opencode-go.com/v1"
+
+
 def test_same_provider_named_custom_adopts_rotated_config_creds(
     tmp_path, monkeypatch
 ):
@@ -682,3 +724,74 @@ def test_same_provider_named_custom_adopts_rotated_config_creds(
     )
     assert result.base_url.rstrip("/") == "https://replacement.example/v1"
     assert result.api_key == "rotated-config-key"
+
+
+def test_same_provider_direct_alias_does_not_send_session_key_to_alias_host(
+    tmp_path, monkeypatch
+):
+    """Direct-alias host change must not reuse the prior session credential.
+
+    Bare-custom same-provider switches preserve session URL/key to avoid
+    OpenRouter fallthrough. When a same-provider direct alias then replaces
+    only base_url, that preserved key must not be validated or returned for
+    the alias host.
+    """
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    session_url = "https://endpoint-a.example/v1"
+    session_key = "sk-endpoint-a-private"
+    alias_url = "https://endpoint-b.example/v1"
+
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "alias-b": DirectAlias("model-on-b", "custom", alias_url),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "model-on-b", "alias-b"),
+    )
+
+    validation_calls: list[dict] = []
+
+    def _capture_validate(model_name, provider, **kwargs):
+        validation_calls.append(
+            {
+                "model_name": model_name,
+                "provider": provider,
+                "api_key": kwargs.get("api_key"),
+                "base_url": kwargs.get("base_url"),
+            }
+        )
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model", _capture_validate
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="alias-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+    assert result.api_key != session_key
+    assert validation_calls, "expected validate_requested_model to run"
+    for call in validation_calls:
+        assert (call["base_url"] or "").rstrip("/") == alias_url.rstrip("/")
+        assert call["api_key"] != session_key

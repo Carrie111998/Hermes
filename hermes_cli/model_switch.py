@@ -1618,10 +1618,12 @@ def switch_model(
                 target_model=new_model,
                 **_same_provider_kwargs,
             )
-            # Prefer resolved values (rotation / OpenCode URL tweaks). Fall back
-            # to session creds when resolution returns empty.
-            api_key = runtime.get("api_key", "") or current_api_key
-            base_url = runtime.get("base_url", "") or current_base_url
+            # Use resolver output as-is. Bare custom/local already pinned the
+            # live session endpoint via explicit_* above (blocks OpenRouter
+            # fallthrough). Broad empty-result refill from current_* is owned
+            # by #44502 - do not duplicate it here.
+            api_key = runtime.get("api_key", "")
+            base_url = runtime.get("base_url", "")
             api_mode = runtime.get("api_mode", "")
         except Exception:
             pass
@@ -1631,7 +1633,14 @@ def switch_model(
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
-            base_url = _da.base_url
+            alias_url = _da.base_url
+            # Same-provider bare custom/local may have just preserved the live
+            # session credential for the prior host. If the alias points at a
+            # different endpoint, drop that credential before validation so
+            # key A is never probed against host B.
+            if (base_url or "").rstrip("/") != alias_url.rstrip("/"):
+                api_key = ""
+            base_url = alias_url
             api_mode = ""  # clear so determine_api_mode re-detects from URL
             if not api_key:
                 api_key = "no-key-required"
