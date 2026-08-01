@@ -8,7 +8,7 @@ from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import plugins.memory.openviking as openviking_plugin
-from plugins.memory.openviking import OpenVikingMemoryProvider
+from plugins.memory.openviking import OpenVikingMemoryProvider, _VikingClient
 
 
 def _write_skill(skills_dir, name, body="Do the thing."):
@@ -125,6 +125,60 @@ def make_prefetch_provider(monkeypatch, responses, **env):
 
 def wait_prefetch(provider, query="What should we recall?", session_id="session-test"):
     return provider.prefetch(query, session_id=session_id)
+
+
+class TestVikingClientHeaders:
+    def test_api_key_requests_do_not_assert_tenant_by_default(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        client = _VikingClient("http://openviking.test", api_key="user-key")
+
+        headers = client._headers()
+
+        assert headers["X-API-Key"] == "user-key"
+        assert headers["Authorization"] == "Bearer user-key"
+        assert headers["X-OpenViking-Actor-Peer"] == "hermes"
+        assert "X-OpenViking-Account" not in headers
+        assert "X-OpenViking-User" not in headers
+
+    def test_api_key_trusted_retry_sends_no_spurious_tenant(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        client = _VikingClient("http://openviking.test", api_key="user-key")
+
+        retry_headers = client._headers(include_tenant=True)
+
+        assert "X-OpenViking-Account" not in retry_headers
+        assert "X-OpenViking-User" not in retry_headers
+
+    def test_api_key_trusted_retry_can_send_explicit_tenant(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        client = _VikingClient(
+            "http://openviking.test",
+            api_key="root-key",
+            account="default",
+            user="alice",
+        )
+
+        default_headers = client._headers()
+        retry_headers = client._headers(include_tenant=True)
+
+        assert "X-OpenViking-Account" not in default_headers
+        assert "X-OpenViking-User" not in default_headers
+        assert retry_headers["X-OpenViking-Account"] == "default"
+        assert retry_headers["X-OpenViking-User"] == "alice"
+
+    def test_trusted_mode_without_api_key_sends_configured_tenant(self, monkeypatch):
+        monkeypatch.setenv("OPENVIKING_ACCOUNT", "default")
+        monkeypatch.setenv("OPENVIKING_USER", "alice")
+        client = _VikingClient("http://openviking.test")
+
+        headers = client._headers()
+
+        assert headers["X-OpenViking-Account"] == "default"
+        assert headers["X-OpenViking-User"] == "alice"
+        assert "X-API-Key" not in headers
 
 
 class TestOpenVikingSummaryUriNormalization:
