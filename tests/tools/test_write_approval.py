@@ -634,6 +634,41 @@ def test_fuzzy_applicable_pending_patch_is_not_stale(hermes_home):
         assert "changed rule" in f.read()
 
 
+def test_supporting_file_pending_patch_is_not_stale(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "supporting-file-approval-skill"
+    skill_path = _create_stale_test_skill(
+        hermes_home,
+        name,
+        "---\nname: supporting-file-approval-skill\ndescription: A test skill\n---\n",
+    )
+    target = Path(skill_path).parent / "references" / "notes.txt"
+    target.parent.mkdir()
+    target.write_text("old supporting content", encoding="utf-8")
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "file_path": "references/notes.txt",
+            "old_string": "old supporting content",
+            "new_string": "new supporting content",
+        },
+        summary="supporting file patch",
+        origin="foreground",
+    )
+
+    pending = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    approved = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert "[stale]" not in pending
+    assert "Approved 1 skills write(s)." in approved
+    assert wa.get_pending(wa.SKILLS, record["id"]) is None
+    assert target.read_text(encoding="utf-8") == "new supporting content"
+
+
 def test_non_patch_pending_skill_write_bypasses_stale_classification(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa

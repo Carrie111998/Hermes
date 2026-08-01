@@ -926,7 +926,7 @@ def inspect_skill_patch_pending(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             target = skill_dir / "SKILL.md"
 
-        if not target.exists():
+        if not target.is_file():
             return {"state": "unverified"}
         content = target.read_text(encoding="utf-8")
 
