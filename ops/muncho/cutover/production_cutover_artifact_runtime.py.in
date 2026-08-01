@@ -6109,6 +6109,7 @@ def _discord_policy_continuity(value: Any) -> Mapping[str, Any]:
         )
         or target["allowed_guild_ids"] != ["1282725267068157972"]
         or target["allowed_channel_ids"] != [
+            "1282930260911984660",
             "1504852355588423801",
             "1504852408227069993",
             "1504852444407140402",
@@ -6257,7 +6258,10 @@ def _assert_reviewed_connector_boundary(
         != target_policy["free_response_channel_ids"]
         or discord["reviewed_cron_history_targets"] != {
             "06ef64d72891": ["1504852355588423801"],
-            "e62f55ca93ca": ["1524321461714681976"],
+            "e62f55ca93ca": [
+                "1282930260911984660",
+                "1524321461714681976",
+            ],
         }
         or discord["public_only"] is not False
         or discord["author_policy"] != "guild_acl"

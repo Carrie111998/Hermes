@@ -154,6 +154,7 @@ def test_package_is_exact_credential_isolated_and_never_activates() -> None:
     assert by_job["e62f55ca93ca"]["historical_source_delivery"] == (
         "discord:1504852355588423801:1524321461714681976"
     )
+    assert by_job["e62f55ca93ca"]["preserve_source_prompt"] is True
     assert any(
         row["execution_boundary"] == rail.EXECUTION_BOUNDARY_SCOPED
         for row in contract

@@ -19,6 +19,7 @@ from gateway.session_context import get_session_env
 
 
 CONTROL_TOWER_CHANNEL_ID: Final = "1504852355588423801"
+VOICE_DISCUSSIONS_SOURCE_CHANNEL_ID: Final = "1282930260911984660"
 VOICE_DIGEST_THREAD_ID: Final = "1524321461714681976"
 CANARY_REQUESTER_USER_ID: Final = "1279454038731264061"
 CANARY_HISTORY_READER_SERVICE_UNIT: Final = (
@@ -32,7 +33,12 @@ REVIEWED_PRODUCTION_CRON_HISTORY_TARGETS: Final[Mapping[str, frozenset[str]]] = 
     MappingProxyType(
         {
             "06ef64d72891": frozenset({CONTROL_TOWER_CHANNEL_ID}),
-            "e62f55ca93ca": frozenset({VOICE_DIGEST_THREAD_ID}),
+            "e62f55ca93ca": frozenset(
+                {
+                    VOICE_DISCUSSIONS_SOURCE_CHANNEL_ID,
+                    VOICE_DIGEST_THREAD_ID,
+                }
+            ),
         }
     )
 )
@@ -115,6 +121,7 @@ __all__ = [
     "CANARY_HISTORY_READER_SERVICE_UNIT",
     "CANARY_HISTORY_READER_SERVICE_USER",
     "CANARY_REQUESTER_USER_ID",
+    "VOICE_DISCUSSIONS_SOURCE_CHANNEL_ID",
     "VOICE_DIGEST_THREAD_ID",
     "DiscordHistoryAuthorityError",
     "REVIEWED_PRODUCTION_CRON_HISTORY_TARGETS",

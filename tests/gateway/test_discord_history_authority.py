@@ -15,6 +15,7 @@ from gateway.discord_connector_protocol import (
 )
 from gateway.discord_history_authority import (
     CONTROL_TOWER_CHANNEL_ID,
+    VOICE_DISCUSSIONS_SOURCE_CHANNEL_ID,
     VOICE_DIGEST_THREAD_ID,
     DiscordHistoryAuthorityError,
     bind_cron_history_job,
@@ -66,6 +67,7 @@ def test_interactive_authority_comes_only_from_authenticated_discord_context(
     ("job_id", "channel_id"),
     [
         ("06ef64d72891", CONTROL_TOWER_CHANNEL_ID),
+        ("e62f55ca93ca", VOICE_DISCUSSIONS_SOURCE_CHANNEL_ID),
         ("e62f55ca93ca", VOICE_DIGEST_THREAD_ID),
     ],
 )

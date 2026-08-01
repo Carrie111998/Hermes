@@ -444,7 +444,11 @@ _EXPECTED_DEFINITION_SHA256 = {
     "cd778104fc92": "b3051076d5cac8a7644fd2ef22f279d76e3fa1faab999627685dfb57e140b407",
     "a1dfd5c2a7ab": "a158cb710306188be39f4ecb64dd1d9fbf0a93a5c8a542273b7f1bd461bd9b2c",
     "457b208c90ab": "c3d6d31bc29a0a54cb75850f2e40e0f6a824bdc2a77a9323c31db03d4e471cb2",
-    "e62f55ca93ca": "6861092e5d1941eaa4f5505dad1b1b492f3a8272088570a93bd4d99c7a5bfbe6",
+    # Re-reviewed after the owner-directed 2026-07-27 expansion from the
+    # voice-only digest to the exact Discord discussion source plus voice
+    # evidence. The source prompt remains model-authored semantic policy;
+    # this digest is only immutable configuration identity.
+    "e62f55ca93ca": "5aad142a2ddd89efe9006b44d302862b516e729100927cc6c95916ba202e1ca8",
     "7e4a90bdeff0": "3fb3e2bb2e4188e66e8c691911b586106066badfaf9137c6a4b50abfa2a511ca",
     "27f7f59fa0ca": "a3f35f4e32029b2a0082db878aa27b320d2dfe043c0837d62e2233a65f22089c",
     "6faf380f3512": "868f2d6aab796c94921e91a9d7288e631493e90d0118c60e98a2ed2e0bf23eec",

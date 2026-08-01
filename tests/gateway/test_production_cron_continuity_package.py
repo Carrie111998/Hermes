@@ -23,6 +23,9 @@ from toolsets import resolve_toolset
 
 LEGACY_LOCKED_CHANNEL = "1504852355588423801"
 LEGACY_LOCKED_THREAD = "1524321461714681976"
+VOICE_DISCUSSIONS_SOURCE_CHANNEL = "1282930260911984660"
+
+
 def _agent_job(entry: review.ReviewDisposition, index: int) -> dict:
     origin = {
         "platform": "discord",
@@ -290,6 +293,10 @@ def test_plan_is_exhaustive_primary_model_authored_and_owner_complete(
     assert LEGACY_LOCKED_CHANNEL in root_record["prompt"]
     assert LEGACY_LOCKED_CHANNEL in thread_record["prompt"]
     assert LEGACY_LOCKED_THREAD in thread_record["prompt"]
+    assert VOICE_DISCUSSIONS_SOURCE_CHANNEL in thread_record["prompt"]
+    assert thread_record["prompt"].startswith(
+        "Use your judgment for reviewed operation"
+    )
     assert "1526870121677848636" not in root_record["prompt"]
     assert "1526870121677848636" not in thread_record["prompt"]
 

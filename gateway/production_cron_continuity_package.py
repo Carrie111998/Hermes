@@ -32,6 +32,9 @@ from typing import Any, Mapping, Sequence
 
 from gateway import production_cron_continuity_review as review
 from gateway import production_cron_migration
+from gateway.discord_history_authority import (
+    reviewed_cron_history_targets_json,
+)
 from gateway.operational_edge_catalog import required_cron_operations
 from gateway.operational_edge_readiness import (
     operational_catalog_sha256,
@@ -303,7 +306,7 @@ def _target_from_delivery(
     """Project an exact reviewed guild-ACL target, never infer authority.
 
     Legacy ``origin``/``deliver`` fields are historical provenance. A numeric
-    Discord shape never grants a target. Only the two owner-reviewed job
+    Discord shape never grants a target. Only code-owned, owner-reviewed job
     identities project to their exact existing production lane/thread. The
     connector still re-proves live bot ACL before every read or send. This is a
     permission boundary, not semantic routing; GPT still decides whether any
@@ -335,10 +338,22 @@ def _agent_note() -> str:
 def _collector_prompt(source: Mapping[str, Any], spec: collector_rail.CollectorSpec) -> str:
     target = _target_from_delivery(source, source_job_id=spec.source_job_id)
     target_text = json.dumps(target, ensure_ascii=True, sort_keys=True)
+    history_targets = reviewed_cron_history_targets_json().get(
+        spec.source_job_id,
+        [],
+    )
+    history_targets_text = json.dumps(
+        history_targets,
+        ensure_ascii=True,
+        sort_keys=True,
+    )
     authorized_history = (
-        " When guild conversation context is needed, read only that exact "
-        "ACL-authorized channel/thread with discord_guild_history."
-        if target is not None
+        " When guild conversation context is needed, read only the exact "
+        "ACL-authorized history target IDs stated below with "
+        "discord_guild_history. A preserved instruction that names "
+        "discord.fetch_messages refers to this replacement read tool; it "
+        "does not authorize the legacy mutation-capable Discord surface."
+        if history_targets
         else ""
     )
     voice = ""
@@ -369,7 +384,8 @@ def _collector_prompt(source: Mapping[str, Any], spec: collector_rail.CollectorS
         "model-authored review outcome to Canonical Brain. Do not infer from "
         "filenames alone. Do not perform a dangerous mutation without the "
         "applicable owner/passkey approval. "
-        f"Approved guild target, if any: {target_text}. Legacy delivery fields "
+        f"Approved guild delivery target, if any: {target_text}. Approved "
+        f"guild history target IDs: {history_targets_text}. Legacy delivery fields "
         "are ineligible historical provenance and must never be used as a "
         "send/read authorization. If a guild "
         "message is useful, use the Canonical route-back operation so delivery "

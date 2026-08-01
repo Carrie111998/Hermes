@@ -64,6 +64,7 @@ def test_package_config_has_production_guild_acl_policy_and_no_embedded_token() 
     assert '"author_policy": "guild_acl"' in config
     assert '"1504852355588423801"' in config
     assert '"1505499746939174993"' in config
+    assert '"1282930260911984660"' in config
     assert "1526870121677848636" not in config
     assert '"allow_bot_authors": false' in config
     assert '"token":' not in config
