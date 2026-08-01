@@ -10,6 +10,17 @@
     "focus": "campaign terms, warm founder exception framing without overpromising"
   },
   {
+    "id": "campaign_gift_time_validity",
+    "message": "Щом пише „неизползван“, мога ли да го ползвам сега или да го дам на друг човек?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Получих основния ваучер като подарък преди няколко години, а в профила виждам неизползван подарък от кампания."
+      }
+    ],
+    "focus": "distinguish received date from purchase or entitlement date; verify historical campaign terms, separate validity, use state, and current usability; no expiry claim without evidence and no transfer or exception guidance first"
+  },
+  {
     "id": "massage_sofia_budget",
     "message": "Търся масаж за двама в София до 100 евро. Какво ще ми предложиш?",
     "focus": "catalog relevance, cards, EUR pricing, budget taste"
@@ -60,9 +71,91 @@
     "focus": "give info@skyvision.bg as the customer reply contact; do not present the automated reservations notification address as a reply channel"
   },
   {
+    "id": "reservation_voucher_path_ambiguity",
+    "message": "Искам да направя резервация за водно преживяване за двама на морето. Как да продължа?",
+    "focus": "when reservation intent is clear but voucher/payment path is unknown, do not assume direct BookNow/card payment; clarify or explain existing SkyVision voucher account/My Voucher flow and product reservation voucher option, with direct BookNow/card only when no voucher is used; no unsupported mandatory UI/slot/operator steps"
+  },
+  {
+    "id": "confirmed_reservation_wants_another_experience",
+    "message": "Имам потвърдена резервация за едно преживяване, но вече искам друго. Какво да направя?",
+    "focus": "confirmed/upcoming reservation change should explain self-service cancellation first when available, then voucher/service exchange only after successful cancellation and voucher release; no immediate team-only info@ escalation and no invented universal cutoff"
+  },
+  {
+    "id": "reservation_cancel_cutoff_unknown",
+    "message": "До колко часа преди резервацията мога да я анулирам?",
+    "focus": "provider-defined cutoff unknown; answer must not invent 24/48/global hours and should rely on product/provider facts or platform state"
+  },
+  {
+    "id": "reservation_identified_service_eight_hour_policy",
+    "message": "За полета с балон край София до колко часа преди слота мога да анулирам?",
+    "focus": "service is identified; use catalog canonical slug then bounded product detail refresh; answer from 8-hour structured cancellationPolicy"
+  },
+  {
+    "id": "reservation_identified_service_no_free_cancellation",
+    "message": "При това екстремно преживяване има ли безплатно анулиране?",
+    "focus": "service is identified; product detail structured cancellationPolicy says no free cancellation"
+  },
+  {
+    "id": "reservation_detail_fetch_policy_unknown",
+    "message": "За тази услуга какъв е точният срок за анулиране?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Гледам услугата Морско приключение за двама."
+      }
+    ],
+    "focus": "prior context identifies service but detail fetch/policy missing; say exact policy could not be verified, do not infer hours"
+  },
+  {
+    "id": "reservation_prior_turn_service_no_redundant_clarification",
+    "message": "До колко часа преди слота може да се анулира?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Интересувам се от Полет с балон край София."
+      },
+      {
+        "role": "assistant",
+        "content": "Това е конкретната услуга в SkyVision каталога."
+      }
+    ],
+    "focus": "service named in prior turn; no redundant service clarification; refresh detail by canonical slug"
+  },
+  {
+    "id": "reservation_ambiguous_service_clarification",
+    "message": "До колко часа преди резервацията мога да анулирам?",
+    "focus": "service not identifiable and answer depends on service; ask one concise service clarification"
+  },
+  {
+    "id": "reservation_reject_stale_prose_and_universal_hours",
+    "message": "Страницата казва едно, но какъв е актуалният срок за анулиране на тази услуга?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Гледам Полет с балон край София."
+      }
+    ],
+    "focus": "structured product detail cancellationPolicy has precedence over stale product prose; reject universal hardcoded hours"
+  },
+  {
+    "id": "reservation_cancel_unavailable_or_deadline_passed",
+    "message": "В профила ми няма бутон за анулиране на резервацията или системата отказва. Какво следва?",
+    "focus": "cancellation unavailable or deadline passed: explain self-service boundary under applicable reservation conditions, then assistance/exception review only without promising cancellation"
+  },
+  {
+    "id": "reservation_already_cancelled_voucher_exchange",
+    "message": "Резервацията вече е анулирана. Как да използвам ваучера за друго преживяване?",
+    "focus": "already-cancelled reservation should proceed with verified voucher management/exchange path without repeating cancellation steps"
+  },
+  {
+    "id": "reservation_self_cancel_reject_team_only",
+    "message": "Имам потвърдена резервация и искам друга услуга вместо нея.",
+    "focus": "wrong immediate info@/team-only answer fails; self-service cancellation first when available, provider-defined cutoff uncertainty, no promised exception"
+  },
+  {
     "id": "gift_wish_text",
-    "message": "Искам да напиша лично пожелание във ваучера. Къде се пише?",
-    "focus": "voucher greeting UI knowledge and edit window"
+    "message": "Стигнах до плащането, но не ми излезе меню за поздрав.",
+    "focus": "voucher greeting UI knowledge: cart edit flow before payment, and BookNow is not a gift voucher"
   },
   {
     "id": "gift_packaging",

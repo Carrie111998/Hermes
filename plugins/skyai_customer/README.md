@@ -64,6 +64,19 @@ Current line:
   `reservations@skyvision.bg` remains an automated notification sender, not a
   reply channel. No issuer classifier, keyword guard, or contact router is
   added.
+- `v2.8` - campaign-gift time and validity reasoning: receipt of the main
+  voucher is not treated as the purchase or entitlement-creation date; Hermes
+  checks historical campaign terms, separate validity, use state, and current
+  usability before ownership, transfer, exception, or escalation guidance.
+  Missing evidence permits only a possible-expiry statement and a lookup, not
+  an expiry fact or promised exception. No runtime status classifier, phrase
+  matcher, or response guard is added.
+- `v2.9` - service-specific reservation cancellation policy reasoning: Hermes
+  uses exact service context plus the existing public product-detail tool to
+  refresh current structured `cancellationPolicy` facts by canonical slug. The
+  structured field has precedence over product prose; missing/fetch-failed
+  detail stays unverified. No universal cancellation-hour constant, classifier,
+  router, or customer-answer template is added.
 
 ## Canonical Source
 

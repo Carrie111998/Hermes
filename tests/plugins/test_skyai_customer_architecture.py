@@ -8,6 +8,7 @@ from plugins.skyai_customer import dev_gateway, public_tools
 
 ARCHITECTURE_PATH = Path("plugins/skyai_customer/ARCHITECTURE.md")
 QA_PRINCIPLES_PATH = Path("plugins/skyai_customer/fixtures/qa_behavior_principles.json")
+COMPARE_SCENARIOS_PATH = Path("plugins/skyai_customer/fixtures/compare_scenarios.json")
 
 
 def test_architecture_contract_declares_hermes_led_reasoning() -> None:
@@ -31,7 +32,7 @@ def test_skyai_prompt_is_principle_based_not_script_pack() -> None:
 
     assert "Hermes мисли" in prompt
     assert "не е заповед какво да кажеш" in prompt
-    assert len(prompt) < 5200
+    assert len(prompt) < 6000
     assert "SkyAI sales playbook" not in prompt
     assert "do_not_say" not in prompt
     assert "customer_facing_flow" not in prompt
@@ -62,6 +63,60 @@ def test_skyai_prompt_treats_prior_turns_as_shared_context() -> None:
     assert "prompt-and-evaluation principle" in architecture
     assert "backend deduplication" in architecture
     assert "keyword rule" in architecture
+
+
+def test_campaign_gift_validity_precedes_transfer_reasoning() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+
+    assert "не извеждай едната дата от другата" in prompt
+    assert "историческите условия на конкретната кампания" in prompt
+    assert "отделно от ползването на основния ваучер" in prompt
+    assert "„Неизползван“ не означава „използваем сега“" in prompt
+    assert "само че изтичане е възможно и е нужна проверка" in prompt
+    assert "не обявявай подаръка за изтекъл" in prompt
+    assert "не предлагай прехвърляне, ръчно изключение или ескалация" in prompt
+    assert prompt.index(
+        "точната дата на покупката или създаването на entitlement"
+    ) < prompt.index(
+        "собственост, профил или прехвърляне"
+    )
+
+
+def test_campaign_gift_validity_is_general_evaluation_material() -> None:
+    principles = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    principle = next(
+        case for case in principles if case["id"] == "campaign_gift_time_validity"
+    )
+    assert principle["source_threads"] == ["generalized_campaign_validity_regression"]
+    assert "received or gifted" in principle["principle"]
+    assert "purchase or entitlement-creation date" in principle["principle"]
+    assert "historical campaign terms" in principle["principle"]
+    assert "separate from main-voucher use" in principle["principle"]
+    assert "Unused is not the same as currently usable" in principle["principle"]
+    assert "expiry is possible" in principle["principle"]
+    assert "never declare expiry as fact" in principle["principle"]
+    assert "before transfer or exception guidance" in principle["principle"]
+
+    scenario = next(
+        case for case in scenarios if case["id"] == "campaign_gift_time_validity"
+    )
+    assert scenario["history"] == [
+        {
+            "role": "user",
+            "content": (
+                "Получих основния ваучер като подарък преди няколко години, "
+                "а в профила виждам неизползван подарък от кампания."
+            ),
+        }
+    ]
+    assert scenario["message"] == (
+        "Щом пише „неизползван“, мога ли да го ползвам сега "
+        "или да го дам на друг човек?"
+    )
+    assert "historical campaign terms" in scenario["focus"]
+    assert "no expiry claim without evidence" in scenario["focus"]
 
 
 def test_external_voucher_boundary_is_a_general_hermes_principle() -> None:
@@ -118,6 +173,95 @@ def test_customer_reply_contact_distinguishes_automated_sender() -> None:
     assert principle["source_threads"] == ["1530546975835947061"]
     assert "use info@skyvision.bg" in principle["principle"]
     assert "not a customer reply channel" in principle["principle"]
+
+
+def test_reservation_voucher_path_ambiguity_is_hermes_principle() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "не е ясно дали има/ползва ваучер" in prompt
+    assert "Моят ваучер/профил" in prompt
+    assert "директен BookNow/карта само без ваучер" in prompt
+    assert "Не твърди задължителни UI стъпки" in prompt
+    assert "tool/public evidence" in prompt
+    assert len(prompt) < 6000
+
+    assert "Reservation path ambiguity is Hermes reasoning context" in architecture
+    assert "not a runtime intent router" in architecture
+    assert "direct BookNow/card payment only when no voucher is being used" in architecture
+    assert "without bounded public facts or tool evidence" in architecture
+
+    principle = next(case for case in cases if case["id"] == "reservation_voucher_path_ambiguity")
+    assert principle["source_threads"] == ["real_customer_discord_reservation_voucher_ambiguity"]
+    assert "do not assume direct BookNow/card payment" in principle["principle"]
+    assert "existing SkyVision voucher" in principle["principle"]
+    assert "product reservation voucher option" in principle["principle"]
+    assert "buying a voucher only" in principle["principle"]
+    assert "unless bounded facts or tools supply them" in principle["principle"]
+
+    scenario = next(case for case in scenarios if case["id"] == "reservation_voucher_path_ambiguity")
+    assert "voucher/payment path is unknown" in scenario["focus"]
+    assert "do not assume direct BookNow/card payment" in scenario["focus"]
+
+
+def test_confirmed_reservation_self_cancellation_is_general_principle() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    support = public_tools.handle_skyai_support_knowledge(include_contacts=True)
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "потвърдена/предстояща резервация" in prompt
+    assert "профил -> Резервации" in prompt
+    assert "Анулиране на резервацията" in prompt
+    assert "не казвай, че екипът трябва да я анулира" in prompt
+    assert "не измисляй универсален срок" in prompt
+    assert "точната услуга вече е ясна" in prompt
+    assert "skyai_product_detail" in prompt
+    assert "структурния cancellationPolicy" in prompt
+    assert "описателен текст" in prompt
+    assert "след успешно анулиране" in prompt
+    assert prompt.index("Анулиране на резервацията") < prompt.index("след успешно анулиране")
+    assert "info@skyvision.bg" in prompt
+
+    reservation_support = support["reservation_support"]
+    assert reservation_support["customer_profile_section"] == "Профил -> Резервации"
+    assert reservation_support["self_service_cancel_action"] == "Анулиране на резервацията"
+    assert reservation_support["public_terms_sections"] == ["1.2", "4.1", "17.2", "17.4", "17.5"]
+    assert reservation_support["provider_defined_change_conditions"] is True
+    assert reservation_support["platform_enforces_cancel_cutoff"] is True
+    assert reservation_support["global_cancel_hours"] is None
+    assert reservation_support["self_service_cancel_after_cutoff_available"] is False
+    assert "reservation/cancel/" in reservation_support["customer_cancel_endpoint_pattern"]
+    assert "direct_email" not in reservation_support
+
+    principle = next(case for case in cases if case["id"] == "confirmed_reservation_self_cancellation")
+    assert principle["source_threads"] == ["sanitized_qa_1533000762970341406"]
+    assert "self-service path first" in principle["principle"]
+    assert "Do not invent a universal cancellation window" in principle["principle"]
+    assert "only then suggest contacting" in principle["principle"]
+    assert "After successful cancellation and voucher release" in principle["principle"]
+
+    scenario_ids = {case["id"] for case in scenarios}
+    assert {
+        "confirmed_reservation_wants_another_experience",
+        "reservation_cancel_cutoff_unknown",
+        "reservation_cancel_unavailable_or_deadline_passed",
+        "reservation_already_cancelled_voucher_exchange",
+        "reservation_self_cancel_reject_team_only",
+        "reservation_identified_service_eight_hour_policy",
+        "reservation_identified_service_no_free_cancellation",
+        "reservation_detail_fetch_policy_unknown",
+        "reservation_prior_turn_service_no_redundant_clarification",
+        "reservation_ambiguous_service_clarification",
+        "reservation_reject_stale_prose_and_universal_hours",
+    } <= scenario_ids
+    assert "Confirmed reservation self-cancellation is Hermes reasoning context" in architecture
+    assert "not a runtime intent router" in architecture
+    assert "provider-defined conditions" in architecture
+    assert "no universal cancellation window" in architecture
 
 
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
@@ -213,3 +357,56 @@ def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
     }
     assert all("principle" in case for case in cases)
     assert all("scoring" in case for case in cases)
+
+
+def test_service_cancellation_policy_uses_hybrid_catalog_detail_facts() -> None:
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "hybrid catalog search plus bounded product detail refresh" in architecture
+    assert "structured `cancellationPolicy`" in architecture
+    assert "not free-form product description prose" in architecture
+    assert "no N+1 detail fetch" in architecture
+
+    principle = next(case for case in cases if case["id"] == "service_specific_cancellation_policy")
+    assert "current public product detail" in principle["principle"]
+    assert "ask one concise service clarification" in principle["principle"]
+    assert "not infer from prose" in principle["principle"]
+    assert "no universal cancellation window" in principle["principle"]
+
+    scenario_by_id = {case["id"]: case for case in scenarios}
+    assert "8-hour structured cancellationPolicy" in scenario_by_id["reservation_identified_service_eight_hour_policy"]["focus"]
+    assert "no redundant service clarification" in scenario_by_id["reservation_prior_turn_service_no_redundant_clarification"]["focus"]
+    assert "one concise service clarification" in scenario_by_id["reservation_ambiguous_service_clarification"]["focus"]
+
+
+def test_skyai_architecture_guardrails_absent_in_customer_plugin() -> None:
+    combined = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "plugins/skyai_customer/public_tools.py",
+            "plugins/skyai_customer/dev_gateway.py",
+        )
+    )
+    forbidden_runtime_markers = (
+        "IntentClassifier",
+        "intent_classifier",
+        "keyword_classifier",
+        "mandatory_question_router",
+        "answer_template_selector",
+        "template_selector",
+        "answer_replacing_post_processing",
+        "response_replacing_post_processing",
+        "universal_cancellation_hours",
+    )
+    for marker in forbidden_runtime_markers:
+        assert marker not in combined
+
+    product = public_tools.handle_skyai_product_detail(product_path="")
+    payload_keys = _payload_keys(product)
+    assert "guidance" not in payload_keys
+    assert "answer_guidance" not in payload_keys
+    assert "when_to_use" not in payload_keys
+    assert "suggested_question" not in payload_keys
+    assert "recommended_response" not in payload_keys

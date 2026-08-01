@@ -53,11 +53,51 @@ issuer boundary when another issuer is explicit. This must remain a prompt,
 public-facts, and evaluation principle; do not implement issuer detection as a
 keyword classifier or guard.
 
+Campaign-gift time and validity are also reasoning context, not a status
+shortcut. The date the main voucher was gifted or received is distinct from the
+purchase or campaign-entitlement creation date and must not be inferred from
+it. A campaign gift may have validity under the historical terms that applied
+when its entitlement was created, separate from use of the main voucher. Hermes
+must establish that date, the applicable terms, exact validity, use state, and
+current usability before ownership, profile, transfer, manual-exception, or
+escalation guidance.
+`Unused` does not mean `currently usable`. Without enough evidence, Hermes may
+say only that expiry is possible and a lookup is needed; it must not declare
+expiry or promise an exception. This is a prompt-and-evaluation principle, not
+a runtime status classifier, phrase matcher, or answer guard.
+
 Public contact evidence must distinguish a customer reply channel from an
 automated sender address. `info@skyvision.bg` is the written customer contact.
 `reservations@skyvision.bg` is an automated reservation-notification address,
 not a customer reply channel, even though it is monitored. This is canonical
 contact knowledge, not a response template.
+
+Reservation path ambiguity is Hermes reasoning context, not a runtime intent
+router. When a customer clearly wants to reserve but SkyAI does not yet know
+whether they have or plan to use a voucher, Hermes should clarify briefly or
+explain both valid branches: existing SkyVision voucher through the customer
+account/My Voucher flow and the product reservation voucher option; direct
+BookNow/card payment only when no voucher is being used. It must not invent
+mandatory participant-selection UI, instructor lead times, realtime slots, or
+other booking steps without bounded public facts or tool evidence.
+
+Confirmed reservation self-cancellation is Hermes reasoning context, not a
+runtime intent router. When a customer wants to cancel or change an already
+confirmed/upcoming reservation, Hermes should first explain the customer profile
+self-service path when the platform offers `Анулиране на резервацията` under
+`Резервации`. Reservation change and cancellation eligibility remain
+provider-defined conditions: cutoff before the slot, fees, and even absence of
+customer cancellation can vary by service/provider, and the platform enforces
+those conditions. There is no universal cancellation window to invent. If the
+action is absent, rejected, or the provider-defined deadline has passed, Hermes
+may then suggest assistance or exception review without promising cancellation.
+Cancellation stays separate from later voucher exchange: only after successful
+cancellation and voucher release should Hermes continue to the verified voucher
+management/service exchange path. This is a prompt, public-facts, and evaluation
+principle; do not implement it as keyword matching, a classifier, template
+selection, router branch, or answer-replacing post-processing.
+
+Service-specific cancellation policy uses a hybrid catalog search plus bounded product detail refresh, not a broad detail crawl. When Hermes already knows the service from current or prior conversation context, it should use the matching catalog item and canonical slug/path to call the existing sanitized public product detail tool. The current structured `cancellationPolicy` field from that detail response is the authoritative public cancellation fact, because it tracks operational product metadata such as provider cutoff hours, not free-form product description prose; prose can be stale and must not override it. If the structured field is missing or the detail lookup fails, Hermes should say the exact policy could not be verified instead of inferring a number. If the service is not identifiable and the answer depends on it, Hermes may ask one concise service clarification. This flow intentionally performs no N+1 detail fetch across the full catalog.
 
 ## What The Backend May Do
 
