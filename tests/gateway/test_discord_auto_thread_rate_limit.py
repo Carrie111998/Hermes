@@ -9,9 +9,10 @@ so the user's message was dropped with a generic "please retry" notice.
 The fix:
   1. Honors ``retry_after`` within ``_AUTO_THREAD_MAX_RATE_LIMIT_WAIT_SECONDS``
      by waiting out the bucket before retrying the direct path.
-  2. Gives up immediately for longer rate limits and records the delay on
-     ``_last_auto_thread_rate_limit`` so the caller surfaces a
-     rate-limit-aware notice ("retry in ~Ns") instead of the generic one.
+  2. Gives up immediately for longer rate limits and returns a per-call
+     ``_AutoThreadRateLimited`` sentinel carrying the delay, so the caller
+     surfaces a rate-limit-aware notice ("retry in ~Ns") instead of the
+     generic one — without any shared adapter state.
 """
 
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import (  # noqa: E402
     DiscordAdapter,
     _AUTO_THREAD_MAX_RATE_LIMIT_WAIT_SECONDS,
+    _AutoThreadRateLimited,
 )
 
 
@@ -165,7 +167,7 @@ async def test_direct_connect_error_uses_seed_fallback(adapter, monkeypatch):
     assert result is fake_thread
     assert sleeps == [], "fallback succeeded on the first attempt — no backoff needed"
     channel.send.assert_awaited_once()
-    assert adapter._last_auto_thread_rate_limit is None
+    assert not isinstance(result, _AutoThreadRateLimited)
 
 
 @pytest.mark.asyncio
@@ -189,10 +191,10 @@ async def test_two_short_rate_limits_give_up_skipping_fallback(adapter, monkeypa
 
     result = await adapter._auto_create_thread(message)
 
-    assert result is None
+    assert isinstance(result, _AutoThreadRateLimited)
+    assert result.retry_after == 2.0
     assert sleeps == [2.0], "attempt 0 waits out the short limit; attempt 1 gives up"
     channel.send.assert_not_awaited(), "seed fallback must not spam a 429'd channel"
-    assert adapter._last_auto_thread_rate_limit == 2.0
 
 
 # ── direct: long rate limit gives up fast with recorded retry_after ──
@@ -220,8 +222,8 @@ async def test_long_rate_limit_gives_up_and_records_retry_after(adapter, monkeyp
 
     result = await adapter._auto_create_thread(message)
 
-    assert result is None
-    assert adapter._last_auto_thread_rate_limit == long_wait
+    assert isinstance(result, _AutoThreadRateLimited)
+    assert result.retry_after == long_wait
     assert sleeps == [], "long rate limit must not block the handler"
     channel.send.assert_not_awaited(), "fallback would also 429 — skip it"
 
@@ -292,3 +294,56 @@ async def test_non_rate_limit_failure_keeps_generic_notice(adapter, monkeypatch)
     assert "could not create" in sent_text.lower()
     assert "thread" in sent_text.lower()
     assert "rate-limiting" not in sent_text.lower()
+
+
+# ── interleaving regression: per-message notice isolation (#review) ────
+
+
+@pytest.mark.asyncio
+async def test_interleaved_rate_limit_failures_get_own_notices(adapter, monkeypatch):
+    """Concurrent auto-thread failures each surface their own retry hint.
+
+    Regression for shared-state hazard: retry-after metadata travels in the
+    per-call ``_AutoThreadRateLimited`` return value, never on adapter state,
+    so two messages racing through ``_auto_create_thread`` (which awaits
+    during retry sleeps) cannot overwrite each other's rate-limit notice.
+    """
+    import asyncio
+
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    sleeps = []
+    _patch_sleep(monkeypatch, sleeps)
+
+    channel_a = FakeTextChannel(channel_id=810)
+    channel_b = FakeTextChannel(channel_id=811)
+    msg_a = make_message(channel=channel_a, content="hello a")
+    msg_b = make_message(channel=channel_b, content="hello b")
+
+    async def rate_limited_a(**kwargs):
+        raise _RateLimited(45.0)
+
+    async def rate_limited_b(**kwargs):
+        raise _RateLimited(90.0)
+
+    msg_a.create_thread = rate_limited_a
+    msg_b.create_thread = rate_limited_b
+
+    await asyncio.gather(
+        adapter._handle_message(msg_a),
+        adapter._handle_message(msg_b),
+    )
+
+    # Each message got its OWN rate-limit notice with its own retry_after —
+    # 45s for channel A, 90s for channel B. If the metadata lived on shared
+    # adapter state, both could show the same (last-written) value.
+    adapter.handle_message.assert_not_awaited()
+    text_a = channel_a.send.await_args.args[0]
+    text_b = channel_b.send.await_args.args[0]
+    assert "45" in text_a and "rate-limiting" in text_a.lower()
+    assert "90" in text_b and "rate-limiting" in text_b.lower()
+    assert "45" not in text_b, "channel B must not inherit channel A's retry_after"
+    assert "90" not in text_a, "channel A must not inherit channel B's retry_after"

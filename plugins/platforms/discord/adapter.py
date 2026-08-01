@@ -62,6 +62,24 @@ _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # rate limit will not clear for minutes, so we surface a retry hint to the
 # user instead of blocking the message handler on a doomed wait.
 _AUTO_THREAD_MAX_RATE_LIMIT_WAIT_SECONDS = 30.0
+
+
+class _AutoThreadRateLimited:
+    """Sentinel returned by ``_auto_create_thread`` on a 429 that exceeds the
+    wait bound.
+
+    Carries the server-requested ``retry_after`` so the caller can surface a
+    rate-limit-aware notice without any shared adapter state. Deliberately
+    truthy-but-distinct: the caller must check ``isinstance`` before the
+    generic ``if result:`` success test, and must NOT mutate adapter state
+    (``_auto_create_thread`` yields during retry waits, so another message
+    could observe stale state mid-flight).
+    """
+
+    __slots__ = ("retry_after",)
+
+    def __init__(self, retry_after: float) -> None:
+        self.retry_after = float(retry_after)
 # Discord enforces a hard cap of 100 global application (slash) commands per
 # app. Registering more makes the ENTIRE sync fail with error 30032
 # ("Maximum number of application commands reached"), which silently breaks
@@ -6575,9 +6593,9 @@ class DiscordAdapter(BasePlatformAdapter):
         backoff can never clear the bucket — retrying on it just re-429s.
         We wait out ``retry_after`` when it is within
         ``_AUTO_THREAD_MAX_RATE_LIMIT_WAIT_SECONDS``, and give up
-        immediately (recording the delay on ``self._last_auto_thread_rate_limit``)
-        when it is longer so the caller can surface a rate-limit-aware
-        notice instead of a generic "please retry".
+        immediately (returning :class:`_AutoThreadRateLimited` carrying the
+        delay) when it is longer so the caller can surface a
+        rate-limit-aware notice instead of a generic "please retry".
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
@@ -6585,9 +6603,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         last_direct_error: Exception | None = None
         last_fallback_error: Exception | None = None
-        # Reset per-call rate-limit state; set on failure so the caller can
-        # tailor the user-facing notice (#...).
-        self._last_auto_thread_rate_limit = None
+        # Rate-limit outcome travels in the return value, NOT adapter state:
+        # this method awaits (retry sleeps) and another message's
+        # _auto_create_thread could interleave, so a shared attribute would
+        # race. The caller consumes the per-call sentinel locally.
 
         for attempt in range(2):
             try:
@@ -6601,8 +6620,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 last_direct_error = direct_error
                 if self._is_discord_rate_limit(direct_error):
                     retry_after = self._extract_discord_retry_after(direct_error)
-                    if retry_after is not None:
-                        self._last_auto_thread_rate_limit = retry_after
                     if (
                         retry_after is not None
                         and retry_after <= _AUTO_THREAD_MAX_RATE_LIMIT_WAIT_SECONDS
@@ -6619,14 +6636,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         await asyncio.sleep(retry_after)
                         continue
                     # Long rate limit (or second attempt) — do not block for
-                    # minutes; the caller turns the recorded retry_after into
-                    # a "try again in ~Ns" notice.
+                    # minutes; hand the retry_after back to the caller so it
+                    # can say "try again in ~Ns".
                     logger.warning(
                         "[%s] Auto-thread creation rate-limited (retry_after=%s); giving up",
                         self.name,
                         retry_after,
                     )
-                    break
+                    return _AutoThreadRateLimited(retry_after or 0.0)
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
@@ -6645,14 +6662,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     last_fallback_error = fallback_error
                     if self._is_discord_rate_limit(fallback_error):
                         retry_after = self._extract_discord_retry_after(fallback_error)
-                        if retry_after is not None:
-                            self._last_auto_thread_rate_limit = retry_after
                         logger.warning(
                             "[%s] Auto-thread creation fallback rate-limited (retry_after=%s); giving up",
                             self.name,
                             retry_after,
                         )
-                        break
+                        return _AutoThreadRateLimited(retry_after or 0.0)
                     if attempt == 0:
                         # Brief backoff before the second attempt — most failures
                         # in this path are transient connect errors that recover
@@ -7564,6 +7579,25 @@ class DiscordAdapter(BasePlatformAdapter):
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
+                if isinstance(thread, _AutoThreadRateLimited):
+                    # Discord 429 beyond the wait bound: the caller hands back
+                    # the server-requested retry_after so we can tell the user
+                    # WHEN to retry. The sentinel is per-call — never read
+                    # adapter state here (it would race across messages).
+                    try:
+                        await message.channel.send(
+                            f"⚠️ Discord is rate-limiting requests "
+                            f"(retry in ~{thread.retry_after:.0f}s). "
+                            "Your message was not processed — "
+                            "please try again shortly."
+                        )
+                    except Exception as notify_error:
+                        logger.warning(
+                            "[%s] Failed to notify user of auto-thread failure: %s",
+                            self.name,
+                            notify_error,
+                        )
+                    return False
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
@@ -7589,21 +7623,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     # user can retry once Discord recovers, and skip agent
                     # invocation for this message.
                     try:
-                        rate_limit_after = getattr(
-                            self, "_last_auto_thread_rate_limit", None
+                        await message.channel.send(
+                            "⚠️ Hermes could not create a Discord thread for "
+                            "this message, so the request was not processed. Please retry."
                         )
-                        if rate_limit_after is not None:
-                            await message.channel.send(
-                                f"⚠️ Discord is rate-limiting requests "
-                                f"(retry in ~{rate_limit_after:.0f}s). "
-                                "Your message was not processed — "
-                                "please try again shortly."
-                            )
-                        else:
-                            await message.channel.send(
-                                "⚠️ Hermes could not create a Discord thread for "
-                                "this message, so the request was not processed. Please retry."
-                            )
                     except Exception as notify_error:
                         logger.warning(
                             "[%s] Failed to notify user of auto-thread failure: %s",
