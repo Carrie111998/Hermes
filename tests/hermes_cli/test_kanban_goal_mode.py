@@ -111,9 +111,18 @@ def _patch_judge(monkeypatch, verdicts):
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
 
 
-def test_loop_stops_when_worker_already_completed(monkeypatch):
-    # Worker called kanban_complete on its first turn — no judging needed.
-    _patch_judge(monkeypatch, ["continue"])  # should never be consulted
+def test_loop_judges_worker_completion_and_accepts_it(monkeypatch):
+    # Worker called kanban_complete on its first turn. The judge is STILL
+    # consulted once (that self-completion is exactly what it exists to
+    # check); a "done" verdict accepts it and no extra turn is run.
+    #
+    # This test previously asserted the opposite ("no judging needed") and
+    # encoded the reachability bug: because the loop only starts after the
+    # worker's first turn, and workers are told to terminate their own task
+    # in that turn, an unconditional terminal-status exit meant the judge
+    # was never reached — 97 goal cards in the field produced 0 loop
+    # iterations. See tests/hermes_cli/test_kanban_goal_reachability.py.
+    _patch_judge(monkeypatch, ["done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(
@@ -125,7 +134,7 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
         first_response="done already",
     )
     assert res["outcome"] == "completed_by_worker"
-    assert turns == []  # no extra turns
+    assert turns == []  # accepted completion runs no further turns
 
 
 

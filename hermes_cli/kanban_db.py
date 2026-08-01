@@ -5804,6 +5804,120 @@ def promote_task(
     return True, None
 
 
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    claim_lock: Optional[str] = None,
+    worker_pid: Optional[int] = None,
+    claim_ttl_seconds: Optional[int] = None,
+) -> Optional[int]:
+    """Return a self-terminated ``done``/``blocked`` task to ``running``.
+
+    Used by the goal loop when the auxiliary judge rejects a worker's own
+    ``kanban_complete`` / ``kanban_block``: the worker process is still
+    alive and about to be handed a continuation prompt, so the card goes
+    back to ``running`` rather than ``ready`` (a ``ready`` card would be
+    picked up by the dispatcher and spawn a SECOND worker on the same task).
+
+    OPENS A NEW RUN and returns its id. The previous run was closed by
+    ``complete_task`` / ``block_task`` (via ``_end_run``, which also clears
+    ``tasks.current_run_id``), and reviving that terminal row would corrupt
+    attempt history. But a reopened task with no ``current_run_id`` cannot
+    terminally finish either: the worker's ``kanban_complete`` passes its
+    pinned ``HERMES_KANBAN_RUN_ID`` and ``complete_task`` matches it against
+    ``current_run_id``, so a stale or absent pointer makes the guarded path
+    fail. Callers MUST rebind the worker's run id to the returned value
+    (the CLI goal loop re-exports ``HERMES_KANBAN_RUN_ID``), otherwise the
+    continuation can never complete or block.
+
+    RE-ESTABLISHES THE CLAIM. ``complete_task`` / ``block_task`` clear
+    ``claim_lock``, ``claim_expires`` and ``worker_pid``. Both watchdogs are
+    scoped to those columns — ``reap_crashed_workers`` selects
+    ``status='running' AND worker_pid IS NOT NULL``, and
+    ``release_stale_claims`` selects ``status='running' AND claim_expires IS
+    NOT NULL``. A reopen that left them NULL would produce a card that is
+    ``running`` yet invisible to every watchdog: if the worker then died,
+    the task would hang in ``running`` forever with no recovery path. So
+    callers pass the live worker's own claim identity and it is restored —
+    the same lock must be used for later ``heartbeat_claim`` calls, which
+    match on ``claim_lock``.
+
+    ``block_recurrences`` is left alone for the same reason ``unblock_task``
+    leaves it: the counter is loop protection.
+
+    Returns the new run id, or ``None`` if the task was not in a terminal
+    state (nothing reopened).
+    """
+    now = int(time.time())
+    lock = claim_lock or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(claim_ttl_seconds)
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status       = 'running',
+                   completed_at = NULL,
+                   block_kind   = NULL,
+                   claim_lock   = ?,
+                   worker_pid   = COALESCE(?, worker_pid),
+                   claim_expires= ?
+             WHERE id = ?
+               AND status IN ('done', 'blocked')
+            """,
+            (lock, worker_pid, expires, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        trow = conn.execute(
+            "SELECT assignee, current_step_key, max_runtime_seconds "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, max_runtime_seconds,
+                worker_pid, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["assignee"] if trow else None,
+                trow["current_step_key"] if trow else None,
+                lock,
+                expires,
+                trow["max_runtime_seconds"] if trow else None,
+                worker_pid,
+                now,
+            ),
+        )
+        new_run_id = run_cur.lastrowid
+        if new_run_id is None:
+            raise RuntimeError(f"reopen_task: task_runs insert returned no rowid for {task_id}")
+        run_id = int(new_run_id)
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (run_id, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, 'status', ?, ?)",
+            (
+                task_id,
+                run_id,
+                json.dumps({
+                    "status": "running", "reopened": True,
+                    "reason": reason, "run_id": run_id,
+                }),
+                now,
+            ),
+        )
+    return run_id
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 

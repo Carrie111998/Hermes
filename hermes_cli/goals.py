@@ -1669,6 +1669,8 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    block_kind_fn=None,
+    reopen_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1677,21 +1679,40 @@ def run_kanban_goal_loop(
     first turn has already run by the time this is called; ``first_response``
     is that turn's reply. From here we:
 
-    1. Check whether the worker already terminated the task (called
-       ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
-    2. Otherwise judge the latest response against ``goal_text`` (the card's
-       title + body). ``continue`` → feed a continuation prompt and run
-       another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
-       task is still open → one explicit "call kanban_complete" nudge.
-    3. When the turn budget is exhausted and the worker still hasn't
+    1. Judge the latest response against ``goal_text`` (the card's title +
+       body). This happens EVEN IF the worker already terminated the task —
+       see the self-termination note below. ``continue`` → feed a
+       continuation prompt and run another turn IN THE SAME SESSION via
+       ``run_turn``. ``done`` but the task is still open → one explicit
+       "call kanban_complete" nudge.
+    2. When the turn budget is exhausted and the worker still hasn't
        terminated the task, ``block_fn`` is invoked so the card lands in a
        sticky ``blocked`` state for human review (NOT a silent exit).
+
+    Self-termination does not bypass the judge. The loop only starts after
+    the worker's first turn, and workers are instructed to call
+    ``kanban_complete`` / ``kanban_block`` within that turn — so an
+    unconditional "already terminal → stop" check meant the judge was never
+    reached at all (observed in the field: 97 goal cards, 0 loop
+    iterations, 92 of them with a run ending completed/blocked). A terminal
+    status is therefore judged ONCE; a ``done`` verdict accepts it, and a
+    ``continue`` verdict calls ``reopen_fn`` and keeps working.
+
+    Human and dependency gates are exempt. When ``block_kind_fn`` reports a
+    block that is waiting on something outside the worker (``needs_input``
+    — a person; ``dependency`` — another task), the worker is correct to
+    stop and the judge is not consulted: re-prompting would burn the turn
+    budget arguing with a wall, and reopening would strip the gate. These
+    are exactly the kinds ``kanban_block`` permits for a goal_mode card
+    (``_GOAL_MODE_BLOCK_ALLOWED_KINDS`` in tools/kanban_tools.py); any other
+    block kind is the worker letting itself out early, and is judged.
 
     This function performs NO SessionDB persistence — a worker process is
     ephemeral, so the turn budget lives in a local counter. It is fully
     decoupled from the CLI for testability: callers inject ``run_turn``
-    (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    (str -> str), ``task_status_fn`` (() -> str|None), ``block_fn``
+    (reason: str -> None), and optionally ``block_kind_fn`` (() -> str|None)
+    and ``reopen_fn`` (reason: str -> None).
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
@@ -1705,6 +1726,23 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
+    # Block kinds that represent a genuine wait on something outside the
+    # worker. Mirrors _GOAL_MODE_BLOCK_ALLOWED_KINDS in tools/kanban_tools.py
+    # — the only kinds a goal_mode worker is permitted to block with. Any
+    # other kind means the worker let itself out early, so the judge runs.
+    _GATED_BLOCK_KINDS = frozenset({"needs_input", "dependency"})
+
+    def _block_kind() -> Optional[str]:
+        if block_kind_fn is None:
+            return None
+        try:
+            return block_kind_fn()
+        except Exception as exc:
+            _log(f"kanban goal loop: block_kind check failed ({exc}); treating as external gate")
+            # Fail SAFE: an unknown block kind is treated as a real gate so
+            # the loop never re-prompts a worker that is genuinely waiting.
+            return "needs_input"
+
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
@@ -1713,6 +1751,9 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # A self-terminated task is judged once; if the judge accepts it we stop
+    # rather than looping over a task nobody is working on any more.
+    judged_terminal = False
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -1722,25 +1763,71 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: status check failed ({exc}); stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": "status check failed"}
 
-        if status == "done":
-            _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
-            return {"outcome": "completed_by_worker", "turns_used": turns_used, "reason": "worker completed the task"}
+        terminal_status = status in ("done", "blocked")
+
         if status == "blocked":
-            _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
-            return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
-        if status not in ("running", "ready"):
+            # A worker waiting on something it cannot resolve (a person, or
+            # another task) is right to stop. Judging it would only produce a
+            # continuation prompt aimed at a wall, and reopening would
+            # silently strip the gate.
+            kind = _block_kind()
+            if kind in _GATED_BLOCK_KINDS:
+                _log(
+                    f"kanban goal loop: task {task_id} blocked on {kind} after "
+                    f"{turns_used} turn(s); not judging"
+                )
+                return {
+                    "outcome": "blocked_by_worker",
+                    "turns_used": turns_used,
+                    "reason": f"worker blocked on {kind}",
+                }
+
+        if terminal_status and judged_terminal:
+            # Already judged this terminal state once and accepted it.
+            outcome = "completed_by_worker" if status == "done" else "blocked_by_worker"
+            _log(f"kanban goal loop: task {task_id} {status} after {turns_used} turn(s)")
+            return {"outcome": outcome, "turns_used": turns_used, "reason": f"worker {status} the task"}
+
+        if not terminal_status and status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
-        # Still open — judge whether the latest response satisfies the card.
-        # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
-        # verdict is treated as CONTINUE here.
+        # Judge the latest response against the card. A terminal status does
+        # NOT skip this — the worker self-terminating in its first turn is
+        # exactly the case the judge exists to check.
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        if terminal_status:
+            judged_terminal = True
+            if verdict == "done":
+                outcome = "completed_by_worker" if status == "done" else "blocked_by_worker"
+                _log(f"kanban goal loop: task {task_id} {status}; judge accepted after {turns_used} turn(s)")
+                return {"outcome": outcome, "turns_used": turns_used, "reason": f"judge accepted worker {status}"}
+            # Judge disagrees with the worker's own termination — reopen and
+            # keep working. Without a reopen hook we can only stop, but say so
+            # loudly rather than reporting a clean finish.
+            if reopen_fn is None:
+                _log(
+                    f"kanban goal loop: task {task_id} {status} but judge said continue "
+                    f"({_truncate(reason, 120)}); no reopen hook, stopping"
+                )
+                return {
+                    "outcome": "stopped",
+                    "turns_used": turns_used,
+                    "reason": f"judge rejected worker {status}, no reopen hook",
+                }
+            try:
+                reopen_fn(
+                    f"Goal-mode judge rejected the worker's own {status}: {_truncate(reason, 300)}"
+                )
+            except Exception as exc:
+                _log(f"kanban goal loop: reopen_fn failed ({exc}); stopping")
+                return {"outcome": "stopped", "turns_used": turns_used, "reason": "reopen failed"}
+            _log(f"kanban goal loop: task {task_id} reopened after judge rejected worker {status}")
 
         if verdict == "done":
             if nudged_to_finalize:
