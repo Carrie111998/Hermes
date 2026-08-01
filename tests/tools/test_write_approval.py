@@ -463,6 +463,236 @@ def test_skill_pending_approval_preserves_success_and_failure(hermes_home):
     assert (skill_dir / "references" / "notes.txt").read_text(encoding="utf-8") == "approved"
 
 
+def _create_stale_test_skill(hermes_home, name, content):
+    skill_dir = os.path.join(hermes_home, "skills", name)
+    os.makedirs(skill_dir, exist_ok=True)
+    skill_path = os.path.join(skill_dir, "SKILL.md")
+    with open(skill_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return skill_path
+
+
+def test_stale_skill_patch_is_visible_before_approval(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "stale-visibility-skill"
+    old_string = "## Never Do\n- keep this rule"
+    original = (
+        "---\nname: stale-visibility-skill\ndescription: A test skill\n---\n"
+        f"{old_string}\n"
+    )
+    skill_path = _create_stale_test_skill(hermes_home, name, original)
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "old_string": old_string,
+            "new_string": "## Never Do\n- changed rule",
+        },
+        summary="stale patch",
+        origin="foreground",
+    )
+    with open(skill_path, "w", encoding="utf-8") as f:
+        f.write(original.replace(old_string, "## Changed Section\n- changed elsewhere"))
+
+    out = handle_pending_subcommand(wa.SKILLS, ["pending"])
+
+    assert record["id"] in out
+    assert "[stale]" in out
+    assert "target changed" in out.lower()
+    assert wa.get_pending(wa.SKILLS, record["id"])["stale"] is True
+    diff = handle_pending_subcommand(wa.SKILLS, ["diff", record["id"]])
+    assert f"# Pending skill write {record['id']}:" in diff
+    assert "[stale]" in diff
+    assert "target changed" in diff.lower()
+
+
+def test_stale_skill_patch_approval_is_blocked_and_retained(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "stale-approval-skill"
+    old_string = "## Never Do\n- keep this rule"
+    original = (
+        "---\nname: stale-approval-skill\ndescription: A test skill\n---\n"
+        f"{old_string}\n"
+    )
+    skill_path = _create_stale_test_skill(hermes_home, name, original)
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "old_string": old_string,
+            "new_string": "## Never Do\n- changed rule",
+        },
+        summary="stale approval",
+        origin="foreground",
+    )
+    changed = original.replace(old_string, "## Changed Section\n- changed elsewhere")
+    with open(skill_path, "w", encoding="utf-8") as f:
+        f.write(changed)
+
+    out = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert "Approved 0 skills write(s)." in out
+    assert "Failed:" in out
+    assert record["id"] in out
+    assert "target changed" in out.lower()
+    with open(skill_path, "r", encoding="utf-8") as f:
+        assert f.read() == changed
+    pending = wa.get_pending(wa.SKILLS, record["id"])
+    assert pending is not None
+    assert pending["stale"] is True
+    assert "[stale]" in handle_pending_subcommand(wa.SKILLS, ["pending"])
+
+
+def test_approve_all_applies_valid_patch_and_retains_stale_patch(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "mixed-approval-skill"
+    stale_old = "## Never Do\n- stale rule"
+    valid_old = "## Always Do\n- old rule"
+    original = (
+        "---\nname: mixed-approval-skill\ndescription: A test skill\n---\n"
+        f"{stale_old}\n{valid_old}\n"
+    )
+    skill_path = _create_stale_test_skill(hermes_home, name, original)
+    stale = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "old_string": stale_old,
+            "new_string": "## Never Do\n- new stale rule",
+        },
+        summary="stale batch item",
+        origin="foreground",
+    )
+    valid = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "old_string": valid_old,
+            "new_string": "## Always Do\n- new valid rule",
+        },
+        summary="valid batch item",
+        origin="foreground",
+    )
+    changed = original.replace(stale_old, "## Changed Section\n- changed elsewhere")
+    with open(skill_path, "w", encoding="utf-8") as f:
+        f.write(changed)
+
+    out = handle_pending_subcommand(wa.SKILLS, ["approve", "all"])
+
+    assert "Approved 1 skills write(s)." in out
+    assert "Failed:" in out
+    assert stale["id"] in out
+    assert wa.get_pending(wa.SKILLS, stale["id"]) is not None
+    assert wa.get_pending(wa.SKILLS, valid["id"]) is None
+    with open(skill_path, "r", encoding="utf-8") as f:
+        final = f.read()
+    assert "## Changed Section\n- changed elsewhere" in final
+    assert "## Always Do\n- new valid rule" in final
+
+
+def test_fuzzy_applicable_pending_patch_is_not_stale(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "fuzzy-approval-skill"
+    old_string = "## Never Do\n- keep this rule"
+    original = (
+        "---\nname: fuzzy-approval-skill\ndescription: A test skill\n---\n"
+        "## Never  Do\n- keep this rule\n"
+    )
+    assert old_string not in original
+    skill_path = _create_stale_test_skill(hermes_home, name, original)
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "old_string": old_string,
+            "new_string": "## Never Do\n- changed rule",
+        },
+        summary="fuzzy patch",
+        origin="foreground",
+    )
+
+    pending = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    approved = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert "[stale]" not in pending
+    assert "Approved 1 skills write(s)." in approved
+    assert wa.get_pending(wa.SKILLS, record["id"]) is None
+    with open(skill_path, "r", encoding="utf-8") as f:
+        assert "changed rule" in f.read()
+
+
+def test_non_patch_pending_skill_write_bypasses_stale_classification(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "write-file-approval-skill"
+    skill_path = _create_stale_test_skill(
+        hermes_home,
+        name,
+        "---\nname: write-file-approval-skill\ndescription: A test skill\n---\n",
+    )
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "write_file",
+            "name": name,
+            "file_path": "references/notes.txt",
+            "file_content": "approved file",
+        },
+        summary="write_file proposal",
+        origin="foreground",
+    )
+
+    pending = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    approved = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert "[stale]" not in pending
+    assert "Approved 1 skills write(s)." in approved
+    assert wa.get_pending(wa.SKILLS, record["id"]) is None
+    with open(os.path.join(os.path.dirname(skill_path), "references", "notes.txt"), "r", encoding="utf-8") as f:
+        assert f.read() == "approved file"
+
+
+def test_unresolved_pending_patch_is_not_mislabeled_stale(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    name = "missing-stale-skill"
+    record = wa.stage_write(
+        wa.SKILLS,
+        {
+            "action": "patch",
+            "name": name,
+            "old_string": "## Never Do\n- missing rule",
+            "new_string": "## Never Do\n- changed rule",
+        },
+        summary="missing skill patch",
+        origin="foreground",
+    )
+
+    pending = handle_pending_subcommand(wa.SKILLS, ["pending"])
+    approved = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert "[stale]" not in pending
+    assert "missing-stale-skill" in approved
+    assert "not found" in approved.lower()
+    assert "target changed" not in approved.lower()
+    assert wa.get_pending(wa.SKILLS, record["id"]) is not None
+
+
 def test_skill_pending_lifecycle_leaves_memory_unchanged(hermes_home):
     from tools import write_approval as wa
 

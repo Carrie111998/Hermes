@@ -302,6 +302,29 @@ def pending_snapshot(subsystem: str) -> Dict[str, Any]:
     return _basic_pending_snapshot(subsystem)
 
 
+def _annotate_pending_record(record: Dict[str, Any], subsystem: str) -> Dict[str, Any]:
+    """Add dynamic stale metadata to a resolved pending skill patch."""
+    if subsystem != SKILLS:
+        return record
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("action") != "patch":
+        return record
+    try:
+        from tools.skill_manager_tool import inspect_skill_patch_pending
+
+        inspection = inspect_skill_patch_pending(payload)
+        if inspection.get("state") != "stale":
+            return record
+        annotated = dict(record)
+        annotated["stale"] = True
+        annotated["stale_reason"] = inspection.get(
+            "reason", "The target changed; review this pending proposal."
+        )
+        return annotated
+    except Exception:
+        return record
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any],
                 *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
@@ -351,7 +374,10 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
     if subsystem == SKILLS:
-        return pending_snapshot(SKILLS)["records"]
+        return [
+            _annotate_pending_record(record, subsystem)
+            for record in pending_snapshot(SKILLS)["records"]
+        ]
     return _basic_pending_snapshot(subsystem)["records"]
 
 
@@ -361,7 +387,7 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
         snapshot = pending_snapshot(SKILLS)
         for entry in snapshot["entries"]:
             if entry["pending_id"] == pending_id:
-                return entry["record"]
+                return _annotate_pending_record(entry["record"], subsystem)
         return None
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     if not path.exists():

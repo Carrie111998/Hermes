@@ -34,6 +34,8 @@ def _fmt_pending_list(subsystem: str, snapshot=None) -> str:
     if snapshot is None:
         snapshot = wa.pending_snapshot(subsystem)
     records = snapshot["records"]
+    if subsystem == wa.SKILLS:
+        records = [wa._annotate_pending_record(record, subsystem) for record in records]
     cleanup = _fmt_cleanup_notice(subsystem, snapshot)
     if not records:
         out = f"No pending {subsystem} writes."
@@ -44,7 +46,11 @@ def _fmt_pending_list(subsystem: str, snapshot=None) -> str:
     for r in records:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
-        lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
+        stale = ""
+        if r.get("stale"):
+            reason = r.get("stale_reason", "The target changed; review this pending proposal.")
+            stale = f" [stale] {reason}"
+        lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}{stale}")
     where = "/{s} approve <id>".format(s=subsystem)
     lines.append("")
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
@@ -200,7 +206,11 @@ def _diff(rest: List[str]) -> str:
     if not rec:
         return f"No pending skill write with id '{rest[0]}'."
     diff = wa.skill_pending_diff(rec)
-    header = f"# Pending skill write {rec['id']}: {rec.get('summary', '')}\n"
+    stale = ""
+    if rec.get("stale"):
+        reason = rec.get("stale_reason", "The target changed; review this pending proposal.")
+        stale = f" [stale] {reason}"
+    header = f"# Pending skill write {rec['id']}: {rec.get('summary', '')}{stale}\n"
     return header + "\n" + diff
 
 

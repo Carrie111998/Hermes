@@ -503,6 +503,8 @@ reviewed with the same familiar approve/deny flow as dangerous commands:
 
 The pending-skill queue is store-owned and self-maintaining. Each skill stage, list, lookup, and count pass runs cleanup inside `~/.hermes/pending/skills/`, using the record's persisted `created_at` as the TTL authority. By default, records strictly older than `30` days expire; records exactly `30` days old stay pending, and future timestamps stay pending too. Readable legacy records with missing or invalid `created_at` stay pending unless the queue is over the count cap. The default cap is `100` readable pending skill records, and overflow eviction removes the oldest records first. When cleanup removed anything, `/skills pending` adds a short cleanup notice. Memory writes keep their separate approval flow and are not part of this bounded skill queue.
 
+If a pending patch no longer matches its target, review surfaces mark it `[stale]` with a reason. Approval blocks that proposal without changing the file, and it remains pending so you can inspect the diff, reject it, or replace it with a newly staged proposal. Stale-anchor handling has no cap, TTL, automatic re-anchoring, or automatic discard behavior.
+
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or
 in the pending JSON file). Memory writes have the same gate under
