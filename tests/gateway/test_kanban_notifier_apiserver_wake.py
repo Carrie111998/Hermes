@@ -68,6 +68,7 @@ def _make_runner(adapters):
     runner._running = True
     runner.adapters = adapters
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 
@@ -208,5 +209,4 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     assert attempted_sessions == ["origin-session", "origin-session"]
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
-
 
