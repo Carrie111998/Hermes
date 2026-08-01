@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
 
 @pytest.fixture
@@ -91,6 +92,36 @@ def test_explicit_dispatch_composes_board_limit_with_existing_running_tasks(fres
 
         assert [item[0] for item in result.spawned] == [ready]
         assert result.skipped_wip_capped == []
+
+
+def test_review_only_dispatch_respects_board_limit(fresh_home):
+    kb.create_board("review-only", wip_limit=1)
+    with kb.connect(board="review-only") as conn:
+        review_ids = [
+            kb.create_task(conn, title=f"review-{index}", assignee="default")
+            for index in range(2)
+        ]
+        for task_id in review_ids:
+            assert _set_status_direct(conn, task_id, "review")
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'ready'"
+        ).fetchone()[0] == 0
+
+        result = kb.dispatch_once(
+            conn, board="review-only", spawn_fn=_spawn, max_spawn=8
+        )
+
+        spawned_ids = [item[0] for item in result.spawned]
+        assert len(spawned_ids) == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'review'"
+        ).fetchone()[0] == 1
+        assert set(spawned_ids) | set(result.skipped_wip_capped) == set(review_ids)
+        assert len(result.skipped_wip_capped) == 1
 
 
 def test_dispatch_honors_installation_cap_without_max_spawn(fresh_home):

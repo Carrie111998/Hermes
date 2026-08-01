@@ -6749,7 +6749,7 @@ class DispatchResult:
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
     skipped_wip_capped: list[str] = field(default_factory=list)
-    """Ready task ids deferred because the board WIP limit is full."""
+    """Automatic task ids deferred because the board WIP limit is full."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8303,6 +8303,14 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
+    # max_spawn is a total concurrency cap shared by both automatic queues.
+    # Compose the board/installation cap before inspecting either queue so a
+    # review-only tick cannot bypass the effective cap.
+    if effective_max_in_progress is not None and (
+        max_spawn is None or max_spawn > effective_max_in_progress
+    ):
+        max_spawn = effective_max_in_progress
+
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
@@ -8310,18 +8318,13 @@ def _dispatch_once_locked(
     ).fetchall()
     # Honour the installation and board WIP caps: if the board already has
     # enough running tasks, skip spawning this tick so workers can finish.
-    wip_running_count = 0
+    wip_running_count = running_count if board_wip_limit is not None else 0
     if effective_max_in_progress is not None and ready_rows:
         in_progress = running_count
-        wip_running_count = in_progress
         if in_progress >= effective_max_in_progress:
             if board_wip_limit is not None and in_progress >= board_wip_limit:
                 result.skipped_wip_capped.extend(row["id"] for row in ready_rows)
             return result
-        # max_spawn is a total concurrency cap, so keep the existing running
-        # count in the loop's comparison instead of subtracting it twice.
-        if max_spawn is None or max_spawn > effective_max_in_progress:
-            max_spawn = effective_max_in_progress
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -8558,7 +8561,12 @@ def _dispatch_once_locked(
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    for row in review_rows:
+    for row_index, row in enumerate(review_rows):
+        if board_wip_limit is not None and wip_running_count + spawned >= board_wip_limit:
+            result.skipped_wip_capped.extend(
+                remaining_row["id"] for remaining_row in review_rows[row_index:]
+            )
+            break
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:
