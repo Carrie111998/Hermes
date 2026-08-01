@@ -936,3 +936,38 @@ class TestBackgroundReviewReadMarksSurviveToolThreads:
         finally:
             reset_current_write_origin(parent_token)
             _reset_background_review_read_marks()
+
+    def test_read_marks_isolated_between_review_forks(self, tmp_path):
+        """A mark from review A must not authorize a write in review B (#75661)."""
+        import contextvars
+
+        from tools.skill_manager_tool import (
+            _background_review_has_read,
+            _reset_background_review_read_marks,
+            mark_background_review_skill_read,
+        )
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        target = tmp_path / "skill" / "SKILL.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("x", encoding="utf-8")
+
+        parent_token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            _reset_background_review_read_marks()
+            review_a = contextvars.copy_context()
+            _reset_background_review_read_marks()
+            review_b = contextvars.copy_context()
+
+            review_a.run(mark_background_review_skill_read, target)
+            assert review_a.run(_background_review_has_read, target) is True
+            assert review_b.run(_background_review_has_read, target) is False
+            # Parent holds review B's store after the second reset.
+            assert _background_review_has_read(target) is False
+        finally:
+            reset_current_write_origin(parent_token)
+            _reset_background_review_read_marks()
