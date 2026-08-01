@@ -25,6 +25,7 @@ Design:
 
 import json
 import logging
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -491,6 +492,7 @@ class MemoryStore:
 
             idx = matches[0][0]
             limit = self._char_limit(target)
+            old_entry = entries[idx]
 
             # Check that replacement doesn't blow the budget
             test_entries = entries.copy()
@@ -510,6 +512,36 @@ class MemoryStore:
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
                 })
+
+            # Pre-consolidation guard (#76035): refuse content-reducing
+            # replacements when the file is well under capacity.  This prevents
+            # the agent from hallucinating a full memory and destructively
+            # consolidating entries it shouldn't touch.
+            #
+            # Triggered when:
+            #   - new content is <50% of the original entry length, AND
+            #   - the file is under 80% of its char limit.
+            old_len = len(old_entry)
+            new_len = len(new_content)
+            current_total = self._char_count(target)
+            capacity_pct = current_total / limit if limit else 0
+
+            if old_len > 20 and new_len < old_len * 0.5 and capacity_pct < 0.80:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Refusing destructive consolidation: the replacement would drop "
+                        f"an entry from {old_len:,} to {new_len:,} chars ({100 - int(new_len/old_len*100)}% reduction), "
+                        f"but memory is only at {current_total:,}/{limit:,} chars "
+                        f"({capacity_pct:.0%} capacity).  The file is NOT full.\n\n"
+                        f"If you genuinely need to shorten this entry, use 'replace' with "
+                        f"a more targeted edit (keep most of the original text).  "
+                        f"Use 'remove' only to delete an entry entirely."
+                    ),
+                    "current_entries": entries,
+                    "usage": f"{current_total:,}/{limit:,}",
+                    "capacity": f"{capacity_pct:.0%}",
+                }
 
             entries[idx] = new_content
             self._set_entries(target, entries)
@@ -868,8 +900,19 @@ class MemoryStore:
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
         readers always see either the old complete file or the new one.
+
+        Also creates a timestamped backup (.bak-HHMMSS) before overwriting,
+        so destructive consolidations are recoverable (#76035).
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        # Timestamped backup before destructive write (#76035)
+        if path.exists():
+            try:
+                ts = time.strftime("%H%M%S")
+                bak = path.with_suffix(path.suffix + f".bak-{ts}")
+                shutil.copy2(path, bak)
+            except Exception:
+                pass  # best-effort; the main write below is what matters
         try:
             atomic_write_text(path, content, tmp_prefix=".mem_")
         except (OSError, IOError) as e:
