@@ -24,6 +24,25 @@ CBM_BIN="$HOME/.local/bin/codebase-memory-mcp"
 # Path hardcoded in .claude/settings.json (mcpServers) and the cbm-* hooks.
 MAC_BIN_DIR="/Users/danizhaky/.local/bin"
 
+# Expected sha256 of the v0.9.0 release tarballs, pinned HERE rather than read
+# from the release's own checksums.txt.
+#
+# Fetching the checksum from the same release as the artifact proves the
+# download wasn't corrupted in transit; it proves nothing about the publisher.
+# Anyone who can alter the release alters both files together and verification
+# still passes. A hash committed in this repo is an independent reference: it
+# fails closed if the tag is ever re-pointed or the asset re-uploaded. That
+# matters more than usual here because cbm-code-discovery-gate executes this
+# binary on every PreToolUse once the hook is registered.
+#
+# Same pattern as this repo's gitleaks workflow (pinned by version AND tarball
+# sha256). Values below were computed by downloading each artifact and running
+# sha256sum locally, not transcribed from checksums.txt.
+#
+# To bump: change CBM_VERSION, download both tarballs, sha256sum them, paste.
+CBM_SHA256_amd64="e2832a8d207c26beaa30efa6222ed4a37cb3f526ca4bee060bfbf336ed6fc679"
+CBM_SHA256_arm64="68a345d9a6842f02a3cb07e187b28bc38c4f3a22967f47fadbcd0757ba93a680"
+
 # ---------------------------------------------------------------- binary
 if [ ! -x "$CBM_BIN" ]; then
   arch="$(uname -m)"
@@ -38,13 +57,25 @@ if [ ! -x "$CBM_BIN" ]; then
   tmp="$(mktemp -d)" || exit 0
   trap 'rm -rf "$tmp"' EXIT
 
-  if ! curl -fsSL -o "$tmp/$asset" "$base/$asset" \
-     || ! curl -fsSL -o "$tmp/checksums.txt" "$base/checksums.txt"; then
+  # Resolve the pinned hash for this arch. An arch with no pin is a hard stop,
+  # not a fall-through to unverified install.
+  eval "expected=\${CBM_SHA256_${arch}:-}"
+  if [ -z "$expected" ]; then
+    echo "cbm session-start: no pinned sha256 for $arch — not installing" >&2
+    exit 0
+  fi
+
+  if ! curl -fsSL -o "$tmp/$asset" "$base/$asset"; then
     echo "cbm session-start: download failed — continuing without codebase-memory" >&2
     exit 0
   fi
-  if ! (cd "$tmp" && grep " ${asset}\$" checksums.txt | sha256sum -c - >/dev/null 2>&1); then
+  actual="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
+  if [ "$actual" != "$expected" ]; then
     echo "cbm session-start: checksum verification FAILED — not installing" >&2
+    echo "  expected $expected" >&2
+    echo "  actual   $actual" >&2
+    echo "  The pinned hash is in .claude/hooks/session-start.sh. A mismatch means" >&2
+    echo "  the release asset changed since it was pinned — verify before bumping." >&2
     exit 0
   fi
   tar xzf "$tmp/$asset" -C "$tmp" || exit 0
