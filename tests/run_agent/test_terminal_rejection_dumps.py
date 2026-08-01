@@ -144,24 +144,25 @@ def test_env_var_controls_dumping(tmp_path, monkeypatch):
     mock_agent._vprint = lambda x: None
     mock_agent.verbose_logging = False
     mock_agent.logger = MagicMock()
-    
+
     # Case 1: Variable NOT set -> no file created and None returned
+    monkeypatch.delenv("HERMES_DUMP_REQUESTS", raising=False)
     dummy_file = dump_api_response_debug(
         agent=mock_agent,
         response={"test": "data"},
         reason="test"  # Include reason to make the dump interesting
     )
     assert dummy_file is None, "Dump should not be created when HERMES_DUMP_REQUESTS is not set"
-    
+
     # Case 2: Variable IS set -> file should be created
-    monkeypatch.setattr(os.environ, "HERMES_DUMP_REQUESTS", "1")
+    monkeypatch.setenv("HERMES_DUMP_REQUESTS", "1")
     dummy_file = dump_api_response_debug(
         agent=mock_agent,
         response={"test": "data"},
         reason="test"
     )
-    # At least one file should now exist
+    assert dummy_file is not None, "Must return a path when HERMES_DUMP_REQUESTS is set"
+    assert os.path.exists(dummy_file), "Dump file should be created when HERMES_DUMP_REQUESTS=1"
     files = list(tmp_path.glob("response_dump_*.json"))
     assert len(files) == 1, "Dump file should be created when HERMES_DUMP_REQUESTS=1"
-    
     print("✓ Environment variable control works correctly")

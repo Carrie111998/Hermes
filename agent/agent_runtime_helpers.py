@@ -1758,9 +1758,11 @@ def dump_api_response_debug(
     error: Optional[Exception] = None,
 ) -> Optional[Path]:
     """Write API response debug payload for post-mortem (e.g. terminal rejection)."""
+    if not env_var_enabled("HERMES_DUMP_REQUESTS"):
+        return None
     try:
         from agent.redact import redact_sensitive_text as redact_sensitive_text
-        from utils import atomic_json_write, env_var_enabled
+        from utils import atomic_json_write
 
         # 1. Prepare payload
         if error:
