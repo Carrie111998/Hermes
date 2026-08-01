@@ -1147,6 +1147,15 @@ def cmd_list(args: Any | None = None) -> None:
     entries = _filter_plugin_entries(entries, args, enabled, disabled)
 
     if getattr(args, "json", False):
+        # Collect load errors for JSON output
+        _json_errors: dict[str, str] = {}
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            for p in get_plugin_manager().list_plugins():
+                if p.get("error"):
+                    _json_errors[p["key"]] = p["error"]
+        except Exception:
+            pass
         payload = [
             {
                 "name": name,
@@ -1154,6 +1163,7 @@ def cmd_list(args: Any | None = None) -> None:
                 "version": str(version),
                 "description": description,
                 "source": source,
+                "error": _json_errors.get(key, None),
             }
             for name, version, description, source, _dir, key in entries
         ]
@@ -1161,20 +1171,45 @@ def cmd_list(args: Any | None = None) -> None:
         return
 
     if getattr(args, "plain", False):
+        # Collect load errors for plain output
+        _plain_errors: dict[str, str] = {}
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            for p in get_plugin_manager().list_plugins():
+                if p.get("error"):
+                    _plain_errors[p["key"]] = p["error"]
+        except Exception:
+            pass
         for name, version, _description, source, _dir, key in entries:
             status = _plugin_status(name, enabled, disabled, key=key)
-            print(f"{status:12} {source:8} {str(version):8} {name}")
+            err = _plain_errors.get(key, "")
+            suffix = f"  ERROR: {err}" if err else ""
+            print(f"{status:12} {source:8} {str(version):8} {name}{suffix}")
         return
 
     if not entries:
         console.print("[dim]No plugins matched the selected filters.[/dim]")
         return
 
+    # Collect load errors from plugins that failed during initialization
+    _load_errors: dict[str, str] = {}
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        pm = get_plugin_manager()
+        for p in pm.list_plugins():
+            if p.get("error"):
+                _load_errors[p["key"]] = p["error"]
+    except Exception:
+        pass
+
+    has_errors = bool(_load_errors)
     table = Table(title="Plugins", show_lines=False)
     table.add_column("Name", style="bold")
     table.add_column("Status")
     table.add_column("Version", style="dim")
     table.add_column("Description")
+    if has_errors:
+        table.add_column("Error", style="red")
     table.add_column("Source", style="dim")
 
     for name, version, description, source, _dir, key in entries:
@@ -1185,7 +1220,18 @@ def cmd_list(args: Any | None = None) -> None:
             status = "[green]enabled[/green]"
         else:
             status = "[yellow]not enabled[/yellow]"
-        table.add_row(name, status, str(version), description, source)
+        if has_errors:
+            err = _load_errors.get(key, "")
+            table.add_row(name, status, str(version), description, err, source)
+        else:
+            table.add_row(name, status, str(version), description, source)
+
+    if has_errors:
+        console.print()
+        console.print("[yellow]⚠ Some plugins have errors:[/yellow]")
+        for key, err in sorted(_load_errors.items()):
+            console.print(f"  [red]{key}[/red]: {err}")
+        console.print()
 
     console.print()
     console.print(table)
