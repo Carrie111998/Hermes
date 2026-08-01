@@ -97,6 +97,7 @@ export function LearningInboxView({ className, ...props }: LearningInboxViewProp
 
   useEffect(() => {
     setSelectedId(null)
+    setBusyId(null)
   }, [profileKey])
 
   useEffect(() => {
