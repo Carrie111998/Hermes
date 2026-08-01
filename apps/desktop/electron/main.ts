@@ -199,6 +199,7 @@ import {
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
+import { migrateUserDataFromLegacyHermes, type MigrationResult } from './userdata-migration'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
@@ -247,6 +248,37 @@ if (USER_DATA_OVERRIDE) {
   const resolvedUserData = path.resolve(USER_DATA_OVERRIDE)
   fs.mkdirSync(resolvedUserData, { recursive: true })
   app.setPath('userData', resolvedUserData)
+}
+
+// Douglas Agent: one-time userData migration from the legacy "Hermes"-named
+// directory. package.json's productName changed Hermes -> Douglas Agent
+// (4c8da5049), which silently moves Electron's default userData path
+// (path.join(app.getPath('appData'), productName)) to a brand-new, empty
+// directory on every platform -- connection.json, window-state.json,
+// active-profile.json, native-oauth-tokens.json, etc. would otherwise appear
+// to vanish with no error. Must run before the FIRST app.getPath('userData')
+// read below (the Windows sandbox-marker block) so nothing treats the new,
+// still-possibly-empty directory as authoritative before migration has a
+// chance to populate it. Skipped under HERMES_DESKTOP_USER_DATA_DIR: that
+// path is a disposable test sandbox, never a real user's data.
+let userDataMigrationFailure: MigrationResult | null = null
+
+if (!USER_DATA_OVERRIDE) {
+  const migrationResult = migrateUserDataFromLegacyHermes({
+    appDataPath: app.getPath('appData'),
+    newUserDataPath: app.getPath('userData')
+  })
+
+  if (migrationResult.status === 'migrated') {
+    console.log(
+      `[hermes] migrated userData from legacy Hermes install: ${migrationResult.fileCount} file(s) from ${migrationResult.legacyPath} -> ${migrationResult.newPath}`
+    )
+  } else if (migrationResult.status === 'failed') {
+    console.error(
+      `[hermes] userData migration FAILED (legacy data left untouched at ${migrationResult.legacyPath}): ${migrationResult.error}`
+    )
+    userDataMigrationFailure = migrationResult
+  }
 }
 
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
@@ -11724,6 +11756,22 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  // Surface a failed userData migration loudly, before the window opens with
+  // what would otherwise look like a silently-reset, empty install. The
+  // legacy directory (named in the message) was never touched -- only the
+  // copy into the new location failed -- so the user's data is not lost,
+  // just not migrated yet.
+  if (userDataMigrationFailure) {
+    dialog.showErrorBox(
+      'Douglas Agent could not migrate your previous settings',
+      `Douglas Agent found your previous settings at:\n${userDataMigrationFailure.legacyPath}\n\n` +
+        `Copying them to the new location failed:\n${userDataMigrationFailure.error}\n\n` +
+        `Your original data has NOT been touched or deleted. Douglas Agent will start with default settings ` +
+        `this time. Restart the app to retry the migration, or copy the folder above into:\n` +
+        `${userDataMigrationFailure.newPath}`
+    )
+  }
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {
