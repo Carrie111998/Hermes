@@ -16,10 +16,12 @@ Path ③ keeps full Hermes (memory, skills, approvals, cron, multi-platform gate
 
 **Practical order:**
 
-1. **Mint identity in Buzz Desktop**  
+1. **Mint identity in Buzz Desktop**
+
    Create the agent in Desktop so the community issues the Nostr keypair and NIP-OA auth tag. This is the easy membership step.
 
-2. **Stop Desktop ACP on that key**  
+2. **Stop Desktop ACP on that key**
+
    Stop the worker and turn off start-on-launch. Do **not** leave Desktop ACP and the Hermes gateway running on the same agent key.
 
 3. **Hand the secrets to Hermes**
@@ -33,7 +35,8 @@ Path ③ keeps full Hermes (memory, skills, approvals, cron, multi-platform gate
    - owner allowlist (your pubkey)
    - `require_mention=true` (recommended)
 
-4. **Join channels + publish profile**  
+4. **Join channels + publish profile**
+
    Auth alone is not enough. If the agent is not a **channel member**, humans cannot DM or `@mention` it in Desktop search. The setup wizard can join all visible channels and set a display name. You can also:
    ```bash
    buzz users set-profile --name "Your Agent"
