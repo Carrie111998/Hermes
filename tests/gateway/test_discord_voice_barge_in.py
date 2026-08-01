@@ -167,6 +167,8 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
         "stop_ack_phrases": (),
         "follow_up_ack_phrases": (),
     }
+    assert default_adapter._voice_streaming_kws_cfg.enabled is False
+    assert default_adapter._voice_streaming_kws_cfg.shadow_only is True
 
     with patch(
         "hermes_cli.config.read_raw_config",
@@ -189,6 +191,15 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
                         None,
                         "이어갈게요.",
                     ],
+                    "streaming_kws": {
+                        "enabled": "yes",
+                        "shadow_only": "true",
+                        "provider": "faster_whisper",
+                        "hotword_bias": True,
+                        "contrast_wake_names": ["유나야", "라나야"],
+                        "num_threads": 2,
+                        "queue_frames": 128,
+                    },
                 }
             }
         },
@@ -203,6 +214,16 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
         "stop_ack_phrases": ("네, 멈출게요.",),
         "follow_up_ack_phrases": ("말씀하세요.", "이어갈게요."),
     }
+    assert configured._voice_streaming_kws_cfg.enabled is True
+    assert configured._voice_streaming_kws_cfg.shadow_only is True
+    assert configured._voice_streaming_kws_cfg.provider == "faster_whisper"
+    assert configured._voice_streaming_kws_cfg.hotword_bias is True
+    assert configured._voice_streaming_kws_cfg.contrast_wake_names == (
+        "유나야",
+        "라나야",
+    )
+    assert configured._voice_streaming_kws_cfg.num_threads == 2
+    assert configured._voice_streaming_kws_cfg.queue_frames == 128
 
 
 def test_monitor_only_normalizes_contradictory_live_and_ack_flags_off():
@@ -640,6 +661,204 @@ async def test_monitor_only_fail_closed_when_runtime_dict_enables_both_modes():
     mixer.stop_speech.assert_not_called()
     adapter.play_ack_in_voice.assert_not_awaited()
     adapter._voice_input_callback.assert_not_awaited()
+
+
+def test_streaming_kws_alone_enables_playback_capture():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=True,
+    )
+
+    assert adapter._voice_barge_in_enabled() is False
+    assert adapter._voice_barge_in_monitor_only() is False
+    assert adapter._voice_streaming_kws_enabled() is True
+    assert adapter._voice_barge_in_capture_enabled() is True
+
+
+def test_streaming_kws_shadow_detection_has_no_side_effects():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=True,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+
+    adapter._handle_voice_streaming_kws_detection(
+        {
+            "guild_id": 111,
+            "token": state.token,
+            "user_id": 42,
+            "keyword_index": 0,
+            "latency_ms": 620,
+            "audio_ms": 880,
+            "queue_delay_ms": 4,
+        }
+    )
+
+    assert state.interrupted.is_set() is False
+    mixer.stop_speech.assert_not_called()
+    adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_kws_shadow_endpoint_skips_wav_and_batch_stt():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=True,
+    )
+    state = adapter._begin_voice_playback(111)
+
+    with (
+        patch("plugins.platforms.discord.adapter.tempfile.NamedTemporaryFile") as temp,
+        patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav") as pcm_to_wav,
+        patch("tools.transcription_tools.transcribe_audio") as transcribe,
+    ):
+        await adapter._process_voice_input(
+            111,
+            42,
+            b"private pcm",
+            playback_token=state.token,
+        )
+
+    temp.assert_not_called()
+    pcm_to_wav.assert_not_called()
+    transcribe.assert_not_called()
+    adapter._voice_input_callback.assert_not_awaited()
+
+
+def test_parent_monitor_only_forces_nested_streaming_live_to_shadow():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=True)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+
+    adapter._handle_voice_streaming_kws_detection(
+        {"guild_id": 111, "token": state.token, "user_id": 42}
+    )
+
+    assert state.interrupted.is_set() is False
+    mixer.stop_speech.assert_not_called()
+    assert (111, state.token) not in getattr(
+        adapter,
+        "_voice_streaming_kws_live_tokens",
+        {},
+    )
+
+
+def test_streaming_kws_live_detection_interrupts_once_without_claiming_follow_up():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+    event = {
+        "guild_id": 111,
+        "token": state.token,
+        "user_id": 42,
+        "keyword_index": 0,
+        "latency_ms": 620,
+        "audio_ms": 880,
+        "queue_delay_ms": 4,
+    }
+
+    adapter._handle_voice_streaming_kws_detection(event)
+    adapter._handle_voice_streaming_kws_detection(event)
+
+    assert state.interrupted.is_set()
+    mixer.stop_speech.assert_called_once()
+    assert adapter._voice_barge_in_claims == set()
+    assert (111, state.token) in adapter._voice_streaming_kws_live_tokens
+    adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_kws_live_token_routes_only_trailing_follow_up():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+    adapter._handle_voice_streaming_kws_detection(
+        {"guild_id": 111, "token": state.token, "user_id": 42}
+    )
+
+    await _process_transcript(
+        adapter,
+        "세린아 멈춰, 날씨 알려줘",
+        token=state.token,
+    )
+
+    adapter._voice_input_callback.assert_awaited_once_with(
+        guild_id=111,
+        user_id=42,
+        transcript="날씨 알려줘",
+    )
+    assert (111, state.token) not in adapter._voice_streaming_kws_live_tokens
+
+
+def test_streaming_kws_rejects_unauthorized_and_stale_detection():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=False)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+
+    adapter._handle_voice_streaming_kws_detection(
+        {"guild_id": 111, "token": state.token, "user_id": 42}
+    )
+    adapter._is_allowed_user.return_value = True
+    adapter._handle_voice_streaming_kws_detection(
+        {"guild_id": 111, "token": state.token + 1, "user_id": 42}
+    )
+
+    assert state.interrupted.is_set() is False
+    mixer.stop_speech.assert_not_called()
 
 
 @pytest.mark.asyncio

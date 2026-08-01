@@ -41,7 +41,7 @@ def _load_real_opus(discord):
     pytest.skip("a real libopus shared library is unavailable")
 
 
-def _receiver(secret_key, *, bot_ssrc=9999):
+def _receiver(secret_key, *, bot_ssrc=9999, **receiver_kwargs):
     from plugins.platforms.discord.adapter import VoiceReceiver
 
     voice_client = MagicMock()
@@ -54,7 +54,11 @@ def _receiver(secret_key, *, bot_ssrc=9999):
     voice_client.user = SimpleNamespace(id=bot_ssrc)
     voice_client.channel = MagicMock()
     voice_client.channel.members = []
-    receiver = VoiceReceiver(voice_client, allowed_user_ids={"42"})
+    receiver = VoiceReceiver(
+        voice_client,
+        allowed_user_ids={"42"},
+        **receiver_kwargs,
+    )
     receiver.start()
     receiver.map_ssrc(100, 42)
     return receiver
@@ -141,7 +145,20 @@ def test_playback_end_defers_summary_until_token_pinned_decode_finishes(
     caplog.set_level(logging.INFO)
     secret_key = bytes(range(32))
     packet = next(_encrypted_opus_rtp_packets(secret_key, count=1))
-    receiver = _receiver(secret_key)
+    callback_order = []
+    pcm_events = []
+    drained = []
+    receiver = _receiver(
+        secret_key,
+        playback_pcm_callback=lambda *event: (
+            callback_order.append("pcm"),
+            pcm_events.append(event),
+        ),
+        playback_drained_callback=lambda token: (
+            callback_order.append("drained"),
+            drained.append(token),
+        ),
+    )
     decode_started = threading.Event()
     release_decode = threading.Event()
 
@@ -160,6 +177,8 @@ def test_playback_end_defers_summary_until_token_pinned_decode_finishes(
     receiver.end_playback_capture(91)
     assert "capture draining token=91 inflight=1" in caplog.text
     assert receiver._playback_inflight[91] == 1
+    assert pcm_events == []
+    assert drained == []
 
     release_decode.set()
     worker.join(timeout=2)
@@ -168,8 +187,35 @@ def test_playback_end_defers_summary_until_token_pinned_decode_finishes(
     assert receiver.snapshot_transport_stats()["decoded_packets"] == 1
     assert "capture summary token=91" in caplog.text
     assert "decoded=1 tagged=1" in caplog.text
+    assert len(pcm_events) == 1
+    assert pcm_events[0][0] == 91
+    assert pcm_events[0][1] == 42
+    assert pcm_events[0][2] == b"\x00" * 3840
+    assert drained == [91]
+    assert callback_order == ["pcm", "drained"]
     assert 91 not in receiver._playback_inflight
     assert 91 not in receiver._playback_transport_stats
+
+
+def test_shadow_streaming_callback_does_not_retain_playback_pcm():
+    secret_key = bytes(range(32))
+    packet = next(_encrypted_opus_rtp_packets(secret_key, count=1))
+    events = []
+    receiver = _receiver(
+        secret_key,
+        playback_pcm_callback=lambda *event: events.append(event),
+        retain_playback_pcm=False,
+    )
+    receiver.begin_playback_capture(92)
+
+    receiver._on_packet(packet)
+
+    assert len(events) == 1
+    assert events[0][0] == 92
+    assert events[0][1] == 42
+    assert receiver._buffers.get(100, bytearray()) == bytearray()
+    assert 100 not in receiver._last_packet_time
+    assert 100 not in receiver._buffer_playback_tokens
 
 
 def test_nacl_and_opus_failure_counters_are_recorded(monkeypatch):

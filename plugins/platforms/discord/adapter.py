@@ -490,9 +490,20 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(
+        self,
+        voice_client,
+        allowed_user_ids: set = None,
+        *,
+        playback_pcm_callback: Optional[Callable] = None,
+        playback_drained_callback: Optional[Callable] = None,
+        retain_playback_pcm: bool = True,
+    ):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        self._playback_pcm_callback = playback_pcm_callback
+        self._playback_drained_callback = playback_drained_callback
+        self._retain_playback_pcm = bool(retain_playback_pcm)
         self._running = False
 
         # Decryption
@@ -626,6 +637,22 @@ class VoiceReceiver:
             stats.get("opus_decode_failures", 0),
         )
 
+    def _finish_playback_summary(
+        self,
+        token: int,
+        summary: Tuple[Optional[Dict[str, int]], int],
+    ) -> None:
+        self._log_playback_summary(token, summary)
+        callback = self._playback_drained_callback
+        if callback is not None:
+            try:
+                callback(token)
+            except Exception as exc:
+                logger.info(
+                    "Discord playback drain callback failed type=%s",
+                    type(exc).__name__,
+                )
+
     def begin_playback_capture(self, token: int) -> None:
         """Enable and tag inbound capture for one TTS playback."""
         with self._lock:
@@ -649,7 +676,7 @@ class VoiceReceiver:
             inflight = self._playback_inflight.get(token, 0)
             summary = self._take_playback_summary_locked(token)
         if summary is not None:
-            self._log_playback_summary(token, summary)
+            self._finish_playback_summary(token, summary)
         else:
             logger.info(
                 "Discord voice playback capture draining token=%s inflight=%d",
@@ -714,6 +741,7 @@ class VoiceReceiver:
         seen_ssrc: Optional[int] = None
         reset_decoder = False
         summary = None
+        playback_pcm_event = None
 
         with self._lock:
             running = self._running
@@ -914,8 +942,22 @@ class VoiceReceiver:
                     and decoded_ssrc is not None
                     and self._running
                 ):
-                    self._buffers[decoded_ssrc].extend(decoded_pcm)
-                    self._last_packet_time[decoded_ssrc] = time.monotonic()
+                    if packet_token is None or self._retain_playback_pcm:
+                        self._buffers[decoded_ssrc].extend(decoded_pcm)
+                        self._last_packet_time[decoded_ssrc] = time.monotonic()
+                        if packet_token is not None:
+                            self._buffer_playback_tokens.setdefault(
+                                decoded_ssrc,
+                                packet_token,
+                            )
+                            max_playback_bytes = (
+                                self.SAMPLE_RATE * self.CHANNELS * 2 * 15
+                            )
+                            overflow = (
+                                len(self._buffers[decoded_ssrc]) - max_playback_bytes
+                            )
+                            if overflow > 0:
+                                del self._buffers[decoded_ssrc][:overflow]
                     if packet_token is not None:
                         self._transport_stats["playback_tagged_packets"] += 1
                         token_stats = self._playback_transport_stats.get(packet_token)
@@ -923,10 +965,14 @@ class VoiceReceiver:
                             token_stats["playback_tagged_packets"] = (
                                 token_stats.get("playback_tagged_packets", 0) + 1
                             )
-                        self._buffer_playback_tokens.setdefault(
-                            decoded_ssrc,
-                            packet_token,
-                        )
+                        user_id = self._ssrc_to_user.get(decoded_ssrc, 0)
+                        if user_id and self._playback_pcm_callback is not None:
+                            playback_pcm_event = (
+                                packet_token,
+                                user_id,
+                                decoded_pcm,
+                                time.monotonic(),
+                            )
 
                 if (
                     packet_token is not None
@@ -938,8 +984,16 @@ class VoiceReceiver:
                     )
                     summary = self._take_playback_summary_locked(packet_token)
 
+            if playback_pcm_event is not None:
+                try:
+                    self._playback_pcm_callback(*playback_pcm_event)
+                except Exception as exc:
+                    logger.info(
+                        "Discord playback PCM callback failed type=%s",
+                        type(exc).__name__,
+                    )
             if summary is not None and packet_token is not None:
-                self._log_playback_summary(packet_token, summary)
+                self._finish_playback_summary(packet_token, summary)
 
     # ------------------------------------------------------------------
     # Silence detection
@@ -1235,6 +1289,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         self._voice_barge_in_cfg = self._load_voice_barge_in_config()
+        self._voice_streaming_kws_cfg = self._load_voice_streaming_kws_config()
+        self._voice_streaming_kws_manager = None
+        self._voice_streaming_kws_loop = None
+        self._voice_streaming_kws_live_tokens: Dict[Tuple[int, int], float] = {}
         self._voice_playback_locks: Dict[int, asyncio.Lock] = {}
         self._voice_playback_states: Dict[int, _VoicePlaybackState] = {}
         self._voice_playback_serial = 0
@@ -1996,6 +2054,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+        self._close_voice_streaming_kws_manager()
 
         if self._client:
             try:
@@ -4170,6 +4229,30 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_barge_in config: %s", e)
             return defaults
 
+    def _load_voice_streaming_kws_config(self):
+        """Read the opt-in playback-scoped streaming KWS policy."""
+        from .streaming_kws import StreamingKwsConfig
+
+        try:
+            from hermes_cli.config import read_raw_config
+
+            config = read_raw_config() or {}
+            discord_cfg = config.get("discord") if isinstance(config, dict) else None
+            barge_cfg = (
+                discord_cfg.get("voice_barge_in")
+                if isinstance(discord_cfg, dict)
+                else None
+            )
+            raw = (
+                barge_cfg.get("streaming_kws")
+                if isinstance(barge_cfg, dict)
+                else None
+            )
+            return StreamingKwsConfig.from_mapping(raw)
+        except Exception as exc:
+            logger.debug("Could not load Discord streaming KWS config: %s", exc)
+            return StreamingKwsConfig()
+
     def _voice_barge_in_enabled(self) -> bool:
         cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
         return bool(
@@ -4182,8 +4265,120 @@ class DiscordAdapter(BasePlatformAdapter):
         cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
         return bool(cfg.get("monitor_only") and cfg.get("phrases"))
 
+    def _voice_streaming_kws_enabled(self) -> bool:
+        cfg = getattr(self, "_voice_streaming_kws_cfg", None)
+        phrases = (getattr(self, "_voice_barge_in_cfg", None) or {}).get("phrases")
+        return bool(cfg and cfg.enabled and phrases)
+
     def _voice_barge_in_capture_enabled(self) -> bool:
-        return self._voice_barge_in_enabled() or self._voice_barge_in_monitor_only()
+        return bool(
+            self._voice_barge_in_enabled()
+            or self._voice_barge_in_monitor_only()
+            or self._voice_streaming_kws_enabled()
+        )
+
+    def _ensure_voice_streaming_kws_manager(self):
+        if not self._voice_streaming_kws_enabled():
+            return None
+        manager = getattr(self, "_voice_streaming_kws_manager", None)
+        if manager is not None:
+            if manager.snapshot_stats().get("startup_failed"):
+                manager.close()
+                self._voice_streaming_kws_manager = None
+            else:
+                return manager
+        try:
+            from .streaming_kws import DiscordStreamingKwsManager
+
+            loop = asyncio.get_running_loop()
+            phrases = tuple(
+                (getattr(self, "_voice_barge_in_cfg", None) or {}).get("phrases")
+                or ()
+            )
+
+            def _detected(event):
+                loop.call_soon_threadsafe(
+                    self._handle_voice_streaming_kws_detection,
+                    event,
+                )
+
+            manager = DiscordStreamingKwsManager(
+                self._voice_streaming_kws_cfg,
+                phrases,
+                _detected,
+            )
+            self._voice_streaming_kws_loop = loop
+            self._voice_streaming_kws_manager = manager
+            logger.info(
+                "Discord streaming KWS started shadow=%s queue_frames=%d",
+                self._voice_streaming_kws_cfg.shadow_only,
+                self._voice_streaming_kws_cfg.queue_frames,
+            )
+            return manager
+        except Exception as exc:
+            logger.warning(
+                "Discord streaming KWS unavailable type=%s",
+                type(exc).__name__,
+            )
+            return None
+
+    def _handle_voice_streaming_kws_detection(self, event: Dict[str, Any]) -> None:
+        cfg = getattr(self, "_voice_streaming_kws_cfg", None)
+        if not cfg or not cfg.enabled:
+            return
+        guild_id = int(event.get("guild_id") or 0)
+        token = int(event.get("token") or 0)
+        user_id = int(event.get("user_id") or 0)
+        state = getattr(self, "_voice_playback_states", {}).get(guild_id)
+        active = bool(state is not None and state.token == token)
+        guild = self._client.get_guild(guild_id) if self._client is not None else None
+        authorized = bool(
+            user_id
+            and self._is_allowed_user(
+                str(user_id),
+                guild=guild,
+                is_dm=False,
+            )
+        )
+        effective_shadow = cfg.shadow_only or self._voice_barge_in_monitor_only()
+        logger.info(
+            "Discord streaming KWS detection playback=%s keyword_index=%d "
+            "latency_ms=%d audio_ms=%d queue_ms=%d shadow=%s active=%s "
+            "authorized=%s",
+            token,
+            int(event.get("keyword_index") or 0),
+            int(event.get("latency_ms") or 0),
+            int(event.get("audio_ms") or 0),
+            int(event.get("queue_delay_ms") or 0),
+            effective_shadow,
+            active,
+            authorized,
+        )
+        if effective_shadow or not active or not authorized:
+            return
+        now = time.monotonic()
+        live_tokens = getattr(self, "_voice_streaming_kws_live_tokens", None)
+        if live_tokens is None:
+            live_tokens = {}
+            self._voice_streaming_kws_live_tokens = live_tokens
+        for key, detected_at in tuple(live_tokens.items()):
+            if now - detected_at > 30.0:
+                live_tokens.pop(key, None)
+        live_tokens[(guild_id, token)] = now
+        interrupted = self._interrupt_voice_playback(guild_id, token)
+        logger.info(
+            "Discord streaming KWS accepted playback=%s interrupted=%s",
+            token,
+            interrupted,
+        )
+
+    def _close_voice_streaming_kws_manager(self) -> None:
+        manager = getattr(self, "_voice_streaming_kws_manager", None)
+        self._voice_streaming_kws_manager = None
+        self._voice_streaming_kws_loop = None
+        getattr(self, "_voice_streaming_kws_live_tokens", {}).clear()
+        if manager is not None:
+            manager.close()
 
     def _next_voice_barge_in_ack_phrase(self, kind: str) -> Optional[str]:
         """Return the next configured stop/follow-up ack in round-robin order."""
@@ -4591,9 +4786,41 @@ class DiscordAdapter(BasePlatformAdapter):
             if source is not None:
                 self._voice_sources[guild_id] = source
 
-            # Start voice receiver (Phase 2: listen to users)
+            # Start voice receiver (Phase 2: listen to users). Streaming KWS
+            # callbacks are deliberately non-blocking on the SocketReader thread.
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                kws_manager = self._ensure_voice_streaming_kws_manager()
+                playback_pcm_callback = None
+                playback_drained_callback = None
+                if kws_manager is not None:
+                    playback_pcm_callback = (
+                        lambda token, user_id, pcm, received_at: kws_manager.offer_pcm(
+                            guild_id,
+                            token,
+                            user_id,
+                            pcm,
+                            received_at=received_at,
+                        )
+                    )
+                    playback_drained_callback = (
+                        lambda token: kws_manager.end_playback(guild_id, token)
+                    )
+                streaming_live = bool(
+                    self._voice_streaming_kws_enabled()
+                    and not self._voice_streaming_kws_cfg.shadow_only
+                    and not self._voice_barge_in_monitor_only()
+                )
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    playback_pcm_callback=playback_pcm_callback,
+                    playback_drained_callback=playback_drained_callback,
+                    retain_playback_pcm=bool(
+                        self._voice_barge_in_enabled()
+                        or self._voice_barge_in_monitor_only()
+                        or streaming_live
+                    ),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -4626,6 +4853,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if receiver:
                 pending_inputs = receiver.flush_pending(with_context=True)
                 receiver.stop()
+            kws_manager = getattr(self, "_voice_streaming_kws_manager", None)
+            if kws_manager is not None and playback_state is not None:
+                kws_manager.end_playback(guild_id, playback_state.token)
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
                 listen_task.cancel()
@@ -4700,6 +4930,9 @@ class DiscordAdapter(BasePlatformAdapter):
             playback_state = self._begin_voice_playback(guild_id)
             if receiver is not None:
                 if self._voice_barge_in_capture_enabled():
+                    kws_manager = getattr(self, "_voice_streaming_kws_manager", None)
+                    if kws_manager is not None:
+                        kws_manager.begin_playback(guild_id, playback_state.token)
                     receiver.begin_playback_capture(playback_state.token)
                     receiver_capturing = True
                 else:
@@ -5016,6 +5249,19 @@ class DiscordAdapter(BasePlatformAdapter):
         """Convert PCM -> WAV -> STT and apply the playback phrase gate."""
         from tools.voice_mode import is_whisper_hallucination
 
+        streaming_live = False
+        if playback_token is not None:
+            live_tokens = getattr(self, "_voice_streaming_kws_live_tokens", {})
+            streaming_live = live_tokens.pop((guild_id, playback_token), None) is not None
+            if not (
+                self._voice_barge_in_enabled()
+                or self._voice_barge_in_monitor_only()
+                or streaming_live
+            ):
+                # Streaming shadow and non-matching live audio stay entirely
+                # in memory: no temporary WAV and no batch/cloud STT request.
+                return
+
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
@@ -5069,7 +5315,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if playback_token is not None:
                 cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
                 phrases = cfg.get("phrases") or ()
-                live_enabled = self._voice_barge_in_enabled()
+                live_enabled = self._voice_barge_in_enabled() or streaming_live
                 monitor_only = self._voice_barge_in_monitor_only()
                 if not (live_enabled or monitor_only):
                     return
