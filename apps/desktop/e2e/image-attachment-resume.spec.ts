@@ -29,7 +29,6 @@ import { type ElectronApplication, expect, type Page, test } from './test'
 
 // A seeded session has no generated title, so every label falls back to the
 // session preview — the first 60 characters of the first user message.
-const SESSION_TITLE = 'E2E attached image session'
 const CAPTION = 'E2E attached image must survive a relaunch'
 const IMAGE_DIR = 'Application Support/e2e shots'
 const IMAGE_NAME = 'e2e capture.png'
@@ -67,7 +66,6 @@ async function setupSeededDesktop(): Promise<SeededFixture> {
 
   try {
     await builder.createSession({
-      title: SESSION_TITLE,
       turns: [{ images: [writeImage(sandbox)], text: CAPTION }],
     })
   } finally {
