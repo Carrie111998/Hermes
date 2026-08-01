@@ -92,7 +92,7 @@ import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
-import { partitionIdleReapable, selectLruEvictionCandidates } from './pool-reaper'
+import { countLocalBackends, partitionIdleReapable, selectLruEvictionCandidates } from './pool-reaper'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
@@ -8037,6 +8037,12 @@ function touchPoolBackend(profile) {
 // ever evict backends without a live renderer socket (stale beyond the keepalive
 // window). When every backend is actively kept alive we let the pool exceed the
 // soft cap rather than kill a running session.
+//
+// The eviction budget counts only entries with a local child `process`. Remote
+// descriptors (`process === null`) are excluded from eviction candidates already
+// (see pool-reaper.ts); they must not inflate the budget either, or a mixed pool
+// with several cheap remote descriptors would wrongly mark a still-needed local
+// backend as over-cap and evict it.
 function evictLruPoolBackends(keep) {
   if (backendPool.size <= keep) {
     return
@@ -8046,7 +8052,8 @@ function evictLruPoolBackends(keep) {
 
   const evictable = selectLruEvictionCandidates(backendPool, now, POOL_KEEPALIVE_FRESH_MS)
 
-  let removable = backendPool.size - Math.max(0, keep)
+  const localCount = countLocalBackends(backendPool)
+  let removable = localCount - Math.max(0, keep)
 
   for (const profile of evictable) {
     if (removable <= 0) {

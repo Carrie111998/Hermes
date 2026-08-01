@@ -72,3 +72,20 @@ export function selectLruEvictionCandidates(
     .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))
     .map(([profile]) => profile)
 }
+
+/**
+ * Count of pool entries that hold a local child process. The LRU eviction
+ * budget must be based on this — not on the total pool size — so that cheap
+ * remote descriptors never push a still-needed local backend over the cap in a
+ * mixed pool. (Regression: several remote descriptors + one local backend below
+ * the local cap must yield a budget of 0, evicting nothing.)
+ */
+export function countLocalBackends(entries: Iterable<[string, PoolReaperEntry]>): number {
+  let count = 0
+  for (const [, entry] of entries) {
+    if (entry && entry.process) {
+      count += 1
+    }
+  }
+  return count
+}
