@@ -106,6 +106,10 @@ export function useComposerDraft({
   queueEditStateRef.current = queueEditRef.current
 
   const [focusRequestId, setFocusRequestId] = useState(0)
+  // After an in-place chip insert the DOM already has the right glyphs. A
+  // sync-driven renderComposerContents would replaceChildren() and flash the
+  // leading icon (empty → SVG). Hold this until after the next paint.
+  const skipDomRepaintRef = useRef(false)
 
   const focusInput = useCallback(() => {
     focusComposerInput(editorRef.current)
@@ -277,7 +281,12 @@ export function useComposerDraft({
 
       const editor = editorRef.current
 
-      if (editor && document.activeElement !== editor && composerPlainText(editor) !== text) {
+      if (
+        editor &&
+        !skipDomRepaintRef.current &&
+        document.activeElement !== editor &&
+        composerPlainText(editor) !== text
+      ) {
         renderComposerContents(editor, text, { trailingCommitted: true })
       }
 
@@ -334,9 +343,23 @@ export function useComposerDraft({
       return false
     }
 
-    draftRef.current = nextDraft
-    setComposerText(nextDraft)
-    requestMainFocus()
+    // Belt-and-suspenders with insertInlineRefsIntoEditor: never publish a
+    // leading newline into AUI — metrics treats it as a hard wrap.
+    const draft = nextDraft.replace(/^\n+/, '')
+
+    draftRef.current = draft
+    skipDomRepaintRef.current = true
+    setComposerText(draft)
+    // Keep the guard through the input-event rAF flush and the focus effect.
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        skipDomRepaintRef.current = false
+      })
+    })
+
+    if (document.activeElement !== editor) {
+      requestMainFocus()
+    }
 
     return true
   }

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { insertInlineRefsIntoEditor } from './inline-refs'
 import {
+  caretOffsetInEditor,
   composerPlainText,
   deleteSelectionInEditor,
   insertComposerContentsAtCaret,
@@ -155,6 +156,33 @@ describe('insertInlineRefsIntoEditor', () => {
     expect(composerPlainText(editor)).toBe('@file:`src/foo.ts` ')
   })
 
+  it('drops the empty-editor scaffolding br so the chip does not land on line 2', () => {
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    editor.dataset.empty = ''
+    editor.append(document.createElement('br'))
+
+    insertInlineRefsIntoEditor(editor, ['@line:`src/a.ts:12`'])
+
+    expect(editor.querySelector('br')).toBeNull()
+    expect(composerPlainText(editor)).toBe('@line:`src/a.ts:12` ')
+    expect(editor.dataset.empty).toBeUndefined()
+  })
+
+  it('atomically replaces a Chromium-wrapped scaffolding break without a leading newline', () => {
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    const wrap = document.createElement('div')
+    wrap.append(document.createElement('br'))
+    editor.append(wrap)
+
+    const text = insertInlineRefsIntoEditor(editor, ['@line:`src/a.ts:12`'])
+
+    expect(text).toBe('@line:`src/a.ts:12` ')
+    expect(text?.startsWith('\n')).toBe(false)
+    expect(editor.querySelector(':scope > div')).toBeNull()
+  })
+
   it('separates a chip from the word the caret sits after', () => {
     const editor = document.createElement('div')
     editor.dataset.slot = RICH_INPUT_SLOT
@@ -176,6 +204,34 @@ describe('insertInlineRefsIntoEditor', () => {
 
     expect(insertInlineRefsIntoEditor(editor, ['@file:`src/a.ts`'])).toBe('review @file:`src/a.ts` ')
 
+    editor.remove()
+  })
+
+  it('lands the caret after the second chip when refs are inserted back-to-back', () => {
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+
+    const first = insertInlineRefsIntoEditor(editor, ['@line:`a.ts:1`'])
+    expect(first).toBe('@line:`a.ts:1` ')
+    expect(caretOffsetInEditor(editor)).toBe(first!.length)
+
+    // Simulate Add-to-Chat from the preview: a live selection still points at
+    // an outside node. Insertion must append and leave the caret after chip 2.
+    const outsider = document.createElement('span')
+    outsider.textContent = 'preview selection'
+    document.body.append(outsider)
+    const outsideRange = document.createRange()
+    outsideRange.selectNodeContents(outsider)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(outsideRange)
+
+    const second = insertInlineRefsIntoEditor(editor, ['@line:`a.ts:2`'])
+    expect(second).toBe('@line:`a.ts:1` @line:`a.ts:2` ')
+    expect(caretOffsetInEditor(editor)).toBe(second!.length)
+
+    outsider.remove()
     editor.remove()
   })
 })
