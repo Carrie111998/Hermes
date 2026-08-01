@@ -211,3 +211,91 @@ def test_bare_provider_slug_still_switches_to_default_model(fake_catalogs):
     assert result.success
     assert result.target_provider == "opencode-go"
     assert result.provider_changed is True
+
+
+def test_empty_catalog_routing_aggregator_slug_preserved(monkeypatch):
+    """On a routing aggregator, an empty models.dev catalog must not turn a
+    native vendor slug into a provider hop (hermes-sweeper #75777 review)."""
+    monkeypatch.setattr(ms, "list_provider_models", lambda *a, **k: [])
+    result = switch_model(
+        raw_input="anthropic/claude-sonnet-4.6",
+        current_provider="openrouter",
+        current_model="nvidia/nemotron-3-ultra-550b-a55b:free",
+        user_providers={},
+        custom_providers=[],
+    )
+    assert result.success
+    assert result.target_provider == "openrouter"
+    assert result.provider_changed is False
+    assert result.new_model == "anthropic/claude-sonnet-4.6"
+    assert result.typed_provider_hop is False
+
+
+def test_empty_catalog_flat_reseller_still_hops(monkeypatch):
+    """Flat-namespace resellers (opencode-go/zen) never consult the catalog:
+    a typed provider/model string still switches even when models.dev is
+    empty."""
+    monkeypatch.setattr(ms, "list_provider_models", lambda *a, **k: [])
+    result = switch_model(
+        raw_input="opencode-zen/gpt-5.5",
+        current_provider="opencode-go",
+        current_model="deepseek-v4-flash",
+        user_providers={},
+        custom_providers=[],
+    )
+    assert result.success
+    assert result.target_provider == "opencode"
+    assert result.provider_changed is True
+    assert result.new_model == "gpt-5.5"
+    assert result.typed_provider_hop is True
+
+
+def test_typed_provider_hop_signal_set_for_typed_hop(fake_catalogs):
+    """result.typed_provider_hop must be True for a typed provider hop."""
+    result = switch_model(
+        raw_input="opencode-zen/gpt-5.5",
+        current_provider="opencode-go",
+        current_model="deepseek-v4-flash",
+        user_providers={},
+        custom_providers=[],
+    )
+    assert result.success
+    assert result.provider_changed is True
+    assert result.typed_provider_hop is True
+
+
+def test_typed_provider_hop_signal_not_set_for_native_slug(fake_catalogs):
+    """Native aggregator slugs (openai/gpt-5.5 on OpenRouter) are NOT hops."""
+    result = switch_model(
+        raw_input="openai/gpt-5.5",
+        current_provider="openrouter",
+        current_model="nvidia/nemotron-3-ultra-550b-a55b:free",
+        user_providers={},
+        custom_providers=[],
+    )
+    assert result.success
+    assert result.provider_changed is False
+    assert result.typed_provider_hop is False
+
+
+def test_typed_provider_hop_signal_not_set_for_plain_model(fake_catalogs):
+    """Plain model names never set the typed-hop signal."""
+    result = switch_model(
+        raw_input="deepseek-v4-flash",
+        current_provider="opencode-go",
+        current_model="kimi-k2.5",
+        user_providers={},
+        custom_providers=[],
+    )
+    assert result.success
+    assert result.typed_provider_hop is False
+
+
+def test_resolve_persist_behavior_typed_hop_is_session_only():
+    """A typed provider hop follows the --provider session-only rule unless
+    --global forces persistence (resolve_persist_behavior rule 4)."""
+    assert ms.resolve_persist_behavior(False, False, typed_provider_hop=True) is False
+    assert ms.resolve_persist_behavior(False, False, typed_provider_hop=False) is False
+    assert ms.resolve_persist_behavior(True, False, typed_provider_hop=True) is True
+    assert ms.resolve_persist_behavior(False, True, typed_provider_hop=True) is False
+    assert ms.resolve_persist_behavior(False, False, is_once=True, typed_provider_hop=True) is False

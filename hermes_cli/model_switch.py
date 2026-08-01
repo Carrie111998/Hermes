@@ -32,6 +32,7 @@ from hermes_cli.providers import (
     get_label,
     host_mandated_api_mode,
     is_aggregator,
+    is_routing_aggregator,
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
@@ -450,6 +451,12 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    # True when the provider hop came from a typed ``provider/model``
+    # prefix (e.g. ``/model opencode-zen/gpt-5.5``) rather than an
+    # explicit ``--provider`` flag.  Callers use this to apply the same
+    # session-only persistence default as ``--provider`` (rule 4 in
+    # :func:`resolve_persist_behavior`).
+    typed_provider_hop: bool = False
 
 
 @dataclass(frozen=True)
@@ -557,6 +564,7 @@ def resolve_persist_behavior(
     is_session: bool,
     is_once: bool = False,
     explicit_provider: str = "",
+    typed_provider_hop: bool = False,
 ) -> bool:
     """Decide whether a ``/model`` switch should persist to ``config.yaml``.
 
@@ -569,6 +577,9 @@ def resolve_persist_behavior(
        (session only).  Provider switches are typically exploratory — the
        user is trying a different backend for this conversation, not
        reconfiguring the default.  ``--global`` can still force persist.
+       ``typed_provider_hop`` (a ``provider/model`` prefix in the model
+       input, e.g. ``/model opencode-zen/gpt-5.5``) is the same signal and
+       gets the same session-only default.
     5. Otherwise defer to ``model.persist_switch_by_default`` in
        ``config.yaml`` (defaults to ``False``: a plain ``/model <name>``
        affects only the current session).  Users who want the old
@@ -585,7 +596,7 @@ def resolve_persist_behavior(
         return False
     if is_global:
         return True
-    if explicit_provider:
+    if explicit_provider or typed_provider_hop:
         return False
     try:
         from hermes_cli.config import load_config
@@ -1222,6 +1233,8 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    _typed_provider_hop = False
+    _native_aggregator_slug = False
 
     # =================================================================
     # PATH A0: Provider-slug prefix in the model target
@@ -1260,14 +1273,29 @@ def switch_model(
         _cur_norm = str(current_provider or "").strip().lower()
         if _pfx_norm and _rest and _pfx_norm != _cur_norm:
             _native_slug = False
-            if is_aggregator(current_provider):
+            if is_routing_aggregator(current_provider):
+                # A slash-bearing name on a TRUE routing aggregator (e.g.
+                # "anthropic/claude-sonnet-4.6" on OpenRouter) is native by
+                # default.  Only a *confirmed* non-match in the live catalog
+                # allows the provider-hop interpretation; when models.dev has
+                # no catalog data (empty list / lookup failure) preserve the
+                # native slug rather than guessing it is a provider hop.
+                # Flat-namespace resellers (opencode-zen/go) never match here
+                # — their catalogs are bare IDs, so their typed "provider/model"
+                # strings always route as hops.
                 try:
                     _cat = list_provider_models(current_provider)
-                    _native_slug = any(
+                    _native_slug = not _cat or any(
                         str(m).lower() == new_model.lower() for m in _cat
                     )
                 except Exception:
-                    _native_slug = False
+                    _native_slug = True
+                if _native_slug:
+                    # Preserve the native slug end-to-end: also suppress the
+                    # PATH B step-e provider guesser, which would otherwise
+                    # re-route the unconfirmed name via static catalogs when
+                    # models.dev had no data (e.g. anthropic/... -> gmi).
+                    _native_aggregator_slug = True
             if not _native_slug:
                 _pfx_pdef = resolve_provider_full(
                     _pfx_norm, user_providers, custom_providers
@@ -1283,6 +1311,7 @@ def switch_model(
                     )
                     explicit_provider = _pfx_norm
                     new_model = _rest
+                    _typed_provider_hop = True
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1571,6 +1600,7 @@ def switch_model(
             and not resolved_alias
             and not resolved_in_current_catalog
             and not config_routed
+            and not _native_aggregator_slug
         ):
             detected = detect_provider_for_model(new_model, current_provider)
             if detected:
@@ -1842,6 +1872,7 @@ def switch_model(
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,
+        typed_provider_hop=_typed_provider_hop,
     )
 
 
