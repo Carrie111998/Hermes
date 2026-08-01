@@ -334,6 +334,43 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _parse_inbox_sweep(extra: Dict[str, Any]) -> tuple[bool, int, str]:
+    """Normalize the opt-in fixed-window inbox sweep configuration.
+
+    This mode is intentionally distinct from ordinary WhatsApp bot mode: it
+    captures inbound receipts during a fixed three-second window, then routes
+    triage out of band.  The bridge window is deliberately not configurable.
+    """
+    raw = extra.get("inbox_sweep")
+    if raw is None:
+        return False, 0, ""
+    if not isinstance(raw, dict):
+        raise ValueError("inbox_sweep must be a mapping")
+
+    enabled = raw.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return False, 0, ""
+
+    try:
+        interval_seconds = int(raw.get("reconnect_interval_seconds", 120))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("inbox_sweep.reconnect_interval_seconds must be a positive integer") from exc
+    if interval_seconds <= 3:
+        raise ValueError("inbox_sweep.reconnect_interval_seconds must exceed the fixed 3-second window")
+
+    delivery_platform = str(raw.get("delivery_platform", "telegram")).strip().lower()
+    try:
+        target_platform = Platform(delivery_platform)
+    except ValueError as exc:
+        raise ValueError("inbox_sweep.delivery_platform must name a supported platform") from exc
+    if target_platform == Platform.WHATSAPP:
+        raise ValueError("inbox_sweep.delivery_platform must be a non-WhatsApp platform")
+
+    return True, interval_seconds * 1000, target_platform.value
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -407,6 +444,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        (
+            self._inbox_sweep_enabled,
+            self._inbox_sweep_interval_ms,
+            self._inbox_sweep_delivery_platform,
+        ) = _parse_inbox_sweep(config.extra)
         self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
@@ -415,7 +457,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._send_read_receipts = (
             read_receipts if isinstance(read_receipts, bool)
             else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
-        )
+        ) and not self._inbox_sweep_enabled
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -447,6 +489,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+    def _inbox_sweep_outbound_denied(self) -> Optional[SendResult]:
+        if getattr(self, "_inbox_sweep_enabled", False):
+            return SendResult(success=False, error="WhatsApp inbox sweep mode is receive-only")
+        return None
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -643,6 +690,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env = with_hermes_node_path()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            # Inbox-only sweep mode has a fixed 3-second capture window. The
+            # bridge receives only normalized values; the user-facing config
+            # stays in YAML under platforms.whatsapp.extra.inbox_sweep.
+            if getattr(self, "_inbox_sweep_enabled", False):
+                bridge_env["WHATSAPP_INBOX_SWEEP_ENABLED"] = "true"
+                bridge_env["WHATSAPP_INBOX_SWEEP_INTERVAL_MS"] = str(
+                    getattr(self, "_inbox_sweep_interval_ms", 0)
+                )
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
@@ -862,6 +917,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        denied = self._inbox_sweep_outbound_denied()
+        if denied:
+            return denied
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -928,6 +986,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
+        denied = self._inbox_sweep_outbound_denied()
+        if denied:
+            return denied
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -961,6 +1022,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        denied = self._inbox_sweep_outbound_denied()
+        if denied:
+            return denied
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1015,6 +1079,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         remain gateway-owned and add text fallback plus explicit confirmation
         semantics before approval prompts are ever mapped onto polls.
         """
+        denied = self._inbox_sweep_outbound_denied()
+        if denied:
+            return denied
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1099,6 +1166,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a native WhatsApp location pin via the Baileys bridge."""
+        denied = self._inbox_sweep_outbound_denied()
+        if denied:
+            return denied
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1204,6 +1274,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        if self._inbox_sweep_outbound_denied():
+            return
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1539,6 +1611,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
             metadata: Dict[str, Any] = {}
+            if getattr(self, "_inbox_sweep_enabled", False):
+                metadata["whatsapp_inbox_sweep"] = True
+                metadata["whatsapp_inbox_delivery_platform"] = getattr(
+                    self, "_inbox_sweep_delivery_platform", None
+                )
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

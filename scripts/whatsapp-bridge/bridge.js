@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, DEFAULT_CONNECTION_CONFIG, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -33,6 +33,9 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createInboxReceiptBuffer, createInboxSweepController } from './inbox_sweep.js';
+import { createBaileysVersionResolver } from './baileys_version.js';
+import { createReconnectScheduler } from './reconnect_scheduler.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -115,6 +118,23 @@ const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n──────────
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
+
+// Inbox-only sweep mode: capture inbound receipts for a fixed three seconds,
+// then disconnect the WhatsApp companion. Triage and notification occur after
+// disconnect and must never use the sender-facing bridge endpoints.
+const INBOX_SWEEP_ENABLED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.WHATSAPP_INBOX_SWEEP_ENABLED || '').trim().toLowerCase(),
+);
+const INBOX_SWEEP_INTERVAL_MS = Number.parseInt(
+  process.env.WHATSAPP_INBOX_SWEEP_INTERVAL_MS || '0',
+  10,
+);
+const INBOX_SWEEP_WINDOW_MS = 3_000;
+let inboxSweep = null;
+// A locally initiated sweep close can use the interval; a remote 428 must
+// retain normal quick reconnect despite sharing the same status code.
+const intentionalSweepSockets = new WeakSet();
+
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
@@ -264,10 +284,40 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
+const resolveBaileysVersion = createBaileysVersionResolver({
+  fetchVersion: fetchLatestBaileysVersion,
+  fallbackVersion: DEFAULT_CONNECTION_CONFIG.version,
+  timeoutMs: 5_000,
+  onFallback: (reason) => logger.warn({ reason }, 'Using bundled Baileys version fallback'),
+});
 
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+let inboxSweepReceiptBuffer = null;
+
+function enqueueGatewayEvent(event) {
+  messageQueue.push(event);
+  if (messageQueue.length > MAX_QUEUE_SIZE) {
+    messageQueue.shift();
+  }
+}
+
+function captureInboxReceipt(event) {
+  if (inboxSweepReceiptBuffer) {
+    if (!inboxSweepReceiptBuffer.capture(event)) {
+      console.warn('[bridge] inbox sweep receipt buffer is full; dropped newest receipt');
+    }
+  } else {
+    enqueueGatewayEvent(event);
+  }
+}
+
+function rejectInboxSweepOutbound(res) {
+  if (!INBOX_SWEEP_ENABLED) return false;
+  res.status(403).json({ error: 'WhatsApp inbox sweep mode is receive-only' });
+  return true;
+}
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -373,10 +423,7 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     botIds: [],
     timestamp: Math.floor(Date.now() / 1000),
   };
-  messageQueue.push(event);
-  if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
-  }
+  captureInboxReceipt(event);
 }
 
 function rememberSentId(id) {
@@ -385,6 +432,32 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+const reconnectScheduler = createReconnectScheduler({
+  start: startSocket,
+  onError: (err) => logger.error({ err }, 'WhatsApp socket start failed; retrying'),
+});
+
+if (INBOX_SWEEP_ENABLED) {
+  if (!Number.isSafeInteger(INBOX_SWEEP_INTERVAL_MS) || INBOX_SWEEP_INTERVAL_MS <= INBOX_SWEEP_WINDOW_MS) {
+    throw new Error('WHATSAPP_INBOX_SWEEP_INTERVAL_MS must exceed the fixed 3000ms inbox sweep window');
+  }
+  inboxSweep = createInboxSweepController({
+    reconnectIntervalMs: INBOX_SWEEP_INTERVAL_MS,
+    windowMs: INBOX_SWEEP_WINDOW_MS,
+    closeSocket: () => {
+      if (sock && connectionState === 'connected') {
+        const sweepSocket = sock;
+        intentionalSweepSockets.add(sweepSocket);
+        sweepSocket.end(new Boom('Inbox sweep window complete', { statusCode: 428 }));
+      }
+    },
+    reconnect: () => { reconnectScheduler.schedule(0); },
+  });
+  inboxSweepReceiptBuffer = createInboxReceiptBuffer({
+    deliver: enqueueGatewayEvent,
+    onDeliveryError: (error) => logger.warn({ error }, 'Inbox sweep receipt delivery failed'),
+  });
+}
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -395,9 +468,9 @@ function emitPairEvent(event) {
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveBaileysVersion();
 
-  sock = makeWASocket({
+  const activeSocket = makeWASocket({
     version,
     auth: state,
     logger,
@@ -413,10 +486,15 @@ async function startSocket() {
       return { conversation: '' };
     },
   });
+  sock = activeSocket;
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  activeSocket.ev.on('creds.update', () => {
+    if (sock !== activeSocket) return;
+    saveCreds();
+    lidToPhone = buildLidMap();
+  });
 
-  sock.ev.on('connection.update', (update) => {
+  activeSocket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -430,8 +508,11 @@ async function startSocket() {
     }
 
     if (connection === 'close') {
+      if (sock !== activeSocket) return;
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const wasIntentionalSweepDisconnect = intentionalSweepSockets.delete(activeSocket);
       connectionState = 'disconnected';
+      if (inboxSweepReceiptBuffer) inboxSweepReceiptBuffer.release();
 
       if (reason === DisconnectReason.loggedOut) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
@@ -439,8 +520,15 @@ async function startSocket() {
           console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         }
         process.exit(1);
+      } else if (wasIntentionalSweepDisconnect && inboxSweep) {
+        emitPairEvent({ event: 'disconnected', reason, inboxSweep: true });
+        if (!PAIR_JSON) {
+          console.log('↻ Inbox sweep complete. Next connection attempt remains anchored to the prior open.');
+        }
+        inboxSweep.closed({ intentional: true, reason });
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
+        // 515 = restart requested (common after pairing). Remote 428/network
+        // closes retain fast recovery and never complete an inbox sweep.
         emitPairEvent({ event: 'disconnected', reason });
         if (!PAIR_JSON) {
           if (reason === 515) {
@@ -449,19 +537,27 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        if (inboxSweep) {
+          inboxSweep.closed({ intentional: false, reason });
+        } else {
+          reconnectScheduler.schedule(reason === 515 ? 1000 : 3000);
+        }
       }
     } else if (connection === 'open') {
+      if (sock !== activeSocket) return;
       connectionState = 'connected';
-      const connectedUser = sock?.user
+      const connectedUser = activeSocket?.user
         ? {
-            id: sock.user.id || null,
-            name: sock.user.name || sock.user.verifiedName || null,
+            id: activeSocket.user.id || null,
+            name: activeSocket.user.name || activeSocket.user.verifiedName || null,
           }
         : null;
       emitPairEvent({ event: 'connected', user: connectedUser });
       if (!PAIR_JSON) {
         console.log('✅ WhatsApp connected!');
+      }
+      if (inboxSweep && !PAIR_ONLY) {
+        inboxSweep.connected();
       }
       if (PAIR_ONLY) {
         if (!PAIR_JSON) {
@@ -473,7 +569,8 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.update', async (updates) => {
+  activeSocket.ev.on('messages.update', async (updates) => {
+    if (sock !== activeSocket) return;
     for (const { key, update } of updates || []) {
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
@@ -524,7 +621,8 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  activeSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (sock !== activeSocket) return;
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -755,7 +853,8 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
-      messageQueue.push(event);
+      captureInboxReceipt(event);
+      if (inboxSweep) inboxSweep.receivedInbound();
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
@@ -816,6 +915,7 @@ app.get('/messages', (req, res) => {
 
 // Send a message
 app.post('/send', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -855,6 +955,7 @@ app.post('/send', async (req, res) => {
 
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -889,6 +990,7 @@ app.post('/edit', async (req, res) => {
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -990,6 +1092,7 @@ app.post('/send-media', async (req, res) => {
 // approvals need text fallback and explicit confirmation semantics above this
 // low-level transport helper.
 app.post('/send-poll', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1012,6 +1115,7 @@ app.post('/send-poll', async (req, res) => {
 
 // Send native WhatsApp location pin
 app.post('/send-location', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -1034,6 +1138,7 @@ app.post('/send-location', async (req, res) => {
 
 // Typing indicator
 app.post('/typing', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
@@ -1052,6 +1157,7 @@ app.post('/typing', async (req, res) => {
 // Mark an inbound message as read only after the Python adapter has accepted
 // it through the authoritative DM/group/mention intake policy.
 app.post('/read', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
@@ -1145,6 +1251,6 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    reconnectScheduler.schedule(0);
   });
 }
