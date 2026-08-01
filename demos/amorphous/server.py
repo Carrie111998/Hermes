@@ -250,10 +250,10 @@ def run_workflow(wf_id: str, req: WorkflowRunRequest):
     return run
 
 
-# ---------- layout (user drag/hide) ----------
+# ---------- layout (user drag/resize/hide — saved VERBATIM, no repack) ----------
 @app.post("/api/layout")
 def save_layout(body: LayoutSave):
-    spec = apply_mutations(body.spec, [])  # reflow + sanitize
+    spec = {k: v for k, v in body.spec.items() if k != "_meta"}
     version = store.save_layout(body.user_id, spec, source="user")
     return {"ok": True, "version": version}
 
@@ -381,10 +381,14 @@ def sse_events():
 
 # ---------- pages ----------
 _NO_CACHE = {"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"}
+_DIST = HERE / "web" / "dist"
 
 
 @app.get("/")
 def index(user: str = DEFAULT_USER):
+    spa = _DIST / "index.html"
+    if spa.exists():
+        return FileResponse(spa, headers=_NO_CACHE)
     if store.get_active_layout(user) is None:
         return RedirectResponse(f"/onboarding?user={user}", headers=_NO_CACHE)
     return FileResponse(HERE / "static" / "index.html", headers=_NO_CACHE)
@@ -392,6 +396,9 @@ def index(user: str = DEFAULT_USER):
 
 @app.get("/onboarding")
 def onboarding_page():
+    spa = _DIST / "index.html"
+    if spa.exists():
+        return FileResponse(spa, headers=_NO_CACHE)
     return FileResponse(HERE / "static" / "onboarding.html", headers=_NO_CACHE)
 
 
@@ -414,6 +421,8 @@ def create_app(db_path: str | Path, curator_interval_s: int = 6 * 3600) -> FastA
     store = Store(db_path)
     _curator_state["interval_s"] = curator_interval_s
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+    if (_DIST / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
     return app
 
 

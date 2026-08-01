@@ -232,11 +232,18 @@ def apply_mutations(spec: dict, mutations: list[dict]) -> dict:
 
 
 def _reflow(spec: dict) -> None:
-    """Skyline packer: place each visible component at the leftmost-topmost
-    position it fits. No gaps, works with mixed sizes, preserves list order
-    as priority."""
+    """Position-preserving placement: components that already carry col/row are
+    LEFT ALONE (the user may have dragged them there). Only components missing
+    coordinates (fresh adds) are skyline-packed into free space. The frontend
+    grid (react-grid-layout) resolves any residual overlap by vertical
+    compaction, so we never fight user-chosen positions."""
     columns = spec.get("grid", {}).get("columns", 12)
     occupied: set[tuple[int, int]] = set()
+
+    def mark(col: int, row: int, w: int, h: int) -> None:
+        for cc in range(col, col + w):
+            for rr in range(row, row + h):
+                occupied.add((cc, rr))
 
     def fits(col: int, row: int, w: int, h: int) -> bool:
         if col + w > columns:
@@ -244,20 +251,27 @@ def _reflow(spec: dict) -> None:
         return all((c, r) not in occupied
                    for c in range(col, col + w) for r in range(row, row + h))
 
+    pending = []
     for comp in spec.get("components", []):
         if comp.get("hidden"):
             continue
         w = max(1, min(int(comp.get("w", 3)), columns))
         h = max(1, int(comp.get("h", 1)))
+        if comp.get("col") is not None and comp.get("row") is not None:
+            mark(int(comp["col"]), int(comp["row"]), w, h)
+        else:
+            pending.append((comp, w, h))
+
+    for comp, w, h in pending:
         row = 0
-        placed = False
-        while not placed:
+        while True:
+            placed = False
             for col in range(0, columns - w + 1):
                 if fits(col, row, w, h):
                     comp["col"], comp["row"] = col, row
-                    for cc in range(col, col + w):
-                        for rr in range(row, row + h):
-                            occupied.add((cc, rr))
+                    mark(col, row, w, h)
                     placed = True
                     break
+            if placed:
+                break
             row += 1

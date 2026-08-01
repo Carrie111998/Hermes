@@ -1,0 +1,67 @@
+@import "tailwindcss";
+@import "react-grid-layout/css/styles.css";
+@import "react-resizable/css/styles.css";
+
+@theme {
+  --color-background: #0a0a0b;
+  --color-surface: #111113;
+  --color-surface-2: #18181b;
+  --color-line: #232326;
+  --color-line-2: #2e2e33;
+  --color-ink: #f4f4f5;
+  --color-ink-2: #b6b8bf;
+  --color-ink-3: #7b7e87;
+  --color-gold: #e6c368;
+  --color-gold-ink: #1a1610;
+  --color-teal: #45d5c0;
+  --color-red: #ff7a70;
+  --color-green: #5fdd8d;
+  --font-sans: "Geist", "Inter", "SF Pro Text", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", monospace;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--color-line-2); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+* { scrollbar-width: thin; scrollbar-color: var(--color-line-2) transparent; }
+
+/* react-grid-layout theming */
+.react-grid-item.react-grid-placeholder {
+  background: color-mix(in srgb, var(--color-gold) 22%, transparent) !important;
+  border: 1px dashed color-mix(in srgb, var(--color-gold) 60%, transparent);
+  border-radius: 12px;
+  opacity: 1 !important;
+}
+.react-grid-item > .react-resizable-handle {
+  opacity: 0;
+  transition: opacity .15s;
+}
+.react-grid-item:hover > .react-resizable-handle { opacity: .7; }
+.react-grid-item > .react-resizable-handle::after {
+  border-color: var(--color-ink-3) !important;
+  width: 7px; height: 7px;
+}
+.react-grid-item.react-draggable-dragging {
+  z-index: 30;
+  box-shadow: 0 18px 60px rgba(0,0,0,.6);
+}
+
+.shimmer {
+  background: linear-gradient(90deg, #202024 25%, #2b2b31 50%, #202024 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.3s infinite;
+}
+@keyframes shimmer { to { background-position: -200% 0; } }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { display: inline-block; animation: spin 1s linear infinite; }
