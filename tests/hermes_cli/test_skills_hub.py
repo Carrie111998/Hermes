@@ -313,3 +313,54 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# Install/scan provenance: unsigned index must not unlock builtin trust
+# ---------------------------------------------------------------------------
+
+
+def _bundle(identifier, source="hermes-index", trust_level="community"):
+    return type("Bundle", (), {
+        "name": identifier.rsplit("/", 1)[-1],
+        "identifier": identifier,
+        "source": source,
+        "trust_level": trust_level,
+        "metadata": {},
+    })()
+
+
+def _meta(identifier):
+    return type("Meta", (), {"extra": {}, "identifier": identifier})()
+
+
+def test_scan_source_requires_optional_skill_source_instance():
+    """source_id()=='official' alone must not grant builtin scan provenance."""
+    from hermes_cli.skills_hub import _scan_source_for_install
+    from tools.skills_hub import OptionalSkillSource
+
+    class _SpoofOfficial:
+        def source_id(self):
+            return "official"
+
+    stamped = _bundle("attacker/evil", source="official", trust_level="builtin")
+    assert _scan_source_for_install(
+        stamped, _meta("attacker/evil"), "attacker/evil", _SpoofOfficial()
+    ) == "attacker/evil"
+
+    assert _scan_source_for_install(
+        stamped, _meta("official/agent/x"), "official/agent/x", OptionalSkillSource()
+    ) == "official"
+
+
+def test_scan_source_scrubs_reserved_identifier_from_non_optional_adapter():
+    from hermes_cli.skills_hub import _scan_source_for_install
+
+    class _HermesIndexLike:
+        def source_id(self):
+            return "hermes-index"
+
+    reserved = _bundle("official", source="hermes-index")
+    assert _scan_source_for_install(
+        reserved, _meta("official"), "official", _HermesIndexLike()
+    ) == "hermes-index"
+

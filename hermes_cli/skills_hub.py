@@ -158,14 +158,15 @@ def _is_official_optional_adapter(matched_source) -> bool:
 
     Bundle ``source`` / index metadata strings are not provenance: adapters such
     as HermesIndexSource can stamp ``source="official"`` onto third-party
-    GitHub content. Builtin install trust must follow the adapter identity.
+    GitHub content. Builtin install trust must follow the concrete adapter
+    class — another SkillSource that merely returns ``source_id() == "official"``
+    must not unlock builtin policy.
     """
     if matched_source is None:
         return False
-    source_id = getattr(matched_source, "source_id", None)
-    if not callable(source_id):
-        return False
-    return source_id() == "official"
+    from tools.skills_hub import OptionalSkillSource
+
+    return isinstance(matched_source, OptionalSkillSource)
 
 
 _RESERVED_SCAN_PROVENANCE = frozenset({"official", "agent-created"})
