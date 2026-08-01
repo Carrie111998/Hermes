@@ -308,6 +308,48 @@ class TestTelegramTokens:
         assert "ABCDEfghij" not in result
 
 
+class TestInterruptDebugLogRedaction:
+    """#75461: both interrupt_debug.log write sites in cli.py route their
+    message values through redact_sensitive_text(force=True) before the
+    existing 60-char truncation. force=True is mandatory because the file
+    is persistent and must never hold a raw credential even when the user
+    has disabled global logging redaction (security.redact_secrets: false)."""
+
+    # Telegram bot token shape that triggered the original leak.
+    TOKEN = "1234567890:" + "A" * 35
+
+    def test_force_masks_token(self):
+        """The contract both CLI write sites rely on: force=True masks a
+        Telegram-token-shaped payload."""
+        result = redact_sensitive_text(self.TOKEN, force=True)
+        assert "A" * 35 not in result
+        assert "1234567890:***" in result
+
+    def test_force_masks_even_when_redaction_disabled(self, monkeypatch):
+        """Crucial: the persistent debug file must not leak a credential when
+        the user has turned off global redaction. Without force=True the
+        function returns the input unchanged (agent/redact.py:687-688)."""
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        result = redact_sensitive_text(self.TOKEN, force=True)
+        assert "A" * 35 not in result
+        assert "1234567890:***" in result
+
+    def test_truncation_happens_after_redaction(self):
+        """Both CLI sites apply [:60] after redaction. A long payload whose
+        secret sits near the start must still be masked — the secret cannot
+        survive merely because it falls within the first 60 chars."""
+        payload = self.TOKEN + " trailing context " + "x" * 80
+        truncated = redact_sensitive_text(payload, force=True)[:60]
+        assert "A" * 35 not in truncated
+
+    def test_non_string_payload_coerced_and_masked(self):
+        """Both CLI sites call str() on the payload before redacting; the
+        dict payload path (interrupt queue) must not leak either."""
+        payload = {"msg": self.TOKEN}
+        result = redact_sensitive_text(str(payload), force=True)
+        assert "A" * 35 not in result
+
+
 class TestPassthrough:
     def test_empty_string(self):
         assert redact_sensitive_text("") == ""
