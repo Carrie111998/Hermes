@@ -17,6 +17,27 @@ FIXTURE = Path(
     )
 )
 
+_ISSUE_REPRODUCTION_FALLBACK = {
+    "platform": "Windows 11",
+    "command": "hermes update",
+    "python_version": "3.11.15",
+    "sqlite_version": "3.50.4",
+    "journal_mode": "delete",
+    "quick_check": "ok",
+    "uv_catalog": [
+        "cpython-3.11.15-windows-x86_64-none",
+        "cpython-3.11.14-windows-x86_64-none",
+    ],
+}
+
+
+def _issue_reproduction() -> dict:
+    if FIXTURE.is_file():
+        return json.loads(FIXTURE.read_text(encoding="utf-8"))
+    if "HERMES_76106_REPRO" in os.environ:
+        raise FileNotFoundError(FIXTURE)
+    return _ISSUE_REPRODUCTION_FALLBACK
+
 
 def _runtime_info(executable: Path, sqlite=(3, 50, 4), *, source="vulnerable"):
     from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo
@@ -106,7 +127,7 @@ def test_issue_76106_repeated_update_skips_same_vulnerable_artifact(tmp_path, mo
     """The issue artifact drives two real repair/reporting invocations."""
     import hermes_cli.managed_uv as managed_uv
 
-    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    fixture = _issue_reproduction()
     assert fixture["platform"] == "Windows 11"
     assert fixture["python_version"] == "3.11.15"
     assert fixture["sqlite_version"] == "3.50.4"
@@ -232,6 +253,79 @@ def test_malformed_unavailable_marker_fails_open(tmp_path, monkeypatch):
     assert result.status == "unavailable"
     assert len([call for call in calls if "install" in call]) == 1
     assert marker.read_bytes() != b"\xff"
+
+
+def test_malformed_catalog_is_not_cached(tmp_path, monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+
+    _windows_hermetic(monkeypatch)
+    root, _ = _runtime_install(tmp_path)
+    original_run, calls = _uv_process(
+        monkeypatch, uv_version="0.8.4", candidate_sqlite=(3, 50, 4)
+    )
+
+    def malformed_catalog(command, **kwargs):
+        if "list" in command:
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(managed_uv.subprocess, "run", malformed_catalog)
+    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", Mock())
+
+    first = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
+    second = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
+
+    marker = root / ".hermes-runtime" / "python" / "unavailable-artifact.json"
+    assert first.status == "failed"
+    assert second.status == "failed"
+    assert not marker.exists()
+    assert len([call for call in calls if "install" in call]) == 2
+
+
+def test_semantically_malformed_marker_fails_open(tmp_path, monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+
+    _windows_hermetic(monkeypatch)
+    root, _ = _runtime_install(tmp_path)
+    marker = root / ".hermes-runtime" / "python" / "unavailable-artifact.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "uv_path": str(Path("uv.exe").resolve()),
+                "uv_version": "uv 0.8.4",
+                "platform": "Windows",
+                "machine": "AMD64",
+                "requested_python": "3.11",
+                "live_runtime": {
+                    "python_version": [3, 11, 15],
+                    "sqlite_version": [3, 50, 4],
+                    "sqlite_version_string": "3.50.4",
+                    "sqlite_source_id": "vulnerable",
+                },
+                "rejected_candidates": [
+                    {
+                        "python_version": [3, 11, 15],
+                        "sqlite_version": [3, 50, 4],
+                        "sqlite_version_string": None,
+                        "sqlite_source_id": "vulnerable",
+                        "executable": "candidate",
+                        "base_prefix": "candidate",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, calls = _uv_process(monkeypatch, uv_version="0.8.4", candidate_sqlite=(3, 50, 4))
+    monkeypatch.setattr(managed_uv, "_refresh_managed_uv_catalog", lambda *_: False)
+
+    result = managed_uv.repair_vulnerable_runtime("uv.exe", project_root=root)
+
+    assert result.status == "unavailable"
+    assert len([call for call in calls if "install" in call]) == 1
 
 
 def test_safe_runtime_clears_unavailable_marker(tmp_path, monkeypatch):

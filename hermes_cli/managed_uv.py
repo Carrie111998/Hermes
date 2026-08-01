@@ -534,10 +534,12 @@ def _list_available_patches(
         if result.returncode != 0 or not result.stdout.strip():
             return _PatchQueryResult(complete=False)
         entries = json.loads(result.stdout)
+        if not isinstance(entries, list):
+            return _PatchQueryResult(complete=False)
         versions: list[tuple[int, int, int]] = []
         for entry in entries:
             if not isinstance(entry, dict):
-                continue
+                return _PatchQueryResult(complete=False)
             # Only default/cpython builds -- skip pypy/graalpy/freethreaded
             # variants, which aren't what this repair path wants.
             if entry.get("implementation") not in (None, "cpython"):
@@ -550,7 +552,7 @@ def _list_available_patches(
                     (int(parts["major"]), int(parts["minor"]), int(parts["patch"]))
                 )
             except (KeyError, TypeError, ValueError):
-                continue
+                return _PatchQueryResult(complete=False)
         # Deduplicate (list --all-versions can repeat a version across
         # platforms/arches if filtering above didn't fully narrow it) and
         # sort newest-first.
@@ -653,7 +655,12 @@ def _attempt_install_generation(
         _remove_tree(generation, boundary=python_root)
         return _AttemptInstallResult.failed("path-boundary violation")
 
-    candidate = probe_sqlite_runtime(python)
+    try:
+        candidate = probe_sqlite_runtime(python)
+    except Exception as exc:
+        logger.warning("could not probe candidate Python runtime: %s", exc)
+        _remove_tree(generation, boundary=python_root)
+        return _AttemptInstallResult.failed("probe failed")
     if candidate is None:
         logger.warning("could not probe candidate Python runtime: %s", python)
         _remove_tree(generation, boundary=python_root)
@@ -1101,17 +1108,32 @@ def _runtime_from_identity(payload: object) -> SQLiteRuntimeInfo | None:
     if not isinstance(payload, dict):
         return None
     try:
-        python_version = tuple(int(value) for value in payload["python_version"])
-        sqlite_version = tuple(int(value) for value in payload["sqlite_version"])
-        if len(python_version) != 3 or len(sqlite_version) != 3:
+        raw_python_version = payload["python_version"]
+        raw_sqlite_version = payload["sqlite_version"]
+        if (
+            not isinstance(raw_python_version, list)
+            or not isinstance(raw_sqlite_version, list)
+            or len(raw_python_version) != 3
+            or len(raw_sqlite_version) != 3
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in (*raw_python_version, *raw_sqlite_version)
+            )
+            or not isinstance(payload["sqlite_version_string"], str)
+            or not isinstance(payload["sqlite_source_id"], str)
+            or not isinstance(payload.get("executable"), str)
+            or not isinstance(payload.get("base_prefix"), str)
+        ):
             return None
+        python_version = tuple(raw_python_version)
+        sqlite_version = tuple(raw_sqlite_version)
         return SQLiteRuntimeInfo(
-            executable=Path(str(payload.get("executable", ""))),
-            base_prefix=Path(str(payload.get("base_prefix", ""))),
+            executable=Path(payload["executable"]),
+            base_prefix=Path(payload["base_prefix"]),
             python_version=python_version,
             sqlite_version=sqlite_version,
-            sqlite_version_string=str(payload["sqlite_version_string"]),
-            sqlite_source_id=str(payload["sqlite_source_id"]),
+            sqlite_version_string=payload["sqlite_version_string"],
+            sqlite_source_id=payload["sqlite_source_id"],
         )
     except (KeyError, TypeError, ValueError):
         return None
