@@ -35,7 +35,7 @@ import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, buildDesktopBackendPath, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   canImportHermesCli,
@@ -3256,7 +3256,13 @@ async function applyUpdatesPosixInApp(opts: any) {
   const env: Record<string, string> = {
     HERMES_HOME,
     PYTHONUNBUFFERED: '1',
-    PATH: pathWithHermesManagedNode(path.join(updateRoot, 'venv', 'bin'))
+    // GUI-launched macOS apps inherit a Finder/Dock-sanitized PATH
+    // (/usr/bin:/bin:/usr/sbin:/sbin) that misses Homebrew (/opt/homebrew/bin)
+    // and user-installed CLIs — yet `hermes desktop --build-only` needs npm on
+    // PATH to rebuild the desktop shell. buildDesktopBackendPath adds the
+    // hermes-managed Node dir, venv/bin, the caller's PATH, and the sane
+    // POSIX fallback surface (incl. Homebrew), de-duplicated.
+    PATH: buildDesktopBackendPath({ hermesHome: HERMES_HOME, venvRoot: path.join(updateRoot, 'venv') })
   }
 
   // `hermes update` reaps stale `hermes serve` backends (a code update
