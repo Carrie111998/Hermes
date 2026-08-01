@@ -8252,7 +8252,7 @@ def test_file_attach_fallback_ref_survives_session_key_and_cwd_change(monkeypatc
         provider = ""
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["prompt"] = prompt
             return {
