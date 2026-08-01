@@ -512,24 +512,19 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         )
 
         if msg_type == "image":
-            # Fire-and-forget: download the PicUrl in the background so the
-            # callback acknowledgement returns immediately.  WeCom retries
-            # callbacks on timeout (30s) — cache_image_from_url can take that
-            # long on slow networks.  The image arrives as a later message
-            # in the queue once downloaded.
+            # Return None so _handle_callback does NOT queue a placeholder
+            # event.  The image is downloaded in the background and queued
+            # as a single PHOTO event when the download completes — this
+            # avoids producing two agent turns for one inbound image
+            # (sweeper review: double-event bug).
             pic_url = root.findtext("PicUrl", default="")
             media_id = root.findtext("MediaId", default="")
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._cache_and_queue_image(pic_url, media_id, source, msg_id, xml_text)
             )
-            # Return a placeholder text event so the ACK is immediate.
-            return MessageEvent(
-                text="[图片]",
-                message_type=MessageType.PHOTO,
-                source=source,
-                raw_message=xml_text,
-                message_id=msg_id,
-            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return None
 
         content = root.findtext("Content", default="").strip()
         if not content and msg_type == "event":
@@ -551,16 +546,24 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         msg_id: str,
         xml_text: str,
     ) -> None:
-        """Download an inbound image in the background and queue it."""
+        """Download an inbound image and queue exactly one PHOTO event.
+
+        Uses the shared ``cache_image_from_url`` helper from base.py which
+        provides SSRF protection, bounded reads, image validation, and
+        retry with exponential backoff (sweeper review: security).
+        """
         cached_path = None
         if pic_url:
             try:
-                cached_path = await self._cache_image_from_url(pic_url, media_id)
+                # Reuse the shared, SSRF-safe media cache helper rather
+                # than a bare httpx.get + write_bytes (sweeper review).
+                from gateway.platforms.base import cache_image_from_url
+                cached_path = await cache_image_from_url(pic_url, ext=".jpg")
             except Exception as exc:
                 logger.warning("[WecomCallback] Inbound image download failed: %s", exc)
 
         event = MessageEvent(
-            text="[图片]" if not cached_path else "",
+            text="" if cached_path else "[图片]",
             message_type=MessageType.PHOTO,
             source=source,
             raw_message=xml_text,
@@ -568,30 +571,6 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             media_urls=[cached_path] if cached_path else [],
         )
         await self._message_queue.put(event)
-
-    async def _cache_image_from_url(self, url: str, media_id: str) -> Optional[str]:
-        """Download an image from PicUrl and cache it locally."""
-        import hashlib
-
-        if not url:
-            return None
-        # Use the configured media cache directory.
-        cache_dir = Path(os.environ.get("HERMES_MEDIA_CACHE_DIR", "/tmp/hermes-media-cache"))
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        # Derive a stable filename from the URL / media_id.
-        key = media_id or url
-        ext = ".jpg"  # WeCom PicUrl images are JPEG
-        safe_name = hashlib.sha256(key.encode()).hexdigest()[:16] + ext
-        dest = cache_dir / safe_name
-        if dest.exists():
-            return str(dest)
-
-        resp = await self._http_client.get(url)
-        if resp.status_code != 200:
-            logger.warning("[WecomCallback] PicUrl download returned %s", resp.status_code)
-            return None
-        dest.write_bytes(resp.content)
-        return str(dest)
 
     def _crypt_for_app(self, app: Dict[str, Any]) -> WXBizMsgCrypt:
         return WXBizMsgCrypt(

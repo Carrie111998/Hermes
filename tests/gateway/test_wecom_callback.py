@@ -69,8 +69,11 @@ class TestWecomCallbackEventConstruction:
         assert event.text == "\u4f60\u597d"
 
     @pytest.mark.asyncio
-    async def test_build_event_image_returns_placeholder_immediately(self):
-        """Inbound image events must return a placeholder without blocking on download."""
+    async def test_build_event_image_returns_none_no_double_event(self):
+        """Inbound image must NOT produce a placeholder event — only the
+        background download task queues a single PHOTO event later.
+        (sweeper review: double-event bug)
+        """
         adapter = WecomCallbackAdapter(_config())
         xml_text = """
         <xml>
@@ -83,13 +86,11 @@ class TestWecomCallbackEventConstruction:
           <MsgId>img001</MsgId>
         </xml>
         """
+        # _build_event must return None for image — no placeholder event
         event = await adapter._build_event(_app(), xml_text)
-        assert event is not None
-        assert event.message_type == MessageType.PHOTO
-        assert event.message_id == "img001"
-        assert event.source.user_id == "zhangsan"
-        # Placeholder text returned immediately — download is fire-and-forget
-        assert event.text == "[图片]"
+        assert event is None
+        # The background download task should be tracked in _background_tasks
+        assert len(adapter._background_tasks) > 0
 
 
 class TestWecomCallbackRouting:
@@ -314,5 +315,35 @@ class TestWecomCallbackImageSend:
         adapter._user_app_map["ww1234567890:alice"] = "test-app"
         result = await adapter.send_image_file("ww1234567890:alice", "../../etc/passwd")
         assert result.success is False
+
+
+class TestWecomCallbackInboundImageFailure:
+    """Regression: cache failure must queue a degraded event, not lose the message."""
+
+    @pytest.mark.asyncio
+    async def test_cache_and_queue_image_failure_still_queues_event(self, monkeypatch):
+        adapter = WecomCallbackAdapter(_config())
+        # Monkey-patch the shared helper to raise (simulates download failure)
+        from gateway.platforms import base as base_mod
+        async def _fail(url, ext=".jpg"):
+            raise RuntimeError("network unreachable")
+        monkeypatch.setattr(base_mod, "cache_image_from_url", _fail)
+
+        from gateway.platforms.base import MessageEvent, MessageType
+        source = adapter.build_source(
+            chat_id="ww1234567890:zhangsan", chat_name="zhangsan",
+            chat_type="dm", user_id="zhangsan", user_name="zhangsan",
+        )
+        await adapter._cache_and_queue_image(
+            "https://example.com/photo.jpg", "MEDIA123",
+            source, "img001", "<xml/>",
+        )
+        # Must have queued exactly one event
+        assert not adapter._message_queue.empty()
+        event = await adapter._message_queue.get()
+        assert event.message_type == MessageType.PHOTO
+        # No cached file → degraded text placeholder
+        assert event.text == "[图片]"
+        assert event.media_urls == []
 
 
