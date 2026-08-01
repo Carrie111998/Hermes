@@ -556,9 +556,13 @@ def _ensure_sherpa_model(root: Optional[Path] = None) -> Path:
 class _SherpaKwsEngine(_Engine):
     """sherpa-onnx open-vocabulary keyword spotting — any typed phrase, zero training.
 
-    The configured ``wake_word.phrase`` is BPE-tokenized at runtime against the
-    model's vocabulary, so "hey hermes", "hey coder", or any other phrase works
-    immediately. Here ``phrase`` is DETECTION config, not a cosmetic label.
+    The configured ``wake_word.phrase`` is tokenized at runtime against the
+    model's vocabulary, so "hey hermes", "hey coder", "你好赫尔墨斯", or any
+    other phrase works immediately. Here ``phrase`` is DETECTION config, not a
+    cosmetic label. English KWS models (gigaspeech) BPE-tokenize via
+    ``bpe.model``; the Chinese models (wenetspeech / zh-en) tokenize by pinyin
+    syllables and ship no ``bpe.model`` — the mode is chosen from what the
+    model directory actually provides.
     """
 
     # sherpa's streaming zipformer consumes arbitrary chunk sizes; 1280
@@ -592,11 +596,18 @@ class _SherpaKwsEngine(_Engine):
 
         phrases = list(phrase_map)
         # Runtime tokenization of the arbitrary phrases — the open-vocab core.
+        # English KWS models (gigaspeech) BPE-tokenize via bpe.model; the
+        # Chinese models (wenetspeech / zh-en) tokenize by pinyin syllables
+        # and ship no bpe.model. Pick the mode from what the model directory
+        # actually provides, so a sherpa.model_dir pointing at a Chinese model
+        # works out of the box. ppinyin also needs pypinyin installed, which
+        # the wake.sherpa lazy-deps entry carries.
+        has_bpe_model = (d / "bpe.model").exists()
         tokens = text2token(
-            [p.upper() for p in phrases],
+            [p.upper() if has_bpe_model else p for p in phrases],
             tokens=str(d / "tokens.txt"),
-            tokens_type="bpe",
-            bpe_model=str(d / "bpe.model"),
+            tokens_type="bpe" if has_bpe_model else "ppinyin",
+            bpe_model=str(d / "bpe.model") if has_bpe_model else None,
         )
         import tempfile
 
@@ -892,6 +903,10 @@ class WakeWordDetector:
         # from "deaf".
         self.audio_silent = False
         self._silent_frames = 0
+        # Set when the stream was opened in callback-bridge mode (WDM-KS /
+        # other backends that reject PortAudio's blocking API). Frames arrive
+        # via a queue instead of stream.read().
+        self._frame_queue: Optional[Any] = None
 
     @property
     def running(self) -> bool:
@@ -957,8 +972,14 @@ class WakeWordDetector:
             startup_errors.append(e)
             ready.set()
             return
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
 
         frame_length = self.engine.frame_length
+        device_rate = SAMPLE_RATE  # overridden by the native-rate fallback
+        read_len = frame_length   # samples per read; scaled in the fallback
         self.input_device_details = _describe_input_device(sd, self.input_device)
         logger.info(
             "wake word: opening microphone device=%s selector=%r hostapi=%s "
@@ -970,6 +991,7 @@ class WakeWordDetector:
             SAMPLE_RATE,
         )
         try:
+            self._frame_queue = None  # reset per open; set again only if callback mode
             stream = sd.InputStream(
                 device=self.input_device,
                 samplerate=SAMPLE_RATE,
@@ -979,10 +1001,107 @@ class WakeWordDetector:
             )
             stream.start()
         except Exception as e:
-            logger.error("wake word: failed to open microphone: %s", e)
-            startup_errors.append(e)
-            ready.set()
-            return
+            # Some host APIs (notably Windows WASAPI) reject non-native sample
+            # rates, and several Windows input devices only work over WASAPI
+            # while their MME/DirectSound paths deliver silence. Fall back to
+            # the device's native default rate and resample frames to 16 kHz
+            # before feeding the engine (numpy linear interp — plenty for
+            # hotword detection).
+            try:
+                dev_info = (
+                    sd.query_devices(self.input_device)
+                    if self.input_device is not None
+                    else sd.query_devices(kind="input")
+                )
+                device_rate = int(dev_info["default_samplerate"])
+                if device_rate <= 0 or device_rate == SAMPLE_RATE:
+                    raise ValueError(f"unsupported fallback rate {device_rate}")
+                read_len = max(1, int(round(frame_length * device_rate / SAMPLE_RATE)))
+                # Some WASAPI devices deliver a silent stream in shared mode
+                # (known PortAudio/Realtek issue) while exclusive mode reads the
+                # hardware directly and works. Exclusive mode requires the
+                # device's native channel count, so capture all channels and
+                # mix down to mono below.
+                native_channels = max(1, int(dev_info.get("max_input_channels") or 1))
+                exclusive_settings = None
+                if os.name == "nt" and hasattr(sd, "WasapiSettings"):
+                    try:
+                        exclusive_settings = sd.WasapiSettings(exclusive=True)
+                    except Exception:
+                        exclusive_settings = None
+                # PortAudio's WASAPI hostapi binds to the thread that first
+                # initialized it. When sounddevice was imported on the main
+                # thread (e.g. by voice mode), opening an exclusive stream from
+                # the wake listener thread fails with -9996 (Invalid device) —
+                # and a failed exclusive attempt poisons the hostapi so even a
+                # later re-init can't recover. Re-initialize PortAudio on THIS
+                # thread BEFORE the exclusive attempt (works, verified), then
+                # fall back to shared mode at the native rate if the device is
+                # genuinely busy or unsupported.
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    pass
+                try:
+                    stream = sd.InputStream(
+                        device=self.input_device,
+                        samplerate=device_rate,
+                        channels=native_channels,
+                        dtype="int16",
+                        blocksize=read_len,
+                        extra_settings=exclusive_settings,
+                    )
+                    stream.start()
+                    if exclusive_settings is not None:
+                        logger.info("wake word: using WASAPI exclusive mode (native %d Hz, re-init)", device_rate)
+                except Exception:
+                    try:
+                        stream = sd.InputStream(
+                            device=self.input_device,
+                            samplerate=device_rate,
+                            channels=native_channels,
+                            dtype="int16",
+                            blocksize=read_len,
+                        )
+                        stream.start()
+                        logger.info("wake word: WASAPI exclusive unavailable — shared %d Hz", device_rate)
+                    except Exception:
+                        # Some backends (notably WDM-KS / kernel streaming, e.g.
+                        # Bluetooth headset hands-free mics) reject PortAudio's
+                        # blocking API entirely and only support callback mode.
+                        # Bridge callback frames through a queue that the main
+                        # loop consumes instead of stream.read().
+                        from queue import Empty, Full, Queue
+
+                        q: Queue = Queue(maxsize=64)
+
+                        def _feed(indata, _frames, _time, _status):
+                            try:
+                                q.put_nowait(indata.copy())
+                            except Full:
+                                pass
+
+                        stream = sd.InputStream(
+                            device=self.input_device,
+                            samplerate=device_rate,
+                            channels=native_channels,
+                            dtype="int16",
+                            blocksize=read_len,
+                            callback=_feed,
+                        )
+                        stream.start()
+                        self._frame_queue = q
+                        logger.info("wake word: WDM-KS callback bridge — native %d Hz", device_rate)
+                logger.info(
+                    "wake word: 16 kHz rejected (%s) — using native %d Hz with resample",
+                    str(e).splitlines()[0], device_rate,
+                )
+            except Exception as e2:
+                logger.error("wake word: failed to open microphone: %s", e2)
+                startup_errors.append(e2)
+                ready.set()
+                return
 
         # Drop any buffered audio/feature state so a resume right after a voice
         # turn can't immediately re-fire on audio captured before the pause (the
@@ -1001,12 +1120,41 @@ class WakeWordDetector:
         try:
             while not self._stop.is_set():
                 try:
-                    data, _overflow = stream.read(frame_length)
+                    if self._frame_queue is not None:
+                        # Callback-bridge mode (WDM-KS): frames arrive via the
+                        # queue fed by the PortAudio callback.
+                        from queue import Empty
+
+                        try:
+                            data = self._frame_queue.get(timeout=0.5)
+                        except Empty:
+                            continue
+                        _overflow = None
+                    else:
+                        data, _overflow = stream.read(read_len)
                 except Exception as e:
                     logger.warning("wake word: stream read error: %s", e)
                     failed = not self._stop.is_set()
                     break
-                frame = data[:, 0] if getattr(data, "ndim", 1) == 2 else data
+                frame = (
+                    np.abs(data).max(axis=1).astype("int16")
+                    if getattr(data, "ndim", 1) == 2 and np is not None
+                    else data
+                )
+                if device_rate != SAMPLE_RATE:
+                    # Native-rate capture (WASAPI fallback): linear-interp
+                    # downsample to the engine's 16 kHz before processing.
+                    import numpy as np
+
+                    n_out = max(1, int(round(len(frame) * SAMPLE_RATE / device_rate)))
+                    try:
+                        frame = np.interp(
+                            np.linspace(0, len(frame) - 1, n_out),
+                            np.arange(len(frame)),
+                            frame.astype(np.float64),
+                        ).astype(np.int16)
+                    except Exception:
+                        pass
                 try:
                     peak = int(abs(frame).max()) if len(frame) else 0
                 except Exception:
@@ -1050,6 +1198,7 @@ class WakeWordDetector:
                 stream.close()
             except Exception:
                 pass
+            self._frame_queue = None
             logger.info("wake word: stream closed")
             if failed and self.on_failure is not None:
                 self.on_failure(self)
