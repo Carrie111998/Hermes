@@ -73,35 +73,29 @@ class TestCustomReasoningWireShape:
     @pytest.mark.parametrize(
         "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
     )
-    def test_enabled_effort_goes_top_level(self, custom_profile, effort):
-        """enabled + effort → TOP-LEVEL reasoning_effort, passed through verbatim.
-
-        GLM-5.2/ARK and OpenAI-compatible reasoning APIs read reasoning_effort
-        as a top-level string, not nested in extra_body. ``max`` is GLM's
-        native deep-reasoning level and must survive.
+    def test_enabled_effort_omitted_for_heterogeneous_endpoints(self, custom_profile, effort):
+        """enabled + effort → omitted. Custom providers are heterogeneous;
+        emitting reasoning_effort breaks LiteLLM and other proxies that
+        reject unknown top-level params (#72649, #72656).
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2"
+            reasoning_config={"enabled": True, "effort": effort}, model="llama3.1"
         )
-        assert tl == {"reasoning_effort": effort}
+        assert tl == {}
         assert "reasoning_effort" not in eb
         assert "think" not in eb
 
-    def test_enabled_without_effort_emits_nothing(self, custom_profile):
-        """enabled but no effort → omit; do NOT force a level the user didn't pick."""
-        eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True}, model="glm-5.2"
-        )
-        assert eb == {}
-        assert tl == {}
 
     def test_does_not_force_think_true_on_enable(self, custom_profile):
         """We must never send think=True on enable — it's Ollama-only and
-        would 400 on GLM/vLLM endpoints that don't recognize it."""
-        eb, _ = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "high"}, model="glm-5.2"
+        would 400 on GLM/vLLM endpoints that don't recognize it. Also
+        reasoning_effort is omitted for heterogeneous custom endpoints."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"}, model="llama3.1"
         )
         assert eb.get("think") is not True
+        assert "reasoning_effort" not in tl
+        assert "reasoning_effort" not in eb
 
 
 class TestCustomReasoningWithNumCtx:
@@ -114,11 +108,4 @@ class TestCustomReasoningWithNumCtx:
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
 
-    def test_num_ctx_with_effort(self, custom_profile):
-        eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "high"},
-            ollama_num_ctx=8192,
-            model="qwen3",
-        )
-        assert eb == {"options": {"num_ctx": 8192}}
-        assert tl == {"reasoning_effort": "high"}
+
