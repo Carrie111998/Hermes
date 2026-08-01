@@ -8,7 +8,11 @@ from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import plugins.memory.openviking as openviking_plugin
-from plugins.memory.openviking import OpenVikingMemoryProvider, _VikingClient
+from plugins.memory.openviking import (
+    OpenVikingMemoryProvider,
+    _OpenVikingHTTPError,
+    _VikingClient,
+)
 
 
 def _write_skill(skills_dir, name, body="Do the thing."):
@@ -125,6 +129,76 @@ def make_prefetch_provider(monkeypatch, responses, **env):
 
 def wait_prefetch(provider, query="What should we recall?", session_id="session-test"):
     return provider.prefetch(query, session_id=session_id)
+
+
+class _FakeResponse:
+    def __init__(self, data, status_code=200):
+        self._data = data
+        self.status_code = status_code
+        self.text = ""
+
+    def json(self):
+        return self._data
+
+
+def _trusted_identity_error():
+    return _OpenVikingHTTPError(
+        "Trusted mode requests must include X-OpenViking-Account", 400
+    )
+
+
+class TestVikingClientTrustedIdentityRetry:
+    """Exercise _send_with_trusted_identity_retry end to end (GET/POST/DELETE
+    and multipart uploads all share this retry wrapper)."""
+
+    def _run_retry(self, client, *, multipart=False):
+        seen = []
+
+        def send(headers):
+            seen.append(dict(headers))
+            if len(seen) == 1:
+                raise _trusted_identity_error()
+            return _FakeResponse({"result": {"ok": True}})
+
+        result = client._send_with_trusted_identity_retry(send, multipart=multipart)
+        assert result == {"result": {"ok": True}}
+        assert len(seen) == 2
+        return seen
+
+    def test_retry_sends_no_spurious_tenant(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        client = _VikingClient("http://openviking.test", api_key="user-key")
+
+        seen = self._run_retry(client)
+
+        for headers in seen:
+            assert "X-OpenViking-Account" not in headers
+            assert "X-OpenViking-User" not in headers
+
+    def test_retry_sends_explicit_tenant_when_configured(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        client = _VikingClient(
+            "http://openviking.test", api_key="root-key", account="default", user="alice"
+        )
+
+        seen = self._run_retry(client)
+
+        assert "X-OpenViking-Account" not in seen[0]
+        assert seen[1]["X-OpenViking-Account"] == "default"
+        assert seen[1]["X-OpenViking-User"] == "alice"
+
+    def test_retry_multipart_strips_content_type_and_tenant(self, monkeypatch):
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        client = _VikingClient("http://openviking.test", api_key="user-key")
+
+        seen = self._run_retry(client, multipart=True)
+
+        for headers in seen:
+            assert "Content-Type" not in headers
+            assert "X-OpenViking-Account" not in headers
 
 
 class TestVikingClientHeaders:
