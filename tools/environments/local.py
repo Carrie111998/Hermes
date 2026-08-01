@@ -1235,6 +1235,21 @@ def _make_run_env(env: dict) -> dict:
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
+
+    # Under multiplexed profiles, resolve passthrough keys through the active
+    # secret scope so that routed profiles receive their own credentials
+    # instead of the default profile's os.environ values (#76163).
+    try:
+        from agent.secret_scope import current_secret_scope, get_secret
+        if current_secret_scope() is not None:
+            for k in list(run_env):
+                if _is_passthrough(k):
+                    scoped_val = get_secret(k)
+                    if scoped_val is not None:
+                        run_env[k] = scoped_val
+    except Exception:
+        pass
+
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))

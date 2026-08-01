@@ -1522,7 +1522,16 @@ class DockerEnvironment(BaseEnvironment):
         forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         for key in sorted(forward_keys):
-            value = os.getenv(key)
+            # Under multiplexed profiles, resolve through the active secret
+            # scope so routed profiles get their own credentials (#76163).
+            try:
+                from agent.secret_scope import current_secret_scope, get_secret
+                if current_secret_scope() is not None:
+                    value = get_secret(key)
+                else:
+                    value = os.getenv(key)
+            except Exception:
+                value = os.getenv(key)
             if not value:
                 value = hermes_env.get(key)
             if value:
