@@ -2,10 +2,11 @@
 import { useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
-  MessageCircle, RefreshCw, EyeOff, Trash2, GripVertical,
+  MessageCircle, RefreshCw, EyeOff, Trash2,
   Send, X, LoaderCircle,
 } from "lucide-react";
 import { DataView, useComponentData } from "./DataViews";
+import { accentFor, SOURCE_ICONS } from "../lib/accents";
 import { post, track, USER, type Component } from "../lib/api";
 
 interface Props {
@@ -18,12 +19,14 @@ interface Props {
 export default function Card({ c, preview, onHide, onRemove }: Props) {
   const { data, err, refresh } = useComponentData(c, preview);
   const [chatOpen, setChatOpen] = useState(false);
+  const accent = accentFor(c.type);
+  const Icon = SOURCE_ICONS[c.props?.source] || accent.icon;
 
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>
         <div
-          className="h-full flex flex-col bg-surface border border-line rounded-xl overflow-hidden hover:border-line-2 transition-colors group"
+          className="relative h-full flex flex-col bg-surface border border-line rounded-xl overflow-hidden hover:border-line-2 hover:shadow-[0_4px_24px_rgba(0,0,0,.35)] transition-all group"
           onClickCapture={() => track("click", c.id)}
           onMouseEnter={() => ((c as any)._t0 = performance.now())}
           onMouseLeave={() => {
@@ -34,9 +37,12 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
             }
           }}
         >
+          <div className={`absolute top-0 left-0 right-0 h-px bg-gradient-to-r ${accent.line} to-transparent`} />
           <div className="drag-handle flex items-center justify-between h-10 px-3 border-b border-line shrink-0 cursor-grab active:cursor-grabbing select-none">
-            <div className="flex items-center gap-1.5 min-w-0">
-              <GripVertical size={13} className="text-ink-3/50 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+            <div className="flex items-center gap-2 min-w-0">
+              <span className={`w-6 h-6 rounded-md ${accent.bg} ${accent.fg} flex items-center justify-center shrink-0`}>
+                <Icon size={13} />
+              </span>
               <span className="text-[13px] font-semibold truncate">{c.title}</span>
             </div>
             {!preview && (

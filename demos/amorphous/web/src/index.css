@@ -6,8 +6,8 @@
   --color-background: #0a0a0b;
   --color-surface: #111113;
   --color-surface-2: #18181b;
-  --color-line: #232326;
-  --color-line-2: #2e2e33;
+  --color-line: #1f1f23;
+  --color-line-2: #2c2c31;
   --color-ink: #f4f4f5;
   --color-ink-2: #b6b8bf;
   --color-ink-3: #7b7e87;
@@ -24,6 +24,10 @@ html, body, #root { height: 100%; }
 body {
   margin: 0;
   background: var(--color-background);
+  background-image:
+    radial-gradient(1200px 500px at 20% -10%, rgba(230,195,104,.05), transparent 60%),
+    radial-gradient(1000px 500px at 90% -10%, rgba(69,213,192,.04), transparent 60%);
+  background-attachment: fixed;
   color: var(--color-ink);
   font-family: var(--font-sans);
   font-size: 14px;
