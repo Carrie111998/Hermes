@@ -81,6 +81,75 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_description_uses_non_default_runtime_limits_everywhere(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.registry import registry
+
+        with (
+            patch("tools.delegate_tool._get_max_concurrent_children", return_value=7),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=4),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+        ):
+            overrides = _build_dynamic_schema_overrides()
+            definition = registry.get_definitions({"delegate_task"})[0]["function"]
+
+        for surface in (overrides["description"], definition["description"]):
+            self.assertIn("up to 7", surface)
+            self.assertIn("max_spawn_depth=4", surface)
+        for parameters in (overrides["parameters"], definition["parameters"]):
+            self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
+            self.assertIn("max_spawn_depth=4", parameters["properties"]["role"]["description"])
+
+    def test_schema_description_is_compact_without_losing_safety_contract(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        desc = _build_dynamic_schema_overrides()["description"]
+
+        self.assertLessEqual(len(desc), 2600)
+        self.assertIn("USE FOR: reasoning-heavy subtasks", desc)
+        self.assertIn(
+            "tasks needing user interaction; or durable work that must survive the "
+            "parent session",
+            desc,
+        )
+        self.assertIn(
+            "Top-level delegations run in the background and re-enter the conversation "
+            "when complete. Do not wait or poll",
+            desc,
+        )
+        self.assertIn(
+            "A batch returns one consolidated result after all children finish", desc
+        )
+        self.assertIn(
+            "Nested orchestrator calls wait synchronously for their workers before synthesis",
+            desc,
+        )
+        self.assertIn("live transcript paths for optional inspection", desc)
+        self.assertIn(
+            "Background delegations are not durable: /stop, /new, or parent process "
+            "exit can cancel or discard them",
+            desc,
+        )
+        self.assertIn(
+            "If the user writes in a non-English language or requests a language, "
+            "tone, or style, include those requirements",
+            desc,
+        )
+        self.assertIn(
+            "For external side effects or shared writes, require a verifiable handle "
+            "and verify it independently from the parent before reporting success",
+            desc,
+        )
+        self.assertIn(
+            "Leaf children cannot call delegate_task, clarify, cronjob, memory, send_message",
+            desc,
+        )
+        self.assertIn(
+            "Children inherit the parent model and fallback chain unless delegation "
+            "model/provider configuration pins them globally",
+            desc,
+        )
+
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
