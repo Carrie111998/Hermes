@@ -15532,9 +15532,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        # Log a length and a checksum prefix instead of the message body.
+        # A raw preview means everything a user writes accumulates in the log
+        # file for good.  The digest still lets you correlate the same message
+        # across log lines.  It is taken over the whole platform message, so it
+        # will not match a checksum computed over any extracted part of it.
+        def _redact(v):
+            v = v or ""
+            if not v:
+                return "<empty>"
+            import hashlib as _h
+            return "<%d chars sha256:%s>" % (len(v), _h.sha256(v.encode("utf-8")).hexdigest()[:12])
+        _msg_preview = _redact(event.text)
         _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _reply_txt = _redact(getattr(event, "reply_to_text", None))
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
