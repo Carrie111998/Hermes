@@ -1677,6 +1677,17 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        # Tear down voice connections BEFORE cancelling the bot task.
+        # VoiceClient.disconnect() sends a voice state update over the main
+        # gateway websocket and waits for the voice websocket to close.  If
+        # the bot task (which runs client.start() / the gateway loop) is
+        # cancelled first, the voice disconnect handshake has no transport
+        # and blocks until the caller's shutdown timeout fires (~5s delay).
+        for guild_id in list(self._voice_clients.keys()):
+            try:
+                await self.leave_voice_channel(guild_id)
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
         # Cancel the bot task before closing the client.  If connect() timed out
         # and returned False, the background client.start() task may still be
         # running; calling client.close() alone is not enough to stop it because
@@ -1684,12 +1695,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # WebSocket handshake is in flight.  Explicitly cancelling the task here
         # ensures the zombie client cannot receive or dispatch any further events.
         await self._cancel_bot_task()
-        # Clean up all active voice connections before closing the client
-        for guild_id in list(self._voice_clients.keys()):
-            try:
-                await self.leave_voice_channel(guild_id)
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
 
         if self._client:
             try:
