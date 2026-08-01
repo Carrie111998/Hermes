@@ -23,21 +23,36 @@ import subprocess
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 
+_CHROME_PATH = next(
+    (
+        path
+        for candidate in ("google-chrome", "chromium", "chromium-browser")
+        if (path := shutil.which(candidate))
+    ),
+    None,
+)
+if _CHROME_PATH is None:
+    mac_chrome = Path(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    )
+    if mac_chrome.is_file():
+        _CHROME_PATH = str(mac_chrome)
+
+
 pytestmark = pytest.mark.skipif(
-    not shutil.which("google-chrome") and not shutil.which("chromium"),
+    _CHROME_PATH is None,
     reason="Chrome/Chromium not installed",
 )
 
 
 def _find_chrome() -> str:
-    for candidate in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(candidate)
-        if path:
-            return path
+    if _CHROME_PATH:
+        return _CHROME_PATH
     pytest.skip("no Chrome binary found")
 
 
@@ -291,6 +306,134 @@ def marketplace_selling_page():
     thread.start()
     host, port = server.server_address
     yield f"http://{host}:{port}/marketplace/you/selling", listing_id
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+
+@pytest.fixture
+def marketplace_crosspost_dialog_page():
+    listing_id = "37276725125275496"
+    group_id = "1333742673375089"
+    unapproved_group_id = "999999999999999"
+    html = f"""<!doctype html>
+<html><head><title>Marketplace crosspost dialog fixture</title></head><body>
+<script>
+  const relayRecords = {{
+    '{listing_id}': {{
+      __typename: 'ProductItem', id: '{listing_id}',
+      for_sale_item: {{__ref: '555555555555555'}}
+    }},
+    'client:root:viewer:marketplace_suggested_crosspost_targets(first:100,for_sale_item_id:"555555555555555",include_target_types:["all"])': {{
+      __typename: 'MarketplaceSuggestedCrosspostTargetsEdgeViewConnection',
+      edges: {{__refs: ['fixture-edge-0', 'fixture-edge-1']}},
+      page_info: {{has_next_page: false}}
+    }},
+    'client:root:viewer:marketplace_suggested_crosspost_targets(first:100,for_sale_item_id:"444444444444444",include_target_types:["all"])': {{
+      __typename: 'MarketplaceSuggestedCrosspostTargetsEdgeViewConnection',
+      edges: {{__refs: []}},
+      page_info: {{has_next_page: false}}
+    }},
+    'fixture-edge-0': {{
+      __typename: 'MarketplaceSuggestedCrosspostTargetsEdgeViewEdge',
+      node: {{__ref: '{group_id}'}}
+    }},
+    'fixture-edge-1': {{
+      __typename: 'MarketplaceSuggestedCrosspostTargetsEdgeViewEdge',
+      node: {{__ref: '{unapproved_group_id}'}}
+    }},
+    '{group_id}': {{
+      __typename: 'Group', id: '{group_id}',
+      name: 'Taipei secondhand group',
+      'profile_picture(height:36,scale:2,width:36)': {{
+        __ref: 'fixture-approved-picture'
+      }}
+    }},
+    '{unapproved_group_id}': {{
+      __typename: 'Group', id: '{unapproved_group_id}',
+      name: 'Taipei secondhand group',
+      'profile_picture(height:36,scale:2,width:36)': {{
+        __ref: 'fixture-unapproved-picture'
+      }}
+    }},
+    'fixture-approved-picture': {{
+      __typename: 'Image',
+      uri: 'https://scontent.example.fbcdn.net/v/group-approved.jpg'
+    }},
+    'fixture-unapproved-picture': {{
+      __typename: 'Image',
+      uri: 'https://scontent.example.fbcdn.net/v/group-unapproved.jpg'
+    }}
+  }};
+  window.require = name => {{
+    if (name !== 'RelayFBEnvironment') throw new Error('unknown module');
+    return {{
+      getStore: () => ({{
+        getSource: () => ({{toJSON: () => relayRecords}})
+      }})
+    }};
+  }};
+</script>
+<article>
+  <a href="/marketplace/item/{listing_id}/">Kolin KD-291M06</a>
+  <button aria-label="List in more places"
+          onclick="document.querySelector('[role=dialog]').hidden=false">
+    List in more places
+  </button>
+</article>
+<div role="dialog" aria-label="List in more places" hidden>
+  <div id="group-list" style="height: 40px; overflow-y: auto">
+    <div id="scroll-content">
+      <div id="destination-list">
+        <div class="row-wrapper">
+          <div role="checkbox" aria-checked="false" style="height: 40px"
+             onclick="this.setAttribute('aria-checked','true')">
+            <span role="button" aria-label="Taipei secondhand group">
+              <img src="https://scontent.example.fbcdn.net/v/group-approved.jpg">
+              Taipei secondhand group
+            </span>
+          </div>
+        </div>
+        <div class="row-wrapper">
+          <div role="checkbox" aria-checked="false" style="height: 40px">
+            <img src="https://scontent.example.fbcdn.net/v/group-unapproved.jpg">
+          Taipei secondhand group
+          </div>
+        </div>
+      </div>
+      <div id="suggested-groups">
+        <h1>Suggested groups you should join</h1>
+        <button aria-label="Join group">Join group</button>
+      </div>
+    </div>
+  </div>
+  <button aria-label="Post" onclick="window.__crosspostSubmitted=true">
+    Post
+  </button>
+</div>
+</body></html>"""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    yield (
+        f"http://{host}:{port}/marketplace/you/selling",
+        listing_id,
+        group_id,
+    )
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
@@ -630,6 +773,255 @@ def test_guarded_marketplace_selling_action_binds_deep_generic_listing_row(
         crosspost_source_token="single-bound-source-token",
     )
     assert single_bound["ok"] is True, single_bound
+
+
+def test_guarded_crosspost_selection_accepts_nested_visible_row_content(
+    chrome_cdp,
+    supervisor_registry,
+    marketplace_crosspost_dialog_page,
+):
+    cdp_url, _port = chrome_cdp
+    page_url, listing_id, group_id = marketplace_crosspost_dialog_page
+    supervisor = supervisor_registry.get_or_start(
+        task_id="pytest-marketplace-crosspost-nested-row",
+        cdp_url=cdp_url,
+    )
+    _fire_on_page(cdp_url, "void 0", page_url=page_url)
+    identity = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": "`${location.href}|${performance.timeOrigin}`",
+            "returnByValue": True,
+        },
+    )["result"]["result"]["value"]
+
+    nodes = supervisor.call_page_cdp(
+        "Accessibility.getFullAXTree"
+    )["result"]["nodes"]
+    direct_id = next(
+        node["backendDOMNodeId"]
+        for node in nodes
+        if node.get("role", {}).get("value") == "button"
+        and node.get("name", {}).get("value") == "List in more places"
+    )
+    opened = supervisor.guarded_dom_action(
+        backend_node_id=direct_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="List in more places",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        crosspost_stage="open_dialog_direct",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert opened["ok"] is True, opened
+
+    dialog_nodes = supervisor.call_page_cdp(
+        "Accessibility.getFullAXTree"
+    )["result"]["nodes"]
+    nested_id = next(
+        node["backendDOMNodeId"]
+        for node in dialog_nodes
+        if node.get("role", {}).get("value") == "button"
+        and node.get("name", {}).get("value") == "Taipei secondhand group"
+    )
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": """
+              (() => {
+                const connection = Object.values(relayRecords).find(
+                  value => value.__typename ===
+                    'MarketplaceSuggestedCrosspostTargetsEdgeViewConnection'
+                );
+                delete connection.page_info;
+              })()
+            """,
+            "returnByValue": True,
+        },
+    )
+    incomplete_connection = supervisor.guarded_dom_action(
+        backend_node_id=nested_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Taipei secondhand group",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        crosspost_stage="select_group",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert incomplete_connection["ok"] is False, incomplete_connection
+    assert "may be truncated" in incomplete_connection["error"]
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": """
+              Object.values(relayRecords).find(
+                value => value.__typename ===
+                  'MarketplaceSuggestedCrosspostTargetsEdgeViewConnection'
+              ).page_info = {has_next_page: false}
+            """,
+            "returnByValue": True,
+        },
+    )
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "relayRecords['fixture-unapproved-picture'].uri = "
+                "relayRecords['fixture-approved-picture'].uri"
+            ),
+            "returnByValue": True,
+        },
+    )
+    ambiguous = supervisor.guarded_dom_action(
+        backend_node_id=nested_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Taipei secondhand group",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        crosspost_stage="select_group",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert ambiguous["ok"] is False, ambiguous
+    assert "no unique authoritative group identity" in ambiguous["error"]
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "relayRecords['fixture-unapproved-picture'].uri = "
+                "'https://scontent.example.fbcdn.net/v/group-unapproved.jpg'"
+            ),
+            "returnByValue": True,
+        },
+    )
+    selected = supervisor.guarded_dom_action(
+        backend_node_id=nested_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Taipei secondhand group",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        crosspost_stage="select_group",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert selected["ok"] is True, selected
+    assert selected["result"]["crosspostGroupId"] == group_id
+    assert selected["result"]["crosspostPreselectedGroupIds"] == []
+
+    checked = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "document.querySelector('[role=checkbox]')"
+                ".getAttribute('aria-checked')"
+            ),
+            "returnByValue": True,
+        },
+    )
+    assert checked["result"]["result"]["value"] == "true"
+
+    submit_nodes = supervisor.call_page_cdp(
+        "Accessibility.getFullAXTree"
+    )["result"]["nodes"]
+    submit_id = next(
+        node["backendDOMNodeId"]
+        for node in submit_nodes
+        if node.get("role", {}).get("value") == "button"
+        and node.get("name", {}).get("value") == "Post"
+    )
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "document.querySelectorAll('[role=checkbox]')[1]"
+                ".setAttribute('aria-checked','true')"
+            ),
+            "returnByValue": True,
+        },
+    )
+    unknown_selected = supervisor.guarded_dom_action(
+        backend_node_id=submit_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Post",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        selected_crosspost_group_ids=[group_id],
+        crosspost_stage="submit",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert unknown_selected["ok"] is False, unknown_selected
+    assert "not bound to an authorized group id" in unknown_selected["error"]
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": """
+              (() => {
+                document.querySelectorAll('[role=checkbox]')[1]
+                  .setAttribute('aria-checked', 'false');
+                const extra = document.createElement('div');
+                extra.id = 'unbound-destination-row';
+                extra.setAttribute('role', 'checkbox');
+                extra.setAttribute('aria-checked', 'false');
+                extra.textContent = 'Lazy destination outside Relay edges';
+                document.querySelector('#destination-list').append(extra);
+              })()
+            """,
+            "returnByValue": True,
+        },
+    )
+    incomplete_layout = supervisor.guarded_dom_action(
+        backend_node_id=submit_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Post",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        selected_crosspost_group_ids=[group_id],
+        crosspost_stage="submit",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert incomplete_layout["ok"] is False, incomplete_layout
+    assert "authoritative destination connection" in incomplete_layout["error"]
+    supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": (
+                "document.querySelector('#unbound-destination-row')"
+                ".remove()"
+            ),
+            "returnByValue": True,
+        },
+    )
+    submitted = supervisor.guarded_dom_action(
+        backend_node_id=submit_id,
+        expected_page_identity=identity,
+        expected_role="button",
+        expected_name="Post",
+        action="click",
+        required_marketplace_listing_id=listing_id,
+        allowed_crosspost_group_ids=[group_id],
+        selected_crosspost_group_ids=[group_id],
+        crosspost_stage="submit",
+        crosspost_source_token="dialog-source-token",
+    )
+    assert submitted["ok"] is True, submitted
+    posted = supervisor.call_page_cdp(
+        "Runtime.evaluate",
+        {
+            "expression": "window.__crosspostSubmitted === true",
+            "returnByValue": True,
+        },
+    )
+    assert posted["result"]["result"]["value"] is True
 
 
 def test_main_frame_alert_detection_and_dismiss(chrome_cdp, supervisor_registry):

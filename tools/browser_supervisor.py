@@ -1033,6 +1033,7 @@ class CDPSupervisor:
                       }
                       let crosspostGroupId = null;
                       let crosspostPreselectedGroupIds = [];
+                      let sourceControl = null;
                       if (requiredListingId) {
                         const listingMatch = location.pathname.match(
                           /^\\/marketplace\\/item\\/([0-9]+)\\/?$/
@@ -1103,7 +1104,6 @@ class CDPSupervisor:
                           return ids;
                         };
                         const flow = this.ownerDocument.__hermesCrosspostFlow;
-                        let sourceControl = null;
                         const bindSourceControl = () => {
                           const listingScopeSelector = [
                             "[data-listing-id]",
@@ -1291,6 +1291,8 @@ class CDPSupervisor:
                           crosspostStage === "select_group"
                           || crosspostStage === "submit"
                         ) {
+                          const normalizeGroupName = value => String(value || "")
+                            .replace(/\\s+/g, " ").trim().toLowerCase();
                           const dialog = this.closest?.('[role="dialog"]');
                           const dialogText = [
                             dialog?.getAttribute("aria-label") || "",
@@ -1323,6 +1325,191 @@ class CDPSupervisor:
                           ) {
                             fail("Marketplace source selection state changed");
                           }
+                          let authoritativeCrosspostRows = null;
+                          const bindAuthoritativeCrosspostRows = () => {
+                            if (authoritativeCrosspostRows) {
+                              return authoritativeCrosspostRows;
+                            }
+                            let records;
+                            try {
+                              records = require("RelayFBEnvironment")
+                                .getStore().getSource().toJSON();
+                            } catch {
+                              fail(
+                                "Facebook cross-post Relay data is unavailable"
+                              );
+                            }
+                            const productItem = records?.[
+                              String(requiredListingId)
+                            ];
+                            const forSaleItemId = productItem
+                              ?.for_sale_item?.__ref;
+                            if (
+                              productItem?.__typename !== "ProductItem"
+                              || String(productItem.id) !== String(
+                                requiredListingId
+                              )
+                              || !/^[0-9]+$/.test(forSaleItemId || "")
+                            ) {
+                              fail(
+                                "Facebook cross-post listing has no authoritative for-sale item binding"
+                              );
+                            }
+                            const connectionNeedle = (
+                              `for_sale_item_id:\"${forSaleItemId}\"`
+                            );
+                            const connections = Object.entries(records || {})
+                              .filter(([key, record]) => (
+                                record?.__typename
+                                  === "MarketplaceSuggestedCrosspostTargetsEdgeViewConnection"
+                                && key.includes(
+                                  "marketplace_suggested_crosspost_targets("
+                                )
+                                && key.includes(connectionNeedle)
+                              ));
+                            if (connections.length !== 1) {
+                              fail(
+                                "Facebook cross-post destination connection is not bound to the active listing"
+                              );
+                            }
+                            const [, connection] = connections[0];
+                            const edgeRefs = connection.edges?.__refs;
+                            const pageInfo = connection.page_info?.__ref
+                              ? records[connection.page_info.__ref]
+                              : connection.page_info;
+                            if (
+                              !Array.isArray(edgeRefs)
+                              || !edgeRefs.length
+                              || pageInfo?.has_next_page !== false
+                            ) {
+                              fail(
+                                "Facebook cross-post destination connection may be truncated"
+                              );
+                            }
+                            const groupDescriptors = edgeRefs.map(edgeRef => {
+                              const edge = records[edgeRef];
+                              const groupId = edge?.node?.__ref;
+                              const group = records[groupId];
+                              if (
+                                !/^[0-9]+$/.test(groupId || "")
+                                || group?.__typename !== "Group"
+                                || String(group.id) !== groupId
+                              ) {
+                                fail(
+                                  "Facebook cross-post connection contains an invalid group record"
+                                );
+                              }
+                              const picturePaths = new Set();
+                              for (const [key, value] of Object.entries(group)) {
+                                if (
+                                  !key.startsWith("profile_picture(")
+                                  || typeof value?.__ref !== "string"
+                                ) continue;
+                                const raw = records[value.__ref]?.uri || "";
+                                try {
+                                  const parsed = new URL(raw, location.href);
+                                  if (parsed.hostname.endsWith("fbcdn.net")) {
+                                    picturePaths.add(parsed.pathname);
+                                  }
+                                } catch {}
+                              }
+                              if (!picturePaths.size) {
+                                fail(
+                                  "Facebook cross-post group record has no profile image identity"
+                                );
+                              }
+                              return {
+                                groupId,
+                                name: normalizeGroupName(group.name),
+                                picturePaths
+                              };
+                            });
+                            if (
+                              new Set(groupDescriptors.map(
+                                descriptor => descriptor.groupId
+                              )).size !== groupDescriptors.length
+                            ) {
+                              fail(
+                                "Facebook cross-post connection repeats a group record"
+                              );
+                            }
+                            const allSelectionControls = [...(
+                              dialog.querySelectorAll([
+                                '[role="checkbox"]',
+                                '[role="menuitemcheckbox"]',
+                                '[role="switch"]', '[role="option"]',
+                                'input[type="checkbox"]'
+                              ].join(", "))
+                            )];
+                            const optionRoots = allSelectionControls.filter(
+                              candidate => !allSelectionControls.some(other =>
+                                other !== candidate && other.contains(candidate)
+                              )
+                            );
+                            if (optionRoots.length !== edgeRefs.length) {
+                              fail(
+                                "Facebook cross-post rows do not match the authoritative destination connection"
+                              );
+                            }
+                            const rowMap = new Map();
+                            const seenGroupIds = new Set();
+                            optionRoots.forEach(option => {
+                              const rowAssetPaths = new Set();
+                              for (const asset of option.querySelectorAll(
+                                "img[src], image"
+                              )) {
+                                const raw = asset.getAttribute("src")
+                                  || asset.getAttribute("xlink:href")
+                                  || asset.getAttributeNS?.(
+                                    "http://www.w3.org/1999/xlink", "href"
+                                  )
+                                  || asset.getAttribute("href") || "";
+                                try {
+                                  const parsed = new URL(raw, location.href);
+                                  if (parsed.hostname.endsWith("fbcdn.net")) {
+                                    rowAssetPaths.add(parsed.pathname);
+                                  }
+                                } catch {}
+                              }
+                              const rowElements = [
+                                option, ...option.querySelectorAll("span, div")
+                              ];
+                              const rowNames = new Set(rowElements.map(
+                                element => normalizeGroupName(element.innerText)
+                              ).filter(Boolean));
+                              const matches = groupDescriptors.filter(
+                                descriptor => (
+                                  rowNames.has(descriptor.name)
+                                  && [...descriptor.picturePaths].some(
+                                    path => rowAssetPaths.has(path)
+                                  )
+                                )
+                              );
+                              if (matches.length !== 1) {
+                                fail(
+                                  "Facebook cross-post row has no unique authoritative group identity"
+                                );
+                              }
+                              const groupId = matches[0].groupId;
+                              if (seenGroupIds.has(groupId)) {
+                                fail(
+                                  "Facebook cross-post rows repeat an authoritative group"
+                                );
+                              }
+                              seenGroupIds.add(groupId);
+                              rowMap.set(option, groupId);
+                            });
+                            const missingAllowedIds = [...allowedIds].filter(
+                              groupId => !seenGroupIds.has(groupId)
+                            );
+                            if (missingAllowedIds.length) {
+                              fail(
+                                "Authorized cross-post groups are absent from Facebook's destination connection"
+                              );
+                            }
+                            authoritativeCrosspostRows = rowMap;
+                            return rowMap;
+                          };
                           const discoverGroupId = control => {
                             const containerSelector = [
                               "label", "li", '[role="checkbox"]',
@@ -1336,6 +1523,7 @@ class CDPSupervisor:
                               '[role="switch"]', 'input[type="checkbox"]'
                             ].join(", ");
                             let node = control;
+                            let sawUniqueSelectionRow = false;
                             for (
                               let depth = 0;
                               node && node !== dialog && depth < 8;
@@ -1352,8 +1540,17 @@ class CDPSupervisor:
                                   && other.contains(candidate)
                                 )
                               );
+                              // Snapshot references often resolve to the
+                              // visible text or image inside Facebook's
+                              // checkbox row. Keep walking until an ancestor
+                              // actually contains the selection control; an
+                              // empty descendant is not ambiguous.
+                              if (!roots.length) continue;
+                              if (roots.length > 1 && sawUniqueSelectionRow) {
+                                return null;
+                              }
                               if (
-                                roots.length !== 1
+                                roots.length > 1
                                 || !(
                                   roots[0] === control
                                   || roots[0].contains(control)
@@ -1364,9 +1561,14 @@ class CDPSupervisor:
                                   "Cross-post option is not a unique selection row"
                                 );
                               }
-                              if (!node.matches?.(containerSelector)) continue;
+                              sawUniqueSelectionRow = true;
+                              const identityNode = node.matches?.(
+                                containerSelector
+                              ) ? node : roots[0].matches?.(containerSelector)
+                                ? roots[0] : null;
+                              if (!identityNode) continue;
                               const ids = new Set();
-                              for (const link of node.querySelectorAll(
+                              for (const link of identityNode.querySelectorAll(
                                 'a[href*="/groups/"]'
                               )) {
                                 const href = link.getAttribute("href") || "";
@@ -1375,8 +1577,8 @@ class CDPSupervisor:
                                 );
                                 if (match) ids.add(match[1]);
                               }
-                              for (const candidate of [node, ...(
-                                node.querySelectorAll(
+                              for (const candidate of [identityNode, ...(
+                                identityNode.querySelectorAll(
                                   "[data-group-id], [data-groupid]"
                                 )
                               )]) {
@@ -1396,6 +1598,17 @@ class CDPSupervisor:
                                   "Cross-post option maps to multiple group ids"
                                 );
                               }
+                              if (!ids.size) {
+                                const authoritativeId = (
+                                  bindAuthoritativeCrosspostRows().get(roots[0])
+                                );
+                                if (authoritativeId) ids.add(authoritativeId);
+                              }
+                              if (ids.size > 1) {
+                                fail(
+                                  "Cross-post option maps to multiple authoritative groups"
+                                );
+                              }
                               if (ids.size === 1) return [...ids][0];
                             }
                             return null;
@@ -1407,6 +1620,12 @@ class CDPSupervisor:
                             + '[role="option"][aria-selected="true"], '
                             + 'input[type="checkbox"]:checked'
                           )];
+                          const controlIsSelected = control => (
+                            control.matches?.('input[type="checkbox"]')
+                              ? Boolean(control.checked)
+                              : control.getAttribute?.("aria-checked") === "true"
+                                || control.getAttribute?.("aria-selected") === "true"
+                          );
                           const actualSelectedIds = new Set();
                           for (const selectedControl of selectedControls) {
                             const selectedId = discoverGroupId(selectedControl);
@@ -1453,60 +1672,19 @@ class CDPSupervisor:
                             const enumeratedGroupIds = new Set();
                             for (const optionRoot of optionRoots) {
                               const optionId = discoverGroupId(optionRoot);
-                              if (
-                                !optionId || enumeratedGroupIds.has(optionId)
-                              ) {
+                              if (!optionId && controlIsSelected(optionRoot)) {
+                                fail(
+                                  "Selected cross-post destination has no authorized identity"
+                                );
+                              }
+                              if (optionId && enumeratedGroupIds.has(optionId)) {
                                 fail(
                                   "Cross-post destination rows are not uniquely enumerable"
                                 );
                               }
-                              enumeratedGroupIds.add(optionId);
+                              if (optionId) enumeratedGroupIds.add(optionId);
                             }
-                            const scrollContainers = new Set();
-                            for (const optionRoot of optionRoots) {
-                              let ancestor = optionRoot.parentElement;
-                              while (ancestor && ancestor !== dialog) {
-                                const style = getComputedStyle(ancestor);
-                                if (
-                                  /(auto|scroll)/.test(style.overflowY)
-                                  && ancestor.scrollHeight
-                                    > ancestor.clientHeight + 1
-                                ) scrollContainers.add(ancestor);
-                                ancestor = ancestor.parentElement;
-                              }
-                            }
-                            const dialogStyle = getComputedStyle(dialog);
-                            if (
-                              /(auto|scroll)/.test(dialogStyle.overflowY)
-                              && dialog.scrollHeight > dialog.clientHeight + 1
-                            ) scrollContainers.add(dialog);
-                            if (scrollContainers.size) {
-                              const setSizes = optionRoots.map(option => Number(
-                                option.getAttribute("aria-setsize")
-                                || option.closest?.("[aria-setsize]")
-                                  ?.getAttribute("aria-setsize")
-                              ));
-                              const positions = optionRoots.map(option => Number(
-                                option.getAttribute("aria-posinset")
-                              ));
-                              const declaredSize = setSizes[0];
-                              const completeAriaSet = (
-                                Number.isInteger(declaredSize)
-                                && declaredSize === optionRoots.length
-                                && setSizes.every(size => size === declaredSize)
-                                && new Set(positions).size === declaredSize
-                                && positions.every(position =>
-                                  Number.isInteger(position)
-                                  && position >= 1
-                                  && position <= declaredSize
-                                )
-                              );
-                              if (!completeAriaSet) {
-                                fail(
-                                  "Cross-post destination list may be virtualized"
-                                );
-                              }
-                            }
+                            bindAuthoritativeCrosspostRows();
                           }
                           if (crosspostStage === "select_group") {
                             const discovered = discoverGroupId(this);
