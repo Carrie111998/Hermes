@@ -441,8 +441,60 @@ class TestAgentMessageInterimDispatch:
             "text": "I'll check the config first.",
         }))
         agent._emit_interim_assistant_message.assert_called_once_with(
-            {"role": "assistant", "content": "I'll check the config first."}
+            {"role": "assistant", "content": "I'll check the config first."},
+            already_streamed=False,
         )
+
+    def test_distinct_streamed_items_settle_against_their_own_deltas(self):
+        delivered = []
+        agent = _make_stub_agent()
+        agent._current_streamed_assistant_text = ""
+        agent._fire_stream_delta = lambda text: setattr(
+            agent,
+            "_current_streamed_assistant_text",
+            agent._current_streamed_assistant_text + text,
+        )
+        agent._emit_interim_assistant_message = (
+            lambda message, **kwargs: delivered.append((message["content"], kwargs))
+        )
+        agent._normalize_interim_visible_text = lambda text: " ".join(text.split())
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"itemId": "commentary", "delta": "Checking first."},
+            }
+        )
+        bridge(
+            _item_completed(
+                {
+                    "type": "agentMessage",
+                    "id": "commentary",
+                    "text": "Checking first.",
+                }
+            )
+        )
+        bridge(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"itemId": "final", "delta": "Done."},
+            }
+        )
+        bridge(
+            _item_completed(
+                {
+                    "type": "agentMessage",
+                    "id": "final",
+                    "text": "Done.",
+                }
+            )
+        )
+
+        assert delivered == [
+            ("Checking first.", {"already_streamed": True}),
+            ("Done.", {"already_streamed": True}),
+        ]
 
     def test_empty_text_does_not_emit_interim(self):
         agent = _make_stub_agent()

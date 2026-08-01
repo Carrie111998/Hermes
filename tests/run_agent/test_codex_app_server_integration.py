@@ -168,6 +168,62 @@ class TestRunConversationCodexPath:
         assert result["final_response"] == "Done."
         assert result["response_previewed"] is False
 
+    def test_distinct_streamed_items_are_each_rendered_once(self, monkeypatch):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            for item_id, text in (
+                ("commentary-message", "I'll inspect it first."),
+                ("final-message", "Done."),
+            ):
+                self._on_event(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"itemId": item_id, "delta": text},
+                    }
+                )
+                self._on_event(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "agentMessage",
+                                "id": item_id,
+                                "text": text,
+                            }
+                        },
+                    }
+                )
+            return TurnResult(
+                final_text="Done.",
+                projected_messages=[{"role": "assistant", "content": "Done."}],
+                turn_id="turn-two-items-1",
+                thread_id="thread-two-items-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-two-items-1",
+        )
+        visible = []
+
+        def deliver_interim(text, *, already_streamed=False):
+            if not already_streamed:
+                visible.append(text)
+
+        agent = _make_codex_agent(
+            stream_delta_callback=visible.append,
+            interim_assistant_callback=deliver_interim,
+        )
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+        if not result["response_previewed"]:
+            visible.append(result["final_response"])
+
+        assert visible == ["I'll inspect it first.", "Done."]
+        assert result["response_previewed"] is True
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

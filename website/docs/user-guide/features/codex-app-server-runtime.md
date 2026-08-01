@@ -411,10 +411,11 @@ Known limitations:
 - **Sub-second cancellation isn't guaranteed.** Mid-stream interrupts (Ctrl+C while codex is responding) are sent via `turn/interrupt`, but if codex has already flushed the final message, you get the response anyway.
 
 Completed app-server messages are surfaced immediately as interim updates. When
-the last update exactly matches the final response, Hermes marks that response
-as already previewed so TUI and messaging clients settle it as one assistant
-message instead of rendering or sending it twice. Distinct mid-turn commentary
-remains separate.
+an update was streamed, Hermes tracks its visible text by app-server item ID and
+settles the matching completed item without rendering it again. When the last
+completed update exactly matches the final response, Hermes also marks that
+response as already previewed so messaging clients do not send it twice.
+Distinct mid-turn commentary remains separate.
 
 If you find a bug, [open an issue](https://github.com/NousResearch/hermes-agent/issues) with the output of `hermes logs --since 5m`. Mention `codex-runtime` in the title so it's easy to triage.
 
