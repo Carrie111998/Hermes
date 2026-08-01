@@ -3,6 +3,8 @@ import { Fragment, memo, type ReactNode, useMemo } from 'react'
 
 import {
   borderLabelWidth,
+  FENCE_CLOSE_RE,
+  FENCE_OPEN_RE,
   innerContentWidth,
   isNarrowPanel,
   truncateToWidth
@@ -63,8 +65,6 @@ const renderMath = (text: string): ReactNode => {
   return out
 }
 
-const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/
-const FENCE_CLOSE_RE = /^\s*(`{3,}|~{3,})\s*$/
 const HR_RE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/
 const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/
 const SETEXT_RE = /^\s{0,3}(=+|-+)\s*$/
@@ -856,7 +856,7 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
         continue
       }
 
-      const fence = line.match(FENCE_RE)
+      const fence = line.match(FENCE_OPEN_RE)
 
       if (fence) {
         const char = fence[1]![0] as '`' | '~'

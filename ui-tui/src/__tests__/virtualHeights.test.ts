@@ -214,4 +214,36 @@ describe('fence-aware virtual heights', () => {
     // panel height — no +1 gap row.
     expect(h).toBeGreaterThanOrEqual(4)
   })
+
+  it('counts `md` / `markdown` fences as prose at the body width, not as a code panel', () => {
+    // The renderer recurses `lang === 'md' || 'markdown'` fences through
+    // `<Md cols={cols}>` instead of painting the rounded CodeBlock panel.
+    // That means: body width is the full body width (no -4 panel
+    // overhead), no top/bottom border rows, and the language label is
+    // not rendered as a separate row. The estimator must mirror that or
+    // it overcounts md/markdown fences by 2 (the missing panel chrome)
+    // and by any inner-width-vs-body-width difference.
+    //
+    // Pre-fix the estimator returned 4 (= 2 wrapped code rows at
+    // bodyWidth - 4 + 2 chrome) for the first case; the renderer
+    // actually renders 2 rows of prose at the full body width.
+    const longLine = 'a'.repeat(30)
+
+    // `md` — 30 chars at bodyWidth 30 (innerW 26 would wrap to 2). At
+    // bodyWidth 30 the 30-char line fits on 1 row. No chrome.
+    const mdText = ['```md', longLine, '```'].join('\n')
+    expect(estimateBodyHeight(mdText, 30, false)).toBe(1)
+
+    // `markdown` — same expectation via the alternate lang string.
+    const markdownText = ['```markdown', longLine, '```'].join('\n')
+    expect(estimateBodyHeight(markdownText, 30, false)).toBe(1)
+
+    // Even at the narrow threshold, no language row is added for a
+    // markdown fence: the renderer paints it as a plain prose block.
+    expect(estimateBodyHeight(mdText, 18, false)).toBe(2) // 30 chars / 18 ≈ 2 rows, no chrome
+
+    // Sanity: a real code-language fence of the same shape still takes
+    // the panel path. 30 chars / innerW 26 → 2 rows + 2 chrome = 4.
+    expect(estimateBodyHeight(['```python', longLine, '```'].join('\n'), 30, false)).toBe(4)
+  })
 })
