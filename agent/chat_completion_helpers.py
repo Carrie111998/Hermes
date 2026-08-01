@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -2068,14 +2068,47 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
-    print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+class FinalSummaryResult(NamedTuple):
+    """Outcome metadata for a tool-free final-response request."""
 
-    summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
+    text: str
+    api_attempts: int
+    already_streamed: bool
+
+
+def _request_final_summary(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    summary_request: str | None = None,
+    failure_response: str | None = None,
+    call_role: str = "iteration_summary",
+    request_id_prefix: str = "iteration-summary",
+    client_reason: str = "iteration_limit_summary",
+    status_message: str | None = None,
+    retry_empty: bool = True,
+    persist_summary_request: bool = True,
+) -> FinalSummaryResult:
+    """Request one tool-free final response after a terminal loop condition."""
+    print(
+        status_message
+        or f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    )
+
+    custom_failure_response = failure_response is not None
+    failure_response = failure_response or (
+        "I reached the iteration limit and couldn't generate a summary."
+    )
+
+    summary_api_request_id = f"{request_id_prefix}:{uuid.uuid4()}"
     summary_call_outcome = "failed"
+    summary_api_attempts = 0
+    summary_already_streamed = False
 
     def _managed_summary_call(request, callback, *, retry_count: int):
+        nonlocal summary_api_attempts
+        summary_api_attempts += 1
         from agent import relay_llm
 
         return relay_llm.execute_current(
@@ -2088,25 +2121,30 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     getattr(agent, "api_mode", "") or "chat_completions"
                 ),
                 "api_request_id": summary_api_request_id,
-                "call_role": "iteration_summary",
+                "call_role": call_role,
                 "retry_count": retry_count,
             },
             defer_logical_completion=True,
         )
 
-    summary_request = (
+    summary_request = summary_request or (
         "You've reached the maximum number of tool-calling iterations allowed. "
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
-    messages.append({"role": "user", "content": summary_request})
+    summary_prompt_message = {"role": "user", "content": summary_request}
+    if persist_summary_request:
+        messages.append(summary_prompt_message)
+        summary_messages = messages
+    else:
+        summary_messages = [*messages, summary_prompt_message]
 
     try:
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
-        for msg in messages:
+        for msg in summary_messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
@@ -2208,9 +2246,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            codex_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=[])
+            summary_response = _managed_summary_call(
+                codex_kwargs,
+                agent._run_codex_stream,
+                retry_count=0,
+            )
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -2277,7 +2318,25 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
 
-            if agent.api_mode == "anthropic_messages":
+            if agent.api_mode == "bedrock_converse":
+                _bedrock_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    tools_for_api=[],
+                )
+                summary_response = _managed_summary_call(
+                    _bedrock_kwargs,
+                    lambda request: _dispatch_nonstreaming_api_request(
+                        agent,
+                        request,
+                        make_client=lambda *_args, **_kwargs: None,
+                    ),
+                    retry_count=0,
+                )
+                _bedrock_result = agent._get_transport().normalize_response(
+                    summary_response
+                )
+                final_response = (_bedrock_result.content or "").strip()
+            elif agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(
                     model=agent.model,
@@ -2298,9 +2357,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_client = agent._ensure_primary_openai_client(
-                    reason="iteration_limit_summary"
-                )
+                summary_client = agent._ensure_primary_openai_client(reason=client_reason)
                 summary_response = _managed_summary_call(
                     summary_kwargs,
                     lambda request: summary_client.chat.completions.create(**request),
@@ -2316,16 +2373,40 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_call_outcome = "success"
                 messages.append({"role": "assistant", "content": final_response})
             else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
-        else:
+                final_response = failure_response
+        elif retry_empty:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                codex_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    tools_for_api=[],
+                )
+                retry_response = _managed_summary_call(
+                    codex_kwargs,
+                    agent._run_codex_stream,
+                    retry_count=1,
+                )
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
+            elif agent.api_mode == "bedrock_converse":
+                _bedrock_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    tools_for_api=[],
+                )
+                retry_response = _managed_summary_call(
+                    _bedrock_kwargs,
+                    lambda request: _dispatch_nonstreaming_api_request(
+                        agent,
+                        request,
+                        make_client=lambda *_args, **_kwargs: None,
+                    ),
+                    retry_count=1,
+                )
+                _bedrock_result = agent._get_transport().normalize_response(
+                    retry_response
+                )
+                final_response = (_bedrock_result.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
                 _tretry = agent._get_transport()
                 _ant_kw2 = _tretry.build_kwargs(
@@ -2361,7 +2442,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["extra_body"] = summary_extra_body
 
                 summary_client = agent._ensure_primary_openai_client(
-                    reason="iteration_limit_summary_retry"
+                    reason=f"{client_reason}_retry"
                 )
                 summary_response = _managed_summary_call(
                     summary_kwargs,
@@ -2378,13 +2459,22 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_call_outcome = "success"
                     messages.append({"role": "assistant", "content": final_response})
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = failure_response
             else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+                final_response = failure_response
+        else:
+            final_response = failure_response
 
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = (
+            failure_response
+            if custom_failure_response
+            else (
+                f"I reached the maximum iterations ({agent.max_iterations}) "
+                f"but couldn't summarize. Error: {str(e)}"
+            )
+        )
     finally:
         from agent import relay_llm
 
@@ -2393,8 +2483,46 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             outcome=summary_call_outcome,
         )
 
-    return final_response
+    summary_already_streamed = bool(
+        summary_call_outcome == "success"
+        and agent.api_mode == "codex_responses"
+        and agent.stream_delta_callback is not None
+    )
+    return FinalSummaryResult(
+        final_response,
+        summary_api_attempts,
+        summary_already_streamed,
+    )
 
+
+def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+    """Request a tool-free summary after the normal iteration budget is spent."""
+    return _request_final_summary(agent, messages, api_call_count).text
+
+
+def handle_terminal_cap_summary(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    summary_request: str,
+    failure_response: str,
+    status_message: str,
+) -> FinalSummaryResult:
+    """Request one tool-free final response after a terminal tool-loop cap."""
+    return _request_final_summary(
+        agent,
+        messages,
+        api_call_count,
+        summary_request=summary_request,
+        failure_response=failure_response,
+        call_role="guardrail_summary",
+        request_id_prefix="guardrail-summary",
+        client_reason="tool_guardrail_summary",
+        status_message=status_message,
+        retry_empty=False,
+        persist_summary_request=False,
+    )
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:

@@ -5,6 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.chat_completion_helpers import FinalSummaryResult
+from agent.tool_guardrails import ToolGuardrailDecision
 from run_agent import AIAgent
 
 
@@ -84,6 +86,16 @@ def _hard_stop_config(**overrides) -> dict:
     }
     cfg["tool_loop_guardrails"].update(overrides)
     return cfg
+
+
+def _loop_cap_config(cap_key: str) -> dict:
+    return {
+        "tool_loop_guardrails": {
+            "loop_caps": {
+                cap_key: 1,
+            }
+        }
+    }
 
 
 def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
@@ -412,6 +424,7 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert result["turn_exit_reason"] == "guardrail_halt"
     halt_text = result["final_response"]
     assert "stopped retrying" in halt_text
+    assert agent.client.chat.completions.create.call_count == 3
 
     # The halt message must have been pushed through the callback at least
     # once.  Empty-queue SSE writers were the bug — clients saw no content
@@ -420,3 +433,365 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_web_search_cap_synthesizes_existing_results_without_more_tools():
+    """A terminal research cap should preserve evidence in a final answer.
+
+    The cap still blocks the extra search, but the model receives one tool-free
+    call so users get a useful partial report instead of only guardrail text.
+    """
+    agent = _make_agent(
+        "web_search",
+        "write_file",
+        max_iterations=10,
+        config=_loop_cap_config("max_web_searches"),
+    )
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search",
+                    json.dumps({"query": "first query"}),
+                    "c-first",
+                )
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search",
+                    json.dumps({"query": "second query"}),
+                    "c-capped",
+                ),
+                _mock_tool_call(
+                    "write_file",
+                    json.dumps({"path": "/tmp/must-not-run", "content": "unsafe"}),
+                    "c-skipped-write",
+                ),
+            ],
+        ),
+        _mock_response(
+            content="Useful partial report from the available evidence.",
+            finish_reason="stop",
+            tool_calls=None,
+        ),
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+    agent._disable_streaming = True
+    deltas: list = []
+    agent.stream_delta_callback = lambda delta: deltas.append(delta)
+
+    existing_result = json.dumps(
+        {"data": {"web": [{"title": "Useful source", "url": "https://example.com"}]}}
+    )
+    with (
+        patch("run_agent.handle_function_call", return_value=existing_result) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("research this topic thoroughly")
+
+    assert dispatch.call_count == 1
+    assert not any(
+        call.args and call.args[0] == "write_file"
+        for call in dispatch.call_args_list
+    )
+    assert agent.client.chat.completions.create.call_count == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "loop_web_search_cap"
+    assert result["api_calls"] == 3
+    assert result["final_response"] == "Useful partial report from the available evidence."
+    assert [
+        message
+        for message in result["messages"]
+        if message.get("role") == "assistant"
+        and message.get("content") == result["final_response"]
+    ] == [{"role": "assistant", "content": result["final_response"]}]
+    assert not any(
+        message.get("role") == "user"
+        and "tool-call guardrail stopped further research" in message.get("content", "")
+        for message in result["messages"]
+    )
+    skipped_write = next(
+        message
+        for message in result["messages"]
+        if message.get("tool_call_id") == "c-skipped-write"
+    )
+    assert "terminal tool-loop cap" in skipped_write["content"]
+
+    summary_request = agent.client.chat.completions.create.call_args_list[-1].kwargs
+    assert "tools" not in summary_request
+    assert "tool_choice" not in summary_request
+    assert any(
+        message.get("role") == "tool" and "Useful source" in message.get("content", "")
+        for message in summary_request["messages"]
+    )
+    assert summary_request["messages"][-1]["role"] == "user"
+    assert "Do not call any more tools" in summary_request["messages"][-1]["content"]
+
+    text_deltas = [delta for delta in deltas if isinstance(delta, str)]
+    assert result["final_response"] in text_deltas
+
+
+def test_subagent_cap_also_requests_tool_free_final_response():
+    agent = _make_agent("delegate_task")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="Partial report from completed subagents.",
+        finish_reason="stop",
+        tool_calls=None,
+    )
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_subagent_cap",
+        message="cap reached",
+        tool_name="delegate_task",
+        count=50,
+    )
+
+    response = agent._toolguard_final_response(
+        [{"role": "user", "content": "research this"}],
+        decision,
+        api_call_count=2,
+    )
+
+    assert response.text == "Partial report from completed subagents."
+    assert response.api_attempts == 1
+    assert response.already_streamed is False
+    summary_request = agent.client.chat.completions.create.call_args.kwargs
+    assert "tools" not in summary_request
+    assert "tool_choice" not in summary_request
+
+
+def test_terminal_loop_cap_summary_failure_uses_controlled_halt_fallback():
+    agent = _make_agent("web_search")
+    agent.client.chat.completions.create.side_effect = RuntimeError("provider unavailable")
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_web_search_cap",
+        message="cap reached",
+        tool_name="web_search",
+        count=50,
+    )
+    messages = [
+        {"role": "user", "content": "research this"},
+        {"role": "tool", "content": "useful existing result"},
+    ]
+
+    response = agent._toolguard_final_response(messages, decision, api_call_count=2)
+
+    assert "stopped retrying web_search" in response.text
+    assert "loop_web_search_cap" in response.text
+    assert response.api_attempts == 1
+    assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_terminal_loop_cap_empty_summary_is_not_retried():
+    agent = _make_agent("web_search")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="",
+        finish_reason="stop",
+        tool_calls=None,
+    )
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_web_search_cap",
+        message="cap reached",
+        tool_name="web_search",
+        count=50,
+    )
+
+    response = agent._toolguard_final_response(
+        [{"role": "user", "content": "research this"}],
+        decision,
+        api_call_count=2,
+    )
+
+    assert "loop_web_search_cap" in response.text
+    assert response.api_attempts == 1
+    assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_terminal_loop_cap_codex_summary_is_tool_free_and_marked_streamed():
+    agent = _make_agent("web_search")
+    agent.api_mode = "codex_responses"
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    build_calls = []
+
+    def build_kwargs(api_messages, tools_for_api=None):
+        build_calls.append((api_messages, tools_for_api))
+        return {"model": "codex-test", "input": api_messages}
+
+    def run_codex_stream(_request):
+        agent.stream_delta_callback("Codex cap summary")
+        return object()
+
+    transport = SimpleNamespace(
+        normalize_response=lambda _response: SimpleNamespace(
+            content="Codex cap summary"
+        )
+    )
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_web_search_cap",
+        message="cap reached",
+        tool_name="web_search",
+        count=50,
+    )
+
+    with (
+        patch.object(agent, "_build_api_kwargs", side_effect=build_kwargs),
+        patch.object(agent, "_run_codex_stream", side_effect=run_codex_stream),
+        patch.object(agent, "_get_transport", return_value=transport),
+    ):
+        response = agent._toolguard_final_response(
+            [{"role": "user", "content": "research this"}],
+            decision,
+            api_call_count=2,
+        )
+
+    assert response == FinalSummaryResult("Codex cap summary", 1, True)
+    assert len(build_calls) == 1
+    assert build_calls[0][1] == []
+    assert deltas == ["Codex cap summary"]
+
+
+def test_terminal_loop_cap_bedrock_summary_uses_converse_transport_without_tools():
+    agent = _make_agent("web_search")
+    agent.api_mode = "bedrock_converse"
+    build_calls = []
+
+    def build_kwargs(api_messages, tools_for_api=None):
+        build_calls.append((api_messages, tools_for_api))
+        return {
+            "__bedrock_converse__": True,
+            "model": "bedrock-test",
+            "messages": api_messages,
+        }
+
+    transport = SimpleNamespace(
+        normalize_response=lambda _response: SimpleNamespace(
+            content="Bedrock cap summary"
+        )
+    )
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_web_search_cap",
+        message="cap reached",
+        tool_name="web_search",
+        count=50,
+    )
+
+    with (
+        patch.object(agent, "_build_api_kwargs", side_effect=build_kwargs),
+        patch.object(agent, "_get_transport", return_value=transport),
+        patch(
+            "agent.chat_completion_helpers._dispatch_nonstreaming_api_request",
+            return_value=object(),
+        ) as dispatch,
+    ):
+        response = agent._toolguard_final_response(
+            [{"role": "user", "content": "research this"}],
+            decision,
+            api_call_count=2,
+        )
+
+    assert response == FinalSummaryResult("Bedrock cap summary", 1, False)
+    assert len(build_calls) == 1
+    assert build_calls[0][1] == []
+    dispatch.assert_called_once()
+
+
+def test_terminal_loop_cap_anthropic_summary_is_tool_free():
+    agent = _make_agent("web_search")
+    agent.api_mode = "anthropic_messages"
+    build_calls = []
+
+    def build_kwargs(**kwargs):
+        build_calls.append(kwargs)
+        return {"model": kwargs["model"], "messages": kwargs["messages"]}
+
+    transport = SimpleNamespace(
+        build_kwargs=build_kwargs,
+        normalize_response=lambda _response, **_kwargs: SimpleNamespace(
+            content="Anthropic cap summary"
+        ),
+    )
+    decision = ToolGuardrailDecision(
+        action="block",
+        code="loop_web_search_cap",
+        message="cap reached",
+        tool_name="web_search",
+        count=50,
+    )
+
+    with (
+        patch.object(agent, "_get_transport", return_value=transport),
+        patch.object(agent, "_anthropic_messages_create", return_value=object()),
+    ):
+        response = agent._toolguard_final_response(
+            [{"role": "user", "content": "research this"}],
+            decision,
+            api_call_count=2,
+        )
+
+    assert response == FinalSummaryResult("Anthropic cap summary", 1, False)
+    assert len(build_calls) == 1
+    assert build_calls[0]["tools"] is None
+
+
+def test_already_streamed_cap_summary_is_not_replayed_to_client():
+    agent = _make_agent(
+        "web_search",
+        config=_loop_cap_config("max_web_searches"),
+    )
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search",
+                    json.dumps({"query": "first query"}),
+                    call_id="call-first",
+                )
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search",
+                    json.dumps({"query": "second query"}),
+                    call_id="call-second",
+                )
+            ],
+        ),
+    ]
+
+    def already_streamed(*_args, **_kwargs):
+        agent.stream_delta_callback("Already streamed cap summary")
+        return FinalSummaryResult("Already streamed cap summary", 1, True)
+
+    with (
+        patch("run_agent.handle_function_call", return_value="source evidence"),
+        patch.object(
+            agent,
+            "_toolguard_final_response",
+            side_effect=already_streamed,
+        ),
+    ):
+        result = agent.run_conversation("research this")
+
+    text_deltas = [delta for delta in deltas if isinstance(delta, str)]
+    assert text_deltas.count("Already streamed cap summary") == 1
+    assert result["api_calls"] == 3

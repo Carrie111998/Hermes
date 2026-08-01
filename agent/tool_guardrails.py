@@ -134,6 +134,9 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+TERMINAL_LOOP_CAP_CODES = frozenset(
+    {"loop_web_search_cap", "loop_subagent_cap"}
+)
 
 
 @dataclass(frozen=True)
@@ -291,6 +294,17 @@ class ToolCallGuardrailController:
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    def batch_would_hit_loop_cap(self, tool_names: list[str]) -> bool:
+        """Return whether this batch can cross a terminal per-turn loop cap."""
+        web_searches = sum(name == "web_search" for name in tool_names)
+        subagents = sum(name == "delegate_task" for name in tool_names)
+        web_cap = self.config.loop_caps.max_web_searches
+        subagent_cap = self.config.loop_caps.max_subagents
+        return bool(
+            (web_cap and self._turn_web_search_count + web_searches > web_cap)
+            or (subagent_cap and self._turn_subagent_count + subagents > subagent_cap)
+        )
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
