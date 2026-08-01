@@ -113,6 +113,7 @@ Common options:
 | `-m`, `--model <model>` | Override the model for this run. |
 | `-t`, `--toolsets <csv>` | Enable a comma-separated set of toolsets. |
 | `--provider <provider>` | Force a provider: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot-acp`, `copilot`, `anthropic`, `gemini`, `huggingface`, `novita` (aliases `novita-ai`, `novitaai`), `openai-api`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `upstage` (alias `solar`), `alibaba`, `alibaba-coding-plan` (alias `alibaba_coding`), `deepseek`, `nvidia`, `ollama-cloud`, `xai` (alias `grok`), `xai-oauth` (alias `grok-oauth`), `qwen-oauth`, `bedrock`, `opencode-zen`, `opencode-go`, `ai-gateway`, `azure-foundry`, `lmstudio`, `stepfun`, `tencent-tokenhub` (alias `tencent`, `tokenhub`). |
+| `--fallback <provider/model>` | Replace the configured fallback chain for this invocation. Repeat to set the exact order. Classic CLI and one-shot only; not supported with `--tui`. |
 | `-s`, `--skills <name>` | Preload one or more skills for the session (can be repeated or comma-separated). |
 | `-v`, `--verbose` | Verbose output. |
 | `-Q`, `--quiet` | Programmatic mode: suppress banner/spinner/tool previews. |
@@ -134,6 +135,7 @@ Examples:
 hermes
 hermes chat -q "Summarize the latest PRs"
 hermes chat --provider openrouter --model anthropic/claude-sonnet-4.6
+hermes chat --fallback openai-codex/gpt-5.6-sol --fallback gemini/gemini-3.1-pro-preview
 hermes chat --toolsets web,terminal,skills
 hermes chat --quiet -q "Return only JSON"
 hermes chat --worktree -q "Review this repo and open a PR"
@@ -159,10 +161,12 @@ Per-run overrides (no mutation to `~/.hermes/config.yaml`):
 |---|---|---|
 | `-m` / `--model <model>` | `HERMES_INFERENCE_MODEL` | Override the model for this run |
 | `--provider <provider>` | _(none)_ | Override the provider for this run |
+| `--fallback <provider/model>` | _(none)_ | Replace the configured fallback chain; repeat to set its exact order |
 | `--usage-file <path>` | _(none)_ | Write a JSON usage report after the run (see below) |
 
 ```bash
 hermes -z "…" --provider openrouter --model openai/gpt-5.5
+hermes -z "…" --fallback openai-codex/gpt-5.6-sol --fallback gemini/gemini-3.1-pro-preview
 # or:
 HERMES_INFERENCE_MODEL=anthropic/claude-sonnet-4.6 hermes -z "…"
 ```

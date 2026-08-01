@@ -1500,8 +1500,24 @@ When activated, the fallback swaps the model and provider mid-session without lo
 
 Supported providers: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `ai-gateway`, `azure-foundry`, `opencode-zen`, `opencode-go`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `custom`.
 
-:::tip
-Fallback is configured exclusively through `config.yaml` — or interactively via `hermes fallback`. For full details on when it triggers, how the chain advances, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/user-guide/features/fallback-providers).
+:::tip Persistent and per-invocation fallback chains
+Use `config.yaml` or `hermes fallback` for the persistent chain. For one classic
+CLI or scripted one-shot invocation, repeat `--fallback PROVIDER/MODEL` to
+replace that chain without changing profile configuration:
+
+```bash
+hermes chat --fallback openai-codex/gpt-5.6-sol --fallback gemini/gemini-3.1-pro-preview
+hermes -z "Run the release checks" --fallback openai-codex/gpt-5.6-sol --fallback gemini/gemini-3.1-pro-preview
+```
+
+Entries are tried in command-line order. Omitting the flag keeps the configured
+chain; malformed or duplicate entries exit with status 2 instead of silently
+changing the route. The invocation flag is supported by classic `hermes chat`
+and `hermes -z`/one-shot launches, but not by `--tui`.
+
+For full details on when fallback triggers, how the chain advances, and how it
+interacts with auxiliary tasks and delegation, see [Fallback
+Providers](/user-guide/features/fallback-providers).
 :::
 
 ---
