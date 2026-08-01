@@ -68,6 +68,9 @@ MAX_HISTORY_TURNS = 12
 DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 DISCORD_MESSAGE_LIMIT = 2000
 DISCORD_THREAD_NAME_LIMIT = 100
+DISCORD_RATE_LIMIT_MAX_ATTEMPTS = 4
+DISCORD_RATE_LIMIT_DEFAULT_SECONDS = 1.0
+DISCORD_RATE_LIMIT_MAX_SECONDS = 60.0
 DISCORD_VOICE_THREAD_PREFIX = "🎙️ Voice SkyAI · "
 REQUIRED_DISCORD_MIRROR_CHANNEL_ID = "1510888721614901358"
 DISCORD_CONFIGURED_SURFACE_MIRROR_MARKER = "configured_surface_discord_threads_v2"
@@ -3631,8 +3634,48 @@ def _discord_json_value_request(
             "User-Agent": "SkyAI-Hermes-v2/0.1",
         },
     )
-    with urlopen(request, timeout=12) as response:
-        return json.loads(response.read().decode("utf-8"))
+    for attempt in range(DISCORD_RATE_LIMIT_MAX_ATTEMPTS):
+        try:
+            with urlopen(request, timeout=12) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            if (
+                exc.code != 429
+                or attempt + 1 >= DISCORD_RATE_LIMIT_MAX_ATTEMPTS
+            ):
+                raise
+            time.sleep(_discord_retry_after_seconds(exc))
+    raise RuntimeError("Discord request retry loop exhausted unexpectedly")
+
+
+def _discord_retry_after_seconds(exc: HTTPError) -> float:
+    """Honor Discord's exact HTTP rate-limit delay without semantic routing."""
+
+    candidates: list[Any] = []
+    try:
+        decoded = json.loads(exc.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        decoded = None
+    if isinstance(decoded, dict):
+        candidates.append(decoded.get("retry_after"))
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        candidates.extend(
+            (
+                headers.get("Retry-After"),
+                headers.get("X-RateLimit-Reset-After"),
+            )
+        )
+    for candidate in candidates:
+        if isinstance(candidate, bool) or candidate in (None, ""):
+            continue
+        try:
+            seconds = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(seconds) and seconds >= 0:
+            return min(seconds, DISCORD_RATE_LIMIT_MAX_SECONDS)
+    return DISCORD_RATE_LIMIT_DEFAULT_SECONDS
 
 
 def _discord_json_request(
