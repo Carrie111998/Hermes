@@ -174,7 +174,7 @@ export const ar = defineLocale({
     openStarmap: 'فتح خريطة الذاكرة',
     openKeybinds: 'اختصارات لوحة المفاتيح',
     layoutEditor: 'محرر التخطيط',
-    layoutEditorTitle: 'محرر التخطيط — انقر مع ⌘ لإعادة ضبط التخطيط'
+    layoutEditorTitle: modifier => `محرر التخطيط — انقر مع ${modifier} لإعادة ضبط التخطيط`
   },
   keybinds: {
     title: 'اختصارات لوحة المفاتيح',

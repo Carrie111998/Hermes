@@ -204,7 +204,7 @@ export const en: Translations = {
     openStarmap: 'Open memory graph',
     openKeybinds: 'Keyboard shortcuts',
     layoutEditor: 'Layout editor',
-    layoutEditorTitle: 'Layout editor — ⌘-click resets the layout'
+    layoutEditorTitle: mod => `Layout editor — ${mod}-click resets the layout`
   },
 
   keybinds: {

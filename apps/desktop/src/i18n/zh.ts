@@ -199,7 +199,7 @@ export const zh: Translations = {
     openStarmap: '打开记忆图谱',
     openKeybinds: '键盘快捷键',
     layoutEditor: '布局编辑器',
-    layoutEditorTitle: '布局编辑器 — ⌘ 点击重置布局'
+    layoutEditorTitle: mod => `布局编辑器 — ${mod} 点击重置布局`
   },
 
   keybinds: {

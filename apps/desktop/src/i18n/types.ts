@@ -246,7 +246,7 @@ export interface Translations {
     openStarmap: string
     openKeybinds: string
     layoutEditor: string
-    layoutEditorTitle: string
+    layoutEditorTitle: (modifier: string) => string
   }
 
   keybinds: {
