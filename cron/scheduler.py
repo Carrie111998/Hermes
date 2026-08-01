@@ -4231,30 +4231,56 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
-            _ctx = contextvars.copy_context()
-
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
-                try:
-                    return ctx.run(_process_job, j)
-                finally:
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
-
+            execution = None
             try:
+                execution = create_execution(job_id, source="builtin")
+                dispatched_job = dict(job, execution_id=execution["id"])
+                _ctx = contextvars.copy_context()
+
+                def _run_and_release(j=dispatched_job, ctx=_ctx):
+                    try:
+                        return ctx.run(_process_job, j)
+                    finally:
+                        with _running_lock:
+                            _running_job_ids.discard(j["id"])
+
                 return pool.submit(_run_and_release)
-            except Exception as submit_err:
+            except BaseException as dispatch_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
-                finish_execution(
-                    execution["id"],
-                    success=False,
-                    error=f"Executor dispatch failed: {submit_err}",
-                )
+
+                # If the durable attempt exists, make its terminal failure
+                # explicit. If creation itself failed there is no ledger row to
+                # update, so the error log is the only truthful surface.
+                if execution is not None:
+                    try:
+                        finish_execution(
+                            execution["id"],
+                            success=False,
+                            error=f"Executor dispatch failed: {dispatch_err}",
+                        )
+                    except Exception as record_err:
+                        logger.error(
+                            "Failed to finish execution record for job %s after dispatch failure: %s",
+                            job_id,
+                            record_err,
+                        )
+
+                if not isinstance(dispatch_err, Exception):
+                    raise
+
+                if execution is None:
+                    logger.error(
+                        "Job '%s' not dispatched — execution record could not be created: %s",
+                        job.get("name", job_id),
+                        dispatch_err,
+                        exc_info=True,
+                    )
+                    return None
+
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
-                if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
+                if isinstance(dispatch_err, RuntimeError) and _interpreter_shutting_down(dispatch_err):
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),
@@ -4263,7 +4289,7 @@ def tick(
                 logger.error(
                     "Job '%s' not dispatched: %s",
                     job.get("name", job_id),
-                    submit_err,
+                    dispatch_err,
                 )
                 return None
 
