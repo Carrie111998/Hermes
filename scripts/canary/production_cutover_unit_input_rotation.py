@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -1208,6 +1208,7 @@ def _successor(
     *,
     now_unix: int,
     require_fresh: bool,
+    operational_edge_domains: Collection[str] | None = None,
 ) -> _Successor:
     documents = value.get("documents") if isinstance(value, Mapping) else None
     if (
@@ -1217,17 +1218,34 @@ def _successor(
     ):
         raise UnitInputRotationError("unit_input_rotation_publication_invalid")
     try:
-        plan = package.validate_unit_input_plan(documents["plan"])
+        plan = package.validate_unit_input_plan(
+            documents["plan"],
+            operational_edge_domains=operational_edge_domains,
+        )
         approval = _validate_approval_without_lease(
             documents["approval"],
             plan=plan,
         )
-        expected = public_stager.build_publication(
-            action="unit-input-authority",
-            release_revision=plan["release_revision"],
-            documents={"plan": plan, "approval": approval},
-            now_unix=approval["issued_at_unix"],
-        )
+        if operational_edge_domains is None:
+            expected = public_stager.build_publication(
+                action="unit-input-authority",
+                release_revision=plan["release_revision"],
+                documents={"plan": plan, "approval": approval},
+                now_unix=approval["issued_at_unix"],
+            )
+        else:
+            unsigned = {
+                "schema": public_stager.PUBLICATION_SCHEMA,
+                "action": "unit-input-authority",
+                "release_revision": plan["release_revision"],
+                "documents": {"plan": plan, "approval": approval},
+                "secret_material_recorded": False,
+                "secret_digest_recorded": False,
+            }
+            expected = {
+                **unsigned,
+                "publication_sha256": _sha(_canonical(unsigned)),
+            }
         if require_fresh:
             package.validate_unit_input_approval(
                 approval,
@@ -1244,7 +1262,11 @@ def _successor(
         raise UnitInputRotationError("unit_input_rotation_publication_invalid") from exc
     if value != expected:
         raise UnitInputRotationError("unit_input_rotation_publication_invalid")
-    fixed = package._unit_inputs_from_authority(plan, approval)
+    fixed = package._unit_inputs_from_authority(
+        plan,
+        approval,
+        operational_edge_domains=operational_edge_domains,
+    )
     return _Successor(
         revision=str(plan["release_revision"]),
         publication=dict(value),
@@ -1255,6 +1277,31 @@ def _successor(
         approval_raw=_canonical(approval),
         fixed_inputs_raw=_canonical(fixed) + b"\n",
     )
+
+
+def _historical_successor(value: Mapping[str, Any]) -> _Successor:
+    """Validate an immutable completed successor under its exact v3 shape.
+
+    Incoming successors remain current-catalog-only.  Recovery must also read
+    completed audit records authored before the backup and SEO edges existed,
+    so it accepts only the exact frozen nine-domain shape in addition to the
+    exact current catalog.
+    """
+
+    for operational_edge_domains in (
+        None,
+        package.LEGACY_V3_OPERATIONAL_EDGE_DOMAINS,
+    ):
+        try:
+            return _successor(
+                value,
+                now_unix=0,
+                require_fresh=False,
+                operational_edge_domains=operational_edge_domains,
+            )
+        except UnitInputRotationError:
+            continue
+    raise UnitInputRotationError("unit_input_rotation_publication_invalid")
 
 
 def _triplet(
@@ -1653,11 +1700,7 @@ def validate_prepared_rotation_receipt(
         name: item for name, item in value.items() if name != "receipt_sha256"
     }
     try:
-        successor = _successor(
-            publication,
-            now_unix=0,
-            require_fresh=False,
-        )
+        successor = _historical_successor(publication)
     except UnitInputRotationError as exc:
         raise UnitInputRotationError(
             "unit_input_rotation_prepared_receipt_invalid"
@@ -1791,11 +1834,7 @@ def _persisted_successor(
         gid=gid,
         mode=0o400,
     )
-    persisted = _successor(
-        _decode(raw),
-        now_unix=0,
-        require_fresh=False,
-    )
+    persisted = _historical_successor(_decode(raw))
     if (
         transaction["successor_revision"] != persisted.revision
         or transaction["successor_publication_sha256"]
@@ -2320,11 +2359,7 @@ def validate_rotation_receipt(
         raise UnitInputRotationError("unit_input_rotation_receipt_invalid")
     unsigned = {name: item for name, item in value.items() if name != "receipt_sha256"}
     try:
-        successor = _successor(
-            publication,
-            now_unix=0,
-            require_fresh=False,
-        )
+        successor = _historical_successor(publication)
     except UnitInputRotationError as exc:
         raise UnitInputRotationError("unit_input_rotation_receipt_invalid") from exc
     transaction_unsigned = {
