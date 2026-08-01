@@ -211,8 +211,8 @@ import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { resolveStagedUpdaterBinary, spawnUpdaterProcess } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
-import { resolveWatchdogPrewarmedBackend } from './watchdog-backend'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
+import { resolveWatchdogPrewarmedBackend } from './watchdog-backend'
 import {
   computeWindowOptions,
   debounce,
