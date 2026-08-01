@@ -188,6 +188,16 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         help="Skip confirmation prompt when using --restore",
     )
 
+    skills_subparsers.add_parser(
+        "clean-manifest",
+        help="Remove stale .bundled_manifest keys with no bundled source",
+        description=(
+            "Drop orphaned entries from ~/.hermes/skills/.bundled_manifest whose "
+            "bundled source no longer exists. Source-backed tracking keys are never "
+            "removed — including skills that are merely missing from the local install."
+        ),
+    )
+
     skills_list_modified = skills_subparsers.add_parser(
         "list-modified",
         help="List bundled skills you've edited (which `hermes update` keeps)",

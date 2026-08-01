@@ -1247,6 +1247,30 @@ def do_uninstall(name: str, console: Optional[Console] = None,
         c.print(f"[bold red]Error:[/] {msg}\n")
 
 
+def do_clean_manifest(console: Optional[Console] = None) -> dict:
+    """Remove stale .bundled_manifest keys that have no bundled source."""
+    from tools.skills_sync import clean_stale_manifest_orphans
+
+    c = console or _console
+    result = clean_stale_manifest_orphans()
+    removed = result.get("removed") or []
+    kept = int(result.get("kept") or 0)
+    if not removed:
+        c.print(
+            f"[dim]No stale manifest orphans. Kept {kept} source-backed "
+            f"manifest entr{'y' if kept == 1 else 'ies'}.[/]\n"
+        )
+        return result
+    c.print(
+        f"[green]✓[/] Removed {len(removed)} stale manifest orphan(s); "
+        f"kept {kept} source-backed entr{'y' if kept == 1 else 'ies'}."
+    )
+    for name in removed:
+        c.print(f"  − {name}")
+    c.print()
+    return result
+
+
 def do_reset(name: str, restore: bool = False,
              console: Optional[Console] = None,
              skip_confirm: bool = False,
@@ -1835,6 +1859,8 @@ def skills_command(args) -> None:
     elif action == "reset":
         do_reset(args.name, restore=getattr(args, "restore", False),
                  skip_confirm=getattr(args, "yes", False))
+    elif action == "clean-manifest":
+        do_clean_manifest()
     elif action == "list-modified":
         do_list_modified(as_json=getattr(args, "json", False))
     elif action == "diff":
@@ -1869,7 +1895,7 @@ def skills_command(args) -> None:
             return
         do_tap(tap_action, repo=repo)
     else:
-        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
+        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|clean-manifest|opt-out|opt-in|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
 
 

@@ -11,11 +11,14 @@ from hermes_cli.skills_hub import _report_missing_bundled_skills
 from tools.skills_sync import (
     ACTIONABLE_MISSING_BUNDLED_PROVENANCE,
     INTENTIONAL_MISSING_BUNDLED_PROVENANCE,
+    RESTORE_WITH_BUNDLED_SOURCE_PROVENANCE,
+    clean_stale_manifest_orphans,
     format_missing_bundled_restore_guidance,
     is_actionable_missing_bundled_provenance,
     list_missing_bundled_skills,
     partition_missing_bundled_skills,
     provenance_counts,
+    _read_manifest,
     _write_manifest,
 )
 
@@ -161,11 +164,119 @@ def test_restore_guidance_actionable_scopes_restore_away_from_intentional():
         _entry("c", "source_present_never_installed"),
     ]
     text = format_missing_bundled_restore_guidance(missing)
-    assert "Restore unexpected absences" in text
+    assert "Restore unexpected absences with bundled source" in text
     assert "hermes skills reset <name> --restore" in text
     assert "Do not restore opt_out or curator_suppressed" in text
+    # Orphans are not in this fixture — cleanup path stays quiet.
+    assert "clean-manifest" not in text
+    assert "manifest_orphan_no_source / unknown" not in text
     # Must not use the old blanket "when intentional absence is ruled out" phrasing
     assert "when intentional absence is ruled out" not in text
+
+
+def test_restore_guidance_orphans_get_cleanup_not_restore():
+    missing = [
+        _entry("gone", "manifest_tracked_absent"),
+        _entry("orphan", "manifest_orphan_no_source"),
+        _entry("mystery", "unknown"),
+    ]
+    text = format_missing_bundled_restore_guidance(missing)
+    assert "Restore unexpected absences with bundled source" in text
+    # Categories are sorted() for stable wording.
+    assert "manifest_tracked_absent / source_present_never_installed / unknown" in text
+    assert "hermes skills clean-manifest" in text
+    assert "source-backed tracking is never deleted" in text
+    # Orphan must not be listed among --restore targets.
+    assert "manifest_orphan_no_source / unknown" not in text
+    assert "Do not use `hermes skills reset <name> --restore` for orphans" in text
+
+
+def test_restore_guidance_orphan_only_skips_restore_command():
+    text = format_missing_bundled_restore_guidance(
+        [_entry("orphan", "manifest_orphan_no_source")]
+    )
+    assert "hermes skills clean-manifest" in text
+    # No affirmative restore instruction — only the explicit "do not use" warning.
+    assert "Restore unexpected absences" not in text
+    assert "Do not use `hermes skills reset <name> --restore` for orphans" in text
+    assert "manifest_orphan_no_source" not in RESTORE_WITH_BUNDLED_SOURCE_PROVENANCE
+
+
+def test_clean_stale_manifest_orphans_removes_only_source_less_keys(
+    tmp_path: Path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    skills_dir = hermes_home / "skills"
+    skills_dir.mkdir(parents=True)
+    bundled = tmp_path / "bundled_skills"
+    _make_bundled(bundled, "still-bundled", "still-bundled")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    manifest_file = skills_dir / ".bundled_manifest"
+
+    with patch("tools.skills_sync.MANIFEST_FILE", manifest_file), patch(
+        "tools.skills_sync.SKILLS_DIR", skills_dir
+    ), patch("tools.skills_sync.HERMES_HOME", hermes_home), patch(
+        "tools.skills_sync._get_bundled_dir", return_value=bundled
+    ):
+        _write_manifest(
+            {
+                "still-bundled": "abc123",
+                "removed-upstream": "deadbeef",
+                "also-gone": "00ff",
+            }
+        )
+        result = clean_stale_manifest_orphans()
+        remaining = _read_manifest()
+
+    assert result["ok"] is True
+    assert result["removed"] == ["also-gone", "removed-upstream"]
+    assert result["kept"] == 1
+    assert remaining == {"still-bundled": "abc123"}
+
+
+def test_clean_stale_manifest_orphans_cannot_delete_valid_manifests(
+    tmp_path: Path, monkeypatch
+):
+    """Source-backed tracking must survive cleanup even when install is missing."""
+    hermes_home = tmp_path / ".hermes"
+    skills_dir = hermes_home / "skills"
+    skills_dir.mkdir(parents=True)
+    bundled = tmp_path / "bundled_skills"
+    _make_bundled(bundled, "tracked-absent", "tracked-absent")
+    _make_bundled(bundled, "present-skill", "present-skill")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    # Install only one of the two source-backed skills — the other is a
+    # classic manifest_tracked_absent case and must NOT be cleaned.
+    present_dest = skills_dir / "research" / "present-skill"
+    present_dest.mkdir(parents=True)
+    (present_dest / "SKILL.md").write_text(
+        "---\nname: present-skill\ndescription: test.\n---\n",
+        encoding="utf-8",
+    )
+    manifest_file = skills_dir / ".bundled_manifest"
+
+    with patch("tools.skills_sync.MANIFEST_FILE", manifest_file), patch(
+        "tools.skills_sync.SKILLS_DIR", skills_dir
+    ), patch("tools.skills_sync.HERMES_HOME", hermes_home), patch(
+        "tools.skills_sync._get_bundled_dir", return_value=bundled
+    ):
+        _write_manifest(
+            {
+                "tracked-absent": "aaa",
+                "present-skill": "bbb",
+            }
+        )
+        before = _read_manifest()
+        result = clean_stale_manifest_orphans()
+        after = _read_manifest()
+
+    assert before == after == {
+        "tracked-absent": "aaa",
+        "present-skill": "bbb",
+    }
+    assert result["removed"] == []
+    assert result["kept"] == 2
 
 
 def test_doctor_all_intentional_is_ok_not_warn(capsys):
@@ -227,7 +338,7 @@ def test_skills_check_lists_all_provenance_and_scoped_restore(monkeypatch):
     assert "opted" in out and "opt_out" in out
     assert "pruned" in out and "curator_suppressed" in out
     assert "gone" in out and "manifest_tracked_absent" in out
-    assert "Restore unexpected absences" in out
+    assert "Restore unexpected absences with bundled source" in out
     assert "Do not restore opt_out or curator_suppressed" in out
     assert "when intentional absence is ruled out" not in out
 

@@ -916,7 +916,7 @@ def sync_skills(quiet: bool = False) -> dict:
             skipped += 1
 
     # Clean stale manifest entries (skills removed from bundled dir)
-    cleaned = sorted(set(manifest.keys()) - bundled_names)
+    cleaned = find_stale_manifest_orphans(manifest, bundled_names)
     for name in cleaned:
         del manifest[name]
 
@@ -1160,6 +1160,17 @@ ACTIONABLE_MISSING_BUNDLED_PROVENANCE = frozenset(
     }
 )
 
+# Actionable absences that still have (or may have) bundled source to restore
+# from. ``manifest_orphan_no_source`` is intentionally excluded — restore
+# returns ``bundled_missing`` and cannot recreate the skill.
+RESTORE_WITH_BUNDLED_SOURCE_PROVENANCE = frozenset(
+    {
+        "manifest_tracked_absent",
+        "source_present_never_installed",
+        "unknown",
+    }
+)
+
 
 def is_actionable_missing_bundled_provenance(provenance: Optional[str]) -> bool:
     """Return True when a missing-bundled absence should warn in doctor.
@@ -1197,12 +1208,56 @@ def provenance_counts(missing: List[dict]) -> dict:
     return by_prov
 
 
+def _normalize_missing_provenance(provenance: Optional[str]) -> str:
+    return (provenance or "").strip() or "unknown"
+
+
+def find_stale_manifest_orphans(
+    manifest: Optional[Dict[str, str]] = None,
+    bundled_names: Optional[Set[str]] = None,
+) -> List[str]:
+    """Return sorted manifest keys that have no discoverable bundled source.
+
+    Source-backed keys are never included. Used by sync cleanup and by
+    ``clean_stale_manifest_orphans``.
+    """
+    if manifest is None:
+        manifest = _read_manifest()
+    if not manifest:
+        return []
+    if bundled_names is None:
+        bundled_names = {
+            name for name, _ in _discover_bundled_skills(_get_bundled_dir())
+        }
+    return sorted(set(manifest) - set(bundled_names))
+
+
+def clean_stale_manifest_orphans() -> dict:
+    """Drop ``.bundled_manifest`` entries whose bundled source no longer exists.
+
+    Only removes orphaned tracking keys. Entries that still have a discoverable
+    bundled source are never deleted — including skills that are merely absent
+    from the local install (``manifest_tracked_absent``).
+
+    Returns:
+        ``{"ok": True, "removed": [str, ...], "kept": int}``
+    """
+    manifest = _read_manifest()
+    removed = find_stale_manifest_orphans(manifest)
+    if removed:
+        for name in removed:
+            del manifest[name]
+        _write_manifest(manifest)
+    return {"ok": True, "removed": removed, "kept": len(manifest)}
+
+
 def format_missing_bundled_restore_guidance(missing: List[dict]) -> str:
     """Footer guidance for ``hermes skills check`` missing-bundled output.
 
-    Always describes every provenance category. Restore instructions apply only
-    to unexpected absences — never imply opt_out / curator_suppressed should
-    be restored.
+    Always describes every provenance category. Source-backed restore
+    instructions never cover ``manifest_orphan_no_source`` (no bundled source
+    to restore from) — those get a distinct stale-manifest cleanup path.
+    Never imply opt_out / curator_suppressed should be restored.
     """
     _, actionable = partition_missing_bundled_skills(missing)
     base = (
@@ -1218,15 +1273,36 @@ def format_missing_bundled_restore_guidance(missing: List[dict]) -> str:
             + " All listed absences are intentional "
             "(opt_out / curator_suppressed); restore is not recommended."
         )
-    return (
-        base
-        + " Restore unexpected absences "
-        "(manifest_tracked_absent / source_present_never_installed / "
-        "manifest_orphan_no_source / unknown) with "
-        "`hermes skills reset <name> --restore`. "
-        "Do not restore opt_out or curator_suppressed entries unless you "
-        "intentionally reverse that choice."
-    )
+
+    # Orphans are actionable but not restorable (no bundled source). Every
+    # other actionable provenance — including unrecognized/blank→unknown —
+    # keeps the source-backed restore path.
+    orphans = [
+        e
+        for e in actionable
+        if _normalize_missing_provenance(str(e.get("provenance") or ""))
+        == "manifest_orphan_no_source"
+    ]
+    restorable = [e for e in actionable if e not in orphans]
+
+    parts = [base]
+    if restorable:
+        restore_cats = " / ".join(sorted(RESTORE_WITH_BUNDLED_SOURCE_PROVENANCE))
+        parts.append(
+            " Restore unexpected absences with bundled source "
+            f"({restore_cats}) with `hermes skills reset <name> --restore`. "
+            "Do not restore opt_out or curator_suppressed entries unless you "
+            "intentionally reverse that choice."
+        )
+    if orphans:
+        parts.append(
+            " Clear stale manifest_orphan_no_source tracking with "
+            "`hermes skills clean-manifest` (removes orphaned manifest keys "
+            "only; source-backed tracking is never deleted). Do not use "
+            "`hermes skills reset <name> --restore` for orphans — there is no "
+            "bundled source to restore from."
+        )
+    return "".join(parts)
 
 
 def list_missing_bundled_skills() -> List[dict]:
