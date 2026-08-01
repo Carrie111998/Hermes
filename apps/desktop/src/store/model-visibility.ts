@@ -101,11 +101,42 @@ export function setModelVisibilityOpen(open: boolean): void {
 
 /** The default-visible key set: the curated top-N per provider. Used both as
  *  the dropdown fallback and to seed the Edit Models dialog. */
+/** Models guaranteed visible in every provider's default set, regardless of
+ *  the backend's `featured_models` shortlist or a stale persisted visibility
+ *  store. Pinned here so a newly-released flagship (e.g. OpenAI's `gpt-5.6`
+ *  family) is always selectable the moment it lands in the curated catalog,
+ *  instead of being hidden behind a per-lab "newest N" cap until the user
+ *  manually re-shows it (#7efee3286 added the family to the catalog; this
+ *  guarantees it surfaces in the picker). */
+const PINNED_DEFAULT_MODELS: Record<string, string[]> = {
+  openrouter: [
+    'openai/gpt-5.6-luna',
+    'openai/gpt-5.6-luna-pro',
+    'openai/gpt-5.6-sol',
+    'openai/gpt-5.6-sol-pro',
+    'openai/gpt-5.6-terra',
+    'openai/gpt-5.6-terra-pro'
+  ]
+}
+
 export function defaultVisibleKeys(providers: readonly ModelOptionProvider[]): Set<string> {
   const keys = new Set<string>()
 
   for (const provider of providers) {
     expandProviderDefaults(provider, keys)
+  }
+
+  // Guarantee pinned flagships are visible even when a stale persisted
+  // visibility store or the featured shortlist would otherwise omit them.
+  for (const provider of providers) {
+    const pinned = PINNED_DEFAULT_MODELS[provider.slug]
+    if (!pinned) continue
+    const present = new Set(provider.models ?? [])
+    for (const model of pinned) {
+      if (present.has(model)) {
+        keys.add(modelVisibilityKey(provider.slug, model))
+      }
+    }
   }
 
   return keys
