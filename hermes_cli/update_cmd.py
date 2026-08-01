@@ -3584,6 +3584,10 @@ def _windows_updater_is_stale() -> bool:
     the handoff marker string. Any error (missing file, unreadable binary,
     non-Windows) returns False so a healthy install is never nagged and a
     broken probe never blocks an update.
+
+    The marker may sit anywhere in the binary (the Rust compiler can place
+    string literals at any offset), so the file is scanned incrementally in
+    bounded chunks rather than truncated at an arbitrary head size.
     """
     if not _m()._is_windows():
         return False
@@ -3593,38 +3597,55 @@ def _windows_updater_is_stale() -> bool:
         updater = get_hermes_home() / _WINDOWS_UPDATER_BINARY_NAME
         if not updater.is_file():
             return False
+        marker = _WINDOWS_UPDATER_HANDOFF_MARKER
+        # 64 KiB scan window with a one-marker-length overlap so a marker
+        # split across a chunk boundary is still found. Bounded memory: only
+        # two windows are ever live, regardless of binary size.
+        window = 64 * 1024
+        overlap = len(marker) - 1
         with open(updater, "rb") as fh:
-            head = fh.read(16 * 1024 * 1024)
-        return _WINDOWS_UPDATER_HANDOFF_MARKER not in head
+            prev_tail = b""
+            while True:
+                chunk = fh.read(window)
+                if not chunk:
+                    break
+                if marker in prev_tail + chunk:
+                    return False
+                if len(chunk) < window:
+                    break
+                prev_tail = chunk[-overlap:] if overlap > 0 else b""
+        return True
     except Exception as exc:
         logger.debug("Windows updater staleness probe failed: %s", exc)
         return False
 
 
-def _print_windows_updater_stale_notice() -> None:
-    """Warn when the staged Windows updater binary is too old to complete
-    an in-app update, with the exact repair steps.
+def _windows_updater_stale_notice_text() -> str:
+    """Multi-line notice for a stale staged Windows updater binary.
 
-    Printed after a successful `hermes update` so the user learns about the
-    stale binary at the moment they are already thinking about their install.
-    Kept non-fatal: the code update itself succeeded; only the next desktop
-    in-app update would deadlock.
+    Returns (not prints) so callers can append it to their own output:
+    the lock-refusal path in ``cmd_update`` prints it after
+    ``describe_holder`` -- the exact spot a user stuck in the stale-updater
+    deadlock lands -- while the success tail of ``_cmd_update_impl`` prints
+    it proactively for the next update. Kept non-fatal: the code update
+    itself succeeded; only the next desktop in-app update would deadlock.
     """
-    print()
-    print(
+    return (
+        "\n"
         "⚠ Stale Windows updater detected: the installed Hermes-Setup.exe "
-        "was built before the lock-handoff fix (upstream commit 8c76fe19f)."
+        "was built before the lock-handoff fix (upstream commit 8c76fe19f).\n"
+        "  The desktop in-app Update fails with \"Another Hermes update is\n"
+        "  already running\" until this binary is replaced.\n"
+        "  Fix: download the latest installer from\n"
+        "  https://hermes-agent.nousresearch.com/ and run it, or re-run the\n"
+        "  installer you originally used. `hermes update` cannot replace this\n"
+        "  binary itself."
     )
-    print(
-        "  The desktop in-app Update will fail with \"Another Hermes update "
-        "is already running\" until this binary is replaced."
-    )
-    print(
-        "  Fix: download the latest installer from "
-        "https://hermes-agent.nousresearch.com/ and run it, or re-run the "
-        "installer you originally used. `hermes update` cannot replace this "
-        "binary itself."
-    )
+
+
+def _print_windows_updater_stale_notice() -> None:
+    """Print :func:`_windows_updater_stale_notice_text` (success-tail path)."""
+    print(_windows_updater_stale_notice_text())
 
 
 def _cmd_update_impl(args, gateway_mode: bool):

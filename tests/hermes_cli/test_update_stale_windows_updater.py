@@ -98,3 +98,49 @@ def test_notice_mentions_the_failure_signature(capsys):
     update_mod._print_windows_updater_stale_notice()
     out = capsys.readouterr().out
     assert "Another Hermes update" in out
+
+
+def test_marker_after_16mib_is_still_detected(monkeypatch, tmp_path):
+    """A handoff marker placed beyond the old 16 MiB head-cut must still be
+    found -- the probe scans the whole binary, not a fixed prefix."""
+    monkeypatch.setattr(update_mod._m(), "_is_windows", lambda: True)
+    updater = tmp_path / "hermes-setup.exe"
+    # 20 MiB of padding, marker past 16 MiB, then a non-marker tail.
+    payload = b"\x00" * (20 * 1024 * 1024)
+    payload += update_mod._WINDOWS_UPDATER_HANDOFF_MARKER
+    payload += b"\x00" * 1024
+    updater.write_bytes(payload)
+
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    assert update_mod._windows_updater_is_stale() is False
+
+
+def test_marker_split_across_chunk_boundary_is_found(monkeypatch, tmp_path):
+    """A marker straddling a 64 KiB scan-window boundary must still match
+    thanks to the overlap carried between chunks."""
+    monkeypatch.setattr(update_mod._m(), "_is_windows", lambda: True)
+    updater = tmp_path / "hermes-setup.exe"
+    marker = update_mod._WINDOWS_UPDATER_HANDOFF_MARKER
+    # Split the marker right in the middle, with the first half ending
+    # exactly at a 64 KiB window boundary.
+    window = 64 * 1024
+    half = len(marker) // 2
+    payload = b"\x00" * (window - half) + marker
+    updater.write_bytes(payload)
+
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    assert update_mod._windows_updater_is_stale() is False
+
+
+def test_stale_notice_text_is_returned_not_printed():
+    """The lock-refusal path needs the notice as text to append to the
+    describe_holder output; make sure the text helper exists and mentions
+    the fix URL and the failure signature."""
+    text = update_mod._windows_updater_stale_notice_text()
+    assert "Stale Windows updater" in text
+    assert "hermes-agent.nousresearch.com" in text
+    assert "Another Hermes update" in text
