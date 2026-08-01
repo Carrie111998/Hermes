@@ -1035,12 +1035,20 @@ app.setName(APP_NAME)
 // Windows toast notifications silently no-op unless an AppUserModelID is set:
 // `new Notification().show()` returns without error and nothing appears. The
 // AUMID must match the installed Start Menu shortcut's AUMID, which
-// electron-builder derives from the build `appId` (com.nousresearch.hermes) —
+// electron-builder derives from the build `appId` (com.douglasdevsec.douglas-agent) —
 // keep this string in sync with package.json `build.appId`. macOS/Linux don't
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
+//
+// Douglas Agent: matches package.json's build.appId (changed from
+// com.nousresearch.hermes in 4c8da5049, same commit that changed executableName
+// and the NSIS shortcut name) -- keeping the old AUMID here would be internally
+// inconsistent with those, not protective: new installs already get a fresh,
+// unpinned taskbar/shortcut entry regardless of this value, since the target
+// exe path and name changed too. A user upgrading from an old Hermes-branded
+// install will see their pinned icon/notification settings reset either way.
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId('com.douglasdevsec.douglas-agent')
 }
 
 // Seed the native About panel with the live Douglas Agent version. This is refreshed
