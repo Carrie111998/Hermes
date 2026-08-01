@@ -79,6 +79,28 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     assert set(opened) == set(closed)
 
 
+def test_orphan_count_readiness_probe_closes_read_only_connection(monkeypatch, tmp_path):
+    """The read-only orphan diagnostic must close its readiness-probe connection."""
+    _point_ledger(monkeypatch, tmp_path)
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at,
+                completed_at, updated_at, event_json, delivery_state,
+                delivery_attempts, owner_pid)
+               VALUES ('orphaned', 'session', 'completed', 1.0,
+                       2.0, 2.0, '{}', 'pending', 0, 424242)"""
+        )
+    opened, closed = _track_connections(monkeypatch)
+    monkeypatch.setattr(ad, "_owner_process_alive", lambda _pid, _started_at: False)
+
+    assert ad.count_orphaned_pending_completions() == 1
+
+    assert opened, "expected the readiness probe to open a connection"
+    assert len(opened) == len(closed)
+    assert set(opened) == set(closed)
+
+
 def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
     """A PRAGMA/DDL failure after connect() must still close the connection."""
     _point_ledger(monkeypatch, tmp_path)
