@@ -76,6 +76,31 @@
     "focus": "when reservation intent is clear but voucher/payment path is unknown, do not assume direct BookNow/card payment; clarify or explain existing SkyVision voucher account/My Voucher flow and product reservation voucher option, with direct BookNow/card only when no voucher is used; no unsupported mandatory UI/slot/operator steps"
   },
   {
+    "id": "confirmed_reservation_wants_another_experience",
+    "message": "Имам потвърдена резервация за едно преживяване, но вече искам друго. Какво да направя?",
+    "focus": "confirmed/upcoming reservation change should explain self-service cancellation first when available, then voucher/service exchange only after successful cancellation and voucher release; no immediate team-only info@ escalation and no invented universal cutoff"
+  },
+  {
+    "id": "reservation_cancel_cutoff_unknown",
+    "message": "До колко часа преди резервацията мога да я анулирам?",
+    "focus": "provider-defined cutoff unknown; answer must not invent 24/48/global hours and should rely on product/provider facts or platform state"
+  },
+  {
+    "id": "reservation_cancel_unavailable_or_deadline_passed",
+    "message": "В профила ми няма бутон за анулиране на резервацията или системата отказва. Какво следва?",
+    "focus": "cancellation unavailable or deadline passed: explain self-service boundary under applicable reservation conditions, then assistance/exception review only without promising cancellation"
+  },
+  {
+    "id": "reservation_already_cancelled_voucher_exchange",
+    "message": "Резервацията вече е анулирана. Как да използвам ваучера за друго преживяване?",
+    "focus": "already-cancelled reservation should proceed with verified voucher management/exchange path without repeating cancellation steps"
+  },
+  {
+    "id": "reservation_self_cancel_reject_team_only",
+    "message": "Имам потвърдена резервация и искам друга услуга вместо нея.",
+    "focus": "wrong immediate info@/team-only answer fails; self-service cancellation first when available, provider-defined cutoff uncertainty, no promised exception"
+  },
+  {
     "id": "gift_wish_text",
     "message": "Стигнах до плащането, но не ми излезе меню за поздрав.",
     "focus": "voucher greeting UI knowledge: cart edit flow before payment, and BookNow is not a gift voucher"

@@ -206,6 +206,54 @@ def test_reservation_voucher_path_ambiguity_is_hermes_principle() -> None:
     assert "do not assume direct BookNow/card payment" in scenario["focus"]
 
 
+def test_confirmed_reservation_self_cancellation_is_general_principle() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    support = public_tools.handle_skyai_support_knowledge(include_contacts=True)
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "потвърдена/предстояща резервация" in prompt
+    assert "профил -> Резервации" in prompt
+    assert "Анулиране на резервацията" in prompt
+    assert "не казвай, че екипът трябва да я анулира" in prompt
+    assert "не измисляй универсален срок" in prompt
+    assert "след успешно анулиране" in prompt
+    assert prompt.index("Анулиране на резервацията") < prompt.index("след успешно анулиране")
+    assert "info@skyvision.bg" in prompt
+
+    reservation_support = support["reservation_support"]
+    assert reservation_support["customer_profile_section"] == "Профил -> Резервации"
+    assert reservation_support["self_service_cancel_action"] == "Анулиране на резервацията"
+    assert reservation_support["public_terms_sections"] == ["1.2", "4.1", "17.2", "17.4", "17.5"]
+    assert reservation_support["provider_defined_change_conditions"] is True
+    assert reservation_support["platform_enforces_cancel_cutoff"] is True
+    assert reservation_support["global_cancel_hours"] is None
+    assert reservation_support["self_service_cancel_after_cutoff_available"] is False
+    assert "reservation/cancel/" in reservation_support["customer_cancel_endpoint_pattern"]
+    assert "direct_email" not in reservation_support
+
+    principle = next(case for case in cases if case["id"] == "confirmed_reservation_self_cancellation")
+    assert principle["source_threads"] == ["sanitized_qa_1533000762970341406"]
+    assert "self-service path first" in principle["principle"]
+    assert "Do not invent a universal cancellation window" in principle["principle"]
+    assert "only then suggest contacting" in principle["principle"]
+    assert "After successful cancellation and voucher release" in principle["principle"]
+
+    scenario_ids = {case["id"] for case in scenarios}
+    assert {
+        "confirmed_reservation_wants_another_experience",
+        "reservation_cancel_cutoff_unknown",
+        "reservation_cancel_unavailable_or_deadline_passed",
+        "reservation_already_cancelled_voucher_exchange",
+        "reservation_self_cancel_reject_team_only",
+    } <= scenario_ids
+    assert "Confirmed reservation self-cancellation is Hermes reasoning context" in architecture
+    assert "not a runtime intent router" in architecture
+    assert "provider-defined conditions" in architecture
+    assert "no universal cancellation window" in architecture
+
+
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     result = public_tools.handle_skyai_campaign_knowledge()
     serialized = json.dumps(result, ensure_ascii=False)

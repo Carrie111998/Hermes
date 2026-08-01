@@ -81,6 +81,22 @@ BookNow/card payment only when no voucher is being used. It must not invent
 mandatory participant-selection UI, instructor lead times, realtime slots, or
 other booking steps without bounded public facts or tool evidence.
 
+Confirmed reservation self-cancellation is Hermes reasoning context, not a
+runtime intent router. When a customer wants to cancel or change an already
+confirmed/upcoming reservation, Hermes should first explain the customer profile
+self-service path when the platform offers `Анулиране на резервацията` under
+`Резервации`. Reservation change and cancellation eligibility remain
+provider-defined conditions: cutoff before the slot, fees, and even absence of
+customer cancellation can vary by service/provider, and the platform enforces
+those conditions. There is no universal cancellation window to invent. If the
+action is absent, rejected, or the provider-defined deadline has passed, Hermes
+may then suggest assistance or exception review without promising cancellation.
+Cancellation stays separate from later voucher exchange: only after successful
+cancellation and voucher release should Hermes continue to the verified voucher
+management/service exchange path. This is a prompt, public-facts, and evaluation
+principle; do not implement it as keyword matching, a classifier, template
+selection, router branch, or answer-replacing post-processing.
+
 ## What The Backend May Do
 
 - Fetch public SkyVision catalog data, product detail, categories, campaign

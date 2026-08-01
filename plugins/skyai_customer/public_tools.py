@@ -766,6 +766,23 @@ def handle_skyai_support_knowledge(
                 "monitored": True,
                 "accepts_customer_replies": False,
             },
+            "customer_profile_section": "Профил -> Резервации",
+            "self_service_cancel_action": "Анулиране на резервацията",
+            "customer_cancel_endpoint_pattern": "POST reservation/cancel/<voucher>",
+            "public_terms_url": "https://skyvision.bg/общи-условия/",
+            "public_terms_sections": ["1.2", "4.1", "17.2", "17.4", "17.5"],
+            "platform_reservation_management_available": True,
+            "reservation_changes_through_platform": True,
+            "provider_defined_change_conditions": True,
+            "provider_defined_cutoff_before_slot": True,
+            "provider_defined_fees_possible": True,
+            "service_may_have_no_customer_cancellation": True,
+            "platform_enforces_cancel_cutoff": True,
+            "global_cancel_hours": None,
+            "self_service_cancel_after_cutoff_available": False,
+            "self_service_cancel_after_unavailable_action_available": False,
+            "exception_review_guaranteed": False,
+            "voucher_exchange_requires_released_voucher": True,
             "missing_confirmation": (
                 "При липсващ потвърдителен имейл за резервация екипът може да провери и да помогне; "
                 "SkyAI не твърди, че сам е изпратил или преиздал потвърждение."
