@@ -328,3 +328,104 @@ class TestSanePathIncludesHomebrew:
             result = _make_run_env({})
         # Should keep existing PATH unchanged
         assert result["PATH"] == "/usr/bin:/bin"
+
+
+class TestConfiguredSecretTokenNamesAreBlocked:
+    """A renamed secrets.{onepassword,bitwarden}.*_env value is a
+    high-privilege secret-manager credential just like the default name —
+    it must reach the blocklist even though it's not a static
+    OPTIONAL_ENV_VARS entry.
+
+    See the Codex finding on hermes-agent PR #106: the static blocklist
+    only ever caught the default OP_SERVICE_ACCOUNT_TOKEN name, so a
+    config like `service_account_token_env: COMPANY_OP_TOKEN` left that
+    token exposed to model-issued terminal commands.
+    """
+
+    def test_custom_onepassword_token_env_is_blocked(self):
+        from tools.environments.local import _build_provider_env_blocklist
+
+        fake_config = {
+            "secrets": {
+                "onepassword": {"service_account_token_env": "COMPANY_OP_TOKEN"},
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=fake_config):
+            blocklist = _build_provider_env_blocklist()
+
+        assert "COMPANY_OP_TOKEN" in blocklist
+
+    def test_custom_bitwarden_token_env_is_blocked(self):
+        from tools.environments.local import _build_provider_env_blocklist
+
+        fake_config = {
+            "secrets": {
+                "bitwarden": {"access_token_env": "COMPANY_BWS_TOKEN"},
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=fake_config):
+            blocklist = _build_provider_env_blocklist()
+
+        assert "COMPANY_BWS_TOKEN" in blocklist
+
+    def test_malformed_config_does_not_crash_blocklist_build(self):
+        from tools.environments.local import _build_provider_env_blocklist
+
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
+            blocklist = _build_provider_env_blocklist()
+
+        # Falls back gracefully — the static entries are still present.
+        assert "OPENAI_API_KEY" in blocklist
+
+
+class TestDynamicallyManagedSecretsAreBlocked:
+    """A 1Password field with an unregistered label (e.g. DATABASE_PASSWORD,
+    CUSTOM_PRIVATE_KEY) has no static registration anywhere — the only way
+    to keep it out of subprocess env is to consult env_loader's runtime
+    source-tracking registry at call time, not the fixed blocklist computed
+    once at import time.
+
+    See the Codex finding on hermes-agent PR #106: without this, any
+    1Password-managed name that wasn't already a known API key leaked into
+    model-issued terminal and background-process commands.
+    """
+
+    def test_is_externally_sourced_secret_true_when_tracked(self):
+        from tools.environments.local import _is_externally_sourced_secret
+        import hermes_cli.env_loader as env_loader
+
+        env_loader._SECRET_SOURCES["DATABASE_PASSWORD"] = "onepassword"
+        try:
+            assert _is_externally_sourced_secret("DATABASE_PASSWORD") is True
+        finally:
+            env_loader._SECRET_SOURCES.pop("DATABASE_PASSWORD", None)
+
+    def test_is_externally_sourced_secret_false_when_untracked(self):
+        from tools.environments.local import _is_externally_sourced_secret
+        assert _is_externally_sourced_secret("SOME_UNTRACKED_VAR") is False
+
+    def test_make_run_env_strips_dynamically_managed_secret(self):
+        from tools.environments.local import _make_run_env
+        import hermes_cli.env_loader as env_loader
+
+        env_loader._SECRET_SOURCES["DATABASE_PASSWORD"] = "onepassword"
+        try:
+            with patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin:/bin", "DATABASE_PASSWORD": "hunter2"},
+                clear=True,
+            ):
+                result = _make_run_env({})
+            assert "DATABASE_PASSWORD" not in result
+        finally:
+            env_loader._SECRET_SOURCES.pop("DATABASE_PASSWORD", None)
+
+    def test_make_run_env_keeps_untracked_var(self):
+        from tools.environments.local import _make_run_env
+        with patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin:/bin", "MY_PROJECT_VAR": "keep-me"},
+            clear=True,
+        ):
+            result = _make_run_env({})
+        assert result.get("MY_PROJECT_VAR") == "keep-me"

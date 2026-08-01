@@ -549,7 +549,7 @@ def cmd_op_setup(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             console.print(f"  [red]✗ Could not install SDK: {exc}[/red]")
             console.print(
-                "  Manual install:  [cyan]pip install onepassword-sdk[/cyan]"
+                f"  Manual install:  [cyan]pip install '{op.OP_SDK_REQUIREMENT}'[/cyan]"
             )
             return 1
 
@@ -594,10 +594,16 @@ def cmd_op_setup(args: argparse.Namespace) -> int:
     console.print()
     console.print("[bold]Step 3[/bold]  Vault name")
     vault_name = (getattr(args, "vault", None) or "").strip()
-    if not vault_name:
+    if not vault_name and sys.stdin.isatty():
         vault_name = console.input(
             "  Vault name (leave empty to search all accessible vaults): "
         ).strip()
+    elif not vault_name:
+        # Non-interactive (no TTY) and --vault wasn't given: an empty
+        # vault_name IS the documented "search all accessible vaults"
+        # value, not a missing input — prompting here would raise EOFError
+        # and abort automation that intentionally omitted --vault.
+        console.print("  (non-interactive: searching all accessible vaults)")
 
     # ------------------------------------------------------------------ item
     console.print()
@@ -622,7 +628,9 @@ def cmd_op_setup(args: argparse.Namespace) -> int:
             field_mapping=secrets_cfg.get("field_mapping") or {},
             use_cache=False,
         )
-    except Exception as exc:  # noqa: BLE001
+    except RuntimeError as exc:
+        # Category only (exception class name), never str(exc) — see the
+        # "Error categories" comment in agent/secret_sources/onepassword.py.
         console.print(f"  [red]✗ Fetch failed: {type(exc).__name__}[/red]")
         return 1
 
@@ -733,6 +741,18 @@ def cmd_op_status(args: argparse.Namespace) -> int:
             f"\n  [red]Connection check failed: {status['connection_error']}[/red]"
         )
         return 1
+    if status["field_warnings"]:
+        # Count only, not the warning text itself — each entry embeds the
+        # 1Password field label (see _fetch_secrets_async's "Skipping field
+        # {label!r}" message), which CodeQL's clear-text-logging taint
+        # tracking treats as sensitive the same as a value, since it
+        # originates from the same tainted item.fields source.
+        console.print(
+            f"\n  [yellow]{len(status['field_warnings'])} field(s) skipped "
+            "during the connection check — check the field labels in the "
+            "1Password item for names that collide, are invalid, or are "
+            "blocklisted (PATH, EDITOR, etc.).[/yellow]"
+        )
     return 0
 
 
@@ -772,7 +792,8 @@ def cmd_op_sync(args: argparse.Namespace) -> int:
             field_mapping=field_mapping,
             use_cache=False,
         )
-    except Exception as exc:  # noqa: BLE001
+    except RuntimeError as exc:
+        # Category only — see cmd_op_setup's matching comment.
         console.print(f"[red]Fetch failed: {type(exc).__name__}[/red]")
         return 1
 

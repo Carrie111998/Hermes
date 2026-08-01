@@ -273,7 +273,16 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# `hermes secrets ...` manages external secret sources directly (setup,
+# status, sync, disable, install) — skip auto-bootstrapping them here so
+# e.g. `hermes secrets onepassword disable` can turn off a hanging or
+# misconfigured source without first waiting through the very bootstrap
+# attempt (SDK auto-install, network fetch, timeout) it's trying to stop.
+_argv_subcommand = next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+load_hermes_dotenv(
+    project_env=PROJECT_ROOT / ".env",
+    skip_external_secrets=(_argv_subcommand == "secrets"),
+)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at

@@ -121,6 +121,50 @@ def test_apply_external_secret_sources_noop_when_disabled(tmp_path, monkeypatch)
     assert env_loader.get_secret_source("ANTHROPIC_API_KEY") is None
 
 
+def test_load_hermes_dotenv_skip_external_secrets(tmp_path, monkeypatch):
+    """skip_external_secrets=True (used for `hermes secrets ...` management
+    commands) must not touch external sources at all — e.g. so `hermes
+    secrets onepassword disable` doesn't have to bootstrap the very
+    integration it's trying to turn off before it can run."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    item: Hermes\n",
+        encoding="utf-8",
+    )
+
+    def _boom(home_path):
+        raise AssertionError("_apply_external_secret_sources must not run")
+
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", _boom)
+
+    env_loader.load_hermes_dotenv(hermes_home=tmp_path, skip_external_secrets=True)
+
+
+def test_load_secrets_config_expands_env_vars(tmp_path, monkeypatch):
+    """${VAR} references in secrets.* config values must be expanded the
+    same way the canonical load_config() path expands them — otherwise a
+    documented ${OP_VAULT}-style value reaches fetch_onepassword_secrets()
+    as a literal, unresolvable string."""
+    monkeypatch.setenv("OP_VAULT_NAME", "Prod Vault")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    vault: ${OP_VAULT_NAME}\n"
+        "    item: Hermes\n",
+        encoding="utf-8",
+    )
+
+    secrets_cfg = env_loader._load_secrets_config(tmp_path)
+
+    assert secrets_cfg["onepassword"]["vault"] == "Prod Vault"
+
+
 def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config_path = tmp_path / "config.yaml"
@@ -213,3 +257,39 @@ def test_onepassword_removal_clears_source_tracking(tmp_path, monkeypatch):
 
     assert env_loader.get_secret_source("GONE_KEY") is None
     assert "GONE_KEY" not in env_loader._SECRET_VALUES
+
+
+def test_onepassword_disabling_relinquishes_previously_managed_secrets(tmp_path, monkeypatch):
+    """Regression test: disabling the integration on a long-lived gateway
+    must stop it from continuing to use secrets a prior (enabled) sync
+    already injected — the gateway reloads env every turn without
+    restarting, so this can't wait for a process restart to take effect."""
+    import os
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("STILL_MANAGED_KEY", "op-value")
+    env_loader._SECRET_SOURCES["STILL_MANAGED_KEY"] = "onepassword"
+    env_loader._SECRET_VALUES["STILL_MANAGED_KEY"] = "op-value"
+
+    # A key the operator overrode locally in the meantime must be left
+    # alone — same rule as the enabled-refresh path.
+    monkeypatch.setenv("LOCALLY_OVERRIDDEN_KEY", "operator-value")
+    env_loader._SECRET_SOURCES["LOCALLY_OVERRIDDEN_KEY"] = "onepassword"
+    env_loader._SECRET_VALUES["LOCALLY_OVERRIDDEN_KEY"] = "stale-op-value"
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert "STILL_MANAGED_KEY" not in os.environ
+    assert env_loader.get_secret_source("STILL_MANAGED_KEY") is None
+
+    assert os.environ["LOCALLY_OVERRIDDEN_KEY"] == "operator-value"
+    assert env_loader.get_secret_source("LOCALLY_OVERRIDDEN_KEY") is None
+    monkeypatch.delenv("LOCALLY_OVERRIDDEN_KEY", raising=False)

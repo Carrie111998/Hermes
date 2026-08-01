@@ -100,6 +100,26 @@ def _build_provider_env_blocklist() -> frozenset:
     except ImportError:
         pass
 
+    # secrets.{onepassword,bitwarden}.*_env config keys let a user rename
+    # the bootstrap-token env var away from the registered default (e.g.
+    # OP_SERVICE_ACCOUNT_TOKEN -> COMPANY_OP_TOKEN). The static
+    # OPTIONAL_ENV_VARS-derived block above only ever catches the default
+    # name, so without this a custom name reaches model-issued subprocess
+    # commands unprotected even though it's a high-privilege secret-manager
+    # credential. Broad except: a malformed config.yaml must never block
+    # startup, same convention as _apply_external_secret_sources().
+    try:
+        from hermes_cli.config import load_config
+        secrets_cfg = (load_config() or {}).get("secrets") or {}
+        op_token_env = (secrets_cfg.get("onepassword") or {}).get("service_account_token_env")
+        if op_token_env:
+            blocked.add(op_token_env)
+        bw_token_env = (secrets_cfg.get("bitwarden") or {}).get("access_token_env")
+        if bw_token_env:
+            blocked.add(bw_token_env)
+    except Exception:
+        pass
+
     blocked.update({
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
@@ -171,6 +191,28 @@ def _build_provider_env_blocklist() -> frozenset:
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
 
+def _is_externally_sourced_secret(name: str) -> bool:
+    """True if ``name`` was injected into os.environ by Bitwarden/1Password
+    this process, per env_loader's runtime source-tracking registry.
+
+    Unlike ``_HERMES_PROVIDER_ENV_BLOCKLIST`` (a fixed set computed once at
+    import time from static config), a 1Password field's label — and
+    therefore its derived env var name — is only known once the vault is
+    actually fetched at runtime. A field like ``DATABASE_PASSWORD`` or
+    ``CUSTOM_PRIVATE_KEY`` has no static registration anywhere the
+    blocklist above could pick it up from, so the only way to protect it
+    from model-issued terminal/background-process commands is to consult
+    the same dynamic registry env_loader already maintains for exactly
+    this purpose (labeling detected credentials by origin for `hermes
+    model` / `hermes setup` display).
+    """
+    try:
+        from hermes_cli.env_loader import get_secret_source
+    except ImportError:
+        return False
+    return get_secret_source(name) is not None
+
+
 def _inject_context_hermes_home(env: dict) -> None:
     """Bridge the context-local Hermes home override into subprocess env."""
     try:
@@ -195,14 +237,20 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if _is_passthrough(key) or (
+            key not in _HERMES_PROVIDER_ENV_BLOCKLIST
+            and not _is_externally_sourced_secret(key)
+        ):
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             sanitized[real_key] = value
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        elif _is_passthrough(key) or (
+            key not in _HERMES_PROVIDER_ENV_BLOCKLIST
+            and not _is_externally_sourced_secret(key)
+        ):
             sanitized[key] = value
 
     _inject_context_hermes_home(sanitized)
@@ -293,7 +341,10 @@ def _make_run_env(env: dict) -> dict:
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             run_env[real_key] = v
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
+        elif _is_passthrough(k) or (
+            k not in _HERMES_PROVIDER_ENV_BLOCKLIST
+            and not _is_externally_sourced_secret(k)
+        ):
             run_env[k] = v
     existing_path = run_env.get("PATH", "")
     # The "/usr/bin not already present → inject sane POSIX path" heuristic

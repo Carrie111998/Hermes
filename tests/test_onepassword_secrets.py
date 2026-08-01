@@ -54,6 +54,15 @@ def test_is_valid_env_name_rejects_unicode_letters():
     assert op._is_valid_env_name("") is False
 
 
+def test_is_valid_env_name_rejects_trailing_newline():
+    # re.match(r"...$", ...) matches just before a trailing "\n" even
+    # though the "\n" itself was never consumed by the pattern — a YAML
+    # literal-block field_mapping value commonly has exactly this shape.
+    assert op._is_valid_env_name("OPENAI_API_KEY\n") is False
+    assert op._is_valid_env_name("OPENAI_API_KEY\n\n") is False
+    assert op._is_valid_env_name("OPENAI_API_KEY") is True
+
+
 # ---------------------------------------------------------------------------
 # Cache key includes token + field_mapping identity (P1 finding)
 # ---------------------------------------------------------------------------
@@ -118,6 +127,29 @@ def test_cache_hit_same_identity(monkeypatch):
     op.fetch_onepassword_secrets(token="t", vault_name="v", item_title="i", use_cache=True)
 
     assert len(calls) == 1  # identical identity => cache hit on the second call
+
+
+def test_rotated_token_evicts_old_cache_entry(monkeypatch):
+    """A long-lived gateway that rotates its service account token must not
+    keep the old token/entry reachable in _CACHE forever — that's an
+    unbounded memory leak of prior bootstrap tokens and fetched secrets."""
+
+    async def _fake_fetch(*, token, vault_name, item_title, field_mapping):
+        return {"KEY": f"secret-for-{token}"}, []
+
+    monkeypatch.setattr(op, "_fetch_secrets_async", _fake_fetch)
+    monkeypatch.setattr(op, "_ensure_sdk", lambda: None)
+
+    op.fetch_onepassword_secrets(token="token-a", vault_name="v", item_title="i", use_cache=True)
+    assert len(op._CACHE) == 1
+
+    op.fetch_onepassword_secrets(token="token-b", vault_name="v", item_title="i", use_cache=True)
+
+    # Still exactly one entry for this (vault, item) slot — the old
+    # token-a entry was evicted, not left to accumulate.
+    assert len(op._CACHE) == 1
+    remaining_key = next(iter(op._CACHE))
+    assert remaining_key[2] == "token-b"
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +218,7 @@ def test_ambiguous_vault_name_rejected(monkeypatch):
         items_by_vault={},
         items_by_id={},
     )
-    with pytest.raises(RuntimeError, match="ambiguous"):
+    with pytest.raises(op.VaultAmbiguousError, match="ambiguous"):
         asyncio.run(
             op._fetch_secrets_async(
                 token="t", vault_name="Shared", item_title="Hermes", field_mapping={}
@@ -204,7 +236,7 @@ def test_ambiguous_item_title_rejected(monkeypatch):
         ]},
         items_by_id={},
     )
-    with pytest.raises(RuntimeError, match="ambiguous"):
+    with pytest.raises(op.ItemAmbiguousError, match="ambiguous"):
         asyncio.run(
             op._fetch_secrets_async(
                 token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
@@ -317,3 +349,289 @@ def test_apply_never_removes_unmanaged_key(monkeypatch, tmp_path):
     assert removed == []
     import os
     assert os.environ["UNRELATED_KEY"] == "keep-me"
+
+
+# ---------------------------------------------------------------------------
+# Duplicate field labels are rejected, not silently collapsed (P1 finding)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_field_labels_rejected(monkeypatch):
+    """Two fields sharing the exact same label must both be dropped as a
+    collision, not have the second silently overwrite the first in a
+    label-keyed dict before collision detection ever runs."""
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Vault1")],
+        items_by_vault={"v1": [_FakeItemOverview("i1", "Hermes")]},
+        items_by_id={
+            "i1": _FakeItem([
+                _FakeField("API KEY", "first-value"),
+                _FakeField("API KEY", "second-value"),
+            ])
+        },
+    )
+    secrets, warnings = asyncio.run(
+        op._fetch_secrets_async(
+            token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
+        )
+    )
+    # Neither value should win — both are dropped as an ambiguous collision.
+    assert "API_KEY" not in secrets
+    assert secrets == {}
+
+
+def test_duplicate_labels_do_not_shadow_a_third_distinct_field(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Vault1")],
+        items_by_vault={"v1": [_FakeItemOverview("i1", "Hermes")]},
+        items_by_id={
+            "i1": _FakeItem([
+                _FakeField("API KEY", "first-value"),
+                _FakeField("API KEY", "second-value"),
+                _FakeField("OTHER FIELD", "unaffected-value"),
+            ])
+        },
+    )
+    secrets, warnings = asyncio.run(
+        op._fetch_secrets_async(
+            token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
+        )
+    )
+    assert "API_KEY" not in secrets
+    assert secrets == {"OTHER_FIELD": "unaffected-value"}
+
+
+# ---------------------------------------------------------------------------
+# get_onepassword_status skips the live connection check when disabled (P2)
+# ---------------------------------------------------------------------------
+
+
+def test_status_skips_connection_check_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("OP_TOKEN", "tok")
+    monkeypatch.setattr(op, "_check_sdk_available", lambda: True)
+
+    def _boom(**kw):
+        raise AssertionError("fetch_onepassword_secrets must not be called when disabled")
+
+    monkeypatch.setattr(op, "fetch_onepassword_secrets", _boom)
+
+    status = op.get_onepassword_status(
+        {
+            "enabled": False,
+            "service_account_token_env": "OP_TOKEN",
+            "item": "Hermes",
+        },
+        tmp_path,
+    )
+
+    assert status["connection_ok"] is None
+    assert status["connection_error"] is None
+
+
+def test_status_connection_error_is_exception_category_only(monkeypatch, tmp_path):
+    """connection_error must be the exception's class name, never str(exc)
+    — see the "Error categories" comment in onepassword.py. A raw message
+    could embed vault titles/item ids returned by the 1Password Client."""
+
+    def _boom(**kw):
+        raise op.VaultAmbiguousError(
+            "Vault name 'Top Secret Vault' is ambiguous: 3 vaults share this title."
+        )
+
+    monkeypatch.setenv("OP_TOKEN", "tok")
+    monkeypatch.setattr(op, "_check_sdk_available", lambda: True)
+    monkeypatch.setattr(op, "fetch_onepassword_secrets", _boom)
+
+    status = op.get_onepassword_status(
+        {
+            "enabled": True,
+            "service_account_token_env": "OP_TOKEN",
+            "item": "Hermes",
+        },
+        tmp_path,
+    )
+
+    assert status["connection_ok"] is False
+    assert status["connection_error"] == "VaultAmbiguousError"
+    assert "Top Secret Vault" not in status["connection_error"]
+
+
+def test_status_checks_connection_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("OP_TOKEN", "tok")
+    monkeypatch.setattr(op, "_check_sdk_available", lambda: True)
+    monkeypatch.setattr(op, "fetch_onepassword_secrets", lambda **kw: ({"X": "v"}, []))
+
+    status = op.get_onepassword_status(
+        {
+            "enabled": True,
+            "service_account_token_env": "OP_TOKEN",
+            "item": "Hermes",
+        },
+        tmp_path,
+    )
+
+    assert status["connection_ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Editor/pager env vars are blocked (P1 finding — code execution via
+# `hermes config edit`'s $EDITOR/$VISUAL exec)
+# ---------------------------------------------------------------------------
+
+
+def test_editor_and_visual_are_blocked(monkeypatch):
+    assert "EDITOR" in op._DANGEROUS_ENV_VARS
+    assert "VISUAL" in op._DANGEROUS_ENV_VARS
+    assert "PAGER" in op._DANGEROUS_ENV_VARS
+
+
+def test_editor_field_is_skipped_not_injected(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Vault1")],
+        items_by_vault={"v1": [_FakeItemOverview("i1", "Hermes")]},
+        items_by_id={
+            "i1": _FakeItem([
+                _FakeField("Editor", "/bin/rm"),
+                _FakeField("API KEY", "sekret"),
+            ])
+        },
+    )
+    secrets, warnings = asyncio.run(
+        op._fetch_secrets_async(
+            token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
+        )
+    )
+    assert "EDITOR" not in secrets
+    assert secrets == {"API_KEY": "sekret"}
+
+
+# ---------------------------------------------------------------------------
+# status() surfaces skipped-field warnings, not just connection_ok (P2)
+# ---------------------------------------------------------------------------
+
+
+def test_status_surfaces_field_warnings(monkeypatch, tmp_path):
+    monkeypatch.setenv("OP_TOKEN", "tok")
+    monkeypatch.setattr(op, "_check_sdk_available", lambda: True)
+    monkeypatch.setattr(
+        op, "fetch_onepassword_secrets",
+        lambda **kw: ({"GOOD_KEY": "v"}, ["Skipping field 'bad label': ..."]),
+    )
+
+    status = op.get_onepassword_status(
+        {
+            "enabled": True,
+            "service_account_token_env": "OP_TOKEN",
+            "item": "Hermes",
+        },
+        tmp_path,
+    )
+
+    assert status["connection_ok"] is True
+    assert status["field_warnings"] == ["Skipping field 'bad label': ..."]
+
+
+# ---------------------------------------------------------------------------
+# Embedded null bytes are stripped, not left to crash os.environ[k]=v (P2)
+# ---------------------------------------------------------------------------
+
+
+def test_null_byte_in_field_value_is_stripped(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Vault1")],
+        items_by_vault={"v1": [_FakeItemOverview("i1", "Hermes")]},
+        items_by_id={
+            "i1": _FakeItem([_FakeField("API KEY", "sek\x00ret")]),
+        },
+    )
+    secrets, warnings = asyncio.run(
+        op._fetch_secrets_async(
+            token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
+        )
+    )
+    assert secrets == {"API_KEY": "sekret"}
+    assert "\x00" not in secrets["API_KEY"]
+
+
+def test_field_value_that_is_only_null_bytes_is_skipped(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Vault1")],
+        items_by_vault={"v1": [_FakeItemOverview("i1", "Hermes")]},
+        items_by_id={
+            "i1": _FakeItem([
+                _FakeField("EMPTY", "\x00\x00"),
+                _FakeField("API KEY", "sekret"),
+            ]),
+        },
+    )
+    secrets, warnings = asyncio.run(
+        op._fetch_secrets_async(
+            token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
+        )
+    )
+    assert "EMPTY" not in secrets
+    assert secrets == {"API_KEY": "sekret"}
+
+
+# ---------------------------------------------------------------------------
+# Vault/item ambiguity errors no longer leak other vaults'/items' titles
+# or ids from the 1Password account (CodeQL clear-text-logging finding)
+# ---------------------------------------------------------------------------
+
+
+def test_vault_not_found_error_omits_other_vault_titles(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Top Secret Executive Vault")],
+        items_by_vault={},
+        items_by_id={},
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            op._fetch_secrets_async(
+                token="t", vault_name="Nope", item_title="Hermes", field_mapping={}
+            )
+        )
+    assert "Top Secret Executive Vault" not in str(excinfo.value)
+
+
+def test_ambiguous_vault_error_omits_vault_ids(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("vault-id-1", "Shared"), _FakeVault("vault-id-2", "Shared")],
+        items_by_vault={},
+        items_by_id={},
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            op._fetch_secrets_async(
+                token="t", vault_name="Shared", item_title="Hermes", field_mapping={}
+            )
+        )
+    assert "vault-id-1" not in str(excinfo.value)
+    assert "vault-id-2" not in str(excinfo.value)
+
+
+def test_ambiguous_item_error_omits_item_ids(monkeypatch):
+    _install_fake_sdk(
+        monkeypatch,
+        vaults=[_FakeVault("v1", "Vault1")],
+        items_by_vault={"v1": [
+            _FakeItemOverview("item-id-1", "Hermes"),
+            _FakeItemOverview("item-id-2", "Hermes"),
+        ]},
+        items_by_id={},
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(
+            op._fetch_secrets_async(
+                token="t", vault_name="Vault1", item_title="Hermes", field_mapping={}
+            )
+        )
+    assert "item-id-1" not in str(excinfo.value)
+    assert "item-id-2" not in str(excinfo.value)

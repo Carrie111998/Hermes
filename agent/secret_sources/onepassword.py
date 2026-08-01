@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,13 @@ SDK_TIMEOUT_SECONDS = 30
 _OP_INTEGRATION_NAME = "hermes-agent"
 _OP_INTEGRATION_VERSION = "1.0.0"
 
+# Pinned pre-1.0 SDK requirement — single source of truth so every install
+# path (auto-install, the disabled-lazy-install error, the CLI's manual
+# fallback message) recommends the same bounded version rather than a bare
+# `pip install onepassword-sdk` that could pull in a breaking release
+# outside pyproject.toml/uv.lock's locked range.
+OP_SDK_REQUIREMENT = "onepassword-sdk>=0.1.0,<0.2.0"
+
 # In-process cache: (vault_name, item_title, token, field_mapping) → _CachedFetch
 # The token and field_mapping are part of the key (not hashed — this is an
 # in-memory dict key, never logged or persisted) so that a rotated service
@@ -65,16 +72,75 @@ _CACHE: Dict[_CacheKey, "_CachedFetch"] = {}
 # These variables can be used to hijack subprocess execution via interpreter
 # hooks, dynamic linker preloads, or shell startup files.
 _DANGEROUS_ENV_VARS: frozenset = frozenset({
-    "BASH_ENV", "ENV",
+    "PATH",
+    "BASH_ENV", "ENV", "ZDOTDIR", "SHELLOPTS", "PROMPT_COMMAND", "IFS", "PS4",
     "GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXEC_PATH", "GIT_PROXY_COMMAND", "GIT_ASKPASS",
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "SSH_ASKPASS", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_CONFIG",
+    # `hermes config edit` (hermes_cli/config.py) execs $EDITOR/$VISUAL
+    # directly as a command; PAGER is the same class of risk (a common
+    # convention: subprocess.run([os.environ.get("PAGER", ...), ...])).
+    "EDITOR", "VISUAL", "PAGER",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
     "NODE_OPTIONS", "NODE_PATH",
-    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERSITE",
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERSITE", "PYTHONHOME",
     "RUBYOPT", "RUBYLIB",
     "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS",
     "PERL5OPT", "PERL5LIB",
     "CDPATH",
 })
+
+
+# ---------------------------------------------------------------------------
+# Error categories
+# ---------------------------------------------------------------------------
+#
+# Distinct RuntimeError subclasses (rather than one generic RuntimeError
+# with a descriptive message) so that `type(exc).__name__` alone is a
+# meaningful failure category. This matters because several call sites
+# display *only* the exception type, never str(exc): CodeQL's clear-text-
+# logging taint tracking follows data through exception messages built
+# from anything the authenticated 1Password Client returned (vault/item
+# lists), all the way to any print/log of str(exc) — regardless of
+# whether the literal message text still contains sensitive substrings.
+# A distinct class per failure kind is what lets the UI stay useful
+# without ever needing str(exc).
+
+
+class OnePasswordSDKNotInstalledError(RuntimeError):
+    pass
+
+
+class VaultNotFoundError(RuntimeError):
+    pass
+
+
+class VaultAmbiguousError(RuntimeError):
+    pass
+
+
+class NoVaultsAccessibleError(RuntimeError):
+    pass
+
+
+class ItemNotFoundError(RuntimeError):
+    pass
+
+
+class ItemAmbiguousError(RuntimeError):
+    pass
+
+
+class EmptyTokenError(RuntimeError):
+    pass
+
+
+class FetchTimeoutError(RuntimeError):
+    pass
+
+
+class SDKCallError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -124,12 +190,12 @@ def _check_sdk_available() -> bool:
 
 
 def _ensure_sdk() -> None:
-    """Raise :class:`RuntimeError` if the SDK is not available."""
+    """Raise :class:`OnePasswordSDKNotInstalledError` if the SDK is unavailable."""
     if not _check_sdk_available():
-        raise RuntimeError(
+        raise OnePasswordSDKNotInstalledError(
             "The 'onepassword' Python SDK is not installed.  "
             "Run `hermes secrets onepassword install` or "
-            "`pip install onepassword-sdk` to install it."
+            f"`pip install '{OP_SDK_REQUIREMENT}'` to install it."
         )
 
 
@@ -170,10 +236,10 @@ def install_onepassword_sdk(*, force: bool = False, skip_gate: bool = False) -> 
         if not _lazy_ok:
             raise ImportError(
                 "1Password SDK auto-install is disabled (HERMES_DISABLE_LAZY_INSTALLS). "
-                "Install manually: pip install 'onepassword-sdk>=0.1.0,<0.2.0'"
+                f"Install manually: pip install '{OP_SDK_REQUIREMENT}'"
             )
 
-    pkg = "onepassword-sdk>=0.1.0,<0.2.0"
+    pkg = OP_SDK_REQUIREMENT
     pip_args = ["--quiet"]
     if force:
         pip_args.append("--force-reinstall")
@@ -210,7 +276,7 @@ def _sdk_version() -> str:
 # ---------------------------------------------------------------------------
 
 
-_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*\Z")
 
 
 def _field_label_to_env_name(label: str) -> str:
@@ -268,18 +334,21 @@ async def _fetch_secrets_async(
     if vault_name:
         matching_vaults = [v for v in all_vaults if v.title == vault_name]
         if not matching_vaults:
-            raise RuntimeError(
-                f"Vault {vault_name!r} not found.  "
-                f"Accessible vaults: {[v.title for v in all_vaults]}"
+            # Report a count, not the other accessible vaults' titles —
+            # those are 1Password account data unrelated to the lookup
+            # failure and shouldn't end up in a log/terminal for a vault
+            # name typo.
+            raise VaultNotFoundError(
+                f"Vault {vault_name!r} not found among "
+                f"{len(all_vaults)} accessible vault(s)."
             )
         if len(matching_vaults) > 1:
             # 1Password permits duplicate vault titles across accounts.
             # Silently picking the first one risks pulling credentials from
             # the wrong vault — fail loud instead.
-            raise RuntimeError(
+            raise VaultAmbiguousError(
                 f"Vault name {vault_name!r} is ambiguous: "
-                f"{len(matching_vaults)} vaults share this title "
-                f"(ids: {[v.id for v in matching_vaults]}).  "
+                f"{len(matching_vaults)} vaults share this title.  "
                 "Rename one of the vaults, or contact 1Password admin to "
                 "resolve the duplicate."
             )
@@ -288,7 +357,7 @@ async def _fetch_secrets_async(
         vault_ids = [v.id for v in all_vaults]
 
     if not vault_ids:
-        raise RuntimeError(
+        raise NoVaultsAccessibleError(
             "No vaults are accessible to this service account.  "
             "Check vault permissions in the 1Password admin console."
         )
@@ -298,7 +367,10 @@ async def _fetch_secrets_async(
     # first — 1Password permits duplicate item titles within a vault, so
     # picking the first match found would silently risk injecting
     # credentials from the wrong item.
-    matching_overviews: List[Tuple[str, object]] = []  # (vault_id, overview)
+    # `Any` (not `object`) — these are SDK-defined item-overview objects with
+    # a `.title`/`.id` shape, but the SDK package isn't installed at
+    # type-check time so there's no real type to name here.
+    matching_overviews: List[Tuple[str, Any]] = []  # (vault_id, overview)
     for vault_id in vault_ids:
         item_overviews = await asyncio.wait_for(client.items.list_all(vault_id=vault_id), timeout=SDK_TIMEOUT_SECONDS)
         for overview in item_overviews:
@@ -307,19 +379,18 @@ async def _fetch_secrets_async(
 
     if not matching_overviews:
         if item_title:
-            raise RuntimeError(
+            raise ItemNotFoundError(
                 f"Item {item_title!r} not found in 1Password "
                 f"(searched {len(vault_ids)} vault(s))."
             )
         return {}, ["No items found in the accessible 1Password vault(s)."]
 
     if item_title and len(matching_overviews) > 1:
-        raise RuntimeError(
+        raise ItemAmbiguousError(
             f"Item title {item_title!r} is ambiguous: "
             f"{len(matching_overviews)} items share this title across the "
-            f"searched vault(s) (ids: {[ov.id for _, ov in matching_overviews]}).  "
-            "Rename one of the items so the title is unique, or narrow "
-            "secrets.onepassword.vault to a single vault."
+            "searched vault(s).  Rename one of the items so the title is "
+            "unique, or narrow secrets.onepassword.vault to a single vault."
         )
 
     target_vault_id, target_overview = matching_overviews[0]
@@ -329,10 +400,12 @@ async def _fetch_secrets_async(
     )
 
     # ------------------------------------------------------------------ fields
-    # First pass: build label → env_name mapping and label → value for all
-    # non-empty fields with valid env var names.
-    field_to_env: Dict[str, str] = {}   # field label → env var name
-    field_values: Dict[str, str] = {}   # field label → secret value
+    # Single pass: derive (label, env_name, value) for every eligible field
+    # into a LIST, not a label-keyed dict — two fields sharing the exact
+    # same label (1Password permits duplicate labels within an item) must
+    # both survive to the collision scan below rather than one silently
+    # overwriting the other in a dict before collision detection ever runs.
+    entries: List[Tuple[str, str, str]] = []  # (label, env_name, value)
     warnings: List[str] = []
 
     for fld in target_item.fields:
@@ -340,6 +413,16 @@ async def _fetch_secrets_async(
         value = fld.value
         if not isinstance(value, str) or not value:
             continue
+        if "\x00" in value:
+            # os.environ[k] = v raises ValueError: embedded null byte,
+            # which would abort the caller's loop mid-way through applying
+            # fields (partially injected secrets, skipped source tracking
+            # and stale-key removal for the rest). Strip here, same as the
+            # dotenv path already does for the same reason
+            # (_sanitize_env_file_if_needed above).
+            value = value.replace("\x00", "")
+            if not value:
+                continue
 
         # Apply explicit override first; fall back to derived name.
         if field_mapping and label in field_mapping:
@@ -354,35 +437,43 @@ async def _fetch_secrets_async(
             )
             continue
 
-        if env_name in _DANGEROUS_ENV_VARS:
-            logger.warning(
-                "1Password: skipping field — env var %s is in the "
-                "process-control blocklist and will not be auto-injected",
-                env_name,
+        # BASH_FUNC_x%% is how bash exports shell functions via env vars —
+        # blanket-block the family rather than enumerate function names.
+        if env_name in _DANGEROUS_ENV_VARS or env_name.startswith("BASH_FUNC_"):
+            # `label`/`env_name` are tainted per CodeQL's clear-text-logging
+            # model (derived from `fld.title`, the same source as `.value`) —
+            # route through `warnings`, which the caller only ever surfaces
+            # as a count, never logged/printed verbatim.
+            warnings.append(
+                f"Skipping field {label!r}: env var {env_name!r} is in the "
+                "process-control blocklist and will not be auto-injected"
             )
             continue
 
-        field_to_env[label] = env_name
-        field_values[label] = value
+        entries.append((label, env_name, value))
 
-    # Detect collisions: two fields that normalize to the same env var name.
+    # Detect collisions: two fields — whether they share a label or not —
+    # that normalize to the same env var name. A duplicate label produces
+    # two distinct list entries here (unlike the old dict-based version),
+    # so it's caught by the exact same logic as a cross-label collision.
     env_name_sources: Dict[str, str] = {}  # env_name → first field label
     collisions: set = set()
-    for field_name, env_name in field_to_env.items():
+    for label, env_name, _value in entries:
         if env_name in env_name_sources:
-            logger.warning(
-                "1Password field mapping collision: '%s' and '%s' both map to '%s'; skipping both",
-                env_name_sources[env_name], field_name, env_name,
+            # Same taint-model rationale as the blocklist-skip warning above.
+            warnings.append(
+                f"Field mapping collision: {env_name_sources[env_name]!r} and "
+                f"{label!r} both map to {env_name!r}; skipping both"
             )
             collisions.add(env_name)
         else:
-            env_name_sources[env_name] = field_name
+            env_name_sources[env_name] = label
 
     # Build final secrets dict, excluding colliding env names.
     secrets: Dict[str, str] = {
-        field_to_env[label]: value
-        for label, value in field_values.items()
-        if field_to_env[label] not in collisions
+        env_name: value
+        for _label, env_name, value in entries
+        if env_name not in collisions
     }
 
     return secrets, warnings
@@ -412,7 +503,7 @@ def fetch_onepassword_secrets(
     propagate so the user sees a clear error.
     """
     if not token:
-        raise RuntimeError("1Password service account token is empty")
+        raise EmptyTokenError("1Password service account token is empty")
 
     fm_for_key = tuple(sorted((field_mapping or {}).items()))
     cache_key: _CacheKey = (vault_name, item_title, token, fm_for_key)
@@ -451,10 +542,19 @@ def fetch_onepassword_secrets(
                 ),
             )
             try:
-                secrets, warnings = future.result(timeout=SDK_TIMEOUT_SECONDS + 5)
+                # cast(): pool.submit(asyncio.run, coro) can't be inferred
+                # through by the type checker (asyncio.run's generic return
+                # type doesn't unify across submit's Callable[_P, _T] — a
+                # known type-checker limitation, not a real type error),
+                # which otherwise surfaces as a spurious "not-iterable"
+                # warning on this unpacking.
+                secrets, warnings = cast(
+                    Tuple[Dict[str, str], List[str]],
+                    future.result(timeout=SDK_TIMEOUT_SECONDS + 5),
+                )
             except concurrent.futures.TimeoutError:
                 pool.shutdown(wait=False)
-                raise RuntimeError("1Password fetch timed out") from None
+                raise FetchTimeoutError("1Password fetch timed out") from None
             else:
                 pool.shutdown(wait=False)
         else:
@@ -473,7 +573,21 @@ def fetch_onepassword_secrets(
         # Use only the exception type name — not str(exc) — to avoid
         # propagating token data that may appear in the SDK's error message
         # (CodeQL py/clear-text-logging-sensitive-data taint path).
-        raise RuntimeError(f"1Password SDK error: {type(exc).__name__}") from None
+        raise SDKCallError(f"1Password SDK error: {type(exc).__name__}") from None
+
+    # Evict any other cache entries for this same (vault, item) slot — e.g.
+    # left behind by a rotated token or a changed field_mapping — before
+    # inserting the new one. Without this, a long-lived gateway that goes
+    # through routine credential rotation accumulates one _CachedFetch per
+    # old identity forever, each one keeping a prior bootstrap token and
+    # its fetched secret values reachable for the rest of the process
+    # lifetime.
+    stale_keys = [
+        k for k in _CACHE
+        if k[0] == vault_name and k[1] == item_title and k != cache_key
+    ]
+    for k in stale_keys:
+        del _CACHE[k]
 
     _CACHE[cache_key] = _CachedFetch(secrets=secrets, fetched_at=time.time())
     return secrets, warnings
@@ -550,7 +664,8 @@ def apply_onepassword_secrets(
             logger.warning(
                 "1Password SDK is not installed and auto-install is disabled "
                 "(HERMES_DISABLE_LAZY_INSTALLS). "
-                "Install manually: pip install 'onepassword-sdk>=0.1.0,<0.2.0'"
+                "Install manually: pip install '%s'",
+                OP_SDK_REQUIREMENT,
             )
             return {}, []
 
@@ -632,13 +747,17 @@ def get_onepassword_status(config: dict, home_path: Path, *, check_connection: b
 
     Used by ``hermes secrets onepassword status`` to populate the table.
 
-    When ``check_connection`` is True (the default) and the SDK is available
-    and a token/item are configured, this performs a real (uncached) fetch
-    to surface the actual failure category — revoked token, vault/item not
-    found, ambiguous match, network error, etc. — rather than only reporting
-    static config presence.  Pass ``check_connection=False`` for callers that
-    just want the cheap static snapshot (e.g. tests, or code paths that
-    already fetch separately).
+    When ``check_connection`` is True (the default), the integration is
+    enabled, the SDK is available, and a token/item are configured, this
+    performs a real (uncached) fetch to surface the actual failure category
+    — revoked token, vault/item not found, ambiguous match, network error,
+    etc. — rather than only reporting static config presence.  Disabled mode
+    never contacts the SDK, matching the rest of the integration's
+    master-switch contract — a disabled config can still have a leftover
+    token/vault/item from before it was turned off, and status shouldn't
+    make a network call (or wait out the timeout) just to report that.  Pass
+    ``check_connection=False`` for callers that just want the cheap static
+    snapshot (e.g. tests, or code paths that already fetch separately).
     """
     token_env = config.get("service_account_token_env", "OP_SERVICE_ACCOUNT_TOKEN")
     vault = config.get("vault", "")
@@ -648,9 +767,10 @@ def get_onepassword_status(config: dict, home_path: Path, *, check_connection: b
 
     connection_ok: Optional[bool] = None
     connection_error: Optional[str] = None
-    if check_connection and sdk_available and token and item:
+    field_warnings: List[str] = []
+    if check_connection and config.get("enabled") and sdk_available and token and item:
         try:
-            fetch_onepassword_secrets(
+            _secrets, field_warnings = fetch_onepassword_secrets(
                 token=token,
                 vault_name=vault,
                 item_title=item,
@@ -660,11 +780,14 @@ def get_onepassword_status(config: dict, home_path: Path, *, check_connection: b
             connection_ok = True
         except RuntimeError as exc:
             connection_ok = False
-            # str(exc) here is one of our own RuntimeError messages (vault/item
-            # not found, ambiguous match, timeout, or a redacted SDK error
-            # type name) — never raw SDK exception text — so it's safe to
-            # surface directly, unlike the taint path in apply_*().
-            connection_error = str(exc)
+            # Category only (the exception's class name, e.g.
+            # "VaultNotFoundError", "ItemAmbiguousError") — never str(exc).
+            # Each distinct failure kind is its own RuntimeError subclass
+            # (see "Error categories" above) specifically so this alone is
+            # informative without ever needing the message text, which
+            # CodeQL's clear-text-logging taint tracking follows all the
+            # way from the authenticated 1Password Client's return values.
+            connection_error = type(exc).__name__
 
     return {
         "enabled": bool(config.get("enabled")),
@@ -680,6 +803,12 @@ def get_onepassword_status(config: dict, home_path: Path, *, check_connection: b
         "field_mapping": config.get("field_mapping") or {},
         "connection_ok": connection_ok,
         "connection_error": connection_error,
+        # Non-fatal per-field issues from the connection check above (e.g. a
+        # field whose derived/mapped env name was invalid or blocklisted) —
+        # without this, "connection: OK" hid which credential got silently
+        # dropped, and the very status command startup pointed to for
+        # details discarded exactly the information it was supposed to show.
+        "field_warnings": field_warnings,
     }
 
 

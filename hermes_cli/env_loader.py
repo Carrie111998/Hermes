@@ -200,6 +200,7 @@ def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
+    skip_external_secrets: bool = False,
 ) -> list[Path]:
     """Load Hermes environment files with user config taking precedence.
 
@@ -208,6 +209,15 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+
+    ``skip_external_secrets``: pass True to load plain dotenv files only and
+    skip contacting any configured external secret source (Bitwarden,
+    1Password). ``hermes_cli.main`` calls this at import time for every
+    invocation, including ``hermes secrets <source> disable/setup/status``
+    — without this, trying to disable a hanging or misconfigured source
+    would itself have to wait through a full bootstrap attempt (SDK
+    auto-install, network fetch, timeout) before the disable command even
+    got a chance to run.
     """
     loaded: list[Path] = []
 
@@ -236,7 +246,8 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
-    _apply_external_secret_sources(home_path)
+    if not skip_external_secrets:
+        _apply_external_secret_sources(home_path)
 
     return loaded
 
@@ -300,9 +311,16 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                     " (run `hermes secrets bitwarden setup` to diagnose)",
                     file=sys.stderr,
                 )
-            for warn in result.warnings:
+            if result.warnings:
+                # Count only, not the warning text itself — each entry
+                # embeds the Bitwarden secret *key* (see
+                # agent/secret_sources/bitwarden.py's "Skipping secret
+                # {key!r}" message), which CodeQL's clear-text-logging
+                # taint tracking treats as sensitive the same as a value.
                 print(
-                    f"  Bitwarden Secrets Manager: {warn}",
+                    f"  Bitwarden Secrets Manager: {len(result.warnings)} "
+                    f"secret{'s' if len(result.warnings) != 1 else ''} skipped "
+                    "(run `hermes secrets bitwarden setup` to diagnose)",
                     file=sys.stderr,
                 )
 
@@ -347,10 +365,14 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                 _SECRET_SOURCES.pop(name, None)
                 _SECRET_VALUES.pop(name, None)
             if op_removed:
+                # Env var *names*, not values — but keep the same
+                # count-only convention as the Bitwarden branch above
+                # rather than interpolating them, since CodeQL's clear-text
+                # logging taint tracking doesn't distinguish "name" from
+                # "value" once either has touched the secrets pipeline.
                 print(
                     f"  1Password Secrets Manager: removed {len(op_removed)} "
-                    f"secret{'s' if len(op_removed) != 1 else ''} no longer in the item "
-                    f"({', '.join(sorted(op_removed))})",
+                    f"secret{'s' if len(op_removed) != 1 else ''} no longer in the item",
                     file=sys.stderr,
                 )
         except Exception as exc:  # noqa: BLE001
@@ -360,6 +382,31 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                 file=sys.stderr,
             )
             logger.warning("1Password secrets sync failed (%s)", type(exc).__name__)
+    else:
+        # The integration was disabled (or was previously enabled and just
+        # got turned off). A long-lived gateway reloads this on every turn
+        # without restarting, so without this, secrets a prior sync already
+        # injected would keep being used indefinitely after disabling —
+        # relinquish anything still holding the value we set (an operator's
+        # local override in the meantime is left alone, same rule as the
+        # refresh path above).
+        stale_managed = [
+            k for k, v in _SECRET_SOURCES.items()
+            if v == "onepassword" and _SECRET_VALUES.get(k) == os.environ.get(k)
+        ]
+        for k in stale_managed:
+            os.environ.pop(k, None)
+        for k, v in list(_SECRET_SOURCES.items()):
+            if v == "onepassword":
+                _SECRET_SOURCES.pop(k, None)
+                _SECRET_VALUES.pop(k, None)
+        if stale_managed:
+            print(
+                f"  1Password Secrets Manager: disabled — relinquished "
+                f"{len(stale_managed)} previously-managed secret"
+                f"{'s' if len(stale_managed) != 1 else ''}",
+                file=sys.stderr,
+            )
 
 
 def _load_secrets_config(home_path: Path) -> dict:
@@ -380,4 +427,15 @@ def _load_secrets_config(home_path: Path) -> dict:
             data = yaml.safe_load(f) or {}
     except Exception:  # noqa: BLE001
         return {}
-    return data.get("secrets") or {}
+    secrets = data.get("secrets") or {}
+    # Apply the same ${VAR_NAME} expansion the canonical load_config() path
+    # applies — this is a separate, isolated loader (see docstring above),
+    # so without this a documented ${OP_VAULT}-style value in vault/item/
+    # service_account_token_env would reach fetch_onepassword_secrets() as
+    # a literal, unexpanded string and fail to resolve.
+    try:
+        from hermes_cli.config import _expand_env_vars
+        secrets = _expand_env_vars(secrets)
+    except ImportError:
+        pass
+    return secrets
