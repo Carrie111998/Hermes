@@ -116,6 +116,57 @@ class TestSyncMode:
         sched._shutdown_parallel_pool()
 
 
+class TestAgentAdmissionGate:
+    """Agent jobs can be serialized without delaying no_agent scripts."""
+
+    def test_agent_limit_serializes_agents_but_not_scripts(self, monkeypatch):
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        sched._set_agent_parallel_limit(None)
+
+        jobs = [
+            {"id": "agent-a", "name": "Agent A", "prompt": "test", "deliver": "local"},
+            {"id": "agent-b", "name": "Agent B", "prompt": "test", "deliver": "local"},
+            {"id": "script", "name": "Script", "script": "true", "no_agent": True, "deliver": "local"},
+        ]
+        state_lock = threading.Lock()
+        script_ran = threading.Event()
+        running_agents = 0
+        max_running_agents = 0
+
+        def fake_run_job(job, *, defer_agent_teardown=None):
+            nonlocal running_agents, max_running_agents
+            if job.get("no_agent"):
+                script_ran.set()
+                return True, "out", "resp", None
+            with state_lock:
+                running_agents += 1
+                max_running_agents = max(max_running_agents, running_agents)
+            assert script_ran.wait(timeout=2)
+            time.sleep(0.05)
+            with state_lock:
+                running_agents -= 1
+            return True, "out", "resp", None
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"max_parallel_agent_jobs": 1}})
+        monkeypatch.setattr(sched, "run_job", fake_run_job)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        assert sched.tick(verbose=False) == 3
+        assert script_ran.is_set()
+        assert max_running_agents == 1
+
+        sched._set_agent_parallel_limit(None)
+        sched._shutdown_parallel_pool()
+
+
 class TestSequentialPool:
     """Sequential (workdir) jobs use the persistent cron-seq pool.
 
