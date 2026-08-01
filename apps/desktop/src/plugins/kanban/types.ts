@@ -132,6 +132,9 @@ export interface BoardMeta {
   /** First-class Project the board is scoped to (id) + resolved name. */
   project_id?: null | string
   project_name?: null | string
+  /** Maximum automatically dispatched running tasks; null means unlimited. */
+  wip_limit?: null | number
+  counts?: Record<string, number>
 }
 
 /** GET /projects — first-class Hermes projects available to scope a board. */

@@ -1074,6 +1074,8 @@ export function KanbanBoardPage() {
     queryKey: boardKey(slug, archived),
     refetchInterval: 60_000
   })
+  const { data: boards } = useQuery({ queryFn: fetchBoards, queryKey: BOARDS_KEY, staleTime: 30_000 })
+  const currentBoard = boards?.boards.find(meta => meta.slug === (slug || boards.current))
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1166,6 +1168,7 @@ export function KanbanBoardPage() {
   }, [board, search, tenant, assignee])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
+  const runningCount = board?.columns.find(column => column.name === 'running')?.tasks.length ?? 0
 
   const moveMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
@@ -1313,6 +1316,9 @@ export function KanbanBoardPage() {
         <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
         <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
           {total}
+        </span>
+        <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
+          {k.runningCount(runningCount, currentBoard?.wip_limit ?? null)}
         </span>
         {board && (
           <FilterMenu

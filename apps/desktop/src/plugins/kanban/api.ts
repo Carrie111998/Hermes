@@ -218,10 +218,15 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
-export const createBoard = (slug: string, name: string, projectId?: string) =>
-  call<{ board: { slug: string } }>('/boards', {
+export const createBoard = (slug: string, name: string, projectId?: string, wipLimit?: number | null) =>
+  call<{ board: BoardMeta; current: string }>('/boards', {
     method: 'POST',
-    body: { slug, name, ...(projectId ? { project_id: projectId } : {}) }
+    body: {
+      slug,
+      name,
+      ...(projectId ? { project_id: projectId } : {}),
+      ...(wipLimit !== undefined ? { wip_limit: wipLimit } : {})
+    }
   })
 
 /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a

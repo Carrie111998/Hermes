@@ -657,6 +657,16 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+_WIP_LIMIT_UNSET = object()
+
+
+def _normalize_wip_limit(value: Any) -> Optional[int]:
+    """Return a valid board WIP limit, treating hand-edited bad values as unset."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -680,6 +690,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "project_id": None,
         "created_at": None,
         "archived": False,
+        "wip_limit": None,
     }
     try:
         p = board_metadata_path(slug)
@@ -692,6 +703,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
+    meta["wip_limit"] = _normalize_wip_limit(meta.get("wip_limit"))
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -706,6 +718,7 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    wip_limit: object = _WIP_LIMIT_UNSET,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -715,6 +728,9 @@ def write_board_metadata(
     ``project_id``: ``None`` leaves it unchanged; empty string clears the
     project scope; a value sets it (not validated here — the caller resolves
     it against ``projects_db``).
+
+    ``wip_limit`` distinguishes omission from an explicit ``None`` clear.
+    Invalid non-null values raise before the metadata file is written.
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
@@ -736,6 +752,10 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if wip_limit is not _WIP_LIMIT_UNSET:
+        if wip_limit is not None and _normalize_wip_limit(wip_limit) is None:
+            raise ValueError("wip_limit must be a positive integer or null")
+        meta["wip_limit"] = _normalize_wip_limit(wip_limit)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -757,6 +777,7 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    wip_limit: object = _WIP_LIMIT_UNSET,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -775,6 +796,7 @@ def create_board(
         color=color,
         default_workdir=default_workdir,
         project_id=project_id,
+        **({"wip_limit": wip_limit} if wip_limit is not _WIP_LIMIT_UNSET else {}),
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -6726,6 +6748,8 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_wip_capped: list[str] = field(default_factory=list)
+    """Ready task ids deferred because the board WIP limit is full."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8248,6 +8272,17 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    board_wip_limit = read_board_metadata(resolved_board).get("wip_limit")
+    if board_wip_limit is not None:
+        if (isinstance(max_in_progress, int) and not isinstance(max_in_progress, bool)
+                and max_in_progress > 0):
+            effective_max_in_progress = min(max_in_progress, board_wip_limit)
+        else:
+            effective_max_in_progress = board_wip_limit
+    else:
+        effective_max_in_progress = max_in_progress
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -8268,18 +8303,20 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
+    # Honour the installation and board WIP caps: if the board already has
+    # enough running tasks, skip spawning this tick so workers can finish.
+    wip_running_count = 0
+    if effective_max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
-        if in_progress >= max_in_progress:
+        wip_running_count = int(in_progress)
+        if in_progress >= effective_max_in_progress:
+            if board_wip_limit is not None and in_progress >= board_wip_limit:
+                result.skipped_wip_capped.extend(row["id"] for row in ready_rows)
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
+        remaining = effective_max_in_progress - in_progress
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
@@ -8319,7 +8356,12 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    for row in ready_rows:
+    for row_index, row in enumerate(ready_rows):
+        if board_wip_limit is not None and wip_running_count + spawned >= board_wip_limit:
+            result.skipped_wip_capped.extend(
+                remaining_row["id"] for remaining_row in ready_rows[row_index:]
+            )
+            break
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]

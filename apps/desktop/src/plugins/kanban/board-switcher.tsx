@@ -38,6 +38,22 @@ import { errText, FIELD_LABEL, useKanban } from './ui'
 
 const NO_PROJECT = '__none__'
 
+export function parseBoardWipLimit(value: string): number | null | undefined {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return null
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined
+  }
+  const parsed = Number(trimmed)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
+export function buildBoardWipPatch(name: string, project: string, wipLimit: number | null) {
+  return { name: name.trim(), project_id: project, wip_limit: wipLimit }
+}
+
 /** Board scope = a first-class Hermes project. Its primary repo becomes the
  *  board's default workspace root; new tasks inherit it as a worktree with a
  *  deterministic branch. "No project" falls back to scratch sandboxes. */
@@ -75,6 +91,8 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
   const qc = useQueryClient()
   const [name, setName] = useState('')
   const [project, setProject] = useState('')
+  const [wipLimitInput, setWipLimitInput] = useState('')
+  const wipLimit = parseBoardWipLimit(wipLimitInput)
 
   const slug = name
     .trim()
@@ -86,11 +104,12 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
     if (open) {
       setName('')
       setProject('')
+      setWipLimitInput('')
     }
   }, [open])
 
   const create = useMutation({
-    mutationFn: () => createBoard(slug, name.trim(), project || undefined),
+    mutationFn: () => createBoard(slug, name.trim(), project || undefined, wipLimit),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: result => {
       $boardSlug.set(result.board.slug)
@@ -111,19 +130,35 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
             <Input
               autoFocus
               onChange={event => setName(event.target.value)}
-              onKeyDown={event => event.key === 'Enter' && slug && !project && create.mutate()}
+              onKeyDown={event =>
+                event.key === 'Enter' && slug && !project && wipLimit !== undefined && create.mutate()
+              }
               placeholder={k.boardNamePlaceholder}
               value={name}
             />
             {slug && <span className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.slug(slug)}</span>}
           </label>
           <ProjectPicker onChange={setProject} value={project} />
+          <label className="flex flex-col gap-1">
+            <span className={FIELD_LABEL}>{k.wipLimit}</span>
+            <Input
+              inputMode="numeric"
+              min="1"
+              onChange={event => setWipLimitInput(event.target.value)}
+              placeholder={k.wipLimitHint}
+              type="number"
+              value={wipLimitInput}
+            />
+            <span className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
+              {wipLimit === undefined ? k.wipLimitInvalid : k.wipLimitHint}
+            </span>
+          </label>
         </div>
         <DialogFooter>
           <Button onClick={onClose} variant="text">
             {k.cancel}
           </Button>
-          <Button disabled={!slug || create.isPending} onClick={() => create.mutate()}>
+          <Button disabled={!slug || create.isPending || wipLimit === undefined} onClick={() => create.mutate()}>
             {k.createBoard}
           </Button>
         </DialogFooter>
@@ -137,18 +172,21 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
   const qc = useQueryClient()
   const [name, setName] = useState('')
   const [project, setProject] = useState('')
+  const [wipLimitInput, setWipLimitInput] = useState('')
+  const wipLimit = parseBoardWipLimit(wipLimitInput)
 
   useEffect(() => {
     if (board) {
       setName(board.name || '')
       setProject(board.project_id || '')
+      setWipLimitInput(board.wip_limit == null ? '' : String(board.wip_limit))
     }
   }, [board])
 
   const save = useMutation({
     // Slug is immutable; send name + project_id ('' clears the scope, which
     // also drops the mirrored default_workdir on the backend).
-    mutationFn: () => updateBoard(board!.slug, { name: name.trim(), project_id: project }),
+    mutationFn: () => updateBoard(board!.slug, buildBoardWipPatch(name, project, wipLimit!)),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: BOARDS_KEY })
@@ -169,12 +207,26 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
             {board && <span className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.slug(board.slug)}</span>}
           </label>
           <ProjectPicker onChange={setProject} value={project} />
+          <label className="flex flex-col gap-1">
+            <span className={FIELD_LABEL}>{k.wipLimit}</span>
+            <Input
+              inputMode="numeric"
+              min="1"
+              onChange={event => setWipLimitInput(event.target.value)}
+              placeholder={k.wipLimitHint}
+              type="number"
+              value={wipLimitInput}
+            />
+            <span className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
+              {wipLimit === undefined ? k.wipLimitInvalid : k.wipLimitHint}
+            </span>
+          </label>
         </div>
         <DialogFooter>
           <Button onClick={onClose} variant="text">
             {k.cancel}
           </Button>
-          <Button disabled={save.isPending} onClick={() => save.mutate()}>
+          <Button disabled={save.isPending || wipLimit === undefined} onClick={() => save.mutate()}>
             {k.save}
           </Button>
         </DialogFooter>

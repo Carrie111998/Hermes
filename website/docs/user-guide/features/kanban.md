@@ -756,6 +756,16 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
+Boards can add a narrower automatic-dispatch cap with the optional `wip_limit` field in `board.json`. Set it when creating or editing a board:
+
+```bash
+hermes kanban boards create feature-work --wip-limit 2
+hermes kanban boards set-wip-limit feature-work 3
+hermes kanban boards set-wip-limit feature-work  # clear the board limit
+```
+
+The board limit and `kanban.max_in_progress` compose by minimum. An unset or cleared value is unlimited for that layer. The limit applies only to new automatic `ready` → `running` claims; cleanup, readiness promotion, dependency and assignment checks, per-profile limits, existing workers, manual status changes, and `max_spawn` continue to operate. The board REST API accepts a positive integer, preserves the current value when `wip_limit` is omitted from `PATCH`, and clears it when the field is explicitly `null`. Class-of-Service task fields are a separate follow-up and are not part of board WIP limits.
+
 ```yaml
 kanban:
   max_in_progress: 2

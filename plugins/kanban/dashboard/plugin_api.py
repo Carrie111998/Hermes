@@ -2215,6 +2215,7 @@ class CreateBoardBody(BaseModel):
     # board's default_workdir mirrors the project's primary repo and new tasks
     # inherit the project (deterministic worktree + branch).
     project_id: Optional[str] = None
+    wip_limit: Any = None
     switch: bool = False
 
 
@@ -2229,6 +2230,26 @@ class RenameBoardBody(BaseModel):
     # Project scope (id or slug). ``None`` = leave unchanged; empty = clear;
     # a value = resolve + set (and mirror default_workdir to its primary repo).
     project_id: Optional[str] = None
+    wip_limit: Any = None
+
+
+def _payload_has_field(payload: BaseModel, name: str) -> bool:
+    """Support Pydantic v1 and v2 field-presence tracking for PATCH tri-state."""
+    fields_set = getattr(payload, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(payload, "__fields_set__", set())
+    return name in fields_set
+
+
+def _validate_wip_limit(value: Any) -> Optional[int]:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="wip_limit must be a positive integer or null",
+        )
+    return value
 
 
 def _resolve_project(ref: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -2363,6 +2384,7 @@ def _validate_workdir(raw: str) -> str:
 @router.post("/boards")
 def create_board_endpoint(payload: CreateBoardBody):
     """Create a new board. Idempotent — ``slug`` collision returns existing."""
+    wip_limit = _validate_wip_limit(payload.wip_limit)
     default_workdir = None
     if payload.default_workdir:
         default_workdir = _validate_workdir(payload.default_workdir)
@@ -2372,8 +2394,8 @@ def create_board_endpoint(payload: CreateBoardBody):
     if primary_path and not default_workdir:
         default_workdir = primary_path
     try:
-        meta = kanban_db.create_board(
-            payload.slug,
+        board_kwargs = dict(
+            slug=payload.slug,
             name=payload.name,
             description=payload.description,
             icon=payload.icon,
@@ -2381,6 +2403,9 @@ def create_board_endpoint(payload: CreateBoardBody):
             default_workdir=default_workdir,
             project_id=project_id,
         )
+        if _payload_has_field(payload, "wip_limit"):
+            board_kwargs["wip_limit"] = wip_limit
+        meta = kanban_db.create_board(**board_kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if payload.switch:
@@ -2402,6 +2427,7 @@ def rename_board(slug: str, payload: RenameBoardBody):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    wip_limit = _validate_wip_limit(payload.wip_limit)
     # default_workdir: None = leave unchanged; "" = clear; path = validate + set.
     # write_board_metadata treats a falsy value as "clear", so pass "" through.
     default_workdir: Optional[str] = None
@@ -2419,8 +2445,8 @@ def rename_board(slug: str, payload: RenameBoardBody):
                 default_workdir = primary_path
         else:
             project_id = ""  # clear the scope
-    meta = kanban_db.write_board_metadata(
-        normed,
+    metadata_kwargs = dict(
+        board=normed,
         name=payload.name,
         description=payload.description,
         icon=payload.icon,
@@ -2428,6 +2454,9 @@ def rename_board(slug: str, payload: RenameBoardBody):
         default_workdir=default_workdir,
         project_id=project_id,
     )
+    if _payload_has_field(payload, "wip_limit"):
+        metadata_kwargs["wip_limit"] = wip_limit
+    meta = kanban_db.write_board_metadata(**metadata_kwargs)
     meta["default_workspace_kind"] = _default_workspace_kind(meta)
     _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
     return {"board": meta}

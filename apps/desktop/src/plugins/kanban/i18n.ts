@@ -172,6 +172,10 @@ type KanbanMessages = {
   projectHintPre: string
   projectHintCmd: string
   createBoard: string
+  wipLimit: string
+  wipLimitHint: string
+  wipLimitInvalid: string
+  runningCount: (running: number, limit: null | number) => string
   // orchestration
   orchestratorProfile: string
   defaultAssignee: string
@@ -360,6 +364,10 @@ const en: KanbanMessages = {
     'New tasks run in the project’s repo (a worktree per task); each task can still override its workspace at creation. Manage projects with ',
   projectHintCmd: 'hermes project',
   createBoard: 'Create board',
+  wipLimit: 'Automatic WIP limit',
+  wipLimitHint: 'Maximum tasks the dispatcher may run at once. Blank is unlimited.',
+  wipLimitInvalid: 'Enter a positive whole number or leave this blank.',
+  runningCount: (running, limit) => (limit === null ? `${running} running` : `${running}/${limit} running`),
   orchestratorProfile: 'Orchestrator profile',
   defaultAssignee: 'Default assignee',
   defaultParen: '(default)',
@@ -547,6 +555,10 @@ const ja: KanbanMessages = {
     '新しいタスクはプロジェクトのリポジトリで実行されます（タスクごとに worktree）。各タスクは作成時にワークスペースを上書きできます。プロジェクトの管理は ',
   projectHintCmd: 'hermes project',
   createBoard: 'ボードを作成',
+  wipLimit: '自動WIP上限',
+  wipLimitHint: 'ディスパッチャが同時に実行できる最大タスク数。空欄は無制限。',
+  wipLimitInvalid: '正の整数を入力するか、空欄にしてください。',
+  runningCount: (running, limit) => (limit === null ? `実行中 ${running}` : `実行中 ${running}/${limit}`),
   orchestratorProfile: 'オーケストレータープロフィール',
   defaultAssignee: 'デフォルトの担当',
   defaultParen: '（既定）',
@@ -732,6 +744,10 @@ const zh: KanbanMessages = {
     '新任务将在项目的仓库中运行（每个任务一个 worktree）；每个任务在创建时仍可覆盖其工作区。管理项目请使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '创建面板',
+  wipLimit: '自动 WIP 上限',
+  wipLimitHint: '调度器可同时运行的最大任务数。留空表示无限制。',
+  wipLimitInvalid: '请输入正整数，或留空。',
+  runningCount: (running, limit) => (limit === null ? `运行中 ${running}` : `运行中 ${running}/${limit}`),
   orchestratorProfile: '编排者配置档',
   defaultAssignee: '默认负责人',
   defaultParen: '（默认）',
@@ -916,6 +932,10 @@ const zhHant: KanbanMessages = {
     '新任務將在專案的儲存庫中執行（每個任務一個 worktree）；每個任務在建立時仍可覆寫其工作區。管理專案請使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '建立面板',
+  wipLimit: '自動 WIP 上限',
+  wipLimitHint: '排程器可同時執行的最大工作數。留空表示不設限。',
+  wipLimitInvalid: '請輸入正整數，或留空。',
+  runningCount: (running, limit) => (limit === null ? `執行中 ${running}` : `執行中 ${running}/${limit}`),
   orchestratorProfile: '編排者設定檔',
   defaultAssignee: '預設負責人',
   defaultParen: '（預設）',
