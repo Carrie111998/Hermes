@@ -2381,7 +2381,16 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                         "unavailable); enterprise-only models may 400 with "
                         "model_not_available_for_integrator until exchange recovers."
                     )
-                source_name = "gh_cli" if "gh" in source.lower() else f"env:{source}"
+                # Map the token source to its pool source name.  The ONLY
+                # value resolve_copilot_token() returns for the gh CLI path
+                # is exactly "gh auth token"; env sources return the raw env
+                # var name (COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN).
+                # A substring test like `"gh" in source.lower()` misfires on
+                # every env name (they all contain "gh"), tagging env-seeded
+                # entries as gh_cli — which makes `hermes auth remove
+                # copilot gh_cli`-style per-source suppression unable to
+                # distinguish a suppressed gh CLI from a live env var.
+                source_name = "gh_cli" if source == "gh auth token" else f"env:{source}"
                 if not _is_suppressed(provider, source_name):
                     active_sources.add(source_name)
                     pconfig = PROVIDER_REGISTRY.get(provider)
