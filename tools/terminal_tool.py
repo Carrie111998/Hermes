@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import re
 import shlex
 import stat
@@ -1152,6 +1153,7 @@ _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 # file_tools and _resolve_command_cwd to read this store, then delete the
 # env-side tracking + ownership guards.
 _session_cwd: Dict[str, str] = {}
+_session_cwd_authority_scopes: Dict[str, object] = {}
 _session_cwd_lock = threading.Lock()
 
 
@@ -1167,9 +1169,15 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     if not isinstance(cwd, str) or not cwd.strip():
         return
     key = str(session_key or "default")
+    from agent.runtime_cwd import resolve_authoritative_cwd_scope
+
+    authority_scope = resolve_authoritative_cwd_scope()
     with _session_cwd_lock:
-        if _session_cwd.get(key) != cwd:
-            _session_cwd[key] = cwd
+        _session_cwd[key] = cwd
+        if authority_scope is None:
+            _session_cwd_authority_scopes.pop(key, None)
+        else:
+            _session_cwd_authority_scopes[key] = authority_scope
 
 
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
@@ -1184,10 +1192,25 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
         return _session_cwd.get(key)
 
 
+def get_authoritative_session_cwd(session_key: Optional[str]) -> Optional[str]:
+    """Return a live cwd recorded inside the current authoritative scope."""
+    from agent.runtime_cwd import resolve_authoritative_cwd_scope
+
+    authority_scope = resolve_authoritative_cwd_scope()
+    if authority_scope is None:
+        return None
+    key = str(session_key or "default")
+    with _session_cwd_lock:
+        if _session_cwd_authority_scopes.get(key) is authority_scope:
+            return _session_cwd.get(key)
+    return None
+
+
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
         _session_cwd.pop(session_key, None)
+        _session_cwd_authority_scopes.pop(session_key, None)
 
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
@@ -1373,6 +1396,53 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
+def _map_cwd_to_backend(
+    candidate: str,
+    default_cwd: str,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    authoritative_host: bool = False,
+) -> str:
+    """Translate a host cwd into the active backend's native path.
+
+    Docker's explicit host-cwd mount is authoritative even when the host path
+    lives outside the usual ``/home``/``/Users`` prefixes (for example
+    ``/mnt/project``). Descendants preserve their relative suffix beneath the
+    backend mount root. Other unusable container paths retain the historical
+    fallback to ``default_cwd``.
+    """
+    if not config:
+        return candidate
+    env_type = str(config.get("env_type") or "").lower()
+    if env_type == "docker" and config.get("docker_mount_cwd_to_workspace"):
+        host_cwd = str(config.get("host_cwd") or "").strip()
+        if host_cwd:
+            try:
+                host_norm = os.path.normcase(
+                    os.path.normpath(os.path.expanduser(host_cwd))
+                )
+                candidate_norm = os.path.normcase(
+                    os.path.normpath(os.path.expanduser(candidate))
+                )
+                relative = os.path.relpath(candidate_norm, host_norm)
+                if relative == ".":
+                    return default_cwd
+                if (
+                    relative != os.pardir
+                    and not relative.startswith(os.pardir + os.sep)
+                    and not os.path.isabs(relative)
+                ):
+                    return posixpath.normpath(
+                        posixpath.join(default_cwd, relative.replace(os.sep, "/"))
+                    )
+            except (OSError, ValueError):
+                pass
+    if env_type in _CONTAINER_BACKENDS:
+        if authoritative_host or _is_unusable_container_cwd(candidate):
+            return default_cwd
+    return candidate
+
+
 # One-shot guard for the config-fallback bridge below.  Purely an
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
@@ -1476,16 +1546,18 @@ def _get_env_config() -> Dict[str, Any]:
     else:
         default_cwd = "/root"
 
-    # Read TERMINAL_CWD but sanity-check it for container backends.
-    # If Docker cwd passthrough is explicitly enabled, remap the host path to
-    # /workspace and track the original host path separately. Otherwise keep the
-    # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    from agent.runtime_cwd import resolve_tool_cwd
+
+    configured_cwd = resolve_tool_cwd() or None
+
+    # Prefer the task-local cwd when a gateway/cron session pinned one; fall
+    # back to the startup environment for CLI and legacy callers.
+    cwd = configured_cwd or os.getenv("TERMINAL_CWD", default_cwd)
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+        docker_cwd_source = configured_cwd or os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
@@ -2185,6 +2257,7 @@ def _resolve_command_cwd(
     workdir: Optional[str],
     default_cwd: str,
     session_key: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
 
@@ -2197,6 +2270,23 @@ def _resolve_command_cwd(
     """
     if workdir:
         return workdir
+
+    def _backend_native_cwd(candidate: str) -> str:
+        return _map_cwd_to_backend(candidate, default_cwd, config)
+
+    live_authoritative_cwd = get_authoritative_session_cwd(session_key)
+    if live_authoritative_cwd:
+        return _backend_native_cwd(live_authoritative_cwd)
+    from agent.runtime_cwd import resolve_authoritative_tool_cwd
+
+    authoritative_cwd = resolve_authoritative_tool_cwd()
+    if authoritative_cwd:
+        return _map_cwd_to_backend(
+            authoritative_cwd,
+            default_cwd,
+            config,
+            authoritative_host=True,
+        )
     return get_session_cwd(session_key) or default_cwd
 
 
@@ -2617,6 +2707,7 @@ def terminal_tool(
                 workdir=workdir,
                 default_cwd=cwd,
                 session_key=session_key,
+                config=config,
             )
             try:
                 if env_type == "local":
@@ -2877,6 +2968,7 @@ def terminal_tool(
                         workdir=workdir,
                         default_cwd=cwd,
                         session_key=session_key,
+                        config=config,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,
@@ -2918,13 +3010,13 @@ def terminal_tool(
                 # Got a result
                 break
 
-            # Dual-write (cwd rearch step 1): the env's post-command tracking
-            # (marker parse / local sync) has just updated env.cwd with the
-            # directory this command finished in. That cwd belongs to THIS
-            # session — record it under the session key so the durable record
-            # never depends on the shared env surviving or on who drives the
-            # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            # Record the cwd parsed from this command's own marker. Reading the
+            # shared environment's mutable env.cwd here races another session
+            # using the same container/shell and can mis-tag its cwd as ours.
+            command_result_cwd = (
+                result.get("cwd") if isinstance(result, dict) else None
+            )
+            record_session_cwd(session_key, command_result_cwd)
 
             # Extract output
             output = result.get("output", "")

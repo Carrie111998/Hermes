@@ -33,6 +33,7 @@ import pytest
 import gateway.session_context as sc
 from gateway.session_context import (
     _SESSION_ASYNC_DELIVERY,
+    _SESSION_CONTEXT_BOUND,
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
@@ -71,10 +72,12 @@ def _isolate_session_context():
     saved_env = {k: os.environ.get(k) for k in SESSION_VARS}
     saved_ctx = {name: var.get() for name, var in _VAR_MAP.items()}
     saved_async = _SESSION_ASYNC_DELIVERY.get()
+    saved_bound = _SESSION_CONTEXT_BOUND.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_CONTEXT_BOUND.set(False)
     sc._session_context_engaged = True  # a concurrent multi-session host is engaged
     try:
         yield
@@ -82,6 +85,7 @@ def _isolate_session_context():
         for var, val in zip(_VAR_MAP.values(), saved_ctx.values()):
             var.set(val)
         _SESSION_ASYNC_DELIVERY.set(saved_async)
+        _SESSION_CONTEXT_BOUND.set(saved_bound)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
             if v is None:
