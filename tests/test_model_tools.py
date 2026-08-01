@@ -7,11 +7,22 @@ from unittest.mock import ANY, call, patch
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
+    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+class TestToolsetAllowlist:
+    def test_environment_allowlist_restricts_explicit_toolsets(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ALLOWED_TOOLSETS", "web")
+
+        with patch("model_tools._compute_tool_definitions", return_value=[]) as compute:
+            get_tool_definitions(["all", "terminal"], quiet_mode=False)
+
+        assert compute.call_args.args[0] == ["web"]
 
 
 # =========================================================================

@@ -30,7 +30,12 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry, tool_error
-from toolsets import resolve_toolset, validate_toolset
+from toolsets import (
+    get_allowed_toolsets,
+    resolve_toolset,
+    restrict_toolsets,
+    validate_toolset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +314,9 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    allowed_toolsets = get_allowed_toolsets()
+    effective_enabled_toolsets = restrict_toolsets(enabled_toolsets, allowed_toolsets)
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -326,7 +334,9 @@ def get_tool_definitions(
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         cache_key = (
-            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+            frozenset(effective_enabled_toolsets)
+            if effective_enabled_toolsets is not None
+            else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
@@ -344,8 +354,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        effective_enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        allowed_toolsets=allowed_toolsets,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -369,6 +384,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    allowed_toolsets: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -387,6 +403,10 @@ def _compute_tool_definitions(
             # (for token/cost reasons), but that should not strip the kanban
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
+        effective_enabled_toolsets = restrict_toolsets(
+            effective_enabled_toolsets,
+            allowed_toolsets,
+        )
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)

@@ -35,6 +35,16 @@ class TestPerJobToolsetMcpMerge:
         assert result[:2] == ["web", "terminal"]
         assert set(result) == {"web", "terminal"} | self._enabled_names()
 
+    def test_per_job_toolsets_honor_service_allowlist(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ALLOWED_TOOLSETS", "web")
+
+        result = _resolve_cron_enabled_toolsets(
+            {"enabled_toolsets": ["web", "terminal"]},
+            self.CFG,
+        )
+
+        assert result == ["web"]
+
 
     def test_explicit_mcp_name_is_treated_as_allowlist(self):
         # User named one server -> add nothing further.
