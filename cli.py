@@ -5368,7 +5368,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot["session_cost_source"] = cost_source
                 amount = getattr(agent, "session_estimated_cost_usd", None)
                 if amount is not None and float(amount) > 0:
-                    snapshot["session_cost_label"] = f"~${float(amount):.2f}"
+                    # 'actual' costs (OpenRouter usage.cost) are exact; only
+                    # estimates get the ~ prefix.
+                    _prefix = "~" if cost_status != "actual" else ""
+                    snapshot["session_cost_label"] = f"{_prefix}${float(amount):.2f}"
                 elif cost_status == "included":
                     snapshot["session_cost_label"] = "included"
                 else:

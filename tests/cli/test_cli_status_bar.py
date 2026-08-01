@@ -407,6 +407,26 @@ class TestShowCostStatusBar:
         assert "included" in text
         assert "~$" not in text
 
+    def test_show_cost_actual_openrouter_cost_no_tilde(self):
+        """An 'actual' cost (from OpenRouter usage.cost) must render without the
+        ~ estimate prefix, so the status bar distinguishes exact from estimated."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_000,
+            total_tokens=12_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+            estimated_cost_usd=0.1310,
+            cost_status="actual",
+            cost_source="provider_cost_api",
+        )
+        cli_obj._show_cost = True
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "$0.13" in text
+        assert "~$0.13" not in text
+
     def test_show_cost_disabled_hides_cost_and_tokens_default(self):
         """When show_cost is not set (default False), cost/tokens should not appear."""
         cli_obj = _attach_agent(
