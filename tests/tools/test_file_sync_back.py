@@ -10,8 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-fcntl = pytest.importorskip("fcntl")
-
 from tools.environments.file_sync import (
     FileSyncManager,
     _sha256_file,
@@ -309,6 +307,7 @@ class TestSyncBackFileLock:
 
     @patch("tools.environments.file_sync.fcntl.flock")
     def test_sync_back_file_lock(self, mock_flock, tmp_path):
+        fcntl = pytest.importorskip("fcntl")
         download_fn = _make_download_fn({})
         mgr = _make_manager(tmp_path, bulk_download_fn=download_fn)
 
@@ -330,6 +329,73 @@ class TestSyncBackFileLock:
         with patch("tools.environments.file_sync.fcntl", None):
             # Should not raise — locking is skipped
             mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+
+class TestSyncBackWindowsTempfile:
+    """bulk_download_fn must be able to reopen the dest path for writing."""
+
+    def test_sync_back_download_can_open_dest_for_write(self, tmp_path):
+        """SSH/Modal-style writers reopen dest; the staging tar must not stay locked."""
+        host_file = tmp_path / "host" / "skill.py"
+        _write_file(host_file, b"print('v1')")
+        remote_path = "/root/.hermes/skill.py"
+        mapping = [(str(host_file), remote_path)]
+        remote_content = b"print('v2')"
+
+        def download_open_wb(dest: Path):
+            with open(dest, "wb") as f:
+                with tarfile.open(fileobj=f, mode="w") as tar:
+                    info = tarfile.TarInfo(name="root/.hermes/skill.py")
+                    info.size = len(remote_content)
+                    tar.addfile(info, io.BytesIO(remote_content))
+
+        mgr = _make_manager(
+            tmp_path, file_mapping=mapping, bulk_download_fn=download_open_wb
+        )
+        mgr._pushed_hashes[remote_path] = _sha256_bytes(b"print('v1')")
+        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert host_file.read_bytes() == remote_content
+
+
+class TestSyncBackPosixRemotePaths:
+    """Remote mapping keys are POSIX even when the host uses backslashes."""
+
+    def test_sync_back_maps_when_relpath_returns_backslashes(self, tmp_path):
+        host_file = tmp_path / "host" / "skill.py"
+        _write_file(host_file, b"print('v1')")
+        remote_path = "/root/.hermes/skill.py"
+        mapping = [(str(host_file), remote_path)]
+        remote_content = b"print('from-remote')"
+
+        download_fn = _make_download_fn({
+            "root/.hermes/skill.py": remote_content,
+        })
+        mgr = _make_manager(
+            tmp_path, file_mapping=mapping, bulk_download_fn=download_fn
+        )
+        mgr._pushed_hashes[remote_path] = _sha256_bytes(b"print('v1')")
+
+        real_relpath = os.path.relpath
+
+        def windowsish_relpath(path, start=os.curdir):
+            return real_relpath(path, start).replace("/", "\\")
+
+        with patch("tools.environments.file_sync.os.path.relpath", windowsish_relpath):
+            mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert host_file.read_bytes() == remote_content
+
+    def test_infer_host_path_uses_posix_remote_dirname(self, tmp_path):
+        host_file = tmp_path / "host" / "skills" / "a.py"
+        _write_file(host_file, b"content")
+        mapping = [(str(host_file), "/root/.hermes/skills/a.py")]
+
+        mgr = _make_manager(tmp_path, file_mapping=mapping)
+        result = mgr._infer_host_path(
+            "/root/.hermes/skills/b.py",
+            file_mapping=mapping,
+        )
+        assert result == str(tmp_path / "host" / "skills" / "b.py")
 
 
 class TestInferHostPath:
