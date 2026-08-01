@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tools.tool_log import LOG_ERROR_PREVIEW_LIMIT
 from tools.vision_tools import (
     _validate_image_url,
     _handle_vision_analyze,
@@ -166,16 +167,17 @@ class TestHandleVisionAnalyze:
 
 
 # ---------------------------------------------------------------------------
-# Error logging with exc_info — verify tracebacks are logged
+# Error logging — terminal download errors are bounded single-line logs with no
+# traceback; internal cleanup warnings retain exc_info for diagnosis
 # ---------------------------------------------------------------------------
 
 
-class TestErrorLoggingExcInfo:
-    """Verify that exc_info=True is used in error/warning log calls."""
+class TestErrorLogging:
+    """Error/warning logging contracts for the vision tool path."""
 
     @pytest.mark.asyncio
-    async def test_download_failure_logs_exc_info(self, tmp_path, caplog):
-        """After max retries, the download error should include exc_info."""
+    async def test_download_failure_logs_bounded_no_traceback(self, tmp_path, caplog):
+        """Terminal download errors log one bounded line without a traceback."""
         from tools.vision_tools import _download_image
 
         with patch("tools.vision_tools.httpx.AsyncClient") as mock_client_cls:
@@ -194,10 +196,13 @@ class TestErrorLoggingExcInfo:
                     "https://example.com/img.jpg", dest, max_retries=1
                 )
 
-            # Should have logged with exc_info (traceback present)
             error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
             assert len(error_records) >= 1
-            assert error_records[0].exc_info is not None
+            for rec in error_records:
+                assert rec.exc_info is None
+                assert len(rec.getMessage()) <= LOG_ERROR_PREVIEW_LIMIT + 1
+                assert "\n" not in rec.getMessage()
+                assert "\r" not in rec.getMessage()
 
     @pytest.mark.asyncio
     async def test_cleanup_error_logs_exc_info(self, tmp_path, caplog):

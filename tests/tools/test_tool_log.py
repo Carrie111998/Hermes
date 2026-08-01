@@ -36,6 +36,21 @@ class TestTruncateForLog:
     def test_none_becomes_empty_string(self):
         assert truncate_for_log(None) == ""
 
+    def test_multiline_error_collapses_to_single_line(self):
+        msg = "line one\r\nline two\nline three\rline four"
+        out = truncate_for_log(msg)
+        assert "\n" not in out
+        assert "\r" not in out
+        assert out == "line one line two line three line four"
+
+    def test_multiline_long_error_is_bounded_and_single_line(self):
+        msg = ("line one\n" * (LOG_ERROR_PREVIEW_LIMIT // 10)) + "x" * (LOG_ERROR_PREVIEW_LIMIT * 2)
+        out = truncate_for_log(msg)
+        assert len(out) == LOG_ERROR_PREVIEW_LIMIT + 1  # + ellipsis
+        assert "\n" not in out
+        assert "\r" not in out
+        assert out.endswith("…")
+
 
 class TestVisionErrorLogBounded:
     """End-to-end: a failed vision call logs one bounded line, no traceback,

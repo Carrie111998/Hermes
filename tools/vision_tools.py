@@ -497,10 +497,10 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
             # and ValueError (too-large / SSRF redirect) are also terminal.
             if not _is_retryable_download_error(e) or attempt >= max_retries - 1:
                 logger.error(
-                    "Image download failed after %s attempt(s): %s",
-                    attempt + 1,
-                    str(e)[:100],
-                    exc_info=True,
+                    "%s",
+                    truncate_for_log(
+                        f"Image download failed after {attempt + 1} attempt(s): {e}"
+                    ),
                 )
                 raise
             wait_time = 2 ** (attempt + 1)  # 2s, 4s, 8s
@@ -1644,8 +1644,10 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(
-                    "Video download failed after %s attempts: %s",
-                    max_retries, str(e)[:100], exc_info=True,
+                    "%s",
+                    truncate_for_log(
+                        f"Video download failed after {max_retries} attempts: {e}"
+                    ),
                 )
 
     if last_error is None:
