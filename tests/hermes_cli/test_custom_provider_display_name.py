@@ -128,6 +128,59 @@ def test_unmatched_custom_stays_custom(monkeypatch):
     )
 
 
+def test_unmatched_url_ignores_configured_provider(monkeypatch):
+    """Explicit ad-hoc session URL must not inherit global model.provider.
+
+    Regression for PR review: canonical_custom_identity falls back to
+    config_provider, which would mis-label an unmatched custom endpoint as
+    the unrelated named provider from config.yaml.
+    """
+    cfg = {
+        "model": {
+            "provider": "openlux",
+            "default": "gpt-5.6-sol",
+            "base_url": "https://api.openlux.ai/v1",
+        },
+        "providers": {
+            "openlux": {
+                "base_url": "https://api.openlux.ai/v1",
+                "models": ["gpt-5.6-sol"],
+            }
+        },
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    assert (
+        rp.resolve_custom_provider_display_name(
+            "custom",
+            base_url="https://adhoc.example/v1",
+            config_provider="openlux",
+            model="gpt-5.6-sol",
+        )
+        == "custom"
+    )
+
+
+def test_no_url_may_use_configured_provider(monkeypatch):
+    """Without a session URL, config.model.provider remains a valid recovery."""
+    cfg = {
+        "model": {"provider": "openlux", "default": "gpt-5.6-sol"},
+        "providers": {
+            "openlux": {
+                "base_url": "https://api.openlux.ai/v1",
+                "models": ["gpt-5.6-sol"],
+            }
+        },
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    assert (
+        rp.resolve_custom_provider_display_name(
+            "custom",
+            config_provider="openlux",
+        )
+        == "openlux"
+    )
+
+
 def test_recovers_by_model_when_base_url_missing(monkeypatch):
     monkeypatch.setattr(
         rp,

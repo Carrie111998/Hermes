@@ -1046,8 +1046,9 @@ def resolve_custom_provider_display_name(
     This helper recovers the configured entry name from:
 
     1. An already-named identity (``custom:<name>`` or a direct ``providers:`` key)
-    2. ``base_url`` / ``model`` reverse-lookup against ``config.yaml`` entries
-    3. ``config_provider`` / active ``model.provider`` when it names a real entry
+    2. Session-scoped ``base_url`` / ``model`` reverse-lookup against ``config.yaml``
+    3. ``config_provider`` / active ``model.provider`` only when no session URL was
+       provided (routing recovery; must not override an explicit unmatched URL)
 
     When several catalog entries share one gateway URL (e.g. ``openlux-claude``
     and ``openlux-codex`` both pointing at the same host), a model catalog hit
@@ -1080,23 +1081,29 @@ def resolve_custom_provider_display_name(
     url = str(base_url or "").strip()
     model_id = str(model or "").strip()
 
-    # Shared-gateway disambiguation: prefer the entry that serves this model
-    # when its base_url also matches the session endpoint.
-    if url and model_id:
-        by_model = find_custom_provider_identity_by_model(model_id)
-        if by_model:
-            try:
-                entry = _get_named_custom_provider(by_model)
-            except Exception:
-                entry = None
-            if entry and _normalize_base_url_for_match(
-                entry.get("api") or entry.get("url") or entry.get("base_url")
-            ) == _normalize_base_url_for_match(url):
-                identity = by_model
-
-    if not identity:
+    if url:
+        # Session has an explicit endpoint. Only recover via that URL (and a
+        # model catalog entry that also owns the same URL). Never fall through
+        # to config.model.provider — an ad-hoc unmatched URL must stay "custom"
+        # even when the global default names a configured custom provider.
+        if model_id:
+            by_model = find_custom_provider_identity_by_model(model_id)
+            if by_model:
+                try:
+                    entry = _get_named_custom_provider(by_model)
+                except Exception:
+                    entry = None
+                if entry and _normalize_base_url_for_match(
+                    entry.get("api") or entry.get("url") or entry.get("base_url")
+                ) == _normalize_base_url_for_match(url):
+                    identity = by_model
+        if not identity:
+            identity = find_custom_provider_identity(url)
+    else:
+        # No session URL — model catalog and/or configured provider are fair
+        # game (same recovery sources as canonical_custom_identity).
         identity = canonical_custom_identity(
-            base_url=base_url,
+            base_url=None,
             config_provider=config_provider,
             model=model,
         )
