@@ -1590,16 +1590,20 @@ def _print_tui_exit_summary(
     )
 
 
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
+_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer", "dev"})
 """Lockfile fields npm writes non-deterministically at install time.
 
 ``ideallyInert`` is npm's runtime annotation for packages it skipped installing
 (per-platform opt-outs).  ``peer`` is dropped from the hidden ``.package-lock.json``
 on dev-dependencies that are *also* declared as peers — the canonical
 ``package-lock.json`` records the dual role, but npm 9's actualized tree strips
-it.  Neither key represents a real skew between what was declared and what was
-installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
-to avoid false-positive reinstalls on every launch.
+it.  ``dev`` is recomputed against the installed subset: after a scoped
+``npm install --workspace ui-tui``, packages that are prod deps of *other*
+workspaces but only dev-reachable inside ui-tui get ``dev: true`` in the hidden
+lock while the full lock records no flag — a false-positive reinstall trigger
+on every launch (#45657).  Neither key represents a real skew between what was
+declared and what was installed, so we exclude them from the comparison in
+:func:`_tui_need_npm_install` to avoid false-positive reinstalls on every launch.
 """
 
 
@@ -1726,6 +1730,16 @@ def _tui_need_npm_install(root: Path) -> bool:
 
         if name not in installed:
             if pkg.get("optional") or pkg.get("peer"):
+                continue
+            if ws_root != root:
+                # Workspace mode: launch installs only the ui-tui subset
+                # (`npm install --workspace ui-tui`), so the hidden lockfile
+                # never contains the other workspaces' packages (desktop,
+                # web, bootstrap-installer). They are intentionally absent —
+                # treating them as missing forced a spurious reinstall on
+                # every launch (#45657). The @hermes/ink sentinel above still
+                # guards the critical TUI dependency, and entries that ARE
+                # installed but differ are still caught below.
                 continue
             return True
 
