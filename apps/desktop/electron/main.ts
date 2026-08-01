@@ -2771,23 +2771,36 @@ async function releaseBackendLock(updateRoot, tag) {
     forceKillProcessTree(pid)
   }
 
-  // Stop the separately-running messaging gateway if one is active.
-  // The gateway is launched by the gateway-launcher desktop plugin via
-  // /api/gateway/start and is NOT in backendConnectionState or backendPool,
-  // so the kills above never see it. On Windows it keeps venv\Scripts\python
-  // mandatory-locked, causing uv pip install to fail with access-denied
-  // during the update. (#70337)
+  // Stop separately-running messaging gateways (all profiles) BEFORE the
+  // venv-shim lock poll. The gateway is launched by the gateway-launcher
+  // desktop plugin via /api/gateway/start and is NOT in backendConnectionState
+  // or backendPool, so the kills above never see it. (#70337)
+  //
+  // Windows venv quirk: a gateway started through the venv shim is TWO
+  // processes — venv\Scripts\python.exe (launcher) -> uv python (worker) —
+  // and gateway.pid records the WORKER. The venv lock is held by the LAUNCHER
+  // (its parent), and taskkill /T from the worker PID does not reach parents.
+  // So instead of tree-killing the recorded PID, delegate to the CLI's own
+  // `hermes gateway stop --all`: it discovers every profile's gateway
+  // processes (launcher + worker), drains in-flight agents (planned-stop
+  // marker → resume_pending persistence), and force-kills survivors — exactly
+  // the logic hermes update's _pause_windows_gateways_for_update relies on.
   if (IS_WINDOWS) {
-    try {
-      const gwPidPath = path.join(HERMES_HOME, 'gateway.pid')
-      const gwPidRaw = fs.readFileSync(gwPidPath, 'utf8')
-      const gwPidParsed = JSON.parse(gwPidRaw)
+    const hermesCli = venvHermesShimPath(updateRoot)
 
-      if (Number.isInteger(gwPidParsed?.pid) && gwPidParsed.pid > 0) {
-        forceKillProcessTree(gwPidParsed.pid)
+    try {
+      if (fs.existsSync(hermesCli)) {
+        execFileSync(hermesCli, ['gateway', 'stop', '--all'], {
+          timeout: 20_000,
+          windowsHide: true,
+          stdio: 'ignore',
+          env: { ...process.env, HERMES_HOME }
+        })
       }
     } catch {
-      // gateway.pid missing or unparseable — no gateway to stop.
+      // Best-effort: a wedged/absent CLI must not abort the hand-off. The
+      // shim-lock poll below re-checks liveness and the updater's own
+      // venv-blocker scan will still fail loudly if something holds the venv.
     }
   }
 
