@@ -157,6 +157,97 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
                 return False, str(path), f"could not read: {exc}"
     return True, None, None
 
+
+# Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
+# is only parsed), these are actually *imported* so that cross-module breakage
+# is caught — a file can be syntactically perfect and still fail to import
+# because a name it pulls from a sibling module no longer exists.
+_UPDATE_CRITICAL_MODULES = (
+    "hermes_cli.main",
+    "run_agent",
+    "model_tools",
+    "toolsets",
+)
+
+
+def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
+    """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
+
+    ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
+    cross-module breakage: a partially-updated tree where ``agent/`` is new but
+    ``tools/`` is old parses perfectly and still dies at startup with
+    ``ImportError: cannot import name 'TODO_INJECTION_HEADER' from
+    'tools.todo_tool'``. Every file is valid Python; the *combination* is not.
+
+    That skew is reachable on the Windows ZIP-update path, whose copy loop
+    walks top-level entries in ``os.listdir`` order and replaces each one
+    independently — ``agent/`` lands long before ``tools/``, so a failure or
+    interruption between them leaves exactly that mismatch on disk.
+
+    Runs in a subprocess because importing these modules into the running
+    updater would pollute ``sys.modules`` and execute import-time side effects
+    against the half-updated tree. Costs ~0.4s.
+
+    Uses the project venv's interpreter when there is one (matching
+    ``_venv_core_imports_healthy``): ``hermes update`` can be driven by a
+    different Python than the install's own, and probing the wrong
+    interpreter would test a tree the user never runs.
+
+    Returns ``(ok, failing_module, error_message)``.
+    """
+    from hermes_constants import FIRST_PARTY_MODULE_ROOTS
+
+    probe = (
+        "import importlib, sys\n"
+        "for name in %r:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ModuleNotFoundError as exc:\n"
+        # A missing *third-party* module means dependencies aren't installed
+        # yet, not a skewed checkout. Only our own packages count as breakage.
+        # The root set is injected from hermes_constants so this can't drift
+        # from the hint the user is shown (they disagreed once already).
+        "        missing = (getattr(exc, 'name', '') or '').split('.')[0]\n"
+        "        if missing in %r or missing.startswith('hermes_'):\n"
+        "            sys.stdout.write(name + '\\n' + str(exc))\n"
+        "            raise SystemExit(3)\n"
+        "    except ImportError as exc:\n"
+        "        sys.stdout.write(name + '\\n' + str(exc))\n"
+        "        raise SystemExit(3)\n"
+        "    except Exception:\n"
+        "        pass\n"  # non-import errors (config/env) aren't update breakage
+        "raise SystemExit(0)\n"
+        % (_UPDATE_CRITICAL_MODULES, tuple(sorted(FIRST_PARTY_MODULE_ROOTS)))
+    )
+    try:
+        interpreter = sys.executable
+        try:
+            bin_dir = "Scripts" if _m()._is_windows() else "bin"
+            python_name = "python.exe" if _m()._is_windows() else "python"
+            venv_python = Path(root) / "venv" / bin_dir / python_name
+            if venv_python.exists():
+                interpreter = str(venv_python)
+        except Exception:
+            pass  # fall back to the running interpreter
+        result = subprocess.run(
+            [interpreter, "-c", probe],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Can't run the probe — don't block the update on our own tooling.
+        return True, None, None
+    if result.returncode == 3:
+        parts = (result.stdout or "").split("\n", 1)
+        module = parts[0].strip() or "unknown"
+        detail = parts[1].strip() if len(parts) > 1 else ""
+        return False, module, detail
+    return True, None, None
+
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.
 
@@ -627,6 +718,14 @@ def _update_via_zip(args):
 
     except Exception as e:
         print(f"✗ ZIP update failed: {e}")
+        print(
+            "  The install may be partially updated — some directories were "
+            "replaced and others were not."
+        )
+        print(
+            "  Re-run `hermes update` to finish; if the agent won't start, "
+            "reinstall from https://hermes-agent.nousresearch.com"
+        )
         _m().sys.exit(1)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -684,6 +783,27 @@ def _update_via_zip(args):
     # after the dependency reinstall, same as the git-pull path (#53272,
     # #70636).
     _m()._refresh_active_memory_provider_dependencies()
+
+    # Now that dependencies are installed, verify the tree actually imports.
+    # The copy loop above replaces top-level entries one at a time in
+    # os.listdir order, so an interruption between (say) `agent/` and `tools/`
+    # leaves a tree whose files all parse but cannot be imported together —
+    # the ImportError-on-startup class this guard exists to catch. Deliberately
+    # placed *after* the dependency reinstall so a genuinely-new third-party
+    # requirement isn't misreported as a partial copy. There is no SHA to roll
+    # back to here, so surface it with a concrete recovery step rather than
+    # reporting a successful update over a bricked install.
+    import_ok, failing_module, import_error = _validate_critical_modules_import(
+        _m().PROJECT_ROOT
+    )
+    if not import_ok:
+        print()
+        print("✗ Update left the install in an unimportable state:")
+        print(f"  {failing_module}: {import_error}")
+        print()
+        print("  This usually means the copy was interrupted partway through.")
+        print("  Re-run `hermes update` to complete it.")
+        _m().sys.exit(1)
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
@@ -2683,6 +2803,118 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
     return "\n".join(lines)
 
+def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
+    """Return venv-interpreter ancestors of *pids* that hold the install open.
+
+    On Windows a gateway started through the venv shim is a **two-process
+    chain**: ``venv\\Scripts\\python.exe`` (the launcher, which keeps native
+    ``.pyd`` files from the venv mapped) spawns the actual interpreter from
+    uv's managed CPython directory (``AppData\\Roaming\\uv\\python\\...``).
+    The gateway writes its PID file from the *child*, so
+    ``find_gateway_pids()`` — and therefore this module's pause set — only
+    ever sees the uv-side worker.
+
+    ``_detect_venv_python_processes()`` matches on the venv path prefix, so
+    the guard downstream of the pause sees the *launcher* instead. The two
+    sets are disjoint, which meant a paused gateway still tripped the
+    venv-holder guard and aborted the update every time (the Desktop
+    "venv-blocked: N process(es) hold the install" dead-end, where the
+    reported holder is a gateway the updater believes it already stopped).
+
+    Walking one hop up from each mapped gateway PID and keeping ancestors
+    that live under the project venv closes the gap. Only the venv-side
+    parent is returned — unrelated ancestors (the Scheduled Task's
+    ``cmd.exe``, an operator's shell) are ignored so we never widen the
+    blast radius beyond the gateway's own launcher. Never raises.
+    """
+    if not _m()._is_windows() or not pids:
+        return []
+    try:
+        import psutil
+    except Exception:
+        return []
+
+    venv_dir = _m().PROJECT_ROOT / "venv"
+    try:
+        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
+
+    # Never return ourselves or our own ancestry: a CLI ``hermes update``
+    # runs from the venv python and would otherwise nominate itself.
+    skip: set[int] = {os.getpid()}
+    try:
+        for anc in psutil.Process().parents():
+            skip.add(int(anc.pid))
+    except Exception:
+        pass
+
+    found: list[int] = []
+    for pid in pids:
+        try:
+            parent = psutil.Process(int(pid)).parent()
+        except Exception:
+            continue
+        if parent is None:
+            continue
+        ppid = int(parent.pid)
+        if ppid in skip or ppid in found or ppid in set(pids):
+            continue
+        try:
+            exe = (parent.exe() or "").lower()
+        except Exception:
+            continue
+        if exe.startswith(venv_prefix):
+            found.append(ppid)
+    return found
+
+
+def _leftover_pausable_gateway_pids(
+    matches: list[tuple[int, str, str]],
+) -> list[int] | None:
+    """PIDs from *matches* when every remaining venv holder is a pausable gateway.
+
+    ``_pause_windows_gateways_for_update()`` stops every gateway its discovery
+    finds, but the venv-holder guard downstream sees the process table as it
+    is *now*: a gateway respawned by its supervisor (Scheduled Task, login
+    watchdog) inside the pause→guard window, or one started through a spawn
+    path the discovery does not map, still holds venv ``.pyd`` files and
+    would dead-end the update — an abort pointed at exactly the kind of
+    process the pause machinery exists to stop.
+
+    Holders are classified with the same matcher the Desktop preflight uses
+    to exempt them (``_is_pausable_gateway``), so the preflight's exemption
+    and this guard's tolerance cannot drift apart — matcher drift between
+    two views of the same process table is what produced the launcher/worker
+    dead-end fixed above. The scan captures only a 120-char cmdline prefix,
+    so the live argv is re-read where psutil allows; an unreadable argv
+    falls back to the captured prefix.
+
+    Returns ``None`` when any holder is not a pausable gateway — an operator
+    REPL, a stray script, or the Desktop backend has no pause machinery
+    downstream, and the guard must keep refusing exactly as before.
+    """
+    from hermes_cli._scan_venv_blockers import _is_pausable_gateway
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        psutil = None
+
+    pids: list[int] = []
+    for pid, _name, cmdline in matches:
+        argv = cmdline
+        if psutil is not None:
+            try:
+                argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
+            except Exception:
+                pass
+        if not _is_pausable_gateway(argv):
+            return None
+        pids.append(int(pid))
+    return pids
+
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -2757,6 +2989,20 @@ def _pause_windows_gateways_for_update() -> dict | None:
         mapped_pids.append(int(pid))
         _write_update_planned_stop_marker(Path(proc.path), int(pid))
 
+    # Resolve each mapped worker's venv-side launcher BEFORE draining: the
+    # drain stops tracking a PID exactly when it dies, so a gracefully
+    # drained worker is gone by the time the wait returns — and a dead pid's
+    # parent cannot be recovered (psutil raises NoSuchProcess). The snapshot
+    # is stopped after the drain alongside the survivors.
+    #
+    # Why launchers matter: the drain targets the PID that wrote the PID
+    # file (the uv-side worker). On Windows that worker's parent is usually
+    # the venv-side ``python.exe`` launcher, which keeps venv ``.pyd`` files
+    # mapped and is what ``_detect_venv_python_processes()`` reports
+    # downstream. Left alive, it trips the venv-holder guard and aborts the
+    # update even though the gateway itself is stopped.
+    launcher_pids = _m()._venv_launcher_ancestors(mapped_pids)
+
     print("→ Stopping Windows gateway process(es) before updating Hermes...")
     try:
         drain_timeout = max(float(_get_restart_drain_timeout()), 1.0)
@@ -2783,8 +3029,13 @@ def _pause_windows_gateways_for_update() -> dict | None:
             logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
         unmapped.append({"pid": int(pid), "argv": argv})
 
+    # Stop drain survivors, unmapped gateways, and the pre-drain launcher
+    # snapshot. ``terminate_pid(force=True)`` is a tree kill, so a launcher
+    # that outlived its worker takes any stragglers with it; a launcher that
+    # already exited with its drained worker raises ProcessLookupError below
+    # and is skipped.
     force_killed = []
-    for pid in sorted(set(survivors).union(unmapped_pids)):
+    for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
         try:
             terminate_pid(int(pid), force=True)
             force_killed.append(int(pid))
@@ -3049,6 +3300,89 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         # Never let lockfile cleanup block an update.
         pass
 
+def _normalize_managed_eol(git_cmd, repo_root):
+    """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
+
+    Git for Windows ships ``core.autocrlf=true`` in its system config, which
+    renormalizes this repo's LF text files to CRLF in the working tree. That
+    breaks ``git checkout`` on update with "Your local changes would be
+    overwritten", so ``install.ps1`` pins ``core.autocrlf=false`` on the managed
+    clone (#67730). Checkouts created before that landed never got the pin and
+    cannot receive it — the bootstrap installer reuses its build-pinned
+    ``install.ps1`` forever — so ``hermes update``, which ships with the checkout
+    itself, is the only path left that can fix them.
+
+    The pin and the cleanup are one operation. Under ``autocrlf=true`` git
+    compares normalized content, so a CRLF working tree reads clean; pinning
+    alone would expose every text file as modified and hand the update an
+    autostash of the whole tree. So the pin is written only after the tree is
+    verified clean under it, and a checkout we cannot fully normalize is left
+    exactly as it was. Best-effort: never blocks an update.
+    """
+    # -c, not config: evaluate the tree as it WOULD look pinned, without
+    # persisting anything we might not be able to follow through on.
+    probe = git_cmd + ["-c", "core.autocrlf=false"]
+
+    def _dirty(*extra):
+        out = subprocess.run(
+            probe + ["diff", "-z", "--name-only", *extra],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if out.returncode != 0:
+            return None
+        return {p for p in out.stdout.split("\0") if p}
+
+    def _eol_only():
+        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
+        if all_dirty is None or real_dirty is None:
+            return None
+        return all_dirty - real_dirty
+
+    try:
+        effective = subprocess.run(
+            git_cmd + ["config", "--get", "core.autocrlf"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        # Only "true" rewrites LF to CRLF on checkout. Unset, false, and input
+        # all leave the working tree alone, so there is nothing to repair.
+        if effective.stdout.strip().lower() != "true":
+            return
+
+        eol_only = _eol_only()
+        if eol_only is None:
+            return
+        if eol_only:
+            # Pathspec over stdin, not argv: a fully renormalized checkout is
+            # thousands of paths, well past the Windows command-line limit.
+            subprocess.run(
+                probe
+                + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
+                cwd=repo_root,
+                input="\0".join(sorted(eol_only)),
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=False,
+            )
+            if _eol_only():
+                # Still dirty — persisting the pin here would only surface churn
+                # we failed to clear. Leave the checkout as we found it.
+                return
+            print(f"→ Normalized line-ending churn ({len(eol_only)} file(s))")
+
+        subprocess.run(
+            git_cmd + ["config", "core.autocrlf", "false"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        # Never let line-ending cleanup block an update.
+        pass
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -3127,6 +3461,30 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if _m()._is_windows() and not getattr(args, "force_venv", False):
         _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
+            _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
+            if _gateway_holders is not None:
+                # Every remaining holder is a gateway the pause machinery
+                # already owns — respawned by its supervisor inside the
+                # pause→guard window, or up through a spawn path discovery
+                # does not map. Stop them and re-check instead of
+                # dead-ending; the post-update resume (and the supervisor
+                # that respawned them) brings gateways back afterwards.
+                from gateway.status import terminate_pid
+
+                print(
+                    f"  ⚠ {len(_gateway_holders)} gateway process(es) still "
+                    "hold the venv after the pause; stopping them"
+                )
+                for _pid in _gateway_holders:
+                    try:
+                        terminate_pid(int(_pid), force=True)
+                    except Exception as exc:
+                        logger.debug(
+                            "Could not stop leftover gateway %s: %s", _pid, exc
+                        )
+                _time.sleep(1.0)
+                _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
@@ -3176,6 +3534,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # switches fragile. Restoring them first lets the common case (only
     # lockfile churn) update with a clean tree.
     _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    # Same rationale, different generator: line-ending churn is machine-made
+    # dirt on a managed checkout, so clear it (and stop generating it) before
+    # the stash/branch logic rather than autostashing the entire tree.
+    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
@@ -3641,6 +4003,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # reinstall + lazy refresh above may have stripped or downgraded
         # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
         _m()._refresh_active_memory_provider_dependencies()
+
+        # Everything that can legitimately produce a transient ImportError has
+        # now run (bytecode sweep, dependency reinstall, lazy refresh), so a
+        # module that still won't import is real breakage. Warn only — never
+        # roll back here: `cannot import name X` is also the signature of the
+        # stale-bytecode class (#6207, #60242), and the launch-time sweep in
+        # _sweep_stale_bytecode_if_checkout_changed() self-heals that on the
+        # next run. A destructive reset would undo a good update over a state
+        # that fixes itself.
+        import_ok, failing_module, import_error = _validate_critical_modules_import(
+            _m().PROJECT_ROOT
+        )
+        if not import_ok:
+            print()
+            print(f"  ⚠ {failing_module} still fails to import after updating:")
+            print(f"      {import_error}")
+            print("    Run `hermes update` again — if it persists, reinstall:")
+            print("    https://hermes-agent.nousresearch.com")
 
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
