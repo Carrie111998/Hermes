@@ -47,6 +47,11 @@
       "note": "Official desktop split moved this hook into use-prompt-actions/; drop the deleted legacy file during sync."
     },
     {
+      "pattern": "apps/desktop/src/app/chat/composer/status-stack/surface-var-lifecycle.test.tsx",
+      "action": "upstream",
+      "note": "Official composer-strip refactor removed this obsolete lifecycle test; take the upstream deletion."
+    },
+    {
       "pattern": "pyproject.toml",
       "action": "official_with_overlay",
       "note": "Take official deps; re-apply fork-only optional extras after merge."
@@ -75,6 +80,11 @@
       "pattern": "skills/creative/pretext/SKILL.md",
       "action": "upstream",
       "note": "Official new creative skill; no fork-local counterpart exists."
+    },
+    {
+      "pattern": "skills/creative/comfyui/tests/README.md",
+      "action": "upstream",
+      "note": "Official ComfyUI suite guidance follows the current test runner; restore the upstream documentation."
     },
     {
       "pattern": "skills/devops/kanban-worker/SKILL.md",
