@@ -183,17 +183,21 @@ class OSSBackend(Mem0Backend):
         if "path" in vs_config:
             vs_config["path"] = os.path.expanduser(vs_config["path"])
 
+        # Only inject embedding_model_dims for providers that accept it.
+        # Chroma auto-detects dims from the embedder and rejects extra fields
+        # with pydantic validation (mem0ai 2.0+).  Providers that need it:
+        # qdrant, pgvector, elasticsearch, milvus.
+        _DIMS_ACCEPTING_PROVIDERS = {"qdrant", "pgvector", "elasticsearch", "milvus"}
+        vs_provider = str(vector_store.get("provider", "qdrant")).strip().lower()
         embedder_config = oss_config.get("embedder", {}).get("config", {})
         dims = embedder_config.get("embedding_dims")
         if not dims:
             from ._oss_providers import KNOWN_DIMS
             model = embedder_config.get("model", "")
             dims = KNOWN_DIMS.get(model)
-        if dims:
+        if dims and vs_provider in _DIMS_ACCEPTING_PROVIDERS:
             vs_config["embedding_model_dims"] = dims
-            self._recreate_collection_if_dims_changed(
-                vector_store.get("provider", "qdrant"), vs_config, dims,
-            )
+            self._recreate_collection_if_dims_changed(vs_provider, vs_config, dims)
 
         vector_store["config"] = vs_config
 
