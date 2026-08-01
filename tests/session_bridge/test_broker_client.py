@@ -16,9 +16,21 @@ def test_broker_client_maps_each_command_to_the_exact_mcp_tool() -> None:
         (["status"], "session_status", {}),
         (["pending"], "session_sidebar_pending", {"limit": 1}),
         (
-            ["reserve", "--lease-token", "lease"],
+            [
+                "reserve",
+                "--lease-token",
+                "lease",
+                "--reconciliation-proof-digest",
+                "3" * 64,
+                "--reconciliation-generation",
+                "scan:1",
+            ],
             "session_sidebar_reserve",
-            {"lease_token": "lease"},
+            {
+                "lease_token": "lease",
+                "reconciliation_proof_digest": "3" * 64,
+                "reconciliation_generation": "scan:1",
+            },
         ),
         (
             ["bind", "--lease-token", "lease", "--thread-id", "thread"],

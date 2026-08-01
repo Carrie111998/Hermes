@@ -65,6 +65,10 @@ from session_bridge.sidebar import (
 )
 from session_bridge.sidebar_executor import NativeTurnAmbiguous
 from session_bridge.sidebar_hydration_executor import SidebarHydrationExecutor
+from session_bridge.sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -93,7 +97,6 @@ class _SidebarSkillContract:
     pending_tool: str
     pending_limit: int
     projects_tool: str
-    list_threads_tool: str
     read_thread_tool: str
     reserve_tool: str
     create_tool: str
@@ -101,7 +104,7 @@ class _SidebarSkillContract:
     rename_tool: str
     commit_tool: str
     fail_tool: str
-    reconcile_limit: int
+    reconciliation_fields: tuple[str, ...]
     project_precedence: tuple[str, ...]
     create_cwd_source: str
     runtime_root_sources: tuple[str, ...]
@@ -142,10 +145,23 @@ class _SidebarSkillContract:
                 r"native tool `(list_[a-z_]+)\(\{\}\)` exactly once",
                 queue_selection,
             )
-            list_threads = re.search(
-                r"call `(list_threads)\(\{.*?\"limit\":(\d+)\}\)`",
-                steps[5],
+            if "list_threads" in text:
+                raise ValueError("native task discovery is forbidden")
+            reconciliation_fields = tuple(
+                field
+                for field in (
+                    "reconciliation_state",
+                    "reconciliation_proof_digest",
+                    "reconciliation_generation",
+                )
+                if f"`{field}`" in steps[5] or f"`{field}`" in steps[6]
             )
+            if reconciliation_fields != (
+                "reconciliation_state",
+                "reconciliation_proof_digest",
+                "reconciliation_generation",
+            ):
+                raise ValueError("authoritative reconciliation fields")
             read_thread = re.search(r"call `(read_thread)\(", steps[5])
             reserve = re.search(r"call `(session_sidebar_reserve)\(", steps[6])
             create = re.search(r"`(create_thread)\(", steps[6])
@@ -157,7 +173,6 @@ class _SidebarSkillContract:
                 status,
                 pending,
                 projects,
-                list_threads,
                 read_thread,
                 reserve,
                 create,
@@ -168,7 +183,7 @@ class _SidebarSkillContract:
             )
             if any(match is None for match in matches):
                 raise ValueError("required call schemas")
-            assert status and pending and projects and list_threads
+            assert status and pending and projects
             assert (
                 read_thread
                 and reserve
@@ -257,7 +272,7 @@ class _SidebarSkillContract:
             )
             required_rules = (
                 "never select placement or project identity",
-                "reconcile before creating anything",
+                "Trust only the authoritative reconciliation object",
                 '"prompt":"<registration_prompt verbatim>"',
                 "title before commit",
                 "try fail/release once with `bridge_temporarily_unavailable`",
@@ -271,7 +286,6 @@ class _SidebarSkillContract:
                 pending_tool=pending.group(1),
                 pending_limit=int(pending.group(2)),
                 projects_tool=projects.group(1),
-                list_threads_tool=list_threads.group(1),
                 read_thread_tool=read_thread.group(1),
                 reserve_tool=reserve.group(1),
                 create_tool=create.group(1),
@@ -279,7 +293,7 @@ class _SidebarSkillContract:
                 rename_tool=rename.group(1),
                 commit_tool=commit.group(1),
                 fail_tool=fail.group(1),
-                reconcile_limit=int(list_threads.group(2)),
+                reconciliation_fields=reconciliation_fields,
                 project_precedence=precedence,
                 create_cwd_source=create_cwd_source,
                 runtime_root_sources=runtime_root_sources,
@@ -554,7 +568,6 @@ class _SidebarSkillContract:
             tools = [event["tool"] for event in events]
             ranks = {
                 "project_choice": 0,
-                self.list_threads_tool: 1,
                 self.reserve_tool: 3,
                 self.create_tool: 4,
                 self.bind_tool: 5,
@@ -600,9 +613,6 @@ class _SidebarSkillContract:
                     self.reserve_tool
                 ) > tools.index(self.create_tool):
                     raise AssertionError("create must follow durable reservation")
-            if self.list_threads_tool in tools and self.create_tool in tools:
-                if tools.index(self.list_threads_tool) > tools.index(self.create_tool):
-                    raise AssertionError("reconciliation must precede creation")
             if self.rename_tool in tools:
                 if self.bind_tool not in tools or tools.index(
                     self.bind_tool
@@ -621,18 +631,12 @@ class _SidebarSkillContract:
                     raise AssertionError("failure code must come from shipped mapping")
                 fail_index = events.index(event)
                 known_thread_id: str | None = None
-                marker_search_seen = False
                 for prior in events[:fail_index]:
-                    if prior["tool"] == self.list_threads_tool:
-                        marker_search_seen = True
-                    elif prior["tool"] == self.bind_tool:
+                    if prior["tool"] == self.bind_tool:
                         candidate = prior["arguments"].get("codex_thread_id")
                         if isinstance(candidate, str):
                             known_thread_id = candidate
-                    elif (
-                        prior["tool"] == self.read_thread_tool
-                        and not marker_search_seen
-                    ):
+                    elif prior["tool"] == self.read_thread_tool:
                         candidate = prior["arguments"].get("threadId")
                         if isinstance(candidate, str):
                             known_thread_id = candidate
@@ -1661,6 +1665,19 @@ class _SidebarMcpCoordinator:
             codex_thread_id=codex_thread_id,
         )
 
+    async def reserve_sidebar_create_authoritatively(
+        self,
+        *,
+        lease_token: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+    ):
+        return await self.delegate.reserve_sidebar_create_authoritatively(
+            lease_token=lease_token,
+            reconciliation_proof_digest=reconciliation_proof_digest,
+            reconciliation_generation=reconciliation_generation,
+        )
+
     def health(self) -> dict[str, Any]:
         return self.delegate.health()
 
@@ -1841,6 +1858,47 @@ class _FakeNativeCodexTasks:
             return None
         assert len(matches) == 1, "fake native inventory must never hide duplicates"
         return _verified_native_thread(matches[0])
+
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        self.reconciliation_calls.append(expected)
+        marker = encode_bridge_marker(expected, self.marker_secret)
+        matches = [
+            thread for thread in self.threads.values() if thread["marker"] == marker
+        ]
+        marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+        inventory_digest = hashlib.sha256(
+            "\0".join(sorted(self.threads)).encode("utf-8")
+        ).hexdigest()
+        generation = f"synthetic:{len(self.reconciliation_calls)}:{inventory_digest}"
+        if len(matches) == 1:
+            state = SidebarReconciliationState.RECOVERED
+            recovered_thread_id = matches[0]["thread_id"]
+            fixed_reason = None
+        elif not matches:
+            state = SidebarReconciliationState.ABSENCE_PROVEN
+            recovered_thread_id = None
+            fixed_reason = None
+        else:
+            state = SidebarReconciliationState.BLOCKED
+            recovered_thread_id = None
+            fixed_reason = "marker_conflict"
+        return SidebarReconciliationEvidence.create(
+            state=state,
+            generation=generation,
+            completed_at=now,
+            expires_at=now + ttl_seconds,
+            inventory_digest=inventory_digest,
+            marker_digest=marker_digest,
+            match_count=len(matches),
+            recovered_thread_id=recovered_thread_id,
+            fixed_reason=fixed_reason,
+        )
 
     def verify_thread(
         self, *, thread_id: str, expected: BridgeMarkerPayload
@@ -2433,12 +2491,16 @@ class _SidebarEndToEndHarness:
             thread_id = None
             created = False
             recovered_thread_id = job["recovered_thread_id"]
+            reconciliation_state = job["reconciliation_state"]
             marker = _registration_marker(job["registration_prompt"])
             expected_registration = decode_sidebar_registration_identity(
                 job["registration_prompt"],
                 _MARKER_SECRET,
             )
-            if recovered_thread_id is not None:
+            if reconciliation_state == "recovered":
+                if recovered_thread_id is None or job.get("create_eligible") is not False:
+                    outcomes.append(fail_once("Bridge temporarily unavailable"))
+                    continue
                 read_arguments = {"threadId": recovered_thread_id}
                 trace.append({
                     "tool": self.contract.read_thread_tool,
@@ -2491,93 +2553,24 @@ class _SidebarEndToEndHarness:
                     )
                     continue
                 thread_id = recovered_thread_id
-            elif job.get("reconcile_required") or job.get("create_reserved"):
-                list_arguments = {
-                    "query": marker,
-                    "limit": self.contract.reconcile_limit,
-                }
-                trace.append({
-                    "tool": self.contract.list_threads_tool,
-                    "job": job_id,
-                    "arguments": list_arguments,
-                })
-                summaries = getattr(
-                    self.native,
-                    self.contract.list_threads_tool,
-                )(**list_arguments)
-                for summary in summaries:
-                    candidate_id = summary["threadId"]
-                    if summary.get("projectId") != placement.project_id:
-                        outcomes.append(
-                            fail_once(
-                                "Native task outside Session Inbox placement",
-                                candidate_id,
-                            )
-                        )
-                        thread_id = candidate_id
-                        break
-                    trace.append({
-                        "tool": self.contract.read_thread_tool,
-                        "job": job_id,
-                        "arguments": {"threadId": candidate_id},
-                    })
-                    try:
-                        candidate = getattr(
-                            self.native,
-                            self.contract.read_thread_tool,
-                        )(thread_id=candidate_id)
-                    except (KeyError, RuntimeError):
-                        outcomes.append(
-                            fail_once("Bound task not yet indexed", candidate_id)
-                        )
-                        thread_id = candidate_id
-                        break
-                    identity_failure = self._registration_identity_failure(
-                        candidate,
-                        expected_thread_id=candidate_id,
-                        expected_marker=marker,
-                        expected_source_id=expected_registration.source_session_id,
-                        expected_source_cwd=cwd,
-                    )
-                    if identity_failure == "Authenticated marker conflict":
-                        outcomes.append(
-                            fail_once(identity_failure, candidate_id)
-                        )
-                        thread_id = candidate_id
-                        break
-                    if (
-                        candidate.get("project_id") != placement.project_id
-                        or _canonical_sidebar_path(candidate.get("cwd", ""))
-                        != placement.inbox_cwd
-                    ):
-                        outcomes.append(
-                            fail_once(
-                                "Native task outside Session Inbox placement",
-                                candidate_id,
-                            )
-                        )
-                        thread_id = candidate_id
-                        break
-                    if identity_failure is not None:
-                        outcomes.append(
-                            fail_once(identity_failure, candidate_id)
-                        )
-                        thread_id = candidate_id
-                        break
-                    thread_id = candidate_id
-                    break
-
-                if outcomes and thread_id is not None:
-                    continue
-
-            if thread_id is None and job.get("create_reserved"):
-                outcomes.append(
-                    fail_once("Create response lost or otherwise ambiguous")
-                )
+            elif (
+                reconciliation_state != "absence_proven"
+                or recovered_thread_id is not None
+                or job.get("create_eligible") is not True
+            ):
+                outcomes.append(fail_once("Bridge temporarily unavailable"))
                 continue
 
             if thread_id is None:
-                reserve_arguments = {"lease_token": job["lease_token"]}
+                reserve_arguments = {
+                    "lease_token": job["lease_token"],
+                    "reconciliation_proof_digest": job[
+                        "reconciliation_proof_digest"
+                    ],
+                    "reconciliation_generation": job[
+                        "reconciliation_generation"
+                    ],
+                }
                 trace.append({
                     "tool": self.contract.reserve_tool,
                     "job": job_id,
@@ -2592,53 +2585,92 @@ class _SidebarEndToEndHarness:
                 except (httpx.TransportError, AssertionError, ValueError):
                     outcomes.append(fail_once("Bridge temporarily unavailable"))
                     continue
-                if reservation != {
+                if reservation.get("state") == "recovered" and (
+                    reservation.get("create_reserved") is False
+                ):
+                    recovered_after_reserve = reservation.get("codex_thread_id")
+                    if not isinstance(recovered_after_reserve, str):
+                        outcomes.append(fail_once("Bridge temporarily unavailable"))
+                        continue
+                    trace.append({
+                        "tool": self.contract.read_thread_tool,
+                        "job": job_id,
+                        "arguments": {"threadId": recovered_after_reserve},
+                    })
+                    try:
+                        recovered = getattr(
+                            self.native,
+                            self.contract.read_thread_tool,
+                        )(thread_id=recovered_after_reserve)
+                    except (KeyError, RuntimeError):
+                        outcomes.append(
+                            fail_once(
+                                "Bound task not yet indexed",
+                                recovered_after_reserve,
+                            )
+                        )
+                        continue
+                    identity_failure = self._registration_identity_failure(
+                        recovered,
+                        expected_thread_id=recovered_after_reserve,
+                        expected_marker=marker,
+                        expected_source_id=expected_registration.source_session_id,
+                        expected_source_cwd=cwd,
+                    )
+                    if identity_failure is not None:
+                        outcomes.append(
+                            fail_once(identity_failure, recovered_after_reserve)
+                        )
+                        continue
+                    thread_id = recovered_after_reserve
+                elif reservation != {
                     "state": "sidebar_leased",
                     "create_reserved": True,
                 }:
                     outcomes.append(fail_once("Bridge temporarily unavailable"))
                     continue
-                create_arguments = self.contract.create_arguments(
-                    prompt=job["registration_prompt"],
-                    placement=placement,
-                )
-                trace.append({
-                    "tool": self.contract.create_tool,
-                    "job": job_id,
-                    "arguments": create_arguments,
-                    "registration_prompt": job["registration_prompt"],
-                })
-                try:
-                    thread_id = getattr(
-                        self.native,
-                        self.contract.create_tool,
-                    )(**create_arguments)
-                    created = True
-                except RuntimeError:
-                    if self.production_codex_target is not None and (
-                        self.allow_forbidden_app_server_fallback_for_mutation
-                        or not self.contract.forbid_app_server
-                    ):
-                        marker_payload = decode_bridge_marker(
-                            _registration_marker(job["registration_prompt"]),
-                            _MARKER_SECRET,
-                        )
-                        trace.append({
-                            "tool": "app-server.create_placeholder",
-                            "job": job_id,
-                            "arguments": {"source_session_id": job_id},
-                        })
-                        self.production_codex_target.create_placeholder(
-                            title=job["title"],
-                            source_session_id=marker_payload.source_session_id,
-                            bridge_id=marker_payload.bridge_id,
-                            policy_generation=marker_payload.policy_generation,
-                            cwd=job["cwd"],
-                        )
-                    outcomes.append(
-                        fail_once("Create response lost or otherwise ambiguous")
+                else:
+                    create_arguments = self.contract.create_arguments(
+                        prompt=job["registration_prompt"],
+                        placement=placement,
                     )
-                    continue
+                    trace.append({
+                        "tool": self.contract.create_tool,
+                        "job": job_id,
+                        "arguments": create_arguments,
+                        "registration_prompt": job["registration_prompt"],
+                    })
+                    try:
+                        thread_id = getattr(
+                            self.native,
+                            self.contract.create_tool,
+                        )(**create_arguments)
+                        created = True
+                    except RuntimeError:
+                        if self.production_codex_target is not None and (
+                            self.allow_forbidden_app_server_fallback_for_mutation
+                            or not self.contract.forbid_app_server
+                        ):
+                            marker_payload = decode_bridge_marker(
+                                _registration_marker(job["registration_prompt"]),
+                                _MARKER_SECRET,
+                            )
+                            trace.append({
+                                "tool": "app-server.create_placeholder",
+                                "job": job_id,
+                                "arguments": {"source_session_id": job_id},
+                            })
+                            self.production_codex_target.create_placeholder(
+                                title=job["title"],
+                                source_session_id=marker_payload.source_session_id,
+                                bridge_id=marker_payload.bridge_id,
+                                policy_generation=marker_payload.policy_generation,
+                                cwd=job["cwd"],
+                            )
+                        outcomes.append(
+                            fail_once("Create response lost or otherwise ambiguous")
+                        )
+                        continue
 
             bind_arguments = {
                 "lease_token": job["lease_token"],
@@ -3083,7 +3115,6 @@ def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
             harness.contract.projects_tool,
             harness.contract.pending_tool,
             "project_choice",
-            harness.contract.list_threads_tool,
             harness.contract.reserve_tool,
             harness.contract.create_tool,
             harness.contract.bind_tool,
@@ -4126,7 +4157,22 @@ def test_recovered_id_read_failure_settles_with_the_same_exact_id(
         )
         harness.register()
         lease = harness.store.claim_sidebar_jobs(now=harness.now, limit=1)[0]
-        recovered_thread_id = "native-missing-recovered-id"
+        recovered_thread_id = harness.native.create_thread(
+            prompt=build_registration_prompt(
+                harness.store.get_sidebar_candidate_for_delivery(source_id),
+                encode_bridge_marker(
+                    BridgeMarkerPayload(
+                        bridge_id=lease["bridge_id"],
+                        source_session_id=source_id,
+                        target_provider=Provider.CODEX,
+                        policy_generation=1,
+                    ),
+                    _MARKER_SECRET,
+                ),
+            ),
+            cwd=str(harness.inbox),
+            runtimeWorkspaceRoots=[str(harness.inbox), str(source_cwd)],
+        )
         harness.store.bind_sidebar_thread(
             lease_token=lease["lease_token"],
             codex_thread_id=recovered_thread_id,
@@ -4138,6 +4184,12 @@ def test_recovered_id_read_failure_settles_with_the_same_exact_id(
             codex_thread_id=recovered_thread_id,
             now=harness.now,
         )
+        harness.native.create_calls.clear()
+
+        def unreadable_recovered(*, thread_id: str) -> dict[str, Any]:
+            raise KeyError(thread_id)
+
+        harness.native.read_thread = unreadable_recovered
         harness.advance_retry()
 
         with harness.client() as client:
@@ -4214,13 +4266,19 @@ def test_recovered_id_read_classifies_identity_and_placement_without_replacement
             now=harness.now,
         )
         harness.native.create_calls.clear()
-        thread = harness.native.threads[recovered_thread_id]
-        if mutation == "thread_id":
-            thread["thread_id"] = "native-returned-different-id"
-        elif mutation == "marker":
-            thread["marker"] = "HERMES_SESSION_BRIDGE_V1:wrong.signature"
-        else:
-            thread["cwd"] = _canonical_sidebar_path(source_cwd)
+        original_read = harness.native.read_thread
+
+        def mutated_read(*, thread_id: str) -> dict[str, Any]:
+            result = original_read(thread_id=thread_id)
+            if mutation == "thread_id":
+                result["thread_id"] = "native-returned-different-id"
+            elif mutation == "marker":
+                result["marker"] = "HERMES_SESSION_BRIDGE_V1:wrong.signature"
+            else:
+                result["cwd"] = _canonical_sidebar_path(source_cwd)
+            return result
+
+        harness.native.read_thread = mutated_read
         harness.advance_retry()
 
         with harness.client() as client:

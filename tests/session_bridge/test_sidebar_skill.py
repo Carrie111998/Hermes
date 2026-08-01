@@ -191,7 +191,10 @@ def test_sidebar_skill_encodes_the_single_lease_sequential_delivery_protocol() -
     assert "exactly once" in skill
     assert "no user-facing message" in skill
     assert "local-e59c279a6cdda9313cf111e46a80b027" in skill
-    assert "reconcile_required" in skill
+    assert "reconciliation_state" in skill
+    assert "reconciliation_proof_digest" in skill
+    assert "reconciliation_generation" in skill
+    assert "create_eligible" in skill
     assert "recovered_thread_id" in skill
     assert "registration_prompt" in skill
     assert "exactly one native local task" in skill
@@ -290,11 +293,14 @@ def test_sidebar_skill_allows_only_prebind_candidate_authentication_reads() -> N
         "\n## Continuation Contract\n", 1
     )[0]
 
-    assert "Bounded pre-bind reads are allowed solely to authenticate a candidate" in registration
+    assert (
+        "Bounded pre-bind reads are allowed solely to authenticate the one exact "
+        "recovered ID"
+    ) in registration
     assert "do not poll, rename, or commit during candidate authentication" in registration
     assert "Never bind an unauthenticated candidate" in registration
-    assert "exactly one authenticated candidate, call `session_sidebar_bind" in registration
-    assert "Only the bound ID may then be polled, renamed, or committed" in registration
+    assert "call `session_sidebar_bind" in registration
+    assert "do not poll, rename, commit, or create a replacement" in registration
     assert "Bounded pre-bind candidate-authentication reads are permitted" in hard_stops
     assert "Never poll, rename, or commit a selected task before binding" in hard_stops
 
@@ -451,9 +457,11 @@ def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
     assert "authenticated quiescent registration" in create_step
     assert "60 seconds" in create_step
     assert "`native_task_not_indexed`" in create_step
-    assert create_step.index("session_sidebar_bind") > create_step.index(
-        "returned `threadId`"
+    bind_call = (
+        "session_sidebar_bind(lease_token=<exact token>, "
+        "codex_thread_id=<threadId>)"
     )
+    assert create_step.index(bind_call) > create_step.index("returned `threadId`")
     assert create_step.index("`read_thread`") > create_step.index(
         "session_sidebar_bind"
     )
@@ -484,13 +492,10 @@ def test_sidebar_skill_reserves_the_create_boundary_before_native_creation() -> 
 
     assert "`create_reserved`" in skill
     assert (
-        "When `create_reserved` is true, zero marker-search results never authorize "
-        "creation"
-    ) in reconcile_step
-    assert "settle once with `native_create_ambiguous`" in reconcile_step
-    assert (
-        "`session_sidebar_reserve(lease_token=<exact token>)` immediately before "
-        "`create_thread`"
+        "`session_sidebar_reserve(lease_token=<exact token>, "
+        "reconciliation_proof_digest=<exact digest>, "
+        "reconciliation_generation=<exact generation>)` immediately before native "
+        "create"
     ) in create_step
     assert create_step.index("session_sidebar_reserve") < create_step.index(
         "create_thread"
@@ -528,17 +533,11 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     assert "`list_projects({})` exactly once" in skill
     assert "exactly one local saved project" in skill
     assert "canonical path equals `C:\\Users\\diego\\.hermes`" in skill
-    assert '`list_threads({"query":"<exact signed marker>","limit":20})`' in skill
     assert (
-        '`read_thread({"threadId":"<candidate threadId>",'
-        '"hostId":"<candidate hostId>","turnLimit":10,'
+        '`read_thread({"threadId":"<recovered_thread_id>","turnLimit":10,'
         '"includeOutputs":false})`'
     ) in skill
-    assert "Omit `hostId` only when it was absent or null" in skill
     assert "Pass no other fields" in skill
-    assert '`read_thread({"threadId":"<candidate threadId>",...})`' not in skill
-    assert "Before matching the signed marker" in skill
-    assert "remote-host candidate" in skill
     assert "`codex_thread_conflict`" in skill
     create = (
         '`create_thread({"prompt":"<registration_prompt verbatim>",'
@@ -585,24 +584,24 @@ def test_sidebar_skill_uses_project_placement_only_for_registration() -> (
     assert '"target":{"type":"project"' in registration
 
 
-def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() -> None:
+def test_sidebar_skill_uses_only_authoritative_reconciliation_paths() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
 
+    assert "Trust only the authoritative reconciliation object" in reconcile_step
+    assert "When `reconciliation_state` is `recovered`" in reconcile_step
     assert (
         '`read_thread({"threadId":"<recovered_thread_id>",'
         '"turnLimit":10,"includeOutputs":false})`' in reconcile_step
     )
     assert '"turnLimit":20' not in reconcile_step
-    assert "Ten is the bounded reconciliation and read limit" in reconcile_step
-    assert "Do not call `list_threads` before this recovered-ID read" in reconcile_step
-    assert (
-        "Only when `recovered_thread_id` is absent, call "
-        '`list_threads({"query":"<exact signed marker>","limit":20})`' in reconcile_step
-    )
-    recovered_branch = reconcile_step.split("When `recovered_thread_id` is present", 1)[
-        1
-    ].split("Only when `recovered_thread_id` is absent", 1)[0]
+    assert "session_sidebar_bind" in reconcile_step
+    assert "When `reconciliation_state` is `absence_proven`" in reconcile_step
+    assert "do not inspect any other native task" in reconcile_step
+    assert "A missing or unsupported reconciliation state" in reconcile_step
+    recovered_branch = reconcile_step.split(
+        "When `reconciliation_state` is `recovered`", 1
+    )[1].split("When `reconciliation_state` is `absence_proven`", 1)[0]
     assert (
         "unavailable, missing, or not-yet-indexed recovered-ID read maps to "
         "`native_task_not_indexed`"
@@ -645,9 +644,9 @@ def test_sidebar_skill_matches_the_native_read_thread_response_schema() -> None:
 def test_sidebar_skill_fails_closed_when_recovered_task_drifted_outside_inbox() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
-    recovered_branch = reconcile_step.split("When `recovered_thread_id` is present", 1)[
-        1
-    ].split("Only when `recovered_thread_id` is absent", 1)[0]
+    recovered_branch = reconcile_step.split(
+        "When `reconciliation_state` is `recovered`", 1
+    )[1].split("When `reconciliation_state` is `absence_proven`", 1)[0]
 
     assert "Require `thread.cwd` to match the resolved Session Inbox cwd" in (
         recovered_branch
@@ -660,27 +659,14 @@ def test_sidebar_skill_fails_closed_when_recovered_task_drifted_outside_inbox() 
     assert "never permits creation or replacement" in recovered_branch
 
 
-def test_sidebar_skill_never_creates_after_an_unverifiable_search_candidate() -> None:
+def test_sidebar_skill_never_discovers_tasks_through_native_list_threads() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
-    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
 
-    assert (
-        "Creation is permitted only when the exact-marker search returns zero "
-        "candidate summaries"
-    ) in reconcile_step
-    assert (
-        "candidate read is unavailable or not yet indexed within the ten-turn "
-        "read, map to `native_task_not_indexed`"
-    ) in reconcile_step
-    assert (
-        "candidate read returns successfully but its exact ID or signed marker "
-        "mismatches, map to `marker_conflict`"
-    ) in reconcile_step
-    assert "any returned candidate that cannot be authenticated" not in reconcile_step
-    assert "never continue to creation after a candidate summary was returned" in (
-        reconcile_step
-    )
-    assert "no match: continue to creation" not in reconcile_step
+    assert "list_threads" not in skill
+    assert "reconciliation_state" in skill
+    assert "reconciliation_proof_digest" in skill
+    assert "reconciliation_generation" in skill
+    assert "create_eligible" in skill
 
 
 def test_sidebar_skill_deterministically_settles_native_and_broker_failures() -> None:
@@ -775,35 +761,9 @@ def test_sidebar_skill_normalizes_only_current_local_host_identity() -> None:
     assert "current-local sentinel `local`" in project_step
     assert "Reject every other explicit host value" in project_step
     assert "never infer or coerce an arbitrary host string" in project_step
-    assert (
-        "Apply the same host normalization to every thread candidate" in reconcile_step
+    assert "normalized task host must equal the Session Inbox project's normalized host" in (
+        reconcile_step
     )
-    assert "normalized host is `local`" in reconcile_step
-    assert "equals the chosen project's normalized host" in reconcile_step
-    assert "original candidate `hostId`" in reconcile_step
-    assert "Omit `hostId` only when it was absent or null" in reconcile_step
-    assert "remote marker collision" in reconcile_step
-
-
-def test_sidebar_skill_filters_explicit_remote_candidate_before_read() -> None:
-    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
-    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
-
-    filter_rule = (
-        "Normalize and filter each `list_threads` candidate summary before any "
-        "`read_thread` call"
-    )
-    read_schema = (
-        '`read_thread({"threadId":"<candidate threadId>","hostId":"<candidate hostId>"'
-    )
-    assert filter_rule in reconcile_step
-    assert reconcile_step.index(filter_rule) < reconcile_step.index(read_schema)
-    assert (
-        "explicit non-`local` host maps to `codex_thread_conflict` without a read"
-        in (reconcile_step)
-    )
-    assert "only when that summary supplies project identity" in reconcile_step
-    assert "do not invent a missing project field" in reconcile_step
 
 
 def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:

@@ -24,6 +24,8 @@ def _parser() -> argparse.ArgumentParser:
     pending.add_argument("--limit", type=int, choices=(1,), default=1)
     reserve = commands.add_parser("reserve")
     reserve.add_argument("--lease-token", required=True)
+    reserve.add_argument("--reconciliation-proof-digest", required=True)
+    reserve.add_argument("--reconciliation-generation", required=True)
     for name in ("bind", "commit"):
         command = commands.add_parser(name)
         command.add_argument("--lease-token", required=True)
@@ -56,7 +58,11 @@ async def dispatch(argv: Sequence[str], *, call: BrokerCall) -> dict[str, Any]:
     if args.command == "reserve":
         return await call(
             "session_sidebar_reserve",
-            {"lease_token": args.lease_token},
+            {
+                "lease_token": args.lease_token,
+                "reconciliation_proof_digest": args.reconciliation_proof_digest,
+                "reconciliation_generation": args.reconciliation_generation,
+            },
         )
     if args.command in {"bind", "commit"}:
         return await call(
