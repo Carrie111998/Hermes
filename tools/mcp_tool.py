@@ -2751,7 +2751,7 @@ class MCPServerTask:
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
-        if not _MCP_HTTP_AVAILABLE:
+        if not _MCP_HTTP_AVAILABLE and not _MCP_NEW_HTTP:
             raise ImportError(
                 f"MCP server '{self.name}' requires HTTP transport but "
                 "mcp.client.streamable_http is not available. "
@@ -2765,7 +2765,12 @@ class MCPServerTask:
         # Seed it as a client-level default, but treat user overrides as
         # case-insensitive so conventional casing is preserved.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+            # Use the latest HANDSHAKE version, not LATEST_PROTOCOL_VERSION.
+            # session.initialize() sends a legacy handshake (2025-11-25), not
+            # the modern protocol (2026-07-28). If the header says 2026-07-28,
+            # the server routes to the modern path which requires _meta
+            # envelope keys that the legacy initialize() doesn't send.
+            headers["mcp-protocol-version"] = "2025-11-25"
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
@@ -2923,7 +2928,7 @@ class MCPServerTask:
             try:
                 async with httpx.AsyncClient(**client_kwargs) as http_client:
                     async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream, _get_session_id,
+                        read_stream, write_stream,
                     ):
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
@@ -4861,8 +4866,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP CallToolResult has .content (list of content blocks) and .is_error
+            # In MCP 2.0.0 the field was renamed from isError (camelCase) to
+            # is_error (snake_case). Use getattr to support both.
+            if getattr(result, "is_error", getattr(result, "isError", False)):
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
