@@ -1570,10 +1570,10 @@ def _ensure_ssl_certs() -> None:
     """
     configured_cert = os.environ.get("SSL_CERT_FILE")
     if configured_cert:
-        if os.path.exists(configured_cert):
+        if os.path.isfile(configured_cert):
             return  # user already configured it to a real file
         logging.getLogger(__name__).warning(
-            "Ignoring stale SSL_CERT_FILE=%r because the path does not exist",
+            "Ignoring SSL_CERT_FILE=%r because it is not a file",
             configured_cert,
         )
         os.environ.pop("SSL_CERT_FILE", None)

@@ -32,6 +32,30 @@ def test_ensure_ssl_certs_ignores_stale_ssl_cert_file(monkeypatch, tmp_path):
     assert os.environ["SSL_CERT_FILE"] == str(cert_file)
 
 
+def test_ensure_ssl_certs_ignores_directory_ssl_cert_file(monkeypatch, tmp_path):
+    """A directory is not a valid SSL certificate bundle."""
+    cert_file = tmp_path / "cacert.pem"
+    cert_file.write_text("dummy cert bundle", encoding="utf-8")
+    cert_directory = tmp_path / "cert-directory"
+    cert_directory.mkdir()
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert_directory))
+    monkeypatch.setattr(
+        ssl,
+        "get_default_verify_paths",
+        lambda: SimpleNamespace(cafile=None, openssl_cafile=None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "certifi",
+        SimpleNamespace(where=lambda: str(cert_file)),
+    )
+
+    _ensure_ssl_certs()
+
+    assert os.environ["SSL_CERT_FILE"] == str(cert_file)
+
+
 def test_ensure_ssl_certs_keeps_existing_ssl_cert_file(monkeypatch, tmp_path):
     """A valid user-provided SSL_CERT_FILE must not be overwritten."""
     cert_file = tmp_path / "existing.pem"
