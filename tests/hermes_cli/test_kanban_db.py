@@ -171,6 +171,134 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_reopen_done_task_preserves_history_and_invalidates_ready_child(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        assert kb.complete_task(conn, parent, result="premature review") is True
+        assert kb.get_task(conn, child).status == "ready"
+
+        completed_run = conn.execute(
+            "SELECT id, status, outcome FROM task_runs WHERE task_id = ?",
+            (parent,),
+        ).fetchone()
+
+        assert kb.reopen_task(
+            conn,
+            parent,
+            reason="implementation completion contract was not met",
+        ) is True
+
+        reopened = kb.get_task(conn, parent)
+        assert reopened.status == "ready"
+        assert reopened.result is None
+        assert reopened.completed_at is None
+        assert kb.get_task(conn, child).status == "todo"
+
+        preserved_run = conn.execute(
+            "SELECT id, status, outcome FROM task_runs WHERE task_id = ?",
+            (parent,),
+        ).fetchone()
+        assert dict(preserved_run) == dict(completed_run)
+
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (parent,),
+        ).fetchone()
+        assert event["kind"] == "reopened"
+        assert "implementation completion contract was not met" in event["payload"]
+
+
+def test_reopen_requires_nonempty_reason(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="premature")
+        assert kb.complete_task(conn, task_id) is True
+
+        with pytest.raises(ValueError, match="reopen reason is required"):
+            kb.reopen_task(conn, task_id, reason="   ")
+
+        assert kb.get_task(conn, task_id).status == "done"
+
+
+def test_reopen_rejects_done_task_with_active_claim(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="claimed terminal")
+        assert kb.complete_task(conn, task_id) is True
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, worker_pid = ? WHERE id = ?",
+            ("still-owned", 424242, task_id),
+        )
+        conn.commit()
+
+        with pytest.raises(RuntimeError, match="active run or worker"):
+            kb.reopen_task(conn, task_id, reason="premature completion")
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        assert task.claim_lock == "still-owned"
+        assert task.worker_pid == 424242
+
+
+def test_reopen_rejects_dispatcher_worker_context(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="worker-owned terminal")
+        assert kb.complete_task(conn, task_id) is True
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+
+        with pytest.raises(PermissionError, match="operator-only"):
+            kb.reopen_task(conn, task_id, reason="worker attempted self-reopen")
+
+        assert kb.get_task(conn, task_id).status == "done"
+
+
+def test_reopen_rejects_running_child_dependency_race(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        assert kb.complete_task(conn, parent) is True
+        assert kb.claim_task(conn, child) is not None
+
+        with pytest.raises(RuntimeError, match="active child"):
+            kb.reopen_task(conn, parent, reason="premature completion")
+
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "running"
+
+
+def test_reopen_bypasses_recent_success_respawn_guard(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="recently completed")
+        assert kb.complete_task(conn, task_id, result="premature") is True
+        assert kb.reopen_task(conn, task_id, reason="completion contract unmet") is True
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_reopen_resets_failure_state_inside_primary_transaction(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="atomic reopen")
+        assert kb.complete_task(conn, task_id) is True
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 3, last_failure_error = ? "
+            "WHERE id = ?",
+            ("old failure", task_id),
+        )
+        conn.commit()
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("reopen must not use a second failure-reset transaction")
+
+        monkeypatch.setattr(kb, "_clear_failure_counter", fail_if_called)
+        assert kb.reopen_task(conn, task_id, reason="completion contract unmet") is True
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+
 
 # ---------------------------------------------------------------------------
 # Links + dependency resolution

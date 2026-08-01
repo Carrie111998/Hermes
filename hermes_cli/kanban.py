@@ -601,6 +601,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_reopen = sub.add_parser(
+        "reopen",
+        help="Reopen one prematurely completed task while preserving its history",
+    )
+    p_reopen.add_argument("task_id")
+    p_reopen.add_argument(
+        "--reason",
+        required=True,
+        help="Required audit reason for invalidating the completion",
+    )
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1062,6 +1073,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "reopen":   _cmd_reopen,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1091,7 +1103,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PermissionError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
 
@@ -1127,6 +1139,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "reopen",
     "edit",
     "block",
     "schedule",
@@ -2225,6 +2238,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        if not kb.reopen_task(conn, args.task_id, reason=args.reason):
+            print(
+                f"cannot reopen {args.task_id} (unknown id or task is not done)",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Reopened {args.task_id}")
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:

@@ -5043,6 +5043,97 @@ def complete_task(
     return True
 
 
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> bool:
+    """Reopen one prematurely completed task without erasing its history.
+
+    Only a terminal ``done`` task with no active claim or worker may be
+    reopened.  The task returns to ``ready`` when all of its parents are
+    terminal, otherwise to ``todo``.  Direct children that were made ready by
+    the premature completion are demoted to ``todo`` so they cannot run against
+    an invalid prerequisite.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        raise PermissionError("reopen is operator-only and unavailable to Kanban workers")
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("reopen reason is required")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, result, completed_at, claim_lock, worker_pid, "
+            "current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "done":
+            return False
+        if (
+            row["claim_lock"] is not None
+            or row["worker_pid"] is not None
+            or row["current_run_id"] is not None
+        ):
+            raise RuntimeError(f"cannot reopen task {task_id} with an active run or worker")
+
+        active_child = conn.execute(
+            "SELECT c.id FROM tasks c "
+            "JOIN task_links l ON l.child_id = c.id "
+            "WHERE l.parent_id = ? AND (c.status = 'running' "
+            "OR c.claim_lock IS NOT NULL OR c.worker_pid IS NOT NULL "
+            "OR c.current_run_id IS NOT NULL) LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active_child is not None:
+            raise RuntimeError(
+                f"cannot reopen task {task_id} while active child "
+                f"{active_child['id']} is running or claimed"
+            )
+
+        parents = conn.execute(
+            "SELECT p.status FROM tasks p "
+            "JOIN task_links l ON l.parent_id = p.id "
+            "WHERE l.child_id = ?",
+            (task_id,),
+        ).fetchall()
+        target_status = (
+            "ready"
+            if all(parent["status"] in ("done", "archived") for parent in parents)
+            else "todo"
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, result = NULL, completed_at = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "last_heartbeat_at = NULL, current_run_id = NULL, block_kind = NULL, "
+            "block_recurrences = 0, consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ? AND status = 'done'",
+            (target_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        invalidated = conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE status = 'ready' AND id IN "
+            "(SELECT child_id FROM task_links WHERE parent_id = ?)",
+            (task_id,),
+        ).rowcount
+        _append_event(
+            conn,
+            task_id,
+            "reopened",
+            {
+                "reason": reason,
+                "previous_completed_at": row["completed_at"],
+                "previous_result_len": len(row["result"]) if row["result"] else 0,
+                "status": target_status,
+                "invalidated_ready_children": invalidated,
+            },
+        )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
@@ -8219,7 +8310,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'reopened') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()

@@ -39,6 +39,22 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_run_slash_reopen_completed_task(kanban_home):
+    out = kc.run_slash("create 'premature completion' --assignee alice")
+    import re
+    task_id = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    assert "Completed" in kc.run_slash(f"complete {task_id} --result premature")
+
+    reopened = kc.run_slash(
+        f"reopen {task_id} --reason 'implementation contract unmet'"
+    )
+
+    assert f"Reopened {task_id}" in reopened
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.result is None
+
 
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
