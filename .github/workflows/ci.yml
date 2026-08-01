@@ -47,6 +47,7 @@ jobs:
       scan: ${{ steps.classify.outputs.scan }}
       deps: ${{ steps.classify.outputs.deps }}
       npm_lock: ${{ steps.classify.outputs.npm_lock }}
+      nix: ${{ steps.classify.outputs.nix }}
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
@@ -166,6 +167,16 @@ jobs:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
 
+  # Offline Nix build of the flake outputs (.#web, .#tui, .#desktop). Runs on
+  # both the inputs the build depends on: the `frontend` lane (package-lock.json
+  # — the file an incremental `npm install` prunes platform-optional packages
+  # from — plus the web/ui-tui/apps sources) and the `nix` lane (nix/, flake.nix,
+  # flake.lock). See .github/workflows/nix-build.yml for the full rationale.
+  nix-build:
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true' || needs.detect.outputs.nix == 'true'
+    uses: ./.github/workflows/nix-build.yml
+
   # ─────────────────────────────────────────────────────────────────────
   # Live-updating PR review comment.
   #
@@ -270,6 +281,7 @@ jobs:
       - supply-chain
       - review-labels
       - osv-scanner
+      - nix-build
       # comment-live is a polling job — it doesn't block the gate.
       # we don't require docker to pass rn because it's so slow lol
       # - docker

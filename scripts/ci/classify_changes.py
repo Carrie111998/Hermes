@@ -15,6 +15,7 @@ Lanes:
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
 * ``npm_lock``    — semantic package-lock.json diff PR comment.
+* ``nix``         — offline ``nix build .#web .#tui .#desktop``.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
 
 Docker is not a lane — it builds on push-to-main and release only,
@@ -40,6 +41,10 @@ _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
+# Nix flake build inputs — gate the offline `nix build .#web .#tui .#desktop`
+# lane. The importNpmLock build also breaks on a pruned package-lock.json
+# (caught via the frontend lane), so nix-build runs on `frontend OR nix`.
+_NIX = ("nix/", "flake.nix", "flake.lock")
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
 
@@ -106,6 +111,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         "scan": any(_is_scan(f) for f in files),
         "deps": any(f == "pyproject.toml" for f in files),
         "npm_lock": any(f.split("/")[-1] == "package-lock.json" for f in files),
+        "nix": any(f.startswith(_NIX) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
     }
@@ -118,6 +124,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["deps"] = True
         ret["npm_lock"] = True
         ret["ci_review"] = True
+        ret["nix"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret
