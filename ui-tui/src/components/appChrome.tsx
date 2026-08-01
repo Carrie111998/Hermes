@@ -554,6 +554,12 @@ export function StatusRule({
   const showVoice = segs.voice && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
   const showSessionCount = !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
   const showBg = segs.bg && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
+  // Estimated cost for the session (USD). Hidden when zero or included in subscription.
+  const costLabel =
+    usage.cost_usd && usage.cost_usd > 0 && usage.cost_status !== 'included'
+      ? `$${usage.cost_usd < 10 ? usage.cost_usd.toFixed(2) : usage.cost_usd.toFixed(1)}`
+      : ''
+  const showCost = !!costLabel && fits(SEP + stringWidth(costLabel))
   const subagentCount = typeof usage.active_subagents === 'number' ? usage.active_subagents : 0
   const showSubagents = segs.subagents && subagentCount > 0 && fits(SEP + stringWidth(`⛓ ${subagentCount}`))
 
@@ -688,6 +694,12 @@ export function StatusRule({
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
             {bgCount} bg
+          </Text>
+        ) : null}
+        {showCost ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {costLabel}
           </Text>
         ) : null}
         {showSubagents ? (

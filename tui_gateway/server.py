@@ -4727,6 +4727,19 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    # Session cost tracking — populated from the agent's running accumulator
+    if agent is not None:
+        cost = getattr(agent, "session_estimated_cost_usd", 0) or 0
+        if cost > 0:
+            # Respect display.show_cost config gate
+            try:
+                from hermes_cli.config import load_config
+                show = (load_config().get("display") or {}).get("show_cost", False)
+            except Exception:
+                show = False
+            if show:
+                usage["cost_usd"] = cost
+        usage["cost_status"] = getattr(agent, "session_cost_status", "unknown") or "unknown"
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.

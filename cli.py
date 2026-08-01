@@ -4263,6 +4263,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", True)
+        # show_cost: display $ cost in the status bar
+        self.show_cost = CLI_CONFIG["display"].get("show_cost", False)
         # reasoning_full: when reasoning display is on, print the post-response
         # recap box uncollapsed instead of clamping to the first 10 lines.
         self.reasoning_full = CLI_CONFIG["display"].get("reasoning_full", False)
@@ -5335,6 +5337,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
 
+        # Session cost
+        cost = getattr(agent, "session_estimated_cost_usd", 0) or 0
+        snapshot["cost_usd"] = cost if cost > 0 else 0
+        snapshot["cost_status"] = getattr(agent, "session_cost_status", "unknown") or "unknown"
+
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
             # last_prompt_tokens is parked at the -1 sentinel right after a
@@ -5886,8 +5893,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
+            cost_usd = snapshot.get("cost_usd", 0)
+            cost_label = (
+                f"${cost_usd:.2f}"
+                if cost_usd > 0 and getattr(self, "show_cost", False)
+                else ""
+            )
+            cost_part = f" {cost_label}" if cost_label else ""
             if width < 52:
-                text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                text = f"{battery_prefix}⚕ {snapshot['model_short']}{cost_part} · {duration_label}"
                 if goal_segment:
                     text += f" · {goal_segment}"
                 if focus_label:
@@ -5913,6 +5927,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     parts.append(f"⛓ {bg_subagent_count}")
                 if goal_segment:
                     parts.append(goal_segment)
+                if cost_label:
+                    parts.append(cost_label)
                 parts.append(duration_label)
                 if focus_label:
                     parts.append(focus_label)
@@ -5944,6 +5960,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(f"⛓ {bg_subagent_count}")
             if goal_segment:
                 parts.append(goal_segment)
+            if cost_label:
+                parts.append(cost_label)
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -5976,14 +5994,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
+            cost_usd = snapshot.get("cost_usd", 0)
+            cost_label = (
+                f"${cost_usd:.2f}"
+                if cost_usd > 0 and getattr(self, "show_cost", False)
+                else ""
+            )
 
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                ]
+                if cost_label:
+                    frags.append(("class:status-bar-dim", f" {cost_label}"))
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
-                ]
+                ])
                 if goal_segment:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-strong", goal_segment))
@@ -6023,6 +6051,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if goal_segment:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", goal_segment))
+                    if cost_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-dim", cost_label))
                     frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
@@ -6072,6 +6103,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if goal_segment:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", goal_segment))
+                    if cost_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-dim", cost_label))
                     frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
