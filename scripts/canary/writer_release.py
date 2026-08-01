@@ -68,6 +68,7 @@ BUILD_SCRATCH_NAME = ".release-build-scratch"
 SCRATCH_PROVENANCE_NAME = "provenance.json"
 SCRATCH_PROVENANCE_SCHEMA = "muncho-writer-release-scratch.v1"
 BUILD_CONSTRAINTS_RELATIVE_PATH = Path("scripts/canary/writer-build-constraints.txt")
+UV_PROJECT_CONFIG_RELATIVE_PATH = Path("scripts/canary/writer-uv.toml")
 DEFAULT_UV_CACHE = Path("/var/cache/muncho-writer-release")
 # Exact currently supported 3.11 security release.  The release builder never
 # falls back to an older interpreter when this managed runtime is unavailable.
@@ -156,6 +157,7 @@ CANONICAL_WRITER_SCHEMA_RECONCILIATION_CONTROL_SQL_RELATIVE_PATHS = (
 )
 RUNTIME_DEPENDENCY_LOCK_RELATIVE_PATHS = (
     Path("pyproject.toml"),
+    UV_PROJECT_CONFIG_RELATIVE_PATH,
     Path("uv.lock"),
     Path("package.json"),
     Path("package-lock.json"),
@@ -641,7 +643,8 @@ def install_commands(
                 "--no-python-downloads",
                 "--project",
                 project,
-                "--no-config",
+                "--config-file",
+                str(spec.build_project_root / UV_PROJECT_CONFIG_RELATIVE_PATH),
             ),
             env=clean,
         ),
@@ -790,7 +793,11 @@ def verify_clean_checkout(
     source_stat = os.lstat(spec.source_root)
     if not stat.S_ISDIR(source_stat.st_mode) or stat.S_ISLNK(source_stat.st_mode):
         raise ValueError("release source must be a real directory")
-    for required in (spec.source_root / "pyproject.toml", spec.source_root / "uv.lock"):
+    for required in (
+        spec.source_root / "pyproject.toml",
+        spec.source_root / UV_PROJECT_CONFIG_RELATIVE_PATH,
+        spec.source_root / "uv.lock",
+    ):
         item = os.lstat(required)
         if not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode):
             raise ValueError("release source lacks an exact project lock input")
@@ -3940,6 +3947,7 @@ __all__ = [
     "STOPPED_RELEASE_FAILURE_SCHEMA",
     "STOPPED_RELEASE_PLAN_SCHEMA",
     "STOPPED_RELEASE_RECEIPT_SCHEMA",
+    "UV_PROJECT_CONFIG_RELATIVE_PATH",
     "ReleaseBuildSpec",
     "ReleaseManifest",
     "SystemdUnitBundle",
