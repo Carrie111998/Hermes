@@ -933,6 +933,7 @@ describe('resumeSession failure recovery', () => {
             branch: '',
             busy: false,
             cwd: '',
+            failed: false,
             fast: false,
             interimBoundaryPending: false,
             interrupted: false,

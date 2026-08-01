@@ -47,44 +47,33 @@ interface CachedPetInfo {
 export interface PetActivity {
   busy?: boolean
   awaitingInput?: boolean
-  toolRunning?: boolean
-  reasoning?: boolean
   error?: boolean
-  justCompleted?: boolean
+  ready?: boolean
   celebrate?: boolean
 }
 
 /**
- * Resolve the animation state from coarse activity signals.
+ * Resolve the animation state from app-global session activity.
  *
- * Priority (highest first) mirrors `agent.pet.state.derive_pet_state`:
- * error → celebrate → justCompleted → awaitingInput → toolRunning → reasoning →
- * busy → idle. `awaitingInput` (a clarify/approval blocking on the user) outranks
- * the in-flight signals because the turn is paused on you, not working.
+ * Session priority mirrors Codex Desktop: needs input → failed → ready →
+ * running → idle. A direct pet reaction (`celebrate`) remains a transient beat
+ * below actionable states, so it cannot hide a session that needs attention.
  */
 export function derivePetState(activity: PetActivity): PetState {
-  if (activity.error) {
-    return 'failed'
-  }
-
-  if (activity.celebrate) {
-    return 'jump'
-  }
-
-  if (activity.justCompleted) {
-    return 'wave'
-  }
-
   if (activity.awaitingInput) {
     return 'waiting'
   }
 
-  if (activity.toolRunning) {
-    return 'run'
+  if (activity.error) {
+    return 'failed'
   }
 
-  if (activity.reasoning) {
+  if (activity.ready) {
     return 'review'
+  }
+
+  if (activity.celebrate) {
+    return 'jump'
   }
 
   if (activity.busy) {
@@ -92,6 +81,23 @@ export function derivePetState(activity: PetActivity): PetState {
   }
 
   return 'idle'
+}
+
+export interface PetSessionActivitySets {
+  attentionSessionIds: readonly string[]
+  failedSessionIds: readonly string[]
+  unreadFinishedSessionIds: readonly string[]
+  workingSessionIds: readonly string[]
+}
+
+/** Collapse every live conversation into the one activity the global pet shows. */
+export function deriveSessionPetActivity(sets: PetSessionActivitySets): PetActivity {
+  return {
+    awaitingInput: sets.attentionSessionIds.length > 0,
+    busy: sets.workingSessionIds.length > 0,
+    error: sets.failedSessionIds.length > 0,
+    ready: sets.unreadFinishedSessionIds.length > 0
+  }
 }
 
 // The full spritesheet normally arrives only after the gateway is ready. Keep
@@ -156,22 +162,16 @@ export const $petUnread = atom(false)
 export const markPetUnread = () => $petUnread.set(true)
 export const clearPetUnread = () => $petUnread.set(false)
 
-/** Steady activity flags (toolRunning / reasoning) set + cleared by the stream. */
+/** Update the app-global activity mirrored to both in-window and overlay pets. */
 export const setPetActivity = (next: Partial<PetActivity>) => $petActivity.set({ ...$petActivity.get(), ...next })
 
 let flashTimer: ReturnType<typeof setTimeout> | undefined
 
-/** Fire a transient reaction beat (error / celebrate / justCompleted) that
- *  decays back to the steady state after `ms`.
- *
- *  Each beat first clears its siblings so a stale one can't win the priority
- *  race: without this, a completion beat (`celebrate`) would merge on top of a
- *  lingering `error`, and `derivePetState` checks `error` first — so a clean
- *  finish would render the sad/failed pose. */
+/** Fire a transient direct-reaction beat that decays to session activity. */
 export const flashPetActivity = (next: Partial<PetActivity>, ms = 1600) => {
-  setPetActivity({ celebrate: false, error: false, justCompleted: false, ...next })
+  setPetActivity({ celebrate: false, ...next })
   clearTimeout(flashTimer)
-  flashTimer = setTimeout(() => setPetActivity({ celebrate: false, error: false, justCompleted: false }), ms)
+  flashTimer = setTimeout(() => setPetActivity({ celebrate: false }), ms)
 }
 
 export const setPetInfo = (info: PetInfo) => $petInfo.set(info)
@@ -186,10 +186,8 @@ export const cachePetInfo = (info: PetInfo) => {
  * Resolve the live activity state from the dedicated activity atom, falling back
  * to the always-present `$busy` chat signal so the pet reacts out of the box.
  *
- * `awaitingInput` (a clarify/approval blocking on the user) is an explicit flag
- * on `$petActivity` — set by the controller from `$attentionSessionIds` and
- * mirrored to the pop-out overlay through the same atom, so both surfaces agree
- * without the overlay needing the session list.
+ * The primary renderer resolves all sessions into `$petActivity`, then mirrors
+ * that atom to the gateway-less pop-out overlay so both surfaces agree.
  */
 function deriveLivePetState(activity: PetActivity, busy: boolean): PetState {
   const live = activity.busy ?? busy
@@ -197,12 +195,8 @@ function deriveLivePetState(activity: PetActivity, busy: boolean): PetState {
   return derivePetState({
     busy: live,
     awaitingInput: activity.awaitingInput,
-    // Steady flags only count mid-turn — ignore stale ones once at rest so an
-    // interrupted turn can't pin the pet on `run`/`review`.
-    toolRunning: live && activity.toolRunning,
-    reasoning: live && activity.reasoning,
     error: activity.error,
-    justCompleted: activity.justCompleted,
+    ready: activity.ready,
     celebrate: activity.celebrate
   })
 }

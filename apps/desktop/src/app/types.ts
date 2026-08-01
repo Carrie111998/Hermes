@@ -184,6 +184,8 @@ export interface ClientSessionState {
   yolo: boolean
   personality: string
   busy: boolean
+  /** The most recent turn ended in an error. Cleared when a new turn starts. */
+  failed: boolean
   awaitingResponse: boolean
   streamId: string | null
   sawAssistantPayload: boolean

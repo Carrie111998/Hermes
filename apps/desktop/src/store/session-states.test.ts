@@ -3,18 +3,40 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
+  $failedSessionIds,
   blankDraftTile,
+  clearAllSessionStates,
   focusedSessionNeedsRoute,
   markSelectionRestore,
   orderTilesByTree,
+  publishSessionState,
   selectionHomesToWorkspace
 } from '@/store/session-states'
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
+
+describe('failed session projection', () => {
+  afterEach(() => clearAllSessionStates())
+
+  it('tracks failures across runtimes without emitting again for unrelated updates', () => {
+    const failed = { ...createClientSessionState('stored-a'), failed: true }
+    publishSessionState('runtime-a', failed)
+
+    const first = $failedSessionIds.get()
+    expect(first).toEqual(['runtime-a'])
+
+    publishSessionState('runtime-a', { ...failed, cwd: '/next' })
+    expect($failedSessionIds.get()).toBe(first)
+
+    publishSessionState('runtime-a', { ...failed, busy: true, failed: false })
+    expect($failedSessionIds.get()).toEqual([])
+  })
+})
 
 describe('orderTilesByTree', () => {
   it('no-ops (null) without a tree or below two tiles', () => {
