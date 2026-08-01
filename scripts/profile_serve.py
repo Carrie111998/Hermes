@@ -13,18 +13,31 @@ Two front doors, one engine (`<profile> chat -q <task>`):
   (c) POST /v1/chat/completions     OpenAI-shaped, model=profile -> OpenAI-shaped
       GET  /v1/models               lists the served profiles
 
-ALLOWLIST: only profiles in AGENT_ALLOWLIST can be brought up, and each carries
-the kernel tool-groups it may call back into (enforced kernel-side via the
-X-Agent header the run_agent tool sets). A profile not on the list is 403 — the
-gate is closed by default, not open.
+GATE (the "clean shape", 2026-08-01):
+  1. Single-homed bind — we bind THIS container's ai-shared address (172.x), not
+     0.0.0.0. hermes is multi-homed (ai-shared + a tailnet iface); 0.0.0.0 would
+     start answering on the tailnet the moment the node signs in — an unauthed
+     hole that opens on login. Pinning the 172.x means growing an interface can
+     never expose the runtime. Fail-closed: if no safe address is found we refuse
+     to start rather than fall back to all-interfaces.
+  2. Bearer token — POST endpoints require `Authorization: Bearer $PROFILE_SERVE_TOKEN`.
+     This is a SEPARATE secret from FRIDAY_API_KEY (the kernel's front-door key):
+     east-west, single-holder (only the kernel), rotatable on its own. No token
+     configured => everything is refused (closed by default). Because only the
+     kernel holds the token, an authenticated request's X-Allowed-Groups is
+     trustworthy without extra signing — forging it needs BOTH the 172.x net AND
+     the token.
+  3. ALLOWLIST — only profiles in AGENT_ALLOWLIST can be brought up, each carrying
+     the kernel tool-groups it may call back into. Off the list => 403.
 
-Runs INSIDE hermes-trainman-alpha on ai-shared (bind 0.0.0.0 is safe: the network
-is internal/tailnet-gated, no host publish). Stdlib only — no pip in the image.
+Stdlib only — no pip in the image.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import socket
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -35,6 +48,46 @@ HERMES_SHIM = "/opt/hermes/bin/hermes"
 PORT = int(os.environ.get("PROFILE_SERVE_PORT", "8642"))
 MAX_TURNS = int(os.environ.get("PROFILE_SERVE_MAX_TURNS", "40"))
 TIMEOUT = int(os.environ.get("PROFILE_SERVE_TIMEOUT", "540"))
+
+# East-west bearer secret (gate #2). Shared ONLY with the kernel via friday-secrets
+# (kernel.env + hermes.env). Distinct from FRIDAY_API_KEY. Empty => fail closed.
+TOKEN = os.environ.get("PROFILE_SERVE_TOKEN", "").strip()
+
+# ai-shared subnet prefix used to pick our bind address when PROFILE_SERVE_BIND is
+# not set. Docker's bridge subnet is 172.x; the tailnet is 100.64/10 (CGNAT) — we
+# never want that one. Override the prefix if the ai-shared subnet ever changes.
+NET_PREFIX = os.environ.get("PROFILE_SERVE_NET_PREFIX", "172.").strip()
+
+
+def resolve_bind() -> str:
+    """Pick the ai-shared (172.x) address to bind. Never 0.0.0.0, never the tailnet.
+
+    Explicit PROFILE_SERVE_BIND wins (and is validated). Otherwise we take the
+    container's own addresses and keep the one on the ai-shared subnet. Binding a
+    specific address means we physically cannot answer on any other interface the
+    container grows later (tailnet, a second net) — single-homed by construction.
+    Fail closed: no safe address => refuse to start (do NOT fall back to 0.0.0.0).
+    """
+    explicit = os.environ.get("PROFILE_SERVE_BIND", "").strip()
+    if explicit:
+        if explicit in ("0.0.0.0", "::", "") or explicit.startswith("127."):
+            raise SystemExit(
+                f"profile-serve: refusing PROFILE_SERVE_BIND={explicit!r} — must be a "
+                f"specific ai-shared address, never all-interfaces/loopback.")
+        return explicit
+    candidates = set()
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            candidates.add(res[4][0])
+    except socket.gaierror:
+        pass
+    for ip in sorted(candidates):
+        if ip.startswith(NET_PREFIX) and not ip.startswith("127."):
+            return ip
+    raise SystemExit(
+        f"profile-serve: refusing to start — no ai-shared address matching prefix "
+        f"{NET_PREFIX!r} found (candidates={sorted(candidates) or 'none'}). Set "
+        f"PROFILE_SERVE_BIND explicitly. Will NOT fall back to 0.0.0.0.")
 
 # Agent tool-group allowlist. Key = profile/agent; value = kernel tool GROUPS it
 # may call back into (matches fridai/kernel/tool_groups.py). The kernel enforces
@@ -92,15 +145,30 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("body too large")
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _authed(self) -> bool:
+        """Bearer gate (#2). Fail closed: no configured token => refuse. Constant-time."""
+        if not TOKEN:
+            return False
+        got = self.headers.get("Authorization", "")
+        if not got.startswith("Bearer "):
+            return False
+        return hmac.compare_digest(got[7:].strip(), TOKEN)
+
     def do_GET(self):
+        # /health stays open for liveness probes but leaks nothing (no roster).
         if self.path.rstrip("/") == "/health":
-            return self._send(200, {"status": "ok", "agents": sorted(AGENT_ALLOWLIST)})
+            return self._send(200, {"status": "ok"})
+        # Listing the served profiles reveals the roster — require auth.
         if self.path.rstrip("/") == "/v1/models":
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
             return self._send(200, {"object": "list", "data": [
                 {"id": a, "object": "model", "owned_by": "hermes"} for a in sorted(AGENT_ALLOWLIST)]})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._authed():
+            return self._send(401, {"error": "unauthorized"})
         try:
             data = self._body()
         except Exception as e:
@@ -132,5 +200,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"profile-serve on :{PORT} — agents: {sorted(AGENT_ALLOWLIST)}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    bind = resolve_bind()  # fail-closed; raises SystemExit if no safe address
+    gate = "bearer=on" if TOKEN else "bearer=OFF(fail-closed: all POSTs 401)"
+    print(f"profile-serve on {bind}:{PORT} [{gate}] — agents: {sorted(AGENT_ALLOWLIST)}",
+          flush=True)
+    if not TOKEN:
+        print("profile-serve: WARNING — PROFILE_SERVE_TOKEN unset; refusing every "
+              "authenticated request until it is provided in hermes.env.", flush=True)
+    ThreadingHTTPServer((bind, PORT), Handler).serve_forever()
