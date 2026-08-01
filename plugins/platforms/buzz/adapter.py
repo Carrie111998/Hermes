@@ -23,17 +23,19 @@ Configuration in config.yaml::
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             poll_interval: 4           # seconds between poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
-            credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
+            credentials_file: ""       # JSON file holding the nsec (fallback for
+                                       #   BUZZ_PRIVATE_KEY) and, optionally, the
+                                       #   NIP-OA auth_tag (fallback for BUZZ_AUTH_TAG)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_AUTH_TAG
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
-``~/.hermes/.env``.  It is passed to the CLI via the subprocess
-environment and is never logged.
+``~/.hermes/.env``.  It, and the optional NIP-OA BUZZ_AUTH_TAG, are passed
+to the CLI via the subprocess environment and are never logged.
 """
 
 import asyncio
@@ -46,7 +48,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -83,9 +85,37 @@ _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 
-# Where to look for a credentials JSON (keys: nsec / private_key_hex) when
-# BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
+# Where to look for a credentials JSON (keys: nsec / private_key_hex /
+# auth_tag) when BUZZ_PRIVATE_KEY / BUZZ_AUTH_TAG are not set.  Module-level
+# so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
+
+# The only non-BUZZ_* parent environment variables the buzz CLI subprocess
+# inherits (when set): enough to find the binary, a home/temp directory, a
+# locale, and the system trust store for its TLS connection to the relay.
+# The second block is the Windows spelling of exactly those runtime facts —
+# a process spawned there without SystemRoot/USERPROFILE/TEMP has no system
+# directory, home, or temp dir at all.  Every name here is a path/locale
+# setting, never a credential.  See _cli_environment().
+_CLI_SAFE_ENV_KEYS = frozenset({
+    "PATH",
+    "HOME",
+    "USER",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+})
 
 
 def _load_nostr_auth():
@@ -221,14 +251,18 @@ def _resolve_cli_path(configured: str = "") -> str:
     return str(fallback) if fallback.is_file() else ""
 
 
-def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: env first, then a credentials JSON.
+def _credentials_documents(extra: Optional[dict] = None):
+    """Yield the parsed credentials JSON objects, in selection order.
 
-    NEVER log the return value.
+    One candidate list serves every credential a file can carry (private key,
+    NIP-OA auth tag): the configured path (BUZZ_CREDENTIALS_FILE or
+    ``credentials_file``, ``~`` expanded), else the auto-discovered
+    ``~/.config/buzz/*credentials*.json``.  A configured file is therefore the
+    single source for both; with auto-discovery each credential takes the
+    first candidate that provides it.  Unreadable, malformed, or non-object
+    files are skipped silently — their contents are never logged or surfaced
+    in an error.
     """
-    key = os.getenv("BUZZ_PRIVATE_KEY", "").strip()
-    if key:
-        return key
     configured = os.getenv("BUZZ_CREDENTIALS_FILE", "").strip() or (extra or {}).get("credentials_file", "")
     if configured:
         candidates = [Path(configured).expanduser()]
@@ -242,13 +276,70 @@ def _resolve_private_key(extra: Optional[dict] = None) -> str:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(data, dict):
-            continue
+        if isinstance(data, dict):
+            yield data
+
+
+def _resolve_private_key(extra: Optional[dict] = None) -> str:
+    """Resolve the Nostr private key: env first, then a credentials JSON.
+
+    NEVER log the return value.
+    """
+    key = os.getenv("BUZZ_PRIVATE_KEY", "").strip()
+    if key:
+        return key
+    for data in _credentials_documents(extra):
         for field in ("nsec", "private_key_hex", "private_key"):
             value = data.get(field)
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return ""
+
+
+def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
+    """Resolve the NIP-OA owner-attestation auth tag JSON.
+
+    Same precedence as the private key: a non-empty BUZZ_AUTH_TAG, else the
+    ``auth_tag`` field of the selected credentials JSON.  Only a non-blank
+    string value counts; anything else resolves to "" so a malformed file
+    degrades to "no attestation" instead of breaking the handshake with a
+    value the signer cannot use.  NEVER log the return value.
+    """
+    tag = os.getenv("BUZZ_AUTH_TAG", "").strip()
+    if tag:
+        return tag
+    for data in _credentials_documents(extra):
+        value = data.get("auth_tag")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _cli_environment(*, relay_url: str, private_key: str, auth_tag: str) -> Dict[str, str]:
+    """Build the environment the buzz CLI subprocess runs with.
+
+    The CLI gets a deliberately narrow slice of this process's environment
+    rather than a copy of all of it: the runtime keys in
+    ``_CLI_SAFE_ENV_KEYS`` that are actually set, plus the parent's own
+    ``BUZZ_*`` settings (relay/channel/transport config a user exported).
+    Everything else — other providers' API keys, Hermes internals — never
+    reaches a subprocess that talks to a third-party relay.
+
+    The call's own relay URL and credentials are layered on top, so a
+    resolved value always wins over an inherited one.  NEVER log the result.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CLI_SAFE_ENV_KEYS or key.startswith("BUZZ_")
+    }
+    env["BUZZ_RELAY_URL"] = relay_url
+    env["BUZZ_PRIVATE_KEY"] = private_key
+    # Only export a resolved tag; an empty one must not clobber whatever the
+    # parent environment already provides.
+    if auth_tag:
+        env["BUZZ_AUTH_TAG"] = auth_tag
+    return env
 
 
 async def _exec_buzz(
@@ -257,18 +348,19 @@ async def _exec_buzz(
     *,
     relay_url: str,
     private_key: str,
+    auth_tag: str = "",
     input_text: Optional[str] = None,
     timeout: float = _CLI_TIMEOUT,
 ) -> Tuple[int, str, str]:
     """Run the buzz CLI with an argument list (never a shell) and return
     ``(returncode, stdout, stderr)``.
 
-    The private key travels via the subprocess environment only — it never
-    appears in argv, so process listings and error logs stay clean.
+    The private key and the NIP-OA auth tag travel via the subprocess
+    environment only — they never appear in argv, so process listings and
+    error logs stay clean.  That environment is a narrow allowlist rather
+    than a copy of this process's (see _cli_environment).
     """
-    env = os.environ.copy()
-    env["BUZZ_RELAY_URL"] = relay_url
-    env["BUZZ_PRIVATE_KEY"] = private_key
+    env = _cli_environment(relay_url=relay_url, private_key=private_key, auth_tag=auth_tag)
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
@@ -307,6 +399,25 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     except ValueError:
         pass
     return text or f"buzz CLI failed with exit code {returncode}"
+
+
+def _membership_conversation_id(event: dict) -> Optional[str]:
+    """The conversation a kind-44100 membership event names.
+
+    Buzz identifies a conversation with an ``h`` tag — the same tag its chat
+    messages carry and its subscriptions filter on.  Returns None when the
+    event names no conversation, or names more than one: neither is a shape
+    the relay is known to emit, and DM classification fails closed on both.
+    """
+    tags = event.get("tags")
+    if not isinstance(tags, list):
+        return None
+    ids = {
+        str(tag[1]).strip()
+        for tag in tags
+        if isinstance(tag, (list, tuple)) and len(tag) > 1 and tag[0] == "h" and str(tag[1]).strip()
+    }
+    return ids.pop() if len(ids) == 1 else None
 
 
 def _parse_json_list(stdout: str) -> List[dict]:
@@ -387,10 +498,12 @@ class BuzzAdapter(BasePlatformAdapter):
             if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
         }
 
-        # Secret — resolved lazily (never at import/registration time and
-        # never logged).  connect() re-resolves it to fail fast with a clear
-        # error when it is missing.
+        # Secrets — resolved lazily (never at import/registration time and
+        # never logged).  connect() re-resolves them to fail fast with a clear
+        # error when the key is missing.  The auth tag is optional and shares
+        # the private key's resolution, so one credentials file serves both.
         self._private_key: str = ""
+        self._auth_tag: str = ""
 
         # Identity — filled in by connect() from ``buzz users get``
         self._self_pubkey: str = ""
@@ -419,14 +532,21 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
+    def _resolve_credentials(self) -> None:
+        """Resolve the private key and the NIP-OA auth tag together, off the
+        same credentials-file selection.  Never logged."""
+        self._private_key = _resolve_private_key(self._extra)
+        self._auth_tag = _resolve_auth_tag(self._extra)
+
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
         if not self._private_key:
-            self._private_key = _resolve_private_key(self._extra)
+            self._resolve_credentials()
         return await _exec_buzz(
             self.cli_path,
             args,
             relay_url=self.relay_url,
             private_key=self._private_key,
+            auth_tag=self._auth_tag,
             input_text=input_text,
         )
 
@@ -442,7 +562,7 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.error("Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)")
             self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=False)
             return False
-        self._private_key = _resolve_private_key(self._extra)
+        self._resolve_credentials()
         if not self._private_key:
             logger.error("Buzz: no private key (set BUZZ_PRIVATE_KEY or a credentials file)")
             self._set_fatal_error("config_missing", "BUZZ_PRIVATE_KEY must be set", retryable=False)
@@ -738,8 +858,9 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _authenticate_websocket(self, websocket) -> None:
         """NIP-42: wait for the relay's AUTH challenge, answer with a signed
-        kind-22242 event (plus the optional NIP-OA owner-attestation tag from
-        BUZZ_AUTH_TAG), and wait for the OK acknowledgment."""
+        kind-22242 event (plus the optional NIP-OA owner-attestation tag
+        resolved from BUZZ_AUTH_TAG or the credentials file), and wait for the
+        OK acknowledgment."""
         build_auth_event = _load_nostr_auth().build_auth_event
 
         raw = await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT)
@@ -750,7 +871,7 @@ class BuzzAdapter(BasePlatformAdapter):
             private_key=self._private_key,
             challenge=str(message[1]),
             relay_url=self._websocket_url(),
-            auth_tag_json=os.getenv("BUZZ_AUTH_TAG", ""),
+            auth_tag_json=self._auth_tag,
         )
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
@@ -800,10 +921,17 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
         """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
+        subscribe to any new ones (fresh DMs dispatch from their beginning).
+
+        The frame arrived on the NIP-42-authenticated subscription filtered
+        to ``#p`` = our own pubkey, so it is addressed to this agent; the
+        conversation it names is passed to _discover_dms as the only
+        candidate for immediate DM classification (see "DM classification"
+        below for what the event does and does not prove).
+        """
         self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
         before = set(self._channel_state)
-        await self._discover_dms(seed=False)
+        await self._discover_dms(seed=False, membership_id=_membership_conversation_id(event))
         for channel_id in self._channel_state:
             if channel_id in before:
                 continue
@@ -921,7 +1049,7 @@ class BuzzAdapter(BasePlatformAdapter):
             self._maybe_latch_dm(channel_id, state, event)
         self._trim_seen(state)
 
-    async def _discover_dms(self, *, seed: bool) -> None:
+    async def _discover_dms(self, *, seed: bool, membership_id: Optional[str] = None) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
         beginning (a fresh conversation has no history worth suppressing);
         ones present at startup are seeded like channels.
@@ -933,6 +1061,13 @@ class BuzzAdapter(BasePlatformAdapter):
         finds are watched as ``group`` and latch to ``dm`` via p-tag
         detection (_is_direct_message_event) rather than trusting the name
         alone to unlock the mention-free DM path.
+
+        ``membership_id`` is set ONLY by _handle_membership_event — the one
+        conversation a kind-44100 membership event addressed to us named.  If
+        that exact conversation's metadata is DM-shaped, it is classified
+        ``dm`` right away, because some hosted relays never p-tag the messages
+        inside a DM (see _is_hosted_dm_metadata).  Every other find stays
+        ``group``.
         """
         code, out, _err = await self._run_cli(["dms", "list"])
         if code == 0:
@@ -955,12 +1090,22 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
+            hosted_dm = ch_id == membership_id and self._is_hosted_dm_metadata(ch_id)
+            if ch_id in self._channel_state:
+                # Already watched (startup seeding or an earlier sweep saw it
+                # before the membership event arrived): the same two facts
+                # still classify it, they just cannot create the state entry.
+                if hosted_dm:
+                    self._latch_hosted_dm(ch_id, self._channel_state[ch_id])
+                continue
+            if not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")
             else:
                 self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+            if hosted_dm:
+                self._latch_hosted_dm(ch_id, self._channel_state[ch_id])
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
@@ -1059,6 +1204,33 @@ class BuzzAdapter(BasePlatformAdapter):
     # "DM" with an empty description.  Nothing is lost while unlatched: a
     # DM message that DOES mention us dispatches through the mention gate
     # anyway, so the latch flips exactly on the first message that needs it.
+    #
+    # One relay shape defeats the p-tag latch entirely: on some hosted relays
+    # the other party's kind-9 messages inside a DM carry ONLY
+    # ["h", <dm id>] — no p-tag ever arrives, so an un-mentioned DM stays
+    # stuck behind the channel mention gate forever.  For those,
+    # classification comes from the discovery path instead, and it takes two
+    # independent facts:
+    #
+    #   * a kind-44100 membership event, delivered on the NIP-42-authenticated
+    #     subscription filtered ``#p`` = our own pubkey, NAMES the conversation
+    #     (one ``h`` tag).  This is what the event contributes: it is addressed
+    #     to us and it points at exactly one conversation.  It is not proof of
+    #     membership on its own — the event is signed by whoever published it,
+    #     not by us — so it never classifies anything by itself;
+    #   * that same conversation is present in OUR OWN authenticated
+    #     ``channels list`` with the hosted-DM shape (name "DM", no
+    #     description, untyped, not operator-configured).  The listing is the
+    #     membership evidence: the relay only lists conversations this
+    #     identity belongs to.
+    #
+    # Both together classify a DM; neither half does so alone, and everything
+    # else fails closed — an event naming no conversation (or several) promotes
+    # nothing, an unauthenticated poll sweep or startup listing never promotes
+    # anything, and a typed / described / configured channel is excluded.
+    # A real channel that is genuinely named "DM", untyped and undescribed
+    # remains indistinguishable from a materialized DM by design; the operator
+    # can pin it via the configured `channels` list.
 
     def _may_reclassify_as_dm(self, channel_id: str) -> bool:
         """True when the conversation's metadata does not rule out a DM.
@@ -1074,6 +1246,44 @@ class BuzzAdapter(BasePlatformAdapter):
         name = str(meta.get("name") or "").strip()
         description = str(meta.get("description") or "").strip()
         return name == "DM" and not description
+
+    def _is_hosted_dm_metadata(self, channel_id: str) -> bool:
+        """True when ``channels list`` describes this conversation as a
+        relay-materialized DM rather than a community channel.
+
+        Stricter than _may_reclassify_as_dm, because this is the predicate
+        that (together with an authenticated membership event) unlocks the
+        mention-free DM path outright instead of merely allowing a p-tagged
+        message to do it:  the entry must match the observed hosted-DM shape
+        exactly — named "DM", no description, and no channel_type field at
+        all (the relay types real channels and leaves materialized DMs
+        untyped) — and must not be a channel the operator asked to watch.
+        Any other channel_type value, known or not, fails closed.
+        """
+        meta = self._channel_meta.get(channel_id)
+        if not isinstance(meta, dict) or channel_id in self.channels:
+            return False
+        name = str(meta.get("name") or "").strip()
+        description = str(meta.get("description") or "").strip()
+        channel_type = str(meta.get("channel_type") or "").strip()
+        return name == "DM" and not description and not channel_type
+
+    def _latch_hosted_dm(self, channel_id: str, state: dict) -> None:
+        """Classify a watched conversation as a DM once a membership event
+        named it and its ``channels list`` entry has the hosted-DM shape.
+
+        Applies whether the conversation was discovered in the same pass or
+        was already being watched as ``group`` (startup seeding, or a poll
+        sweep that ran before the membership event arrived) — the two facts
+        that classify it do not depend on when it was first seen.
+        """
+        if state["chat_type"] == "dm":
+            return
+        state["chat_type"] = "dm"
+        logger.info(
+            "Buzz: conversation %s classified as DM (membership event + DM-shaped listing)",
+            channel_id,
+        )
 
     def _is_direct_message_event(self, channel_id: str, event: dict) -> bool:
         """True when ``event`` is shaped like a direct message to us: a chat
@@ -1338,7 +1548,7 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List[Union[str, Tuple[str, bool]]]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
     """One-shot send without a live adapter (out-of-process cron delivery).
@@ -1350,6 +1560,7 @@ async def _standalone_send(
     extra = getattr(pconfig, "extra", {}) or {}
     relay = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
     private_key = _resolve_private_key(extra)
+    auth_tag = _resolve_auth_tag(extra)
     cli_path = _resolve_cli_path(
         os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
     )
@@ -1364,11 +1575,24 @@ async def _standalone_send(
     args = ["messages", "send", "--channel", target, "--content", "-"]
     if thread_id:
         args += ["--reply-to", str(thread_id)]
-    for path in media_files or []:
+    for entry in media_files or []:
+        # Both out-of-process callers (cron/scheduler.py and
+        # tools/send_message_tool.py) build media_files with the core
+        # (path, is_voice) contract — BasePlatformAdapter.extract_media +
+        # filter_media_delivery_paths.  Buzz attaches every file the same
+        # way, so only the path is used; stringifying the pair itself would
+        # hand the CLI an unopenable path.  A bare string is still accepted
+        # for callers that never adopted the pair contract.
+        path = entry[0] if isinstance(entry, (list, tuple)) else entry
         args += ["--file", str(path)]
     try:
         code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+            cli_path,
+            args,
+            relay_url=relay,
+            private_key=private_key,
+            auth_tag=auth_tag,
+            input_text=message,
         )
     except asyncio.CancelledError:
         raise
