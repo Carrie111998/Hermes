@@ -115,6 +115,36 @@ jobs:
           # build script then runs vite + bundles the Electron main process.
           command: npm ci --ignore-scripts
 
+      # Teknium review (#76240): the publish target must BE the triggering
+      # release. electron-publish computes its target tag as
+      # `githubTagPrefix(info) + version` (gitHubPublisher.js:38 +
+      # publishOptions.js githubTagPrefix), i.e. it derives the tag from the
+      # app version — but this repo tags releases CALENDAR-versioned
+      # (`v2026.7.30`) while the app package.json carries a SEMVER
+      # (`0.19.1`, and it even drifts — main currently says 0.17.0). Passing
+      # the semver alone would publish to a nonexistent `v0.19.1` tag.
+      #
+      # The single contract that resolves it: force the publish tag to equal
+      # the triggering release's tag via `tagNamePrefix` + version. For a
+      # `v2026.7.30` release we set tagNamePrefix="" and version=2026.7.30, so
+      # the computed tag is exactly the release that fired the workflow —
+      # independent of any package.json semver drift.
+      - name: Resolve release tag for publishing
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          # Strip a leading "v" from the triggering tag to get the version
+          # electron-publish should append after our (empty) tagNamePrefix.
+          TAG="$RELEASE_TAG"
+          VER="${TAG#v}"
+          if [ -z "$VER" ]; then
+            echo "::error::could not derive a publish version from tag '$TAG'"
+            exit 1
+          fi
+          echo "Publishing to triggering release tag: $TAG (version: $VER)"
+          echo "semver=$VER" >> "$GITHUB_OUTPUT"
+
       - name: Build + publish desktop app
         working-directory: apps/desktop
         env:
@@ -129,10 +159,13 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           # `dist` = `npm run build` (vite + bundle) then electron-builder.
-          # `--publish always` uploads the artifacts + latest-*.yml to the
-          # GitHub Release for this tag; on workflow_dispatch (no release)
-          # electron-builder skips publishing and we upload artifacts below.
-          npm run dist -- --${{ matrix.platform }} --${{ matrix.arch }} --publish always
+          # `--publish always` attaches the artifacts + latest-*.yml to the
+          # triggering GitHub Release. On workflow_dispatch (no triggering
+          # release) electron-publish creates a DRAFT release for that tag —
+          # see the artifact step below for the no-publish verification path.
+          npm run dist -- --${{ matrix.platform }} --${{ matrix.arch }} --publish always \
+            -c.extraMetadata.version=${{ steps.version.outputs.semver }} \
+            -c.publish.tagNamePrefix=""
 
       - name: Upload artifacts (workflow_dispatch / verification runs)
         if: github.event_name == 'workflow_dispatch'
