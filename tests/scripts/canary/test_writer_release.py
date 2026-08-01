@@ -40,6 +40,7 @@ REVISION = "a" * 40
 UNIT_SPEC = WriterOnlyUnitSpec(database_ip_allow=("10.20.30.40/32",))
 EXPECTED_TRACKED_RELEASE_ARTIFACTS = (
     "pyproject.toml",
+    "scripts/canary/writer-uv.toml",
     "uv.lock",
     "package.json",
     "package-lock.json",
@@ -104,6 +105,14 @@ def _source(spec: ReleaseBuildSpec) -> None:
     spec.source_root.mkdir(parents=True)
     (spec.source_root / "pyproject.toml").write_text(
         "[project]\nname='test'\nversion='1'\n",
+        encoding="utf-8",
+    )
+    release_uv_config = (
+        spec.source_root / writer_release.UV_PROJECT_CONFIG_RELATIVE_PATH
+    )
+    release_uv_config.parent.mkdir(parents=True, exist_ok=True)
+    release_uv_config.write_text(
+        "# exact release resolver configuration\n",
         encoding="utf-8",
     )
     (spec.source_root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
@@ -279,6 +288,11 @@ def test_release_commands_pin_managed_copied_frozen_noneditable_install(tmp_path
     )
     assert "--check" in lock_command.argv
     assert "--managed-python" in lock_command.argv
+    assert "--no-config" not in lock_command.argv
+    assert lock_command.argv[lock_command.argv.index("--config-file") + 1] == str(
+        spec.build_project_root / writer_release.UV_PROJECT_CONFIG_RELATIVE_PATH
+    )
+    assert lock_command.environment()["UV_NO_CONFIG"] == "1"
     assert "--frozen" in sync_command.argv
     assert "--no-editable" in sync_command.argv
     assert "--no-dev" in sync_command.argv
@@ -528,6 +542,23 @@ def test_build_constraints_are_exact_and_hash_pinned(tmp_path):
             writer_release._validate_build_constraints(spec)
 
 
+def test_release_uv_config_matches_project_resolution_policy():
+    repository = Path(writer_release.__file__).resolve().parents[2]
+    project_uv = tomllib.loads(
+        (repository / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["uv"]
+    release_uv = tomllib.loads(
+        (repository / writer_release.UV_PROJECT_CONFIG_RELATIVE_PATH).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert release_uv == {
+        "exclude-newer": project_uv["exclude-newer"],
+        "exclude-newer-package": project_uv["exclude-newer-package"],
+    }
+
+
 def test_build_and_egg_info_writes_are_isolated_from_canonical_source(tmp_path):
     spec = _spec(tmp_path)
     _source(spec)
@@ -540,6 +571,13 @@ def test_build_and_egg_info_writes_are_isolated_from_canonical_source(tmp_path):
     spec.wheel_output_root.mkdir()
     (spec.build_project_root / "pyproject.toml").write_bytes(
         (spec.source_root / "pyproject.toml").read_bytes()
+    )
+    release_uv_config = (
+        spec.build_project_root / writer_release.UV_PROJECT_CONFIG_RELATIVE_PATH
+    )
+    release_uv_config.parent.mkdir(parents=True, exist_ok=True)
+    release_uv_config.write_bytes(
+        (spec.source_root / writer_release.UV_PROJECT_CONFIG_RELATIVE_PATH).read_bytes()
     )
     (spec.build_project_root / "uv.lock").write_bytes(
         (spec.source_root / "uv.lock").read_bytes()
@@ -611,8 +649,14 @@ def test_real_uv_build_dirties_only_tracked_index_scratch(tmp_path):
         encoding="utf-8",
     )
     (source / "proof.py").write_text("PROOF = True\n", encoding="utf-8")
+    release_uv_config = source / writer_release.UV_PROJECT_CONFIG_RELATIVE_PATH
+    release_uv_config.parent.mkdir(parents=True, exist_ok=True)
+    release_uv_config.write_text(
+        "# exact release resolver configuration\n",
+        encoding="utf-8",
+    )
     constraints = source / writer_release.BUILD_CONSTRAINTS_RELATIVE_PATH
-    constraints.parent.mkdir(parents=True)
+    constraints.parent.mkdir(parents=True, exist_ok=True)
     constraints.write_bytes(writer_release._PINNED_BUILD_CONSTRAINTS)
     subprocess.run([str(git), "init", "--quiet", str(source)], check=True)
     subprocess.run([str(git), "-C", str(source), "add", "."], check=True)

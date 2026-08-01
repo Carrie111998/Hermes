@@ -1,0 +1,5 @@
+# Hermetic mirror of the resolver settings needed by the stopped-release
+# lock check. Keep these values equal to their [tool.uv] counterparts in the
+# root pyproject.toml; the regression test enforces that invariant.
+exclude-newer = "14 days"
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false }
