@@ -108,13 +108,15 @@ describe('formatCombo — honest Control labels', () => {
 
     expect(formatCombo('ctrl+tab')).toBe('⌃⇥')
     expect(formatCombo('ctrl+shift+tab')).toBe('⌃⇧⇥')
+    expect(formatCombo('mod+enter')).toBe('⌘↵')
   })
 
-  it('renders "Ctrl+…" off macOS (base key keeps its glyph)', async () => {
-    const { formatCombo } = await loadCombo('Win32')
+  it.each(['Linux x86_64', 'Win32'])('renders "Ctrl+…" off macOS on %s (base key keeps its glyph)', async platform => {
+    const { formatCombo } = await loadCombo(platform)
 
     expect(formatCombo('ctrl+tab')).toBe('Ctrl+⇥')
     expect(formatCombo('ctrl+shift+tab')).toBe('Ctrl+Shift+⇥')
+    expect(formatCombo('mod+enter')).toBe('Ctrl+↵')
   })
 })
 

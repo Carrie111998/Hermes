@@ -1778,7 +1778,7 @@ export interface Translations {
       scopeLastTurn: string
       commit: string
       commitAndPush: string
-      commitPlaceholder: string
+      commitPlaceholder: (shortcut: string) => string
       generateCommitMessage: string
       stopGenerating: string
       createPr: string
