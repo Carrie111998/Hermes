@@ -179,8 +179,12 @@ def _launch_for_test(
         "sys.argv=sys.argv[1:];"
         f"runpy.run_module({_MODULE!r},run_name='__main__')"
     )
+    # Isolated mode ignores PYTHONDONTWRITEBYTECODE, so -B must be explicit.
+    # Otherwise the first root execution writes pyc files into the sealed
+    # release and makes every later whole-tree verification fail closed.
     argv = (
         str(interpreter),
+        "-B",
         "-I",
         "-c",
         code,
