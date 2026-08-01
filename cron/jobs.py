@@ -1044,6 +1044,11 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
+        for job in jobs:
+            job.setdefault(
+                "last_delivery_status",
+                "failed" if job.get("last_delivery_error") else "not_requested",
+            )
         if _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
@@ -1052,6 +1057,11 @@ def load_jobs() -> List[Dict[str, Any]]:
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
+        for job in data:
+            job.setdefault(
+                "last_delivery_status",
+                "failed" if job.get("last_delivery_error") else "not_requested",
+            )
         if data:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
@@ -1421,6 +1431,7 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "last_delivery_status": "not_requested",
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1686,8 +1697,27 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_delivery_pending(job_id: str) -> None:
+    """Persist delivery intent before the external send begins."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                job["last_delivery_status"] = "pending"
+                job["last_delivery_error"] = None
+                save_jobs(jobs)
+                return
+
+
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    *,
+    delivery_attempted: Optional[bool] = None,
+    delivery_status: Optional[str] = None,
+):
     """
     Mark a job as having been run.
     
@@ -1707,6 +1737,26 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                if delivery_status is not None:
+                    job["last_delivery_status"] = delivery_status
+                elif delivery_attempted is None:
+                    # Backward compatibility for callers predating explicit
+                    # delivery-attempt bookkeeping. A pending state belongs to
+                    # the current run and stays ambiguous across interruption;
+                    # terminal states belong to an older run and must not leak
+                    # into a new run that never recorded delivery intent.
+                    if delivery_error:
+                        job["last_delivery_status"] = "failed"
+                    elif job.get("last_delivery_status") != "pending":
+                        job["last_delivery_status"] = "not_requested"
+                elif delivery_attempted is not None:
+                    job["last_delivery_status"] = (
+                        "failed"
+                        if delivery_attempted and delivery_error
+                        else "sent"
+                        if delivery_attempted
+                        else "not_requested"
+                    )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None

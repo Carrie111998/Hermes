@@ -345,6 +345,7 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+        assert updated["last_delivery_status"] == "failed"
 
 
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):

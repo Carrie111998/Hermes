@@ -101,6 +101,64 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+    fallback_evidenced = (
+        "fallback chain exhausted" in lower
+        or "fallbacks exhausted" in lower
+        or "all providers failed" in lower
+    )
+
+    def _fallback_note() -> str:
+        return "Fallback chain was exhausted or unavailable. " if fallback_evidenced else ""
+
+    if (
+        "pending_approval" in lower
+        or "approval_pending" in lower
+        or "timed out without user response" in lower
+        or "approval timed out" in lower
+    ):
+        return (
+            f"⚠️ Cron '{job_name}' failed: unattended tool approval timed out. "
+            "Full details saved in cron output."
+        )
+
+    inactivity_tool = re.search(
+        r"idle for .*?last activity:\s*executing tool:\s*([^.;,\s]+)", lower
+    )
+    if inactivity_tool:
+        tool_name = inactivity_tool.group(1).strip("'\"")
+        return (
+            f"⚠️ Cron '{job_name}' failed: job inactivity timeout while executing "
+            f"{tool_name}. Full details saved in cron output."
+        )
+    if "idle for" in lower and "last activity:" in lower:
+        if any(
+            marker in lower
+            for marker in (
+                "api response",
+                "provider response",
+                "stream response",
+                "sse event",
+            )
+        ):
+            return (
+                f"⚠️ Cron '{job_name}' failed: provider inactivity timeout. "
+                f"{_fallback_note()}Full details saved in cron output."
+            )
+        return (
+            f"⚠️ Cron '{job_name}' failed: job inactivity timeout. "
+            "Full details saved in cron output."
+        )
+
+    tool_timeout = re.search(
+        r"(?:executing tool|tool)\s+['\"]?([a-z0-9_.:-]+)['\"]?.{0,120}?timed out",
+        lower,
+    )
+    if tool_timeout:
+        tool_name = tool_timeout.group(1)
+        return (
+            f"⚠️ Cron '{job_name}' failed: tool '{tool_name}' timed out. "
+            "Full details saved in cron output."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
@@ -111,15 +169,32 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "quota limit"
         return (
             f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            "Fallback chain was exhausted or unavailable. "
-            "Full details saved in cron output."
+            f"{_fallback_note()}Full details saved in cron output."
         )
 
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
+        provider_evidenced = any(
+            marker in lower
+            for marker in (
+                "apitimeouterror",
+                "provider timeout",
+                "codex stream",
+                "sse events",
+                "openai",
+                "anthropic",
+                "openrouter",
+                "gemini",
+                "inference-api",
+            )
+        )
+        if not provider_evidenced:
+            return (
+                f"⚠️ Cron '{job_name}' failed: operation timed out. "
+                "Full details saved in cron output."
+            )
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            "Fallback chain was exhausted or unavailable. "
-            "Full details saved in cron output."
+            f"{_fallback_note()}Full details saved in cron output."
         )
 
     # Match authentication/authorization wording at a word boundary and the
@@ -281,7 +356,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_delivery_pending,
+    mark_job_run,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -4002,11 +4085,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
+            normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+            unresolved_origin = (
+                should_deliver
+                and normalized_deliver == "origin"
+                and not _resolve_delivery_targets(job)
+            )
+            delivery_attempted = (
+                should_deliver and normalized_deliver != "local" and not unresolved_origin
+            )
             if should_deliver:
-                unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
-                )
+                if delivery_attempted:
+                    mark_job_delivery_pending(job["id"])
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
@@ -4027,8 +4117,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+            mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                delivery_attempted=delivery_attempted,
+                delivery_status=(
+                    "not_configured"
+                    if should_deliver and unresolved_origin and not delivery_error
+                    else None
+                ),
+            )
         if delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
