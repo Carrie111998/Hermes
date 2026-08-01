@@ -52,9 +52,9 @@ import {
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwdTransient,
-  setCurrentFastMode,
+  setCurrentFastModeTransient,
   setCurrentPersonality,
-  setCurrentReasoningEffort,
+  setCurrentReasoningEffortTransient,
   setCurrentServiceTier,
   setCurrentUsage,
   setMessages,
@@ -473,8 +473,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             setCurrentPersonality(normalizePersonalityValue(payload.personality))
           }
 
+          // Runtime paint only — session.info / heartbeats must not persist
+          // Fast/effort or mark provenance manual (teknium T2 / sticky).
           if (typeof payload?.reasoning_effort === 'string') {
-            setCurrentReasoningEffort(payload.reasoning_effort)
+            setCurrentReasoningEffortTransient(payload.reasoning_effort)
           }
 
           if (typeof payload?.service_tier === 'string') {
@@ -482,7 +484,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
 
           if (typeof payload?.fast === 'boolean') {
-            setCurrentFastMode(payload.fast)
+            setCurrentFastModeTransient(payload.fast)
           }
 
           if (typeof payload?.yolo === 'boolean') {
