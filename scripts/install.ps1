@@ -360,7 +360,11 @@ function Invoke-UvWithSystemCertsRetry {
     $ErrorActionPreference = $prevEAP
 
     if ($exitCode -eq 0) {
+        # Success: emit captured stdout (without stderr which went to Out-Host)
+        # so callers like `uv python find` can capture the path.
+        $captured = Get-Content $_retryLog -Raw -ErrorAction SilentlyContinue
         Remove-Item $_retryLog -Force -ErrorAction SilentlyContinue
+        if ($captured) { Write-Output $captured }
         return 0
     }
 
@@ -3683,7 +3687,28 @@ function Stage-Repository       { Install-Repository }
 function Stage-Venv             { Resolve-UvCmd; Install-Venv }
 function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
 function Stage-NodeDeps         { Install-NodeDeps }
-function Stage-Desktop          { Install-Desktop }
+function Install-DesktopVoiceDeps {
+    if (-not $script:UvCmd) { Resolve-UvCmd }
+    if (-not $script:UvCmd) {
+        Write-Warn "uv unavailable -- voice/wake deps will lazy-install at first use instead"
+        return
+    }
+    $env:VIRTUAL_ENV = "$InstallDir\venv"
+    Write-Info "Installing voice + wake-word dependencies (onnxruntime, faster-whisper -- 1-3min)..."
+    Push-Location $InstallDir
+    try {
+        Invoke-UvWithSystemCertsRetry { & $UvCmd pip install -e ".[wake,voice]" }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Voice + wake-word dependencies installed"
+        } else {
+            Write-Warn "Voice/wake dependency install failed (exit $LASTEXITCODE) -- they will lazy-install at first use"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Stage-Desktop          { Install-DesktopVoiceDeps; Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
 function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }

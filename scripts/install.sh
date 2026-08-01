@@ -254,23 +254,27 @@ uv_is_cert_error() {
 # Run a uv command with automatic retry using UV_SYSTEM_CERTS=1 on TLS failure.
 # The first attempt streams stdout+stderr live to the user (the happy path —
 # `uv sync` can take 1-5 minutes and must show progress, not swallow it).
-# On failure, the command is re-run once silently to capture output for
-# cert-error inspection, and retried with UV_SYSTEM_CERTS=1. Only the
-# captured-then-retried output is echoed on the final attempt path; on the
-# success path the user already saw everything live.
+# Output is also captured via tee for cert-error inspection on failure.
+# On failure with a TLS cert error, retries once with UV_SYSTEM_CERTS=1.
 # Usage: uv_with_system_certs_retry <uv command and args...>
 uv_with_system_certs_retry() {
-    # Happy path: stream live.  uv's own progress UI (resolver bars, download
-    # meters) writes to stderr; capturing it makes `uv sync` look frozen.
-    if "$UV_CMD" "$@"; then
+    # Use a temp file to capture output while streaming live (tee).
+    local _capture_file
+    _capture_file="$(mktemp)" || return 1
+
+    # Run live with tee so user sees progress AND we capture output.
+    # Note: tee reads stdout+stderr merged; we can't easily separate them
+    # without more complexity, but for cert-error detection merged is fine.
+    if "$UV_CMD" "$@" 2>&1 | tee "$_capture_file"; then
+        rm -f "$_capture_file"
         return 0
     fi
-    local _first_exit=$?
+    local _first_exit=${PIPESTATUS[0]}
 
-    # Re-run silently to capture stderr+stdout for cert-error inspection.
+    # Read captured output for cert-error inspection (no re-run needed).
     local _output
-    _output="$("$UV_CMD" "$@" 2>&1)" || true
-    local _exit=$?
+    _output="$(cat "$_capture_file")"
+    rm -f "$_capture_file"
 
     # Check for TLS certificate error
     if uv_is_cert_error "$_output"; then
@@ -2858,6 +2862,37 @@ _restore_electron_dist_with_fallback() {
 # (electron-builder --dir) which emits an unpacked app for the current OS. Only invoked
 # via the 'desktop' stage / --include-desktop, which the Electron app's own
 # first-launch bootstrap never requests (it must not rebuild itself).
+install_desktop_voice_deps() {
+    # Desktop ships with working voice out of the box: eagerly install the
+    # wake-word + local-STT stacks ([wake] + [voice] extras) instead of
+    # leaving them to lazy first-use install. Policy change (Teknium, July
+    # 2026, #70509 testing): the first ear-click used to trigger a
+    # multi-minute onnxruntime pip install that froze the UI and blew RPC
+    # timeouts. Lazy install remains the fallback for CLI-only installs and
+    # for anything this best-effort step fails to fetch.
+    local _prev_venv="${VIRTUAL_ENV:-}"
+    if [ "$USE_VENV" = true ]; then
+        export VIRTUAL_ENV="$INSTALL_DIR/venv"
+    fi
+    if [ -z "${UV_CMD:-}" ]; then
+        install_uv || true
+    fi
+    if [ -z "${UV_CMD:-}" ]; then
+        log_warn "uv unavailable — voice/wake deps will lazy-install at first use instead"
+        return 0
+    fi
+    log_info "Installing voice + wake-word dependencies (onnxruntime, faster-whisper — 1-3min)..."
+    if (cd "$INSTALL_DIR" && uv_with_system_certs_retry pip install -e ".[wake,voice]") ; then
+        log_success "Voice + wake-word dependencies installed"
+    else
+        log_warn "Voice/wake dependency install failed — they will lazy-install at first use"
+    fi
+    if [ "$USE_VENV" = true ] && [ -z "$_prev_venv" ]; then
+        unset VIRTUAL_ENV
+    fi
+    return 0
+}
+
 install_desktop() {
     local desktop_dir="$INSTALL_DIR/apps/desktop"
 
@@ -3226,6 +3261,7 @@ main() {
     maybe_start_gateway
 
     if [ "$INCLUDE_DESKTOP" = true ]; then
+        install_desktop_voice_deps
         install_desktop
     fi
 
