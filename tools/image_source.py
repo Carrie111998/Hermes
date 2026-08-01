@@ -127,6 +127,27 @@ async def resolve_image_source(
     # every other path is read inside the sandbox via exec-read, so a host
     # path outside the caches never yields the host's bytes.
     host_target = _permitted_host_read_target(p, ctx)
+    # Unicode-space recovery: macOS screenshot names use U+202F (narrow
+    # no-break space) before AM/PM; models normalize it to ASCII space,
+    # causing exact-path misses.  If the exact path is absent but its
+    # parent directory exists, scan for a unique sibling whose name matches
+    # after collapsing all UNICODE_MAP entries to their ASCII equivalents.
+    # Refuses silently when zero or more than one sibling matches (no broad
+    # fuzzy guessing).
+    if host_target is not None and not host_target.is_file() and host_target.parent.is_dir():
+        try:
+            from tools.fuzzy_match import UNICODE_MAP as _UMAP
+            def _norm_spaces(name: str) -> str:
+                return "".join(_UMAP.get(c, c) for c in name)
+            _wanted = _norm_spaces(host_target.name)
+            _siblings = [
+                sib for sib in host_target.parent.iterdir()
+                if sib.is_file() and _norm_spaces(sib.name) == _wanted
+            ]
+            if len(_siblings) == 1:
+                host_target = _siblings[0]
+        except Exception:  # noqa: BLE001 — recovery best-effort
+            pass
     if host_target is not None and host_target.is_file():
         # Shared credential-read guard (agent.file_safety, #57698): refuse
         # secret-bearing files (.env, auth.json, ...) with an intentional,
