@@ -306,7 +306,10 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
-    kanban_worker = "HERMES_KANBAN_TASK" in os.environ
+    kanban_worker = (
+        "HERMES_KANBAN_TASK" in os.environ
+        or "HERMES_KANBAN_SAFE_ROOT_ACTIVE" in os.environ
+    )
     inherited_safe_root = os.environ.get("HERMES_WRITE_SAFE_ROOT")
     had_safe_root = "HERMES_WRITE_SAFE_ROOT" in os.environ
 

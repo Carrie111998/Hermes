@@ -163,6 +163,41 @@ def test_task_safe_root_survives_profile_dotenv_override(monkeypatch, tmp_path):
     assert target.read_text(encoding="utf-8") == "own"
 
 
+def test_delegated_worker_safe_root_survives_profile_dotenv_override(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "board"
+    workspace = root / "scratch-a"
+    inherited = tmp_path / "deployment-root"
+    workspace.mkdir(parents=True)
+    inherited.mkdir()
+    profile_home = tmp_path / ".hermes" / "profiles" / "w"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        f"HERMES_WRITE_SAFE_ROOT={inherited}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(inherited))
+
+    from agent.delegation_context import scrub_kanban_env
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+    delegated_env = scrub_kanban_env(captured["env"])
+    child_root = os.path.realpath(workspace)
+    assert "HERMES_KANBAN_TASK" not in delegated_env
+    assert delegated_env["HERMES_KANBAN_SAFE_ROOT_ACTIVE"] == "1"
+    with mock.patch.dict(os.environ, delegated_env, clear=True):
+        load_hermes_dotenv(hermes_home=delegated_env["HERMES_HOME"])
+        target = workspace / "delegated-own.txt"
+        result = _shell_file_operations(workspace).write_file(str(target), "own")
+
+    assert result.error is None
+    assert target.read_text(encoding="utf-8") == "own"
+    assert delegated_env["HERMES_WRITE_SAFE_ROOT"] == child_root
+
+
 def test_sibling_and_traversal_mutations_are_denied(monkeypatch, tmp_path):
     root = tmp_path / "board"
     workspace = root / "scratch-a"

@@ -27,6 +27,7 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
+    # HERMES_KANBAN_SAFE_ROOT_ACTIVE intentionally survives for delegate children.
 )
 
 
