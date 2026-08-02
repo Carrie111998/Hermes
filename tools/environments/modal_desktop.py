@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tools.computer_use.backend import ActionResult, CaptureResult, ComputerUseBackend, UIElement
 from tools.computer_use.transports.base import CuaToolTransport
-from tools.computer_use.transports.stdio import StdioMcpTransport
+from tools.computer_use.transports.modal_sandbox import ModalSandboxMcpTransport
 from tools.environments.compute_provider import ComputeLease, EnvironmentCapabilities
 from tools.environments.modal import ModalEnvironment
 
@@ -22,7 +22,9 @@ class ModalDesktopConfig:
     persistent_filesystem: bool = True
     cpu: float = 2
     memory: int = 8192
-    cua_driver_command: tuple[str, ...] = ("cua-driver", "mcp")
+    cua_driver_runtime_command: tuple[str, ...] = ("/bin/cua-driver-mcp-runtime",)
+    cua_driver_port: int = 8080
+    cua_driver_path: str = "/mcp"
     sandbox_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -123,10 +125,20 @@ class ModalDesktopEnvironment(ModalEnvironment):
         self._desktop_config = config
         self._computer_backend: ComputerUseBackend | None = None
         sandbox_kwargs = {"cpu": config.cpu, "memory": config.memory, **dict(config.sandbox_kwargs)}
+        configured_ports = sandbox_kwargs.pop("encrypted_ports", ())
+        if isinstance(configured_ports, (str, bytes)) or not isinstance(configured_ports, Sequence):
+            raise ValueError("modal.sandbox_kwargs.encrypted_ports must be a sequence")
+        encrypted_ports = {config.cua_driver_port}
+        for port in configured_ports:
+            if not isinstance(port, int):
+                raise ValueError("modal.sandbox_kwargs.encrypted_ports must contain integers")
+            encrypted_ports.add(port)
+        sandbox_kwargs["encrypted_ports"] = sorted(encrypted_ports)
         super().__init__(
             image=config.image, cwd=config.cwd, timeout=config.timeout,
             modal_sandbox_kwargs=sandbox_kwargs,
             persistent_filesystem=config.persistent_filesystem, task_id=compute_lease.task_id,
+            sandbox_command=config.cua_driver_runtime_command,
         )
 
     @property
@@ -135,10 +147,12 @@ class ModalDesktopEnvironment(ModalEnvironment):
 
     def get_computer_backend(self) -> ComputerUseBackend:
         if self._computer_backend is None:
-            # The image owns cua-driver. The default command preserves the
-            # existing stdio MCP contract while the lease owns its lifecycle.
             self._computer_backend = _TransportComputerBackend(
-                StdioMcpTransport(self._desktop_config.cua_driver_command)
+                ModalSandboxMcpTransport(
+                    self._sandbox, self._worker,
+                    port=self._desktop_config.cua_driver_port,
+                    path=self._desktop_config.cua_driver_path,
+                )
             )
             self._computer_backend.start()
         return self._computer_backend
@@ -173,7 +187,10 @@ class ModalDesktopProvider:
         config = self.config if lease.image == self.config.image else ModalDesktopConfig(
             image=lease.image, cwd=self.config.cwd, timeout=self.config.timeout,
             persistent_filesystem=self.config.persistent_filesystem, cpu=self.config.cpu,
-            memory=self.config.memory, cua_driver_command=self.config.cua_driver_command,
+            memory=self.config.memory,
+            cua_driver_runtime_command=self.config.cua_driver_runtime_command,
+            cua_driver_port=self.config.cua_driver_port,
+            cua_driver_path=self.config.cua_driver_path,
             sandbox_kwargs=self.config.sandbox_kwargs,
         )
         return ModalDesktopEnvironment(compute_lease=lease, config=config)

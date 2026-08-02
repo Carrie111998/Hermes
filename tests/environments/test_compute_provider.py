@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -7,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tools.computer_use.transports.http_mcp import HttpMcpTransport
+from tools.computer_use.transports.modal_sandbox import ModalSandboxMcpTransport
 from tools.computer_use.transports.stdio import StdioMcpTransport
 from tools.environments import CuaFleetConfig, CuaFleetDesktopProvider
 from tools.environments.capability_adapter import resolve_tools
@@ -18,7 +20,7 @@ from tools.environments.cua_fleet import (
     _provider_from_config,
 )
 from tools.environments.desktop_lease import DesktopSandboxManager
-from tools.environments.modal_desktop import ModalDesktopConfig
+from tools.environments.modal_desktop import ModalDesktopConfig, ModalDesktopEnvironment
 
 
 def test_compute_lease_fields() -> None:
@@ -138,11 +140,70 @@ def test_http_transport_start_stop_and_alive() -> None:
     assert not transport.is_alive()
 
 
+
+class _ModalWorker:
+    def run_coroutine(self, coroutine, timeout: int = 60):
+        return asyncio.run(coroutine)
+
+
+class _ModalSandbox:
+    async def _tunnels(self, timeout: int):
+        assert timeout == 50
+        return {8080: SimpleNamespace(url="https://lease-1.modal.host")}
+
+    def __init__(self):
+        self.tunnels = SimpleNamespace(aio=self._tunnels)
+
+
+def _modal_mcp_response():
+    response = Mock()
+    response.headers = {"mcp-session-id": "session-1"}
+    response.read.side_effect = [b'{"jsonrpc":"2.0","id":1,"result":{}}', b""]
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    return response
+
+
+def test_modal_sandbox_transport_uses_the_lease_tunnel() -> None:
+    transport = ModalSandboxMcpTransport(_ModalSandbox(), _ModalWorker(), port=8080, path="/mcp")
+
+    with patch("tools.computer_use.transports.modal_sandbox.urlopen", return_value=_modal_mcp_response()):
+        transport.start()
+
+    assert transport.endpoint == "https://lease-1.modal.host/mcp"
+    assert transport.headers["mcp-session-id"] == "session-1"
+
+
+def test_modal_desktop_starts_the_image_mcp_runtime_on_an_encrypted_port() -> None:
+    lease = ComputeLease("task-1", "lease-1", "modal", "registry.example/cua-driver-mcp@sha256:test", EnvironmentCapabilities(computer_use=True))
+
+    with patch("tools.environments.modal_desktop.ModalEnvironment.__init__") as init:
+        ModalDesktopEnvironment(compute_lease=lease, config=ModalDesktopConfig())
+
+    kwargs = init.call_args.kwargs
+    assert kwargs["sandbox_command"] == ("/bin/cua-driver-mcp-runtime",)
+    assert kwargs["modal_sandbox_kwargs"]["encrypted_ports"] == [8080]
+
+
+def test_modal_desktop_backend_uses_the_lease_bound_transport() -> None:
+    environment = object.__new__(ModalDesktopEnvironment)
+    environment._computer_backend = None
+    environment._desktop_config = ModalDesktopConfig()
+    environment._sandbox = _ModalSandbox()
+    environment._worker = _ModalWorker()
+
+    with patch("tools.computer_use.transports.modal_sandbox.urlopen", return_value=_modal_mcp_response()):
+        backend = environment.get_computer_backend()
+
+    assert isinstance(backend.transport, ModalSandboxMcpTransport)
+
 def test_modal_desktop_config_defaults() -> None:
     config = ModalDesktopConfig()
 
     assert config.image == "trycua/cua:latest"
-    assert config.cua_driver_command == ("cua-driver", "mcp")
+    assert config.cua_driver_runtime_command == ("/bin/cua-driver-mcp-runtime",)
+    assert config.cua_driver_port == 8080
+    assert config.cua_driver_path == "/mcp"
     assert config.persistent_filesystem
 
 

@@ -12,7 +12,7 @@ import shlex
 import tarfile
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from hermes_constants import get_hermes_home
 from tools.environments.base import (
@@ -179,6 +179,7 @@ class ModalEnvironment(BaseEnvironment):
         modal_sandbox_kwargs: Optional[dict[str, Any]] = None,
         persistent_filesystem: bool = True,
         task_id: str = "default",
+        sandbox_command: Sequence[str] | None = None,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
 
@@ -190,6 +191,7 @@ class ModalEnvironment(BaseEnvironment):
         self._sync_manager: FileSyncManager | None = None  # initialized after sandbox creation
 
         sandbox_kwargs = dict(modal_sandbox_kwargs or {})
+        self._sandbox_command = tuple(sandbox_command or ("sleep", "infinity"))
 
         restored_snapshot_id = None
         restored_from_legacy_key = False
@@ -246,7 +248,7 @@ class ModalEnvironment(BaseEnvironment):
                 existing_mounts.extend(cred_mounts)
                 create_kwargs["mounts"] = existing_mounts
             sandbox = await _modal.Sandbox.create.aio(
-                "sleep", "infinity",
+                *self._sandbox_command,
                 image=image_spec,
                 app=app,
                 timeout=int(create_kwargs.pop("timeout", 3600)),
