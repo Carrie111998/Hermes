@@ -982,6 +982,13 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "boolean",
         "description": "Run the local browser in headed mode (visible window). Also keeps the window open between turns; idle sessions are still reaped after browser.inactivity_timeout.",
     },
+    "plugins.hook_callback_timeout": {
+        "type": "number",
+        "description": (
+            "Wall-clock cap (seconds) for a single in-process Python plugin "
+            "hook callback. 0 disables the cap; values above 600 are clamped."
+        ),
+    },
 }
 
 # Categories with fewer fields get merged into "general" to avoid tab sprawl.
@@ -1019,6 +1026,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # `telemetry.shared_metrics.enabled` is the only schema-surfaced telemetry
     # field — fold it into security alongside the other privacy-posture toggles.
     "telemetry": "security",
+    # `plugins.hook_callback_timeout` is the only schema-surfaced plugins field
+    # (`enabled`/`disabled` are list allow-lists omitted from DEFAULT_CONFIG) —
+    # fold it into the agent tab rather than spawning a one-field orphan category.
+    "plugins": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
