@@ -235,10 +235,39 @@ def _apply_speculative_settings(agent: Any, settings: SpeculativeCompressionSett
     return bool(getattr(agent, "speculative_compression_enabled", False))
 
 
+def _ensure_speculative_epoch(agent: Any) -> None:
+    epoch = getattr(agent, "_speculative_epoch", None)
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        setattr(agent, "_speculative_epoch", 0)
+
+
+def _bump_speculative_epoch(agent: Any) -> None:
+    _ensure_speculative_epoch(agent)
+    agent._speculative_epoch += 1
+
+
+def _invalidate_speculative_session(manager: Any, agent: Any) -> None:
+    invalidate = getattr(manager, "invalidate_session", None)
+    if not callable(invalidate):
+        return
+    try:
+        invalidate(str(getattr(agent, "session_id", "") or ""))
+    except Exception:
+        logger.debug(
+            "speculative compression invalidation failed for session=%s",
+            getattr(agent, "session_id", ""),
+            exc_info=True,
+        )
+
+
 def reset_speculative_compression_to_config(agent: Any) -> bool:
     """Clear the session override and restore config-driven wiring."""
 
     setattr(agent, "_speculative_runtime_override", None)
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    setattr(agent, "speculative_compression_enabled", False)
+    _bump_speculative_epoch(agent)
+    _invalidate_speculative_session(manager, agent)
     return _apply_speculative_settings(agent, _config_speculative_settings())
 
 
@@ -252,22 +281,15 @@ def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
     config.yaml.
     """
 
+    _ensure_speculative_epoch(agent)
     manager = getattr(agent, "_speculative_compression_manager", None)
     setattr(agent, "_speculative_runtime_override", bool(enabled))
     if not enabled:
         # Clear the flag before cancelling work so a racing foreground or
         # tool-wait path cannot start more speculative work during invalidation.
         setattr(agent, "speculative_compression_enabled", False)
-        invalidate = getattr(manager, "invalidate_session", None)
-        if callable(invalidate):
-            try:
-                invalidate(str(getattr(agent, "session_id", "") or ""))
-            except Exception:
-                logger.debug(
-                    "speculative compression invalidation failed for session=%s",
-                    getattr(agent, "session_id", ""),
-                    exc_info=True,
-                )
+        _bump_speculative_epoch(agent)
+        _invalidate_speculative_session(manager, agent)
         return False
 
     settings = _config_speculative_settings()

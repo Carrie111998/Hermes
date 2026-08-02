@@ -91,40 +91,111 @@ class TestAgentConfigSignature:
         assert sig1 != sig2
 
     def test_speculative_enabled_change_rebuilds_once_then_reuses(self):
-        """A speculative config edit rebuilds the cached agent exactly once."""
-        from gateway.run import GatewayRunner
+        """The real gateway turn path rebuilds once after a speculative edit."""
+        from gateway.run import GatewayRunner, TurnRunner
+        from gateway.turn_context import TurnContext
+        from gateway.config import Platform
 
-        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
         session_key = "telegram:12345"
-        cache = {}
         created = []
+        config = {"compression": {"speculative": {"enabled": False}}}
 
-        def cached_agent(user_config):
-            cache_keys = GatewayRunner._extract_cache_busting_config(user_config)
-            signature = GatewayRunner._agent_config_signature(
-                "m", runtime, [], "", cache_keys=cache_keys,
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = {}
+        runner._agent_cache_lock = threading.Lock()
+        runner._session_db = None
+        runner._provider_routing = {}
+        runner._prefill_messages = None
+        runner._service_tier = None
+        runner._pending_model_notes = {}
+        runner._pending_skills_reload_notes = {}
+        runner._session_store = SimpleNamespace(_entries={})
+        runner._resolve_session_agent_runtime = lambda **_kwargs: (
+            "m",
+            {"api_key": "k", "base_url": "u", "provider": "p"},
+        )
+        runner._resolve_turn_agent_config = lambda _message, model, runtime: {
+            "model": model,
+            "runtime": runtime,
+            "request_overrides": None,
+        }
+        runner._resolve_session_reasoning_config = lambda **_kwargs: {}
+        runner._resolve_session_service_tier = lambda **_kwargs: None
+        runner._get_system_prompt_for_channel = lambda *_args, **_kwargs: ""
+        runner._refresh_fallback_model = lambda: None
+        runner._enforce_agent_cache_cap = lambda: None
+        runner._consume_pending_turn_sidecar_notes = lambda _session_key: []
+        runner._consume_pending_native_image_paths = lambda _session_key: []
+        runner._adapter_for_source = lambda _source: None
+        runner._sync_session_model_from_agent = lambda *_args: None
+
+        class FakeCompressor:
+            context_length = 1_000
+            last_prompt_tokens = 0
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                self.tools = []
+                self.context_compressor = FakeCompressor()
+                self.session_prompt_tokens = 0
+                self.session_completion_tokens = 0
+                self._fallback_chain = []
+                self._fallback_model = None
+                created.append(self)
+
+            def run_conversation(self, _message, **_kwargs):
+                return {
+                    "final_response": "ok",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                }
+
+        source = SimpleNamespace(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            thread_id=None,
+            parent_chat_id=None,
+            chat_name=None,
+            user_id="user-1",
+            user_id_alt=None,
+            user_name="tester",
+        )
+
+        def run_turn():
+            ctx = TurnContext(
+                source=source,
+                _run_still_current=lambda: True,
+                message="hello",
+                history=[],
+                context_prompt="",
+                channel_prompt=None,
+                session_id="session-1",
+                session_key=session_key,
+                AIAgent=FakeAgent,
+                resolve_display_setting=lambda *_args, **_kwargs: None,
+                user_config=config,
+                enabled_toolsets=[],
+                disabled_toolsets=None,
+                _hooks_ref=SimpleNamespace(loaded_hooks=False),
             )
-            cached = cache.get(session_key)
-            if cached is not None and cached[1] == signature:
-                return cached[0]
-            agent = SimpleNamespace(
-                _speculative_runtime_override=True if not created else None
-            )
-            created.append(agent)
-            cache[session_key] = (agent, signature)
-            return agent
+            return TurnRunner(runner, ctx).run_sync()
 
-        disabled = {"compression": {"speculative": {"enabled": False}}}
-        enabled = {"compression": {"speculative": {"enabled": True}}}
+        first_result = run_turn()
+        first_signature = runner._agent_cache[session_key][1]
+        config["compression"]["speculative"]["enabled"] = True
+        rebuilt_result = run_turn()
+        rebuilt_signature = runner._agent_cache[session_key][1]
+        reused_result = run_turn()
 
-        first = cached_agent(disabled)
-        rebuilt = cached_agent(enabled)
-        reused = cached_agent(enabled)
-
-        assert first is not rebuilt
-        assert rebuilt is reused
+        assert first_result["final_response"] == "ok"
+        assert rebuilt_result["final_response"] == "ok"
+        assert reused_result["final_response"] == "ok"
+        assert first_signature != rebuilt_signature
         assert len(created) == 2
-        assert rebuilt._speculative_runtime_override is None
+        assert runner._agent_cache[session_key][0] is created[1]
 
 
     def test_cache_keys_key_order_does_not_matter(self):

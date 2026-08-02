@@ -120,6 +120,7 @@ def _try_install_speculative_candidate(
         return messages, None, False, False
 
     wait_seconds = settings.hard_wait_seconds if over_hard else 0.0
+    _epoch_before = getattr(agent, "_speculative_epoch", 0)
     candidate = manager.take_matching_candidate(
         str(getattr(agent, "session_id", "") or ""),
         messages,
@@ -137,11 +138,13 @@ def _try_install_speculative_candidate(
             )
         return messages, None, False, force_sync
     # The slash-command kill switch may have fired while the bounded candidate
-    # claim was waiting.  Do not let a candidate claimed before the switch cross
-    # into the install path; put it back so the next enable can reuse it.
-    if not getattr(agent, "speculative_compression_enabled", False):
+    # claim was waiting.  The claim is destructive on this path: an off/epoch
+    # rejection drops the candidate instead of parking it for a future enable.
+    if (
+        not getattr(agent, "speculative_compression_enabled", False)
+        or getattr(agent, "_speculative_epoch", 0) != _epoch_before
+    ):
         setattr(agent, "_speculative_install_status", "rejected")
-        _restore_speculative_candidate(agent, candidate)
         return messages, None, False, force_sync
     _emit_speculative_status(
         agent,

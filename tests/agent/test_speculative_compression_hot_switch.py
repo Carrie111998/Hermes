@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import agent.speculative_compression as speculative
 from agent.speculative_compression import (
+    SpeculativeCompressionManager,
+    SpeculativeCompressionSettings,
     configure_speculative_compression,
+    capture_snapshot,
     reset_speculative_compression_to_config,
     schedule_tool_wait_candidate,
     speculative_compression_status,
@@ -64,6 +68,7 @@ def test_runtime_switch_wires_scheduling_and_invalidates(monkeypatch):
     assert agent.speculative_compression_settings.enabled is True
     assert agent._speculative_compression_manager is manager
     assert agent._speculative_runtime_override is True
+    assert agent._speculative_epoch == 0
     assert "enabled=True" in speculative_compression_status(agent)
     assert "eligible=True" in speculative_compression_status(agent)
     assert "api_mode=chat_completions" in speculative_compression_status(agent)
@@ -78,6 +83,7 @@ def test_runtime_switch_wires_scheduling_and_invalidates(monkeypatch):
 
     assert configure_speculative_compression(agent, False) is False
     assert agent.speculative_compression_enabled is False
+    assert agent._speculative_epoch == 1
     assert manager.invalidated == ["session-1"]
     assert agent._speculative_runtime_override is False
     assert schedule_tool_wait_candidate(agent, messages, 800) == "disabled"
@@ -110,6 +116,60 @@ def test_runtime_override_is_cleared_when_config_wiring_is_rebuilt(monkeypatch):
     assert agent.speculative_compression_enabled is False
     assert agent.speculative_compression_settings.enabled is False
     assert agent._speculative_compression_manager is None
+    assert agent._speculative_epoch == 1
+
+
+def test_model_switch_reset_cancels_blocked_worker_before_detaching_manager(
+    monkeypatch,
+):
+    manager = SpeculativeCompressionManager(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "tail"},
+    ]
+    snapshot = capture_snapshot(messages, Compressor(), 100, "session-1")
+
+    class BlockedWorker:
+        def compress(self, worker_messages, **_kwargs):
+            started.set()
+            assert release.wait(2)
+            return [
+                {"role": "user", "content": "summary"},
+                *worker_messages[snapshot.cut_index :],
+            ]
+
+    agent = SimpleNamespace(
+        compression_enabled=True,
+        speculative_compression_enabled=True,
+        speculative_compression_settings=SpeculativeCompressionSettings(enabled=True),
+        context_compressor=Compressor(),
+        api_mode="chat_completions",
+        session_id="session-1",
+        _speculative_compression_manager=manager,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"compression": {"speculative": {"enabled": False}}},
+    )
+    assert (
+        manager.maybe_start(
+            "session-1", snapshot, lambda: BlockedWorker(), max_age_seconds=180
+        )
+        == "started"
+    )
+    assert started.wait(2)
+
+    try:
+        assert reset_speculative_compression_to_config(agent) is False
+        assert agent._speculative_compression_manager is None
+        assert "session-1" not in manager._entries
+        release.set()
+        assert manager.take_matching_candidate("session-1", messages) is None
+    finally:
+        release.set()
+        manager.shutdown()
 
 
 def test_enable_reports_compression_disabled_blocker(monkeypatch):

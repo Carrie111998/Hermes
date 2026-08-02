@@ -101,18 +101,6 @@ COMPACTION_STATUS = (
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
-def _restore_speculative_candidate(agent: Any, candidate: Any) -> None:
-    """Best-effort requeue for a candidate rejected before durable install."""
-    manager = getattr(agent, "_speculative_compression_manager", None)
-    restore = getattr(manager, "restore_candidate", None)
-    if not callable(restore):
-        return
-    try:
-        restore(str(getattr(agent, "session_id", "") or ""), candidate)
-    except Exception:
-        logger.debug("speculative candidate restore failed", exc_info=True)
-
-
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -2217,6 +2205,7 @@ def compress_context(
     )
 
     if speculative_candidate is not None:
+        _epoch_before = getattr(agent, "_speculative_epoch", 0)
         if not getattr(agent, "speculative_compression_enabled", False):
             agent._speculative_install_status = "rejected"
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
@@ -2834,10 +2823,13 @@ def compress_context(
             # the flag may have changed while this caller waited for the
             # session lock. No candidate may cross this final gate into
             # assemble/commit after /speculative off has returned.
-            if not getattr(agent, "speculative_compression_enabled", False):
+            if (
+                not getattr(agent, "speculative_compression_enabled", False)
+                or getattr(agent, "_speculative_epoch", 0)
+                != _epoch_before
+            ):
                 agent._speculative_install_status = "rejected"
                 _release_lock()
-                _restore_speculative_candidate(agent, speculative_candidate)
                 existing_prompt = getattr(agent, "_cached_system_prompt", None)
                 if not existing_prompt:
                     existing_prompt = agent._build_system_prompt(system_message)
@@ -2862,6 +2854,17 @@ def compress_context(
                     and _spec_live_compressor_fp is not None
                     and _spec_compressor_fp != _spec_live_compressor_fp
                 )
+            ):
+                agent._speculative_install_status = "rejected"
+                _release_lock()
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+            if (
+                not getattr(agent, "speculative_compression_enabled", False)
+                or getattr(agent, "_speculative_epoch", 0)
+                != _epoch_before
             ):
                 agent._speculative_install_status = "rejected"
                 _release_lock()

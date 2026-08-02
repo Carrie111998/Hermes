@@ -6,6 +6,7 @@ import time
 from agent.speculative_compression import (
     SpeculativeCandidate,
     SpeculativeCompressionSettings,
+    configure_speculative_compression,
     fingerprint_messages,
 )
 from hermes_state import SessionDB
@@ -15,9 +16,13 @@ from run_agent import AIAgent
 class _RestoreManager:
     def __init__(self):
         self.restored = []
+        self.invalidated = []
 
     def restore_candidate(self, session_id, candidate):
         self.restored.append((session_id, candidate))
+
+    def invalidate_session(self, session_id):
+        self.invalidated.append(session_id)
 
 
 def _agent_with_candidate_db(tmp_path):
@@ -203,7 +208,9 @@ def test_failed_durable_commit_rejects_candidate_and_releases_lock(
     assert db.get_compression_lock_holder(session_id) is None
 
 
-def test_off_after_lock_wait_rejects_and_restores_before_commit(tmp_path, monkeypatch):
+def test_off_after_lock_wait_rejects_without_restoring_before_commit(
+    tmp_path, monkeypatch
+):
     """The kill switch linearizes after lock acquisition, before assemble."""
     agent, db, session_id = _agent_with_candidate_db(tmp_path)
     manager = _RestoreManager()
@@ -244,7 +251,7 @@ def test_off_after_lock_wait_rejects_and_restores_before_commit(tmp_path, monkey
     thread = threading.Thread(target=install)
     thread.start()
     assert acquired.wait(2)
-    agent.speculative_compression_enabled = False
+    configure_speculative_compression(agent, False)
     db.release_compression_lock(session_id, other_holder)
     release_wait.set()
     thread.join(timeout=2)
@@ -252,9 +259,56 @@ def test_off_after_lock_wait_rejects_and_restores_before_commit(tmp_path, monkey
     assert not thread.is_alive()
     assert result[0][0] == messages
     assert agent._speculative_install_status == "rejected"
-    assert manager.restored == [(session_id, candidate)]
+    assert manager.restored == []
     assert commit_calls == []
     assert agent.session_id == session_id
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_off_after_candidate_match_rejects_without_db_rewrite(tmp_path, monkeypatch):
+    """The post-gate epoch barrier rejects a switch during pure validation."""
+    agent, db, session_id = _agent_with_candidate_db(tmp_path)
+    manager = _RestoreManager()
+    agent._speculative_compression_manager = manager
+    messages = _messages()
+    candidate = _candidate(messages, session_id)
+    rows_before = db.get_messages_as_conversation(session_id, include_inactive=True)
+    session_before = db.get_session(session_id)
+    matches_started = threading.Event()
+    resume_matches = threading.Event()
+    real_matches = SpeculativeCandidate.matches
+
+    def blocked_matches(self, *args, **kwargs):
+        matches_started.set()
+        assert resume_matches.wait(2)
+        return real_matches(self, *args, **kwargs)
+
+    monkeypatch.setattr(SpeculativeCandidate, "matches", blocked_matches)
+    result = []
+
+    def install():
+        result.append(
+            agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=100,
+                speculative_candidate=candidate,
+            )
+        )
+
+    thread = threading.Thread(target=install)
+    thread.start()
+    assert matches_started.wait(2)
+    configure_speculative_compression(agent, False)
+    resume_matches.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result[0][0] == messages
+    assert agent._speculative_install_status == "rejected"
+    assert manager.restored == []
+    assert db.get_messages_as_conversation(session_id, include_inactive=True) == rows_before
+    assert db.get_session(session_id) == session_before
     assert db.get_compression_lock_holder(session_id) is None
 
 

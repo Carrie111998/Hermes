@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from agent.speculative_compression import (
+    SpeculativeCandidate,
+    SpeculativeCompressionManager,
     SpeculativeCompressionSettings,
+    configure_speculative_compression,
+    fingerprint_messages,
     schedule_tool_wait_candidate,
 )
 from agent.turn_context import _try_install_speculative_candidate
@@ -108,7 +114,7 @@ def test_candidate_commit_rejection_falls_back_without_installing(monkeypatch):
     assert result == (messages, None, False, True)
 
 
-def test_candidate_taken_before_off_is_restored_without_installing(monkeypatch):
+def test_candidate_taken_before_off_is_dropped_without_restoring(monkeypatch):
     class ReadyCandidate:
         def is_expired(self, _max_age):
             return False
@@ -134,8 +140,55 @@ def test_candidate_taken_before_off_is_restored_without_installing(monkeypatch):
     result = _try_install_speculative_candidate(agent, messages, "sys", 900, "task-1")
 
     assert result == (messages, None, False, True)
-    assert manager.restored == [("session-1", manager.candidate)]
+    assert manager.restored == []
     assert agent._speculative_install_status != "installed"
+
+
+def test_off_cancels_claimed_candidate_without_parking_it(monkeypatch):
+    manager = SpeculativeCompressionManager(max_workers=1)
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "current"},
+    ]
+    candidate = SpeculativeCandidate(
+        session_id="session-1",
+        source_fingerprint=fingerprint_messages(messages[:1]),
+        boundary_fingerprint=fingerprint_messages(messages[1:]),
+        cut_index=1,
+        compress_start=0,
+        original_count=len(messages),
+        compressed_prefix=({"role": "user", "content": "summary"},),
+        created_at=time.monotonic(),
+    )
+    manager.restore_candidate("session-1", candidate)
+    restore = MagicMock(wraps=manager.restore_candidate)
+    manager.restore_candidate = restore
+    agent = _agent(manager)
+    agent.compression_enabled = True
+
+    real_take = manager.take_matching_candidate
+
+    def take_and_disable(*args, **kwargs):
+        claimed = real_take(*args, **kwargs)
+        configure_speculative_compression(agent, False)
+        return claimed
+
+    manager.take_matching_candidate = take_and_disable
+    monkeypatch.setattr(
+        "agent.speculative_compression.is_builtin_compression_eligible",
+        lambda **_kwargs: True,
+    )
+    try:
+        result = _try_install_speculative_candidate(
+            agent, messages, "sys", 900, "task-1"
+        )
+
+        assert result == (messages, None, False, True)
+        assert "session-1" not in manager._entries
+        assert manager.take_matching_candidate("session-1", messages) is None
+        restore.assert_not_called()
+    finally:
+        manager.shutdown()
 
 
 def test_anti_thrash_ineffective_still_installs_ready_candidate(monkeypatch):
