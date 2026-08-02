@@ -80,6 +80,14 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/model/auxiliary",
   "/api/model/moa",
   "/api/model/options",
+  // Provider Logins OAuth: the backend already accepts ?profile= on
+  // /api/providers/oauth{,/{provider}/start,/submit,/poll/{session_id},/sessions/{session_id}}
+  // (web_server.py _validate_oauth_profile wraps the calls in _profile_scope),
+  // but the SPA helpers in this file forget to forward it. Without the prefix
+  // here, switching management profile to a non-default one (e.g. `coder`) and
+  // then opening Provider Logins still reads/writes the dashboard's launch
+  // profile — a real bug (#76674, root cause: missing prefix).
+  "/api/providers/oauth",
   // A named profile keeps its own pairing whitelist, and its gateway only
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
