@@ -9,12 +9,30 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+# Cadence for the heartbeat that keeps the calling agent's inactivity watchdog
+# at bay while a manual `cronjob(action="run")` executes the job synchronously
+# in-process (#76502). Mirrors the 10s cadence of
+# tools/environments/base.py::touch_activity_if_due (delegate_task's heartbeat
+# uses 30s) — comfortably below the 1800s default HERMES_AGENT_TIMEOUT.
+_CRON_RUN_HEARTBEAT_INTERVAL = 10.0
+
+# Hard ceiling on how long the heartbeat keeps the parent watchdog at bay.
+# The child cron run has its own inactivity watchdog (HERMES_CRON_TIMEOUT,
+# default 600s) that bounds a wedged job, but with HERMES_CRON_TIMEOUT=0
+# (explicit "unlimited") a truly hung run_one_job would otherwise mask the
+# gateway watchdog forever — pre-#76502 the parent was at least reaped at
+# ~1800s. After this ceiling the heartbeat stops and the gateway watchdog
+# regains authority over the turn.
+_CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -81,7 +99,7 @@ _CRON_THREAT_PATTERNS = [
     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)', "read_secrets"),
+    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|id_rsa|id_ed25519|id_ecdsa)', "read_secrets"),
     (r'authorized_keys', "ssh_backdoor"),
     (r'/etc/sudoers|visudo', "sudoers_mod"),
     (r'rm\s+-rf\s+/', "destructive_root_rm"),
@@ -174,16 +192,28 @@ def _strip_cron_safe_constructs(prompt: str) -> str:
 
     Allows the bundled GitHub skill fallback without opening a blanket
     exemption for arbitrary Authorization-header exfiltration.
+
+    Uses ``re.sub`` so EVERY occurrence is scrubbed, not just the first — a
+    cron job that loads 2+ GitHub skills (e.g. github-issues +
+    github-pr-workflow + github-code-review) contains several such blocks,
+    and the old ``re.search`` + single ``str.replace`` left the rest to trip
+    the exfil_curl_auth_header detector on every run. The trailing
+    ``[^\\s;&|$`]*`` consumes only the URL path — never whitespace, command
+    separators, or subshell openers — so a payload smuggled onto the same
+    line (``;``, ``&&``, ``|``, ``$(...)``, backticks) survives the strip
+    and is still scanned. The host must be exactly ``api.github.com``
+    followed by ``/``, whitespace, quote, or end: lookalike authorities
+    (``api.github.com.evil.com``, ``api.github.com@evil.com``) are not the
+    trusted construct and fall through to the exfil detectors, while
+    legitimately quoted bare-host URLs stay exempt.
     """
-    github_auth_header = re.search(
-        rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?:/|\b)',
+    return re.sub(
+        rf'curl\s+[^\n;&|$`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
+        r'\s+["\']?https://api\.github\.com(?::\d+)?(?:/|\s|$|["\'])[^\s;&|$`]*',
+        'curl https://api.github.com/user',
         prompt,
-        re.IGNORECASE,
+        flags=re.IGNORECASE,
     )
-    if github_auth_header:
-        return prompt.replace(github_auth_header.group(0), "curl https://api.github.com/user")
-    return prompt
 
 
 def _check_invisible_unicode(prompt: str) -> str:
@@ -373,48 +403,6 @@ def _canonical_skills(skill: Optional[str] = None, skills: Optional[Any] = None)
 
 
 
-def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
-    """Resolve a model override object into (provider, model) for job storage.
-
-    If provider is omitted, pins the current main provider from config so the
-    job doesn't drift when the user later changes their default via hermes model.
-
-    Returns (provider_str_or_none, model_str_or_none).
-    """
-    if not model_obj or not isinstance(model_obj, dict):
-        return (None, None)
-    model_name = (model_obj.get("model") or "").strip() or None
-    provider_name = (model_obj.get("provider") or "").strip() or None
-    # Bare "custom" is usually an incomplete spec — the canonical form is
-    # "custom:<name>" matching a custom_providers entry, and LLMs frequently
-    # supply the bare type because the schema does not advertise the
-    # ":<name>" suffix. It is only a problem when it can't resolve at runtime:
-    # a user may literally name a ``providers.custom`` (or custom_providers
-    # "custom") entry, in which case the job should keep ``provider="custom"``
-    # and run against that endpoint. Only when no such entry exists do we treat
-    # the bare value as "no provider supplied" and pin the current main
-    # provider below — otherwise pinning to ``model.provider`` (e.g. codex)
-    # silently hijacks a job that meant to use the configured custom endpoint.
-    if provider_name == "custom":
-        try:
-            from hermes_cli.runtime_provider import has_named_custom_provider
-            if not has_named_custom_provider("custom"):
-                provider_name = None
-        except Exception:
-            provider_name = None
-    if model_name and not provider_name:
-        # Pin to the current main provider so the job is stable
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config()
-            model_cfg = cfg.get("model", {})
-            if isinstance(model_cfg, dict):
-                provider_name = model_cfg.get("provider") or None
-        except Exception:
-            pass  # Best-effort; provider stays None
-    return (provider_name, model_name)
-
-
 def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash: bool = False) -> Optional[str]:
     if value is None:
         return None
@@ -443,6 +431,86 @@ def _normalize_deliver_param(value: Any) -> Optional[str]:
         return ",".join(parts) if parts else None
     text = str(value).strip()
     return text or None
+
+
+def _validate_cron_base_url(
+    provider: Optional[Any], base_url: Optional[Any]
+) -> Optional[str]:
+    """Reject pairing a named provider's stored credential with an off-host base_url.
+
+    The cron tool is model-callable, so a prompt-injected job could set a real
+    provider plus an attacker ``base_url``; on fire the scheduler resolves that
+    provider's stored API key and sends it to the URL, exfiltrating the
+    credential (CWE-200/CWE-522). Allow a ``base_url`` override only when it
+    cannot leak a stored secret: no override at all, a configured custom/byok
+    provider that carries its own endpoint+key, or an override whose host
+    matches the named provider's own endpoint.
+
+    Returns an error string if blocked, else None (valid).
+    """
+    bu = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+    if not bu:
+        return None
+    prov = _normalize_optional_job_value(provider)
+    if not prov:
+        # A base_url with no explicit provider inherits the default/session
+        # provider's stored key — the same exfil primitive without naming a
+        # provider. Require an explicit (custom) provider for custom endpoints.
+        return (
+            "base_url override requires an explicit provider. Set provider to a "
+            "configured custom provider to use a custom endpoint."
+        )
+    try:
+        from hermes_cli.runtime_provider import (
+            has_named_custom_provider,
+            resolve_requested_provider,
+            _get_named_custom_provider,
+        )
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from utils import base_url_host_matches, base_url_hostname
+    except Exception:
+        # Can't resolve provider metadata -> fail closed.
+        return f"Unable to validate base_url override for provider {prov!r}; refused."
+
+    if prov.lower() == "custom":
+        # Bare/inline 'custom' (and aliases that resolve to it) is pure BYOK: the
+        # runtime derives the key from a pool keyed by THIS base_url or from
+        # host-gated env vars, never an arbitrary stored secret. Safe to allow.
+        return None
+    if has_named_custom_provider(prov):
+        # A NAMED custom provider carries a STORED key, and
+        # _resolve_named_custom_runtime prefers the override base_url while still
+        # sending that stored key — so an off-host override exfiltrates it.
+        # Require the override host to match the provider's CONFIGURED endpoint.
+        try:
+            cp = _get_named_custom_provider(prov)
+        except Exception:
+            cp = None
+        cfg_host = base_url_hostname((cp or {}).get("base_url", "")) if cp else ""
+        if cfg_host and base_url_host_matches(bu, cfg_host):
+            return None
+        return (
+            f"base_url {bu!r} is not allowed for provider {prov!r}. A named "
+            f"custom provider's stored credential may only be sent to its own "
+            f"configured endpoint ({cfg_host or 'unknown'})."
+        )
+    try:
+        resolved = resolve_requested_provider(prov)
+    except Exception:
+        resolved = prov
+    pconfig = PROVIDER_REGISTRY.get(resolved) if isinstance(resolved, str) else None
+    known_host = base_url_hostname(getattr(pconfig, "inference_base_url", "") if pconfig else "")
+    if known_host and base_url_host_matches(bu, known_host):
+        return None
+    # Fail closed: any non-custom provider we cannot host-match to its own
+    # endpoint is refused. This covers named providers with a stored credential
+    # AND aliases/unknown names we can't resolve to a known host (e.g. "openai",
+    # "google"), which would otherwise pair a stored key with the override URL.
+    return (
+        f"base_url {bu!r} is not allowed for provider {prov!r}. A named "
+        f"provider's stored credential may only be sent to its own endpoint; "
+        f'use a configured custom provider (provider="custom") for a custom base_url.'
+    )
 
 
 def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
@@ -518,10 +586,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
-    if job.get("profile"):
-        result["profile"] = job["profile"]
     if job.get("on_failure"):
         result["on_failure"] = job["on_failure"]
+    if job.get("repair_script"):
+        result["repair_script"] = job["repair_script"]
     return result
 
 
@@ -547,12 +615,85 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
-            return {"claimed": False, "success": False,
-                    "error": "Job is already being fired by the scheduler; not run again."}
+            # claim_job_for_fire returns False for paused/disabled/missing
+            # jobs too — don't mislabel those as "already being fired"
+            # (#60703): that message sends the user chasing a phantom
+            # in-flight run when the job simply isn't runnable.
+            refreshed = get_job(job_id)
+            if refreshed is None:
+                reason = "Job no longer exists; nothing to run."
+            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                reason = "Job is paused/disabled; resume it before running."
+            else:
+                reason = "Job is already being fired by the scheduler; not run again."
+            return {"claimed": False, "success": False, "error": reason}
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        #
+        # A manual `run` executes the job synchronously on the caller's thread,
+        # and a cron job is itself a full agent run that routinely takes
+        # minutes. The calling turn emits no tool activity for that entire
+        # window, so the gateway inactivity watchdog concludes the agent is
+        # hung and kills the parent turn (#76502). Fire a heartbeat into the
+        # caller's activity tracker (the same signal tool progress uses) while
+        # the job runs, so the watchdog sees a working tool instead of a
+        # silent one — mirrors the delegate_task heartbeat pattern. Best-effort:
+        # if no activity callback is registered (direct Python callers, tests),
+        # behavior is unchanged.
+        try:
+            from tools.environments.base import get_activity_callback
+
+            # Capture on THIS thread: the callback is thread-local (installed
+            # by the tool executor as the calling agent's _touch_activity), so
+            # a freshly spawned thread cannot read it back.
+            activity_cb = get_activity_callback()
+        except Exception:
+            activity_cb = None
+
+        _heartbeat_stop = threading.Event()
+        _heartbeat_thread = None
+
+        if activity_cb is not None:
+            job_name = str(job.get("name") or job_id)
+
+            def _heartbeat_loop() -> None:
+                started = time.monotonic()
+                while not _heartbeat_stop.wait(_CRON_RUN_HEARTBEAT_INTERVAL):
+                    elapsed = time.monotonic() - started
+                    if elapsed > _CRON_RUN_HEARTBEAT_CEILING:
+                        # Stop masking the gateway watchdog — a run this long
+                        # with an unlimited child watchdog is likely wedged.
+                        logger.warning(
+                            "cronjob run heartbeat ceiling reached for job "
+                            "'%s' (%.0fs) — stopping heartbeat; gateway "
+                            "watchdog regains authority",
+                            job_name, elapsed,
+                        )
+                        return
+                    try:
+                        activity_cb(
+                            f"cronjob: running job '{job_name}' ({int(elapsed)}s elapsed)"
+                        )
+                    except Exception:
+                        # Never break the job run; keep heartbeating — one
+                        # transient callback error must not silently drop
+                        # watchdog protection for the rest of a long job.
+                        continue
+
+            _heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop,
+                daemon=True,
+                name="cronjob-run-heartbeat",
+            )
+            _heartbeat_thread.start()
+
+        try:
+            processed = run_one_job(job)
+        finally:
+            _heartbeat_stop.set()
+            if _heartbeat_thread is not None:
+                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -592,6 +733,7 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     on_failure: Optional[str] = None,
+    repair_script: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -629,6 +771,16 @@ def cronjob(
                 script_error = _validate_cron_script_path(script)
                 if script_error:
                     return tool_error(script_error, success=False)
+            if repair_script:
+                repair_error = _validate_cron_script_path(repair_script)
+                if repair_error:
+                    return tool_error(repair_error, success=False)
+
+            # Reject a model-supplied base_url that would route a named
+            # provider's stored credential to an attacker endpoint (F8).
+            base_url_error = _validate_cron_base_url(provider, base_url)
+            if base_url_error:
+                return tool_error(base_url_error, success=False)
 
             # Validate context_from references existing jobs
             if context_from:
@@ -654,6 +806,7 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                repair_script=_normalize_optional_job_value(repair_script),
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
@@ -752,12 +905,18 @@ def cronjob(
             # _execute_job_now advances next_run_at and blocks a concurrent tick
             # from double-firing.
             exec_result = _execute_job_now(job)
+            # A claimed direct run advances next_run_at and may race the
+            # external one-shot for the same occurrence. If Chronos loses that
+            # claim, its consumed fire cannot re-arm itself; reconcile from the
+            # winning direct path after the run has persisted its final state.
+            if exec_result.get("claimed", False):
+                _notify_provider_jobs_changed_safe()
             # Re-read so the response reflects the post-run last_run_at/last_status.
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
-                result["execution_skipped"] = (
+                result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
             elif exec_result.get("error"):
@@ -785,6 +944,25 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
+            # only when this update supplies provider/base_url. A job persisted
+            # before this guard (or written directly to the jobs store) may
+            # already hold an unsafe named-provider + off-host base_url pair;
+            # if we only checked when the update touches those axes, editing any
+            # unrelated field (name, schedule, ...) would succeed and leave that
+            # exfil-capable pair active and schedulable (F8). The effective pair
+            # merges this update's normalized values over the stored job; an
+            # operator can still remediate in the same update by clearing
+            # base_url or pointing provider/base_url at a safe pair.
+            eff_provider = (
+                updates["provider"] if "provider" in updates else job.get("provider")
+            )
+            eff_base_url = (
+                updates["base_url"] if "base_url" in updates else job.get("base_url")
+            )
+            base_url_error = _validate_cron_base_url(eff_provider, eff_base_url)
+            if base_url_error:
+                return tool_error(base_url_error, success=False)
             if script is not None:
                 # Pass empty string to clear an existing script
                 if script:
@@ -834,6 +1012,13 @@ def cronjob(
                 updates["no_agent"] = target_no_agent
             if on_failure is not None:
                 updates["on_failure"] = _normalize_optional_job_value(on_failure) or None
+            if repair_script is not None:
+                normalized_repair = _normalize_optional_job_value(repair_script)
+                if normalized_repair:
+                    repair_error = _validate_cron_script_path(normalized_repair)
+                    if repair_error:
+                        return tool_error(repair_error, success=False)
+                updates["repair_script"] = normalized_repair or None
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -915,21 +1100,6 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
             },
-            "model": {
-                "type": "object",
-                "description": "Optional per-job model override. If provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
-                "properties": {
-                    "provider": {
-                        "type": "string",
-                        "description": "Provider name (e.g. 'openrouter', 'anthropic', or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
-                    }
-                },
-                "required": ["model"]
-            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
@@ -952,13 +1122,18 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "repair_script": {
+                "type": "string",
+                "description": f"Trusted local repair executable for opt-in no_agent failure recovery. It runs with the scheduler user's OS authority and is not sandboxed. Relative paths resolve under {display_hermes_home()}/scripts/. It receives bounded JSON on stdin and must emit one strict JSON result. Required when on_failure is not off. On update, pass empty string together with on_failure='off' to clear."
+            },
             "on_failure": {
                 "type": "string",
+                "enum": ["off", "repair_only", "rerun_once"],
                 "description": (
                     "Optional failure policy for no_agent jobs. Default/off keeps classic no-token failure alerts. "
-                    "Use 'repair_only' to run one agent triage pass that may safely repair the local script/helper for future runs. "
-                    "Use 'rerun_once' only for safe/idempotent jobs (for example CC tmux resume/nudge): after a successful repair the scheduler reruns the script exactly once. "
-                    "On update, pass empty string to clear."
+                    "Non-off policies require a distinct trusted repair_script; no LLM is invoked. "
+                    "repair_only runs the repair script for future ticks. rerun_once reruns the original script exactly once only after a valid repair result explicitly authorizes it. "
+                    "On update, use 'off' and clear repair_script together."
                 ),
             },
             "context_from": {
@@ -1022,7 +1197,7 @@ registry.register(
     name="cronjob",
     toolset="cronjob",
     schema=CRONJOB_SCHEMA,
-    handler=lambda args, **kw: (lambda _mo=_resolve_model_override(args.get("model")): cronjob(
+    handler=lambda args, **kw: cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
@@ -1033,18 +1208,21 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        model=_mo[1],
-        provider=_mo[0] or args.get("provider"),
-        base_url=args.get("base_url"),
+        # model / provider / base_url are intentionally NOT read from the
+        # agent's arguments: per-job inference pins are user-owned (dashboard,
+        # `hermes cron create/edit --model`, or hand-edited jobs). The agent
+        # must not be able to point unattended spend at a different model.
+        # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
+        repair_script=args.get("repair_script"),
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         on_failure=args.get("on_failure"),
         task_id=kw.get("task_id"),
-    ))(),
+    ),
     check_fn=check_cronjob_requirements,
     emoji="⏰",
 )
