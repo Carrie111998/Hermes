@@ -20,7 +20,7 @@ from starlette.requests import Request
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers
-from hermes_cli.dashboard_auth import token_auth
+from hermes_cli.dashboard_auth import middleware, token_auth
 from hermes_cli.dashboard_auth.routes import (
     _PW_RATE_MAX_ATTEMPTS,
     _client_ip,
@@ -28,9 +28,15 @@ from hermes_cli.dashboard_auth.routes import (
 )
 
 
-# Both call sites carry an identical helper; every case below must hold for
+# THREE call sites carry an identical helper; every case below must hold for
 # each of them, so they are parametrized rather than duplicated.
-_HELPERS = (_client_ip, token_auth._client_ip)
+#
+# middleware._client_ip was missing from this list while this PR patched it,
+# so the one copy that feeds the audit log's ip= field on every authenticated
+# request was changed with nothing exercising it. A helper tuple that silently
+# lags the call sites is worse than no parametrization, because the coverage it
+# implies is the reason nobody looks again.
+_HELPERS = (_client_ip, token_auth._client_ip, middleware._client_ip)
 
 
 def _req(peer, xff=None) -> Request:
