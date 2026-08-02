@@ -18329,9 +18329,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         audio_path = None
         actual_path = None
         try:
+            from gateway.platforms.base import BasePlatformAdapter
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            # Auto-TTS runs before the normal outbound media extraction path.
+            # Clean a copy with the same canonical display rules so attachment
+            # directives and local paths are never spoken aloud; keep ``text``
+            # unchanged for the later attachment-delivery pass (#76620).
+            display_text = BasePlatformAdapter.strip_media_directives_for_display(text)
+            tts_text = _strip_markdown_for_tts(display_text[:4000])
             if not tts_text:
                 return
 

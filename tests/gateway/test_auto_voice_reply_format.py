@@ -52,6 +52,40 @@ class TestAutoVoiceReplyFormat:
         adapter.send_voice.assert_awaited_once()
         assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".ogg")
 
+    @pytest.mark.asyncio
+    async def test_auto_voice_reply_strips_media_directives_before_tts(self):
+        """Auto-TTS speaks visible text, not native attachment paths (#76620)."""
+        runner = _make_runner()
+        adapter = _make_adapter(Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        event = _make_event(Platform.TELEGRAM)
+        synthesized_text = []
+
+        response = (
+            "Capture ready.\n\n"
+            "[[as_document]]\n"
+            "MEDIA:/private/tmp/hermes-capture.png"
+        )
+
+        def fake_tts(*, text, output_path):
+            synthesized_text.append(text)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(b"fake ogg opus")
+            return json.dumps({
+                "success": True,
+                "file_path": output_path,
+                "provider": "edge",
+                "voice_compatible": True,
+            })
+
+        with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
+            await runner._send_voice_reply(event, response)
+
+        assert synthesized_text == ["Capture ready."]
+        assert "MEDIA:" in response
+        assert "/private/tmp/hermes-capture.png" in response
+        adapter.send_voice.assert_awaited_once()
+
     def test_should_send_voice_reply_streamed_global_auto_tts_fires(self):
         """Streamed reply + global voice.auto_tts (no /voice opt-in) sends voice.
 
