@@ -2704,6 +2704,7 @@ class WorkflowEngine:
                             for other_nid, other_node in workflow.nodes.items()
                             if other_nid != nid
                         )
+                        print(f"   DEBUG: {nid} is_reviewer={is_reviewer}")
                         if is_reviewer:
                             state.status = "pending"
                             print(f"   ⏳ {nid} — REVIEWER (will be dispatched by supervisor)")
@@ -2897,10 +2898,24 @@ class WorkflowEngine:
                 state.started_at = datetime.now(timezone.utc).isoformat()
                 state.attempts += 1
 
+                # Detect if this node is a reviewer for another node
+                # and inject review context header into the card body.
+                _review_body_prefix = ""
+                for _up_nid, _up_node in workflow.nodes.items():
+                    if _up_nid != nid and nid in (_up_node.reviews or []):
+                        _up_card = states.get(_up_nid, NodeState(nid)).kanban_card_id or "unknown"
+                        _review_body_prefix = (
+                            f"You are reviewing the output of node '{_up_nid}' "
+                            f"(task {_up_card}). Read the card body and "
+                            f"completion summary of that task to find the work.\n\n"
+                        )
+                        break
+
                 try:
                     card_id = self.dispatch_node(
                         state, node, context,
                         workflow=workflow, states=states, layers=layers,
+                        body_prefix=_review_body_prefix,
                     )
                     if card_id is None:
                         # scope: global — in-process, no card to monitor
