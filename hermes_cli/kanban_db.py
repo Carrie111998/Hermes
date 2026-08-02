@@ -8840,7 +8840,7 @@ def _resolve_hermes_argv() -> list[str]:
        semantics and never prefer a same-directory file before ``PATH``.
     2. ``shutil.which("hermes")`` — the console-script shim, normalized to
        an absolute path. On Windows, ``which`` can return a relative
-       ``.\hermes.CMD`` when the current directory is on ``PATH``; directly
+       ``.\\hermes.CMD`` when the current directory is on ``PATH``; directly
        launching batch shims is also unsafe with task-derived argv. The
        dispatcher therefore falls back to the interpreter-bound module form
        for implicit ``.cmd`` / ``.bat`` shims.

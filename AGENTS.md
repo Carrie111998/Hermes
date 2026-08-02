@@ -220,3 +220,19 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## Learned User Preferences
+
+- Hermes系再起動は、デスクトップ再ビルド（`hermes desktop --build-only --force-build`）＋ llama ホットスタンバイ（`-StartLlama`）。この経路では `--skip-build` / worktree 起動を使わない。
+- Desktop は canonical の packaged `apps/desktop/release/win-unpacked/Hermes.exe`（または同等の release 成果物）から起動する。`.worktrees\...` 上の `npx electron` / `--source --skip-build` は失敗パターンとして避ける。
+- User 環境の `HERMES_DESKTOP_HERMES_ROOT` は canonical リポジトリルートのみ。worktree パスを指させない。
+- 公式（upstream）向け PR は King's English。`_docs/` と fork 専用面は含めない。
+- main への push では環境変数・秘密ファイルをコミットしない。`_docs/` もリモートに載せない。
+- スキン壁紙（`background_image`）を有効にするときは、チャット本文が読めるコントラスト／オーバーレイを必須とする。
+
+## Learned Workspace Facts
+
+- Windows の正本チェックアウトは `C:\Users\downl\Documents\New project\hermes-agent` の `main`。Desktop/llama 再起動の RepoRoot に `.worktrees\main-ci-harness-uv` 等を使わない。
+- Remotes: `origin` = zapabob/hermes-agent、`upstream` = NousResearch/hermes-agent。
+- Desktop/llama 再起動の運用入口は `fork/operations/AGENTS.md` と `scripts/windows/`（例: `restart-hermes-stack.ps1`）。
+- ローカル llama サーバーをカスタムプロバイダとして使う想定。このマシンではコンテキスト長 131072 を希望することがある。
