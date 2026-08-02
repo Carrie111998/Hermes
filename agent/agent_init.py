@@ -1835,6 +1835,23 @@ def init_agent(
     _compression_cfg = _agent_cfg.get("compression", {})
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
+    try:
+        from agent.speculative_compression import (
+            DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS,
+            normalize_speculative_compression_settings,
+        )
+
+        agent.speculative_compression_settings = normalize_speculative_compression_settings(
+            _compression_cfg.get("speculative", {})
+        )
+    except Exception:
+        # Config parsing must never prevent the agent from starting.  Keep the
+        # feature disabled if the optional settings reader is unavailable.
+        agent.speculative_compression_settings = (
+            DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS
+            if "DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS" in locals()
+            else None
+        )
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the
@@ -2491,6 +2508,28 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
+    try:
+        from agent.speculative_compression import (
+            get_default_manager,
+            is_builtin_compression_eligible,
+        )
+
+        _spec_settings = agent.speculative_compression_settings
+        agent.speculative_compression_enabled = bool(
+            compression_enabled
+            and _spec_settings
+            and _spec_settings.enabled
+            and is_builtin_compression_eligible(
+                api_mode=agent.api_mode,
+                context_engine=agent.context_compressor,
+            )
+        )
+        agent._speculative_compression_manager = (
+            get_default_manager() if agent.speculative_compression_enabled else None
+        )
+    except Exception:
+        agent.speculative_compression_enabled = False
+        agent._speculative_compression_manager = None
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)

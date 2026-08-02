@@ -49,6 +49,102 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def _try_install_speculative_candidate(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    system_message: str,
+    approx_tokens: int,
+    task_id: str,
+) -> tuple[List[Dict[str, Any]], Optional[str], bool, bool]:
+    """Consume a ready candidate only at soft/hard foreground pressure.
+
+    The final lock/fingerprint validation lives in ``compress_context``.  The
+    boolean pair is ``(installed, hard_pressure)``; callers use hard pressure
+    to force the existing synchronous compression fallback when no candidate
+    is usable.
+    """
+
+    settings = getattr(agent, "speculative_compression_settings", None)
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    compressor = getattr(agent, "context_compressor", None)
+    if (
+        not getattr(agent, "speculative_compression_enabled", False)
+        or settings is None
+        or manager is None
+        or compressor is None
+    ):
+        return messages, None, False, False
+    try:
+        from agent.speculative_compression import (
+            is_builtin_compression_eligible,
+            speculative_thresholds,
+        )
+
+        if not is_builtin_compression_eligible(
+            api_mode=getattr(agent, "api_mode", None),
+            context_engine=compressor,
+        ):
+            return messages, None, False, False
+        _soft_trigger, hard_trigger = speculative_thresholds(compressor, settings)
+    except Exception:
+        return messages, None, False, False
+
+    hard_pressure = int(approx_tokens or 0) >= hard_trigger
+    if hard_pressure:
+        # Anti-thrash guard: when the live compressor has backed off because
+        # recent passes saved <10% ("ineffective"), do NOT force the
+        # synchronous fallback — that is exactly the freeze/thrash loop
+        # #40803/#11529 exists to prevent. A ready candidate is still
+        # installable (its summary LLM call already happened on the worker);
+        # only the forced re-compression is suppressed.
+        _info_fn = getattr(compressor, "should_compress_info", None)
+        if callable(_info_fn):
+            try:
+                _info_result = _info_fn(approx_tokens)
+                _block_reason = (
+                    _info_result[1]
+                    if isinstance(_info_result, tuple) and len(_info_result) > 1
+                    else None
+                )
+            except Exception:
+                _block_reason = None
+            if _block_reason == "ineffective":
+                hard_pressure = False
+    try:
+        normal_pressure = bool(compressor.should_compress(approx_tokens))
+    except Exception:
+        normal_pressure = False
+    if not hard_pressure and not normal_pressure:
+        return messages, None, False, False
+
+    wait_seconds = settings.hard_wait_seconds if hard_pressure else 0.0
+    candidate = manager.take_matching_candidate(
+        str(getattr(agent, "session_id", "") or ""),
+        messages,
+        wait_seconds=wait_seconds,
+        max_age_seconds=settings.max_age_seconds,
+    )
+    if candidate is None:
+        return messages, None, False, hard_pressure
+    try:
+        compressed, active_system_prompt = agent._compress_context(
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            speculative_candidate=candidate,
+        )
+    except Exception:
+        # Any install failure (candidate splice, durable commit, system-prompt
+        # rebuild) degrades to the unchanged synchronous path — the optional
+        # speculative path must never crash the turn.
+        logger.debug("speculative candidate install failed", exc_info=True)
+        return messages, None, False, hard_pressure
+    if getattr(agent, "_speculative_install_status", None) != "installed":
+        return messages, None, False, hard_pressure
+    return compressed, active_system_prompt, True, hard_pressure
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -796,6 +892,37 @@ def build_turn_context(
             lambda: None,
         )()
 
+        _speculative_preflight_compressed = False
+        _speculative_hard_pressure = False
+        if not _preflight_deferred and not _compression_cooldown and not _codex_native_auto:
+            (
+                _speculative_messages,
+                _speculative_prompt,
+                _speculative_preflight_compressed,
+                _speculative_hard_pressure,
+            ) = _try_install_speculative_candidate(
+                agent,
+                messages,
+                system_message,
+                _preflight_tokens,
+                effective_task_id,
+            )
+            if _speculative_preflight_compressed:
+                _preflight_compressed = True
+                messages = _speculative_messages
+                active_system_prompt = _speculative_prompt or active_system_prompt
+                conversation_history = conversation_history_after_compression(
+                    agent, messages, conversation_history
+                )
+                _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+                if callable(_clear_warn):
+                    _clear_warn()
+                agent._empty_content_retries = 0
+                agent._thinking_prefill_retries = 0
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+                agent._mute_post_response = False
+
         _should_compress_now = False
         _compress_block_reason = None
         if _preflight_deferred:
@@ -825,7 +952,10 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            _should_compress_now = (
+                _compressor.should_compress(_preflight_tokens)
+                or _speculative_hard_pressure
+            )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -839,7 +969,9 @@ def build_turn_context(
                         _compress_block_reason = _info(_preflight_tokens)[1]
                     except Exception:
                         _compress_block_reason = None
-        if _should_compress_now:
+        if _speculative_preflight_compressed:
+            pass
+        elif _should_compress_now:
             _preflight_compressed = True
             # Compression is actually running (block cleared / was never
             # blocked) — reset the dedup so a future blocked-over-threshold

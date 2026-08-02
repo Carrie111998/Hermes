@@ -37,6 +37,9 @@ test_durations.json
 tmp/
 temp_vision_images/
 hermes-*/*
+# Explicit user-owned daily maintenance history; the job retains only 15 days.
+!hermes-memory/
+!hermes-memory/memory-distillation-log.md
 examples/
 tests/quick_test_dataset.jsonl
 tests/sample_dataset.jsonl

@@ -2811,6 +2811,97 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_post_tool_loop_installs_ready_speculative_candidate(self, agent):
+        from agent.speculative_compression import SpeculativeCompressionSettings
+
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.speculative_compression_enabled = True
+        agent.speculative_compression_settings = SpeculativeCompressionSettings(
+            enabled=True,
+            start_ratio=0.01,
+            hard_ratio=0.02,
+        )
+        candidate = object()
+
+        class CandidateManager:
+            def __init__(self):
+                self.take_calls = []
+
+            def maybe_start(self, *_args, **_kwargs):
+                return "started"
+
+            def take_matching_candidate(self, session_id, messages, **kwargs):
+                self.take_calls.append((session_id, messages, kwargs))
+                return candidate if len(messages) >= 3 else None
+
+        manager = CandidateManager()
+        agent._speculative_compression_manager = manager
+        agent.context_compressor.last_prompt_tokens = 0
+        tool_complete = False
+
+        def execute_tool(*_args, **_kwargs):
+            nonlocal tool_complete
+            tool_complete = True
+            return "tool result"
+
+        def should_compress(_tokens):
+            return tool_complete
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        def install_candidate(messages, _system_message, **kwargs):
+            nonlocal tool_complete
+            assert kwargs["speculative_candidate"] is candidate
+            agent._speculative_install_status = "installed"
+            agent._last_compression_attempt_recorded = True
+            agent._last_compression_attempt_in_place = True
+            agent._last_compaction_in_place = True
+            tool_complete = False
+            return (
+                [
+                    {"role": "user", "content": "prepared summary"},
+                    *messages[1:],
+                ],
+                "prepared system prompt",
+            )
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=execute_tool),
+            patch.object(
+                agent.context_compressor,
+                "should_compress",
+                side_effect=should_compress,
+            ),
+            patch.object(
+                agent, "_compress_context", side_effect=install_candidate
+            ) as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Done searching"
+        assert compress.call_count == 1
+        assert manager.take_calls
+        assert len(manager.take_calls[-1][1]) >= 3
+        assert result["messages"][0]["content"] == "prepared summary"
+        assert result["messages"][-1]["content"] == "Done searching"
+        assert any(
+            message.get("role") == "system"
+            and message.get("content") == "prepared system prompt"
+            for message in agent.client.chat.completions.create.call_args_list[-1].kwargs[
+                "messages"
+            ]
+        )
+        assert agent._empty_content_retries == 0
+        assert agent._thinking_prefill_retries == 0
+        assert agent._mute_post_response is False
+
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
@@ -5823,4 +5914,5 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
 

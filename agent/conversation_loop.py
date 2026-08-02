@@ -40,6 +40,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
+    _try_install_speculative_candidate,
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
@@ -6276,6 +6277,28 @@ def run_conversation(
                     except Exception:
                         pass
 
+                # Tool execution is the v1 overlap window. The worker receives
+                # an immutable snapshot after the assistant tool-call row is
+                # durable and before any external tool can append results.
+                try:
+                    from agent.speculative_compression import (
+                        schedule_tool_wait_candidate,
+                    )
+
+                    _tool_wait_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=system_message or "",
+                        tools=agent.tools or None,
+                    )
+                    schedule_tool_wait_candidate(
+                        agent, messages, _tool_wait_tokens
+                    )
+                except Exception:
+                    logger.debug(
+                        "tool-wait speculative compression scheduling failed",
+                        exc_info=True,
+                    )
+
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
@@ -6366,10 +6389,63 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                _post_tool_speculative_installed = False
+                _post_tool_hard_pressure = False
                 if (
                     agent.compression_enabled
+                    and getattr(agent, "speculative_compression_enabled", False)
                     and compression_attempts < max_compression_attempts
-                    and _compressor.should_compress(_real_tokens)
+                ):
+                    _post_tool_cooldown = getattr(
+                        _compressor,
+                        "get_active_compression_failure_cooldown",
+                        lambda: None,
+                    )()
+                    if not _post_tool_cooldown:
+                        (
+                            _speculative_messages,
+                            _speculative_prompt,
+                            _post_tool_speculative_installed,
+                            _post_tool_hard_pressure,
+                        ) = _try_install_speculative_candidate(
+                            agent,
+                            messages,
+                            system_message,
+                            _real_tokens,
+                            effective_task_id,
+                        )
+
+                if _post_tool_speculative_installed:
+                    compression_attempts += 1
+                    _clear_warn = getattr(
+                        agent, "_clear_context_overflow_warn", None
+                    )
+                    if callable(_clear_warn):
+                        _clear_warn()
+                    agent._safe_print("  ⟳ compacting context…")
+                    messages = _speculative_messages
+                    active_system_prompt = _speculative_prompt or active_system_prompt
+                    conversation_history = conversation_history_after_compression(
+                        agent, messages, conversation_history
+                    )
+                    agent._empty_content_retries = 0
+                    agent._thinking_prefill_retries = 0
+                    agent._last_content_with_tools = None
+                    agent._last_content_tools_all_housekeeping = False
+                    agent._mute_post_response = False
+                    _real_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
+                    approx_tokens = _real_tokens
+                elif (
+                    agent.compression_enabled
+                    and compression_attempts < max_compression_attempts
+                    and (
+                        _post_tool_hard_pressure
+                        or _compressor.should_compress(_real_tokens)
+                    )
                 ):
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was
