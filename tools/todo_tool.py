@@ -1693,7 +1693,10 @@ TODO_SCHEMA = {
                 "description": (
                     "For exact GPT-5.6 on the verified OpenAI Codex Responses "
                     "backend only: request reasoning depth for later model calls "
-                    "in this current turn. You decide the effort; "
+                    "in this current turn. The responsive baseline is medium. "
+                    "For complex, long-running, high-risk, or deep analytical work, "
+                    "raise effort in your first plan call before continuing. You "
+                    "decide the effort from the full conversation context; "
                     "the runtime only validates the operator's baseline/cap and returns "
                     "a receipt. You may choose max for the most demanding work. "
                     "The mechanical policy receipt rejects any effort unavailable "

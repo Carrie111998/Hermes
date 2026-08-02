@@ -118,6 +118,7 @@ def test_plan_is_read_only_and_binds_exact_target(tmp_path, monkeypatch):
     assert "agent.verify_on_stop=true" in plan["mutations"]
     assert "agent.verification_ledger_enabled=true" in plan["mutations"]
     assert "agent.gateway_notify_interval=180" in plan["mutations"]
+    assert "agent.reasoning_effort=medium" in plan["mutations"]
     assert "display.busy_input_mode=steer" in plan["mutations"]
     assert "display.show_commentary=true" in plan["mutations"]
     assert (
@@ -147,6 +148,7 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
     assert receipt["mutations"] == list(module.MUTATIONS)
     assert Path(receipt["backup_path"]).read_bytes() == before
     effective = yaml.safe_load(path.read_text())
+    assert effective["agent"]["reasoning_effort"] == "medium"
     assert effective["agent"]["adaptive_reasoning"] == {
         "enabled": True,
         "max_effort": "max",
@@ -316,6 +318,16 @@ def test_target_pins_discord_policy_and_preserves_other_display_preferences():
         "busy_ack_detail": False,
         "busy_steer_ack_enabled": False,
     }
+
+
+def test_target_accepts_already_migrated_medium_reasoning_baseline():
+    module = _load()
+    source = yaml.safe_load(_config())
+    source["agent"]["reasoning_effort"] = "medium"
+
+    effective = module._target_mapping(source)
+
+    assert effective["agent"]["reasoning_effort"] == "medium"
 
 
 @pytest.mark.parametrize(

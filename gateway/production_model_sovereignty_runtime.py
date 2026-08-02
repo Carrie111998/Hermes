@@ -213,6 +213,8 @@ _PLATFORMS = {
     "relay": _RELAY_PLATFORM,
 }
 _PRODUCTION_GATEWAY_NOTIFY_INTERVAL = 180
+_PRODUCTION_REASONING_BASELINE = "medium"
+_MIGRATABLE_REASONING_BASELINES = frozenset({"medium", "high"})
 _PRODUCTION_GLOBAL_DISPLAY_POLICY = {
     # Bare text sent while a turn is active augments that turn after its next
     # atomic action. Explicit /stop remains the dedicated hard-stop command.
@@ -480,7 +482,10 @@ def overlay_production_gateway_config(
         raise ProductionContractError("production_model_route_drifted")
 
     agent = _mapping(target, "agent")
-    if agent.get("reasoning_effort") != "high" or agent.get("max_turns") != 90:
+    if (
+        agent.get("reasoning_effort") not in _MIGRATABLE_REASONING_BASELINES
+        or agent.get("max_turns") != 90
+    ):
         raise ProductionContractError("production_agent_baseline_drifted")
     if (
         agent.get("task_completion_guidance") is not True
@@ -506,7 +511,7 @@ def overlay_production_gateway_config(
             raise ProductionContractError(
                 "production_agent_proof_gate_source_drifted"
             )
-    agent["reasoning_effort"] = "high"
+    agent["reasoning_effort"] = _PRODUCTION_REASONING_BASELINE
     agent["max_turns"] = 90
     notify_interval_source = agent.get("gateway_notify_interval")
     if (
@@ -737,7 +742,7 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
     agent = raw.get("agent")
     if not isinstance(agent, Mapping) or any(
         (
-            agent.get("reasoning_effort") != "high",
+            agent.get("reasoning_effort") != _PRODUCTION_REASONING_BASELINE,
             agent.get("max_turns") != 90,
             agent.get("gateway_notify_interval")
             != _PRODUCTION_GATEWAY_NOTIFY_INTERVAL,
