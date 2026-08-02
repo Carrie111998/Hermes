@@ -33,14 +33,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (mtime_ns, size, parsed)
+# canonical target path -> (mtime_ns, size, device, inode, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
-# path_key -> (mtime_ns, size), or None when even stat/read failed. This does
+# canonical target path -> (mtime_ns, size, device, inode), or None when even
+# stat/read failed. This
 # not change managed scope's startup-safe fail-open merge semantics; it lets
 # security-sensitive request guards detect that current administrator policy
 # is degraded and choose a stricter local behavior.
-_CONFIG_FAILURE_BY_PATH: Dict[str, Optional[tuple[int, int]]] = {}
+_CONFIG_FAILURE_BY_PATH: Dict[str, Optional[tuple[int, int, int, int]]] = {}
 
 
 def _under_pytest() -> bool:
@@ -84,14 +85,22 @@ def invalidate_managed_cache() -> None:
         _CONFIG_FAILURE_BY_PATH.clear()
 
 
+def _cache_path_key(path: Path) -> str:
+    """Canonical target identity seam for symlink-safe managed caches."""
+    try:
+        return str(path.resolve(strict=False))
+    except OSError:
+        return str(path.absolute())
+
+
 def _cached_read(
     path: Path,
     cache: Dict[str, tuple],
     parse,
     *,
-    failure_cache: Optional[Dict[str, Optional[tuple[int, int]]]] = None,
+    failure_cache: Optional[Dict[str, Optional[tuple[int, int, int, int]]]] = None,
 ):
-    """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
+    """Target-identity-keyed read. Returns a deepcopy of the parsed value.
 
     Returns ``None`` when the file is absent or fails to parse (fail-open). A
     parse failure is logged LOUDLY — the admin needs to know their policy isn't
@@ -99,7 +108,7 @@ def _cached_read(
     startup. ``failure_cache`` records only the current degraded file state for
     security-sensitive consumers; normal managed-overlay behavior is unchanged.
     """
-    path_key = str(path)
+    path_key = _cache_path_key(path)
     try:
         st = path.stat()
     except FileNotFoundError:
@@ -118,13 +127,13 @@ def _cached_read(
             exc,
         )
         return None
-    key = (st.st_mtime_ns, st.st_size)
+    key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     with _CACHE_LOCK:
         hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
+        if hit is not None and hit[:4] == key:
             if failure_cache is not None:
                 failure_cache.pop(path_key, None)
-            return copy.deepcopy(hit[2])
+            return copy.deepcopy(hit[4])
     try:
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
@@ -140,7 +149,7 @@ def _cached_read(
         )
         return None
     with _CACHE_LOCK:
-        cache[path_key] = (key[0], key[1], copy.deepcopy(parsed))
+        cache[path_key] = (*key, copy.deepcopy(parsed))
         if failure_cache is not None:
             failure_cache.pop(path_key, None)
     return parsed
@@ -180,7 +189,7 @@ def managed_config_load_degraded() -> bool:
     config_path = managed_dir / "config.yaml"
     load_managed_config()  # refresh signature-bound success/failure state
     with _CACHE_LOCK:
-        return str(config_path) in _CONFIG_FAILURE_BY_PATH
+        return _cache_path_key(config_path) in _CONFIG_FAILURE_BY_PATH
 
 
 def load_managed_env() -> Dict[str, str]:

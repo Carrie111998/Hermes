@@ -32,7 +32,7 @@ def _write_raw_config(monkeypatch, tmp_path, text):
     (home / "config.yaml").write_text(text, encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     config_mod._LOAD_CONFIG_CACHE.clear()
-    getattr(config_mod, "_LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH").clear()
+    getattr(config_mod, "_LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH").clear()
     config_mod._RAW_CONFIG_CACHE.clear()
     config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
     getattr(config_mod, "_CONFIG_LOAD_FAILURE_BY_PATH").clear()
@@ -198,7 +198,7 @@ def test_managed_path_change_invalidates_identical_metadata_cache(
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_a))
     managed_scope.invalidate_managed_cache()
     config_mod._LOAD_CONFIG_CACHE.clear()
-    getattr(config_mod, "_LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH").clear()
+    getattr(config_mod, "_LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH").clear()
     first_kwargs = {"extra_body": {"provider": {"zdr": False}}}
     enforce_openrouter_zdr(
         first_kwargs,
@@ -208,6 +208,60 @@ def test_managed_path_change_invalidates_identical_metadata_cache(
     assert first_kwargs["extra_body"]["provider"]["zdr"] is False
 
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_b))
+    second_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        second_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert second_kwargs["extra_body"]["provider"]["zdr"] is True
+    assert config_mod.load_config_readonly()["openrouter"]["zdr"] is True
+
+
+def test_managed_symlink_retarget_invalidates_identical_metadata_cache(
+    monkeypatch, tmp_path
+):
+    import os
+
+    config_mod = _write_raw_config(
+        monkeypatch, tmp_path, "openrouter:\n  zdr: false\n"
+    )
+    from hermes_cli import managed_scope
+
+    managed_a = tmp_path / "managed-link-a"
+    managed_b = tmp_path / "managed-link-b"
+    managed_a.mkdir()
+    managed_b.mkdir()
+    false_text = "openrouter:\n  zdr: false\n"
+    true_text = "openrouter:\n  zdr: true\n"
+    width = max(len(false_text), len(true_text))
+    path_a = managed_a / "config.yaml"
+    path_b = managed_b / "config.yaml"
+    path_a.write_text(false_text.ljust(width), encoding="utf-8")
+    path_b.write_text(true_text.ljust(width), encoding="utf-8")
+    shared_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(path_a, ns=(shared_mtime_ns, shared_mtime_ns))
+    os.utime(path_b, ns=(shared_mtime_ns, shared_mtime_ns))
+    assert path_a.stat().st_size == path_b.stat().st_size
+    assert path_a.stat().st_mtime_ns == path_b.stat().st_mtime_ns
+
+    managed_link = tmp_path / "managed-current"
+    managed_link.symlink_to(managed_a, target_is_directory=True)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_link))
+    managed_scope.invalidate_managed_cache()
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    getattr(config_mod, "_LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH").clear()
+    first_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        first_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert first_kwargs["extra_body"]["provider"]["zdr"] is False
+
+    replacement = tmp_path / "managed-next"
+    replacement.symlink_to(managed_b, target_is_directory=True)
+    os.replace(replacement, managed_link)
     second_kwargs = {"extra_body": {"provider": {"zdr": False}}}
     enforce_openrouter_zdr(
         second_kwargs,

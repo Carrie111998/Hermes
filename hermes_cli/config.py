@@ -246,12 +246,12 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
-# User-config path -> resolved managed config path used to build its cached
-# effective config. The path is separate from the fixed-shape tuple for
-# backward compatibility with tests/helpers that inspect cache entries.
-# Managed files in different directories can legitimately share identical
-# (mtime_ns, size), so metadata alone cannot safely identify the policy source.
-_LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH: Dict[str, str] = {}
+# User-config path -> resolved managed target identity used to build its cached
+# effective config. Kept separate from the fixed-shape tuple for backward
+# compatibility with tests/helpers that inspect cache entries. The canonical
+# target path plus device/inode catches both directory changes and stable-link
+# retargets even when target files share identical (mtime_ns, size).
+_LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH: Dict[str, Tuple[str, int, int]] = {}
 # Path -> (mtime_ns, size) for a user config that the canonical loader could
 # not parse/merge. The effective config may be defaults or last-known-good,
 # but privacy-sensitive readers must be able to distinguish that degraded
@@ -3348,12 +3348,24 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         managed_dir = managed_scope.get_managed_dir()
         managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
-        managed_path_key = str(managed_cfg_path) if managed_cfg_path else ""
+        if managed_cfg_path is not None:
+            try:
+                managed_target_path = str(managed_cfg_path.resolve(strict=False))
+            except OSError:
+                managed_target_path = str(managed_cfg_path.absolute())
+        else:
+            managed_target_path = ""
         try:
             mst = managed_cfg_path.stat() if managed_cfg_path else None
             managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+            managed_identity = (
+                managed_target_path,
+                mst.st_dev if mst else 0,
+                mst.st_ino if mst else 0,
+            )
         except OSError:
             managed_sig = (0, 0)
+            managed_identity = (managed_target_path, 0, 0)
 
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
@@ -3374,8 +3386,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cached is not None
             and cache_sig is not None
             and cached[:4] == cache_sig
-            and _LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH.get(path_key)
-            == managed_path_key
+            and _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH.get(path_key)
+            == managed_identity
         ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
@@ -3442,8 +3454,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                             cache_sig[2], cache_sig[3],
                             lkg_copy, _empty_env,
                         )
-                        _LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH[path_key] = (
-                            managed_path_key
+                        _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH[path_key] = (
+                            managed_identity
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
@@ -3473,7 +3485,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
             _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
-            _LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH[path_key] = managed_path_key
+            _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH[path_key] = managed_identity
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
@@ -3481,7 +3493,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return cached_copy
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
-            _LOAD_CONFIG_MANAGED_PATH_BY_USER_PATH.pop(path_key, None)
+            _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH.pop(path_key, None)
         # First-load result is a fresh dict (not aliased to the cache); safe
         # to return directly. For the deepcopy=True path this is the
         # canonical "freshly-built mutable result" the function has always
