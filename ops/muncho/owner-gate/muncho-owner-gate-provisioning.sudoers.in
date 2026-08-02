@@ -1,4 +1,6 @@
 Cmnd_Alias MUNCHO_CLOUD_TRUSTED_SIGNER_PROVISION = /opt/muncho-owner-gate/releases/@RELEASE_SHA@/venv/bin/python -I -B /opt/muncho-owner-gate/releases/@RELEASE_SHA@/bin/muncho-cloud-trusted-signer-provision
 Cmnd_Alias MUNCHO_CLOUD_OBSERVATION_SIGN = /usr/bin/env -i /opt/muncho-owner-gate/releases/@RELEASE_SHA@/venv/bin/python -I -B /opt/muncho-owner-gate/releases/@RELEASE_SHA@/bin/muncho-owner-gate-cloud-observation-signer
+Cmnd_Alias MUNCHO_OWNER_GATE_PREPARATION_READBACK = /opt/muncho-owner-gate/releases/@RELEASE_SHA@/venv/bin/python -I -B /opt/muncho-owner-gate/releases/@RELEASE_SHA@/bin/muncho-owner-gate-preparation-readback
 %google-sudoers ALL=(root) NOPASSWD: MUNCHO_CLOUD_TRUSTED_SIGNER_PROVISION
+%google-sudoers ALL=(root) NOPASSWD: MUNCHO_OWNER_GATE_PREPARATION_READBACK
 %google-sudoers ALL=(muncho-storage-executor) NOPASSWD: MUNCHO_CLOUD_OBSERVATION_SIGN

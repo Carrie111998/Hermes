@@ -158,6 +158,7 @@ def _signed_ingress_envelope(
         phase=phase,
         release_revision=release_revision,
         plan_sha256=plan_sha256,
+        preparation_carrier_sha256="a" * 64,
         release_private_key=release_key,
         now_unix=NOW,
     )

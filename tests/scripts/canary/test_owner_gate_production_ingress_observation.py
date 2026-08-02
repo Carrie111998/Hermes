@@ -23,6 +23,7 @@ from scripts.canary import owner_gate_trust as trust
 
 REVISION = "a" * 40
 PLAN_SHA256 = "b" * 64
+PREPARATION_CARRIER_SHA256 = "c" * 64
 NOW = 1_800_000_000
 
 
@@ -1177,11 +1178,16 @@ def test_release_signed_envelope_round_trip_and_exact_digest_semantics(
         phase="inert",
         release_revision=REVISION,
         plan_sha256=PLAN_SHA256,
+        preparation_carrier_sha256=PREPARATION_CARRIER_SHA256,
         release_private_key=private_key,
         now_unix=NOW,
     )
 
     assert envelope["observer_report_sha256"] == observation["report_sha256"]
+    assert (
+        envelope["preparation_carrier_sha256"]
+        == PREPARATION_CARRIER_SHA256
+    )
     assert envelope["fresh_through_unix"] == observation["fresh_through_unix"]
     assert envelope["signer_key_id"] == key_id
     signed = {key: item for key, item in envelope.items() if key != "envelope_sha256"}
@@ -1224,6 +1230,7 @@ def test_signed_envelope_rejects_wrong_domain_tamper_wrong_key_and_staleness(
             phase="inert",
             release_revision=REVISION,
             plan_sha256=PLAN_SHA256,
+            preparation_carrier_sha256=PREPARATION_CARRIER_SHA256,
             release_private_key=private_key,
             now_unix=NOW,
         )
@@ -1321,16 +1328,17 @@ def test_transport_runs_exact_committed_source_over_bounded_pinned_stdin(
             return ("/usr/bin/env", "-i", "--chdir=/")
 
         @staticmethod
-        def _authorization_snapshot(account: str) -> tuple[str, str, str]:
-            assert account == "owner@example.com"
-            return ("1" * 64, "2" * 64, "3" * 64)
-
-        @staticmethod
-        def _run_remote_input(command: tuple[str, ...], **kwargs: Any):
+        def _run_production_ingress_observer_input(
+            command: tuple[str, ...],
+            **kwargs: Any,
+        ):
             captured["command"] = command
             captured.update(kwargs)
             stdout = ingress._canonical(observation) + b"\n"
-            return subprocess.CompletedProcess(command, 0, stdout, b"")
+            return (
+                subprocess.CompletedProcess(command, 0, stdout, b""),
+                ("1" * 64, "2" * 64, "3" * 64),
+            )
 
     source = b"print('reviewed observer source')\n"
     monkeypatch.setattr(ingress, "_observer_source", lambda revision: (source, "9" * 64))
@@ -1366,29 +1374,20 @@ def test_transport_runs_exact_committed_source_over_bounded_pinned_stdin(
     )
     assert "-c" not in captured["command"]
     assert captured["input_bytes"] == source
-    assert captured["maximum_input_bytes"] == ingress.MAX_REMOTE_SOURCE_BYTES
-    assert captured["maximum_output_bytes"] == ingress.MAX_REMOTE_OUTPUT_BYTES
-    assert captured["timeout_seconds"] == 120
-    assert captured["stable"] == 2
+    assert captured["account"] == "owner@example.com"
+    assert captured.get("stable", 0) == 0
     assert authority["observer_source_sha256"] == "9" * 64
     assert authority["known_hosts_file_sha256"] == hashlib.sha256(
         b"trusted-known-hosts\n"
     ).hexdigest()
 
 
-def test_transport_rejects_authorization_change_after_remote_observation(
+def test_transport_rejects_invalid_bound_authorization_snapshot(
     production_files: _CommandFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     del production_files
     observation = _collect()
-    snapshots = iter(
-        [
-            ("1" * 64, "2" * 64, "3" * 64),
-            ("4" * 64, "5" * 64, "6" * 64),
-        ]
-    )
-
     class Identity:
         @staticmethod
         def account_for_read_only_preflight() -> str:
@@ -1412,18 +1411,19 @@ def test_transport_rejects_authorization_change_after_remote_observation(
             return ("/usr/bin/env", "-i", f"--chdir={chdir}")
 
         @staticmethod
-        def _authorization_snapshot(account: str) -> tuple[str, str, str]:
-            del account
-            return next(snapshots)
-
-        @staticmethod
-        def _run_remote_input(command: tuple[str, ...], **kwargs: Any):
+        def _run_production_ingress_observer_input(
+            command: tuple[str, ...],
+            **kwargs: Any,
+        ):
             del kwargs
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                ingress._canonical(observation) + b"\n",
-                b"",
+            return (
+                subprocess.CompletedProcess(
+                    command,
+                    0,
+                    ingress._canonical(observation) + b"\n",
+                    b"",
+                ),
+                ("1" * 64, "2" * 64, "not-a-digest"),
             )
 
     monkeypatch.setattr(
@@ -1434,7 +1434,7 @@ def test_transport_rejects_authorization_change_after_remote_observation(
     monkeypatch.setattr(ingress.time, "time", lambda: NOW)
     with pytest.raises(
         ingress.ProductionIngressObservationError,
-        match="owner_gate_production_ingress_transport_changed",
+        match="owner_gate_production_ingress_transport_invalid",
     ):
         ingress.OwnerGateProductionIngressTransport(Transport()).observe(
             phase="inert",

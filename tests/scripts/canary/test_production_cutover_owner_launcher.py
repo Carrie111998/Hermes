@@ -3852,6 +3852,166 @@ def test_production_identity_preflight_fails_closed(responses) -> None:
         transport._authorization_snapshot("owner@example.com")
 
 
+def _production_ingress_remote(
+    transport: owner.ProductionCutoverTransport,
+) -> tuple[str, ...]:
+    return (
+        *transport._fixed_remote_environment(chdir="/"),
+        "/usr/bin/python3",
+        "-B",
+        "-I",
+        "-",
+        "inert",
+        "--release-revision",
+        REVISION,
+        "--plan-sha256",
+        "1" * 64,
+    )
+
+
+def test_production_ingress_bound_transport_keeps_three_distinct_fences() -> None:
+    transport = _production_transport()
+    events: list[str] = []
+    snapshot = ("1" * 64, "2" * 64, "3" * 64)
+    transport._owner_identity.require_stable = lambda: events.append("stable")
+    transport._authorization_snapshot = lambda _account: (
+        events.append("authorization") or snapshot
+    )
+    transport._remote_argv = lambda _remote, *, account: (
+        events.append(f"argv:{account}") or ("sealed-gcloud", "ssh")
+    )
+    transport._validate_dry_run = lambda _argv: events.append("dry-run")
+    transport._postflight = lambda: events.append("postflight")
+
+    def observe(argv, **kwargs):
+        assert kwargs["input"] == b"reviewed-observer"
+        assert kwargs["timeout"] == 120.0
+        assert kwargs["stdout"] is subprocess.PIPE
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        assert kwargs["shell"] is False
+        assert kwargs["check"] is False
+        events.append("remote-observer")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=b'{"ok":true}\n',
+            stderr=b"",
+        )
+
+    transport._preflight_runner = observe
+    completed, authority = transport._run_production_ingress_observer_input(
+        _production_ingress_remote(transport),
+        account="owner@example.com",
+        input_bytes=b"reviewed-observer",
+    )
+
+    assert completed.returncode == 0
+    assert authority == snapshot
+    assert events == [
+        "stable",
+        "authorization",
+        "argv:owner@example.com",
+        "dry-run",
+        "authorization",
+        "remote-observer",
+        "postflight",
+        "stable",
+        "authorization",
+    ]
+
+
+def test_production_ingress_bound_transport_rejects_pre_remote_drift() -> None:
+    transport = _production_transport()
+    snapshots = iter(
+        [
+            ("1" * 64, "2" * 64, "3" * 64),
+            ("4" * 64, "5" * 64, "6" * 64),
+        ]
+    )
+    remote_calls = 0
+    transport._owner_identity.require_stable = lambda: None
+    transport._authorization_snapshot = lambda _account: next(snapshots)
+    transport._remote_argv = lambda _remote, *, account: ("gcloud", account)
+    transport._validate_dry_run = lambda _argv: None
+
+    def reject_remote(*_args, **_kwargs):
+        nonlocal remote_calls
+        remote_calls += 1
+        raise AssertionError("remote observer must not run")
+
+    transport._preflight_runner = reject_remote
+    with pytest.raises(
+        canary_transport.OwnerLauncherError,
+        match="iap_ssh_authorization_changed",
+    ):
+        transport._run_production_ingress_observer_input(
+            _production_ingress_remote(transport),
+            account="owner@example.com",
+            input_bytes=b"reviewed-observer",
+        )
+    assert remote_calls == 0
+
+
+def test_production_ingress_bound_transport_rejects_post_remote_drift() -> None:
+    transport = _production_transport()
+    snapshots = iter(
+        [
+            ("1" * 64, "2" * 64, "3" * 64),
+            ("1" * 64, "2" * 64, "3" * 64),
+            ("4" * 64, "5" * 64, "6" * 64),
+        ]
+    )
+    events: list[str] = []
+    transport._owner_identity.require_stable = lambda: events.append("stable")
+    transport._authorization_snapshot = lambda _account: next(snapshots)
+    transport._remote_argv = lambda _remote, *, account: ("gcloud", account)
+    transport._validate_dry_run = lambda _argv: None
+    transport._postflight = lambda: events.append("postflight")
+
+    def observe(argv, **_kwargs):
+        events.append("remote-observer")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=b'{"ok":true}\n',
+            stderr=b"",
+        )
+
+    transport._preflight_runner = observe
+    with pytest.raises(
+        canary_transport.OwnerLauncherError,
+        match="iap_ssh_authorization_changed",
+    ):
+        transport._run_production_ingress_observer_input(
+            _production_ingress_remote(transport),
+            account="owner@example.com",
+            input_bytes=b"reviewed-observer",
+        )
+    assert events == [
+        "stable",
+        "remote-observer",
+        "postflight",
+        "stable",
+    ]
+
+
+def test_production_ingress_bound_transport_rejects_oversized_input() -> None:
+    transport = _production_transport()
+    transport._owner_identity.require_stable = lambda: pytest.fail(
+        "invalid input must fail before any authority read"
+    )
+    with pytest.raises(
+        canary_transport.OwnerLauncherError,
+        match="production_ingress_observer_input_invalid",
+    ):
+        transport._run_production_ingress_observer_input(
+            _production_ingress_remote(transport),
+            account="owner@example.com",
+            input_bytes=b"x"
+            * (transport._PRODUCTION_INGRESS_INPUT_MAX_BYTES + 1),
+        )
+
+
 def test_production_transport_performs_identity_preflight_before_mutation() -> None:
     transport = _production_transport()
     events: list[str] = []

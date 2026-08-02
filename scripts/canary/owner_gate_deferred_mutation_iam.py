@@ -3064,7 +3064,11 @@ def _successful_activation_evidence_context(
     release_revision: str,
     now_unix: int,
     journal: DeferredMutationIamJournal | None = None,
-) -> Iterator[inert_observation._FrozenInertEvidence]:
+    _include_transaction_id: bool = False,
+) -> Iterator[
+    inert_observation._FrozenInertEvidence
+    | tuple[inert_observation._FrozenInertEvidence, str]
+]:
     """Hold the IAM contract and exact R-bound inert evidence for staging.
 
     Lock order is intentionally global IAM contract, inert evidence lease,
@@ -3075,6 +3079,7 @@ def _successful_activation_evidence_context(
         _REVISION.fullmatch(release_revision or "") is None
         or type(now_unix) is not int
         or now_unix <= 0
+        or type(_include_transaction_id) is not bool
     ):
         _error("owner_gate_deferred_mutation_iam_boundary_invalid")
     selected_journal = journal or DeferredMutationIamJournal()
@@ -3103,7 +3108,10 @@ def _successful_activation_evidence_context(
                     expected_descriptor=descriptor,
                 )
                 try:
-                    yield frozen
+                    if _include_transaction_id:
+                        yield frozen, authority.transaction_id
+                    else:
+                        yield frozen
                 finally:
                     selected_journal.require_contract_lease()
                     current = selected_journal.list(transaction_id)

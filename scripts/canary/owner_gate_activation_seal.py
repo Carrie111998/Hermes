@@ -780,6 +780,18 @@ def _derive_activation(
 
     inert_report = values[INERT_PREFLIGHT_NAME]
     post_report = values[POST_IAM_PREFLIGHT_NAME]
+    inert_ingress = values[
+        INERT_PRODUCTION_INGRESS_OBSERVATION_NAME
+    ]
+    post_ingress = values[
+        POST_IAM_PRODUCTION_INGRESS_OBSERVATION_NAME
+    ]
+    inert_carrier_sha256 = inert_ingress.get(
+        "preparation_carrier_sha256"
+    )
+    post_carrier_sha256 = post_ingress.get(
+        "preparation_carrier_sha256"
+    )
     inert_time = inert_report.get("observed_at_unix")
     post_time = post_report.get("observed_at_unix")
     if (
@@ -798,6 +810,14 @@ def _derive_activation(
     ):
         raise OwnerGateActivationSealError(
             "owner_gate_activation_evidence_stale"
+        )
+    if (
+        not isinstance(inert_carrier_sha256, str)
+        or _SHA256.fullmatch(inert_carrier_sha256) is None
+        or post_carrier_sha256 != inert_carrier_sha256
+    ):
+        raise OwnerGateActivationSealError(
+            "owner_gate_activation_evidence_invalid"
         )
     try:
         expected_inert = preflight.build_preflight_report(

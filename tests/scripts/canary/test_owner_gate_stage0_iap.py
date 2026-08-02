@@ -11,6 +11,8 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +26,7 @@ from scripts.canary import owner_gate_foundation as foundation
 from scripts.canary import owner_gate_foundation_apply as foundation_apply
 from scripts.canary import owner_gate_foundation_journal as foundation_journal
 from scripts.canary import owner_gate_outer_stage0 as outer
+from scripts.canary import owner_gate_preparation_readback as preparation_readback
 from scripts.canary import owner_gate_preflight as owner_preflight
 from scripts.canary import owner_gate_stage0 as cloud_stage0
 from scripts.canary import owner_gate_stage0_iap as transport_module
@@ -53,6 +56,43 @@ class _HostRequestValues(TypedDict):
     cloud_readiness: Mapping[str, Any]
     host_receipt: Mapping[str, Any]
     host_readiness: Mapping[str, Any]
+
+
+class _TrackingLock:
+    """A real lock whose first holder waits for a second acquisition attempt."""
+
+    def __init__(self, *, coordinate_first_two: bool = False) -> None:
+        self._lock = threading.Lock()
+        self._meta_lock = threading.Lock()
+        self._second_attempted = threading.Event()
+        self._coordinate_first_two = coordinate_first_two
+        self.entry_count = 0
+        self.holders = 0
+        self.max_holders = 0
+
+    def __enter__(self) -> "_TrackingLock":
+        with self._meta_lock:
+            self.entry_count += 1
+            ordinal = self.entry_count
+            if ordinal == 2:
+                self._second_attempted.set()
+        assert self._lock.acquire(timeout=5)
+        with self._meta_lock:
+            self.holders += 1
+            self.max_holders = max(self.max_holders, self.holders)
+        if self._coordinate_first_two and ordinal == 1:
+            assert self._second_attempted.wait(timeout=5)
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
+    ) -> None:
+        with self._meta_lock:
+            self.holders -= 1
+        self._lock.release()
 
 
 @pytest.fixture(autouse=True)
@@ -148,6 +188,7 @@ def _attached_sa_probe_fixture(
     binding = transport_module._BoundInertCloudBundle(
         source_tree_oid=TREE,
         package_sha256="3" * 64,
+        package_inventory_sha256="5" * 64,
         interpreter_sha256="8" * 64,
         cloud_collector_public_key_id=plan.spec.cloud_collector_public_key_id,
         host_collector_public_key_id=plan.spec.host_collector_public_key_id,
@@ -462,6 +503,7 @@ def _package_manifest(
         "release_root": str(
             cloud_stage0.RELEASE_BASE / release_revision
         ),
+        "package_inventory_sha256": "e" * 64,
         "interpreter_sha256": "8" * 64,
         "pre_foundation_authority_sha256": "4" * 64,
         "foundation_apply_receipt_sha256": "5" * 64,
@@ -937,7 +979,28 @@ def test_composite_uses_exact_cloud_order_argv_and_returns_inert_terminal(
     })
 
 
-def test_post_iam_resume_revalidates_exact_install_without_retransmission(
+def _opaque_restore_capability(
+    transport: transport_module.OwnerGateStage0IapTransport,
+    *,
+    kit_stream: transport_module.PinnedExactTreeStream,
+    bundle_stream: transport_module.PinnedExactTreeStream,
+    terminal: Mapping[str, Any],
+) -> transport_module.OwnerGateHostObservationRestoreCapability:
+    return transport_module.OwnerGateHostObservationRestoreCapability._create(
+        transport=transport,
+        release_revision=REVISION,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        terminal_raw=outer.canonical_json_bytes(terminal),
+        carrier_envelope_raw=b"{}",
+        input_pins_raw=b"{}",
+        release_public_key_raw=b"\x01" * 32,
+        inert_evidence_set_sha256="8" * 64,
+        iam_transaction_id="9" * 64,
+    )
+
+
+def test_post_iam_restore_uses_one_readback_without_heavy_replay(
     tmp_path: Path,
 ) -> None:
     kit_stream, bundle_stream = _streams(tmp_path)
@@ -949,8 +1012,16 @@ def test_post_iam_resume_revalidates_exact_install_without_retransmission(
         kit_stream=kit_stream,
         bundle_stream=bundle_stream,
     )
-    receipts = _cloud_receipts()
     events: list[str] = []
+    binding = transport._bind_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    host_runtime = {"package_sha256": binding.package_sha256}
+    cloud_receipt = {"receipt_sha256": "1" * 64}
+    cloud_readiness = {"readiness_sha256": "2" * 64}
+    host_receipt = {"receipt_sha256": "3" * 64}
+    host_readiness = {"readiness_sha256": "4" * 64}
 
     transport.transport_exact_stage0_and_bundle = lambda **_kwargs: pytest.fail(
         "resume must not retransmit either exact stream"
@@ -960,59 +1031,101 @@ def test_post_iam_resume_revalidates_exact_install_without_retransmission(
             "resume must not rerun the transfer/install composite"
         )
     )
-    transport._run_cloud_verify = lambda _binding: (
-        events.append("verify") or receipts["cloud-verify"]
+    transport._run_cloud_verify = lambda _binding: pytest.fail(
+        "restore must not replay cloud verify"
     )
-    transport._run_cloud_preflight = lambda _binding: (
-        events.append("preflight") or receipts["cloud-preflight"]
+    transport._run_cloud_preflight = lambda _binding: pytest.fail(
+        "restore must not replay cloud preflight"
     )
-    transport._run_cloud_install = lambda _binding: (
-        events.append("install") or receipts["cloud-install"]
+    transport._run_cloud_install = lambda _binding: pytest.fail(
+        "restore must not replay cloud install"
     )
-    transport._run_host_runtime_install = lambda binding: (
-        events.append("host-runtime")
-        or {"package_sha256": binding.package_sha256}
+    transport._run_host_runtime_install = lambda _binding: pytest.fail(
+        "restore must not replay host runtime install"
     )
-
-    def provision(
-        *,
-        role: str,
-        package_sha256: str,
-        expected_key_id: str,
-    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-        assert package_sha256 == terminal["package_sha256"]
-        assert expected_key_id in {"c" * 64, "d" * 64}
-        events.append(f"signer-{role}")
-        return (
-            {"receipt_sha256": f"{1 if role == 'cloud' else 3}" * 64},
-            {"readiness_sha256": f"{2 if role == 'cloud' else 4}" * 64},
-        )
-
-    transport._provision_signer = provision
-
-    preparation = transport.resume_owner_gate_host_observation_preparation(
-        phase="post_iam",
-        terminal_receipt=terminal,
+    transport._provision_signer = lambda **_kwargs: pytest.fail(
+        "restore must not replay signer provisioning"
+    )
+    capability = _opaque_restore_capability(
+        transport,
         kit_stream=kit_stream,
         bundle_stream=bundle_stream,
+        terminal=terminal,
     )
+    tracking_lock = _TrackingLock(coordinate_first_two=True)
+    object.__setattr__(capability, "_state_lock", tracking_lock)
+
+    def readback(
+        observed: object,
+        *,
+        expected_stage: int,
+    ) -> tuple[Any, ...]:
+        assert observed is capability
+        assert expected_stage == 0
+        events.append("challenge-readback")
+        object.__setattr__(capability, "_readback_stage", 1)
+        return (
+            binding,
+            terminal,
+            host_runtime,
+            cloud_receipt,
+            cloud_readiness,
+            host_receipt,
+            host_readiness,
+        )
+
+    transport._assert_preparation_readback_current = readback
+
+    start = threading.Barrier(2)
+
+    def resume_once() -> (
+        transport_module.OwnerGateHostObservationPreparation | str
+    ):
+        start.wait(timeout=5)
+        try:
+            return (
+                transport.
+                resume_owner_gate_host_observation_preparation(
+                    restore_capability=capability,
+                )
+            )
+        except launcher.OwnerLauncherError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [
+            future.result(timeout=5)
+            for future in (
+                executor.submit(resume_once),
+                executor.submit(resume_once),
+            )
+        ]
+    preparations = [
+        item
+        for item in outcomes
+        if type(item)
+        is transport_module.OwnerGateHostObservationPreparation
+    ]
+    failures = [item for item in outcomes if isinstance(item, str)]
+    assert len(preparations) == 1
+    assert failures == ["owner_gate_host_observation_resume_invalid"]
+    preparation = preparations[0]
 
     assert (
         type(preparation)
         is transport_module.OwnerGateHostObservationPreparation
     )
     assert preparation._terminal == terminal
-    assert events == [
-        "verify",
-        "preflight",
-        "install",
-        "host-runtime",
-        "signer-cloud",
-        "signer-host",
-    ]
+    assert preparation._restore_capability is capability
+    assert capability._consumed is True
+    assert capability._readback_stage == 1
+    assert tracking_lock.entry_count == 2
+    assert tracking_lock.max_holders == 1
+    assert tracking_lock.holders == 0
+    assert events == ["challenge-readback"]
 
 
-def test_post_iam_resume_rejects_rehashed_foundation_drift_before_remote_work(
+def test_post_iam_restore_rejects_mapping_and_burns_failed_capability(
     tmp_path: Path,
 ) -> None:
     kit_stream, bundle_stream = _streams(tmp_path)
@@ -1020,32 +1133,644 @@ def test_post_iam_resume_rejects_rehashed_foundation_drift_before_remote_work(
         kit_stream=kit_stream,
         bundle_stream=bundle_stream,
     )
-    terminal = dict(
-        transport.transport_and_install_inert_cloud_bundle(
-            kit_stream=kit_stream,
-            bundle_stream=bundle_stream,
-        )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
     )
-    terminal["foundation_apply_receipt_sha256"] = "f" * 64
-    terminal["terminal_receipt_sha256"] = outer.sha256_json({
-        name: item
-        for name, item in terminal.items()
-        if name != "terminal_receipt_sha256"
-    })
-    transport._run_cloud_verify = lambda _binding: pytest.fail(
-        "invalid durable lineage must fail before remote replay"
+    capability = _opaque_restore_capability(
+        transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        terminal=terminal,
     )
+    readback_calls = 0
 
+    def fail_readback(
+        observed: object,
+        *,
+        expected_stage: int,
+    ) -> None:
+        nonlocal readback_calls
+        assert observed is capability
+        assert expected_stage == 0
+        readback_calls += 1
+        object.__setattr__(capability, "_readback_stage", -1)
+        raise launcher.OwnerLauncherError("fixture-readback-failed")
+
+    transport._assert_preparation_readback_current = fail_readback
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_host_observation_resume_failed",
+    ):
+        transport.resume_owner_gate_host_observation_preparation(
+            restore_capability=capability,
+        )
+    assert readback_calls == 1
+    assert capability._consumed is True
+    assert capability._readback_stage == -1
     with pytest.raises(
         launcher.OwnerLauncherError,
         match="owner_gate_host_observation_resume_invalid",
     ):
         transport.resume_owner_gate_host_observation_preparation(
-            phase="post_iam",
-            terminal_receipt=terminal,
+            restore_capability=capability,
+        )
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_host_observation_resume_invalid",
+    ):
+        transport.resume_owner_gate_host_observation_preparation(
+            restore_capability={"terminal_receipt": terminal},  # type: ignore[arg-type]
+        )
+
+
+def test_restore_readback_state_machine_advances_exactly_three_challenges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    capability = _opaque_restore_capability(
+        transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        terminal=terminal,
+    )
+    binding = transport._bind_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    state = (
+        binding,
+        terminal,
+        {"signed": "carrier"},
+        {"receipt_sha256": "0" * 64},
+        {"receipt_sha256": "1" * 64},
+        {"readiness_sha256": "2" * 64},
+        {"receipt_sha256": "3" * 64},
+        {"readiness_sha256": "4" * 64},
+    )
+    requests: list[Mapping[str, Any]] = []
+    responses: list[Mapping[str, Any]] = []
+    monkeypatch.setattr(
+        transport,
+        "_validated_restore_capability_lineage",
+        lambda observed: (
+            state
+            if observed is capability
+            else pytest.fail("wrong capability")
+        ),
+    )
+
+    def build_request(**kwargs: Any) -> Mapping[str, Any]:
+        request = {
+            "sequence": len(requests),
+            "iam_transaction_id": kwargs["iam_transaction_id"],
+        }
+        requests.append(request)
+        return request
+
+    monkeypatch.setattr(
+        preparation_readback,
+        "build_preparation_readback_request",
+        build_request,
+    )
+
+    def run_readback(raw: bytes) -> Mapping[str, Any]:
+        request = json.loads(raw)
+        response = {"sequence": request["sequence"]}
+        responses.append(response)
+        return response
+
+    transport.run_owner_gate_preparation_readback = run_readback
+    monkeypatch.setattr(
+        transport_module,
+        "_local_signer_public_key",
+        lambda *_args, **_kwargs: Ed25519PrivateKey.generate().public_key(),
+    )
+    monkeypatch.setattr(
+        transport,
+        "_preparation_readback_expected_lineage",
+        lambda **_kwargs: {
+            name: (
+                TREE if name == "source_tree_oid" else "5" * 64
+            )
+            for name in preparation_readback.EXPECTED_LINEAGE_FIELDS
+        },
+    )
+    monkeypatch.setattr(
+        preparation_readback,
+        "validate_preparation_readback_response",
+        lambda value, **_kwargs: value,
+    )
+
+    for expected_stage in range(3):
+        observed = transport._assert_preparation_readback_current(
+            capability,
+            expected_stage=expected_stage,
+        )
+        assert observed == (
+            binding,
+            terminal,
+            state[3],
+            state[4],
+            state[5],
+            state[6],
+            state[7],
+        )
+        assert capability._readback_stage == expected_stage + 1
+
+    assert [item["sequence"] for item in requests] == [0, 1, 2]
+    assert [item["sequence"] for item in responses] == [0, 1, 2]
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_preparation_readback_order_invalid",
+    ):
+        transport._assert_preparation_readback_current(
+            capability,
+            expected_stage=2,
+        )
+
+
+def test_stage_two_readback_burns_before_local_lineage_failure(
+    tmp_path: Path,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    capability = _opaque_restore_capability(
+        transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        terminal=terminal,
+    )
+    object.__setattr__(capability, "_readback_stage", 2)
+    transport._validated_restore_capability_lineage = (
+        lambda _capability: (_ for _ in ()).throw(
+            launcher.OwnerLauncherError("fixture-local-lineage-failed")
+        )
+    )
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_preparation_readback_failed",
+    ):
+        transport._assert_preparation_readback_current(
+            capability,
+            expected_stage=2,
+        )
+
+    assert capability._readback_stage == -1
+
+
+def test_readback_stage_transition_is_atomic_across_threads(
+    tmp_path: Path,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    capability = _opaque_restore_capability(
+        transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        terminal=terminal,
+    )
+    tracking_lock = _TrackingLock(coordinate_first_two=True)
+    object.__setattr__(capability, "_state_lock", tracking_lock)
+    entered = threading.Event()
+    release = threading.Event()
+    lineage_calls = 0
+
+    def hold_lineage(_capability: object) -> tuple[Any, ...]:
+        nonlocal lineage_calls
+        lineage_calls += 1
+        entered.set()
+        assert release.wait(timeout=5)
+        raise launcher.OwnerLauncherError("fixture-stop-after-gate")
+
+    transport._validated_restore_capability_lineage = hold_lineage
+    start = threading.Barrier(2)
+
+    def attempt() -> str:
+        start.wait(timeout=5)
+        try:
+            transport._assert_preparation_readback_current(
+                capability,
+                expected_stage=0,
+            )
+        except launcher.OwnerLauncherError as exc:
+            return str(exc)
+        return "unexpected-success"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(attempt) for _ in range(2)]
+        assert entered.wait(timeout=5)
+        release.set()
+        outcomes = [future.result(timeout=5) for future in futures]
+
+    assert lineage_calls == 1
+    assert tracking_lock.entry_count == 2
+    assert tracking_lock.max_holders == 1
+    assert tracking_lock.holders == 0
+    assert capability._readback_stage == -1
+    assert sorted(outcomes) == [
+        "owner_gate_preparation_readback_failed",
+        "owner_gate_preparation_readback_order_invalid",
+    ]
+
+
+def test_fresh_tail_consumes_preparation_atomically_before_host_path(
+    tmp_path: Path,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    binding = transport._bind_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    network_key = Ed25519PrivateKey.generate()
+    network_key_id = preflight_fixture._key_id(network_key)
+    network_mapping = preflight_fixture._signed_network_evidence(
+        network_key,
+        collected_at=preflight_fixture.NOW,
+    )
+    network_evidence = foundation.ProductionNetworkEvidence.from_mapping(
+        network_mapping,
+        public_key=network_key.public_key(),
+        expected_public_key_id=network_key_id,
+        now_unix=preflight_fixture.NOW,
+    )
+    plan = foundation.build_plan(
+        spec=foundation.OwnerGateSpec(
+            release_revision=REVISION,
+            boot_image_self_link=preflight_fixture.IMAGE,
+            package_inventory_sha256=binding.package_inventory_sha256,
+            interpreter_sha256=binding.interpreter_sha256,
+            network_collector_public_key_id=network_key_id,
+            organization_id="123456789012",
+            ancestry_evidence_sha256="9" * 64,
+            cloud_collector_public_key_id=(
+                binding.cloud_collector_public_key_id
+            ),
+            host_collector_public_key_id=(
+                binding.host_collector_public_key_id
+            ),
+        ),
+        network_evidence=network_evidence,
+        network_collector_public_key=network_key.public_key(),
+        now_unix=preflight_fixture.NOW,
+    )
+    terminal: Mapping[str, Any] = {}
+    host_runtime: Mapping[str, Any] = {}
+    cloud_receipt: Mapping[str, Any] = {}
+    cloud_readiness: Mapping[str, Any] = {}
+    host_receipt: Mapping[str, Any] = {}
+    host_readiness: Mapping[str, Any] = {}
+    preparation_state = transport_module._host_observation_preparation_state(
+        phase="inert",
+        binding=binding,
+        terminal=terminal,
+        host_runtime=host_runtime,
+        cloud_receipt=cloud_receipt,
+        cloud_readiness=cloud_readiness,
+        host_receipt=host_receipt,
+        host_readiness=host_readiness,
+    )
+    preparation = (
+        transport_module.OwnerGateHostObservationPreparation._create(
+            transport=transport,
+            phase="inert",
             kit_stream=kit_stream,
             bundle_stream=bundle_stream,
+            binding=binding,
+            terminal=terminal,
+            host_runtime=host_runtime,
+            cloud_receipt=cloud_receipt,
+            cloud_readiness=cloud_readiness,
+            host_receipt=host_receipt,
+            host_readiness=host_readiness,
+            snapshot=outer.canonical_json_bytes(preparation_state),
         )
+    )
+    tracking_lock = _TrackingLock(coordinate_first_two=True)
+    object.__setattr__(preparation, "_state_lock", tracking_lock)
+    transport._validate_owner_gate_host_observation_fresh_inputs = (
+        lambda **_kwargs: None
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    host_path_calls = 0
+
+    def stop_at_host_path() -> int:
+        nonlocal host_path_calls
+        host_path_calls += 1
+        entered.set()
+        assert release.wait(timeout=5)
+        raise launcher.OwnerLauncherError("fixture-stop-at-host-path")
+
+    transport._open_host_observation_window = stop_at_host_path
+    start = threading.Barrier(2)
+
+    def attempt() -> str:
+        start.wait(timeout=5)
+        try:
+            transport.collect_owner_gate_host_observation_fresh_tail(
+                preparation=preparation,
+                plan=plan,
+                final_network_evidence=network_evidence,
+                final_network_collector_public_key=(
+                    network_key.public_key()
+                ),
+                production_ingress_observation_sha256=(
+                    PRODUCTION_INGRESS_OBSERVATION_SHA256
+                ),
+            )
+        except launcher.OwnerLauncherError as exc:
+            return str(exc)
+        return "unexpected-success"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(attempt) for _ in range(2)]
+        assert entered.wait(timeout=5)
+        release.set()
+        outcomes = [future.result(timeout=5) for future in futures]
+
+    assert host_path_calls == 1
+    assert tracking_lock.entry_count == 2
+    assert tracking_lock.max_holders == 1
+    assert tracking_lock.holders == 0
+    assert preparation._consumed is True
+    assert sorted(outcomes) == [
+        "owner_gate_host_observation_input_invalid",
+        "owner_launcher_failed",
+    ]
+
+
+@pytest.mark.parametrize("readback_drifts", (False, True))
+def test_post_iam_fresh_tail_orders_stage_one_readback_after_host(
+    readback_drifts: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, _calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    binding = transport._bind_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    terminal = transport.transport_and_install_inert_cloud_bundle(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    network_key = Ed25519PrivateKey.generate()
+    network_key_id = preflight_fixture._key_id(network_key)
+    network_evidence = foundation.ProductionNetworkEvidence.from_mapping(
+        preflight_fixture._signed_network_evidence(
+            network_key,
+            collected_at=preflight_fixture.NOW,
+        ),
+        public_key=network_key.public_key(),
+        expected_public_key_id=network_key_id,
+        now_unix=preflight_fixture.NOW,
+    )
+    plan = foundation.build_plan(
+        spec=foundation.OwnerGateSpec(
+            release_revision=REVISION,
+            boot_image_self_link=preflight_fixture.IMAGE,
+            package_inventory_sha256=binding.package_inventory_sha256,
+            interpreter_sha256=binding.interpreter_sha256,
+            network_collector_public_key_id=network_key_id,
+            organization_id="123456789012",
+            ancestry_evidence_sha256="9" * 64,
+            cloud_collector_public_key_id=(
+                binding.cloud_collector_public_key_id
+            ),
+            host_collector_public_key_id=(
+                binding.host_collector_public_key_id
+            ),
+        ),
+        network_evidence=network_evidence,
+        network_collector_public_key=network_key.public_key(),
+        now_unix=preflight_fixture.NOW,
+    )
+    host_runtime = {
+        "package_sha256": binding.package_sha256,
+        "receipt_sha256": "0" * 64,
+    }
+    cloud_receipt = {"receipt_sha256": "1" * 64}
+    cloud_readiness = {"readiness_sha256": "2" * 64}
+    host_receipt = {"receipt_sha256": "3" * 64}
+    host_readiness = {"readiness_sha256": "4" * 64}
+    capability = _opaque_restore_capability(
+        transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        terminal=terminal,
+    )
+    object.__setattr__(capability, "_consumed", True)
+    object.__setattr__(capability, "_readback_stage", 1)
+    preparation_state = transport_module._host_observation_preparation_state(
+        phase="post_iam",
+        binding=binding,
+        terminal=terminal,
+        host_runtime=host_runtime,
+        cloud_receipt=cloud_receipt,
+        cloud_readiness=cloud_readiness,
+        host_receipt=host_receipt,
+        host_readiness=host_readiness,
+    )
+    preparation = (
+        transport_module.OwnerGateHostObservationPreparation._create(
+            transport=transport,
+            phase="post_iam",
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+            binding=binding,
+            terminal=terminal,
+            host_runtime=host_runtime,
+            cloud_receipt=cloud_receipt,
+            cloud_readiness=cloud_readiness,
+            host_receipt=host_receipt,
+            host_readiness=host_readiness,
+            snapshot=outer.canonical_json_bytes(preparation_state),
+            restore_capability=capability,
+        )
+    )
+    attached_report_sha256 = "5" * 64
+    events: list[str] = []
+
+    transport._validate_owner_gate_host_observation_fresh_inputs = (
+        lambda **_kwargs: None
+    )
+    transport._open_host_observation_window = (
+        lambda: preflight_fixture.NOW
+    )
+    transport._provision_signer = lambda **_kwargs: pytest.fail(
+        "post-IAM fresh tail must not replay signer provisioning"
+    )
+    host_key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(
+        transport_module,
+        "_local_signer_public_key",
+        lambda *_args, **_kwargs: host_key.public_key(),
+    )
+    monkeypatch.setattr(
+        transport_module,
+        "_select_stable_attached_sa_probe",
+        lambda first, _second, **_kwargs: first,
+    )
+    monkeypatch.setattr(
+        owner_preflight,
+        "_validate_host",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def dispatch(
+        *,
+        operation_name: str,
+        frame_value: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        events.append(operation_name)
+        if operation_name != "host_observation":
+            return {"report_sha256": attached_report_sha256}
+        request = frame_value["request"]
+        return {
+            "release": {
+                "revision": REVISION,
+                "source_tree_oid": binding.source_tree_oid,
+                "package_sha256": binding.package_sha256,
+                "package_inventory_sha256": (
+                    binding.package_inventory_sha256
+                ),
+                "install_receipt_sha256": terminal[
+                    "cloud_install_receipt_sha256"
+                ],
+                "install_receipt_file_sha256": terminal[
+                    "cloud_install_receipt_file_sha256"
+                ],
+                "terminal_receipt_sha256": terminal[
+                    "terminal_receipt_sha256"
+                ],
+                "cloud_signer_provisioning_receipt_sha256": (
+                    cloud_receipt["receipt_sha256"]
+                ),
+                "cloud_signer_readiness_sha256": (
+                    cloud_readiness["readiness_sha256"]
+                ),
+                "host_signer_provisioning_receipt_sha256": (
+                    host_receipt["receipt_sha256"]
+                ),
+                "host_signer_readiness_sha256": (
+                    host_readiness["readiness_sha256"]
+                ),
+                "attached_sa_permission_probe_report_sha256": (
+                    attached_report_sha256
+                ),
+            },
+            "observation_binding_sha256": request[
+                "observation_binding_sha256"
+            ],
+            "production_ingress_observation_sha256": (
+                PRODUCTION_INGRESS_OBSERVATION_SHA256
+            ),
+        }
+
+    transport._run_host_observation_dispatcher = dispatch
+
+    def stage_one_readback(
+        observed: object,
+        *,
+        expected_stage: int,
+    ) -> tuple[Any, ...]:
+        assert events == [
+            "attached_sa_probe_first",
+            "attached_sa_probe_second",
+            "host_observation",
+        ]
+        assert observed is capability
+        assert expected_stage == 1
+        events.append("preparation_readback_stage_1")
+        object.__setattr__(capability, "_readback_stage", 2)
+        returned_runtime = dict(host_runtime)
+        if readback_drifts:
+            returned_runtime["receipt_sha256"] = "f" * 64
+        return (
+            binding,
+            terminal,
+            returned_runtime,
+            cloud_receipt,
+            cloud_readiness,
+            host_receipt,
+            host_readiness,
+        )
+
+    transport._assert_preparation_readback_current = stage_one_readback
+    if readback_drifts:
+        with pytest.raises(
+            launcher.OwnerLauncherError,
+            match="owner_gate_host_observation_preparation_changed",
+        ):
+            transport.collect_owner_gate_host_observation_fresh_tail(
+                preparation=preparation,
+                plan=plan,
+                final_network_evidence=network_evidence,
+                final_network_collector_public_key=(
+                    network_key.public_key()
+                ),
+                production_ingress_observation_sha256=(
+                    PRODUCTION_INGRESS_OBSERVATION_SHA256
+                ),
+            )
+    else:
+        handoff = (
+            transport.collect_owner_gate_host_observation_fresh_tail(
+                preparation=preparation,
+                plan=plan,
+                final_network_evidence=network_evidence,
+                final_network_collector_public_key=(
+                    network_key.public_key()
+                ),
+                production_ingress_observation_sha256=(
+                    PRODUCTION_INGRESS_OBSERVATION_SHA256
+                ),
+            )
+        )
+        assert handoff._restore_capability is capability
+        assert handoff.terminal_receipt == terminal
+
+    assert capability._readback_stage == 2
+    assert events == [
+        "attached_sa_probe_first",
+        "attached_sa_probe_second",
+        "host_observation",
+        "preparation_readback_stage_1",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1568,6 +2293,65 @@ def test_composite_rejects_stale_signed_final_network_evidence_before_iap(
     assert calls == []
 
 
+def test_public_prepare_and_composite_reject_post_iam_before_iap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit_stream, bundle_stream = _streams(tmp_path)
+    transport, calls = _transport(
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+    )
+    binding_calls = 0
+
+    def unexpected_binding(
+        _transport: transport_module.OwnerGateStage0IapTransport,
+        **_kwargs: object,
+    ) -> transport_module._BoundInertCloudBundle:
+        nonlocal binding_calls
+        binding_calls += 1
+        raise AssertionError("post-IAM public path reached bundle binding")
+
+    monkeypatch.setattr(
+        transport_module.OwnerGateStage0IapTransport,
+        "_bind_inert_cloud_bundle",
+        unexpected_binding,
+    )
+    monkeypatch.setattr(
+        transport,
+        "_validate_owner_gate_host_observation_fresh_inputs",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_host_observation_preparation_invalid",
+    ):
+        transport.prepare_owner_gate_host_observation(
+            phase="post_iam",
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+        )
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_host_observation_preparation_invalid",
+    ):
+        transport.collect_owner_gate_host_observation(
+            phase="post_iam",
+            plan=object(),  # type: ignore[arg-type]
+            final_network_evidence=object(),  # type: ignore[arg-type]
+            final_network_collector_public_key=object(),  # type: ignore[arg-type]
+            production_ingress_observation_sha256=(
+                PRODUCTION_INGRESS_OBSERVATION_SHA256
+            ),
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+        )
+
+    assert binding_calls == 0
+    assert calls == []
+
+
 def test_host_request_variants_share_one_exact_observation_binding() -> None:
     values: _HostRequestValues = {
         "phase": "inert",
@@ -1724,10 +2508,19 @@ def test_cloud_observation_signer_uses_only_fixed_target_executor_command() -> N
     )
 
 
-@pytest.mark.parametrize("exchange_fails", (False, True))
+@pytest.mark.parametrize(
+    ("phase", "exchange_fails"),
+    (
+        ("inert", False),
+        ("inert", True),
+        ("post_iam", False),
+        ("post_iam", True),
+    ),
+)
 def test_cloud_signer_always_runs_mandatory_post_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    phase: str,
     exchange_fails: bool,
 ) -> None:
     kit_stream, bundle_stream = _streams(tmp_path)
@@ -1767,7 +2560,7 @@ def test_cloud_signer_always_runs_mandatory_post_readiness(
         ],
     }
     host = {
-        "phase": "inert",
+        "phase": phase,
         "plan_sha256": plan_sha256,
         "report_sha256": host_report_sha256,
         "observation_binding_sha256": host_binding_sha256,
@@ -1776,7 +2569,7 @@ def test_cloud_signer_always_runs_mandatory_post_readiness(
         "attestation": {"public_key_id": host_key_id},
     }
     release_binding = {
-        "phase": "inert",
+        "phase": phase,
         "release_revision": REVISION,
         "source_tree_oid": terminal["source_tree_oid"],
         "package_sha256": terminal["package_sha256"],
@@ -1802,14 +2595,45 @@ def test_cloud_signer_always_runs_mandatory_post_readiness(
     }
     unsigned = {
         "schema": owner_preflight.CLOUD_OBSERVATION_SCHEMA,
-        "phase": "inert",
+        "phase": phase,
         "plan_sha256": plan_sha256,
         "release_binding": release_binding,
     }
+    restore_capability = (
+        _opaque_restore_capability(
+            transport,
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+            terminal=terminal,
+        )
+        if phase == "post_iam"
+        else None
+    )
+    if restore_capability is not None:
+        object.__setattr__(restore_capability, "_consumed", True)
+        object.__setattr__(restore_capability, "_readback_stage", 2)
     handoff = transport_module.OwnerGateHostObservationHandoff._create(
         terminal_receipt=terminal,
         host_observation=host,
+        restore_capability=restore_capability,
     )
+    second_handoff = (
+        transport_module.OwnerGateHostObservationHandoff._create(
+            terminal_receipt=terminal,
+            host_observation=host,
+            restore_capability=restore_capability,
+        )
+        if restore_capability is not None
+        else handoff
+    )
+    concurrency_lock: _TrackingLock | None = None
+    if not exchange_fails:
+        concurrency_lock = _TrackingLock(coordinate_first_two=True)
+        object.__setattr__(
+            restore_capability if restore_capability is not None else handoff,
+            "_state_lock",
+            concurrency_lock,
+        )
     events: list[str] = []
 
     monkeypatch.setattr(
@@ -1849,6 +2673,53 @@ def test_cloud_signer_always_runs_mandatory_post_readiness(
         return host_receipt, host_readiness
 
     transport._provision_signer = provision
+    if restore_capability is not None:
+        binding = transport._bind_inert_cloud_bundle(
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+        )
+        host_runtime = {"package_sha256": terminal["package_sha256"]}
+        restored_state = (
+            binding,
+            terminal,
+            {"signed": "carrier"},
+            host_runtime,
+            cloud_receipt,
+            cloud_readiness,
+            host_receipt,
+            host_readiness,
+        )
+        transport._validated_restore_capability_lineage = (
+            lambda observed: (
+                restored_state
+                if observed is restore_capability
+                else pytest.fail("wrong restore capability")
+            )
+        )
+
+        def post_signer_readback(
+            observed: object,
+            *,
+            expected_stage: int,
+        ) -> tuple[Any, ...]:
+            assert observed is restore_capability
+            assert expected_stage == 2
+            assert restore_capability._cloud_signer_consumed is True
+            events.append("post-readback")
+            object.__setattr__(restore_capability, "_readback_stage", 3)
+            return (
+                binding,
+                terminal,
+                host_runtime,
+                cloud_receipt,
+                cloud_readiness,
+                host_receipt,
+                host_readiness,
+            )
+
+        transport._assert_preparation_readback_current = (
+            post_signer_readback
+        )
     monkeypatch.setattr(
         owner_preflight,
         "_validate_cloud",
@@ -1861,23 +2732,62 @@ def test_cloud_signer_always_runs_mandatory_post_readiness(
             match="owner_gate_cloud_observation_signer_failed",
         ):
             transport._sign_owner_gate_cloud_observation_on_target(
-                phase="inert",
+                phase=phase,
                 unsigned_observation=unsigned,
                 terminal_binding=handoff,
             )
     else:
-        result = transport._sign_owner_gate_cloud_observation_on_target(
-            phase="inert",
-            unsigned_observation=unsigned,
-            terminal_binding=handoff,
-        )
-        assert result["report_sha256"] == "a" * 64
+        start = threading.Barrier(2)
 
-    assert events == [
-        "exchange",
-        "post-readiness-cloud",
-        "post-readiness-host",
-    ]
+        def sign_once(
+            selected_handoff: (
+                transport_module.OwnerGateHostObservationHandoff
+            ),
+        ) -> Mapping[str, Any] | str:
+            start.wait(timeout=5)
+            try:
+                return (
+                    transport.
+                    _sign_owner_gate_cloud_observation_on_target(
+                        phase=phase,
+                        unsigned_observation=unsigned,
+                        terminal_binding=selected_handoff,
+                    )
+                )
+            except launcher.OwnerLauncherError as exc:
+                return str(exc)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = [
+                future.result(timeout=5)
+                for future in (
+                    executor.submit(sign_once, handoff),
+                    executor.submit(sign_once, second_handoff),
+                )
+            ]
+        successes = [
+            item for item in outcomes if isinstance(item, Mapping)
+        ]
+        failures = [item for item in outcomes if isinstance(item, str)]
+        assert len(successes) == 1
+        assert successes[0]["report_sha256"] == "a" * 64
+        assert failures == [
+            "owner_gate_cloud_observation_signer_input_invalid"
+        ]
+        assert concurrency_lock is not None
+        assert concurrency_lock.entry_count == 2
+        assert concurrency_lock.max_holders == 1
+        assert concurrency_lock.holders == 0
+
+    assert events == (
+        ["exchange", "post-readback"]
+        if phase == "post_iam"
+        else [
+            "exchange",
+            "post-readiness-cloud",
+            "post-readiness-host",
+        ]
+    )
 
 
 def test_fixed_iap_transport_rejects_remote_receipt_drift(tmp_path: Path) -> None:
@@ -2279,6 +3189,443 @@ def _minimal_transport(
     transport._stage0_exchange = lambda *_args, **_kwargs: result
     transport._popen_factory = object()
     return transport
+
+
+def _preparation_readback_host_runtime() -> Mapping[str, Any]:
+    release = (
+        cloud_stage0.HOST_TRUSTED_OBSERVATION_RELEASE_BASE / REVISION
+    )
+    unsigned = {
+        "schema": "muncho-host-offline-trusted-runtime.v1",
+        "release_revision": REVISION,
+        "package_sha256": "1" * 64,
+        "preflight_sha256": "2" * 64,
+        "release": {
+            "path": str(release),
+            "uid": 0,
+            "gid": 0,
+            "mode": "0555",
+            "projection_sha256": "3" * 64,
+            "projection_count": 17,
+        },
+        "sudoers": {
+            "path": "/etc/sudoers.d/muncho-host-observation-attestor",
+            "uid": 0,
+            "gid": 0,
+            "mode": "0440",
+            "sha256": "4" * 64,
+        },
+        "runtime_inventory_sha256": "5" * 64,
+        "runtime_interpreter": str(release / "venv/bin/python"),
+        "host_attestor_entrypoint": str(
+            release / "bin/muncho-host-observation-attestor"
+        ),
+        "host_provisioner_entrypoint": str(
+            release / "bin/muncho-host-trusted-signer-provision"
+        ),
+        "offline_runtime": True,
+        "network_install_required": False,
+        "generic_usr_bin_python3_runtime": False,
+        "current_link_absent": True,
+        "activation_seal_absent": True,
+        "service_start_performed": False,
+        "service_enablement_mutated": False,
+        "iam_mutation_performed": False,
+        "cloud_mutation_performed": False,
+        "private_key_material_received": False,
+        "private_key_digest_recorded": False,
+    }
+    return {
+        **unsigned,
+        "receipt_sha256": outer.sha256_json(unsigned),
+    }
+
+
+def _preparation_readback_carrier(
+    *,
+    runtime: Mapping[str, Any],
+    release_key: Ed25519PrivateKey,
+) -> Mapping[str, Any]:
+    carrier: dict[str, Any] = {
+        "schema": (
+            transport_module.HOST_OBSERVATION_PREPARATION_CARRIER_SCHEMA
+        ),
+        "captured_phase": "inert",
+        "allowed_rehydrate_phase": "post_iam",
+        "release_revision": REVISION,
+        "package_inventory_sha256": "0" * 64,
+        "input_pins": {"schema": "test-pins"},
+        "binding": {
+            "source_tree_oid": TREE,
+            "package_sha256": "1" * 64,
+            "package_inventory_sha256": "0" * 64,
+            "interpreter_sha256": "2" * 64,
+            "cloud_collector_public_key_id": "3" * 64,
+            "host_collector_public_key_id": "4" * 64,
+            "bootstrap_pip_version": "24.0",
+            "bootstrap_pip_sha256": "5" * 64,
+            "kit_release_id": "6" * 64,
+            "trusted_runner_path": "/opt/test/trusted-runner",
+            "bundle_path": f"/opt/test/{REVISION}",
+        },
+        "foundation": {"schema": "test-foundation"},
+        "terminal_receipt_sha256": "7" * 64,
+        "terminal_artifact_sha256": "8" * 64,
+        "host_runtime_receipt": dict(runtime),
+        "cloud_signer_provisioning_receipt": {"role": "cloud"},
+        "cloud_signer_provisioning_receipt_file_sha256": "9" * 64,
+        "cloud_signer_readiness": {"role": "cloud"},
+        "host_signer_provisioning_receipt": {"role": "host"},
+        "host_signer_provisioning_receipt_file_sha256": "a" * 64,
+        "host_signer_readiness": {"role": "host"},
+        "freshness_asserted": False,
+        "present_time_host_state_asserted": False,
+        "present_time_iam_state_asserted": False,
+        "prepared_under_iam_binding_present": False,
+        "activation_performed": False,
+        "cloud_mutation_performed": False,
+        "service_activation_performed": False,
+    }
+    carrier["carrier_sha256"] = outer.sha256_json(carrier)
+    signed = {
+        "schema": preparation_readback.CARRIER_ENVELOPE_SCHEMA,
+        "carrier": carrier,
+        "carrier_sha256": carrier["carrier_sha256"],
+        "release_public_key_id": hashlib.sha256(
+            release_key.public_key().public_bytes_raw()
+        ).hexdigest(),
+    }
+    return {
+        **signed,
+        "signature_ed25519_b64url": base64.urlsafe_b64encode(
+            release_key.sign(outer.canonical_json_bytes(signed))
+        )
+        .rstrip(b"=")
+        .decode("ascii"),
+    }
+
+
+def _preparation_readback_request_raw() -> bytes:
+    release_key = Ed25519PrivateKey.generate()
+    carrier = _preparation_readback_carrier(
+        runtime=_preparation_readback_host_runtime(),
+        release_key=release_key,
+    )
+    request = preparation_readback.build_preparation_readback_request(
+        release_revision=REVISION,
+        carrier_envelope=carrier,
+        release_public_key=release_key.public_key(),
+        inert_evidence_set_sha256="8" * 64,
+        iam_transaction_id="9" * 64,
+    )
+    return outer.canonical_json_bytes(request)
+
+
+def _preparation_readback_response_raw(request_raw: bytes) -> bytes:
+    request = json.loads(request_raw.decode("ascii"))
+    package = {"schema": "test-package"}
+    install = {"schema": "test-install"}
+    unsigned = {
+        "schema": preparation_readback.RESPONSE_SCHEMA,
+        "phase": request["phase"],
+        "release_revision": request["release_revision"],
+        "challenge_b64url": request["challenge_b64url"],
+        "request_sha256": request["request_sha256"],
+        "carrier_sha256": request["carrier_sha256"],
+        "terminal_receipt_sha256": request["terminal_receipt_sha256"],
+        "inert_evidence_set_sha256": request[
+            "inert_evidence_set_sha256"
+        ],
+        "iam_transaction_id": request["iam_transaction_id"],
+        "package_manifest": package,
+        "package_manifest_file_sha256": hashlib.sha256(
+            outer.canonical_json_bytes(package)
+        ).hexdigest(),
+        "install_receipt": install,
+        "install_receipt_file_sha256": hashlib.sha256(
+            outer.canonical_json_bytes(install)
+        ).hexdigest(),
+        "host_runtime_receipt": request["carrier_envelope"]["carrier"][
+            "host_runtime_receipt"
+        ],
+        "cloud_signer_readiness": {"role": "cloud"},
+        "host_signer_readiness": {"role": "host"},
+    }
+    report = {
+        **unsigned,
+        "response_sha256": outer.sha256_json(unsigned),
+    }
+    response = {
+        **report,
+        "attestation": {
+            "schema": preparation_readback.ATTESTATION_SCHEMA,
+            "public_key_id": "a" * 64,
+            "signature_ed25519_b64url": base64.urlsafe_b64encode(
+                b"\x02" * 64
+            )
+            .rstrip(b"=")
+            .decode("ascii"),
+        },
+    }
+    return outer.canonical_json_bytes(response) + b"\n"
+
+
+def _preparation_readback_transport(
+    response_raw: bytes,
+) -> transport_module.OwnerGateStage0IapTransport:
+    transport = _minimal_transport(
+        transport_module._ProcessResult(0, response_raw, b"")
+    )
+    transport._release_sha = REVISION
+    transport._timeout_seconds = 37.0
+    return transport
+
+
+def test_preparation_readback_uses_exact_fixed_argv_and_bounds() -> None:
+    request_raw = _preparation_readback_request_raw()
+    response_raw = _preparation_readback_response_raw(request_raw)
+    transport = _preparation_readback_transport(response_raw)
+    calls: list[
+        tuple[tuple[str, ...], Mapping[str, str], bytes, Mapping[str, Any]]
+    ] = []
+
+    def exchange(argv, environment, input_source, **kwargs):
+        calls.append((
+            tuple(argv),
+            dict(environment),
+            input_source.read(),
+            dict(kwargs),
+        ))
+        return transport_module._ProcessResult(0, response_raw, b"")
+
+    transport._stage0_exchange = exchange
+
+    observed = transport.run_owner_gate_preparation_readback(request_raw)
+
+    assert observed["request_sha256"] == json.loads(
+        request_raw.decode("ascii")
+    )["request_sha256"]
+    assert len(calls) == 1
+    argv, environment, payload, bounds = calls[0]
+    command_argument = next(
+        item for item in argv if item.startswith("--command=")
+    )
+    assert tuple(
+        shlex.split(command_argument.removeprefix("--command="))
+    ) == (
+        "/usr/bin/sudo",
+        "--non-interactive",
+        "--",
+        (
+            f"/opt/muncho-owner-gate/releases/{REVISION}"
+            "/venv/bin/python"
+        ),
+        "-I",
+        "-B",
+        (
+            f"/opt/muncho-owner-gate/releases/{REVISION}"
+            "/bin/muncho-owner-gate-preparation-readback"
+        ),
+    )
+    assert environment == {"PINNED": "1"}
+    assert payload == request_raw + b"\n"
+    assert bounds == {
+        "maximum_input_bytes": len(request_raw) + 1,
+        "maximum_stdout_bytes": (
+            transport_module.MAX_PREPARATION_READBACK_FRAME_BYTES
+        ),
+        "maximum_stderr_bytes": transport_module.MAX_STDERR_BYTES,
+        "timeout_seconds": 37.0,
+        "popen_factory": transport._popen_factory,
+    }
+
+
+def test_preparation_readback_rejects_noncanonical_or_mapping_input() -> None:
+    request_raw = _preparation_readback_request_raw()
+    request = json.loads(request_raw.decode("ascii"))
+    response_raw = _preparation_readback_response_raw(request_raw)
+    transport = _preparation_readback_transport(response_raw)
+    calls = 0
+
+    def exchange(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return transport_module._ProcessResult(0, response_raw, b"")
+
+    transport._stage0_exchange = exchange
+    invalid_inputs = (
+        request,
+        request_raw + b"\n",
+        json.dumps(request, sort_keys=True).encode("ascii"),
+    )
+
+    for invalid in invalid_inputs:
+        with pytest.raises(
+            launcher.OwnerLauncherError,
+            match="owner_gate_preparation_readback_request_invalid",
+        ):
+            transport.run_owner_gate_preparation_readback(invalid)
+
+    assert calls == 0
+
+
+def test_preparation_readback_rejects_oversized_input_before_exchange() -> None:
+    transport = _preparation_readback_transport(b"unused")
+    calls = 0
+
+    def exchange(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return transport_module._ProcessResult(0, b"", b"")
+
+    transport._stage0_exchange = exchange
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_preparation_readback_request_invalid",
+    ):
+        transport.run_owner_gate_preparation_readback(
+            b"x"
+            * transport_module.MAX_PREPARATION_READBACK_FRAME_BYTES
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize("case", ("missing_lf", "double_lf", "noncanonical"))
+def test_preparation_readback_requires_canonical_single_line_stdout(
+    case: str,
+) -> None:
+    request_raw = _preparation_readback_request_raw()
+    response_raw = _preparation_readback_response_raw(request_raw)
+    if case == "missing_lf":
+        stdout = response_raw[:-1]
+    elif case == "double_lf":
+        stdout = response_raw + b"\n"
+    else:
+        response = json.loads(response_raw.decode("ascii"))
+        stdout = json.dumps(response, sort_keys=True).encode("ascii") + b"\n"
+    transport = _preparation_readback_transport(stdout)
+    calls = 0
+
+    def exchange(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return transport_module._ProcessResult(0, stdout, b"")
+
+    transport._stage0_exchange = exchange
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_preparation_readback_response_invalid",
+    ):
+        transport.run_owner_gate_preparation_readback(request_raw)
+
+    assert calls == 1
+
+
+def test_preparation_readback_rejects_oversized_stdout() -> None:
+    request_raw = _preparation_readback_request_raw()
+    stdout = (
+        b"x" * transport_module.MAX_PREPARATION_READBACK_FRAME_BYTES
+        + b"\n"
+    )
+    transport = _preparation_readback_transport(stdout)
+    calls = 0
+
+    def exchange(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return transport_module._ProcessResult(0, stdout, b"")
+
+    transport._stage0_exchange = exchange
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_preparation_readback_response_invalid",
+    ):
+        transport.run_owner_gate_preparation_readback(request_raw)
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize("case", ("binding", "self_hash"))
+def test_preparation_readback_rejects_response_binding_or_hash_drift(
+    case: str,
+) -> None:
+    request_raw = _preparation_readback_request_raw()
+    response = json.loads(
+        _preparation_readback_response_raw(request_raw).decode("ascii")
+    )
+    if case == "binding":
+        response["request_sha256"] = "f" * 64
+        unsigned = {
+            name: item
+            for name, item in response.items()
+            if name not in {"attestation", "response_sha256"}
+        }
+        response["response_sha256"] = outer.sha256_json(unsigned)
+    else:
+        response["response_sha256"] = "f" * 64
+    stdout = outer.canonical_json_bytes(response) + b"\n"
+    transport = _preparation_readback_transport(stdout)
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_preparation_readback_response_invalid",
+    ):
+        transport.run_owner_gate_preparation_readback(request_raw)
+
+
+def test_preparation_readback_timeout_has_no_fallback() -> None:
+    request_raw = _preparation_readback_request_raw()
+    transport = _preparation_readback_transport(b"unused")
+    calls = 0
+
+    def exchange(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise launcher.OwnerLauncherError("owner_gate_stage0_iap_timeout")
+
+    transport._stage0_exchange = exchange
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_stage0_iap_timeout",
+    ):
+        transport.run_owner_gate_preparation_readback(request_raw)
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "result",
+    (
+        transport_module._ProcessResult(1, b"", b""),
+        transport_module._ProcessResult(0, b"", b"bounded stderr"),
+    ),
+)
+def test_preparation_readback_failure_has_no_fallback(
+    result: transport_module._ProcessResult,
+) -> None:
+    request_raw = _preparation_readback_request_raw()
+    transport = _preparation_readback_transport(b"unused")
+    calls = 0
+
+    def exchange(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return result
+
+    transport._stage0_exchange = exchange
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_stage0_iap_preparation_readback_failed",
+    ):
+        transport.run_owner_gate_preparation_readback(request_raw)
+
+    assert calls == 1
 
 
 def test_fixed_operation_rejects_authority_change() -> None:

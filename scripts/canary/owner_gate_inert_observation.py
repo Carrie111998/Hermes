@@ -11,6 +11,7 @@ HOST/CLOUD composite, and returns its immediately validated inert preflight.
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Never
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -51,8 +53,16 @@ from scripts.canary import trusted_signer_author as signer_author
 
 
 INPUT_PINS_SCHEMA = "muncho-owner-gate-inert-observation-input-pins.v1"
-RECEIPT_SCHEMA = "muncho-owner-gate-inert-observation-receipt.v3"
-EVIDENCE_SET_ID_SCHEMA = "muncho-owner-gate-inert-observation-set-id.v3"
+RECEIPT_SCHEMA = "muncho-owner-gate-inert-observation-receipt.v4"
+EVIDENCE_SET_ID_SCHEMA = "muncho-owner-gate-inert-observation-set-id.v4"
+_HISTORICAL_RECEIPT_SCHEMAS = {
+    "v2": "muncho-owner-gate-inert-observation-receipt.v2",
+    "v3": "muncho-owner-gate-inert-observation-receipt.v3",
+}
+_HISTORICAL_EVIDENCE_SET_ID_SCHEMAS = {
+    "v2": "muncho-owner-gate-inert-observation-set-id.v2",
+    "v3": "muncho-owner-gate-inert-observation-set-id.v3",
+}
 OWNER_HOME = Path(pwd.getpwuid(os.geteuid()).pw_dir)  # windows-footgun: ok
 INPUT_ROOT = OWNER_HOME / ".hermes" / "owner-gate-inert-observation-inputs"
 EVIDENCE_ROOT = OWNER_HOME / ".hermes" / "owner-gate-inert-observation-evidence"
@@ -70,6 +80,12 @@ INERT_PREFLIGHT_NAME = "inert-preflight.json"
 INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME = (
     "inert-cloud-bundle-terminal-receipt.json"
 )
+INERT_HOST_PREPARATION_CARRIER_NAME = (
+    "inert-host-preparation-carrier.json"
+)
+HOST_PREPARATION_CARRIER_ENVELOPE_SCHEMA = (
+    "muncho-owner-gate-host-preparation-carrier-envelope.v1"
+)
 RECEIPT_NAME = "receipt.json"
 PENDING_NAME = ".pending"
 MAX_PINS_BYTES = 16 * 1024
@@ -78,6 +94,13 @@ MAX_EVIDENCE_BYTES = 16 * 1024 * 1024
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _PROCESS_LOCK = threading.Lock()
+_HOST_PREPARATION_CARRIER_ENVELOPE_FIELDS = frozenset({
+    "schema",
+    "carrier",
+    "carrier_sha256",
+    "release_public_key_id",
+    "signature_ed25519_b64url",
+})
 
 _EVIDENCE_NAMES = (
     NETWORK_EVIDENCE_NAME,
@@ -89,6 +112,7 @@ _EVIDENCE_NAMES = (
 _TRANSACTION_EVIDENCE_NAMES = (
     *_EVIDENCE_NAMES,
     INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME,
+    INERT_HOST_PREPARATION_CARRIER_NAME,
 )
 _TRANSACTION_NAMES = frozenset(
     (*_TRANSACTION_EVIDENCE_NAMES, RECEIPT_NAME)
@@ -113,6 +137,7 @@ _RECEIPT_FIELDS = frozenset({
     "cloud_observation_sha256",
     "host_observation_sha256",
     "inert_cloud_bundle_terminal_receipt_sha256",
+    "host_preparation_carrier_sha256",
     "preflight_report_sha256",
     "evidence_set_sha256",
     "caller_authored_evidence_accepted",
@@ -120,6 +145,60 @@ _RECEIPT_FIELDS = frozenset({
     "service_activation_performed",
     "receipt_sha256",
 })
+_HISTORICAL_TRANSACTION_EVIDENCE_NAMES = {
+    "v2": (
+        NETWORK_EVIDENCE_NAME,
+        INERT_PRODUCTION_INGRESS_OBSERVATION_NAME,
+        INERT_CLOUD_OBSERVATION_NAME,
+        INERT_HOST_OBSERVATION_NAME,
+        INERT_PREFLIGHT_NAME,
+    ),
+    "v3": (
+        NETWORK_EVIDENCE_NAME,
+        INERT_PRODUCTION_INGRESS_OBSERVATION_NAME,
+        INERT_CLOUD_OBSERVATION_NAME,
+        INERT_HOST_OBSERVATION_NAME,
+        INERT_PREFLIGHT_NAME,
+        INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME,
+    ),
+}
+_HISTORICAL_TRANSACTION_NAMES = {
+    version: frozenset((*names, RECEIPT_NAME))
+    for version, names in _HISTORICAL_TRANSACTION_EVIDENCE_NAMES.items()
+}
+_HISTORICAL_V2_RECEIPT_FIELDS = frozenset({
+    "schema",
+    "ok",
+    "phase",
+    "release_revision",
+    "source_tree_oid",
+    "foundation_source_revision",
+    "foundation_source_tree_oid",
+    "package_sha256",
+    "plan_sha256",
+    "pre_foundation_authority_sha256",
+    "foundation_apply_receipt_sha256",
+    "input_pins_sha256",
+    "observed_at_unix",
+    "evidence_files",
+    "network_evidence_sha256",
+    "production_ingress_observation_sha256",
+    "cloud_observation_sha256",
+    "host_observation_sha256",
+    "preflight_report_sha256",
+    "evidence_set_sha256",
+    "caller_authored_evidence_accepted",
+    "cloud_mutation_performed",
+    "service_activation_performed",
+    "receipt_sha256",
+})
+_HISTORICAL_RECEIPT_FIELDS = {
+    "v2": _HISTORICAL_V2_RECEIPT_FIELDS,
+    "v3": _HISTORICAL_V2_RECEIPT_FIELDS
+    | {
+        "inert_cloud_bundle_terminal_receipt_sha256",
+    },
+}
 
 
 def _error(code: str, _cause: BaseException | None = None) -> Never:
@@ -1122,6 +1201,176 @@ def _validated_terminal_receipt(
     return dict(value)
 
 
+def _host_preparation_foundation_state(
+    *,
+    binding: _ReleaseBinding,
+    loaded: _LoadedFoundation,
+) -> Mapping[str, Any]:
+    ancestry = loaded.chain.foundation_a.ancestry_evidence
+    return {
+        "foundation_source_revision": (
+            loaded.chain.foundation_source_revision
+        ),
+        "foundation_source_tree_oid": (
+            loaded.chain.foundation_source_tree_oid
+        ),
+        "pre_foundation_authority_sha256": (
+            loaded.chain.pre_foundation_authority_sha256
+        ),
+        "foundation_apply_receipt_sha256": (
+            loaded.chain.foundation_apply_receipt_sha256
+        ),
+        "project_ancestry_evidence_sha256": (
+            ancestry.signed_evidence_sha256
+        ),
+        "project_ancestry_chain_sha256": (
+            ancestry.value["stable_chain_sha256"]
+        ),
+        "resource_ancestor_chain": [
+            str(item["resource_name"])
+            for item in ancestry.ordered_chain[1:]
+        ],
+        "interpreter_sha256": binding.package["interpreter_sha256"],
+        "owner_reauthentication_receipt_sha256": (
+            loaded.chain.owner_reauthentication_receipt_sha256
+        ),
+    }
+
+
+def _decode_carrier_signature(value: Any) -> bytes:
+    error_code = "owner_gate_host_preparation_carrier_envelope_invalid"
+    if (
+        not isinstance(value, str)
+        or stage0_iap._ED25519_SIGNATURE_B64URL.fullmatch(value) is None
+        or "=" in value
+    ):
+        _error(error_code)
+    try:
+        raw = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (TypeError, ValueError) as exc:
+        _error(error_code, exc)
+    if (
+        len(raw) != 64
+        or base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+        != value
+    ):
+        _error(error_code)
+    return raw
+
+
+def _validated_host_preparation_carrier_envelope(
+    value: Mapping[str, Any],
+    *,
+    binding: _ReleaseBinding,
+    inputs: _PinnedObservationInputs,
+    loaded: _LoadedFoundation,
+    terminal_receipt: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    error_code = "owner_gate_host_preparation_carrier_envelope_invalid"
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _HOST_PREPARATION_CARRIER_ENVELOPE_FIELDS
+        or value.get("schema")
+        != HOST_PREPARATION_CARRIER_ENVELOPE_SCHEMA
+        or not isinstance(value.get("carrier"), Mapping)
+    ):
+        _error(error_code)
+    carrier = value["carrier"]
+    public_key_id = _sha256(
+        binding.release_public_key.public_bytes_raw()
+    )
+    signed = {
+        name: item
+        for name, item in value.items()
+        if name != "signature_ed25519_b64url"
+    }
+    if (
+        value.get("carrier_sha256") != carrier.get("carrier_sha256")
+        or _SHA256.fullmatch(str(value.get("carrier_sha256", "")))
+        is None
+        or value.get("release_public_key_id") != public_key_id
+    ):
+        _error(error_code)
+    try:
+        binding.release_public_key.verify(
+            _decode_carrier_signature(
+                value.get("signature_ed25519_b64url")
+            ),
+            _canonical(signed),
+        )
+        checked_carrier = (
+            stage0_iap.validate_owner_gate_host_observation_preparation_carrier(
+                carrier,
+                release_revision=binding.release_revision,
+                source_tree_oid=binding.source_tree_oid,
+                package_sha256=str(binding.package["package_sha256"]),
+                package_inventory_sha256=str(
+                    binding.package["package_inventory_sha256"]
+                ),
+                input_pins=inputs.pins,
+                foundation_state=_host_preparation_foundation_state(
+                    binding=binding,
+                    loaded=loaded,
+                ),
+                terminal_receipt=terminal_receipt,
+            )
+        )
+    except (InvalidSignature, launcher.OwnerLauncherError) as exc:
+        _error(error_code, exc)
+    return dict(value), checked_carrier
+
+
+def _sign_host_preparation_carrier(
+    carrier: Mapping[str, Any],
+    *,
+    binding: _ReleaseBinding,
+    release_private_key: Ed25519PrivateKey,
+) -> Mapping[str, Any]:
+    error_code = "owner_gate_host_preparation_carrier_envelope_invalid"
+    if (
+        not isinstance(release_private_key, Ed25519PrivateKey)
+        or release_private_key.public_key().public_bytes_raw()
+        != binding.release_public_key.public_bytes_raw()
+        or not isinstance(carrier, Mapping)
+        or set(carrier)
+        != stage0_iap._HOST_OBSERVATION_PREPARATION_CARRIER_FIELDS
+        or carrier.get("schema")
+        != stage0_iap.HOST_OBSERVATION_PREPARATION_CARRIER_SCHEMA
+        or carrier.get("release_revision") != binding.release_revision
+        or carrier.get("package_inventory_sha256")
+        != binding.package.get("package_inventory_sha256")
+        or carrier.get("carrier_sha256")
+        != foundation.sha256_json({
+            name: item
+            for name, item in carrier.items()
+            if name != "carrier_sha256"
+        })
+    ):
+        _error(error_code)
+    signed = {
+        "schema": HOST_PREPARATION_CARRIER_ENVELOPE_SCHEMA,
+        "carrier": dict(carrier),
+        "carrier_sha256": carrier["carrier_sha256"],
+        "release_public_key_id": _sha256(
+            binding.release_public_key.public_bytes_raw()
+        ),
+    }
+    signature = release_private_key.sign(_canonical(signed))
+    envelope = {
+        **signed,
+        "signature_ed25519_b64url": (
+            base64.urlsafe_b64encode(signature)
+            .rstrip(b"=")
+            .decode("ascii")
+        ),
+    }
+    return envelope
+
+
 def _final_plan(
     binding: _ReleaseBinding,
     network_evidence: foundation.ProductionNetworkEvidence,
@@ -1270,8 +1519,23 @@ def _evidence_set_sha256(
     plan_sha256: str,
     evidence_files: Mapping[str, str],
 ) -> str:
+    return _evidence_set_sha256_for_schema(
+        schema=EVIDENCE_SET_ID_SCHEMA,
+        release_revision=release_revision,
+        plan_sha256=plan_sha256,
+        evidence_files=evidence_files,
+    )
+
+
+def _evidence_set_sha256_for_schema(
+    *,
+    schema: str,
+    release_revision: str,
+    plan_sha256: str,
+    evidence_files: Mapping[str, str],
+) -> str:
     return foundation.sha256_json({
-        "schema": EVIDENCE_SET_ID_SCHEMA,
+        "schema": schema,
         "release_revision": release_revision,
         "phase": EVIDENCE_PHASE,
         "plan_sha256": plan_sha256,
@@ -1288,6 +1552,7 @@ def _build_receipt(
     plan: foundation.OwnerGateFoundationPlan,
     production_ingress_observation: Mapping[str, Any],
     terminal_receipt: Mapping[str, Any],
+    host_preparation_carrier: Mapping[str, Any],
     cloud_observation: Mapping[str, Any],
     host_observation: Mapping[str, Any],
     report: Mapping[str, Any],
@@ -1298,12 +1563,28 @@ def _build_receipt(
         inputs=inputs,
         loaded=loaded,
     )
+    try:
+        checked_carrier_envelope, checked_carrier = (
+            _validated_host_preparation_carrier_envelope(
+                host_preparation_carrier,
+                binding=binding,
+                inputs=inputs,
+                loaded=loaded,
+                terminal_receipt=checked_terminal,
+            )
+        )
+    except launcher.OwnerLauncherError as exc:
+        _error("owner_gate_inert_observation_evidence_invalid", exc)
     terminal_sha256 = checked_terminal["terminal_receipt_sha256"]
     cloud_release_binding = cloud_observation.get("release_binding")
     host_release = host_observation.get("release")
     if (
         not isinstance(cloud_release_binding, Mapping)
         or not isinstance(host_release, Mapping)
+        or production_ingress_observation.get(
+            "preparation_carrier_sha256"
+        )
+        != checked_carrier["carrier_sha256"]
         or cloud_release_binding.get("terminal_receipt_sha256")
         != terminal_sha256
         or host_release.get("terminal_receipt_sha256")
@@ -1320,6 +1601,9 @@ def _build_receipt(
         INERT_PREFLIGHT_NAME: _canonical(report),
         INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME: _canonical(
             checked_terminal
+        ),
+        INERT_HOST_PREPARATION_CARRIER_NAME: _canonical(
+            checked_carrier_envelope
         ),
     }
     evidence_files = {
@@ -1359,6 +1643,9 @@ def _build_receipt(
         "inert_cloud_bundle_terminal_receipt_sha256": (
             terminal_sha256
         ),
+        "host_preparation_carrier_sha256": checked_carrier[
+            "carrier_sha256"
+        ],
         "preflight_report_sha256": report["report_sha256"],
         "evidence_set_sha256": evidence_set_sha256,
         "caller_authored_evidence_accepted": False,
@@ -1441,6 +1728,10 @@ def _validate_receipt(
             )
         )
         is None
+        or _SHA256.fullmatch(
+            str(receipt.get("host_preparation_carrier_sha256", ""))
+        )
+        is None
         or _SHA256.fullmatch(str(receipt.get("preflight_report_sha256", "")))
         is None
         or receipt.get("caller_authored_evidence_accepted") is not False
@@ -1460,6 +1751,296 @@ def _validate_receipt(
         or receipt.get("evidence_set_sha256") != evidence_set_sha256
     ):
         _error("owner_gate_inert_observation_manual_reconciliation_required")
+
+
+def _validate_historical_legacy_receipt(
+    *,
+    version: str,
+    transaction_name: str,
+    receipt: Mapping[str, Any],
+    receipt_raw: bytes,
+    evidence_raw: Mapping[str, bytes],
+    binding: _ReleaseBinding,
+    inputs: _PinnedObservationInputs,
+    loaded: _LoadedFoundation,
+    network_evidence: foundation.ProductionNetworkEvidence,
+    plan: foundation.OwnerGateFoundationPlan,
+) -> None:
+    """Validate an exact retired receipt only for journal-owned removal."""
+
+    error_code = "owner_gate_inert_observation_historical_invalid"
+    evidence_names = _HISTORICAL_TRANSACTION_EVIDENCE_NAMES.get(version)
+    receipt_fields = _HISTORICAL_RECEIPT_FIELDS.get(version)
+    receipt_schema = _HISTORICAL_RECEIPT_SCHEMAS.get(version)
+    set_schema = _HISTORICAL_EVIDENCE_SET_ID_SCHEMAS.get(version)
+    if (
+        evidence_names is None
+        or receipt_fields is None
+        or receipt_schema is None
+        or set_schema is None
+    ):
+        _error(error_code)
+    unsigned = {
+        key: item for key, item in receipt.items() if key != "receipt_sha256"
+    }
+    evidence_files = {
+        name: _sha256(evidence_raw[name])
+        for name in evidence_names
+    }
+    digest_fields = (
+        "production_ingress_observation_sha256",
+        "cloud_observation_sha256",
+        "host_observation_sha256",
+        "preflight_report_sha256",
+    )
+    if (
+        set(receipt) != receipt_fields
+        or receipt.get("schema") != receipt_schema
+        or receipt.get("ok") is not True
+        or receipt.get("phase") != EVIDENCE_PHASE
+        or receipt.get("release_revision") != binding.release_revision
+        or receipt.get("source_tree_oid") != binding.source_tree_oid
+        or receipt.get("foundation_source_revision")
+        != binding.foundation_source_revision
+        or receipt.get("foundation_source_tree_oid")
+        != binding.foundation_source_tree_oid
+        or receipt.get("foundation_source_revision")
+        != loaded.chain.foundation_source_revision
+        or receipt.get("foundation_source_tree_oid")
+        != loaded.chain.foundation_source_tree_oid
+        or receipt.get("package_sha256")
+        != binding.package.get("package_sha256")
+        or receipt.get("plan_sha256") != plan.sha256
+        or receipt.get("pre_foundation_authority_sha256")
+        != loaded.chain.pre_foundation_authority_sha256
+        or receipt.get("foundation_apply_receipt_sha256")
+        != loaded.chain.foundation_apply_receipt_sha256
+        or receipt.get("input_pins_sha256") != inputs.pins.get("pins_sha256")
+        or type(receipt.get("observed_at_unix")) is not int
+        or receipt["observed_at_unix"] <= 0
+        or not isinstance(receipt.get("evidence_files"), Mapping)
+        or dict(receipt["evidence_files"]) != evidence_files
+        or any(
+            _SHA256.fullmatch(str(item)) is None
+            for item in evidence_files.values()
+        )
+        or receipt.get("network_evidence_sha256")
+        != network_evidence.evidence_sha256
+        or any(
+            _SHA256.fullmatch(str(receipt.get(name, ""))) is None
+            for name in digest_fields
+        )
+        or (
+            version == "v3"
+            and _SHA256.fullmatch(
+                str(
+                    receipt.get(
+                        "inert_cloud_bundle_terminal_receipt_sha256",
+                        "",
+                    )
+                )
+            )
+            is None
+        )
+        or receipt.get("caller_authored_evidence_accepted") is not False
+        or receipt.get("cloud_mutation_performed") is not False
+        or receipt.get("service_activation_performed") is not False
+        or receipt.get("receipt_sha256") != foundation.sha256_json(unsigned)
+        or _canonical(receipt) != receipt_raw
+    ):
+        _error(error_code)
+    evidence_set_sha256 = _evidence_set_sha256_for_schema(
+        schema=set_schema,
+        release_revision=binding.release_revision,
+        plan_sha256=plan.sha256,
+        evidence_files=evidence_files,
+    )
+    if (
+        transaction_name != evidence_set_sha256
+        or receipt.get("evidence_set_sha256") != evidence_set_sha256
+    ):
+        _error(error_code)
+
+
+def _load_historical_legacy_evidence_transaction(
+    *,
+    version: str,
+    phase_root: Path,
+    transaction_name: str,
+    binding: _ReleaseBinding,
+    inputs: _PinnedObservationInputs,
+    loaded: _LoadedFoundation,
+    network_key: Ed25519PublicKey,
+    cloud_key: Ed25519PublicKey,
+    host_key: Ed25519PublicKey,
+    now_unix: int,
+) -> tuple[Mapping[str, Any], bool]:
+    """Authenticate one retired v2/v3 transaction without freshness adoption."""
+
+    error_code = "owner_gate_inert_observation_historical_invalid"
+    evidence_names = _HISTORICAL_TRANSACTION_EVIDENCE_NAMES.get(version)
+    transaction_names = _HISTORICAL_TRANSACTION_NAMES.get(version)
+    if (
+        evidence_names is None
+        or transaction_names is None
+        or type(now_unix) is not int
+        or now_unix <= 0
+    ):
+        _error(error_code)
+    transaction_root = phase_root / transaction_name
+    try:
+        transaction_identity = _require_directory(
+            transaction_root,
+            parent=phase_root,
+            code=error_code,
+            mode=0o500,
+        )
+        if set(os.listdir(transaction_root)) != transaction_names:
+            _error(error_code)
+        raw: dict[str, bytes] = {}
+        identities: dict[str, tuple[Any, ...]] = {}
+        for name in (*evidence_names, RECEIPT_NAME):
+            identities[name], raw[name] = _read_pinned_file(
+                transaction_root / name,
+                maximum=(
+                    launcher._MAX_JSON_LINE_BYTES
+                    if name == RECEIPT_NAME
+                    else MAX_EVIDENCE_BYTES
+                ),
+                code=error_code,
+            )
+        network_mapping = _decode_document(
+            raw[NETWORK_EVIDENCE_NAME],
+            code=error_code,
+        )
+        collected_at_unix = network_mapping.get("collected_at_unix")
+        if type(collected_at_unix) is not int or collected_at_unix <= 0:
+            _error(error_code)
+        network_evidence = _validated_final_network_evidence(
+            network_mapping,
+            binding=binding,
+            public_key=network_key,
+            now_unix=collected_at_unix,
+            code=error_code,
+        )
+        plan = _final_plan(binding, network_evidence, network_key)
+        production_ingress_observation = _decode_document(
+            raw[INERT_PRODUCTION_INGRESS_OBSERVATION_NAME],
+            code=error_code,
+        )
+        cloud_observation = _decode_document(
+            raw[INERT_CLOUD_OBSERVATION_NAME],
+            code=error_code,
+        )
+        host_observation = _decode_document(
+            raw[INERT_HOST_OBSERVATION_NAME],
+            code=error_code,
+        )
+        stored_report = _decode_document(
+            raw[INERT_PREFLIGHT_NAME],
+            code=error_code,
+        )
+        terminal_receipt: Mapping[str, Any] | None = None
+        if version == "v3":
+            terminal_receipt = _validated_terminal_receipt(
+                _decode_document(
+                    raw[INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME],
+                    code=error_code,
+                ),
+                binding=binding,
+                inputs=inputs,
+                loaded=loaded,
+            )
+        receipt = _decode_document(raw[RECEIPT_NAME], code=error_code)
+        _validate_historical_legacy_receipt(
+            version=version,
+            transaction_name=transaction_name,
+            receipt=receipt,
+            receipt_raw=raw[RECEIPT_NAME],
+            evidence_raw={name: raw[name] for name in evidence_names},
+            binding=binding,
+            inputs=inputs,
+            loaded=loaded,
+            network_evidence=network_evidence,
+            plan=plan,
+        )
+        observed_at_unix = receipt["observed_at_unix"]
+        rebuilt = preflight.build_preflight_report(
+            plan=plan,
+            production_ingress_observation=production_ingress_observation,
+            release_public_key=binding.release_public_key,
+            cloud_observation=cloud_observation,
+            host_observation=host_observation,
+            cloud_collector_public_key=cloud_key,
+            host_collector_public_key=host_key,
+            now_unix=observed_at_unix,
+            _historical_ingress_v1=True,
+            _historical_v2=version == "v2",
+        )
+        if (
+            rebuilt != stored_report
+            or receipt["cloud_observation_sha256"]
+            != cloud_observation.get("report_sha256")
+            or receipt["production_ingress_observation_sha256"]
+            != production_ingress_observation.get("envelope_sha256")
+            or receipt["host_observation_sha256"]
+            != host_observation.get("report_sha256")
+            or receipt["preflight_report_sha256"]
+            != stored_report.get("report_sha256")
+            or stored_report.get("observed_at_unix") != observed_at_unix
+            or now_unix < observed_at_unix
+        ):
+            _error(error_code)
+        if terminal_receipt is not None and (
+            receipt[
+                "inert_cloud_bundle_terminal_receipt_sha256"
+            ]
+            != terminal_receipt.get("terminal_receipt_sha256")
+            or cloud_observation.get("release_binding", {}).get(
+                "terminal_receipt_sha256"
+            )
+            != terminal_receipt.get("terminal_receipt_sha256")
+            or host_observation.get("release", {}).get(
+                "terminal_receipt_sha256"
+            )
+            != terminal_receipt.get("terminal_receipt_sha256")
+        ):
+            _error(error_code)
+        if (
+            set(os.listdir(transaction_root)) != transaction_names
+            or _require_directory(
+                transaction_root,
+                parent=phase_root,
+                code=error_code,
+                mode=0o500,
+            )
+            != transaction_identity
+        ):
+            _error(error_code)
+        for name in (*evidence_names, RECEIPT_NAME):
+            identity, observed_raw = _read_pinned_file(
+                transaction_root / name,
+                maximum=(
+                    launcher._MAX_JSON_LINE_BYTES
+                    if name == RECEIPT_NAME
+                    else MAX_EVIDENCE_BYTES
+                ),
+                code=error_code,
+            )
+            if identity != identities[name] or observed_raw != raw[name]:
+                _error(error_code)
+        return receipt, False
+    except launcher.OwnerLauncherError:
+        raise
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        foundation.OwnerGateFoundationError,
+        preflight.OwnerGatePreflightError,
+    ) as exc:
+        _error(error_code, exc)
 
 
 def _load_evidence_transaction(
@@ -1546,6 +2127,29 @@ def _load_evidence_transaction(
             inputs=inputs,
             loaded=loaded,
         )
+        host_preparation_carrier = _decode_document(
+            raw[INERT_HOST_PREPARATION_CARRIER_NAME],
+            code=(
+                "owner_gate_inert_observation_"
+                "manual_reconciliation_required"
+            ),
+        )
+        try:
+            checked_carrier_envelope, checked_carrier = (
+                _validated_host_preparation_carrier_envelope(
+                    host_preparation_carrier,
+                    binding=binding,
+                    inputs=inputs,
+                    loaded=loaded,
+                    terminal_receipt=terminal_receipt,
+                )
+            )
+        except launcher.OwnerLauncherError as exc:
+            _error(
+                "owner_gate_inert_observation_"
+                "manual_reconciliation_required",
+                exc,
+            )
         receipt = _decode_document(
             raw[RECEIPT_NAME],
             code="owner_gate_inert_observation_manual_reconciliation_required",
@@ -1587,6 +2191,14 @@ def _load_evidence_transaction(
                 "inert_cloud_bundle_terminal_receipt_sha256"
             ]
             != terminal_receipt.get("terminal_receipt_sha256")
+            or receipt["host_preparation_carrier_sha256"]
+            != checked_carrier.get("carrier_sha256")
+            or _canonical(checked_carrier_envelope)
+            != raw[INERT_HOST_PREPARATION_CARRIER_NAME]
+            or production_ingress_observation.get(
+                "preparation_carrier_sha256"
+            )
+            != checked_carrier.get("carrier_sha256")
             or cloud_observation.get("release_binding", {}).get(
                 "terminal_receipt_sha256"
             )
@@ -1675,6 +2287,86 @@ def _load_evidence_transaction(
         _error("owner_gate_inert_observation_manual_reconciliation_required", exc)
 
 
+def _load_historical_evidence_transaction(
+    *,
+    phase_root: Path,
+    transaction_name: str,
+    binding: _ReleaseBinding,
+    inputs: _PinnedObservationInputs,
+    loaded: _LoadedFoundation,
+    network_key: Ed25519PublicKey,
+    cloud_key: Ed25519PublicKey,
+    host_key: Ed25519PublicKey,
+    now_unix: int,
+) -> tuple[
+    Mapping[str, Any],
+    bool,
+    tuple[str, ...],
+    frozenset[str],
+]:
+    """Dispatch only historical cleanup across exact v2/v3/v4 inventories."""
+
+    error_code = "owner_gate_inert_observation_historical_invalid"
+    transaction_root = phase_root / transaction_name
+    try:
+        _require_directory(
+            transaction_root,
+            parent=phase_root,
+            code=error_code,
+            mode=0o500,
+        )
+        inventory = frozenset(os.listdir(transaction_root))
+    except launcher.OwnerLauncherError:
+        raise
+    except OSError as exc:
+        _error(error_code, exc)
+    if inventory == _TRANSACTION_NAMES:
+        receipt, is_fresh = _load_evidence_transaction(
+            phase_root=phase_root,
+            transaction_name=transaction_name,
+            binding=binding,
+            inputs=inputs,
+            loaded=loaded,
+            network_key=network_key,
+            cloud_key=cloud_key,
+            host_key=host_key,
+            now_unix=now_unix,
+            assess_present_freshness=False,
+        )
+        return (
+            receipt,
+            is_fresh,
+            _TRANSACTION_EVIDENCE_NAMES,
+            _TRANSACTION_NAMES,
+        )
+    versions = [
+        version
+        for version, names in _HISTORICAL_TRANSACTION_NAMES.items()
+        if inventory == names
+    ]
+    if len(versions) != 1:
+        _error(error_code)
+    version = versions[0]
+    receipt, is_fresh = _load_historical_legacy_evidence_transaction(
+        version=version,
+        phase_root=phase_root,
+        transaction_name=transaction_name,
+        binding=binding,
+        inputs=inputs,
+        loaded=loaded,
+        network_key=network_key,
+        cloud_key=cloud_key,
+        host_key=host_key,
+        now_unix=now_unix,
+    )
+    return (
+        receipt,
+        is_fresh,
+        _HISTORICAL_TRANSACTION_EVIDENCE_NAMES[version],
+        _HISTORICAL_TRANSACTION_NAMES[version],
+    )
+
+
 def _find_fresh_replay(
     *,
     phase_root: Path,
@@ -1737,6 +2429,8 @@ class _FrozenInertEvidence:
     host_key: Ed25519PublicKey
     network_evidence: foundation.ProductionNetworkEvidence
     plan: foundation.OwnerGateFoundationPlan
+    transaction_evidence_names: tuple[str, ...]
+    transaction_names: frozenset[str]
 
     def _assert_exact_transaction(
         self,
@@ -1744,7 +2438,13 @@ class _FrozenInertEvidence:
         now_unix: int,
         assess_present_freshness: bool,
     ) -> bool:
-        if type(now_unix) is not int or now_unix <= 0:
+        if (
+            type(now_unix) is not int
+            or now_unix <= 0
+            or self.transaction_evidence_names
+            != _TRANSACTION_EVIDENCE_NAMES
+            or self.transaction_names != _TRANSACTION_NAMES
+        ):
             _error("owner_gate_inert_observation_time_invalid")
         transaction_name = self.transaction_root.name
         receipt, is_fresh = _load_evidence_transaction(
@@ -1761,7 +2461,8 @@ class _FrozenInertEvidence:
         )
         if (
             _canonical(receipt) != _canonical(self.receipt)
-            or set(os.listdir(self.transaction_root)) != _TRANSACTION_NAMES
+            or set(os.listdir(self.transaction_root))
+            != self.transaction_names
             or _require_directory(
                 self.transaction_root,
                 parent=self.phase_root,
@@ -1771,7 +2472,7 @@ class _FrozenInertEvidence:
             != self.transaction_identity
         ):
             _error("owner_gate_inert_observation_stale")
-        for name in _TRANSACTION_EVIDENCE_NAMES:
+        for name in self.transaction_evidence_names:
             identity, raw = _read_pinned_file(
                 self.transaction_root / name,
                 maximum=MAX_EVIDENCE_BYTES,
@@ -1866,6 +2567,157 @@ class _FrozenInertEvidence:
 
         self._assert_activation_seal_window_stable(now_unix=now_unix)
 
+    def _preparation_carrier_sha256_from_exact_bytes(self) -> str:
+        terminal = _decode_document(
+            self.evidence_raw[INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME],
+            code=(
+                "owner_gate_inert_observation_"
+                "manual_reconciliation_required"
+            ),
+        )
+        envelope = _decode_document(
+            self.evidence_raw[INERT_HOST_PREPARATION_CARRIER_NAME],
+            code=(
+                "owner_gate_inert_observation_"
+                "manual_reconciliation_required"
+            ),
+        )
+        try:
+            _checked_envelope, carrier = (
+                _validated_host_preparation_carrier_envelope(
+                    envelope,
+                    binding=self.binding,
+                    inputs=self.inputs,
+                    loaded=self.loaded,
+                    terminal_receipt=terminal,
+                )
+            )
+        except launcher.OwnerLauncherError as exc:
+            _error(
+                "owner_gate_inert_observation_"
+                "manual_reconciliation_required",
+                exc,
+            )
+        return str(carrier["carrier_sha256"])
+
+    def preparation_carrier_sha256(self, *, now_unix: int) -> str:
+        """Return the carrier digest while the collection clocks remain live."""
+
+        self.assert_activation_collection_window_stable(now_unix=now_unix)
+        return self._preparation_carrier_sha256_from_exact_bytes()
+
+    def authenticated_preparation_carrier_sha256(
+        self,
+        *,
+        now_unix: int,
+    ) -> str:
+        """Return the exact carrier digest under activation-staging clocks."""
+
+        self.assert_activation_staging_window_stable(now_unix=now_unix)
+        return self._preparation_carrier_sha256_from_exact_bytes()
+
+    def create_owner_gate_host_observation_restore_capability(
+        self,
+        *,
+        transport: stage0_iap.OwnerGateStage0IapTransport,
+        iam_transaction_id: str,
+        now_unix: int,
+    ) -> stage0_iap.OwnerGateHostObservationRestoreCapability:
+        """Mint one opaque restore only from exact authenticated v4 bytes."""
+
+        error_code = "owner_gate_inert_observation_restore_invalid"
+        if (
+            type(transport) is not stage0_iap.OwnerGateStage0IapTransport
+            or transport._release_sha != self.binding.release_revision
+            or _SHA256.fullmatch(iam_transaction_id or "") is None
+        ):
+            _error(error_code)
+        self.assert_activation_collection_window_stable(now_unix=now_unix)
+        try:
+            terminal_raw = self.evidence_raw[
+                INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+            ]
+            carrier_raw = self.evidence_raw[
+                INERT_HOST_PREPARATION_CARRIER_NAME
+            ]
+            ingress_raw = self.evidence_raw[
+                INERT_PRODUCTION_INGRESS_OBSERVATION_NAME
+            ]
+            terminal = _decode_document(
+                terminal_raw,
+                code=error_code,
+            )
+            terminal = _validated_terminal_receipt(
+                terminal,
+                binding=self.binding,
+                inputs=self.inputs,
+                loaded=self.loaded,
+            )
+            envelope = _decode_document(
+                carrier_raw,
+                code=error_code,
+            )
+            ingress_observation = _decode_document(
+                ingress_raw,
+                code=error_code,
+            )
+            checked_envelope, checked_carrier = (
+                _validated_host_preparation_carrier_envelope(
+                    envelope,
+                    binding=self.binding,
+                    inputs=self.inputs,
+                    loaded=self.loaded,
+                    terminal_receipt=terminal,
+                )
+            )
+            evidence_set_sha256 = str(
+                self.receipt["evidence_set_sha256"]
+            )
+        except (
+            KeyError,
+            TypeError,
+            launcher.OwnerLauncherError,
+        ) as exc:
+            _error(error_code, exc)
+        if (
+            _canonical(terminal) != terminal_raw
+            or _canonical(checked_envelope) != carrier_raw
+            or _canonical(self.inputs.pins) != self.inputs.pins_raw
+            or self.transaction_root.name != evidence_set_sha256
+            or self.receipt.get("host_preparation_carrier_sha256")
+            != checked_carrier.get("carrier_sha256")
+            or ingress_observation.get("preparation_carrier_sha256")
+            != checked_carrier.get("carrier_sha256")
+            or self.receipt.get(
+                "production_ingress_observation_sha256"
+            )
+            != ingress_observation.get("envelope_sha256")
+        ):
+            _error(error_code)
+        self.inputs.assert_stable()
+        try:
+            capability = (
+                stage0_iap.OwnerGateHostObservationRestoreCapability._create(
+                    transport=transport,
+                    release_revision=self.binding.release_revision,
+                    kit_stream=self.inputs.kit_stream,
+                    bundle_stream=self.inputs.bundle_stream,
+                    terminal_raw=terminal_raw,
+                    carrier_envelope_raw=carrier_raw,
+                    input_pins_raw=self.inputs.pins_raw,
+                    release_public_key_raw=(
+                        self.binding.release_public_key.public_bytes_raw()
+                    ),
+                    inert_evidence_set_sha256=evidence_set_sha256,
+                    iam_transaction_id=iam_transaction_id,
+                )
+            )
+        except launcher.OwnerLauncherError as exc:
+            _error(error_code, exc)
+        self.inputs.assert_stable()
+        return capability
+
+
 @contextmanager
 def _fresh_inert_evidence_snapshot(
     *,
@@ -1958,6 +2810,8 @@ def _fresh_inert_evidence_snapshot(
             host_key=host_key,
             network_evidence=network_evidence,
             plan=plan,
+            transaction_evidence_names=_TRANSACTION_EVIDENCE_NAMES,
+            transaction_names=_TRANSACTION_NAMES,
         )
         frozen.assert_stable(now_unix=now_unix)
         yield frozen
@@ -2007,7 +2861,12 @@ def _historical_inert_evidence_snapshot(
         expected_key_id=str(collectors["host"]),
     )
     with _evidence_lease(release_revision) as phase_root:
-        receipt, _is_fresh = _load_evidence_transaction(
+        (
+            receipt,
+            _is_fresh,
+            transaction_evidence_names,
+            transaction_names,
+        ) = _load_historical_evidence_transaction(
             phase_root=phase_root,
             transaction_name=evidence_set_sha256,
             binding=binding,
@@ -2017,7 +2876,6 @@ def _historical_inert_evidence_snapshot(
             cloud_key=cloud_key,
             host_key=host_key,
             now_unix=now_unix,
-            assess_present_freshness=False,
         )
         transaction_root = phase_root / evidence_set_sha256
         transaction_identity = _require_directory(
@@ -2029,7 +2887,7 @@ def _historical_inert_evidence_snapshot(
         evidence_raw: dict[str, bytes] = {}
         evidence_identities: dict[str, tuple[Any, ...]] = {}
         evidence: dict[str, Mapping[str, Any]] = {}
-        for name in _TRANSACTION_EVIDENCE_NAMES:
+        for name in transaction_evidence_names:
             identity, raw = _read_pinned_file(
                 transaction_root / name,
                 maximum=MAX_EVIDENCE_BYTES,
@@ -2071,12 +2929,19 @@ def _historical_inert_evidence_snapshot(
             host_key=host_key,
             network_evidence=network_evidence,
             plan=plan,
+            transaction_evidence_names=transaction_evidence_names,
+            transaction_names=transaction_names,
         )
         inputs.assert_stable()
         try:
             yield frozen
         finally:
-            replay, _still_fresh = _load_evidence_transaction(
+            (
+                replay,
+                _still_fresh,
+                replay_evidence_names,
+                replay_transaction_names,
+            ) = _load_historical_evidence_transaction(
                 phase_root=phase_root,
                 transaction_name=evidence_set_sha256,
                 binding=binding,
@@ -2086,10 +2951,12 @@ def _historical_inert_evidence_snapshot(
                 cloud_key=cloud_key,
                 host_key=host_key,
                 now_unix=now_unix,
-                assess_present_freshness=False,
             )
             if (
                 _canonical(replay) != _canonical(receipt)
+                or replay_evidence_names != transaction_evidence_names
+                or replay_transaction_names != transaction_names
+                or set(os.listdir(transaction_root)) != transaction_names
                 or _require_directory(
                     transaction_root,
                     parent=phase_root,
@@ -2099,7 +2966,7 @@ def _historical_inert_evidence_snapshot(
                 != transaction_identity
             ):
                 _error("owner_gate_inert_observation_historical_invalid")
-            for name in _TRANSACTION_EVIDENCE_NAMES:
+            for name in transaction_evidence_names:
                 identity, raw = _read_pinned_file(
                     transaction_root / name,
                     maximum=MAX_EVIDENCE_BYTES,
@@ -2275,6 +3142,24 @@ def _collect_inert_observation(
                 "owner_gate_inert_observation_host_preparation_failed",
                 exc,
             )
+        try:
+            unsigned_host_preparation_carrier = (
+                transport.freeze_owner_gate_host_observation_preparation(
+                    preparation=host_preparation,
+                    input_pins=inputs.pins,
+                )
+            )
+        except launcher.OwnerLauncherError as exc:
+            _error(
+                "owner_gate_inert_observation_host_preparation_failed",
+                exc,
+            )
+        release_private_key = _release_private_key(binding)
+        host_preparation_carrier = _sign_host_preparation_carrier(
+            unsigned_host_preparation_carrier,
+            binding=binding,
+            release_private_key=release_private_key,
+        )
         network_mapping, network_evidence = _collect_final_network_evidence(
             binding=binding,
             public_key=network_key,
@@ -2282,7 +3167,6 @@ def _collect_inert_observation(
             gcloud_configuration=gcloud_configuration,
         )
         plan = _final_plan(binding, network_evidence, network_key)
-        release_private_key = _release_private_key(binding)
         production_transport = production_cutover.ProductionCutoverTransport(
             owner_identity,
             gcloud_executable=gcloud_executable,
@@ -2296,6 +3180,9 @@ def _collect_inert_observation(
                 phase=EVIDENCE_PHASE,
                 release_revision=release_revision,
                 plan_sha256=plan.sha256,
+                preparation_carrier_sha256=(
+                    host_preparation_carrier["carrier_sha256"]
+                ),
                 release_private_key=release_private_key,
             )
         )
@@ -2362,6 +3249,7 @@ def _collect_inert_observation(
                 production_ingress_observation
             ),
             terminal_receipt=terminal_receipt,
+            host_preparation_carrier=host_preparation_carrier,
             cloud_observation=cloud_observation,
             host_observation=host_observation,
             report=report,
@@ -2433,6 +3321,7 @@ __all__ = [
     "INPUT_ROOT",
     "INERT_CLOUD_OBSERVATION_NAME",
     "INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME",
+    "INERT_HOST_PREPARATION_CARRIER_NAME",
     "INERT_HOST_OBSERVATION_NAME",
     "INERT_PREFLIGHT_NAME",
     "INERT_PRODUCTION_INGRESS_OBSERVATION_NAME",

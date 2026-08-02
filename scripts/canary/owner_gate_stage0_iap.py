@@ -21,6 +21,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ from scripts.canary import owner_gate_author_journal as author_journal
 from scripts.canary import owner_gate_foundation as foundation
 from scripts.canary import owner_gate_foundation_apply as foundation_apply
 from scripts.canary import owner_gate_outer_stage0 as outer
+from scripts.canary import owner_gate_preparation_readback as preparation_readback
 from scripts.canary import owner_gate_preflight as owner_preflight
 from scripts.canary import owner_gate_pre_foundation as pre_foundation
 from scripts.canary import owner_gate_stage0 as cloud_stage0
@@ -48,10 +50,26 @@ TRANSPORT_RECEIPT_SCHEMA = "muncho-owner-gate-iap-stage0-transport.v2"
 INERT_CLOUD_BUNDLE_TERMINAL_SCHEMA = (
     "muncho-owner-gate-inert-cloud-bundle-terminal.v1"
 )
+HOST_OBSERVATION_PREPARATION_CARRIER_SCHEMA = (
+    "muncho-owner-gate-host-observation-preparation-carrier.v1"
+)
+PREPARATION_READBACK_REQUEST_SCHEMA = (
+    "muncho-owner-gate-preparation-readback-request.v2"
+)
+PREPARATION_READBACK_RESPONSE_SCHEMA = (
+    "muncho-owner-gate-preparation-readback-response.v1"
+)
+PREPARATION_READBACK_ATTESTATION_SCHEMA = (
+    "muncho-owner-gate-preparation-readback-attestation.v1"
+)
 MAX_STDOUT_BYTES = 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 MAX_CLOUD_RECEIPT_BYTES = 256 * 1024
 MAX_OBSERVATION_FRAME_BYTES = 1024 * 1024
+MAX_PREPARATION_READBACK_FRAME_BYTES = MAX_STDOUT_BYTES
+_MAX_PREPARATION_READBACK_PAYLOAD_BYTES = (
+    MAX_PREPARATION_READBACK_FRAME_BYTES - 1
+)
 MAX_ACTIVATION_STAGING_RESPONSE_BYTES = 64 * 1024
 MAX_SEALER_BYTES = 128 * 1024 * 1024
 _FIREWALL_RULES_PATH = "/etc/muncho-owner-gate/metadata-firewall.rules"
@@ -131,6 +149,77 @@ _ACTIVATION_STAGING_RESPONSE_FIELDS = frozenset({
     "caddy_mutation_performed",
     "response_sha256",
 })
+_HOST_OBSERVATION_PREPARATION_CARRIER_FIELDS = frozenset({
+    "schema",
+    "captured_phase",
+    "allowed_rehydrate_phase",
+    "release_revision",
+    "package_inventory_sha256",
+    "input_pins",
+    "binding",
+    "foundation",
+    "terminal_receipt_sha256",
+    "terminal_artifact_sha256",
+    "host_runtime_receipt",
+    "cloud_signer_provisioning_receipt",
+    "cloud_signer_provisioning_receipt_file_sha256",
+    "cloud_signer_readiness",
+    "host_signer_provisioning_receipt",
+    "host_signer_provisioning_receipt_file_sha256",
+    "host_signer_readiness",
+    "freshness_asserted",
+    "present_time_host_state_asserted",
+    "present_time_iam_state_asserted",
+    "prepared_under_iam_binding_present",
+    "activation_performed",
+    "cloud_mutation_performed",
+    "service_activation_performed",
+    "carrier_sha256",
+})
+_PREPARATION_READBACK_REQUEST_FIELDS = frozenset({
+    "schema",
+    "phase",
+    "release_revision",
+    "challenge_b64url",
+    "carrier_sha256",
+    "terminal_receipt_sha256",
+    "inert_evidence_set_sha256",
+    "iam_transaction_id",
+    "carrier_envelope",
+    "request_sha256",
+})
+_PREPARATION_READBACK_CARRIER_ENVELOPE_FIELDS = frozenset({
+    "schema",
+    "carrier",
+    "carrier_sha256",
+    "release_public_key_id",
+    "signature_ed25519_b64url",
+})
+_PREPARATION_READBACK_RESPONSE_FIELDS = frozenset({
+    "schema",
+    "phase",
+    "release_revision",
+    "challenge_b64url",
+    "request_sha256",
+    "carrier_sha256",
+    "terminal_receipt_sha256",
+    "inert_evidence_set_sha256",
+    "iam_transaction_id",
+    "package_manifest",
+    "package_manifest_file_sha256",
+    "install_receipt",
+    "install_receipt_file_sha256",
+    "host_runtime_receipt",
+    "cloud_signer_readiness",
+    "host_signer_readiness",
+    "response_sha256",
+    "attestation",
+})
+_PREPARATION_READBACK_ATTESTATION_FIELDS = frozenset({
+    "schema",
+    "public_key_id",
+    "signature_ed25519_b64url",
+})
 
 
 class StableOuterSealer(Protocol):
@@ -201,6 +290,7 @@ class _FoundationProjection:
 class _BoundInertCloudBundle:
     source_tree_oid: str
     package_sha256: str
+    package_inventory_sha256: str
     interpreter_sha256: str
     cloud_collector_public_key_id: str
     host_collector_public_key_id: str
@@ -213,6 +303,104 @@ class _BoundInertCloudBundle:
 
 _HOST_OBSERVATION_HANDOFF_MARKER = object()
 _HOST_OBSERVATION_PREPARATION_MARKER = object()
+_HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER = object()
+
+
+@dataclass(frozen=True, init=False)
+class OwnerGateHostObservationRestoreCapability:
+    """Opaque one-use authority to restore one signed inert preparation.
+
+    The immutable carrier is provenance only.  Consumption always performs a
+    fresh, challenge-bound target readback before it can mint a post-IAM
+    preparation, and the same capability carries the ordered readback state
+    through the HOST and CLOUD signer boundaries.
+    """
+
+    _transport: object
+    _release_revision: str
+    _kit_stream: PinnedExactTreeStream
+    _bundle_stream: PinnedExactTreeStream
+    _terminal_raw: bytes
+    _carrier_envelope_raw: bytes
+    _input_pins_raw: bytes
+    _release_public_key_raw: bytes
+    _inert_evidence_set_sha256: str
+    _iam_transaction_id: str
+    _marker: object
+    _consumed: bool
+    _readback_stage: int
+    _cloud_signer_consumed: bool
+    _state_lock: threading.Lock
+
+    def __new__(
+        cls,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> "OwnerGateHostObservationRestoreCapability":
+        raise launcher.OwnerLauncherError(
+            "owner_gate_host_observation_restore_factory_required"
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        transport: object,
+        release_revision: str,
+        kit_stream: PinnedExactTreeStream,
+        bundle_stream: PinnedExactTreeStream,
+        terminal_raw: bytes,
+        carrier_envelope_raw: bytes,
+        input_pins_raw: bytes,
+        release_public_key_raw: bytes,
+        inert_evidence_set_sha256: str,
+        iam_transaction_id: str,
+    ) -> "OwnerGateHostObservationRestoreCapability":
+        if (
+            _REVISION.fullmatch(release_revision or "") is None
+            or type(terminal_raw) is not bytes
+            or not terminal_raw
+            or len(terminal_raw) > MAX_OBSERVATION_FRAME_BYTES
+            or type(carrier_envelope_raw) is not bytes
+            or not carrier_envelope_raw
+            or len(carrier_envelope_raw) > MAX_OBSERVATION_FRAME_BYTES
+            or type(input_pins_raw) is not bytes
+            or not input_pins_raw
+            or len(input_pins_raw) > MAX_OBSERVATION_FRAME_BYTES
+            or type(release_public_key_raw) is not bytes
+            or len(release_public_key_raw) != 32
+            or _SHA256.fullmatch(inert_evidence_set_sha256 or "") is None
+            or _SHA256.fullmatch(iam_transaction_id or "") is None
+        ):
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_restore_factory_invalid"
+            )
+        value = object.__new__(cls)
+        for name, item in (
+            ("_transport", transport),
+            ("_release_revision", release_revision),
+            ("_kit_stream", kit_stream),
+            ("_bundle_stream", bundle_stream),
+            ("_terminal_raw", terminal_raw),
+            ("_carrier_envelope_raw", carrier_envelope_raw),
+            ("_input_pins_raw", input_pins_raw),
+            ("_release_public_key_raw", release_public_key_raw),
+            (
+                "_inert_evidence_set_sha256",
+                inert_evidence_set_sha256,
+            ),
+            ("_iam_transaction_id", iam_transaction_id),
+            (
+                "_marker",
+                _HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER,
+            ),
+            ("_consumed", False),
+            ("_readback_stage", 0),
+            ("_cloud_signer_consumed", False),
+            ("_state_lock", threading.Lock()),
+        ):
+            object.__setattr__(value, name, item)
+        return value
 
 
 @dataclass(frozen=True, init=False)
@@ -230,9 +418,11 @@ class OwnerGateHostObservationPreparation:
     _cloud_readiness: Mapping[str, Any]
     _host_receipt: Mapping[str, Any]
     _host_readiness: Mapping[str, Any]
+    _restore_capability: OwnerGateHostObservationRestoreCapability | None
     _snapshot: bytes
     _marker: object
     _consumed: bool
+    _state_lock: threading.Lock
 
     def __new__(
         cls,
@@ -259,6 +449,9 @@ class OwnerGateHostObservationPreparation:
         host_receipt: Mapping[str, Any],
         host_readiness: Mapping[str, Any],
         snapshot: bytes,
+        restore_capability: (
+            OwnerGateHostObservationRestoreCapability | None
+        ) = None,
     ) -> "OwnerGateHostObservationPreparation":
         value = object.__new__(cls)
         for name, item in (
@@ -273,9 +466,11 @@ class OwnerGateHostObservationPreparation:
             ("_cloud_readiness", cloud_readiness),
             ("_host_receipt", host_receipt),
             ("_host_readiness", host_readiness),
+            ("_restore_capability", restore_capability),
             ("_snapshot", snapshot),
             ("_marker", _HOST_OBSERVATION_PREPARATION_MARKER),
             ("_consumed", False),
+            ("_state_lock", threading.Lock()),
         ):
             object.__setattr__(value, name, item)
         return value
@@ -287,7 +482,10 @@ class OwnerGateHostObservationHandoff:
 
     terminal_receipt: Mapping[str, Any]
     host_observation: Mapping[str, Any]
+    _restore_capability: OwnerGateHostObservationRestoreCapability | None
     _marker: object
+    _consumed: bool
+    _state_lock: threading.Lock
 
     def __new__(cls, *_args: Any, **_kwargs: Any) -> "OwnerGateHostObservationHandoff":
         raise launcher.OwnerLauncherError(
@@ -300,11 +498,21 @@ class OwnerGateHostObservationHandoff:
         *,
         terminal_receipt: Mapping[str, Any],
         host_observation: Mapping[str, Any],
+        restore_capability: (
+            OwnerGateHostObservationRestoreCapability | None
+        ) = None,
     ) -> "OwnerGateHostObservationHandoff":
         value = object.__new__(cls)
         object.__setattr__(value, "terminal_receipt", terminal_receipt)
         object.__setattr__(value, "host_observation", host_observation)
+        object.__setattr__(
+            value,
+            "_restore_capability",
+            restore_capability,
+        )
         object.__setattr__(value, "_marker", _HOST_OBSERVATION_HANDOFF_MARKER)
+        object.__setattr__(value, "_consumed", False)
+        object.__setattr__(value, "_state_lock", threading.Lock())
         return value
 
 
@@ -521,6 +729,51 @@ def _canonical(value: Any) -> bytes:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _bound_bundle_state(
+    binding: _BoundInertCloudBundle,
+) -> Mapping[str, Any]:
+    return {
+        name: getattr(binding, name)
+        for name in binding.__dataclass_fields__
+    }
+
+
+def _foundation_projection_state(
+    projection: _FoundationProjection,
+) -> Mapping[str, Any]:
+    state = {
+        name: getattr(projection, name)
+        for name in projection.__dataclass_fields__
+    }
+    state["resource_ancestor_chain"] = list(
+        projection.resource_ancestor_chain
+    )
+    return state
+
+
+def _host_observation_preparation_state(
+    *,
+    phase: str,
+    binding: _BoundInertCloudBundle,
+    terminal: Mapping[str, Any],
+    host_runtime: Mapping[str, Any],
+    cloud_receipt: Mapping[str, Any],
+    cloud_readiness: Mapping[str, Any],
+    host_receipt: Mapping[str, Any],
+    host_readiness: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    return {
+        "phase": phase,
+        "binding": _bound_bundle_state(binding),
+        "terminal": terminal,
+        "host_runtime": host_runtime,
+        "cloud_receipt": cloud_receipt,
+        "cloud_readiness": cloud_readiness,
+        "host_receipt": host_receipt,
+        "host_readiness": host_readiness,
+    }
 
 
 def _wipe(frame: bytearray) -> None:
@@ -1454,6 +1707,481 @@ def _validate_self_hash(
         raise launcher.OwnerLauncherError(error_code)
 
 
+def _decode_exact_b64url(
+    value: Any,
+    *,
+    size: int,
+    error_code: str,
+) -> bytes:
+    if (
+        type(value) is not str
+        or not value
+        or "=" in value
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 1
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    try:
+        raw = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (TypeError, ValueError):
+        raise launcher.OwnerLauncherError(error_code) from None
+    if (
+        len(raw) != size
+        or base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+        != value
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    return raw
+
+
+def _validate_preparation_readback_host_runtime(
+    value: Any,
+    *,
+    release_revision: str,
+    error_code: str,
+) -> Mapping[str, Any]:
+    false_fields = (
+        "network_install_required",
+        "generic_usr_bin_python3_runtime",
+        "service_start_performed",
+        "service_enablement_mutated",
+        "iam_mutation_performed",
+        "cloud_mutation_performed",
+        "private_key_material_received",
+        "private_key_digest_recorded",
+    )
+    if not isinstance(value, Mapping):
+        raise launcher.OwnerLauncherError(error_code)
+    receipt = dict(value)
+    release = receipt.get("release")
+    sudoers = receipt.get("sudoers")
+    expected_release = (
+        cloud_stage0.HOST_TRUSTED_OBSERVATION_RELEASE_BASE
+        / release_revision
+    )
+    if (
+        frozenset(receipt) != _HOST_RUNTIME_RECEIPT_FIELDS
+        or receipt.get("schema")
+        != "muncho-host-offline-trusted-runtime.v1"
+        or receipt.get("release_revision") != release_revision
+        or any(
+            type(receipt.get(name)) is not str
+            or _SHA256.fullmatch(receipt[name]) is None
+            for name in (
+                "package_sha256",
+                "preflight_sha256",
+                "runtime_inventory_sha256",
+            )
+        )
+        or not isinstance(release, Mapping)
+        or frozenset(release)
+        != {
+            "path",
+            "uid",
+            "gid",
+            "mode",
+            "projection_sha256",
+            "projection_count",
+        }
+        or release.get("path") != str(expected_release)
+        or release.get("uid") != 0
+        or release.get("gid") != 0
+        or release.get("mode") != "0555"
+        or type(release.get("projection_sha256")) is not str
+        or _SHA256.fullmatch(release["projection_sha256"]) is None
+        or type(release.get("projection_count")) is not int
+        or release["projection_count"] < 1
+        or not isinstance(sudoers, Mapping)
+        or frozenset(sudoers) != {"path", "uid", "gid", "mode", "sha256"}
+        or sudoers.get("path")
+        != "/etc/sudoers.d/muncho-host-observation-attestor"
+        or sudoers.get("uid") != 0
+        or sudoers.get("gid") != 0
+        or sudoers.get("mode") != "0440"
+        or type(sudoers.get("sha256")) is not str
+        or _SHA256.fullmatch(sudoers["sha256"]) is None
+        or receipt.get("runtime_interpreter")
+        != str(expected_release / "venv/bin/python")
+        or receipt.get("host_attestor_entrypoint")
+        != str(expected_release / "bin/muncho-host-observation-attestor")
+        or receipt.get("host_provisioner_entrypoint")
+        != str(
+            expected_release / "bin/muncho-host-trusted-signer-provision"
+        )
+        or receipt.get("offline_runtime") is not True
+        or receipt.get("current_link_absent") is not True
+        or receipt.get("activation_seal_absent") is not True
+        or any(receipt.get(name) is not False for name in false_fields)
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    _validate_self_hash(
+        receipt,
+        field="receipt_sha256",
+        error_code=error_code,
+    )
+    return receipt
+
+
+def _validate_preparation_readback_request_raw(
+    raw: bytes,
+    *,
+    release_revision: str,
+) -> Mapping[str, Any]:
+    error_code = "owner_gate_preparation_readback_request_invalid"
+    request = _decode_canonical_mapping(
+        raw,
+        maximum=_MAX_PREPARATION_READBACK_PAYLOAD_BYTES,
+        error_code=error_code,
+    )
+    carrier_envelope = request.get("carrier_envelope")
+    carrier = (
+        carrier_envelope.get("carrier")
+        if isinstance(carrier_envelope, Mapping)
+        else None
+    )
+    if (
+        frozenset(request) != _PREPARATION_READBACK_REQUEST_FIELDS
+        or request.get("schema") != PREPARATION_READBACK_REQUEST_SCHEMA
+        or request.get("phase") != "post_iam"
+        or request.get("release_revision") != release_revision
+        or type(release_revision) is not str
+        or _REVISION.fullmatch(release_revision) is None
+        or any(
+            type(request.get(name)) is not str
+            or _SHA256.fullmatch(request[name]) is None
+            for name in (
+                "carrier_sha256",
+                "terminal_receipt_sha256",
+                "inert_evidence_set_sha256",
+                "iam_transaction_id",
+            )
+        )
+        or not isinstance(carrier_envelope, Mapping)
+        or frozenset(carrier_envelope)
+        != _PREPARATION_READBACK_CARRIER_ENVELOPE_FIELDS
+        or carrier_envelope.get("schema")
+        != "muncho-owner-gate-host-preparation-carrier-envelope.v1"
+        or not isinstance(carrier, Mapping)
+        or frozenset(carrier)
+        != _HOST_OBSERVATION_PREPARATION_CARRIER_FIELDS
+        or carrier.get("schema")
+        != HOST_OBSERVATION_PREPARATION_CARRIER_SCHEMA
+        or carrier.get("captured_phase") != "inert"
+        or carrier.get("allowed_rehydrate_phase") != "post_iam"
+        or carrier.get("release_revision") != release_revision
+        or request.get("carrier_sha256")
+        != carrier_envelope.get("carrier_sha256")
+        or carrier_envelope.get("carrier_sha256")
+        != carrier.get("carrier_sha256")
+        or request.get("terminal_receipt_sha256")
+        != carrier.get("terminal_receipt_sha256")
+        or type(carrier_envelope.get("release_public_key_id")) is not str
+        or _SHA256.fullmatch(carrier_envelope["release_public_key_id"])
+        is None
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    _decode_exact_b64url(
+        request.get("challenge_b64url"),
+        size=32,
+        error_code=error_code,
+    )
+    _decode_exact_b64url(
+        carrier_envelope.get("signature_ed25519_b64url"),
+        size=64,
+        error_code=error_code,
+    )
+    _validate_self_hash(
+        carrier,
+        field="carrier_sha256",
+        error_code=error_code,
+    )
+    _validate_preparation_readback_host_runtime(
+        carrier.get("host_runtime_receipt"),
+        release_revision=release_revision,
+        error_code=error_code,
+    )
+    _validate_self_hash(
+        request,
+        field="request_sha256",
+        error_code=error_code,
+    )
+    return request
+
+
+def _validate_preparation_readback_response_raw(
+    raw: bytes,
+    *,
+    request: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    error_code = "owner_gate_preparation_readback_response_invalid"
+    if (
+        type(raw) is not bytes
+        or not raw.endswith(b"\n")
+        or raw == b"\n"
+        or b"\n" in raw[:-1]
+        or len(raw) > MAX_PREPARATION_READBACK_FRAME_BYTES
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    response = _decode_canonical_mapping(
+        raw[:-1],
+        maximum=_MAX_PREPARATION_READBACK_PAYLOAD_BYTES,
+        error_code=error_code,
+    )
+    attestation = response.get("attestation")
+    copied_fields = (
+        "phase",
+        "release_revision",
+        "challenge_b64url",
+        "request_sha256",
+        "carrier_sha256",
+        "terminal_receipt_sha256",
+        "inert_evidence_set_sha256",
+        "iam_transaction_id",
+    )
+    package = response.get("package_manifest")
+    install = response.get("install_receipt")
+    host_runtime = response.get("host_runtime_receipt")
+    cloud_readiness = response.get("cloud_signer_readiness")
+    host_readiness = response.get("host_signer_readiness")
+    request_carrier_envelope = request.get("carrier_envelope")
+    request_carrier = (
+        request_carrier_envelope.get("carrier")
+        if isinstance(request_carrier_envelope, Mapping)
+        else None
+    )
+    unsigned = {
+        name: item
+        for name, item in response.items()
+        if name not in {"attestation", "response_sha256"}
+    }
+    if (
+        frozenset(response) != _PREPARATION_READBACK_RESPONSE_FIELDS
+        or response.get("schema") != PREPARATION_READBACK_RESPONSE_SCHEMA
+        or any(response.get(name) != request.get(name) for name in copied_fields)
+        or not isinstance(package, Mapping)
+        or not isinstance(install, Mapping)
+        or not isinstance(host_runtime, Mapping)
+        or not isinstance(cloud_readiness, Mapping)
+        or not isinstance(host_readiness, Mapping)
+        or _canonical(host_runtime)
+        != _canonical(
+            request_carrier.get("host_runtime_receipt")
+            if isinstance(request_carrier, Mapping)
+            else None
+        )
+        or response.get("package_manifest_file_sha256")
+        != _sha256(_canonical(package))
+        or response.get("install_receipt_file_sha256")
+        != _sha256(_canonical(install))
+        or response.get("response_sha256") != outer.sha256_json(unsigned)
+        or not isinstance(attestation, Mapping)
+        or frozenset(attestation)
+        != _PREPARATION_READBACK_ATTESTATION_FIELDS
+        or attestation.get("schema")
+        != PREPARATION_READBACK_ATTESTATION_SCHEMA
+        or type(attestation.get("public_key_id")) is not str
+        or _SHA256.fullmatch(attestation["public_key_id"]) is None
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    _decode_exact_b64url(
+        attestation.get("signature_ed25519_b64url"),
+        size=64,
+        error_code=error_code,
+    )
+    return response
+
+
+def validate_owner_gate_host_observation_preparation_carrier(
+    value: Mapping[str, Any],
+    *,
+    release_revision: str,
+    source_tree_oid: str,
+    package_sha256: str,
+    package_inventory_sha256: str,
+    input_pins: Mapping[str, Any],
+    foundation_state: Mapping[str, Any],
+    terminal_receipt: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate the immutable, non-authorizing preparation envelope.
+
+    Cryptographic signer verification and exact stream re-binding remain the
+    responsibility of the transport that restores the opaque preparation.
+    This public structural boundary is also used while replaying the inert
+    transaction, before any post-IAM work can consume the carrier.
+    """
+
+    error_code = "owner_gate_host_observation_preparation_carrier_invalid"
+    if (
+        not isinstance(value, Mapping)
+        or _REVISION.fullmatch(release_revision or "") is None
+        or _REVISION.fullmatch(source_tree_oid or "") is None
+        or any(
+            _SHA256.fullmatch(item or "") is None
+            for item in (
+                package_sha256,
+                package_inventory_sha256,
+            )
+        )
+        or not isinstance(input_pins, Mapping)
+        or not isinstance(foundation_state, Mapping)
+        or not isinstance(terminal_receipt, Mapping)
+    ):
+        raise launcher.OwnerLauncherError(error_code)
+    try:
+        checked = _decode_canonical_mapping(
+            _canonical(value),
+            maximum=MAX_OBSERVATION_FRAME_BYTES,
+            error_code=error_code,
+        )
+        binding = checked.get("binding")
+        observed_pins = checked.get("input_pins")
+        observed_foundation = checked.get("foundation")
+        host_runtime = checked.get("host_runtime_receipt")
+        cloud_receipt = checked.get(
+            "cloud_signer_provisioning_receipt"
+        )
+        cloud_readiness = checked.get("cloud_signer_readiness")
+        host_receipt = checked.get("host_signer_provisioning_receipt")
+        host_readiness = checked.get("host_signer_readiness")
+        if (
+            set(checked) != _HOST_OBSERVATION_PREPARATION_CARRIER_FIELDS
+            or checked.get("schema")
+            != HOST_OBSERVATION_PREPARATION_CARRIER_SCHEMA
+            or checked.get("captured_phase") != "inert"
+            or checked.get("allowed_rehydrate_phase") != "post_iam"
+            or checked.get("release_revision") != release_revision
+            or checked.get("package_inventory_sha256")
+            != package_inventory_sha256
+            or not isinstance(observed_pins, Mapping)
+            or _canonical(observed_pins) != _canonical(input_pins)
+            or not isinstance(observed_foundation, Mapping)
+            or _canonical(observed_foundation)
+            != _canonical(foundation_state)
+            or not isinstance(binding, Mapping)
+            or set(binding)
+            != set(_BoundInertCloudBundle.__dataclass_fields__)
+            or binding.get("source_tree_oid") != source_tree_oid
+            or binding.get("package_sha256") != package_sha256
+            or binding.get("package_inventory_sha256")
+            != package_inventory_sha256
+            or any(
+                _SHA256.fullmatch(str(binding.get(name, ""))) is None
+                for name in (
+                    "interpreter_sha256",
+                    "cloud_collector_public_key_id",
+                    "host_collector_public_key_id",
+                    "bootstrap_pip_sha256",
+                    "kit_release_id",
+                )
+            )
+            or not isinstance(binding.get("bootstrap_pip_version"), str)
+            or not binding["bootstrap_pip_version"]
+            or not isinstance(binding.get("trusted_runner_path"), str)
+            or binding["trusted_runner_path"]
+            != str(
+                outer.RELEASE_BASE
+                / str(binding["kit_release_id"])
+                / outer.TRUSTED_RUNNER
+            )
+            or not isinstance(binding.get("bundle_path"), str)
+            or binding["bundle_path"]
+            != str(outer.BUNDLE_INCOMING_BASE / release_revision)
+            or checked.get("terminal_receipt_sha256")
+            != terminal_receipt.get("terminal_receipt_sha256")
+            or checked.get("terminal_artifact_sha256")
+            != _sha256(_canonical(terminal_receipt))
+            or terminal_receipt.get("release_sha") != release_revision
+            or terminal_receipt.get("source_tree_oid") != source_tree_oid
+            or terminal_receipt.get("package_sha256") != package_sha256
+            or terminal_receipt.get("kit_release_id")
+            != binding.get("kit_release_id")
+            or terminal_receipt.get("trusted_runner_path")
+            != binding.get("trusted_runner_path")
+            or terminal_receipt.get("bundle_path")
+            != binding.get("bundle_path")
+            or not isinstance(host_runtime, Mapping)
+            or set(host_runtime) != _HOST_RUNTIME_RECEIPT_FIELDS
+            or host_runtime.get("schema")
+            != "muncho-host-offline-trusted-runtime.v1"
+            or host_runtime.get("release_revision") != release_revision
+            or host_runtime.get("package_sha256") != package_sha256
+            or not isinstance(cloud_receipt, Mapping)
+            or not isinstance(cloud_readiness, Mapping)
+            or not isinstance(host_receipt, Mapping)
+            or not isinstance(host_readiness, Mapping)
+            or checked.get(
+                "cloud_signer_provisioning_receipt_file_sha256"
+            )
+            != _sha256(_canonical(cloud_receipt))
+            or checked.get(
+                "host_signer_provisioning_receipt_file_sha256"
+            )
+            != _sha256(_canonical(host_receipt))
+            or cloud_receipt.get("role") != "cloud"
+            or host_receipt.get("role") != "host"
+            or any(
+                receipt.get("release_revision") != release_revision
+                or receipt.get("package_sha256") != package_sha256
+                or receipt.get("owner_authorization_receipt_sha256")
+                != foundation_state.get(
+                    "owner_reauthentication_receipt_sha256"
+                )
+                for receipt in (cloud_receipt, host_receipt)
+            )
+            or cloud_receipt.get("public_key_id")
+            != binding.get("cloud_collector_public_key_id")
+            or host_receipt.get("public_key_id")
+            != binding.get("host_collector_public_key_id")
+            or _canonical(cloud_readiness)
+            != _canonical(_signer_readiness_from_receipt(cloud_receipt))
+            or _canonical(host_readiness)
+            != _canonical(_signer_readiness_from_receipt(host_receipt))
+            or any(
+                checked.get(name) is not False
+                for name in (
+                    "freshness_asserted",
+                    "present_time_host_state_asserted",
+                    "present_time_iam_state_asserted",
+                    "prepared_under_iam_binding_present",
+                    "activation_performed",
+                    "cloud_mutation_performed",
+                    "service_activation_performed",
+                )
+            )
+        ):
+            raise launcher.OwnerLauncherError(error_code)
+        _validate_self_hash(
+            terminal_receipt,
+            field="terminal_receipt_sha256",
+            error_code=error_code,
+        )
+        _validate_self_hash(
+            host_runtime,
+            field="receipt_sha256",
+            error_code=error_code,
+        )
+        _validate_self_hash(
+            checked,
+            field="carrier_sha256",
+            error_code=error_code,
+        )
+    except launcher.OwnerLauncherError:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        outer.OwnerGateOuterStage0Error,
+    ):
+        raise launcher.OwnerLauncherError(error_code) from None
+    return checked
+
+
 _VERIFY_RECEIPT_FIELDS = frozenset({
     "schema",
     "release_revision",
@@ -1683,6 +2411,9 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             raise launcher.OwnerLauncherError(error_code) from None
         source_tree_oid = package.get("source_tree_oid")
         package_sha256 = package.get("package_sha256")
+        package_inventory_sha256 = package.get(
+            "package_inventory_sha256"
+        )
         interpreter_sha256 = package.get("interpreter_sha256")
         collectors = package.get("collector_public_key_ids")
         lineage = {
@@ -1715,6 +2446,10 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             != self._release_sha
             or kit_manifest.get("source_tree_oid") != source_tree_oid
             or _SHA256.fullmatch(str(package_sha256 or "")) is None
+            or _SHA256.fullmatch(
+                str(package_inventory_sha256 or "")
+            )
+            is None
             or not isinstance(collectors, Mapping)
             or set(collectors) != {"network", "cloud", "host"}
             or any(
@@ -1745,6 +2480,7 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
         return _BoundInertCloudBundle(
             source_tree_oid=str(source_tree_oid),
             package_sha256=str(package_sha256),
+            package_inventory_sha256=str(package_inventory_sha256),
             interpreter_sha256=str(interpreter_sha256),
             cloud_collector_public_key_id=str(collectors["cloud"]),
             host_collector_public_key_id=str(collectors["host"]),
@@ -2095,6 +2831,395 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
         return _decode_canonical_stdout(
             result.stdout,
             error_code=error_code,
+        )
+
+    def run_owner_gate_preparation_readback(
+        self,
+        request_raw: bytes,
+    ) -> Mapping[str, Any]:
+        """Run the fixed read-only preparation readback wrapper once.
+
+        This transport validates canonical framing, copied request bindings,
+        and self-hashes.  Cryptographic signature and frozen-lineage
+        verification remain an owner-side responsibility.
+        """
+
+        request = _validate_preparation_readback_request_raw(
+            request_raw,
+            release_revision=self._release_sha,
+        )
+        release = f"/opt/muncho-owner-gate/releases/{self._release_sha}"
+        operation = _FixedOperation(
+            "preparation_readback",
+            (
+                f"{release}/venv/bin/python",
+                "-I",
+                "-B",
+                (
+                    f"{release}/bin/"
+                    "muncho-owner-gate-preparation-readback"
+                ),
+            ),
+            b"",
+            len(request_raw) + 1,
+            self._timeout_seconds,
+        )
+        result = self._exchange_fixed_operation(
+            operation,
+            io.BytesIO(request_raw + b"\n"),
+            maximum_stdout_bytes=MAX_PREPARATION_READBACK_FRAME_BYTES,
+        )
+        return _validate_preparation_readback_response_raw(
+            result.stdout,
+            request=request,
+        )
+
+    def _validated_restore_capability_lineage(
+        self,
+        capability: OwnerGateHostObservationRestoreCapability,
+    ) -> tuple[
+        _BoundInertCloudBundle,
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+    ]:
+        """Rebind every frozen byte to this transport and pinned release."""
+
+        error_code = "owner_gate_host_observation_restore_invalid"
+        if (
+            type(capability)
+            is not OwnerGateHostObservationRestoreCapability
+            or capability._marker
+            is not _HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER
+            or capability._transport is not self
+            or capability._release_revision != self._release_sha
+        ):
+            raise launcher.OwnerLauncherError(error_code)
+        try:
+            terminal = _decode_canonical_mapping(
+                capability._terminal_raw,
+                maximum=MAX_OBSERVATION_FRAME_BYTES,
+                error_code=error_code,
+            )
+            envelope = _decode_canonical_mapping(
+                capability._carrier_envelope_raw,
+                maximum=MAX_OBSERVATION_FRAME_BYTES,
+                error_code=error_code,
+            )
+            input_pins = _decode_canonical_mapping(
+                capability._input_pins_raw,
+                maximum=MAX_OBSERVATION_FRAME_BYTES,
+                error_code=error_code,
+            )
+            release_public_key = Ed25519PublicKey.from_public_bytes(
+                capability._release_public_key_raw
+            )
+            binding = OwnerGateStage0IapTransport._bind_inert_cloud_bundle(
+                self,
+                kit_stream=capability._kit_stream,
+                bundle_stream=capability._bundle_stream,
+            )
+            terminal = self._validate_resumable_inert_terminal(
+                terminal,
+                binding=binding,
+            )
+            checked_envelope, signed_carrier, _signed_runtime = (
+                preparation_readback.
+                _validate_release_signed_carrier_envelope(
+                    envelope,
+                    release_revision=self._release_sha,
+                    release_public_key=release_public_key,
+                    package_sha256=binding.package_sha256,
+                    package_inventory_sha256=(
+                        binding.package_inventory_sha256
+                    ),
+                )
+            )
+            carrier = (
+                validate_owner_gate_host_observation_preparation_carrier(
+                    signed_carrier,
+                    release_revision=self._release_sha,
+                    source_tree_oid=binding.source_tree_oid,
+                    package_sha256=binding.package_sha256,
+                    package_inventory_sha256=(
+                        binding.package_inventory_sha256
+                    ),
+                    input_pins=input_pins,
+                    foundation_state=_foundation_projection_state(
+                        self._foundation
+                    ),
+                    terminal_receipt=terminal,
+                )
+            )
+            host_runtime = self._validate_host_runtime_receipt(
+                carrier["host_runtime_receipt"],
+                binding=binding,
+            )
+            cloud_receipt = self._validate_signer_provisioning_receipt(
+                carrier["cloud_signer_provisioning_receipt"],
+                role="cloud",
+                package_sha256=binding.package_sha256,
+                expected_key_id=binding.cloud_collector_public_key_id,
+            )
+            host_receipt = self._validate_signer_provisioning_receipt(
+                carrier["host_signer_provisioning_receipt"],
+                role="host",
+                package_sha256=binding.package_sha256,
+                expected_key_id=binding.host_collector_public_key_id,
+            )
+            cloud_readiness = _signer_readiness_from_receipt(cloud_receipt)
+            host_readiness = _signer_readiness_from_receipt(host_receipt)
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            launcher.OwnerLauncherError,
+            preparation_readback.OwnerGatePreparationReadbackError,
+        ):
+            raise launcher.OwnerLauncherError(error_code) from None
+        if (
+            _canonical(checked_envelope)
+            != capability._carrier_envelope_raw
+            or _canonical(terminal) != capability._terminal_raw
+            or _canonical(input_pins) != capability._input_pins_raw
+            or _canonical(carrier) != _canonical(signed_carrier)
+            or _canonical(carrier.get("binding"))
+            != _canonical(_bound_bundle_state(binding))
+            or _canonical(host_runtime)
+            != _canonical(carrier["host_runtime_receipt"])
+            or _canonical(cloud_receipt)
+            != _canonical(
+                carrier["cloud_signer_provisioning_receipt"]
+            )
+            or _canonical(host_receipt)
+            != _canonical(
+                carrier["host_signer_provisioning_receipt"]
+            )
+            or _canonical(cloud_readiness)
+            != _canonical(carrier["cloud_signer_readiness"])
+            or _canonical(host_readiness)
+            != _canonical(carrier["host_signer_readiness"])
+            or carrier.get("carrier_sha256")
+            != envelope.get("carrier_sha256")
+            or capability._inert_evidence_set_sha256 == ""
+            or capability._iam_transaction_id == ""
+        ):
+            raise launcher.OwnerLauncherError(error_code)
+        capability._kit_stream.assert_stable()
+        capability._bundle_stream.assert_stable()
+        return (
+            binding,
+            terminal,
+            checked_envelope,
+            host_runtime,
+            cloud_receipt,
+            cloud_readiness,
+            host_receipt,
+            host_readiness,
+        )
+
+    @staticmethod
+    def _preparation_readback_expected_lineage(
+        *,
+        binding: _BoundInertCloudBundle,
+        terminal: Mapping[str, Any],
+        host_runtime: Mapping[str, Any],
+        cloud_receipt: Mapping[str, Any],
+        cloud_readiness: Mapping[str, Any],
+        host_receipt: Mapping[str, Any],
+        host_readiness: Mapping[str, Any],
+    ) -> Mapping[str, str]:
+        install = terminal.get("cloud_install_receipt")
+        lineage = {
+            "source_tree_oid": binding.source_tree_oid,
+            "package_sha256": binding.package_sha256,
+            "package_inventory_sha256": (
+                binding.package_inventory_sha256
+            ),
+            "install_receipt_sha256": (
+                install.get("receipt_sha256")
+                if isinstance(install, Mapping)
+                else ""
+            ),
+            "install_receipt_file_sha256": str(
+                terminal.get("cloud_install_receipt_file_sha256", "")
+            ),
+            "host_runtime_receipt_sha256": str(
+                host_runtime.get("receipt_sha256", "")
+            ),
+            "cloud_signer_provisioning_receipt_sha256": str(
+                cloud_receipt.get("receipt_sha256", "")
+            ),
+            "cloud_signer_readiness_sha256": str(
+                cloud_readiness.get("readiness_sha256", "")
+            ),
+            "host_signer_provisioning_receipt_sha256": str(
+                host_receipt.get("receipt_sha256", "")
+            ),
+            "host_signer_readiness_sha256": str(
+                host_readiness.get("readiness_sha256", "")
+            ),
+            "cloud_public_key_id": (
+                binding.cloud_collector_public_key_id
+            ),
+        }
+        if (
+            frozenset(lineage)
+            != preparation_readback.EXPECTED_LINEAGE_FIELDS
+            or any(
+                _REVISION.fullmatch(value) is None
+                if name == "source_tree_oid"
+                else _SHA256.fullmatch(value) is None
+                for name, value in lineage.items()
+            )
+        ):
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_restore_invalid"
+            )
+        return lineage
+
+    def _assert_preparation_readback_current(
+        self,
+        capability: OwnerGateHostObservationRestoreCapability,
+        *,
+        expected_stage: int,
+    ) -> tuple[
+        _BoundInertCloudBundle,
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+        Mapping[str, Any],
+    ]:
+        """Advance exactly one challenge-bound current-state fence."""
+
+        if (
+            type(capability)
+            is not OwnerGateHostObservationRestoreCapability
+            or capability._marker
+            is not _HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER
+            or capability._transport is not self
+            or expected_stage not in {0, 1, 2}
+        ):
+            raise launcher.OwnerLauncherError(
+                "owner_gate_preparation_readback_order_invalid"
+            )
+        with capability._state_lock:
+            if capability._readback_stage != expected_stage:
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_preparation_readback_order_invalid"
+                )
+            object.__setattr__(capability, "_readback_stage", -1)
+        try:
+            (
+                binding,
+                terminal,
+                envelope,
+                host_runtime,
+                cloud_receipt,
+                cloud_readiness,
+                host_receipt,
+                host_readiness,
+            ) = self._validated_restore_capability_lineage(capability)
+            release_public_key = Ed25519PublicKey.from_public_bytes(
+                capability._release_public_key_raw
+            )
+            request = preparation_readback.build_preparation_readback_request(
+                release_revision=self._release_sha,
+                carrier_envelope=envelope,
+                release_public_key=release_public_key,
+                inert_evidence_set_sha256=(
+                    capability._inert_evidence_set_sha256
+                ),
+                iam_transaction_id=capability._iam_transaction_id,
+            )
+            response = self.run_owner_gate_preparation_readback(
+                _canonical(request)
+            )
+            cloud_public_key = _local_signer_public_key(
+                self._release_sha,
+                role="cloud",
+                expected_key_id=(
+                    binding.cloud_collector_public_key_id
+                ),
+            )
+            checked = (
+                preparation_readback.
+                validate_preparation_readback_response(
+                    response,
+                    request=request,
+                    cloud_public_key=cloud_public_key,
+                    expected_lineage=(
+                        self._preparation_readback_expected_lineage(
+                            binding=binding,
+                            terminal=terminal,
+                            host_runtime=host_runtime,
+                            cloud_receipt=cloud_receipt,
+                            cloud_readiness=cloud_readiness,
+                            host_receipt=host_receipt,
+                            host_readiness=host_readiness,
+                        )
+                    ),
+                )
+            )
+            after = self._validated_restore_capability_lineage(capability)
+            if (
+                _canonical(response) != _canonical(checked)
+                or _canonical({
+                    "binding": _bound_bundle_state(binding),
+                    "terminal": terminal,
+                    "envelope": envelope,
+                    "host_runtime": host_runtime,
+                    "cloud_receipt": cloud_receipt,
+                    "cloud_readiness": cloud_readiness,
+                    "host_receipt": host_receipt,
+                    "host_readiness": host_readiness,
+                })
+                != _canonical({
+                    "binding": _bound_bundle_state(after[0]),
+                    "terminal": after[1],
+                    "envelope": after[2],
+                    "host_runtime": after[3],
+                    "cloud_receipt": after[4],
+                    "cloud_readiness": after[5],
+                    "host_receipt": after[6],
+                    "host_readiness": after[7],
+                })
+            ):
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_preparation_readback_changed"
+                )
+        except (
+            ValueError,
+            launcher.OwnerLauncherError,
+            preparation_readback.OwnerGatePreparationReadbackError,
+        ):
+            raise launcher.OwnerLauncherError(
+                "owner_gate_preparation_readback_failed"
+            ) from None
+        with capability._state_lock:
+            if capability._readback_stage != -1:
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_preparation_readback_order_invalid"
+                )
+            object.__setattr__(
+                capability,
+                "_readback_stage",
+                expected_stage + 1,
+            )
+        return (
+            binding,
+            terminal,
+            host_runtime,
+            cloud_receipt,
+            cloud_readiness,
+            host_receipt,
+            host_readiness,
         )
 
     def _materialize_sealer(self, payload: bytes, sha256: str) -> str:
@@ -2652,6 +3777,52 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             )
         return collected_at_unix
 
+    def _validate_signer_provisioning_receipt(
+        self,
+        receipt: Mapping[str, Any],
+        *,
+        role: str,
+        package_sha256: str,
+        expected_key_id: str,
+    ) -> Mapping[str, Any]:
+        error_code = "owner_gate_stage0_signer_receipt_invalid"
+        if (
+            role not in {"cloud", "host"}
+            or not isinstance(receipt, Mapping)
+            or _SHA256.fullmatch(package_sha256 or "") is None
+            or _SHA256.fullmatch(expected_key_id or "") is None
+        ):
+            raise launcher.OwnerLauncherError(error_code)
+        public_key = _local_signer_public_key(
+            self._release_sha,
+            role=role,
+            expected_key_id=expected_key_id,
+        )
+        try:
+            checked = signer_provisioning._verify_receipt(
+                receipt,
+                public_key=public_key,
+            )
+        except signer_provisioning.TrustedSignerProvisioningError:
+            raise launcher.OwnerLauncherError(error_code) from None
+        if (
+            checked.get("role") != role
+            or checked.get("release_revision") != self._release_sha
+            or checked.get("package_sha256") != package_sha256
+            or checked.get("public_key_id") != expected_key_id
+            or checked.get("owner_authorization_receipt_sha256")
+            != self._foundation.owner_reauthentication_receipt_sha256
+            or checked.get("private_key_material_recorded") is not False
+            or checked.get("private_key_digest_recorded") is not False
+            or checked.get("activation_performed") is not False
+            or checked.get("iam_mutation_performed") is not False
+            or checked.get("cloud_mutation_performed") is not False
+            or checked.get("service_start_performed") is not False
+            or checked.get("network_fetch_performed") is not False
+        ):
+            raise launcher.OwnerLauncherError(error_code)
+        return checked
+
     def _provision_signer(
         self,
         *,
@@ -2701,38 +3872,12 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             )
         finally:
             _wipe(frame)
-        public_key = _local_signer_public_key(
-            self._release_sha,
+        checked = self._validate_signer_provisioning_receipt(
+            receipt,
             role=role,
+            package_sha256=package_sha256,
             expected_key_id=expected_key_id,
         )
-        try:
-            checked = signer_provisioning._verify_receipt(
-                receipt,
-                public_key=public_key,
-            )
-        except signer_provisioning.TrustedSignerProvisioningError:
-            raise launcher.OwnerLauncherError(
-                "owner_gate_stage0_signer_receipt_invalid"
-            ) from None
-        if (
-            checked.get("role") != role
-            or checked.get("release_revision") != self._release_sha
-            or checked.get("package_sha256") != package_sha256
-            or checked.get("public_key_id") != expected_key_id
-            or checked.get("owner_authorization_receipt_sha256")
-            != self._foundation.owner_reauthentication_receipt_sha256
-            or checked.get("private_key_material_recorded") is not False
-            or checked.get("private_key_digest_recorded") is not False
-            or checked.get("activation_performed") is not False
-            or checked.get("iam_mutation_performed") is not False
-            or checked.get("cloud_mutation_performed") is not False
-            or checked.get("service_start_performed") is not False
-            or checked.get("network_fetch_performed") is not False
-        ):
-            raise launcher.OwnerLauncherError(
-                "owner_gate_stage0_signer_receipt_invalid"
-            )
         return checked, _signer_readiness_from_receipt(checked)
 
     def _run_host_observation_dispatcher(
@@ -2840,7 +3985,7 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
     ) -> OwnerGateHostObservationPreparation:
         """Complete the long idempotent work before any freshness window."""
 
-        if phase not in {"inert", "post_iam"}:
+        if phase != "inert":
             raise launcher.OwnerLauncherError(
                 "owner_gate_host_observation_preparation_invalid"
             )
@@ -2865,19 +4010,16 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             package_sha256=binding.package_sha256,
             expected_key_id=binding.host_collector_public_key_id,
         )
-        preparation_state = {
-            "phase": phase,
-            "binding": {
-                name: getattr(binding, name)
-                for name in binding.__dataclass_fields__
-            },
-            "terminal": terminal,
-            "host_runtime": host_runtime,
-            "cloud_receipt": cloud_receipt,
-            "cloud_readiness": cloud_readiness,
-            "host_receipt": host_receipt,
-            "host_readiness": host_readiness,
-        }
+        preparation_state = _host_observation_preparation_state(
+            phase=phase,
+            binding=binding,
+            terminal=terminal,
+            host_runtime=host_runtime,
+            cloud_receipt=cloud_receipt,
+            cloud_readiness=cloud_readiness,
+            host_receipt=host_receipt,
+            host_readiness=host_readiness,
+        )
         kit_stream.assert_stable()
         bundle_stream.assert_stable()
         return OwnerGateHostObservationPreparation._create(
@@ -2893,6 +4035,138 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             host_receipt=host_receipt,
             host_readiness=host_readiness,
             snapshot=_canonical(preparation_state),
+        )
+
+    def freeze_owner_gate_host_observation_preparation(
+        self,
+        *,
+        preparation: OwnerGateHostObservationPreparation,
+        input_pins: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Export one validated inert preparation as non-authorizing bytes."""
+
+        if (
+            type(preparation) is not OwnerGateHostObservationPreparation
+            or preparation._marker
+            is not _HOST_OBSERVATION_PREPARATION_MARKER
+            or preparation._transport is not self
+            or preparation._consumed
+            or preparation._phase != "inert"
+            or not isinstance(input_pins, Mapping)
+        ):
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_preparation_carrier_invalid"
+            )
+        binding = preparation._binding
+        preparation_state = _host_observation_preparation_state(
+            phase=preparation._phase,
+            binding=binding,
+            terminal=preparation._terminal,
+            host_runtime=preparation._host_runtime,
+            cloud_receipt=preparation._cloud_receipt,
+            cloud_readiness=preparation._cloud_readiness,
+            host_receipt=preparation._host_receipt,
+            host_readiness=preparation._host_readiness,
+        )
+        if _canonical(preparation_state) != preparation._snapshot:
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_preparation_carrier_invalid"
+            )
+        terminal = self._validate_resumable_inert_terminal(
+            preparation._terminal,
+            binding=binding,
+        )
+        host_runtime = self._validate_host_runtime_receipt(
+            preparation._host_runtime,
+            binding=binding,
+        )
+        cloud_receipt = self._validate_signer_provisioning_receipt(
+            preparation._cloud_receipt,
+            role="cloud",
+            package_sha256=binding.package_sha256,
+            expected_key_id=binding.cloud_collector_public_key_id,
+        )
+        host_receipt = self._validate_signer_provisioning_receipt(
+            preparation._host_receipt,
+            role="host",
+            package_sha256=binding.package_sha256,
+            expected_key_id=binding.host_collector_public_key_id,
+        )
+        cloud_readiness = _signer_readiness_from_receipt(cloud_receipt)
+        host_readiness = _signer_readiness_from_receipt(host_receipt)
+        if (
+            _canonical(terminal) != _canonical(preparation._terminal)
+            or _canonical(host_runtime)
+            != _canonical(preparation._host_runtime)
+            or _canonical(cloud_receipt)
+            != _canonical(preparation._cloud_receipt)
+            or _canonical(host_receipt)
+            != _canonical(preparation._host_receipt)
+            or _canonical(cloud_readiness)
+            != _canonical(preparation._cloud_readiness)
+            or _canonical(host_readiness)
+            != _canonical(preparation._host_readiness)
+        ):
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_preparation_carrier_invalid"
+            )
+        unsigned = {
+            "schema": HOST_OBSERVATION_PREPARATION_CARRIER_SCHEMA,
+            "captured_phase": "inert",
+            "allowed_rehydrate_phase": "post_iam",
+            "release_revision": self._release_sha,
+            "package_inventory_sha256": (
+                binding.package_inventory_sha256
+            ),
+            "input_pins": dict(input_pins),
+            "binding": _bound_bundle_state(binding),
+            "foundation": _foundation_projection_state(
+                self._foundation
+            ),
+            "terminal_receipt_sha256": terminal[
+                "terminal_receipt_sha256"
+            ],
+            "terminal_artifact_sha256": _sha256(
+                _canonical(terminal)
+            ),
+            "host_runtime_receipt": dict(host_runtime),
+            "cloud_signer_provisioning_receipt": dict(cloud_receipt),
+            "cloud_signer_provisioning_receipt_file_sha256": _sha256(
+                _canonical(cloud_receipt)
+            ),
+            "cloud_signer_readiness": dict(cloud_readiness),
+            "host_signer_provisioning_receipt": dict(host_receipt),
+            "host_signer_provisioning_receipt_file_sha256": _sha256(
+                _canonical(host_receipt)
+            ),
+            "host_signer_readiness": dict(host_readiness),
+            "freshness_asserted": False,
+            "present_time_host_state_asserted": False,
+            "present_time_iam_state_asserted": False,
+            "prepared_under_iam_binding_present": False,
+            "activation_performed": False,
+            "cloud_mutation_performed": False,
+            "service_activation_performed": False,
+        }
+        carrier = {
+            **unsigned,
+            "carrier_sha256": foundation.sha256_json(unsigned),
+        }
+        preparation._kit_stream.assert_stable()
+        preparation._bundle_stream.assert_stable()
+        return validate_owner_gate_host_observation_preparation_carrier(
+            carrier,
+            release_revision=self._release_sha,
+            source_tree_oid=binding.source_tree_oid,
+            package_sha256=binding.package_sha256,
+            package_inventory_sha256=(
+                binding.package_inventory_sha256
+            ),
+            input_pins=input_pins,
+            foundation_state=_foundation_projection_state(
+                self._foundation
+            ),
+            terminal_receipt=terminal,
         )
 
     def _validate_resumable_inert_terminal(
@@ -2993,80 +4267,65 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
     def resume_owner_gate_host_observation_preparation(
         self,
         *,
-        phase: str,
-        terminal_receipt: Mapping[str, Any],
-        kit_stream: PinnedExactTreeStream,
-        bundle_stream: PinnedExactTreeStream,
+        restore_capability: OwnerGateHostObservationRestoreCapability,
     ) -> OwnerGateHostObservationPreparation:
-        """Revalidate one durable exact install without retransferring it."""
+        """Consume one opaque restore and prove current state by readback."""
 
-        if phase != "post_iam" or not isinstance(terminal_receipt, Mapping):
+        if (
+            type(restore_capability)
+            is not OwnerGateHostObservationRestoreCapability
+            or restore_capability._marker
+            is not _HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER
+            or restore_capability._transport is not self
+            or restore_capability._release_revision != self._release_sha
+        ):
             raise launcher.OwnerLauncherError(
                 "owner_gate_host_observation_resume_invalid"
             )
-        binding = OwnerGateStage0IapTransport._bind_inert_cloud_bundle(
-            self,
-            kit_stream=kit_stream,
-            bundle_stream=bundle_stream,
-        )
-        terminal = _decode_canonical_mapping(
-            _canonical(terminal_receipt),
-            maximum=MAX_OBSERVATION_FRAME_BYTES,
-            error_code="owner_gate_host_observation_resume_invalid",
-        )
-        self._validate_resumable_inert_terminal(
-            terminal,
-            binding=binding,
-        )
-        verify = self._run_cloud_verify(binding)
-        preflight_receipt = self._run_cloud_preflight(binding)
-        install = self._run_cloud_install(binding)
-        host_runtime = self._run_host_runtime_install(binding)
-        if (
-            verify.get("receipt_sha256")
-            != terminal.get("cloud_verify_receipt_sha256")
-            or preflight_receipt.get("preflight_sha256")
-            != terminal.get("cloud_preflight_receipt_sha256")
-            or install.get("receipt_sha256")
-            != terminal.get("cloud_install_receipt_sha256")
-            or _sha256(_canonical(install))
-            != terminal.get("cloud_install_receipt_file_sha256")
-            or install != terminal.get("cloud_install_receipt")
-            or host_runtime.get("package_sha256") != binding.package_sha256
-        ):
-            raise launcher.OwnerLauncherError(
-                "owner_gate_host_observation_resume_changed"
+        with restore_capability._state_lock:
+            if (
+                restore_capability._consumed
+                or restore_capability._readback_stage != 0
+            ):
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_host_observation_resume_invalid"
+                )
+            object.__setattr__(restore_capability, "_consumed", True)
+        try:
+            (
+                binding,
+                terminal,
+                host_runtime,
+                cloud_receipt,
+                cloud_readiness,
+                host_receipt,
+                host_readiness,
+            ) = self._assert_preparation_readback_current(
+                restore_capability,
+                expected_stage=0,
             )
-        cloud_receipt, cloud_readiness = self._provision_signer(
-            role="cloud",
-            package_sha256=binding.package_sha256,
-            expected_key_id=binding.cloud_collector_public_key_id,
+        except launcher.OwnerLauncherError:
+            raise launcher.OwnerLauncherError(
+                "owner_gate_host_observation_resume_failed"
+            ) from None
+        phase = "post_iam"
+        preparation_state = _host_observation_preparation_state(
+            phase=phase,
+            binding=binding,
+            terminal=terminal,
+            host_runtime=host_runtime,
+            cloud_receipt=cloud_receipt,
+            cloud_readiness=cloud_readiness,
+            host_receipt=host_receipt,
+            host_readiness=host_readiness,
         )
-        host_receipt, host_readiness = self._provision_signer(
-            role="host",
-            package_sha256=binding.package_sha256,
-            expected_key_id=binding.host_collector_public_key_id,
-        )
-        preparation_state = {
-            "phase": phase,
-            "binding": {
-                name: getattr(binding, name)
-                for name in binding.__dataclass_fields__
-            },
-            "terminal": terminal,
-            "host_runtime": host_runtime,
-            "cloud_receipt": cloud_receipt,
-            "cloud_readiness": cloud_readiness,
-            "host_receipt": host_receipt,
-            "host_readiness": host_readiness,
-        }
-        kit_stream.assert_stable()
-        bundle_stream.assert_stable()
+        restore_capability._kit_stream.assert_stable()
+        restore_capability._bundle_stream.assert_stable()
         return OwnerGateHostObservationPreparation._create(
             transport=self,
             phase=phase,
-            kit_stream=kit_stream,
-            bundle_stream=bundle_stream,
+            kit_stream=restore_capability._kit_stream,
+            bundle_stream=restore_capability._bundle_stream,
             binding=binding,
             terminal=terminal,
             host_runtime=host_runtime,
@@ -3075,6 +4334,7 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             host_receipt=host_receipt,
             host_readiness=host_readiness,
             snapshot=_canonical(preparation_state),
+            restore_capability=restore_capability,
         )
 
     def collect_owner_gate_host_observation_fresh_tail(
@@ -3093,7 +4353,6 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             or preparation._marker
             is not _HOST_OBSERVATION_PREPARATION_MARKER
             or preparation._transport is not self
-            or preparation._consumed
             or type(plan) is not foundation.OwnerGateFoundationPlan
             or preparation._phase not in {"inert", "post_iam"}
             or plan.spec.release_revision != self._release_sha
@@ -3110,6 +4369,12 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             raise launcher.OwnerLauncherError(
                 "owner_gate_host_observation_input_invalid"
             )
+        with preparation._state_lock:
+            if preparation._consumed:
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_host_observation_input_invalid"
+                )
+            object.__setattr__(preparation, "_consumed", True)
         binding = preparation._binding
         terminal = preparation._terminal
         host_runtime = preparation._host_runtime
@@ -3120,25 +4385,41 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
         kit_stream = preparation._kit_stream
         bundle_stream = preparation._bundle_stream
         phase = preparation._phase
-        preparation_state = {
-            "phase": phase,
-            "binding": {
-                name: getattr(binding, name)
-                for name in binding.__dataclass_fields__
-            },
-            "terminal": terminal,
-            "host_runtime": host_runtime,
-            "cloud_receipt": cloud_receipt,
-            "cloud_readiness": cloud_readiness,
-            "host_receipt": host_receipt,
-            "host_readiness": host_readiness,
-        }
+        restore_capability = preparation._restore_capability
+        preparation_state = _host_observation_preparation_state(
+            phase=phase,
+            binding=binding,
+            terminal=terminal,
+            host_runtime=host_runtime,
+            cloud_receipt=cloud_receipt,
+            cloud_readiness=cloud_readiness,
+            host_receipt=host_receipt,
+            host_readiness=host_readiness,
+        )
         if (
             _canonical(preparation_state) != preparation._snapshot
             or plan.spec.cloud_collector_public_key_id
             != binding.cloud_collector_public_key_id
             or plan.spec.host_collector_public_key_id
             != binding.host_collector_public_key_id
+            or (
+                phase == "post_iam"
+                and (
+                    type(restore_capability)
+                    is not OwnerGateHostObservationRestoreCapability
+                    or restore_capability._marker
+                    is not _HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER
+                    or restore_capability._transport is not self
+                    or not restore_capability._consumed
+                    or restore_capability._readback_stage != 1
+                    or restore_capability._kit_stream is not kit_stream
+                    or restore_capability._bundle_stream
+                    is not bundle_stream
+                    or restore_capability._terminal_raw
+                    != _canonical(terminal)
+                )
+            )
+            or (phase == "inert" and restore_capability is not None)
         ):
             raise launcher.OwnerLauncherError(
                 "owner_gate_host_observation_preparation_changed"
@@ -3155,7 +4436,6 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
         )
         kit_stream.assert_stable()
         bundle_stream.assert_stable()
-        object.__setattr__(preparation, "_consumed", True)
         collected_at_unix = self._open_host_observation_window()
         host_request = self._host_request(
             schema="muncho-owner-gate-host-observation-request.v1",
@@ -3231,16 +4511,58 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
                 "frame_sha256": foundation.sha256_json(frame_unsigned),
             },
         )
-        cloud_receipt_after, cloud_readiness_after = self._provision_signer(
-            role="cloud",
-            package_sha256=binding.package_sha256,
-            expected_key_id=str(plan.spec.cloud_collector_public_key_id),
-        )
-        host_receipt_after, host_readiness_after = self._provision_signer(
-            role="host",
-            package_sha256=binding.package_sha256,
-            expected_key_id=str(plan.spec.host_collector_public_key_id),
-        )
+        if phase == "post_iam":
+            assert isinstance(
+                restore_capability,
+                OwnerGateHostObservationRestoreCapability,
+            )
+            readback_state = self._assert_preparation_readback_current(
+                restore_capability,
+                expected_stage=1,
+            )
+            if _canonical({
+                "binding": _bound_bundle_state(readback_state[0]),
+                "terminal": readback_state[1],
+                "host_runtime": readback_state[2],
+                "cloud_receipt": readback_state[3],
+                "cloud_readiness": readback_state[4],
+                "host_receipt": readback_state[5],
+                "host_readiness": readback_state[6],
+            }) != _canonical({
+                "binding": _bound_bundle_state(binding),
+                "terminal": terminal,
+                "host_runtime": host_runtime,
+                "cloud_receipt": cloud_receipt,
+                "cloud_readiness": cloud_readiness,
+                "host_receipt": host_receipt,
+                "host_readiness": host_readiness,
+            }):
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_host_observation_preparation_changed"
+                )
+            cloud_receipt_after = cloud_receipt
+            cloud_readiness_after = cloud_readiness
+            host_receipt_after = host_receipt
+            host_readiness_after = host_readiness
+        else:
+            cloud_receipt_after, cloud_readiness_after = (
+                self._provision_signer(
+                    role="cloud",
+                    package_sha256=binding.package_sha256,
+                    expected_key_id=str(
+                        plan.spec.cloud_collector_public_key_id
+                    ),
+                )
+            )
+            host_receipt_after, host_readiness_after = (
+                self._provision_signer(
+                    role="host",
+                    package_sha256=binding.package_sha256,
+                    expected_key_id=str(
+                        plan.spec.host_collector_public_key_id
+                    ),
+                )
+            )
         host_public_key = _local_signer_public_key(
             self._release_sha,
             role="host",
@@ -3311,6 +4633,7 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
         return OwnerGateHostObservationHandoff._create(
             terminal_receipt=terminal_copy,
             host_observation=host_copy,
+            restore_capability=restore_capability,
         )
 
     def collect_owner_gate_host_observation(
@@ -3418,8 +4741,15 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             raise launcher.OwnerLauncherError(
                 "owner_gate_cloud_observation_signer_input_invalid"
             )
+        with terminal_binding._state_lock:
+            if terminal_binding._consumed:
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_cloud_observation_signer_input_invalid"
+                )
+            object.__setattr__(terminal_binding, "_consumed", True)
         terminal = terminal_binding.terminal_receipt
         host = terminal_binding.host_observation
+        restore_capability = terminal_binding._restore_capability
         release_binding = unsigned_observation.get("release_binding")
         host_release = host.get("release") if isinstance(host, Mapping) else None
         host_attestation = (
@@ -3471,6 +4801,22 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             != host_release.get("host_signer_provisioning_receipt_sha256")
             or release_binding.get("host_signer_readiness_sha256")
             != host_release.get("host_signer_readiness_sha256")
+            or (
+                phase == "post_iam"
+                and (
+                    type(restore_capability)
+                    is not OwnerGateHostObservationRestoreCapability
+                    or restore_capability._marker
+                    is not _HOST_OBSERVATION_RESTORE_CAPABILITY_MARKER
+                    or restore_capability._transport is not self
+                    or not restore_capability._consumed
+                    or restore_capability._readback_stage != 2
+                    or restore_capability._cloud_signer_consumed
+                    or restore_capability._terminal_raw
+                    != _canonical(terminal)
+                )
+            )
+            or (phase == "inert" and restore_capability is not None)
         ):
             raise launcher.OwnerLauncherError(
                 "owner_gate_cloud_observation_terminal_binding_invalid"
@@ -3509,6 +4855,55 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             raise launcher.OwnerLauncherError(
                 "owner_gate_cloud_observation_terminal_binding_invalid"
             )
+        if phase == "post_iam":
+            assert isinstance(
+                restore_capability,
+                OwnerGateHostObservationRestoreCapability,
+            )
+            with restore_capability._state_lock:
+                if (
+                    restore_capability._cloud_signer_consumed
+                    or restore_capability._readback_stage != 2
+                ):
+                    raise launcher.OwnerLauncherError(
+                        "owner_gate_cloud_observation_signer_input_invalid"
+                    )
+                object.__setattr__(
+                    restore_capability,
+                    "_cloud_signer_consumed",
+                    True,
+                )
+            (
+                restored_binding,
+                restored_terminal,
+                _restored_envelope,
+                restored_runtime,
+                restored_cloud_receipt,
+                restored_cloud_readiness,
+                restored_host_receipt,
+                restored_host_readiness,
+            ) = self._validated_restore_capability_lineage(
+                restore_capability
+            )
+            if (
+                _canonical(restored_terminal) != _canonical(terminal)
+                or restored_binding.source_tree_oid
+                != release_binding.get("source_tree_oid")
+                or restored_binding.package_sha256 != package_sha256
+                or restored_runtime.get("package_sha256")
+                != package_sha256
+                or restored_cloud_receipt.get("receipt_sha256")
+                != cloud_receipt_sha256
+                or restored_cloud_readiness.get("readiness_sha256")
+                != cloud_readiness_sha256
+                or restored_host_receipt.get("receipt_sha256")
+                != host_receipt_sha256
+                or restored_host_readiness.get("readiness_sha256")
+                != host_readiness_sha256
+            ):
+                raise launcher.OwnerLauncherError(
+                    "owner_gate_cloud_observation_terminal_binding_invalid"
+                )
         snapshot = _canonical({
             "terminal_receipt": terminal,
             "host_observation": host,
@@ -3545,29 +4940,43 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
             _wipe(frame)
         after_failure: BaseException | None = None
         try:
-            cloud_receipt_after, cloud_readiness_after = self._provision_signer(
-                role="cloud",
-                package_sha256=package_sha256,
-                expected_key_id=cloud_key_id,
-            )
-            host_receipt_after, host_readiness_after = self._provision_signer(
-                role="host",
-                package_sha256=package_sha256,
-                expected_key_id=host_key_id,
-            )
-            if (
-                cloud_receipt_after.get("receipt_sha256")
-                != cloud_receipt_sha256
-                or cloud_readiness_after.get("readiness_sha256")
-                != cloud_readiness_sha256
-                or host_receipt_after.get("receipt_sha256")
-                != host_receipt_sha256
-                or host_readiness_after.get("readiness_sha256")
-                != host_readiness_sha256
-            ):
-                raise launcher.OwnerLauncherError(
-                    "owner_gate_cloud_observation_signer_readiness_changed"
+            if phase == "post_iam":
+                assert isinstance(
+                    restore_capability,
+                    OwnerGateHostObservationRestoreCapability,
                 )
+                self._assert_preparation_readback_current(
+                    restore_capability,
+                    expected_stage=2,
+                )
+            else:
+                cloud_receipt_after, cloud_readiness_after = (
+                    self._provision_signer(
+                        role="cloud",
+                        package_sha256=package_sha256,
+                        expected_key_id=cloud_key_id,
+                    )
+                )
+                host_receipt_after, host_readiness_after = (
+                    self._provision_signer(
+                        role="host",
+                        package_sha256=package_sha256,
+                        expected_key_id=host_key_id,
+                    )
+                )
+                if (
+                    cloud_receipt_after.get("receipt_sha256")
+                    != cloud_receipt_sha256
+                    or cloud_readiness_after.get("readiness_sha256")
+                    != cloud_readiness_sha256
+                    or host_receipt_after.get("receipt_sha256")
+                    != host_receipt_sha256
+                    or host_readiness_after.get("readiness_sha256")
+                    != host_readiness_sha256
+                ):
+                    raise launcher.OwnerLauncherError(
+                        "owner_gate_cloud_observation_signer_readiness_changed"
+                    )
         except BaseException as exc:
             after_failure = exc
         if exchange_failure is not None or after_failure is not None:
@@ -3884,13 +5293,18 @@ class OwnerGateStage0IapTransport(launcher.OwnerGateIapTransport):
 
 
 __all__ = [
+    "MAX_PREPARATION_READBACK_FRAME_BYTES",
     "MAX_STDERR_BYTES",
     "MAX_STDOUT_BYTES",
     "INERT_CLOUD_BUNDLE_TERMINAL_SCHEMA",
     "OwnerGateHostObservationHandoff",
     "OwnerGateHostObservationPreparation",
+    "OwnerGateHostObservationRestoreCapability",
     "OwnerGateStage0IapTransport",
     "PinnedExactTreeStream",
+    "PREPARATION_READBACK_ATTESTATION_SCHEMA",
+    "PREPARATION_READBACK_REQUEST_SCHEMA",
+    "PREPARATION_READBACK_RESPONSE_SCHEMA",
     "RawFoundationChainArtifacts",
     "StableOuterSealer",
     "TRANSPORT_RECEIPT_SCHEMA",
