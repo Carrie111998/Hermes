@@ -362,7 +362,8 @@ export const ar = defineLocale({
       appearance: 'المظهر',
       workspace: 'مساحة العمل',
       safety: 'الأمان',
-      memory: 'الذاكرة والسياق',
+      memory: 'الذاكرة',
+      context: 'السياق',
       voice: 'الصوت',
       advanced: 'متقدم'
     },

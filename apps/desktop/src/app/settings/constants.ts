@@ -2,6 +2,7 @@ import {
   Box,
   Brain,
   type IconComponent,
+  Layers3,
   Lock,
   MessageCircle,
   Mic,
@@ -687,14 +688,21 @@ export const SECTIONS: DesktopConfigSection[] = [
   },
   {
     id: 'memory',
-    label: 'Memory & Context',
+    label: 'Memory',
     icon: Brain,
     keys: [
       'memory.memory_enabled',
       'memory.user_profile_enabled',
       'memory.memory_char_limit',
       'memory.user_char_limit',
-      'memory.provider',
+      'memory.provider'
+    ]
+  },
+  {
+    id: 'context',
+    label: 'Context',
+    icon: Layers3,
+    keys: [
       'context.engine',
       'compression.enabled',
       'compression.threshold',

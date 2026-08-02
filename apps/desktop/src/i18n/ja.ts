@@ -287,7 +287,8 @@ export const ja = defineLocale({
       appearance: '外観',
       workspace: 'ワークスペース',
       safety: '安全性',
-      memory: 'メモリとコンテキスト',
+      memory: 'メモリ',
+      context: 'コンテキスト',
       voice: '音声',
       advanced: '詳細'
     },

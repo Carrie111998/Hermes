@@ -404,7 +404,8 @@ export const zh: Translations = {
       appearance: '外观',
       workspace: '工作区',
       safety: '安全',
-      memory: '记忆与上下文',
+      memory: '记忆',
+      context: '上下文',
       voice: '语音',
       advanced: '高级'
     },
