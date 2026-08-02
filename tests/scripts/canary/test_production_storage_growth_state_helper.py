@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import builtins
 import copy
+import fcntl
 import hashlib
 import json
 import os
 import runpy
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -45,6 +47,34 @@ def _bundle() -> dict:
             "execution_window_expires_at_unix": NOW + 10,
         },
     }
+
+
+def _owner_binding(helper_payload: bytes = b"fixed helper") -> dict:
+    artifacts = {
+        name: {
+            "release_relative": relative,
+            "sha256": (
+                hashlib.sha256(helper_payload).hexdigest()
+                if name == "state_helper" else "1" * 64
+            ),
+            "size": len(helper_payload),
+        }
+        for name, relative in contract.RUNTIME_ARTIFACT_RELATIVES.items()
+    }
+    unsigned = {
+        "schema": contract.RUNTIME_ARTIFACT_ATTESTATION_SCHEMA,
+        "release_revision": RELEASE,
+        "owner_support_manifest_sha256": "2" * 64,
+        "owner_support_source_tree_oid": "3" * 40,
+        "artifacts": artifacts,
+    }
+    return installer.build_owner_artifact_binding(
+        RELEASE,
+        {
+            **unsigned,
+            "attestation_sha256": protocol.sha256_json(unsigned),
+        },
+    )
 
 
 def _machine(tmp_path: Path, *, now: int = NOW) -> helper.RootStateMachine:
@@ -139,6 +169,7 @@ def test_completion_journal_to_event_crash_gap_is_mechanically_recovered(
         },
     })
     original_append = helper._append_events
+    original_write = helper._write_atomic
 
     def crash_after_completed_journal(*_args, **_kwargs):
         raise helper.StateHelperError("simulated_completion_event_crash")
@@ -150,6 +181,25 @@ def test_completion_journal_to_event_crash_gap_is_mechanically_recovered(
                 "state": "target", "observation_sha256": "9" * 64,
             },
         })
+    journal_path, event_path = machine._paths()
+    completed_journal = Path(journal_path).read_bytes()
+    started_events = Path(event_path).read_bytes()
+
+    def forbid_second_write(*_args, **_kwargs):
+        raise AssertionError("an exact completion retry must not write")
+
+    monkeypatch.setattr(helper, "_write_atomic", forbid_second_write)
+    monkeypatch.setattr(helper, "_append_events", forbid_second_write)
+    retried = machine.complete({
+        "final_observation": {
+            "state": "target", "observation_sha256": "9" * 64,
+        },
+    })
+    assert retried["journal"]["state"] == "completed"
+    assert Path(journal_path).read_bytes() == completed_journal
+    assert Path(event_path).read_bytes() == started_events
+
+    monkeypatch.setattr(helper, "_write_atomic", original_write)
     monkeypatch.setattr(helper, "_append_events", original_append)
 
     recovered = _machine(tmp_path).begin({
@@ -165,6 +215,50 @@ def test_completion_journal_to_event_crash_gap_is_mechanically_recovered(
     assert recovered["events"][-1] == recovered["journal"][
         "transition_event"
     ]
+
+
+def test_complete_is_exact_idempotent_and_rejects_different_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_validation(monkeypatch)
+    machine = _machine(tmp_path)
+    machine.begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "source", "observation_sha256": "8" * 64,
+        },
+    })
+    final = {
+        "state": "target", "observation_sha256": "9" * 64,
+    }
+    first = machine.complete({"final_observation": final})
+    journal_path, event_path = machine._paths()
+    journal_raw = Path(journal_path).read_bytes()
+    event_raw = Path(event_path).read_bytes()
+
+    def forbid_write(*_args, **_kwargs):
+        raise AssertionError("completed journal must never be written again")
+
+    monkeypatch.setattr(helper, "_write_atomic", forbid_write)
+    monkeypatch.setattr(helper, "_append_events", forbid_write)
+    second = machine.complete({"final_observation": dict(final)})
+    assert second == first
+    assert Path(journal_path).read_bytes() == journal_raw
+    assert Path(event_path).read_bytes() == event_raw
+    assert event_raw.count(b'"event_kind":"execution_completed"') == 1
+
+    with pytest.raises(
+        helper.StateHelperError,
+        match="production_storage_state_helper_sequence_invalid",
+    ):
+        machine.complete({
+            "final_observation": {
+                "state": "target", "observation_sha256": "a" * 64,
+            },
+        })
+    assert Path(journal_path).read_bytes() == journal_raw
+    assert Path(event_path).read_bytes() == event_raw
 
 
 def test_divergent_transition_event_is_not_repaired(
@@ -258,6 +352,165 @@ def test_state_helper_frames_have_no_caller_key_or_path_surface(
             },
             "receipt_public_key_ed25519_hex": "a" * 64,
         })
+
+
+def test_installer_holds_validated_execution_lock_during_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    original_write = installer._write_atomic
+    lock_checks: list[bool] = []
+
+    def checked_write(path: Path, payload: bytes, **kwargs) -> None:
+        if path == state_root / ".installation.json":
+            lock_path = state_root / ".execution.lock"
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(
+                        descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                lock_checks.append(True)
+            finally:
+                os.close(descriptor)
+        original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(installer, "_write_atomic", checked_write)
+    installer.install_owner_state_root(
+        RELEASE,
+        sealed_artifact_binding=_owner_binding(),
+        state_root=state_root,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        effective_uid=lambda: 0,
+        artifact_verifier=lambda value, **_kwargs: value,
+    )
+    assert lock_checks == [True]
+    assert (state_root / ".execution.lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_helper_acquires_execution_lock_before_reading_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    helper_path = state_root / "helper"
+    helper_path.write_bytes(b"fixed helper")
+    helper_path.chmod(0o555)
+    receipt_path = state_root / ".installation.json"
+    receipt_path.write_bytes(b"{}\n")
+    receipt_path.chmod(0o600)
+    held = installer._acquire_owner_execution_lock(
+        state_root, uid=os.getuid(), gid=os.getgid()
+    )
+    lock_attempted = threading.Event()
+    receipt_read = threading.Event()
+    original_flock = fcntl.flock
+
+    def observed_flock(descriptor: int, operation: int) -> None:
+        if operation == fcntl.LOCK_EX:
+            lock_attempted.set()
+        original_flock(descriptor, operation)
+
+    def observed_read(_path: str) -> dict:
+        receipt_read.set()
+        raise helper.StateHelperError("expected_invalid_receipt")
+
+    monkeypatch.setattr(helper.fcntl, "flock", observed_flock)
+    monkeypatch.setattr(helper, "_read_json", observed_read)
+    machine = helper.RootStateMachine(
+        state_root=str(state_root),
+        helper_path=str(helper_path),
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+    )
+    failures: list[Exception] = []
+
+    def open_helper() -> None:
+        try:
+            machine.open()
+        except Exception as error:  # noqa: BLE001 - asserted below
+            failures.append(error)
+
+    thread = threading.Thread(target=open_helper)
+    thread.start()
+    assert lock_attempted.wait(timeout=1)
+    assert receipt_read.wait(timeout=0.05) is False
+    installer._release_owner_execution_lock(held)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert receipt_read.is_set()
+    assert len(failures) == 1
+    assert isinstance(failures[0], helper.StateHelperError)
+
+
+@pytest.mark.parametrize("preexisting", (False, True))
+def test_owner_publish_transaction_restores_all_four_artifacts(
+    tmp_path: Path,
+    preexisting: bool,
+) -> None:
+    helper_path = tmp_path / "helper"
+    sudoers_path = tmp_path / "sudoers"
+    receipt_path = tmp_path / "receipt"
+    public_path = tmp_path / "public"
+    paths = (
+        (helper_path, 0o555, b"old helper"),
+        (sudoers_path, 0o440, b"fixed sudoers\n"),
+        (receipt_path, 0o600, b"old receipt\n"),
+        (public_path, 0o444, b"old public\n"),
+    )
+    if preexisting:
+        for path, mode, payload in paths:
+            path.write_bytes(payload)
+            path.chmod(mode)
+
+    public = {"schema": "new-public"}
+    expected_public = protocol.canonical_json_bytes(public) + b"\n"
+
+    def accept(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    def fail_final_attestation() -> dict:
+        assert helper_path.read_bytes() == b"new helper"
+        assert sudoers_path.read_bytes() == b"fixed sudoers\n"
+        assert receipt_path.read_bytes() == b"new receipt\n"
+        assert public_path.read_bytes() == expected_public
+        raise installer.ProductionStorageInstallerError(
+            "simulated_public_attestation_failure"
+        )
+
+    lock = installer._acquire_owner_execution_lock(
+        tmp_path, uid=os.getuid(), gid=os.getgid()
+    )
+    try:
+        with pytest.raises(
+            installer.ProductionStorageInstallerError,
+            match="simulated_public_attestation_failure",
+        ):
+            installer._publish_owner_installation_transaction(
+                state_helper_path=helper_path,
+                state_helper_payload=b"new helper",
+                sudoers_path=sudoers_path,
+                sudoers_payload=b"fixed sudoers\n",
+                receipt_path=receipt_path,
+                receipt_payload=b"new receipt\n",
+                public_readiness_path=public_path,
+                build_public_readiness=lambda: public,
+                attest_public_readiness=fail_final_attestation,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                sudoers_validator=accept,
+            )
+    finally:
+        installer._release_owner_execution_lock(lock)
+    for path, mode, payload in paths:
+        if preexisting:
+            assert path.read_bytes() == payload
+            assert path.stat().st_mode & 0o777 == mode
+        else:
+            assert not path.exists()
 
 
 def test_malformed_root_receipt_key_fails_with_stable_error(

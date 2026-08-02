@@ -888,137 +888,159 @@ class RootStateMachine:
             or os.geteuid() != self.expected_uid
         ):
             raise StateHelperError("production_storage_state_helper_privilege_invalid")
-        root_info = _node(
-            self.state_root, True, 0o700,
-            self.expected_uid, self.expected_gid,
+        lock_path = (
+            LOCK_PATH if self.state_root == STATE_ROOT
+            else self.state_root + "/.execution.lock"
         )
-        _node(
-            INSTALLATION_RECEIPT if self.state_root == STATE_ROOT
-            else self.state_root + "/.installation.json",
-            False, 0o600, self.expected_uid, self.expected_gid,
-        )
-        _node(
-            self.helper_path, False, 0o555,
-            self.expected_uid, self.expected_gid,
-        )
-        receipt_path = INSTALLATION_RECEIPT if self.state_root == STATE_ROOT else self.state_root + "/.installation.json"
-        receipt = _read_json(receipt_path)
-        try:
-            with open(self.helper_path, "rb") as handle:
-                helper_raw = handle.read(MAXIMUM_FRAME_BYTES + 1)
-        except OSError:
-            raise StateHelperError(
-                "production_storage_state_helper_installation_invalid"
-            )
-        if len(helper_raw) > MAXIMUM_FRAME_BYTES:
-            raise StateHelperError(
-                "production_storage_state_helper_installation_invalid"
-            )
-        self.helper_sha = hashlib.sha256(helper_raw).hexdigest()
-        receipt_unsigned = {
-            key: value for key, value in receipt.items()
-            if key != "installation_receipt_sha256"
-        } if isinstance(receipt, dict) else {}
-        if (
-            not isinstance(receipt, dict)
-            or set(receipt) != INSTALLATION_FIELDS
-            or receipt.get("schema") != "muncho-production-storage-growth-owner-installation.v2"
-            or receipt.get("state_helper_sha256") != self.helper_sha
-            or receipt.get("state_helper_path") != INSTALLED_HELPER
-            or not _sha40(receipt.get("release_sha"))
-            or receipt.get("state_root") != STATE_ROOT
-            or receipt.get("state_root_device") != root_info.st_dev
-            or receipt.get("state_root_inode") != root_info.st_ino
-            or receipt.get("installation_receipt_sha256")
-            != sha256_json(receipt_unsigned)
-        ):
-            raise StateHelperError("production_storage_state_helper_installation_invalid")
-        self.release_sha = receipt["release_sha"]
-        try:
-            sudo_uid = int(os.environ["SUDO_UID"])
-            sudo_gid = int(os.environ["SUDO_GID"])
-        except (KeyError, ValueError, TypeError):
-            raise StateHelperError(
-                "production_storage_state_helper_invoker_invalid"
-            )
-        if (
-            sudo_uid != receipt.get("authorized_client_uid")
-            or sudo_gid != receipt.get("authorized_client_gid")
-        ):
-            raise StateHelperError(
-                "production_storage_state_helper_invoker_invalid"
-            )
-        authority = receipt.get("authority_key_attestation")
-        try:
-            authority_key_hex = authority.get(
-                "receipt_public_key_ed25519_hex", ""
-            ) if isinstance(authority, dict) else ""
-            authority_key = bytes.fromhex(authority_key_hex)
-        except (TypeError, ValueError):
-            raise StateHelperError(
-                "production_storage_state_helper_installation_invalid"
-            )
-        authority_unsigned = (
-            {
-                key: value for key, value in authority.items()
-                if key != "attestation_sha256"
-            }
-            if isinstance(authority, dict) else {}
-        )
-        if (
-            not isinstance(authority, dict)
-            or authority.get("release_sha") != self.release_sha
-            or authority.get("attestation_sha256")
-            != receipt.get("authority_key_attestation_sha256")
-            or authority.get("attestation_sha256")
-            != sha256_json(authority_unsigned)
-            or len(authority_key) != 32
-            or authority.get("receipt_public_key_id")
-            != hashlib.sha256(authority_key).hexdigest()
-            or authority.get("root_owned_trust_bundle_validated") is not True
-            or authority.get("rotation_requires_new_release_and_owner_install")
-            is not True
-        ):
-            raise StateHelperError(
-                "production_storage_state_helper_installation_invalid"
-            )
-        self.receipt_public_key_hex = authority_key_hex
-        lock_path = LOCK_PATH if self.state_root == STATE_ROOT else self.state_root + "/.execution.lock"
-        flags = os.O_RDWR | os.O_CREAT
+        flags = os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        descriptor = None
         try:
-            self.lock_fd = os.open(lock_path, flags, 0o600)
-            os.fchmod(self.lock_fd, 0o600)
-            os.fchown(self.lock_fd, self.expected_uid, self.expected_gid)
-            info = os.fstat(self.lock_fd)
+            descriptor = os.open(lock_path, flags)
+            lock_info = os.fstat(descriptor)
+            lock_path_info = os.lstat(lock_path)
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != self.expected_uid
+                or lock_info.st_gid != self.expected_gid
+                or stat.S_IMODE(lock_info.st_mode) != 0o600
+                or lock_info.st_nlink != 1
+                or lock_path_info.st_dev != lock_info.st_dev
+                or lock_path_info.st_ino != lock_info.st_ino
+            ):
+                raise OSError("invalid execution lock")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            lock_path_info = os.lstat(lock_path)
+            if (
+                lock_path_info.st_dev != lock_info.st_dev
+                or lock_path_info.st_ino != lock_info.st_ino
+            ):
+                raise OSError("execution lock identity changed")
         except OSError:
-            self.close()
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             raise StateHelperError(
                 "production_storage_state_storage_invalid"
-            )
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != self.expected_uid
-            or info.st_gid != self.expected_gid
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise StateHelperError("production_storage_state_storage_invalid")
+            ) from None
+        self.lock_fd = descriptor
         try:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-        except OSError:
+            root_info = _node(
+                self.state_root, True, 0o700,
+                self.expected_uid, self.expected_gid,
+            )
+            receipt_path = (
+                INSTALLATION_RECEIPT if self.state_root == STATE_ROOT
+                else self.state_root + "/.installation.json"
+            )
+            _node(
+                receipt_path, False, 0o600,
+                self.expected_uid, self.expected_gid,
+            )
+            _node(
+                self.helper_path, False, 0o555,
+                self.expected_uid, self.expected_gid,
+            )
+            receipt = _read_json(receipt_path)
+            try:
+                with open(self.helper_path, "rb") as handle:
+                    helper_raw = handle.read(MAXIMUM_FRAME_BYTES + 1)
+            except OSError:
+                raise StateHelperError(
+                    "production_storage_state_helper_installation_invalid"
+                )
+            if len(helper_raw) > MAXIMUM_FRAME_BYTES:
+                raise StateHelperError(
+                    "production_storage_state_helper_installation_invalid"
+                )
+            self.helper_sha = hashlib.sha256(helper_raw).hexdigest()
+            receipt_unsigned = {
+                key: value for key, value in receipt.items()
+                if key != "installation_receipt_sha256"
+            } if isinstance(receipt, dict) else {}
+            if (
+                not isinstance(receipt, dict)
+                or set(receipt) != INSTALLATION_FIELDS
+                or receipt.get("schema") != "muncho-production-storage-growth-owner-installation.v2"
+                or receipt.get("state_helper_sha256") != self.helper_sha
+                or receipt.get("state_helper_path") != INSTALLED_HELPER
+                or not _sha40(receipt.get("release_sha"))
+                or receipt.get("state_root") != STATE_ROOT
+                or receipt.get("state_root_device") != root_info.st_dev
+                or receipt.get("state_root_inode") != root_info.st_ino
+                or receipt.get("installation_receipt_sha256")
+                != sha256_json(receipt_unsigned)
+            ):
+                raise StateHelperError("production_storage_state_helper_installation_invalid")
+            self.release_sha = receipt["release_sha"]
+            try:
+                sudo_uid = int(os.environ["SUDO_UID"])
+                sudo_gid = int(os.environ["SUDO_GID"])
+            except (KeyError, ValueError, TypeError):
+                raise StateHelperError(
+                    "production_storage_state_helper_invoker_invalid"
+                )
+            if (
+                sudo_uid != receipt.get("authorized_client_uid")
+                or sudo_gid != receipt.get("authorized_client_gid")
+            ):
+                raise StateHelperError(
+                    "production_storage_state_helper_invoker_invalid"
+                )
+            authority = receipt.get("authority_key_attestation")
+            try:
+                authority_key_hex = authority.get(
+                    "receipt_public_key_ed25519_hex", ""
+                ) if isinstance(authority, dict) else ""
+                authority_key = bytes.fromhex(authority_key_hex)
+            except (TypeError, ValueError):
+                raise StateHelperError(
+                    "production_storage_state_helper_installation_invalid"
+                )
+            authority_unsigned = (
+                {
+                    key: value for key, value in authority.items()
+                    if key != "attestation_sha256"
+                }
+                if isinstance(authority, dict) else {}
+            )
+            if (
+                not isinstance(authority, dict)
+                or authority.get("release_sha") != self.release_sha
+                or authority.get("attestation_sha256")
+                != receipt.get("authority_key_attestation_sha256")
+                or authority.get("attestation_sha256")
+                != sha256_json(authority_unsigned)
+                or len(authority_key) != 32
+                or authority.get("receipt_public_key_id")
+                != hashlib.sha256(authority_key).hexdigest()
+                or authority.get("root_owned_trust_bundle_validated") is not True
+                or authority.get("rotation_requires_new_release_and_owner_install")
+                is not True
+            ):
+                raise StateHelperError(
+                    "production_storage_state_helper_installation_invalid"
+                )
+            self.receipt_public_key_hex = authority_key_hex
+            return {
+                "release_sha": self.release_sha,
+                "state_helper_sha256": self.helper_sha,
+                "installation_receipt_sha256": receipt[
+                    "installation_receipt_sha256"
+                ],
+                "lock_acquired": True,
+            }
+        except StateHelperError:
+            self.close()
+            raise
+        except (OSError, ValueError, TypeError):
             self.close()
             raise StateHelperError(
-                "production_storage_state_storage_invalid"
-            )
-        return {
-            "release_sha": self.release_sha,
-            "state_helper_sha256": self.helper_sha,
-            "installation_receipt_sha256": receipt[
-                "installation_receipt_sha256"
-            ],
-            "lock_acquired": True,
-        }
+                "production_storage_state_helper_installation_invalid"
+            ) from None
 
     def close(self):
         if self.lock_fd is not None:
@@ -1045,6 +1067,25 @@ class RootStateMachine:
             raise StateHelperError("production_storage_state_helper_sequence_invalid")
         base = self.state_root + "/" + self.plan["plan_sha256"]
         return base + ".json", base + ".events.jsonl"
+
+    def _read_persisted_events(self, event_path):
+        _node(
+            event_path, False, 0o600,
+            self.expected_uid, self.expected_gid,
+        )
+        try:
+            with open(event_path, "rb") as handle:
+                raw = handle.read(MAXIMUM_FRAME_BYTES + 1)
+        except OSError:
+            raise StateHelperError(
+                "production_storage_event_log_invalid"
+            ) from None
+        if (
+            not raw.endswith(b"\n") or raw.endswith(b"\n\n")
+            or len(raw) > MAXIMUM_FRAME_BYTES
+        ):
+            raise StateHelperError("production_storage_event_log_invalid")
+        return [decode(line) for line in raw[:-1].split(b"\n")]
 
     def begin(self, document):
         if set(document) != {"authorization_bundle", "initial_observation"}:
@@ -1186,8 +1227,59 @@ class RootStateMachine:
         )
         if observed_state != "target":
             raise StateHelperError("production_storage_observation_invalid")
+        journal_path, event_path = self._paths()
+        _node(
+            journal_path, False, 0o600,
+            self.expected_uid, self.expected_gid,
+        )
+        persisted = validate_journal(
+            _read_json(journal_path), self.plan, self.bundle
+        )
+        persisted_events = self._read_persisted_events(event_path)
+        if persisted["state"] == "completed":
+            if persisted.get("final_observation") != observation:
+                raise StateHelperError(
+                    "production_storage_state_helper_sequence_invalid"
+                )
+            missing_completion = (
+                persisted_events[-1].get("event_kind")
+                != "execution_completed"
+            )
+            validate_recovery_events(
+                persisted_events,
+                persisted,
+                self.plan,
+                self.bundle["authorization_receipt"],
+                allow_missing_completion=missing_completion,
+            )
+            transition = persisted["transition_event"]
+            if missing_completion:
+                if (
+                    transition.get("sequence") != len(persisted_events) + 1
+                    or transition.get("prior_event_head_sha256")
+                    != persisted_events[-1].get("event_head_sha256")
+                ):
+                    raise StateHelperError(
+                        "production_storage_event_log_invalid"
+                    )
+            elif transition != persisted_events[-1]:
+                raise StateHelperError(
+                    "production_storage_event_log_invalid"
+                )
+            self.journal = persisted
+            self.events = persisted_events
+            return {"journal": persisted, "event": transition}
+        if persisted != self.journal:
+            raise StateHelperError("production_storage_journal_invalid")
+        validate_recovery_events(
+            persisted_events,
+            persisted,
+            self.plan,
+            self.bundle["authorization_receipt"],
+        )
+        self.events = persisted_events
         completed = self.now()
-        unsigned = dict(self.journal)
+        unsigned = dict(persisted)
         unsigned.pop("journal_sha256", None)
         event = _event(self.events, self.plan, self.bundle["authorization_receipt"], "execution_completed", "completed", observation_sha, None, completed)
         unsigned.update({
@@ -1198,12 +1290,12 @@ class RootStateMachine:
         })
         journal = {**unsigned, "journal_sha256": sha256_json(unsigned)}
         _write_atomic(
-            self._paths()[0], journal, self.state_root,
+            journal_path, journal, self.state_root,
             self.expected_uid, self.expected_gid,
         )
         self.events.append(event)
         _append_events(
-            self._paths()[1], self.events, self.state_root,
+            event_path, self.events, self.state_root,
             self.expected_uid, self.expected_gid,
         )
         self.journal = journal
