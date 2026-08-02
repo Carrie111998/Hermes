@@ -68,7 +68,7 @@ import { reportInstallMethodWarning } from '@/store/updates'
 import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/store/workspace-events'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
 // module graph into the gateway event hot path.
-import { ingestBackendSkin } from '@/themes/backend-sync'
+import { ingestBackendSkin, ingestGatewayReadySkin } from '@/themes/backend-sync'
 import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
@@ -285,23 +285,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       if (event.type === 'gateway.ready') {
-        // Seed the active skin into the desktop theme registry without applying,
-        // so a fresh connect never overrides the user's persisted desktop theme.
-        ingestBackendSkin((payload as { skin?: HermesSkin } | undefined)?.skin, { apply: false })
+        const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+        const sourceProfile = normalizeProfileKey(event.profile ?? activeProfile)
+
+        // Establish the source profile's first-use preference even when this is
+        // a prewarmed/background socket. The queued apply persists to that
+        // profile but ThemeProvider paints only when it is the foreground.
+        ingestGatewayReadySkin((payload as { skin?: HermesSkin } | undefined)?.skin, sourceProfile)
+
         // Backends with the change watcher broadcast pet/cron/sessions change
         // events; consumers demote their legacy polls to slow backstops.
         setChangeEventsAvailable(Boolean((payload as { change_events?: boolean } | undefined)?.change_events))
 
         return
       } else if (event.type === 'skin.changed') {
-        // A runtime skin switch (Hermes activating an authored skin, or `/skin`
-        // on another surface). Only the active profile's change repaints.
-        const fromActiveProfile =
-          !event.profile || normalizeProfileKey(event.profile) === normalizeProfileKey($activeGatewayProfile.get())
-
-        if (fromActiveProfile) {
-          ingestBackendSkin(payload as HermesSkin | undefined, { apply: true })
-        }
+        // Keep every connected profile current. ThemeProvider persists the
+        // source profile but repaints only when that profile is foreground.
+        ingestBackendSkin(payload as HermesSkin | undefined, {
+          apply: true,
+          profile: normalizeProfileKey(event.profile ?? $activeGatewayProfile.get())
+        })
 
         return
       } else if (

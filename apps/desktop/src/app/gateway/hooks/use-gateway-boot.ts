@@ -114,6 +114,10 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    // The profile owned by the primary socket. Keep this separate from the
+    // foreground profile because the user can view a secondary while primary
+    // events are still arriving in the background.
+    let primaryProfile = normalizeProfileKey($activeGatewayProfile.get())
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
@@ -150,7 +154,7 @@ export function useGatewayBoot({
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
         await desktop.revalidateConnection?.().catch(() => undefined)
 
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        const conn = await desktop.getConnection(primaryProfile)
 
         if (cancelled) {
           return
@@ -239,11 +243,14 @@ export function useGatewayBoot({
       try {
         const pref = await desktop.profile?.get?.()
         const profileKey = (pref?.profile ?? '').trim() || 'default'
+        primaryProfile = profileKey
         $activeGatewayProfile.set(profileKey)
         setPrimaryGateway(gateway, profileKey)
         void ensureGatewayForProfile(profileKey)
       } catch {
+        primaryProfile = 'default'
         $activeGatewayProfile.set('default')
+        setPrimaryGateway(gateway, 'default')
       }
     }
 
@@ -285,6 +292,9 @@ export function useGatewayBoot({
         }
 
         publish(conn)
+        // Establish the socket's profile before connect(): gateway.ready can
+        // arrive immediately after the WS opens, before connect() resolves.
+        await adoptPrimaryProfile()
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await gateway.connect(wsUrl)
 
@@ -292,9 +302,6 @@ export function useGatewayBoot({
           return
         }
 
-        // Same shape as boot(): profile first (session scope depends on it),
-        // then the independent fetches concurrently.
-        await adoptPrimaryProfile()
         await Promise.all([
           seedDefaultCwd(),
           callbacksRef.current.refreshHermesConfig().catch(() => undefined),
@@ -360,7 +367,8 @@ export function useGatewayBoot({
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    primaryProfile = normalizeProfileKey(survivor?.profile ?? primaryProfile)
+    setPrimaryGateway(gateway, primaryProfile)
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
@@ -390,10 +398,8 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
-
     const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
+      callbacksRef.current.handleGatewayEvent({ ...event, profile: primaryProfile })
     )
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
@@ -479,6 +485,9 @@ export function useGatewayBoot({
           progress: 95
         })
         publish(conn)
+        // Profile first: the backend may emit gateway.ready in the same turn as
+        // the open event, so its source tag must be established pre-connect.
+        await adoptPrimaryProfile()
         // Mint a fresh WS URL right before connecting. For OAuth gateways the
         // ticket is single-use with a short TTL, so the ticket baked into
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it rather than
@@ -490,13 +499,6 @@ export function useGatewayBoot({
         if (cancelled) {
           return
         }
-
-        // Profile adoption must land first: refreshSessions scopes its fetch by
-        // $profileScope ← $activeGatewayProfile. The remaining three fetches
-        // (cwd seed, config, sessions) are independent REST calls — running
-        // them serially added their sum to time-to-populated-sidebar when only
-        // the max is needed.
-        await adoptPrimaryProfile()
 
         setDesktopBootStep({
           phase: 'renderer.config',

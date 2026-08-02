@@ -17,20 +17,14 @@ import { matchesQuery, useMediaQuery } from '@/hooks/use-media-query'
 import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
-import { $backendThemes, $pendingSkinApply } from './backend-sync'
+import { $backendThemes, $pendingSkinApplies, activateBackendSkinProfile } from './backend-sync'
 import { hexToRgb, mix, readableOn } from './color'
 import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
+import { PROFILE_SKINS_STORAGE_KEY, SKIN_STORAGE_KEY } from './skin-preference'
 import type { DesktopTheme, DesktopThemeColors } from './types'
 import { $userThemes, listAllThemes, resolveTheme } from './user-themes'
 
-// Legacy global skin (pre per-profile themes). Still the inheritance fallback
-// for any profile without its own assignment, so single-profile users and old
-// installs are unaffected.
-const SKIN_KEY = 'hermes-desktop-theme-v2'
 const MODE_KEY = 'hermes-desktop-mode-v1'
-// Per-profile skin + light/dark mode assignments: { [profileKey]: value }. A
-// profile inherits the global default until it's given its own appearance.
-const PROFILE_SKINS_KEY = 'hermes-desktop-profile-themes-v1'
 const PROFILE_MODES_KEY = 'hermes-desktop-profile-modes-v1'
 // Last active profile, recorded so the boot-time paint can pick that profile's
 // theme before the gateway reports which profile actually launched.
@@ -66,7 +60,7 @@ const profilePref = <T extends string>(record: string, legacy: string, normalize
   }
 })
 
-export const skinPref = profilePref(PROFILE_SKINS_KEY, SKIN_KEY, normalizeSkin)
+export const skinPref = profilePref(PROFILE_SKINS_STORAGE_KEY, SKIN_STORAGE_KEY, normalizeSkin)
 export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
 
 // Last active profile — lets the boot paint pick its appearance before the
@@ -346,6 +340,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // Follow profile switches: paint the profile's assigned skin + mode and
   // remember it for the next boot's first paint.
   useEffect(() => {
+    activateBackendSkinProfile(profileKey)
     rememberActiveProfileKey(profileKey)
     setThemeNameState(skinPref.resolve(profileKey))
     setModeState(modePref.resolve(profileKey))
@@ -387,17 +382,32 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     modePref.assign(liveProfile(), next)
   }, [])
 
-  // Drain a backend-driven skin switch (Hermes authoring/activating a skin from a
-  // prompt, or `/skin` on another surface). setTheme persists it per profile, so
-  // the choice sticks like any manual pick.
-  const pendingSkin = useStore($pendingSkinApply)
+  // Drain a backend-driven skin switch (first-use display.skin adoption, Hermes
+  // authoring/activating a skin from a prompt, or `/skin` on another surface).
+  // setTheme persists it per profile, so the choice sticks like any manual pick.
+  const pendingSkins = useStore($pendingSkinApplies)
 
   useEffect(() => {
-    if (pendingSkin) {
-      setTheme(pendingSkin)
-      $pendingSkinApply.set(null)
+    if (pendingSkins.length > 0) {
+      const activeProfile = liveProfile()
+
+      for (const pendingSkin of pendingSkins) {
+        const targetProfile = normalizeProfileKey(pendingSkin.profile)
+        const next = RETIRED_SKINS.has(pendingSkin.name) ? DEFAULT_SKIN_NAME : pendingSkin.name
+
+        // Persist to each event's source profile even if the foreground
+        // switched before this effect drained. Only repaint the profile that is
+        // still active, preventing queued background choices from leaking.
+        skinPref.assign(targetProfile, next)
+
+        if (targetProfile === activeProfile) {
+          setThemeNameState(next)
+        }
+      }
+
+      $pendingSkinApplies.set([])
     }
-  }, [pendingSkin, setTheme])
+  }, [pendingSkins])
 
   // The light/dark toggle (Shift+X by default) is owned by the keybind runtime
   // (`appearance.toggleMode`) so it shows up in the hotkey map and is rebindable.
