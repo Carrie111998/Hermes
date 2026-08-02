@@ -1908,7 +1908,11 @@ class PluginManager:
 
         for ep in group_eps:
             if ep.name == manifest.name:
-                return ep.load()
+                _saved_path = list(sys.path)
+                try:
+                    return ep.load()
+                finally:
+                    sys.path[:] = _saved_path
 
         raise ImportError(
             f"Entry point '{manifest.name}' not found in group '{ENTRY_POINTS_GROUP}'"
