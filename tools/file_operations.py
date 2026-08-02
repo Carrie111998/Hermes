@@ -893,12 +893,64 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            sample = content_sample[:1000]
+            if "\ufffd" in sample and not self._sample_ufffd_is_truncation_artifact(path, sample):
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
         
+        return False
+    
+    def _sample_raw_bytes(self, path: str, byte_count: int) -> bytes:
+        """Read up to ``byte_count`` raw bytes of ``path`` without loss.
+
+        The terminal env decodes stdout with errors="replace", which destroys
+        byte-level information (and fabricates U+FFFD for truncated multibyte
+        chars). Piping through ``od -An -v -tx1`` emits the raw bytes as plain
+        ASCII hex, which survives the lossy decode round-trip intact.
+        """
+        cmd = (
+            f"head -c {byte_count} {self._escape_shell_arg(path)} 2>/dev/null "
+            "| od -An -v -tx1"
+        )
+        result = self._exec(cmd)
+        if result.exit_code != 0:
+            return b""
+        hex_text = _strip_terminal_fence_leaks(result.stdout)
+        try:
+            return bytes.fromhex(hex_text)
+        except ValueError:
+            return b""
+    
+    def _sample_ufffd_is_truncation_artifact(self, path: str, sample: str) -> bool:
+        """True if the sample's U+FFFD is a decode artifact, not file content.
+
+        ``head -c 1000`` cuts at a byte boundary, so it can slice a multibyte
+        UTF-8 char in half; the terminal env's errors="replace" decode then
+        emits a SYNTHETIC U+FFFD the file never contained. Such an artifact is
+        always the LAST character of the sample and is the sample's only
+        U+FFFD (a cut sequence decodes to exactly one). When that pattern
+        matches, re-read the raw bytes and strict-decode slightly larger
+        windows: valid UTF-8 decodes cleanly once the boundary crosses onto a
+        character edge, so the U+FFFD was fabricated; a file that keeps
+        failing really does contain non-UTF-8 bytes and stays binary.
+        """
+        if sample.count("\ufffd") != 1 or not sample.endswith("\ufffd"):
+            return False
+        # A cut UTF-8 char needs at most 3 extra bytes to complete (max
+        # 4-byte sequence), so any of these windows is enough for a valid
+        # file; a file ending mid-character (invalid UTF-8 at EOF) never
+        # decodes and stays binary.
+        for byte_count in (1000, 1004, 1008, 1016, 1032, 1064):
+            raw = self._sample_raw_bytes(path, byte_count)
+            if not raw:
+                return False
+            try:
+                raw.decode("utf-8", errors="strict")
+                return True
+            except UnicodeDecodeError:
+                continue
         return False
     
     def _is_image(self, path: str) -> bool:

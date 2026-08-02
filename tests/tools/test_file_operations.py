@@ -673,3 +673,81 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    # ------------------------------------------------------------------
+    # Regression #76886: a valid UTF-8 file whose 1000-byte sample cuts a
+    # multibyte character must NOT be flagged binary. `head -c 1000` cuts at
+    # a byte boundary, the errors="replace" decode then fabricates a U+FFFD
+    # the file never contained, and the U+FFFD check above used to reject it.
+    # ------------------------------------------------------------------
+
+    def test_sample_cut_multibyte_char_not_flagged_binary(self, tmp_path):
+        """Issue repro: 'ç' starting at byte 1000 → lossy sample ends with a
+        synthetic U+FFFD, but the file is valid UTF-8 from start to finish."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        path = tmp_path / "fails.md"
+        path.write_bytes(b"a" * 999 + "\u00e7\nx\n".encode("utf-8"))  # 'ç' at byte 1000
+        lossy_sample = "a" * 999 + "\ufffd"  # what the terminal env's decode yields
+        assert ops._is_likely_binary(str(path), lossy_sample) is False
+
+    def test_real_non_utf8_byte_at_sample_boundary_still_binary(self, tmp_path):
+        """A genuine non-UTF-8 byte landing exactly on the sample boundary
+        must stay binary — the mojibake round-trip guard still applies."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        path = tmp_path / "latin.md"
+        path.write_bytes(b"a" * 999 + b"\xe9\n")  # lone latin-1 é at byte 1000
+        lossy_sample = "a" * 999 + "\ufffd"
+        assert ops._is_likely_binary(str(path), lossy_sample) is True
+
+    def _make_lossy_decode_env(self, tmp_path, content: bytes):
+        """Mock env mimicking the real terminal backend: stdout decoded with
+        errors=\"replace\", so a byte-truncated sample fabricates U+FFFD."""
+        path = tmp_path / "sample.md"
+        path.write_bytes(content)
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+
+        def execute(command, **kwargs):
+            if "od -An -v -tx1" in command:
+                n = int(command.split("head -c ", 1)[1].split()[0])
+                data = path.read_bytes()[:n]
+                return {"output": " " + " ".join(f"{b:02x}" for b in data) + "\n", "returncode": 0}
+            if command.startswith("wc -c"):
+                return {"output": f"{path.stat().st_size}\n", "returncode": 0}
+            if command.startswith("head -c 1000"):
+                data = path.read_bytes()[:1000]
+                return {"output": data.decode("utf-8", errors="replace"), "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": path.read_text(encoding="utf-8"), "returncode": 0}
+            if command.startswith("cat "):
+                return {"output": path.read_text(encoding="utf-8"), "returncode": 0}
+            if command.startswith("wc -l"):
+                newline_count = path.read_bytes().count(b"\n")
+                return {"output": f"{newline_count}\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        env.execute = execute
+        ops = ShellFileOperations(env)
+        return ops, path
+
+    def test_read_file_utf8_sample_cut_multibyte_char_ok(self, tmp_path):
+        """End-to-end: read_file must open a valid UTF-8 file whose 1000-byte
+        sample boundary cuts a multibyte char (issue's exact fails.md)."""
+        ops, path = self._make_lossy_decode_env(
+            tmp_path, b"a" * 999 + "\u00e7\nx\n".encode("utf-8")
+        )
+        result = ops.read_file(str(path))
+        assert result.is_binary is False
+        assert result.error is None
+        assert "ç" in result.content
+
+    def test_read_file_raw_utf8_sample_cut_multibyte_char_ok(self, tmp_path):
+        """End-to-end: read_file_raw has the same sampling path and must also
+        accept valid UTF-8 whose sample boundary cuts a multibyte char."""
+        ops, path = self._make_lossy_decode_env(
+            tmp_path, b"a" * 999 + "\u00e7\nx\n".encode("utf-8")
+        )
+        result = ops.read_file_raw(str(path))
+        assert result.is_binary is False
+        assert result.error is None
+        assert "ç" in result.content
