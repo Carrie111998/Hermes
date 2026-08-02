@@ -349,6 +349,31 @@ class TestInterruptDebugLogRedaction:
         result = redact_sensitive_text(str(payload), force=True)
         assert "A" * 35 not in result
 
+    def test_url_userinfo_credentials_masked(self):
+        """P2 follow-up: URL userinfo credentials (``user:pass@``) survive
+        force=True alone. The write sites now pass redact_url_credentials=True,
+        which masks the password portion of the userinfo."""
+        text = "https://alice:CorrectHorseBatteryStaple@example.com/path"
+        result = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+        assert "CorrectHorseBatteryStaple" not in result
+        assert "alice:***@example.com" in result
+
+    def test_url_credential_named_query_param_masked(self):
+        """Credential-named query parameters (OAuth ``code=``, ``token=``, ...)
+        are masked under the same call shape used at the write sites."""
+        text = "https://example.com/oauth/cb?code=abc123xyz789&state=ok"
+        result = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+        assert "abc123xyz789" not in result
+        assert "code=***&state=ok" in result
+
+    def test_url_redaction_truncation_still_works(self):
+        """[:60] is still applied after redaction: a long URL whose credential
+        sits near the start must not survive merely because it falls within the
+        first 60 chars."""
+        payload = "https://alice:secret@example.com/" + "x" * 80
+        truncated = redact_sensitive_text(payload, force=True, redact_url_credentials=True)[:60]
+        assert "secret" not in truncated
+
 
 class TestPassthrough:
     def test_empty_string(self):
