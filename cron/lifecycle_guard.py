@@ -275,7 +275,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
 
 
 def _is_shell_script_file(path: Path) -> bool:
-    """Return whether *path* is a bounded-read POSIX shell script file."""
+    """Return whether *path* is a bounded-read script candidate.
+
+    Text candidates are scanned (defence-in-depth: POSIX shells execute
+    extensionless text scripts without a shebang via the ENOEXEC fallback),
+    while clearly binary files are skipped using a bounded NUL-byte header
+    check — a binary decoded as UTF-8 embeds NUL bytes that previously
+    crashed the resolver (ValueError: embedded null byte) or produced
+    false-positive gateway-lifecycle verdicts.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -290,10 +298,9 @@ def _is_shell_script_file(path: Path) -> bool:
         return False
     finally:
         os.close(descriptor)
-    if not data.startswith(b"#!"):
+    if not data:
         return False
-    shebang = data.splitlines()[0].decode("utf-8", errors="replace")
-    return bool(re.search(r"(?i)(?<![A-Za-z0-9_])(sh|bash|dash|ksh|zsh)(?![A-Za-z0-9_])", shebang))
+    return b"\x00" not in data
 
 
 def _contains_unsafe_gateway_action(

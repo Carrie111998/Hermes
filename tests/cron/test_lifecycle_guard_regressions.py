@@ -11,13 +11,22 @@ from tools import approval
 
 def test_full_path_non_shell_binary_is_not_scanned(tmp_path: Path) -> None:
     binary = tmp_path / "python3"
-    binary.write_bytes(b"x" * (2 * 1024 * 1024))
+    binary.write_bytes(b"\x00" * 4096)
 
     command = f'{binary} -c "print(1)"'
 
     assert not contains_gateway_lifecycle_command_or_referenced_script(command, cwd=str(tmp_path))
     assert not _contains_unsafe_gateway_action(
         command, cwd=str(tmp_path), depth=0, visited=set()
+    )
+
+
+def test_extensionless_text_script_without_shebang_is_scanned(tmp_path: Path) -> None:
+    script = tmp_path / "restart-helper"
+    script.write_text("hermes gateway restart\n")
+
+    assert _contains_unsafe_gateway_action(
+        str(script), cwd=".", depth=0, visited=set()
     )
 
 
@@ -159,3 +168,59 @@ def test_run_job_exception_releases_lock_and_resets_cron_flag(tmp_path, monkeypa
     assert acquired.wait(timeout=1), "writer lock was leaked by run_job"
     thread.join(timeout=1)
     assert not thread.is_alive()
+
+
+def test_run_job_handoff_propagates_cron_context_and_isolates_concurrent_thread(
+    tmp_path, monkeypatch
+) -> None:
+    import threading
+    from unittest.mock import MagicMock, patch
+
+    import cron.scheduler as scheduler
+
+    workdir = tmp_path / "cron-workdir"
+    workdir.mkdir()
+    job = {
+        "id": "r2-handoff",
+        "name": "handoff",
+        "prompt": "probe",
+        "workdir": str(workdir),
+    }
+    worker_probe = []
+    concurrent_probe = []
+
+    def probe_run_conversation(*args, **kwargs):
+        worker_probe.append(HERMES_CRON_SESSION_CONTEXTVAR.get())
+
+        def probe_concurrent_thread() -> None:
+            concurrent_probe.append(HERMES_CRON_SESSION_CONTEXTVAR.get())
+
+        thread = threading.Thread(target=probe_concurrent_thread)
+        thread.start()
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        raise RuntimeError("r2 handoff probe")
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    assert HERMES_CRON_SESSION_CONTEXTVAR.get() is False
+    scheduler._terminal_cwd_lock.acquire_write()
+    scheduler._terminal_cwd_lock.release_write()
+
+    agent = MagicMock()
+    agent.run_conversation.side_effect = probe_run_conversation
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch(
+             "hermes_cli.runtime_provider.resolve_runtime_provider",
+             return_value={"provider": "test", "model": "test", "api_key": "key"},
+         ), \
+         patch("hermes_state.SessionDB", return_value=MagicMock()), \
+         patch("run_agent.AIAgent", return_value=agent):
+        result = scheduler.run_job(job)
+
+    assert result[0] is False
+    assert worker_probe == [True]
+    assert concurrent_probe == [False]
+    assert HERMES_CRON_SESSION_CONTEXTVAR.get() is False
