@@ -2,7 +2,7 @@
  * Tests for electron/update-relaunch.ts — the pure decision + script helpers
  * behind the Linux in-app update relaunch (#45205).
  *
- * Run with: node --test electron/update-relaunch.test.ts
+ * Run with: npx vitest run --project electron electron/update-relaunch.test.ts
  * (Wired into npm test:desktop:platforms in package.json.)
  *
  * What this locks (review acceptance criteria for PR #45205):
@@ -23,7 +23,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import test from 'node:test'
+import { test } from 'vitest'
 
 import {
   buildRelaunchScript,
