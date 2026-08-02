@@ -639,6 +639,92 @@ def test_api_active_release_fences_but_retires_only_at_worker_boundary(
     assert id(agent) not in adapter._api_deferred_agent_releases
 
 
+def test_api_clarify_retirement_retries_transient_core_clear_failure(
+    api_runtime,
+    monkeypatch,
+):
+    adapter = api_runtime.adapter
+    from tools import clarify_gateway
+
+    callback = adapter._make_api_clarify_callback("retry-retirement")
+    authority = callback._api_clarify_authority
+    generation = clarify_gateway.claim_session_generation(authority.scope)
+    authority.generation = generation
+    clarify_gateway.register(
+        "retry-core-entry",
+        authority.scope,
+        "Q?",
+        ["A"],
+        generation=generation,
+        identity_v1=True,
+    )
+
+    original_clear = clarify_gateway.clear_session
+    attempts = 0
+
+    def _flaky_clear(session_key, *, generation=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected transient core clear failure")
+        return original_clear(session_key, generation=generation)
+
+    monkeypatch.setattr(clarify_gateway, "clear_session", _flaky_clear)
+
+    assert adapter._retire_api_clarify_authority(authority) is False
+    assert authority.active is False
+    assert authority.accepting is False
+    assert authority.retired is False
+    assert clarify_gateway.session_generation_retained(
+        authority.scope,
+        generation,
+    ) is True
+
+    assert adapter._retire_api_clarify_authority(authority) is True
+    assert authority.retired is True
+    assert clarify_gateway.session_generation_retained(
+        authority.scope,
+        generation,
+    ) is False
+    assert attempts == 2
+
+
+def test_api_clarify_retirement_accepts_exact_supersession_without_rollback(
+    api_runtime,
+):
+    adapter = api_runtime.adapter
+    from tools import clarify_gateway
+
+    callback = adapter._make_api_clarify_callback("superseded-retirement")
+    authority = callback._api_clarify_authority
+    old_generation = clarify_gateway.claim_session_generation(authority.scope)
+    authority.generation = old_generation
+    clarify_gateway.register(
+        "superseded-core-entry",
+        authority.scope,
+        "Old?",
+        ["A"],
+        generation=old_generation,
+        identity_v1=True,
+    )
+    new_generation = clarify_gateway.claim_session_generation(authority.scope)
+
+    assert adapter._retire_api_clarify_authority(authority) is True
+    assert authority.retired is True
+    assert clarify_gateway.session_generation_retained(
+        authority.scope,
+        old_generation,
+    ) is False
+    assert clarify_gateway.session_generation_retained(
+        authority.scope,
+        new_generation,
+    ) is True
+    assert clarify_gateway.retire_session_generation(
+        authority.scope,
+        new_generation,
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_chat_nonstream_approval_is_authenticated_exact_and_session_scoped(
     api_runtime,

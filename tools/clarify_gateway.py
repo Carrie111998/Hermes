@@ -271,6 +271,33 @@ def retire_session_generation(
         return True
 
 
+def session_generation_retained(
+    session_key: str,
+    generation: int,
+) -> bool:
+    """Return whether one exact generation still occupies core state.
+
+    This is a retry decision primitive for lifecycle owners.  It deliberately
+    reports both the authoritative session slot and any exact identity entry,
+    under the same lock, without exposing prompt content or mutable entries.
+    """
+
+    normalized_session = str(session_key or "")
+    if not normalized_session:
+        raise ValueError("session_key is required")
+    normalized_generation = int(generation)
+
+    with _lock:
+        if _current_generations.get(normalized_session) == normalized_generation:
+            return True
+        return any(
+            (entry := _entries.get(clarify_id)) is not None
+            and entry.identity_v1
+            and entry.generation == normalized_generation
+            for clarify_id in _session_index.get(normalized_session, [])
+        )
+
+
 def _remove_from_indices_locked(entry: _ClarifyEntry) -> None:
     """Remove ``entry`` from both indices while ``_lock`` is held."""
     if _entries.get(entry.clarify_id) is entry:

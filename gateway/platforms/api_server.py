@@ -3046,7 +3046,7 @@ class APIServerAdapter(BasePlatformAdapter):
         scope: str,
         *,
         generation: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """Cancel one API conversation's pending clarify requests.
 
         When ``generation`` is supplied, cleanup is exact and cannot consume a
@@ -3054,7 +3054,7 @@ class APIServerAdapter(BasePlatformAdapter):
         """
 
         if not scope:
-            return
+            return True
         clarifications_lock = getattr(self, "_api_clarifications_lock", None)
         pending = getattr(self, "_api_pending_clarifications", None)
         if clarifications_lock is not None and pending is not None:
@@ -3074,8 +3074,10 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.clarify_gateway import clear_session
 
             clear_session(scope, generation=generation)
+            return True
         except Exception:
             logger.debug("Failed to clear API clarify scope", exc_info=True)
+            return False
 
     def _cancel_api_clarify_authority(
         self,
@@ -3106,21 +3108,34 @@ class APIServerAdapter(BasePlatformAdapter):
 
         with self._api_clarifications_lock:
             if authority.retired:
-                return False
+                return True
             authority.accepting = False
             authority.active = False
-            authority.retired = True
             generation = authority.generation
             if generation is None:
+                authority.retired = True
                 return True
-            self._clear_api_clarify_scope(
+            cleared = self._clear_api_clarify_scope(
                 authority.scope,
                 generation=generation,
             )
-            return clarify_gateway.retire_session_generation(
+            if not cleared:
+                return False
+            retired = clarify_gateway.retire_session_generation(
                 authority.scope,
                 generation,
             )
+            if not retired and clarify_gateway.session_generation_retained(
+                authority.scope,
+                generation,
+            ):
+                return False
+            # ``retire_session_generation`` also returns false when a newer
+            # generation already superseded this one.  Exact absence is an
+            # equally valid terminal retirement result and must not disturb
+            # that newer authority.
+            authority.retired = True
+            return True
 
     def _cancel_api_agent_clarifications(self, agent: Any) -> None:
         """Fence an agent's exact turn callback without retiring it early."""
