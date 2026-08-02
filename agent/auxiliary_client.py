@@ -1689,6 +1689,7 @@ class _AnthropicCompletionsAdapter:
         from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
         from agent.transports import get_transport
 
+        strict_single_attempt = bool(kwargs.pop("_strict_single_attempt", False))
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
@@ -1777,6 +1778,11 @@ class _AnthropicCompletionsAdapter:
         response = create_anthropic_message(
             self._client,
             anthropic_kwargs,
+            # The shared helper normally prefers streaming and retries once via
+            # messages.create() when a gateway rejects streaming. Strict mode
+            # must initiate only one physical request, so start with the
+            # non-streaming Messages call and surface any error unchanged.
+            prefer_stream=not strict_single_attempt,
             # Tick the aux forward-progress hook per streamed event so hosts
             # watching liveness (gateway session hygiene) don't kill a
             # slow-but-generating summary model. No-op when no hook is
@@ -8517,6 +8523,8 @@ def _strict_sync_completion(
 
     audit.record_attempt()
     try:
+        if isinstance(client, AnthropicAuxiliaryClient):
+            kwargs = {**kwargs, "_strict_single_attempt": True}
         base_url = str(getattr(client, "base_url", resolved_base_url) or "")
         if _provider_requires_stream(dispatched_provider, base_url):
             response = _create_with_progress(
@@ -8565,6 +8573,8 @@ async def _strict_async_completion(
 
     audit.record_attempt()
     try:
+        if isinstance(client, AsyncAnthropicAuxiliaryClient):
+            kwargs = {**kwargs, "_strict_single_attempt": True}
         base_url = str(getattr(client, "base_url", resolved_base_url) or "")
         force_stream = _provider_requires_stream(dispatched_provider, base_url)
         if force_stream and not isinstance(client, (

@@ -37,6 +37,7 @@ from agent.auxiliary_client import (
     _resolve_task_provider_model,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
+    _AnthropicCompletionsAdapter,
     _pool_runtime_base_url,
 )
 from agent.llm_execution import (
@@ -4375,9 +4376,11 @@ class _StrictSyncCompletions:
     def __init__(self, outcome):
         self.outcome = outcome
         self.calls = 0
+        self.last_kwargs = {}
 
-    def create(self, **_kwargs):
+    def create(self, **kwargs):
         self.calls += 1
+        self.last_kwargs = kwargs
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
@@ -4445,6 +4448,49 @@ def _install_strict_client(monkeypatch, client):
 
 
 class TestStrictSingleAttemptExecution:
+    def test_anthropic_adapter_disables_stream_fallback_in_strict_mode(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_kwargs",
+            lambda **kwargs: kwargs,
+        )
+
+        def fake_create(_client, _kwargs, **options):
+            captured.update(options)
+            return SimpleNamespace(usage=None)
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.create_anthropic_message",
+            fake_create,
+        )
+        monkeypatch.setattr(
+            "agent.transports.get_transport",
+            lambda _name: SimpleNamespace(
+                normalize_response=lambda _response, **_kwargs: SimpleNamespace(
+                    content="ok",
+                    tool_calls=[],
+                    reasoning=None,
+                    finish_reason="stop",
+                )
+            ),
+        )
+        adapter = _AnthropicCompletionsAdapter(
+            SimpleNamespace(),
+            "test-model",
+        )
+
+        response = adapter.create(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            _strict_single_attempt=True,
+        )
+
+        assert response.choices[0].message.content == "ok"
+        assert captured["prefer_stream"] is False
+
     @pytest.mark.parametrize(
         ("provider", "client_type"),
         [
@@ -4471,6 +4517,8 @@ class TestStrictSingleAttemptExecution:
 
         assert response.model == "test-model"
         assert completions.calls == 1
+        if provider == "anthropic":
+            assert completions.last_kwargs["_strict_single_attempt"] is True
 
     def test_strict_success_is_one_outbound_call(self, monkeypatch):
         completions = _StrictSyncCompletions(_strict_response())

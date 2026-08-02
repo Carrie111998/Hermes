@@ -183,8 +183,7 @@ def routes_match(
     return (
         str(requested_provider or "").strip().lower()
         == str(dispatched_provider or "").strip().lower()
-        and str(requested_model or "").strip()
-        == str(dispatched_model or "").strip()
+        and str(requested_model or "").strip() == str(dispatched_model or "").strip()
     )
 
 
