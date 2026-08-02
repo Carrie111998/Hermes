@@ -1032,6 +1032,41 @@ class TestMediaDeliveryDefaultMode:
         else:
             assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) is None
 
+    def test_sibling_credential_symlink_into_cache_denied(
+        self, tmp_path, monkeypatch,
+    ):
+        """Credential-shaped paths must not redeem via safe-root after resolve.
+
+        ``profiles/bob/.env`` symlinked to ``bob/cache/images/...`` resolves
+        into an unconditional profile-cache allowlist root. Lexical sibling
+        credential policy must reject that submission before safe-root
+        acceptance, while the cache target addressed directly still delivers.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        cache_file = bob / "cache" / "images" / "credential.txt"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("leaked-secret\n")
+        secret_link = bob / ".env"
+        try:
+            secret_link.symlink_to(cache_file)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret_link)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(cache_file)) == str(
+            cache_file.resolve()
+        )
+
     def test_case_sensitive_home_exception_preserves_denied_root_identity(
         self, tmp_path, monkeypatch,
     ):

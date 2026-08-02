@@ -1187,9 +1187,11 @@ _MEDIA_DELIVERY_TRUST_RECENT_DEFAULT_SECONDS = 600
 # Hard denylist applied even when a path would otherwise pass recency trust.
 # These prefixes hold credentials, system state, or process introspection that
 # should never be uploaded as a gateway attachment, regardless of how new the
-# file looks. The cache-dir allowlist still beats this — an operator-configured
-# allowed root can intentionally live under one of these prefixes (rare, but
-# their choice).
+# file looks. The cache-dir allowlist still beats system-prefix denial for
+# ordinary artifacts — an operator-configured allowed root can intentionally
+# live under one of these prefixes (rare, but their choice). Credential-shaped
+# sibling-profile paths are checked before that allowlist so a ``.env``
+# symlink into ``cache/images`` cannot redeem via safe-root acceptance.
 _MEDIA_DELIVERY_DENIED_PREFIXES = (
     "/etc",
     "/proc",
@@ -1696,8 +1698,19 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not resolved.is_file():
         return None
 
-    # Cache / operator allowlist is always honored — these are unconditionally
-    # trusted regardless of mode.
+    # Credential-shaped sibling-profile paths must be denied before safe-root
+    # acceptance. Otherwise ``profiles/<name>/.env`` (or another credential
+    # relative path) that symlinks into ``cache/images`` resolves into an
+    # unconditional allowlisted root and returns before lexical/structural
+    # credential denial can run. Direct cache artifacts remain deliverable.
+    if (
+        _path_is_lexical_profile_tree_credential(lexical)
+        or _path_is_profile_tree_credential(resolved)
+    ):
+        return None
+
+    # Cache / operator allowlist is always honored for paths that are not
+    # credential-shaped — these remain trusted regardless of mode.
     for root in _media_delivery_allowed_roots():
         try:
             resolved_root = root.expanduser().resolve(strict=False)
