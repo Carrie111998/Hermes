@@ -2151,7 +2151,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_vm(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
+            logger.warning("Failed to cleanup VM for task %s: %s", task_id, e)
     try:
         headed = False
         try:
@@ -2169,7 +2169,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_browser(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+            logger.warning("Failed to cleanup browser for task %s: %s", task_id, e)
 
 
 def _build_partial_stream_stub(
