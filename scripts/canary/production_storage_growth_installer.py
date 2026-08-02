@@ -161,8 +161,8 @@ class ProductionStorageInstallerError(RuntimeError):
     """Stable, secret-free installer failure."""
 
 
-def _posix_effective_uid() -> int:
-    getter = getattr(os, "geteuid", None)
+def _posix_identity(getter_name: str) -> int:
+    getter = getattr(os, getter_name, None)
     if not callable(getter):
         raise ProductionStorageInstallerError(
             "production_storage_owner_installer_invalid"
@@ -178,6 +178,18 @@ def _posix_effective_uid() -> int:
             "production_storage_owner_installer_invalid"
         )
     return value
+
+
+def _posix_effective_uid() -> int:
+    return _posix_identity("geteuid")
+
+
+def _posix_uid() -> int:
+    return _posix_identity("getuid")
+
+
+def _posix_gid() -> int:
+    return _posix_identity("getgid")
 
 
 def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -802,6 +814,7 @@ def _quiesce_predecessor_helpers(
             "production_storage_predecessor_pidfd_unavailable"
         )
     deadline = monotonic() + 10.0
+    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
     empty_observations = 0
     while monotonic() < deadline:
         try:
@@ -890,7 +903,7 @@ def _quiesce_predecessor_helpers(
             sleeper(0.05)
             for _identity, descriptor in handles:
                 try:
-                    signaler(descriptor, signal.SIGKILL, None, 0)
+                    signaler(descriptor, kill_signal, None, 0)
                 except ProcessLookupError:
                     pass
                 except OSError:
@@ -1283,7 +1296,7 @@ def install_owner_state_root(
             client_uid = (
                 int(os.environ["SUDO_UID"])
                 if expected_uid == 0
-                else os.getuid()
+                else _posix_uid()
             )
         else:
             client_uid = authorized_client_uid
@@ -1291,7 +1304,7 @@ def install_owner_state_root(
             client_gid = (
                 int(os.environ["SUDO_GID"])
                 if expected_uid == 0
-                else os.getgid()
+                else _posix_gid()
             )
         else:
             client_gid = authorized_client_gid

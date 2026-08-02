@@ -883,9 +883,10 @@ class RootStateMachine:
         self.lock_fd = None
 
     def open(self):
+        effective_uid = getattr(os, "geteuid", None)
         if (
-            fcntl is None or not hasattr(os, "geteuid")
-            or os.geteuid() != self.expected_uid
+            fcntl is None or not callable(effective_uid)
+            or effective_uid() != self.expected_uid
         ):
             raise StateHelperError("production_storage_state_helper_privilege_invalid")
         lock_path = (
