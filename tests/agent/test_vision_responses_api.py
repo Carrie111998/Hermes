@@ -103,6 +103,67 @@ class TestVisionResponsesApiMode:
             f"expected an OpenAI chat client, got {type(client).__name__}"
         )
 
+    def test_aux_vision_api_mode_is_a_recognized_config_key(self, tmp_path, monkeypatch):
+        """auxiliary.vision.api_mode is a valid schema key (via set_config_value).
+
+        This guards the new DEFAULT_CONFIG leaf directly: if the ``api_mode``
+        entry under the ``auxiliary.vision`` block in config_defaults.py is
+        deleted, ``_validate_config_key`` reports it unknown and this test
+        fails — even though the named-custom-provider route (tested above)
+        would keep passing on its own.
+        """
+        from hermes_cli.config import set_config_value, _validate_config_key
+
+        set_config_value("auxiliary.vision.api_mode", "codex_responses")
+
+        # No unknown-key warning → the leaf is recognized in DEFAULT_CONFIG.
+        known, suggestion = _validate_config_key("auxiliary.vision.api_mode")
+        assert known is True, (
+            f"auxiliary.vision.api_mode should be a recognized key, got "
+            f"suggestion={suggestion!r}"
+        )
+        # The value actually landed in the user's config.yaml.
+        config_yaml = (tmp_path / ".hermes" / "config.yaml").read_text()
+        assert "api_mode: codex_responses" in config_yaml
+
+    def test_aux_vision_api_mode_routes_vision_resolver_to_responses(self, tmp_path, monkeypatch):
+        """auxiliary.vision.api_mode=codex_responses → CodexAuxiliaryClient.
+
+        End-to-end through the real config write path (set_config_value) and
+        the auxiliary vision resolver, matching the reviewer's ask: deleting
+        the DEFAULT_CONFIG leaf must break this, not just the custom-provider
+        route.
+        """
+        monkeypatch.setenv("LUNA_API_KEY", "sk-test")
+        from hermes_cli.config import set_config_value
+
+        # Configure the vision aux block exactly as a user would, then persist
+        # api_mode through the real set_config_value path.
+        _write_config(tmp_path, {
+            "auxiliary": {
+                "vision": {
+                    "provider": "custom:luna-proxy",
+                    "model": "opencode-gpt-5.6-luna",
+                    "base_url": "http://luna.local/v1",
+                    "api_key": "sk-test",
+                },
+            },
+        })
+        set_config_value("auxiliary.vision.api_mode", "codex_responses")
+
+        from agent.auxiliary_client import resolve_vision_provider_client, CodexAuxiliaryClient
+
+        provider, client, model = resolve_vision_provider_client(
+            provider="custom:luna-proxy",
+            model="opencode-gpt-5.6-luna",
+            async_mode=False,
+        )
+
+        assert isinstance(client, CodexAuxiliaryClient), (
+            f"auxiliary.vision.api_mode=codex_responses should route vision to the "
+            f"Responses client, got {type(client).__name__}"
+        )
+
 
 class TestImageInputToResponses:
     """image_url chat content must lower to input_image in the Responses body."""
