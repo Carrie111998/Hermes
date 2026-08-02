@@ -8076,7 +8076,14 @@ class TestRetryExhaustion:
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
-        assert relay_attempts == []
+        assert len(relay_attempts) == 2
+        assert {
+            attempt["metadata"]["api_request_id"] for attempt in relay_attempts
+        } == {relay_attempts[0]["metadata"]["api_request_id"]}
+        assert all(
+            attempt["defer_logical_completion"] is True
+            for attempt in relay_attempts
+        )
         assert len(logical_completions) == 1
         assert logical_completions[0][1] == "success"
 

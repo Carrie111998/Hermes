@@ -134,20 +134,22 @@ class TestCreateWithProgress:
         # 1 dispatch tick + 1 per chunk
         assert len(ticks) >= len(chunks) + 1
 
-    def test_streaming_rejected_falls_back_to_plain_call(self):
+    def test_streaming_rejection_preserves_exactly_one_provider_call(self):
         client = _FakeClient(
             response=_COMPLETE,
             stream_error=RuntimeError("stream is not supported by this model"),
         )
-        with aux_progress_hook(lambda: None):
-            result = _create_with_progress(
-                client, {"model": "m1", "messages": []},
-            )
-        assert result is _COMPLETE
-        # streamed attempt + non-streaming fallback
-        assert len(client.calls) == 2
+        provider_error = client._stream_error
+        with pytest.raises(RuntimeError, match="stream is not supported") as caught:
+            with aux_progress_hook(lambda: None):
+                _create_with_progress(
+                    client, {"model": "m1", "messages": []},
+                )
+        assert caught.value is provider_error
+        # Recovery belongs to the outer attempt/fallback controller. This
+        # physical attempt must never execute the model a second time.
+        assert len(client.calls) == 1
         assert client.calls[0].get("stream") is True
-        assert "stream" not in client.calls[1]
 
 
 

@@ -134,16 +134,32 @@ def test_install_owner_state_validates_sealed_runtime_before_privileged_mutation
     runtime = object()
     artifacts = _artifact_attestation()
     binding = cli.installer.build_owner_artifact_binding(RELEASE, artifacts)
+
+    class Route:
+        def attest_authority_key(self):
+            events.append("authority")
+            return {"attestation_sha256": "4" * 64}
+
     monkeypatch.setattr(
         cli,
-        "_runtime_artifacts",
-        lambda _release: (events.append("runtime") or (runtime, artifacts)),
+        "_build_route",
+        lambda _release: (events.append("route") or (Route(), runtime)),
+    )
+    monkeypatch.setattr(
+        cli.owner,
+        "observe_exact_production_storage_runtime_artifacts",
+        lambda **_kwargs: (events.append("artifacts") or artifacts),
     )
     monkeypatch.setattr(
         cli,
         "_install_owner_state_privileged",
-        lambda release, observed: (
+        lambda release, observed, authority: (
             events.append("privileged")
+            if authority["attestation_sha256"] == "4" * 64
+            else (_ for _ in ()).throw(AssertionError("wrong authority"))
+        )
+        or (
+            events.append("privileged_result")
             or {
                 "schema": cli.installer.OWNER_READINESS_SCHEMA,
                 "release_sha": release,
@@ -183,7 +199,10 @@ def test_install_owner_state_validates_sealed_runtime_before_privileged_mutation
     assert response["result"]["sealed_artifact_binding_sha256"] == binding[
         "binding_sha256"
     ]
-    assert events == ["runtime", "privileged", "revalidate"]
+    assert events == [
+        "route", "artifacts", "authority", "privileged",
+        "privileged_result", "revalidate",
+    ]
 
 
 def test_build_plan_has_no_caller_runtime_hash_surface(monkeypatch) -> None:
@@ -267,6 +286,7 @@ def test_privileged_owner_install_uses_one_fixed_isolated_installer_command() ->
         RELEASE,
         _artifact_attestation(),
     )
+    authority = {"attestation_sha256": "4" * 64}
     captured = {}
     readiness = {
         "schema": cli.installer.OWNER_READINESS_SCHEMA,
@@ -291,6 +311,7 @@ def test_privileged_owner_install_uses_one_fixed_isolated_installer_command() ->
     assert cli._install_owner_state_privileged(
         RELEASE,
         binding,
+        authority,
         runner=runner,
     ) == readiness
     assert captured["command"] == (
@@ -308,6 +329,7 @@ def test_privileged_owner_install_uses_one_fixed_isolated_installer_command() ->
     )
     assert captured["input"] == cli.installer.canonical_json_bytes({
         "sealed_artifact_binding": binding,
+        "authority_key_attestation": authority,
     })
 
 
