@@ -913,6 +913,34 @@ def init_agent(
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
+
+    # Sampling params from config.yaml -> model.temperature / model.top_p.
+    # Hermes had no user-facing knob for these: the main chat call only ever
+    # got a temperature from _fixed_temperature_for_model()'s hardcoded table,
+    # and top_p was never emitted at all. request_overrides is the existing
+    # channel that lands straight in the request body
+    # (transports/chat_completions.py: api_kwargs.update(overrides)).
+    #
+    # setdefault, so an explicit per-turn override still wins. Temperature is
+    # skipped for models whose contract says the server picks it (Kimi):
+    # re-introducing the field there is exactly what OMIT_TEMPERATURE prevents.
+    try:
+        from hermes_cli.config import load_config_readonly as _load_sampling_cfg, cfg_get as _sampling_get
+        from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE
+
+        _sampling_cfg = _load_sampling_cfg()
+        _omit_temp = (
+            _fixed_temperature_for_model(agent.model, agent.base_url) is OMIT_TEMPERATURE
+        )
+        for _sampling_key in ("temperature", "top_p"):
+            if _sampling_key == "temperature" and _omit_temp:
+                continue
+            _sampling_val = _sampling_get(_sampling_cfg, "model", _sampling_key)
+            if _sampling_val is not None:
+                agent.request_overrides.setdefault(_sampling_key, _sampling_val)
+    except Exception as e:
+        logger.debug("sampling params from config skipped: %s", e)
+
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
