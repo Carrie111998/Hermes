@@ -133,6 +133,26 @@ def test_corr_id_pending_set_self_trims():
 # 7. Outbound send (mocked WS)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
+async def test_send_dm():
+    """DMs use structured ``/_send @<id>`` numeric addressing."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+
+    mock_ws = AsyncMock()
+    adapter._ws = mock_ws
+
+    result = await adapter.send("42", "Hello,\nSimpleX!")
+    mock_ws.send.assert_called_once()
+    payload = json.loads(mock_ws.send.call_args[0][0])
+    assert payload["cmd"].startswith("/_send @42 json ")
+    msg_content = json.loads(payload["cmd"].split(" json ", 1)[1])[0][
+        "msgContent"
+    ]
+    assert msg_content == {"type": "text", "text": "Hello,\nSimpleX!"}
+    assert payload["corrId"].startswith(_CORR_PREFIX)
+    assert result.success is True
 
 @pytest.mark.asyncio
 async def test_send_group():
@@ -202,6 +222,41 @@ async def test_standalone_send_missing_websockets(monkeypatch):
         if saved_websockets is not None:
             sys.modules["websockets"] = saved_websockets
 
+
+@pytest.mark.asyncio
+async def test_standalone_send_defaults_to_local_daemon(monkeypatch):
+    monkeypatch.delenv("SIMPLEX_WS_URL", raising=False)
+    pconfig = MagicMock()
+    pconfig.extra = {}
+
+    sent_payloads = []
+
+    class DummyWs:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def send(self, payload):
+            sent_payloads.append(json.loads(payload))
+
+    def fake_connect(url, **kwargs):
+        assert url == "ws://127.0.0.1:5225"
+        assert kwargs["open_timeout"] == 10
+        assert kwargs["close_timeout"] == 5
+        return DummyWs()
+
+    import websockets
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    result = await _standalone_send(pconfig, "42", "hi")
+    assert result == {"success": True, "platform": "simplex", "chat_id": "42"}
+    assert sent_payloads[0]["cmd"].startswith("/_send @42 json ")
+    msg_content = json.loads(sent_payloads[0]["cmd"].split(" json ", 1)[1])[0][
+        "msgContent"
+    ]
+    assert msg_content == {"type": "text", "text": "hi"}
 
 # ---------------------------------------------------------------------------
 # 10. register() — plugin-side metadata
