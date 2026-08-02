@@ -3238,6 +3238,38 @@ def _cold_start_windows_gateway_after_update() -> None:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
         return
 
+    # The Desktop app's backend (``hermes serve``) hosts the gateway runtime
+    # but uses a different subcommand than ``gateway run``, so
+    # ``find_gateway_pids`` does not see it.  Spawning a standalone gateway
+    # alongside the desktop backend creates duplicate daemons that race on
+    # ports and state files (#76129).  Scan for a running ``serve`` process
+    # before spawning.
+    try:
+        import psutil  # type: ignore
+
+        for proc in psutil.process_iter(["cmdline"]):
+            try:
+                cmdline = " ".join(proc.info.get("cmdline") or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            cmdline_lc = cmdline.lower()
+            _tokens = cmdline_lc.split()
+            # Match ``hermes serve`` / ``hermes.exe serve`` and the module
+            # form ``python -m hermes_cli.main serve``.
+            _is_hermes = any(
+                t.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] in ("hermes", "hermes.exe")
+                for t in _tokens
+            ) or "hermes_cli" in cmdline_lc
+            if _is_hermes and "serve" in _tokens:
+                logger.debug(
+                    "Desktop backend (hermes serve) already running (PID %d); "
+                    "skipping gateway cold-start",
+                    proc.pid,
+                )
+                return
+    except Exception:
+        pass
+
     try:
         pid = gateway_windows._spawn_detached()
     except Exception as exc:
