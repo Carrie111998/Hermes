@@ -5,6 +5,7 @@ import {
 } from "recharts";
 import { api, post, when, USER, type Component } from "../lib/api";
 import { badgeClass, avatarHue, faviconFor } from "../lib/accents";
+import { Button } from "./ui";
 import {
   Play, ExternalLink, LoaderCircle, ArrowUpRight, ArrowDownRight,
   ChevronUp, ChevronDown, Workflow, MessageSquare, MousePointerClick,
@@ -246,7 +247,7 @@ function ChartView({ data }: { data: any }) {
         </span>
         <span className="text-[11px] text-ink-3 truncate">{data.label}</span>
       </div>
-      <div className="flex-1 min-h-0 -mx-1">
+      <div className="flex-1 min-h-[180px] -mx-1">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={pts} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
             <defs>
@@ -375,11 +376,10 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
           ))}
         </div>
       )}
-      <button onClick={run} disabled={running}
-              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg bg-blue text-white text-[13px] w510 w-fit hover:bg-blue-2 disabled:opacity-60 transition-colors">
+      <Button onClick={run} disabled={running} className="w-fit">
         {running ? <LoaderCircle size={14} className="spin" /> : <Play size={13} />}
         {running ? "Running" : "Run"}
-      </button>
+      </Button>
       {result && (
         <div className="mt-2.5 bg-[#101a30] border border-line rounded-lg px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 whitespace-pre-wrap overflow-auto flex-1 min-h-0">
           {result}

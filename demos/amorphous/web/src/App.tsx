@@ -9,6 +9,7 @@ import Card from "./components/Card";
 import ChatDock, { type ChatMsg } from "./components/ChatDock";
 import Onboarding from "./Onboarding";
 import Inspector from "./components/Inspector";
+import { Button, TooltipProvider } from "./components/ui";
 import { api, post, track, when, USER, type Component, type Proposal, type StationState } from "./lib/api";
 
 export default function App() {
@@ -168,6 +169,7 @@ export default function App() {
   const layoutVersion = state.layout._meta?.version ?? 1;
 
   return (
+    <TooltipProvider>
     <div className="min-h-screen flex">
       {/* ===== left sidebar ===== */}
       <aside className="w-[228px] shrink-0 bg-panel border-r border-line flex flex-col fixed top-0 bottom-0 left-0 z-40">
@@ -224,10 +226,9 @@ export default function App() {
               {state.proposals.length}
             </span>
           </TopBtn>
-          <button onClick={() => setDockCollapsed(!dockCollapsed)}
-                  className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-md bg-blue text-white text-[13px] w510 hover:bg-blue-2 transition-colors">
+          <Button onClick={() => setDockCollapsed(!dockCollapsed)}>
             <MessageSquare size={14} /> Chat
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -250,16 +251,15 @@ export default function App() {
           <span className="flex-1 text-ink-2 truncate">
             {preview.diff.map((d) => `${d.change}: ${d.title}`).join(" · ") || "reflow only"}
           </span>
-          <button onClick={() => actProposal(preview.p.id, "approve", "", "up")}
-                  className="h-8 px-3.5 rounded-md bg-blue text-white text-[13px] w510 inline-flex items-center gap-1.5 hover:bg-blue-2 transition-colors">
+          <Button onClick={() => actProposal(preview.p.id, "approve", "", "up")}>
             <Check size={13} /> Keep
-          </button>
-          <button onClick={() => {
+          </Button>
+          <Button variant="secondary" onClick={() => {
             const why = prompt("Why keep the current layout? (optional — steers the curator)") || "";
             actProposal(preview.p.id, "reject", why, "down");
-          }} className="h-8 px-3.5 rounded-md border border-line-2 bg-surface text-[13px] text-ink-2 inline-flex items-center gap-1.5 hover:bg-surface-2">
+          }}>
             <XIcon size={13} /> Go back
-          </button>
+          </Button>
         </div>
       )}
 
@@ -332,6 +332,7 @@ export default function App() {
       )}
       </div>
     </div>
+    </TooltipProvider>
   );
 }
 

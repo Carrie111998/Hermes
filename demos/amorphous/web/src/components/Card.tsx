@@ -1,13 +1,17 @@
-/* One dashboard card: header, live data body, context menu, scoped chat. */
+/* One dashboard card: header, live data body, context menu, scoped chat,
+   and pop-out (maximize into a Dialog with a full-size view + chat tab). */
 import { useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
-  MessageCircle, RefreshCw, EyeOff, Trash2,
-  Send, X, LoaderCircle,
+  MessageCircle, RefreshCw, EyeOff, Trash2, Send, LoaderCircle, Maximize2,
 } from "lucide-react";
 import { DataView, useComponentData } from "./DataViews";
 import { iconFor } from "../lib/accents";
 import { post, track, USER, type Component } from "../lib/api";
+import {
+  Button, Dialog, DialogContent, DialogHeader, Tip, Tabs, TabsList,
+  TabsTrigger, TabsContent,
+} from "./ui";
 
 interface Props {
   c: Component;
@@ -19,14 +23,22 @@ interface Props {
 export default function Card({ c, preview, onHide, onRemove }: Props) {
   const { data, err, refresh } = useComponentData(c, preview);
   const [chatOpen, setChatOpen] = useState(false);
+  const [maxOpen, setMaxOpen] = useState(false);
   const Icon = iconFor(c.type, c.props?.source);
 
   return (
+    <>
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>
         <div
           className="card-surface relative h-full flex flex-col rounded-[10px] overflow-hidden group"
           onClickCapture={() => track("click", c.id)}
+          onDoubleClick={(e) => {
+            if ((e.target as HTMLElement).closest(".drag-handle")) {
+              setMaxOpen(true);
+              track("maximize", c.id);
+            }
+          }}
           onMouseEnter={() => ((c as any)._t0 = performance.now())}
           onMouseLeave={() => {
             const t0 = (c as any)._t0;
@@ -36,7 +48,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
             }
           }}
         >
-          <div className="drag-handle flex items-center justify-between h-9 pl-3.5 pr-2 border-b border-line shrink-0 cursor-grab active:cursor-grabbing select-none">
+          <div className="drag-handle flex items-center justify-between h-9 pl-3.5 pr-1.5 border-b border-line shrink-0 cursor-grab active:cursor-grabbing select-none">
             <div className="flex items-center gap-2 min-w-0">
               <Icon size={14} className="text-ink-4 shrink-0" strokeWidth={1.75} />
               <span className="text-[13px] w510 text-ink-2 truncate">{c.title}</span>
@@ -44,11 +56,28 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
             {!preview && (
               <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                    onMouseDown={(e) => e.stopPropagation()}>
-                <IconBtn title="Ask this component" onClick={() => { setChatOpen(true); track("component_chat_open", c.id); }}>
-                  <MessageCircle size={13} />
-                </IconBtn>
-                <IconBtn title="Refresh" onClick={refresh}><RefreshCw size={13} /></IconBtn>
-                <IconBtn title="Hide" onClick={() => onHide(c.id)}><EyeOff size={13} /></IconBtn>
+                <Tip label="Ask this component">
+                  <Button variant="ghost" size="icon"
+                          onClick={(e) => { e.stopPropagation(); setChatOpen(true); track("component_chat_open", c.id); }}>
+                    <MessageCircle size={13} />
+                  </Button>
+                </Tip>
+                <Tip label="Pop out">
+                  <Button variant="ghost" size="icon"
+                          onClick={(e) => { e.stopPropagation(); setMaxOpen(true); track("maximize", c.id); }}>
+                    <Maximize2 size={13} />
+                  </Button>
+                </Tip>
+                <Tip label="Refresh">
+                  <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); refresh(); }}>
+                    <RefreshCw size={13} />
+                  </Button>
+                </Tip>
+                <Tip label="Hide">
+                  <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); onHide(c.id); }}>
+                    <EyeOff size={13} />
+                  </Button>
+                </Tip>
               </div>
             )}
           </div>
@@ -62,6 +91,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
         <ContextMenu.Portal>
           <ContextMenu.Content className="min-w-[210px] bg-surface-2 border border-line-2 rounded-[10px] p-1 shadow-[0_8px_30px_rgba(0,0,0,.5),0_0_0_1px_rgba(255,255,255,.04)] z-[100] text-[13px]">
             <CtxLabel>{c.title}</CtxLabel>
+            <CtxItem onSelect={() => setMaxOpen(true)}><Maximize2 size={13} /> Pop out</CtxItem>
             <CtxItem onSelect={() => { setChatOpen(true); track("component_chat_open", c.id); }}>
               <MessageCircle size={13} /> Ask this component…
             </CtxItem>
@@ -73,18 +103,34 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
         </ContextMenu.Portal>
       )}
     </ContextMenu.Root>
-  );
-}
 
-function IconBtn({ children, onClick, title }: any) {
-  return (
-    <button
-      title={title}
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
-      className="w-6.5 h-6.5 flex items-center justify-center rounded-md text-ink-3 hover:text-ink hover:bg-surface-2"
-    >
-      {children}
-    </button>
+    {/* ===== pop-out dialog: full-size data + side-by-side scoped chat ===== */}
+    <Dialog open={maxOpen} onOpenChange={setMaxOpen}>
+      <DialogContent>
+        <DialogHeader
+          title={<span className="inline-flex items-center gap-2"><Icon size={15} className="text-ink-4" /> {c.title}</span>}
+          subtitle={c.props?.source || c.type}>
+          <Tip label="Refresh"><Button variant="ghost" size="icon" onClick={refresh}><RefreshCw size={14} /></Button></Tip>
+        </DialogHeader>
+        <Tabs defaultValue="view" className="flex-1 min-h-0 flex flex-col">
+          <div className="px-4 pt-3 shrink-0">
+            <TabsList>
+              <TabsTrigger value="view">View</TabsTrigger>
+              <TabsTrigger value="chat"><MessageCircle size={12} /> Ask Hermes</TabsTrigger>
+            </TabsList>
+          </div>
+          <TabsContent value="view" className="flex-1 min-h-0 overflow-auto px-5 py-4 data-[state=inactive]:hidden">
+            <div className="h-full min-h-[420px]">
+              <DataView c={c} data={data} err={err} />
+            </div>
+          </TabsContent>
+          <TabsContent value="chat" className="flex-1 min-h-0 flex data-[state=inactive]:hidden">
+            <MaximizedChat c={c} onChanged={refresh} />
+          </TabsContent>
+        </Tabs>
+      </DialogContent>
+    </Dialog>
+    </>
   );
 }
 
@@ -103,18 +149,14 @@ function CtxLabel({ children }: any) {
   return <div className="px-3 pt-1.5 pb-1 text-[10.5px] font-semibold uppercase tracking-wider text-ink-3 truncate">{children}</div>;
 }
 
-/* Scoped chat: renders inside the card as an overlay panel */
-function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () => void; onChanged: () => void }) {
+/* Shared scoped-chat engine */
+function useScopedChat(c: Component, onChanged: () => void) {
   const [msgs, setMsgs] = useState<{ who: string; text: string }[]>([
     { who: "hermes", text: "Scoped to this component — ask about its data or tell me to change it." },
   ]);
   const [busy, setBusy] = useState(false);
-  const [input, setInput] = useState("");
-
-  const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    setInput("");
+  const send = async (text: string) => {
+    if (!text.trim() || busy) return;
     setMsgs((m) => [...m, { who: "you", text }]);
     setBusy(true);
     try {
@@ -126,34 +168,68 @@ function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () =>
     }
     setBusy(false);
   };
+  return { msgs, busy, send };
+}
 
+function ChatLog({ msgs, busy, size = "sm" }: { msgs: { who: string; text: string }[]; busy: boolean; size?: "sm" | "lg" }) {
   return (
-    <div className="absolute inset-0 z-20 bg-panel/97 backdrop-blur-sm flex flex-col rounded-xl border border-blue/50"
+    <>
+      {msgs.map((m, i) => (
+        <div key={i} className={`${size === "lg" ? "text-[13.5px]" : "text-[13px]"} leading-relaxed`}>
+          <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-blue-2" : "text-ink-3"}`}>{m.who}</span>
+          <span className="text-ink-2 whitespace-pre-wrap">{m.text}</span>
+        </div>
+      ))}
+      {busy && <LoaderCircle size={15} className="spin text-ink-3" />}
+    </>
+  );
+}
+
+function ChatInput({ onSend, autoFocus }: { onSend: (t: string) => void; autoFocus?: boolean }) {
+  const [input, setInput] = useState("");
+  const go = () => { onSend(input); setInput(""); };
+  return (
+    <div className="flex items-center border-t border-line shrink-0">
+      <input
+        autoFocus={autoFocus}
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && go()}
+        placeholder="Ask or change this component…"
+        className="flex-1 bg-transparent px-3.5 py-3 text-[13px] outline-none placeholder:text-ink-4"
+      />
+      <Button variant="ghost" size="icon" className="mr-2" onClick={go}><Send size={14} /></Button>
+    </div>
+  );
+}
+
+/* In-card overlay chat */
+function ComponentChat({ c, onClose, onChanged }: { c: Component; onClose: () => void; onChanged: () => void }) {
+  const { msgs, busy, send } = useScopedChat(c, onChanged);
+  return (
+    <div className="absolute inset-0 z-20 bg-panel/97 backdrop-blur-sm flex flex-col rounded-[10px] border border-blue/50"
          onMouseDown={(e) => e.stopPropagation()}>
       <div className="flex items-center justify-between px-3.5 h-10 border-b border-line shrink-0">
-        <span className="text-[13px] font-semibold text-blue-2 truncate">◎ {c.title}</span>
-        <button onClick={onClose} className="text-ink-3 hover:text-ink"><X size={15} /></button>
+        <span className="text-[13px] w590 text-blue-2 truncate">◎ {c.title}</span>
+        <Button variant="ghost" size="icon" onClick={onClose}>✕</Button>
       </div>
       <div className="flex-1 overflow-auto px-3.5 py-2.5 space-y-2.5 min-h-0">
-        {msgs.map((m, i) => (
-          <div key={i} className="text-[13px] leading-relaxed">
-            <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-blue-2" : "text-ink-3"}`}>{m.who}</span>
-            <span className="text-ink-2 whitespace-pre-wrap">{m.text}</span>
-          </div>
-        ))}
-        {busy && <LoaderCircle size={15} className="spin text-ink-3" />}
+        <ChatLog msgs={msgs} busy={busy} />
       </div>
-      <div className="flex items-center border-t border-line shrink-0">
-        <input
-          autoFocus
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          placeholder="Ask or change this component…"
-          className="flex-1 bg-transparent px-3.5 py-2.5 text-[13px] outline-none placeholder:text-ink-3"
-        />
-        <button onClick={send} className="pr-3 text-ink-3 hover:text-blue-2"><Send size={15} /></button>
+      <ChatInput onSend={send} autoFocus />
+    </div>
+  );
+}
+
+/* Dialog chat tab */
+function MaximizedChat({ c, onChanged }: { c: Component; onChanged: () => void }) {
+  const { msgs, busy, send } = useScopedChat(c, onChanged);
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <div className="flex-1 overflow-auto px-5 py-4 space-y-3 min-h-0">
+        <ChatLog msgs={msgs} busy={busy} size="lg" />
       </div>
+      <ChatInput onSend={send} autoFocus />
     </div>
   );
 }
