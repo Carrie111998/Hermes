@@ -2653,6 +2653,12 @@ class BasePlatformAdapter(ABC):
     # preview (see gateway/run.py progress_callback).
     supports_code_blocks: bool = False
 
+    # Exact clarify callback identity contract.  The gateway additionally
+    # verifies the concrete ``send_clarify`` signature before using v1 kwargs,
+    # so an older third-party override that inherits this class remains
+    # callable through the legacy path instead of failing at runtime.
+    clarify_identity_version: int = 1
+
     # Whether this adapter's typing indicator renders TEXT (a status line
     # next to the bot name) rather than a native textless bubble. When True,
     # the gateway feeds live per-tool status phrases via set_status_text()
@@ -3788,6 +3794,9 @@ class BasePlatformAdapter(ABC):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Send a clarify prompt to the user.
 
@@ -3845,7 +3854,12 @@ class BasePlatformAdapter(ABC):
             # Text fallback: enable text-capture so the gateway intercept
             # picks up the user's typed reply (e.g. "2" or choice text).
             from tools.clarify_gateway import mark_awaiting_text
-            mark_awaiting_text(clarify_id)
+            mark_awaiting_text(
+                clarify_id,
+                session_key=session_key,
+                generation=generation,
+                responder_id=responder_id,
+            )
         else:
             text = f"❓ {question}"
         return await self.send(
@@ -5840,10 +5854,25 @@ class BasePlatformAdapter(ABC):
             if not cmd:
                 try:
                     from tools import clarify_gateway as _clarify_mod
+                    _clarify_generation = None
+                    _gateway_runner = getattr(self, "gateway_runner", None)
+                    _peek_session_state = getattr(
+                        _gateway_runner,
+                        "_peek_session_state",
+                        None,
+                    )
+                    if callable(_peek_session_state):
+                        _clarify_session_state = _peek_session_state(session_key)
+                        if _clarify_session_state is not None:
+                            _clarify_generation = (
+                                _clarify_session_state.persistent.run_generation
+                            )
                     _has_text_clarify = (
                         _clarify_mod.get_pending_for_session(
                             session_key,
                             include_choice_prompts=True,
+                            generation=_clarify_generation,
+                            responder_id=getattr(event.source, "user_id", None),
                         ) is not None
                     )
                 except Exception:

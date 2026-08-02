@@ -954,6 +954,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
+        self._clarify_callback_state: Dict[Any, Dict[str, Any]] = {}
         self._CLARIFY_RESOLVED_MAX = 1000
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
@@ -6537,6 +6538,9 @@ class SlackAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Render a clarify prompt as Block Kit interactive buttons.
 
@@ -6563,6 +6567,8 @@ class SlackAdapter(BasePlatformAdapter):
                 clarify_id=clarify_id,
                 session_key=session_key,
                 metadata=metadata,
+                generation=generation,
+                responder_id=responder_id,
             )
 
         if not self._app:
@@ -6625,8 +6631,21 @@ class SlackAdapter(BasePlatformAdapter):
                 # Mark unresolved so the action handler's atomic-pop guard can
                 # reject double-clicks (mirrors _approval_resolved).
                 self._clarify_resolved[msg_ts] = False
+                self._clarify_callback_state[msg_ts] = {
+                    "clarify_id": clarify_id,
+                    "session_key": session_key,
+                    "channel_id": str(chat_id),
+                    "team_id": str(self._metadata_team_id(metadata) or ""),
+                    "generation": generation,
+                    "responder_id": (
+                        str(responder_id) if responder_id is not None else None
+                    ),
+                }
                 self._trim_oldest_dict_entries(
                     self._clarify_resolved, self._CLARIFY_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._clarify_callback_state, self._CLARIFY_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -7032,10 +7051,55 @@ class SlackAdapter(BasePlatformAdapter):
             return
         clarify_id, token = value.split("|", 1)
 
+        callback_state = self._clarify_callback_state.get(msg_ts)
+        if (
+            not isinstance(callback_state, dict)
+            or callback_state.get("clarify_id") != clarify_id
+        ):
+            self._clarify_resolved.pop(msg_ts, None)
+            logger.warning(
+                "[Slack] clarify callback state missing/mismatched "
+                "(id=%s, message=%s)",
+                clarify_id,
+                msg_ts,
+            )
+            return
+        expected_responder_id = callback_state.get("responder_id")
+        if str(callback_state.get("channel_id") or "") != str(channel_id):
+            logger.warning(
+                "[Slack] clarify click rejected for non-matching channel "
+                "(id=%s)",
+                clarify_id,
+            )
+            return
+        expected_team_id = str(callback_state.get("team_id") or "")
+        actual_team_id = str(body.get("team", {}).get("id", "") or "")
+        if expected_team_id and actual_team_id != expected_team_id:
+            logger.warning(
+                "[Slack] clarify click rejected for non-matching workspace "
+                "(id=%s)",
+                clarify_id,
+            )
+            return
+        if (
+            expected_responder_id is not None
+            and str(user_id) != str(expected_responder_id)
+        ):
+            logger.warning(
+                "[Slack] clarify click rejected for non-matching responder "
+                "(id=%s, user=%s)",
+                clarify_id,
+                user_id,
+            )
+            return
+
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).
         if self._clarify_resolved.pop(msg_ts, True):
             return
+        self._clarify_callback_state.pop(msg_ts, None)
+        session_key = str(callback_state.get("session_key") or "")
+        generation = callback_state.get("generation")
 
         # Preserve the original question so the resolved message keeps context.
         original_text = ""
@@ -7051,7 +7115,12 @@ class SlackAdapter(BasePlatformAdapter):
         # no Slack-side text bookkeeping: mark_awaiting_text flips the entry and
         # GatewayRunner._handle_message does the rest.
         if action_id == "hermes_clarify_other" or token == "other":
-            if not _clarify_mod.mark_awaiting_text(clarify_id):
+            if not _clarify_mod.mark_awaiting_text(
+                clarify_id,
+                session_key=session_key,
+                generation=generation,
+                responder_id=user_id,
+            ):
                 # Entry evicted (clarify_timeout) or gateway restarted between
                 # ask and tap — a typed answer would go nowhere.
                 await self._update_clarify_message(
@@ -7085,7 +7154,13 @@ class SlackAdapter(BasePlatformAdapter):
         if resolved_text is None:
             resolved_text = f"choice {idx + 1}"
 
-        if _clarify_mod.resolve_gateway_clarify(clarify_id, resolved_text):
+        if _clarify_mod.resolve_gateway_clarify(
+            clarify_id,
+            resolved_text,
+            session_key=session_key,
+            generation=generation,
+            responder_id=user_id,
+        ):
             await self._update_clarify_message(
                 channel_id, msg_ts, original_text,
                 f"✅ {user_name}: {resolved_text}",

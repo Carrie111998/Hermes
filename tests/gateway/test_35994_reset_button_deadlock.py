@@ -49,6 +49,14 @@ def _make_runner_with_cached_agent(close_fn):
     """Build a bare GatewayRunner with a cached agent whose close() runs
     ``close_fn`` (used to simulate slow / blocking teardown)."""
     from gateway.run import GatewayRunner
+    from tools import clarify_gateway
+
+    # Each helper call represents a fresh gateway process.  Mirror process
+    # startup for the module-level clarify authority registry.
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+        clarify_gateway._current_generations.clear()
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(

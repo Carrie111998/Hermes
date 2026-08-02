@@ -6192,12 +6192,55 @@ class TurnRunner:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
+            _send_clarify = ctx._status_adapter.send_clarify
+            try:
+                _clarify_params = inspect.signature(_send_clarify).parameters
+            except (TypeError, ValueError):
+                _clarify_params = {}
+            try:
+                _clarify_identity_version = int(
+                    getattr(
+                        ctx._status_adapter,
+                        "clarify_identity_version",
+                        0,
+                    )
+                    or 0
+                )
+            except (TypeError, ValueError):
+                _clarify_identity_version = 0
+            _identity_v1 = bool(
+                _clarify_identity_version >= 1
+                and "generation" in _clarify_params
+                and "responder_id" in _clarify_params
+                and ctx.run_generation is not None
+                and bool(ctx.session_key)
+            )
+            _source_user_id = getattr(ctx.source, "user_id", None)
+            # Shared channels are collaborative by design: bind the prompt to
+            # session+generation but allow any participant in that exact
+            # conversation to answer.  User-isolated DMs additionally bind the
+            # structurally-known sender identity.
+            _expected_responder = (
+                _source_user_id
+                if getattr(ctx.source, "chat_type", None) == "dm"
+                else None
+            )
+            _identity_kwargs = (
+                {
+                    "generation": ctx.run_generation,
+                    "responder_id": _expected_responder,
+                    "identity_v1": True,
+                }
+                if _identity_v1
+                else {}
+            )
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                **_identity_kwargs,
             )
 
             # Pause typing — like approval, we don't want a "thinking..."
@@ -6229,15 +6272,21 @@ class TurnRunner:
                 )
 
             send_ok = False
+            _send_kwargs = {
+                "chat_id": ctx._status_chat_id,
+                "question": question,
+                "choices": list(choices) if choices else None,
+                "clarify_id": clarify_id,
+                "session_key": ctx.session_key or "",
+                "metadata": ctx._status_thread_metadata,
+            }
+            if _identity_v1:
+                _send_kwargs.update(
+                    generation=ctx.run_generation,
+                    responder_id=_expected_responder,
+                )
             fut = safe_schedule_threadsafe(
-                ctx._status_adapter.send_clarify(
-                    chat_id=ctx._status_chat_id,
-                    question=question,
-                    choices=list(choices) if choices else None,
-                    clarify_id=clarify_id,
-                    session_key=ctx.session_key or "",
-                    metadata=ctx._status_thread_metadata,
-                ),
+                _send_clarify(**_send_kwargs),
                 ctx._loop_for_step,
                 logger=logger,
                 log_message="Clarify send failed to schedule",
@@ -6256,12 +6305,22 @@ class TurnRunner:
                 # Couldn't deliver the prompt — clean up and return
                 # sentinel so the agent can fall back to a sensible
                 # default rather than hanging.
-                _clarify_mod.clear_session(ctx.session_key or "")
+                _delivery = _clarify_mod.complete_failed_delivery(
+                    clarify_id,
+                    session_key=ctx.session_key or "",
+                    generation=ctx.run_generation if _identity_v1 else None,
+                    responder_id=_expected_responder if _identity_v1 else None,
+                )
+                if _delivery is not None and _delivery.answered:
+                    return str(_delivery.response or "")
                 return "[clarify prompt could not be delivered]"
 
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(
-                clarify_id, timeout=float(timeout)
+                clarify_id,
+                timeout=float(timeout),
+                session_key=ctx.session_key if _identity_v1 else None,
+                generation=ctx.run_generation if _identity_v1 else None,
             )
             if response is None or response == "":
                 # Timeout or session-boundary cancellation
@@ -17279,9 +17338,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools import clarify_gateway as _clarify_mod
 
+            _clarify_session_state = self._peek_session_state(_quick_key)
+            _clarify_generation = (
+                _clarify_session_state.persistent.run_generation
+                if _clarify_session_state is not None
+                else None
+            )
             _pending_clarify = _clarify_mod.get_pending_for_session(
                 _quick_key,
                 include_choice_prompts=True,
+                generation=_clarify_generation,
+                responder_id=getattr(source, "user_id", None),
             )
         except Exception:
             _pending_clarify = None
@@ -17304,6 +17371,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _resolved = _clarify_mod.resolve_text_response_for_session(
                     _quick_key,
                     _raw_clarify_reply,
+                    generation=_clarify_generation,
+                    responder_id=getattr(source, "user_id", None),
                 )
                 if _resolved:
                     logger.info(
@@ -29731,9 +29800,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return 0
         persistent = self._session_state(session_key).persistent
-        # Monotonic by design (#28686): incremented here, NEVER reset.
-        persistent.run_generation = int(persistent.run_generation) + 1
-        return persistent.run_generation
+        from tools import clarify_gateway as _clarify_mod
+
+        # Generation authority is process-wide, not runner-local.  A gateway
+        # runner can be recreated while the clarify registry remains alive
+        # (tests do this routinely, and graceful runtime replacement can too),
+        # so restarting a local counter at 1 would attempt to roll authority
+        # backwards.  Claim and publish atomically in the shared registry,
+        # then mirror the exact token into the runner's persistent state for
+        # stale-run guards and the legacy mapping view.
+        generation = _clarify_mod.claim_session_generation(session_key)
+        persistent.run_generation = generation
+        return generation
 
     def _invalidate_session_run_generation(
         self, session_key: str, *, reason: str = ""

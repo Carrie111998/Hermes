@@ -2709,16 +2709,19 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
         thread_id=None,
     )
     session_key = "agent:main:discord:dm:dm-1"
-    runner._session_run_generation[session_key] = 1
+    run_generation = runner._begin_session_run_generation(session_key)
 
     original_send = adapter.send
-    invalidated = {"done": False}
+    invalidated = {"done": False, "generation": None}
 
     async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
         result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
         if "first command" in content and not invalidated["done"]:
             invalidated["done"] = True
-            runner._invalidate_session_run_generation(session_key, reason="test_stop")
+            invalidated["generation"] = runner._invalidate_session_run_generation(
+                session_key,
+                reason="test_stop",
+            )
         return result
 
     adapter.send = send_and_invalidate
@@ -2730,12 +2733,13 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
         source=source,
         session_id="sess-progress-stop",
         session_key=session_key,
-        run_generation=1,
+        run_generation=run_generation,
     )
 
     all_progress_text = " ".join(call["content"] for call in adapter.sent)
     all_progress_text += " ".join(call["content"] for call in adapter.edits)
     assert result["final_response"] == "done"
+    assert invalidated["generation"] > run_generation
     assert 'first command' in all_progress_text
     assert 'second command' not in all_progress_text
 
@@ -2770,16 +2774,19 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
         thread_id=None,
     )
     session_key = "agent:main:discord:dm:dm-2"
-    runner._session_run_generation[session_key] = 1
+    run_generation = runner._begin_session_run_generation(session_key)
 
     original_send = adapter.send
-    invalidated = {"done": False}
+    invalidated = {"done": False, "generation": None}
 
     async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
         result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
         if content == "first interim" and not invalidated["done"]:
             invalidated["done"] = True
-            runner._invalidate_session_run_generation(session_key, reason="test_stop")
+            invalidated["generation"] = runner._invalidate_session_run_generation(
+                session_key,
+                reason="test_stop",
+            )
         return result
 
     adapter.send = send_and_invalidate
@@ -2791,11 +2798,12 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
         source=source,
         session_id="sess-commentary-stop",
         session_key=session_key,
-        run_generation=1,
+        run_generation=run_generation,
     )
 
     sent_texts = [call["content"] for call in adapter.sent]
     assert result["final_response"] == "done"
+    assert invalidated["generation"] > run_generation
     assert "first interim" in sent_texts
     assert "second interim" not in sent_texts
 

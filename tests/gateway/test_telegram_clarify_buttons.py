@@ -64,6 +64,7 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
+        cm._current_generations.clear()
         cm._notify_cbs.clear()
 
 
@@ -108,7 +109,12 @@ class TestTelegramSendClarify:
         # Mocked InlineKeyboardMarkup — just verify it was constructed
         # with rows.  We check state instead of poking the mock structure.
         assert "cid1" in adapter._clarify_state
-        assert adapter._clarify_state["cid1"] == "sk1"
+        assert adapter._clarify_state["cid1"] == {
+            "session_key": "sk1",
+            "chat_id": "12345",
+            "generation": None,
+            "responder_id": None,
+        }
 
 
         # The button label should be short ("1"), not the long choice
@@ -152,7 +158,12 @@ class TestTelegramClarifyCallback:
         adapter = _make_adapter()
         # Pre-register a clarify entry so the callback can look up the choice text
         cm.register("cidA", "sk-cb", "Pick", ["red", "green", "blue"])
-        adapter._clarify_state["cidA"] = "sk-cb"
+        adapter._clarify_state["cidA"] = {
+            "session_key": "sk-cb",
+            "chat_id": "12345",
+            "generation": None,
+            "responder_id": None,
+        }
 
         query = AsyncMock()
         query.data = "cl:cidA:1"  # green
@@ -277,4 +288,3 @@ class TestBaseAdapterClarifyFallback:
         assert "Pick a fruit" in text
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
-
