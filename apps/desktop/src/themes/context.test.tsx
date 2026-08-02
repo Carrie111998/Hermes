@@ -67,4 +67,29 @@ describe('ThemeProvider ← backend skin sync', () => {
     )
     expect(cssVar('--theme-foreground')).toBe('#ff9f0a')
   })
+
+  it('restores a persisted BACKEND skin after the gateway.ready seed (no apply)', () => {
+    // A backend skin (e.g. `catppuccin` from $HERMES_HOME/skins) cannot
+    // resolve at boot — the gateway hasn't announced it yet — so the user's
+    // persisted choice would previously fall back to the default and stay
+    // there. The gateway.ready seed (apply:false) must re-resolve it.
+    window.localStorage.setItem('hermes-desktop-theme-v2', 'bloomberg')
+
+    render(
+      <ThemeProvider>
+        <div />
+      </ThemeProvider>
+    )
+
+    // Before the backend announces anything, the persisted skin is unresolvable:
+    // paint is on the default.
+    expect(cssVar('--theme-foreground')).not.toBe('#ff9f0a')
+
+    // gateway.ready: seed the backend skin into the registry WITHOUT applying.
+    act(() => ingestBackendSkin(bloomberg('#ff9f0a'), { apply: false }))
+
+    // The persisted pref now resolves — the user's choice must repaint even
+    // though the seed itself never applies.
+    expect(cssVar('--theme-foreground')).toBe('#ff9f0a')
+  })
 })
