@@ -276,6 +276,7 @@ class TestUpdateManagedUv:
     def test_self_update_success(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.repair_vulnerable_runtime"), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
             # uv self update succeeds
             mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")

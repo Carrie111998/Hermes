@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import platform
 import sys
 from typing import Any, Dict, List, cast
 from unittest.mock import MagicMock, patch
@@ -1902,7 +1903,11 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id == 2
         assert backend._last_app == "Chrome"
 
-    def test_linux_default_capture_skips_gnome_shell_helper(self):
+    def test_linux_default_capture_skips_gnome_shell_helper(self, monkeypatch):
+        monkeypatch.setattr("tools.computer_use.cua_backend.sys.platform", "linux")
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(platform, "release", lambda: "6.0.0")
+        monkeypatch.setattr(platform, "mac_ver", lambda: ("", ("", "", ""), ""))
         windows = [
             {"app_name": "", "pid": 100, "window_id": 1,
              "is_on_screen": None, "title": "@!1921,0;BDHF", "z_index": 0},
