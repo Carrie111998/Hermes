@@ -650,6 +650,7 @@ export function appendLiveSessionProjection(
   }
 
   const sessionId = projection.session_id || 'session'
+  const projectedAt = Math.floor(Date.now() / 1000)
   const projected: ChatMessage[] = []
   // A turn normally persists its user row before inference begins. session.resume
   // then returns that stored row *and* the still-live inflight projection; adding
@@ -677,7 +678,8 @@ export function appendLiveSessionProjection(
     projected.push({
       id: `user-inflight-${sessionId}`,
       role: 'user',
-      parts: [textPart(inflightUser)]
+      parts: [textPart(inflightUser)],
+      timestamp: projectedAt
     })
   }
 
@@ -693,7 +695,8 @@ export function appendLiveSessionProjection(
     projected.push({
       id: `user-inflight-correction-${index}-${sessionId}`,
       role: 'user',
-      parts: [textPart(correction)]
+      parts: [textPart(correction)],
+      timestamp: projectedAt
     })
   }
 
@@ -744,6 +747,7 @@ export function appendLiveSessionProjection(
         role: 'assistant',
         parts: inflightAssistant ? [assistantTextPart(inflightAssistant)] : [],
         pending: inflightStreaming,
+        timestamp: projectedAt,
         ...(inflightError ? { error: inflightError } : {})
       })
     }
@@ -753,7 +757,8 @@ export function appendLiveSessionProjection(
     projected.push({
       id: `user-queued-${sessionId}`,
       role: 'user',
-      parts: [textPart(queuedUser)]
+      parts: [textPart(queuedUser)],
+      timestamp: projectedAt
     })
   }
 
