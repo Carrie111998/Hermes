@@ -252,7 +252,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -298,7 +298,7 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
             resolved = script_path
         if resolved in visited:
             continue

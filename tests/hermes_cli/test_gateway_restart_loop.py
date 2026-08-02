@@ -643,6 +643,24 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily", "restart.sh")
 
+    def test_absolute_path_with_null_byte_does_not_crash(self, monkeypatch):
+        """Regression: _contains_unsafe_gateway_action crashed with ValueError
+        (embedded null byte) when resolve() was called on an absolute path
+        containing null bytes.  The guard must catch ValueError alongside
+        OSError so absolute-path binaries don't block terminal commands (#76762)."""
+        from cron.lifecycle_guard import _contains_unsafe_gateway_action
+        # A path with an embedded null byte triggers ValueError in resolve().
+        # The guard should handle it gracefully, not propagate the exception.
+        result = _contains_unsafe_gateway_action(
+            "/usr/bin/python\x00 -c 'print(1)'",
+            cwd=None,
+            depth=0,
+            visited=set(),
+        )
+        # The command itself doesn't contain a lifecycle pattern, so it should
+        # pass through without crashing — the null-byte path is just noise.
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
