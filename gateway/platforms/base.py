@@ -1309,6 +1309,27 @@ def _paths_equal_casefold(left: Path, right: Path) -> bool:
     return _path_parts_casefold(left) == _path_parts_casefold(right)
 
 
+def _paths_refer_to_same_home(left: Path, right: Path) -> bool:
+    """Return True when both paths identify the same filesystem home.
+
+    The running-home denylist exception must preserve filesystem identity.
+    Exact resolved equality is always enough. Casefold equality alone is
+    not: on a case-sensitive volume, ``/Etc`` and ``/etc`` are distinct
+    directories, and treating them as the same home would incorrectly exempt
+    a hard-denied system tree. When spellings differ only by case, require
+    ``Path.samefile`` so case-insensitive volumes still recognize aliases.
+    """
+    if left == right:
+        return True
+    if not _paths_equal_casefold(left, right):
+        return False
+    try:
+        return left.samefile(right)
+    except OSError:
+        # Cannot prove identity — do not exempt the deny entry.
+        return False
+
+
 def _path_is_within_casefold(path: Path, root: Path) -> bool:
     """Containment check that treats path components case-insensitively.
 
@@ -1591,7 +1612,9 @@ def _path_under_denied_prefix(resolved: Path, lexical: Optional[Path] = None) ->
             continue
         # Allow the running user's own home tree; its credential sub-dirs are
         # caught by their own (more-specific) denylist entries above.
-        if home is not None and _paths_equal_casefold(resolved_denied, home):
+        # Identity-preserving: never exempt a distinct hard-denied root that
+        # only casefolds to the configured home (case-sensitive volumes).
+        if home is not None and _paths_refer_to_same_home(resolved_denied, home):
             continue
         return True
     return False

@@ -895,6 +895,18 @@ class TestMediaDeliveryDefaultMode:
             text = text.replace(old, new)
         return text
 
+    def _mixed_case_opens_same_file(self, alias: str, real: Path) -> bool:
+        """True when the mixed-case spelling opens the same on-disk file.
+
+        Case-sensitive volumes (Linux CI) do not resolve ``PROFILES/...`` to
+        ``profiles/...``; the alias simply does not exist. Case-insensitive
+        volumes (default macOS / Windows) open the real credential/file.
+        """
+        try:
+            return Path(alias).resolve(strict=True).samefile(real.resolve(strict=True))
+        except OSError:
+            return False
+
     def test_mixed_case_sibling_credential_helpers(self, tmp_path, monkeypatch):
         """Casefolded profile/credential matching must catch mixed-case aliases.
 
@@ -961,11 +973,18 @@ class TestMediaDeliveryDefaultMode:
         )
         mixed_notes = self._mixed_case_alias(notes, ("profiles", "PROFILES"))
 
+        # Credential aliases must never deliver. On case-sensitive volumes the
+        # mixed spelling does not open the file (also None); on case-insensitive
+        # volumes the deny helpers reject the opened secret.
         assert BasePlatformAdapter.validate_media_delivery_path(mixed_secret) is None
         assert BasePlatformAdapter.validate_media_delivery_path(mixed_token) is None
-        assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
-            notes.resolve()
-        )
+        if self._mixed_case_opens_same_file(mixed_notes, notes):
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+                notes.resolve()
+            )
+        else:
+            # Case-sensitive FS: alias path does not exist, so delivery is None.
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) is None
 
     def test_mixed_case_sibling_credential_denied_when_enumeration_fails(
         self, tmp_path, monkeypatch,
@@ -1006,7 +1025,99 @@ class TestMediaDeliveryDefaultMode:
 
         assert base._iter_hermes_profile_dirs() == []
         assert BasePlatformAdapter.validate_media_delivery_path(mixed_secret) is None
-        assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+        if self._mixed_case_opens_same_file(mixed_notes, notes):
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+                notes.resolve()
+            )
+        else:
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) is None
+
+    def test_case_sensitive_home_exception_preserves_denied_root_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        """Casefold-equal but distinct homes must not exempt a hard-denied tree.
+
+        On case-sensitive filesystems, ``/Etc`` and ``/etc`` can both exist.
+        The running-home exception must require filesystem identity so a
+        configured home that only casefolds to a denied system root cannot
+        unlock files under the real denied tree.
+        """
+        self._patch_roots(monkeypatch)
+
+        denied_root = tmp_path / "etc"
+        home_alias = tmp_path / "Etc"
+        denied_root.mkdir()
+        try:
+            home_alias.mkdir()
+        except FileExistsError:
+            pytest.skip("filesystem is case-insensitive")
+        try:
+            if denied_root.samefile(home_alias):
+                pytest.skip("filesystem is case-insensitive")
+        except OSError:
+            pytest.skip("cannot compare directory identity")
+
+        secret = denied_root / "shadow"
+        secret.write_text("root:*:0:0\n")
+
+        monkeypatch.setenv("HOME", str(home_alias))
+        monkeypatch.setenv("USERPROFILE", str(home_alias))
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(denied_root),),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_HOME_SUBPATHS",
+            (),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            tmp_path / "unused-hermes",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            tmp_path / "unused-hermes",
+        )
+
+        import gateway.platforms.base as base
+
+        assert base._paths_equal_casefold(denied_root, home_alias) is True
+        assert base._paths_refer_to_same_home(
+            denied_root.resolve(), home_alias.resolve(),
+        ) is False
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_running_home_exception_allows_exact_home_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        """When the denied prefix IS the running home, non-credential files deliver."""
+        self._patch_roots(monkeypatch)
+
+        home = tmp_path / "rootish"
+        home.mkdir()
+        notes = home / "notes.md"
+        notes.write_text("# ok\n")
+
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(home),),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_HOME_SUBPATHS",
+            (),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            tmp_path / "unused-hermes",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            tmp_path / "unused-hermes",
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(notes)) == str(
             notes.resolve()
         )
 
