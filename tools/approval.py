@@ -224,6 +224,22 @@ def _get_session_platform() -> str:
         return os.getenv("HERMES_SESSION_PLATFORM", "") or ""
 
 
+def _is_cron_approval_context() -> bool:
+    """True when the current approval decision is running inside cron.
+
+    Prefer the session ContextVar so one cron job cannot taint unrelated
+    gateway/API/TUI turns in the same process. If the session context layer is
+    not engaged or unavailable, fall back to the legacy process env var for CLI
+    tests and older entrypoints.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return is_truthy_value(get_session_env("HERMES_CRON_SESSION", ""))
+    except Exception:
+        return env_var_enabled("HERMES_CRON_SESSION")
+
+
 def _is_gateway_approval_context() -> bool:
     """True when this call is inside a gateway/API session.
 
@@ -238,7 +254,7 @@ def _is_gateway_approval_context() -> bool:
     fall through to the gateway branch would submit a pending approval
     with no listener and block the job indefinitely.
     """
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_approval_context():
         return False
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
@@ -2392,8 +2408,8 @@ def load_permanent_allowlist() -> set:
     patterns added via 'always' in a previous session.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
         patterns = set(config.get("command_allowlist", []) or [])
         if patterns:
             load_permanent(patterns)
@@ -2601,10 +2617,14 @@ def _normalize_approval_mode(mode) -> str:
 
 
 def _get_approval_config() -> dict:
-    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
+    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc.
+
+    Returns the LIVE config-cache sub-dict (load_config_readonly contract) —
+    callers must not mutate it or any nested structure.
+    """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
         return config.get("approvals", {}) or {}
     except Exception as e:
         logger.warning("Failed to load approval config: %s", e)
@@ -2662,8 +2682,8 @@ def _get_approval_timeout() -> int:
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
         mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
         if mode in {"approve", "off", "allow", "yes"}:
             return "approve"
@@ -2899,7 +2919,7 @@ def _run_approval_gate(
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
                 return {
                     "approved": False,
@@ -3427,7 +3447,7 @@ def check_all_command_guards(command: str, env_type: str,
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
@@ -3470,7 +3490,7 @@ def check_all_command_guards(command: str, env_type: str,
                     # fail-closed synthesis in the main flow below; see #20733).
                     _cron_fail_open = True  # safe default if config is unreadable
                     try:
-                        from hermes_cli.config import load_config as _load_cfg
+                        from hermes_cli.config import load_config_readonly as _load_cfg
                         _sec = (_load_cfg() or {}).get("security", {}) or {}
                         if _sec.get("tirith_enabled", True):
                             _cron_fail_open = _sec.get("tirith_fail_open", True)
@@ -3508,7 +3528,7 @@ def check_all_command_guards(command: str, env_type: str,
         # normal approval flow.  Fixes #20733.
         _tirith_fail_open = True  # safe default if config is unreadable
         try:
-            from hermes_cli.config import load_config as _load_cfg
+            from hermes_cli.config import load_config_readonly as _load_cfg
             _sec = (_load_cfg() or {}).get("security", {}) or {}
             _tirith_enabled = _sec.get("tirith_enabled", True)
             if _tirith_enabled:
@@ -3878,7 +3898,7 @@ def check_execute_code_guard(code: str, env_type: str,
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Cron: no user is present to approve arbitrary code.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_approval_context():
         if _get_cron_approval_mode() == "deny":
             return {
                 "approved": False,
