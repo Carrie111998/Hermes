@@ -4204,16 +4204,27 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE tasks SET status = 'ready' "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
                 else:
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
+                if cur.rowcount != 1:
+                    # A concurrent writer or a suppressing trigger moved the
+                    # row between selection and UPDATE — do not fabricate a
+                    # promotion event or count it (audit log + dispatcher
+                    # 'promoted=N' must report only real transitions).
+                    _log.debug(
+                        "Skipped promotion bookkeeping for task %s "
+                        "(UPDATE affected %s rows)",
+                        task_id, cur.rowcount,
+                    )
+                    continue
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted

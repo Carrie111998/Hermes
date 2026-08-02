@@ -422,6 +422,42 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         assert kb.get_task(conn, t2).status == "blocked"
 
 
+def test_recompute_ready_skips_bookkeeping_when_update_suppressed(kanban_home):
+    """A promotion UPDATE that affects zero rows must not fabricate an event.
+
+    A suppressing trigger (or a concurrent writer) can make the UPDATE match
+    nothing between candidate selection and the write.  Before the fix,
+    recompute_ready appended a 'promoted' event and incremented its return
+    counter regardless, so the audit log and the dispatcher 'promoted=N'
+    line reported transitions that never happened (#77140).
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", assignee="a")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # Guard trigger mirrors the reporter's deployment: mirror-owned rows
+        # must not be mutated by other writers.  RAISE(IGNORE) silently skips
+        # the row, so the UPDATE affects zero rows.
+        conn.execute(
+            "CREATE TRIGGER suppress_promote BEFORE UPDATE OF status ON tasks "
+            "WHEN NEW.status = 'ready' AND OLD.status = 'todo' "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 0
+        # The child stays todo — the promotion never landed.
+        assert kb.get_task(conn, child).status == "todo"
+        # And no fabricated event was appended for it.
+        promoted_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'promoted'",
+            (child,),
+        ).fetchone()[0]
+        assert promoted_events == 0
+
+
 
 
 # ---------------------------------------------------------------------------
