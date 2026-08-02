@@ -1,26 +1,26 @@
 ---
 sidebar_position: 8
 title: "Context Files"
-description: "Project context files — .hermes.md, AGENTS.md, CLAUDE.md, global SOUL.md, and .cursorrules — automatically injected into every conversation"
+description: "Project context files for coding sessions, plus the global SOUL.md identity loaded independently in every posture"
 ---
 
 # Context Files
 
-Hermes Agent automatically discovers and loads context files that shape how it behaves. Some are project-local and discovered from your working directory. `SOUL.md` is now global to the Hermes instance and is loaded from `HERMES_HOME` only.
+Hermes Agent automatically discovers context files that shape how it behaves. Project-local files are loaded into the startup system prompt only when the session resolves to the coding posture. `SOUL.md` is global to the Hermes instance, loaded from `HERMES_HOME` only, and remains available in both coding and general postures.
 
 ## Supported Context Files
 
 | File | Purpose | Discovery |
 |------|---------|-----------| 
 | **.hermes.md** / **HERMES.md** | Project instructions (highest priority) | Walks to git root |
-| **AGENTS.md** | Project instructions, conventions, architecture | CWD at startup + subdirectories progressively |
+| **AGENTS.md** | Project instructions, conventions, architecture | CWD at startup in coding posture + subdirectories progressively |
 | **CLAUDE.md** | Claude Code context files (also detected) | CWD at startup + subdirectories progressively |
 | **SOUL.md** | Global personality and tone customization for this Hermes instance | `HERMES_HOME/SOUL.md` only |
 | **.cursorrules** | Cursor IDE coding conventions | CWD only |
 | **.cursor/rules/*.mdc** | Cursor IDE rule modules | CWD only |
 
 :::info Priority system
-Only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
+When startup project context is enabled, only **one** project context type is loaded per session (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. **SOUL.md** is always loaded independently as the agent identity (slot #1).
 :::
 
 ## AGENTS.md
@@ -29,7 +29,7 @@ Only **one** project context type is loaded per session (first match wins): `.he
 
 ### Progressive Subdirectory Discovery
 
-At session start, Hermes loads the `AGENTS.md` from your working directory into the system prompt. As the agent navigates into subdirectories during the session (via `read_file`, `terminal`, `search_files`, etc.), it **progressively discovers** context files in those directories and injects them into the conversation at the moment they become relevant.
+At session start, Hermes loads the `AGENTS.md` from your working directory into the system prompt when the session is in the coding posture. As the agent navigates into subdirectories during the session (via `read_file`, `terminal`, `search_files`, etc.), it **progressively discovers** context files in those directories and injects them into the conversation at the moment they become relevant.
 
 ```
 my-project/
@@ -106,7 +106,9 @@ This means your existing Cursor conventions automatically apply when using Herme
 
 Context files are loaded by `build_context_files_prompt()` in `agent/prompt_builder.py`:
 
-1. **Scan working directory** — checks for `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules` (first match wins)
+Before scanning project files, Hermes resolves the session's coding posture. Messaging platforms default to the general posture, and `agent.coding_context: off` forces it, so those sessions skip startup project-context discovery. `agent.coding_context: on` explicitly enables the coding posture. `SOUL.md` is handled independently and remains loaded in either posture.
+
+1. **Scan working directory in coding posture** — checks for `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules` (first match wins); general-posture sessions skip this project scan
 2. **Content is read** — each file is read as UTF-8 text
 3. **Security scan** — content is checked for prompt injection patterns
 4. **Truncation** — files exceeding `context_file_max_chars` characters (default 20,000) are head/tail truncated (70% head, 20% tail, with a marker in the middle)

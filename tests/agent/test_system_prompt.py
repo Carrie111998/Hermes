@@ -104,6 +104,28 @@ class TestContextFileCwd:
         assert options["skip_project_context"] is False
 
 
+def test_real_prompt_build_skips_chat_project_context_but_keeps_soul(
+    monkeypatch, tmp_path
+):
+    project_dir = tmp_path / "project"
+    hermes_home = tmp_path / "hermes-home"
+    project_dir.mkdir()
+    hermes_home.mkdir()
+    (project_dir / "AGENTS.md").write_text(
+        "E2E_PROJECT_CONTEXT_SENTINEL", encoding="utf-8"
+    )
+    (hermes_home / "SOUL.md").write_text("E2E_SOUL_IDENTITY_SENTINEL", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(project_dir))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    prompt = build_system_prompt(
+        _make_agent(platform="telegram", load_soul_identity=True)
+    )
+
+    assert "E2E_SOUL_IDENTITY_SENTINEL" in prompt
+    assert "E2E_PROJECT_CONTEXT_SENTINEL" not in prompt
+
+
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
