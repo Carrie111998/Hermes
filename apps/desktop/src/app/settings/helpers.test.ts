@@ -30,6 +30,40 @@ describe('settings helpers', () => {
     expect(fieldCopyForSchemaKey(FIELD_DESCRIPTIONS, 'desktop.repo_scan_exclude_paths')).toBeTruthy()
   })
 
+  it('keeps Memory and Context sections separate with correct key ownership', () => {
+    const memory = SECTIONS.find(section => section.id === 'memory')
+    const context = SECTIONS.find(section => section.id === 'context')
+
+    expect(memory).toBeDefined()
+    expect(context).toBeDefined()
+    expect(memory?.label).toBe('Memory')
+    expect(context?.label).toBe('Context')
+
+    // Memory owns memory.* keys only
+    expect(memory?.keys).toEqual([
+      'memory.memory_enabled',
+      'memory.memory_char_limit',
+      'memory.user_profile_enabled',
+      'memory.user_char_limit',
+      'memory.provider'
+    ])
+
+    // Context owns context.* and compression.* keys
+    expect(context?.keys).toEqual([
+      'context.engine',
+      'compression.enabled',
+      'compression.threshold',
+      'compression.target_ratio',
+      'compression.protect_last_n'
+    ])
+
+    // No key should appear in both sections
+    const memoryKeySet = new Set(memory?.keys ?? [])
+    const contextKeySet = new Set(context?.keys ?? [])
+    const overlap = [...memoryKeySet].filter(k => contextKeySet.has(k))
+    expect(overlap).toHaveLength(0)
+  })
+
   it('does not shadow the backend schema options for memory.provider', () => {
     // memory.provider options are discovery-driven and served by the backend
     // config schema (merged per-request); enumOptionsFor must return undefined
