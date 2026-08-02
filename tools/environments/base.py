@@ -408,8 +408,19 @@ def _cwd_marker(session_id: str) -> str:
 # with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
+#
+# HERMES_DELEGATED_CHILD_CONTEXT is excluded too: it is a Hermes-internal
+# lineage marker (set by agent.delegation_context.scrub_kanban_env on
+# subprocesses of delegate_task children), NOT user shell state. Persisting it
+# into the shared snapshot makes every LATER session source a stale
+# "delegated child" flag — a session that was never delegated then trips
+# kanban_db._assert_not_delegated_child_mutation and other delegated-child
+# guards (the gateway's own dispatcher failed every tick with exactly this
+# leak). Per-command Popen env scrubbing re-applies the marker when a
+# delegated child actually runs a command, so dropping it from the snapshot is
+# safe and matches the session-identity exclusion above.
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_DELEGATED_CHILD_CONTEXT)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -453,7 +464,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"

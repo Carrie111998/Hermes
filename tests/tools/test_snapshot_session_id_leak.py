@@ -40,7 +40,6 @@ def test_regex_matches_bridged_session_vars():
         line = f'declare -x {name}="whatever"'
         assert rx.search(line), f"{name} should be excluded from the snapshot"
 
-
 def test_export_snippet_shape():
     snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
     assert "export -p" in snippet
@@ -50,6 +49,7 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
     assert "grep -vE" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -60,6 +60,60 @@ def test_export_snippet_shape():
     assert snippet.lstrip().startswith("{ ")
     assert "|| true; }" in snippet
     assert snippet.rstrip().endswith("> /tmp/snap.tmp.$BASHPID")
+
+
+def test_real_snapshot_excludes_delegated_child_marker(tmp_path):
+    """Real regression: when the marker is live in the env, the produced
+    snapshot must NOT export it after the unset runs.
+
+    Exercises the actual dump path (not just the regex) with
+    HERMES_DELEGATED_CHILD_CONTEXT=1 set, then evaluates the snippet in a
+    real POSIX shell to prove the marker is gone from the captured env.
+    Skips where no bash is available (pure Windows cmd).
+    """
+    import shutil
+    import stat
+    import subprocess
+
+    bash = (
+        shutil.which("git-bash")
+        or shutil.which("bash")
+        or shutil.which("wsl")
+    )
+    if bash is None:
+        pytest.skip("no POSIX shell available to evaluate snapshot snippet")
+
+    os.environ["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
+    try:
+        # git-bash on Windows only honors POSIX-style paths for the `>`
+        # redirect target inside the snippet, so use /tmp (mapped to the
+        # git-bash root) rather than the Windows-style tmp_path fixture.
+        snap_posix = "/tmp/hermes_snap_test.out"
+        snippet = _export_dump_excluding_session_vars(snap_posix)
+        # Evaluate the snippet in a real POSIX shell. The brace group writes
+        # `export -p` (post-unset) to snap_posix, so the captured snapshot
+        # must NOT contain the delegated-child marker.
+        script = tmp_path / "run_snapshot.sh"
+        script.write_text(snippet + "\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        out = subprocess.run(
+            [bash, str(script)],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert out.returncode == 0, f"snapshot snippet failed: {out.stderr!r}"
+        # Read the captured snapshot back through bash (it wrote to the
+        # POSIX /tmp path inside the git-bash root).
+        cat = subprocess.run(
+            [bash, "-c", f"cat {snap_posix}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        captured_text = cat.stdout
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in captured_text, (
+            f"delegated-child marker leaked into snapshot: {captured_text!r}"
+        )
+    finally:
+        os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+
 
 
 # ---------------------------------------------------------------------------
