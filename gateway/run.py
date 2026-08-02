@@ -18505,7 +18505,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            # Strip MEDIA:<path> delivery directives before TTS — these are
+            # internal markers for platform attachment delivery and must not
+            # be spoken aloud (#76620).
+            clean_text = _TOOL_MEDIA_RE.sub('', text[:4000])
+            tts_text = _strip_markdown_for_tts(clean_text)
             if not tts_text:
                 return
 
