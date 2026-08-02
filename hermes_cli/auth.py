@@ -46,6 +46,7 @@ import httpx
 from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
+    get_env_value_prefer_dotenv,
     read_raw_config,
     require_readable_config_before_write,
 )
@@ -1767,7 +1768,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
                 continue
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(get_env_value_prefer_dotenv(env_var) or ""):
                 return True
 
     # 4. Check persisted credential-pool entries that came from EXPLICIT flows
@@ -1786,7 +1787,9 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 # the user deletes the env var (#55790) — only count it when
                 # the referenced var still resolves to a usable secret NOW.
                 env_var = entry.get("source", "").split(":", 1)[1].strip()
-                if env_var and has_usable_secret(os.getenv(env_var, "")):
+                if env_var and has_usable_secret(
+                    get_env_value_prefer_dotenv(env_var) or ""
+                ):
                     return True
                 continue
             if (
