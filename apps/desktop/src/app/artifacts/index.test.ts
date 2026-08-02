@@ -106,6 +106,30 @@ describe('collectArtifactsForSession', () => {
     expect(artifacts[0]?.timestamp).toBe(1_700_000_000_125)
   })
 
+  it('treats numeric epochs before 1973 as seconds at the unit boundary', () => {
+    const before1973 = 94_694_399
+    const millisecondsAt1973 = 94_694_400_000
+    const artifacts = collectArtifactsForSession(makeSession(), [
+      {
+        content: 'Reference: https://example.com/boundary',
+        role: 'assistant',
+        timestamp: before1973
+      }
+    ])
+
+    expect(artifacts[0]?.timestamp).toBe(before1973 * 1000)
+
+    const boundaryArtifacts = collectArtifactsForSession(makeSession({ id: 'session-boundary' }), [
+      {
+        content: 'Reference: https://example.com/boundary-ms',
+        role: 'assistant',
+        timestamp: millisecondsAt1973
+      }
+    ])
+
+    expect(boundaryArtifacts[0]?.timestamp).toBe(millisecondsAt1973)
+  })
+
   it('resolves remote image artifact thumbnails through the desktop fs bridge', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path.startsWith('/api/fs/read-data-url?')) {

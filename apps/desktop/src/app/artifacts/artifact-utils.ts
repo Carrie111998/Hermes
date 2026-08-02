@@ -17,6 +17,12 @@ export interface ArtifactRecord {
   timestamp: number
 }
 
+// Numeric epoch timestamps before 1973 are treated as Unix seconds. This is
+// the supported contract for the ambiguous range: millisecond timestamps that
+// far in the past are not realistic for these use cases. A number alone cannot
+// distinguish them from later second timestamps.
+const EPOCH_MILLISECONDS_CUTOFF = Date.UTC(1973, 0, 1)
+
 function toEpochMs(value: null | number | undefined): null | number {
   if (!Number.isFinite(value)) {
     return null
@@ -25,7 +31,7 @@ function toEpochMs(value: null | number | undefined): null | number {
   const ts = Number(value)
 
   // Session DB values are often Unix seconds while JS Date expects ms.
-  return ts < 100_000_000_000 ? ts * 1000 : ts
+  return ts < EPOCH_MILLISECONDS_CUTOFF ? ts * 1000 : ts
 }
 
 const MARKDOWN_IMAGE_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g
