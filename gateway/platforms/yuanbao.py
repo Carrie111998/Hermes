@@ -4740,7 +4740,6 @@ class MessageSender:
             return content
 
         divider = "\n-------------\n\n"
-        footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
         divider_pos = content.find(divider)
         if divider_pos < 0:
             return content
@@ -4751,9 +4750,13 @@ class MessageSender:
 
         body_start = divider_pos + len(divider)
         body_end = len(content)
-        footer_pos = content.rfind(footer_prefix)
-        if footer_pos > body_start:
-            body_end = footer_pos
+        legacy_footer = re.search(
+            r'\n\nTo stop or manage this job, send me a new message '
+            r'\(e\.g\. "stop reminder [^\r\n]*"\)\.\Z',
+            content,
+        )
+        if legacy_footer and legacy_footer.start() > body_start:
+            body_end = legacy_footer.start()
         body = content[body_start:body_end].strip()
         return body or content
 
