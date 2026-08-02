@@ -4916,7 +4916,7 @@ class TestMCPParallelSafetyProvenance:
         try:
             monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
             monkeypatch.setattr(
-                mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+                mcp_tool, "_filter_invalid_mcp_servers", lambda servers: servers
             )
             mcp_tool.register_mcp_servers(
                 {

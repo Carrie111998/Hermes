@@ -11789,7 +11789,7 @@ def _normalize_mcp_server_create(
         _bearer_auth_headers,
         _strip_bearer_prefix,
     )
-    from hermes_cli.mcp_security import validate_mcp_server_entry
+    from hermes_cli.mcp_validation import validate_mcp_server_entry
 
     name = (body.name or "").strip()
     if not name:

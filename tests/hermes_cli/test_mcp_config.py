@@ -334,7 +334,7 @@ class TestMcpTest:
         monkeypatch.setattr(mcp_config.asyncio, "wait_for", fake_wait_for)
 
         assert mcp_config._probe_single_server(
-            "supabase", {"connect_timeout": 300}
+            "supabase", {"command": "test", "connect_timeout": 300}
         ) == []
         assert captured["inner_timeout"] == 300.0
         assert captured["outer_timeout"] == 310.0

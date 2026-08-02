@@ -798,13 +798,13 @@ def run_doctor(args):
         # Never let a bug in the advisory check block the rest of doctor.
         check_warn(f"Security advisory check failed: {e}")
 
-    _section("MCP Server Security")
+    _section("MCP Server Configuration")
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.mcp_security import validate_mcp_server_entry
+        from hermes_cli.mcp_validation import validate_mcp_server_entry
 
         servers = load_config().get("mcp_servers") or {}
-        suspicious = 0
+        invalid = 0
         if isinstance(servers, dict):
             for name, entry in sorted(servers.items()):
                 if not isinstance(entry, dict):
@@ -812,15 +812,15 @@ def run_doctor(args):
                 issues_found = validate_mcp_server_entry(name, entry)
                 if not issues_found:
                     continue
-                suspicious += 1
-                check_warn(f"MCP server '{name}' has suspicious stdio command", "; ".join(issues_found))
+                invalid += 1
+                check_warn(f"MCP server '{name}' has invalid configuration", "; ".join(issues_found))
                 manual_issues.append(
-                    f"Review/remove mcp_servers.{name} in config.yaml; rotate any credentials that may have been exposed."
+                    f"Fix or remove mcp_servers.{name} in config.yaml."
                 )
-        if suspicious == 0:
-            check_ok("No suspicious MCP stdio commands")
+        if invalid == 0:
+            check_ok("MCP server configuration shapes are valid")
     except Exception as e:
-        check_warn(f"MCP security check failed: {e}")
+        check_warn(f"MCP configuration check failed: {e}")
     
     _section("Python Environment")
     py_version = sys.version_info
