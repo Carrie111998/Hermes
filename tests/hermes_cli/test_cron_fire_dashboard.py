@@ -78,7 +78,10 @@ def test_bad_token_401(monkeypatch):
 def test_missing_job_id_400(monkeypatch):
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+        lambda: (lambda **kw: {
+            "purpose": "cron_fire", "job_id": "j1",
+            "fire_at": "2026-08-01T09:10:00+00:00",
+        }),
     )
     client, pa, ph = _client(auth_required=False)
     try:
@@ -96,14 +99,17 @@ def test_unknown_job_200_gone(monkeypatch):
     (NAS shouldn't retry a fire for a cancelled/completed job)."""
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
-        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+        lambda: (lambda **kw: {
+            "purpose": "cron_fire", "job_id": "ghost",
+            "fire_at": "2026-08-01T09:10:00+00:00",
+        }),
     )
     monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: None)
     client, pa, ph = _client(auth_required=False)
     try:
         resp = client.post("/api/cron/fire",
                            headers={"Authorization": "Bearer good"},
-                           json={"job_id": "ghost"})
+                           json={"job_id": "ghost", "fire_at": "2026-08-01T09:10:00Z"})
         assert resp.status_code == 200
         assert resp.json().get("status") == "gone"
     finally:
@@ -111,3 +117,78 @@ def test_unknown_job_200_gone(monkeypatch):
         client.close()
 
 
+def test_valid_token_accepts_and_fires(monkeypatch):
+    """Valid token + known job -> 202 and fire_due invoked for the resolved
+    profile."""
+    fired = []
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {
+            "purpose": "cron_fire", "aud": "agent:x", "job_id": "j1",
+            "fire_at": "2026-08-01T09:10:00+00:00",
+        }),
+    )
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
+    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
+                        lambda p, j, f: fired.append((p, j, f)) or True)
+
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post("/api/cron/fire",
+                           headers={"Authorization": "Bearer good"},
+                           json={"job_id": "j1", "fire_at": "2026-08-01T09:10:00Z"})
+        assert resp.status_code == 202
+        assert resp.json()["job_id"] == "j1"
+    finally:
+        _restore(pa, ph)
+        client.close()
+    # background task ran the fire for the resolved profile
+    assert fired == [("default", "j1", "2026-08-01T09:10:00+00:00")]
+
+
+@pytest.mark.parametrize("claims", [
+    {"purpose": "cron_fire", "job_id": "foreign", "fire_at": "2026-08-01T09:10:00+00:00"},
+    {"purpose": "cron_fire", "job_id": "j1", "fire_at": "2026-08-01T09:11:00+00:00"},
+    {"purpose": "cron_fire"},
+])
+def test_signed_claims_must_match_exact_job_and_nominal_fire(monkeypatch, claims):
+    fired = []
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **_kw: claims),
+    )
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda _jid: "default")
+    monkeypatch.setattr(
+        web_server, "_fire_cron_job_for_profile",
+        lambda profile, job_id, fire_at: fired.append((profile, job_id, fire_at)),
+    )
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "j1", "fire_at": "2026-08-01T09:10:00Z"},
+        )
+        assert resp.status_code == 401
+    finally:
+        _restore(pa, ph)
+        client.close()
+    assert fired == []
+
+
+def test_missing_fire_at_400(monkeypatch):
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "j1"},
+        )
+        assert resp.status_code == 400
+    finally:
+        _restore(pa, ph)
+        client.close()

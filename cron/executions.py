@@ -7,11 +7,15 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -22,6 +26,32 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+SCHEDULER_SOURCES = frozenset({"builtin", "chronos"})
+
+
+def require_canonical_scheduled_for(value: Optional[str]) -> str:
+    """Require the exact UTC spelling used as durable scheduled-run authority."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("producer execution requires canonical UTC scheduled_for")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            "producer execution requires canonical UTC scheduled_for",
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("producer execution requires canonical UTC scheduled_for")
+    canonical = parsed.astimezone(timezone.utc).isoformat()
+    if value != canonical:
+        raise ValueError("producer execution requires canonical UTC scheduled_for")
+    return canonical
+
+
+def require_scheduler_source(value: Any) -> str:
+    source = str(value or "")
+    if source not in SCHEDULER_SOURCES:
+        raise ValueError("cron execution scheduler source is not allowlisted")
+    return source
 
 
 def _connect() -> sqlite3.Connection:
@@ -49,9 +79,45 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             delivery_status TEXT CHECK(delivery_status IN
+               ('suppressed','delivered','failed')),
+             delivery_state TEXT,
+             delivery_error TEXT,
+             delivered_at TEXT,
+             output_file TEXT,
+             delivery_targets TEXT,
+             scheduled_for TEXT,
+             kind TEXT NOT NULL DEFAULT 'producer',
+             parent_execution_id TEXT,
+             artifact_path TEXT,
+             artifact_sha256 TEXT,
+             artifact_size_bytes INTEGER,
+             authorized_delivery_targets TEXT,
+             delivery_receipts TEXT
            )"""
     )
+    existing_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    for column, definition in (
+        ("delivery_status", "TEXT CHECK(delivery_status IN ('suppressed','delivered','failed'))"),
+        ("delivery_state", "TEXT"),
+        ("delivery_error", "TEXT"),
+        ("delivered_at", "TEXT"),
+        ("output_file", "TEXT"),
+        ("delivery_targets", "TEXT"),
+        ("scheduled_for", "TEXT"),
+        ("kind", "TEXT NOT NULL DEFAULT 'producer'"),
+        ("parent_execution_id", "TEXT"),
+        ("artifact_path", "TEXT"),
+        ("artifact_sha256", "TEXT"),
+        ("artifact_size_bytes", "INTEGER"),
+        ("authorized_delivery_targets", "TEXT"),
+        ("delivery_receipts", "TEXT"),
+    ):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE executions ADD COLUMN {column} {definition}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -99,6 +165,14 @@ def _emit_execution_state(
         pass
 
 
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Return one durable execution identity without accepting caller metadata."""
+    with _transaction() as conn:
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (str(execution_id),)
+        ).fetchone())
+
+
 def _process_start_time(pid: int) -> Optional[int]:
     try:
         from gateway.status import get_process_start_time
@@ -132,8 +206,12 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
-def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
+def create_execution(
+    job_id: str, *, source: str, scheduled_for: Optional[str] = None,
+) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
+    normalized_source = require_scheduler_source(source)
+    canonical_scheduled_for = require_canonical_scheduled_for(scheduled_for)
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
@@ -141,10 +219,11 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
+                status, claimed_at, scheduled_for)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+            (execution_id, str(job_id), normalized_source, _PROCESS_ID, pid,
+             _process_start_time(pid), now,
+             canonical_scheduled_for),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -152,6 +231,204 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     record = _record(row)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
+
+def create_delivery_execution(
+    *,
+    producer_execution_id: str,
+    artifact_path: str,
+    artifact_sha256: str,
+    delivery_targets: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Claim a delivery attempt only for completed producer bytes."""
+    expected_digest = str(artifact_sha256 or "").lower()
+    if not expected_digest.startswith("sha256:") or len(expected_digest) != 71:
+        raise ValueError("artifact digest is invalid")
+    try:
+        int(expected_digest[7:], 16)
+    except ValueError as exc:
+        raise ValueError("artifact digest is invalid") from exc
+    resolved = Path(artifact_path).expanduser().resolve(strict=True)
+    payload = resolved.read_bytes()
+    actual_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    if actual_digest != expected_digest:
+        raise ValueError("artifact digest does not match exact bytes")
+
+    normalized_targets = []
+    for target in delivery_targets:
+        platform = str(target.get("platform") or "").strip().lower()
+        chat_id = str(target.get("chat_id") or "").strip()
+        thread_id = target.get("thread_id")
+        if not platform or not chat_id:
+            raise ValueError("delivery target is invalid")
+        normalized_targets.append({
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": None if thread_id is None else str(thread_id),
+        })
+    if not normalized_targets:
+        raise ValueError("delivery execution requires concrete delivery targets")
+
+    execution_id = uuid.uuid4().hex
+    artifact_dir = EXECUTIONS_FILE.parent / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        artifact_dir.chmod(0o700)
+    except OSError:
+        pass
+    suffix = resolved.suffix if len(resolved.suffix) <= 16 else ""
+    owned_path = artifact_dir / f"{execution_id}{suffix}"
+    now = _hermes_now().isoformat()
+    pid = os.getpid()
+    with _transaction() as conn:
+        producer = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (str(producer_execution_id),)
+        ).fetchone()
+        if (producer is None or producer["kind"] != "producer"
+                or producer["status"] not in ("completed", "failed")):
+            raise ValueError("delivery execution requires a terminal producer execution")
+        fd = os.open(owned_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                owned_path.chmod(0o400)
+            except OSError:
+                pass
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at, scheduled_for, kind, parent_execution_id,
+                    artifact_path, artifact_sha256, artifact_size_bytes,
+                    authorized_delivery_targets)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, 'delivery', ?, ?, ?, ?, ?)""",
+                (
+                    execution_id, producer["job_id"], producer["source"], _PROCESS_ID, pid,
+                    _process_start_time(pid), now, producer["scheduled_for"], producer["id"],
+                    str(owned_path), actual_digest, len(payload),
+                    json.dumps(normalized_targets, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+        except BaseException:
+            owned_path.unlink(missing_ok=True)
+            raise
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    record = _record(row)
+    _emit_execution_state(record)
+    return record  # type: ignore[return-value]
+
+
+def read_delivery_artifact(execution_id: str) -> bytes:
+    """Read execution-owned bytes only after proving their durable digest and size."""
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT kind, artifact_path, artifact_sha256, artifact_size_bytes
+               FROM executions WHERE id=?""",
+            (str(execution_id),),
+        ).fetchone()
+    if row is None or row["kind"] != "delivery" or not row["artifact_path"]:
+        raise ValueError("delivery artifact does not belong to a delivery execution")
+    payload = Path(row["artifact_path"]).read_bytes()
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    if digest != row["artifact_sha256"] or len(payload) != row["artifact_size_bytes"]:
+        raise ValueError("delivery artifact bytes no longer match durable proof")
+    return payload
+
+
+def _normalize_target(target: Dict[str, Any], *, label: str) -> Dict[str, Any]:
+    if not isinstance(target, dict):
+        raise ValueError(f"{label} is invalid")
+    platform = str(target.get("platform") or "").strip().lower()
+    chat_id = str(target.get("chat_id") or "").strip()
+    thread_id = target.get("thread_id")
+    if not platform or not chat_id:
+        raise ValueError(f"{label} is invalid")
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": None if thread_id is None else str(thread_id),
+    }
+
+
+def _validate_delivery_evidence(
+    *,
+    state: str,
+    authorized_targets: List[Dict[str, Any]],
+    actual_targets: Optional[List[Dict[str, Any]]],
+    receipts: Optional[List[Dict[str, Any]]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validate requested authority, actual routes, and per-target evidence once."""
+    authorized = [
+        _normalize_target(target, label="authorized delivery target")
+        for target in authorized_targets
+    ]
+    normalized_actual = [
+        _normalize_target(target, label="actual delivery target")
+        for target in actual_targets or []
+    ]
+    normalized_receipts: List[Dict[str, Any]] = []
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            raise ValueError("delivery receipt is invalid")
+        requested = _normalize_target(
+            receipt.get("requested_target"), label="delivery receipt requested target",
+        )
+        actual = _normalize_target(
+            receipt.get("actual_target"), label="delivery receipt actual target",
+        )
+        status = str(receipt.get("status") or "")
+        transport = str(receipt.get("transport") or "")
+        error = None if receipt.get("error") is None else str(receipt.get("error"))
+        provider_receipt_id = (
+            None if receipt.get("provider_receipt_id") is None
+            else str(receipt.get("provider_receipt_id"))
+        )
+        if status not in ("delivered", "failed", "ambiguous"):
+            raise ValueError("delivery receipt status is invalid")
+        if transport not in ("live", "standalone", "none"):
+            raise ValueError("delivery receipt transport is invalid")
+        if status == "delivered" and error is not None:
+            raise ValueError("delivered receipt cannot carry an error")
+        if status in ("failed", "ambiguous") and not error:
+            raise ValueError(f"{status} receipt requires error evidence")
+        if status == "ambiguous" and transport == "none":
+            raise ValueError("ambiguous receipt requires a dispatched transport")
+        if requested not in authorized:
+            raise ValueError("delivery receipts do not match authorized targets")
+        if requested["platform"] != actual["platform"] or requested["chat_id"] != actual["chat_id"]:
+            raise ValueError("delivery receipt actual target is outside requested route")
+        normalized_receipts.append({
+            "requested_target": requested,
+            "actual_target": actual,
+            "status": status,
+            "transport": transport,
+            "error": error,
+            "provider_receipt_id": provider_receipt_id,
+        })
+
+    requested_evidence = [receipt["requested_target"] for receipt in normalized_receipts]
+    if len(requested_evidence) != len(authorized) or any(
+        requested_evidence.count(target) != authorized.count(target) for target in authorized
+    ):
+        raise ValueError("delivery receipts do not match authorized targets")
+    confirmed_actual = [
+        receipt["actual_target"] for receipt in normalized_receipts
+        if receipt["status"] == "delivered"
+    ]
+    if normalized_actual != confirmed_actual:
+        raise ValueError("delivery targets must contain only confirmed actual targets")
+    statuses = [receipt["status"] for receipt in normalized_receipts]
+    if state == "delivered" and (not statuses or any(status != "delivered" for status in statuses)):
+        raise ValueError("delivered execution requires confirmed actual-target receipts")
+    if state == "failed" and ("failed" not in statuses or "ambiguous" in statuses):
+        raise ValueError("failed execution requires non-ambiguous failure evidence")
+    if state == "ambiguous" and "ambiguous" not in statuses:
+        raise ValueError("ambiguous execution requires ambiguous receipt evidence")
+    return normalized_actual, normalized_receipts
 
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
@@ -175,16 +452,58 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
+    delivery_status: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    output_file: Optional[str] = None,
+    delivery_targets: Optional[List[Dict[str, Any]]] = None,
+    delivery_receipts: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+    if delivery_status not in (None, "suppressed", "delivered", "failed"):
+        raise ValueError("delivery_status is invalid")
+    if delivery_status == "delivered" and delivery_error:
+        raise ValueError("delivered execution cannot carry delivery_error")
+    delivery_detail = str(delivery_error) if delivery_error else None
+    delivered_at = now if delivery_status == "delivered" else None
+    output_path = str(output_file) if output_file else None
     with _transaction() as conn:
+        existing = conn.execute(
+            "SELECT kind, authorized_delivery_targets FROM executions WHERE id=?",
+            (str(execution_id),),
+        ).fetchone()
+        if existing is not None and existing["kind"] == "delivery" and delivery_status is None:
+            raise ValueError("delivery execution requires validated terminal evidence")
+        normalized_targets: List[Dict[str, Any]] = []
+        normalized_receipts: List[Dict[str, Any]] = []
+        if delivery_status in ("delivered", "failed"):
+            if existing is None or existing["kind"] != "delivery":
+                raise ValueError("delivery evidence requires a delivery execution")
+            authorized = json.loads(existing["authorized_delivery_targets"] or "[]")
+            normalized_targets, normalized_receipts = _validate_delivery_evidence(
+                state=delivery_status,
+                authorized_targets=authorized,
+                actual_targets=delivery_targets,
+                receipts=delivery_receipts,
+            )
+        elif delivery_targets or delivery_receipts:
+            raise ValueError("producer execution cannot carry delivery evidence")
+        targets_json = json.dumps(
+            normalized_targets, sort_keys=True, separators=(",", ":"),
+        ) if normalized_targets else None
+        receipts_json = json.dumps(
+            normalized_receipts, sort_keys=True, separators=(",", ":"),
+        ) if normalized_receipts else None
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
+            """UPDATE executions
+               SET status=?, finished_at=?, error=?, delivery_status=?, delivery_state=?,
+                   delivery_error=?, delivered_at=?, output_file=?, delivery_targets=?,
+                   delivery_receipts=?
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (status, now, detail, delivery_status, delivery_status, delivery_detail,
+             delivered_at, output_path, targets_json, receipts_json, execution_id),
         )
         if cur.rowcount != 1:
             return None
@@ -193,6 +512,52 @@ def finish_execution(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    return record
+
+
+def mark_execution_ambiguous(
+    execution_id: str, *, error: str,
+    delivery_receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Terminalize an in-flight delivery whose external effect is unknowable."""
+    now = _hermes_now().isoformat()
+    detail = str(error or "delivery outcome is ambiguous")
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT kind, authorized_delivery_targets FROM executions WHERE id=?",
+            (str(execution_id),),
+        ).fetchone()
+        if row is None or row["kind"] != "delivery":
+            raise ValueError("ambiguous outcome is valid only for a delivery execution")
+        actual_targets, normalized_receipts = _validate_delivery_evidence(
+            state="ambiguous",
+            authorized_targets=json.loads(row["authorized_delivery_targets"] or "[]"),
+            actual_targets=[
+                receipt.get("actual_target") for receipt in delivery_receipts or []
+                if isinstance(receipt, dict) and receipt.get("status") == "delivered"
+            ],
+            receipts=delivery_receipts,
+        )
+        targets_json = json.dumps(
+            actual_targets, sort_keys=True, separators=(",", ":"),
+        ) if actual_targets else None
+        receipts_json = json.dumps(
+            normalized_receipts, sort_keys=True, separators=(",", ":"),
+        )
+        cur = conn.execute(
+            """UPDATE executions
+               SET status='unknown', finished_at=?, error=?, delivery_state='ambiguous',
+                   delivery_error=?, delivery_targets=?, delivery_receipts=?
+               WHERE id=? AND status IN ('claimed','running')""",
+            (now, detail, detail, targets_json, receipts_json, str(execution_id)),
+        )
+        if cur.rowcount != 1:
+            return None
+        _prune_unlocked(conn)
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (str(execution_id),)
+        ).fetchone())
+    _emit_execution_state(record)
     return record
 
 

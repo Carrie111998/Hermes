@@ -12107,7 +12107,9 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
+def _fire_cron_job_for_profile(
+    profile: str, job_id: str, fire_at: Optional[str] = None,
+) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
@@ -12128,11 +12130,12 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     try:
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
+            fire_kwargs = {"adapters": None, "loop": None}
+            if fire_at is not None:
+                fire_kwargs["nominal_fire_at"] = fire_at
+            return bool(provider.fire_due(job_id, **fire_kwargs))
     finally:
         reset_hermes_home_override(token)
-
-
 
 
 # ---------------------------------------------------------------------------

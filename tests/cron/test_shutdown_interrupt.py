@@ -160,7 +160,12 @@ class TestRunOneJobHonoursInterruptedFlag:
     status the shutdown path already wrote for the same run."""
 
     def _make_job(self, job_id="job-1"):
-        return {"id": job_id, "name": "test job", "prompt": "do work"}
+        return {
+            "id": job_id,
+            "name": "test job",
+            "prompt": "do work",
+            "next_run_at": "2026-08-01T09:10:00+00:00",
+        }
 
     def test_success_path_skipped_when_interrupted(self):
         import cron.scheduler as sched
@@ -200,8 +205,25 @@ class TestRunOneJobHonoursInterruptedFlag:
         would."""
         import cron.scheduler as sched
 
-        job = self._make_job()
+        job = {
+            **self._make_job(),
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
         sched._interrupted_job_ids.add(job["id"])
+
+        def confirmed_delivery(*_args, **kwargs):
+            target = kwargs["targets"][0]
+            receipt = {
+                "requested_target": target,
+                "actual_target": target,
+                "status": "delivered",
+                "transport": "live",
+                "error": None,
+                "provider_receipt_id": "message-1",
+            }
+            kwargs["receipts"].append(receipt)
+            return sched.DeliveryOutcome(sched.DeliveryState.DELIVERED, (receipt,))
 
         with patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("agent.secret_scope.set_secret_scope", return_value=None), \
@@ -217,7 +239,7 @@ class TestRunOneJobHonoursInterruptedFlag:
                  return_value="This run was interrupted.",
              ) as mock_summarize, \
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
-             patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
+             patch("cron.scheduler._deliver_result", side_effect=confirmed_delivery) as mock_deliver, \
              patch("cron.scheduler.mark_job_run"):
             result = sched.run_one_job(job)
 

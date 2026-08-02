@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -67,6 +68,22 @@ class TestCronFilePermissions(unittest.TestCase):
 
             file_mode = stat.S_IMODE(os.stat(output_file).st_mode)
             self.assertEqual(file_mode, 0o600)
+
+    def test_save_job_output_never_reuses_a_same_second_path(self):
+        output_dir = Path(self.tmpdir) / "output"
+        fixed_now = datetime(2026, 8, 1, 9, 10, 0)
+        with patch("cron.jobs.OUTPUT_DIR", output_dir), \
+             patch("cron.jobs.CRON_DIR", Path(self.tmpdir)), \
+             patch("cron.jobs.ensure_dirs"), \
+             patch("cron.jobs._hermes_now", return_value=fixed_now):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            from cron.jobs import save_job_output
+            first = save_job_output("test-job", "first")
+            second = save_job_output("test-job", "second")
+
+            self.assertNotEqual(first, second)
+            self.assertEqual(Path(first).read_text(), "first")
+            self.assertEqual(Path(second).read_text(), "second")
 
             # Job output dir should also be 0700
             job_dir = output_dir / "test-job"

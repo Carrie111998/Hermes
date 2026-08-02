@@ -5836,6 +5836,17 @@ class APIServerAdapter(BasePlatformAdapter):
             job_id = (body or {}).get("job_id")
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
+            from cron.jobs import canonicalize_fire_at, fire_claims_match_body
+            try:
+                fire_at = canonicalize_fire_at((body or {}).get("fire_at"))
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            if not fire_claims_match_body(claims, job_id=job_id, fire_at=fire_at):
+                logger.warning(
+                    "cron fire: signed claims do not match request body: %s",
+                    self._request_audit_log_suffix(request),
+                )
+                return web.json_response({"error": "invalid fire token"}, status=401)
 
             from cron.scheduler_provider import resolve_cron_scheduler
             provider = resolve_cron_scheduler()
@@ -5844,7 +5855,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # Fire in the background (202 immediately). fire_due claims via the
             # store CAS, so a retry while this is in flight is de-duped.
             task = asyncio.create_task(
-                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+                asyncio.to_thread(
+                    provider.fire_due,
+                    job_id,
+                    nominal_fire_at=fire_at,
+                    adapters=None,
+                    loop=loop,
+                )
             )
             reservation["detached"] = True
             task.add_done_callback(

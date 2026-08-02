@@ -245,12 +245,53 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
+    claimed_for = "2026-08-01T09:10:00+00:00"
     monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
-    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+    monkeypatch.setattr(jobs, "get_job", lambda jid: {
+        "id": jid,
+        "name": "t",
+        "next_run_at": "2026-08-01T09:40:00+00:00",
+        "fire_claim": {"scheduled_for": claimed_for},
+        "execution_source": "builtin",
+    })
+    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(dict(job)) or True)
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda job_id, *, source, scheduled_for: {
+            "id": "execution-1", "job_id": job_id, "source": source,
+            "scheduled_for": scheduled_for,
+        },
+    )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert ran == ["j1"]
+    assert ran[0]["scheduled_for"] == claimed_for
+    assert ran[0]["execution_source"] == "builtin"
+
+
+def test_fire_due_releases_exact_claim_when_execution_record_cannot_be_created(monkeypatch):
+    import pytest
+    from cron import jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    claim = {"at": "2026-08-01T09:10:01+00:00", "by": "host:1",
+             "scheduled_for": "2026-08-01T09:10:00+00:00"}
+    released = []
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _jid: True, raising=False)
+    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "fire_claim": claim})
+    monkeypatch.setattr(
+        jobs,
+        "release_job_fire_claim",
+        lambda jid, expected_claim: released.append((jid, expected_claim)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("ledger unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        InProcessCronScheduler().fire_due("j1")
+    assert released == [("j1", claim)]
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──

@@ -225,7 +225,14 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        nominal_fire_at: str | None = None,
+        adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
         """Run the due job (claim + run_one_job via the ABC default), then
         re-arm the NEXT one-shot through NAS.
 
@@ -233,7 +240,12 @@ class ChronosCronScheduler(CronScheduler):
         If the job is gone (one-shot completed / repeat-N exhausted), get_job
         returns None → nothing to re-arm (the schedule naturally stops).
         """
-        ran = super().fire_due(job_id, adapters=adapters, loop=loop)
+        ran = super().fire_due(
+            job_id,
+            nominal_fire_at=nominal_fire_at,
+            adapters=adapters,
+            loop=loop,
+        )
         if ran:
             from cron.jobs import get_job
             job = get_job(job_id)

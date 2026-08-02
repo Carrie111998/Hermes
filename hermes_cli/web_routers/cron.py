@@ -163,6 +163,14 @@ async def cron_fire_webhook(request: Request):
     job_id = (body or {}).get("job_id") if isinstance(body, dict) else None
     if not job_id:
         return JSONResponse({"error": "missing job_id"}, status_code=400)
+    from cron.jobs import canonicalize_fire_at, fire_claims_match_body
+
+    try:
+        fire_at = canonicalize_fire_at((body or {}).get("fire_at"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if not fire_claims_match_body(claims, job_id=job_id, fire_at=fire_at):
+        return JSONResponse({"error": "invalid fire token"}, status_code=401)
 
     # _find_cron_job_profile walks every profile and lists its jobs (file
     # I/O per profile) — run it off the event loop like the other cron
@@ -176,7 +184,7 @@ async def cron_fire_webhook(request: Request):
     # Run in the background; the store CAS claim inside fire_due de-dupes a
     # NAS/scheduler retry that arrives while this is in flight.
     asyncio.create_task(
-        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
+        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id, fire_at)
     )
     return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
 
