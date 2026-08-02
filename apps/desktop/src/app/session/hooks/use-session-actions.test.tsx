@@ -76,7 +76,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  'createBackendSessionForSend' | 'openNewSessionTile' | 'selectSidebarItem' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -431,6 +431,71 @@ describe('startFreshSessionDraft', () => {
     expect(navigate).not.toHaveBeenCalled()
     expect($currentCwd.get()).toBe('')
     expect($newChatWorkspaceTarget.get()).toBeNull()
+  })
+})
+
+describe('openNewSessionTile cwd routing', () => {
+  afterEach(() => {
+    cleanup()
+    setCurrentCwd('')
+    $sessionTiles.set([])
+    vi.restoreAllMocks()
+  })
+
+  it('points the right rail at the project cwd when a center draft tile is created', async () => {
+    setCurrentCwd('/previous-session')
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        expect(params).toMatchObject({ cwd: '/project-folder' })
+
+        return {
+          info: { cwd: '/project-folder' },
+          session_id: 'runtime-project',
+          stored_session_id: 'stored-project'
+        } as never
+      }
+
+      return {} as never
+    })
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: '/project-folder', listed: false })
+    })
+
+    expect($currentCwd.get()).toBe('/project-folder')
+    expect($sessionTiles.get()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ storedSessionId: 'stored-project' })])
+    )
+    expect(revealTreePane).toHaveBeenCalledWith('session-tile:stored-project')
+  })
+
+  it('keeps split tile cwd out of the global right rail', async () => {
+    setCurrentCwd('/main-session')
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return {
+          info: { cwd: '/split-worktree' },
+          session_id: 'runtime-split',
+          stored_session_id: 'stored-split'
+        } as never
+      }
+
+      return {} as never
+    })
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('right', { cwd: '/split-worktree' })
+    })
+
+    expect($currentCwd.get()).toBe('/main-session')
   })
 })
 

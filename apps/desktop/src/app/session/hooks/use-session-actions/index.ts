@@ -504,13 +504,17 @@ export function useSessionActions({
           upsertOptimisticSession(created, stored, null, null)
         }
 
-        // A tile lives in its OWN worktree — it must not publish its cwd/branch
-        // into the composer atoms the main pane renders from.
+        // A tile lives in its OWN worktree, so do not run the full foreground
+        // composer publish. Center tabs are the focused surface, though, and
+        // the right rail still keys off $currentCwd.
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir)
         patchSessionTile(stored, { runtimeId: created.session_id })
+        if (dir === 'center' && runtimeInfo?.cwd) {
+          setCurrentCwd(runtimeInfo.cwd)
+        }
         revealTreePane(`session-tile:${stored}`)
 
         if (listed) {
