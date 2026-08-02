@@ -3629,11 +3629,11 @@ class MatrixAdapter(BasePlatformAdapter):
     def _sanitize_dynamic_room_name(title: str) -> str:
         """Return a short, stable Matrix room name without nested status icons."""
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
-        cleaned = re.sub(r"^[🟡✅❌⏹]\s*", "", cleaned).strip()
+        cleaned = re.sub(r"^(?:[🟡✅🔴❌⏹]\s*)+", "", cleaned).strip()
         if not cleaned:
             return "Hermes"
-        if len(cleaned) > 80:
-            cleaned = cleaned[:77].rstrip() + "..."
+        if len(cleaned) > 60:
+            cleaned = cleaned[:57].rstrip() + "..."
         return cleaned
 
     def _dynamic_room_name_allowed(self, event: MessageEvent) -> bool:
@@ -3683,8 +3683,8 @@ class MatrixAdapter(BasePlatformAdapter):
             prefix = {
                 "working": "🟡",
                 "success": "✅",
-                "failure": "❌",
-                "cancelled": "⏹",
+                "failure": "🔴",
+                "cancelled": "🔴",
             }.get(status)
             name = f"{prefix} {base}" if prefix else base
             return await self._send_dynamic_room_name(room_id, name)

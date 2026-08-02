@@ -132,11 +132,14 @@ name follow the current Hermes task:
 
 - `🟡` while Hermes is processing
 - `✅` after success
-- `❌` after failure
-- `⏹` after cancellation
+- `🔴` after any unsuccessful terminal outcome (failure or cancellation)
 
 When Hermes generates a semantic session title—or when you use `/title`—that
-title becomes the room-name text while preserving the current status icon.
+title becomes the room-name text while preserving the current status icon. Any
+current or legacy lifecycle prefix (`🟡`, `✅`, `🔴`, `❌`, or `⏹`) is stripped
+to prevent nesting. The stable title base is deterministically truncated to at
+most 60 Unicode code points, including a trailing `...` when truncation occurs,
+and is retained unchanged across lifecycle transitions.
 Updates are deduplicated and limited to DMs so shared project rooms do not gain
 noisy room-state history. The bot account must have permission to send the
 `m.room.name` state event; a permission failure is logged and does not fail the

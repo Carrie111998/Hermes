@@ -1814,7 +1814,7 @@ class TestMatrixDynamicRoomNames:
         ]
 
     @pytest.mark.asyncio
-    async def test_failure_and_cancelled_have_distinct_terminal_states(self):
+    async def test_failure_and_cancelled_share_unsuccessful_terminal_state(self):
         from gateway.platforms.base import ProcessingOutcome
 
         event = self._event()
@@ -1831,7 +1831,37 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["🟡 Hermes", "❌ Hermes", "🟡 Hermes", "⏹ Hermes"]
+        assert names == ["🟡 Hermes", "🔴 Hermes", "🟡 Hermes", "🔴 Hermes"]
+
+    def test_title_sanitization_strips_lifecycle_prefixes_and_truncates(self):
+        sanitize = self.adapter._sanitize_dynamic_room_name
+
+        assert sanitize("🟡 ✅ 🔴 ❌ ⏹ Task title") == "Task title"
+        title = "界" * 61
+        sanitized = sanitize(title)
+        assert sanitized == ("界" * 57) + "..."
+        assert len(sanitized) == 60
+
+    @pytest.mark.asyncio
+    async def test_truncated_base_stays_stable_across_lifecycle_transitions(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        title = "Task " + ("界" * 80)
+        expected_base = self.adapter._sanitize_dynamic_room_name(title)
+
+        await self.adapter.on_session_title_changed(event.source, title)
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [expected_base, f"🟡 {expected_base}", f"🔴 {expected_base}"]
+        assert len(expected_base) == 60
 
     @pytest.mark.asyncio
     async def test_disabled_or_group_room_does_not_rename(self):
