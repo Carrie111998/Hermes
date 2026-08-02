@@ -382,7 +382,7 @@ def test_cua_fleet_terminal_parses_sse_command_response() -> None:
 def test_cua_fleet_sandbox_package_is_lazy_installable() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.20",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.21",)
 
 
 def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkeypatch):
@@ -410,7 +410,7 @@ def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkey
 def test_cua_fleet_provider_uses_public_sandbox_facade() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.20",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.21",)
 
 
 def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:
