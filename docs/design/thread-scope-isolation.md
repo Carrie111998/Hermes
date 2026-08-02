@@ -214,6 +214,21 @@ thread so the scope is chat-level. Gateway restart is a non-event for scope,
 since the manifest lives on disk under the profile directory, independent of
 process lifetime.
 
+**Known gap, not yet closed:** `build_session_key()` already unifies a
+Discord channel-initiating message with its later real-thread follow-ups
+via `prospective_thread_id` (same `session_key` for both — see
+`gateway/session.py:1136-1146`). `hermes_scope`'s own identity normalization
+does not yet inherit that continuity: it reads `HERMES_SESSION_THREAD_ID`
+fresh each call, which is unset during the initiating-message turn and only
+populated once the real thread exists, so a scope touched during that
+narrow window and one touched afterward are, today, two different identity
+tuples. Documented and exercised by
+`tests/gateway/test_discord_scope_isolation.py::TestProspectiveThreadContinuity::test_KNOWN_GAP_scope_identity_does_not_yet_track_prospective_continuity`
+so a future fix (bridging `prospective_thread_id` through session env, or
+resolving scope from the DB session row's already-unified `thread_id`
+instead of live env each time) has a test that flips from documenting the
+gap to proving it closed.
+
 ### 6. CLI surface
 
 New file `hermes_cli/scope.py`, mirroring `hermes_cli/curator.py`'s

@@ -36,6 +36,68 @@ def _resolve_scope_id(args) -> Optional[str]:
     return hermes_scope.resolve_current_scope_id()
 
 
+def _liveness_summary(manifest: dict) -> dict:
+    """Best-effort live-state check for owned artifacts.
+
+    Per docs/design/thread-scope-isolation.md: status must check live state
+    for owned artifacts rather than trusting the manifest's last-known state
+    as current truth (a tmux session, delegation, or cron job the manifest
+    still lists may have exited/completed/been removed hours ago). Lives
+    here rather than in hermes_scope.py -- process_registry/async_delegation/
+    cron.jobs are heavier deps than the storage layer needs, and
+    process_registry.py already imports hermes_scope for auto-registration,
+    so importing them back from there would be circular.
+
+    Returns {category: {"count": N, "active": M or None}}. ``active`` is
+    None (not 0) when liveness genuinely can't be determined for that
+    category, so a caller can tell "checked, none active" apart from
+    "couldn't check" -- fail closed to unknown, never to "still active."
+    Only categories with a liveness check and at least one owned id are
+    included.
+    """
+    owned = manifest.get("owned", {})
+    summary: dict = {}
+
+    tmux_keys = owned.get("tmux_session_keys") or []
+    if tmux_keys:
+        try:
+            from tools.process_registry import process_registry
+
+            active = sum(1 for k in tmux_keys if process_registry.has_active_for_session(k))
+        except Exception:
+            active = None
+        summary["tmux_session_keys"] = {"count": len(tmux_keys), "active": active}
+
+    delegation_ids = owned.get("delegation_ids") or []
+    if delegation_ids:
+        try:
+            from tools.async_delegation import get_durable_delegation
+
+            active = 0
+            for delegation_id in delegation_ids:
+                record = get_durable_delegation(delegation_id)
+                if record and (
+                    record.get("state") in ("running", "finalizing")
+                    or record.get("delivery_state") == "pending"
+                ):
+                    active += 1
+        except Exception:
+            active = None
+        summary["delegation_ids"] = {"count": len(delegation_ids), "active": active}
+
+    cron_job_ids = owned.get("cron_job_ids") or []
+    if cron_job_ids:
+        try:
+            from cron.jobs import get_job
+
+            active = sum(1 for job_id in cron_job_ids if (get_job(job_id) or {}).get("enabled", False))
+        except Exception:
+            active = None
+        summary["cron_job_ids"] = {"count": len(cron_job_ids), "active": active}
+
+    return summary
+
+
 def _identity_from_args_or_env(args) -> Optional[dict]:
     """Build the identity tuple from explicit flags, falling back to the
     live session context. Explicit flags let `hermes scope create` be used
@@ -74,6 +136,21 @@ def _cmd_create(args) -> int:
         included_topics=args.included_topics or [],
         excluded_topics=args.excluded_topics or [],
     )
+    if identity.get("account_id") or identity.get("guild_scope_id"):
+        # No live-session field currently carries account_id/guild_scope_id
+        # (see hermes_scope.identity_from_session_env) -- a scope created
+        # with either set can only ever be resolved again via an explicit
+        # --scope-id. Warn instead of letting it silently become
+        # unreachable to the auto-registration hooks and to a bare
+        # `hermes scope status`/`link`/... in a later turn.
+        print(
+            "warning: --account-id/--guild-scope-id are not carried by the "
+            "live session context, so this scope can only be reached again "
+            "via --scope-id " + _redact(manifest["scope_id"]) + " -- it will "
+            "not be found by auto-registration hooks or by a bare "
+            "`hermes scope status`/`link`.",
+            file=sys.stderr,
+        )
     print(f"scope {_redact(manifest['scope_id'])}: {manifest['goal']} ({manifest['lifecycle']})")
     return 0
 
@@ -93,9 +170,16 @@ def _cmd_status(args) -> int:
     print(f"created:  {manifest['created_at']}")
     print(f"updated:  {manifest['updated_at']}")
     owned = manifest.get("owned", {})
+    liveness = _liveness_summary(manifest)
     print("owned artifacts:")
     for category, values in owned.items():
-        print(f"  {category}: {len(values)}")
+        live = liveness.get(category)
+        if live is None:
+            print(f"  {category}: {len(values)}")
+        elif live["active"] is None:
+            print(f"  {category}: {live['count']} (liveness unknown)")
+        else:
+            print(f"  {category}: {live['count']} ({live['active']} still active)")
     deps = manifest.get("external_dependencies", [])
     if deps:
         print("external dependencies (not verified progress):")
