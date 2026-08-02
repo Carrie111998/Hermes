@@ -5742,6 +5742,62 @@ def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
     )
 
 
+# Per-process memo for resolve_nous_access_token. Startup runs
+# check_tool_availability once per managed-tool check_fn (browser, image_gen,
+# etc.), and each one independently triggers a ~15s blocking token-refresh
+# network call when the stored token is expired. On a slow/constrained host that
+# serial burst stretches startup to many minutes. A short-TTL memo collapses the
+# burst into a single network round-trip; callers that need freshness use
+# separate flows (force_fresh / refresh_nous_oauth_pure) and are unaffected.
+_RESOLVE_TOKEN_CACHE_LOCK = threading.Lock()
+_RESOLVE_TOKEN_CACHE: "tuple[float, tuple[Any, ...], str] | None" = None
+_RESOLVE_TOKEN_CACHE_TTL_S = 5.0
+
+
+def _resolve_token_file_identity(path: Optional[Path]) -> tuple[Any, ...]:
+    """Return a cheap identity for one token-bearing file."""
+    if path is None:
+        return (None, None, None, None, None)
+    try:
+        resolved = str(path.resolve(strict=False))
+    except Exception:
+        resolved = str(path)
+    try:
+        file_stat = path.stat()
+    except OSError:
+        return (resolved, None, None, None, None)
+    return (
+        resolved,
+        getattr(file_stat, "st_ino", None),
+        file_stat.st_size,
+        getattr(file_stat, "st_mtime_ns", None),
+        getattr(file_stat, "st_ctime_ns", None),
+    )
+
+
+def _resolve_token_cache_key(refresh_skew_seconds: int) -> tuple[Any, ...]:
+    """Key the memo to every source that can change the resolved token."""
+    try:
+        shared_path: Optional[Path] = _nous_shared_store_path()
+    except Exception:
+        shared_path = None
+    return (
+        _resolve_token_file_identity(_auth_file_path()),
+        _resolve_token_file_identity(_global_auth_file_path()),
+        _resolve_token_file_identity(shared_path),
+        refresh_skew_seconds,
+        os.getenv("HERMES_PORTAL_BASE_URL", "").strip(),
+        os.getenv("NOUS_PORTAL_BASE_URL", "").strip(),
+    )
+
+
+def _memoize_resolved_nous_token(token: str, refresh_skew_seconds: int) -> None:
+    global _RESOLVE_TOKEN_CACHE
+    cache_key = _resolve_token_cache_key(refresh_skew_seconds)
+    with _RESOLVE_TOKEN_CACHE_LOCK:
+        _RESOLVE_TOKEN_CACHE = (time.monotonic(), cache_key, token)
+
+
 def resolve_nous_access_token(
     *,
     timeout_seconds: float = 15.0,
@@ -5750,6 +5806,21 @@ def resolve_nous_access_token(
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
+    global _RESOLVE_TOKEN_CACHE
+    # Memo: collapse the startup burst of managed-tool check_fns into one
+    # network refresh. Only cache a successful, non-forced resolution for a
+    # short window; force_fresh / error paths bypass and don't populate it.
+    cache_key = None
+    if not insecure and ca_bundle is None:
+        cache_key = _resolve_token_cache_key(refresh_skew_seconds)
+        with _RESOLVE_TOKEN_CACHE_LOCK:
+            if _RESOLVE_TOKEN_CACHE is not None:
+                cached_at, cached_key, cached_token = _RESOLVE_TOKEN_CACHE
+                if (
+                    cached_key == cache_key
+                    and (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S
+                ):
+                    return cached_token
     with _provider_state_transaction("nous") as (
         auth_store,
         state,
@@ -5804,6 +5875,14 @@ def resolve_nous_access_token(
             if not _is_expiring(state.get("expires_at"), refresh_skew_seconds):
                 if merged_shared:
                     _save_provider_state_to_source(auth_store, "nous", state, state_source_path)
+                # Populate the memo on the valid-token fast path too: the
+                # startup burst usually finds a *valid* token, but each
+                # check_fn call still pays two cross-process file locks and
+                # state reads to reach this return. The token has at least
+                # refresh_skew_seconds (>= 120s) of life here, so a 5s memo
+                # can never serve an expired token.
+                if not insecure and ca_bundle is None:
+                    _memoize_resolved_nous_token(access_token, refresh_skew_seconds)
                 return access_token
 
             if not isinstance(refresh_token, str) or not refresh_token:
@@ -5861,7 +5940,10 @@ def resolve_nous_access_token(
             }
             _save_provider_state_to_source(auth_store, "nous", state, state_source_path)
             _write_shared_nous_state(state)
-            return state["access_token"]
+            resolved = state["access_token"]
+            if not insecure and ca_bundle is None:
+                _memoize_resolved_nous_token(resolved, refresh_skew_seconds)
+            return resolved
 
 
 def refresh_nous_oauth_pure(

@@ -119,6 +119,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway import systemd_credentials as systemd_credentials_module
 from gateway.systemd_credentials import (
@@ -139,6 +140,30 @@ from gateway.api_verifier_credentials import (
     parse_api_approval_scrypt_verifier,
     parse_api_bearer_verifier,
 )
+
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
 
 logger = logging.getLogger(__name__)
 
@@ -502,15 +527,16 @@ def _load_systemd_api_approval_verifier_credential(name: Any) -> str:
 def _resolve_api_server_key(extra: Dict[str, Any]) -> str:
     """Resolve legacy inline/env auth or the mutually-exclusive credential seam."""
     credential_name = extra.get("key_credential")
+    env_key = _get_scoped_secret("API_SERVER_KEY", "")
     if extra.get("key_verifier_credential") is not None:
-        if credential_name is not None or "key" in extra or os.getenv("API_SERVER_KEY"):
+        if credential_name is not None or "key" in extra or env_key:
             raise ValueError(
                 "api_server key verifier cannot be combined with secret-bearing auth"
             )
         return ""
     if credential_name is None:
-        return extra.get("key", os.getenv("API_SERVER_KEY", ""))
-    if "key" in extra or os.getenv("API_SERVER_KEY"):
+        return extra.get("key", env_key)
+    if "key" in extra or env_key:
         raise ValueError(
             "api_server key_credential cannot be combined with inline or env key"
         )
@@ -9838,6 +9864,10 @@ class APIServerAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
+                # Same abandonment as a client disconnect: the run will never
+                # be resumed, so reap the background processes it created
+                # (#76115). Epoch-gated; no-op when the turn already
+                # finished and cleared its markers.
                 _reap_disconnected_agent_processes(
                     agent, source="api_server_sse_cancelled"
                 )
@@ -11447,7 +11477,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent = agent_ref[0] if agent_ref else None
         if agent is not None:
             try:
-                agent.interrupt(reason)
+                request_hard_interrupt(agent, reason)
             except Exception:
                 pass
             # interrupt() cannot wake a thread blocked in Event.wait().  Cancel
@@ -13320,7 +13350,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if agent is not None:
             try:
-                agent.interrupt("Stop requested via API")
+                request_hard_interrupt(agent, "Stop requested via API")
             except Exception:
                 pass
             # Stop abandons model execution: reap only this run's process
