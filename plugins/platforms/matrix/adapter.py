@@ -874,6 +874,13 @@ class MatrixAdapter(BasePlatformAdapter):
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
+        # _closing means "the sync loop should stop", which connect() also
+        # asserts while tearing down a previous session. _shutdown_requested
+        # means "stop for good" and is set only by an external disconnect(),
+        # so a failed reconnect does not look like a shutdown to the re-auth
+        # loop.
+        self._shutdown_requested = False
+        self._reauth_task: Optional[asyncio.Task] = None
         self._startup_ts: float = 0.0
         # Clock-skew detection: count grace-check drops that happen well
         # after startup (i.e. not initial-sync backfill).  If the host's
@@ -1216,11 +1223,19 @@ class MatrixAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
         self._device_id_unverified = False
+        if not is_reconnect:
+            self._shutdown_requested = False
         if self._client is not None:
             try:
-                await self.disconnect()
+                await self.disconnect(_for_reconnect=True)
             except Exception as exc:
                 logger.warning("Matrix: error disconnecting before reconnect: %s", exc)
+        # disconnect() raises _closing to stop the old sync task. Lower it
+        # again here rather than 300 lines down at the initial sync: if this
+        # connect fails before reaching that point, a still-raised _closing
+        # would tell the re-auth loop the adapter was shut down and it would
+        # give up after a single failed attempt.
+        self._closing = False
 
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
@@ -1595,9 +1610,26 @@ class MatrixAdapter(BasePlatformAdapter):
         self._mark_connected()
         return True
 
-    async def disconnect(self) -> None:
-        """Disconnect from Matrix."""
+    async def disconnect(self, *, _for_reconnect: bool = False) -> None:
+        """Disconnect from Matrix.
+
+        ``_for_reconnect`` marks the internal teardown connect() performs
+        before rebuilding the session. Only a real, external disconnect
+        counts as a shutdown and stops the token-expiry re-auth loop —
+        otherwise reconnecting would cancel the very task driving it.
+        """
         self._closing = True
+        if not _for_reconnect:
+            self._shutdown_requested = True
+            reauth_task = self._reauth_task
+            if reauth_task is not None and not reauth_task.done():
+                reauth_task.cancel()
+                # Await it out, as with _sync_task below, so shutdown does
+                # not race a re-auth attempt still in flight.
+                try:
+                    await reauth_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         if self._sync_task and not self._sync_task.done():
             self._sync_task.cancel()
@@ -2517,7 +2549,9 @@ class MatrixAdapter(BasePlatformAdapter):
         task, and a coroutine must not cancel itself mid-await. A guard avoids
         launching overlapping re-auth attempts.
         """
-        existing = getattr(self, "_reauth_task", None)
+        if self._shutdown_requested:
+            return
+        existing = self._reauth_task
         if existing is not None and not existing.done():
             return
         logger.warning(
@@ -2526,9 +2560,27 @@ class MatrixAdapter(BasePlatformAdapter):
         self._reauth_task = asyncio.create_task(self._reauthenticate())
 
     async def _reauthenticate(self) -> None:
-        """Re-login with exponential backoff until the connection is restored."""
+        """Re-login with exponential backoff until the connection is restored.
+
+        Requires password credentials. connect() gives ``_access_token``
+        priority, so retrying with the expired token in place would just fail
+        whoami() forever; the dead token is dropped first so connect() takes
+        the password-login branch. With no password configured there is
+        nothing to re-authenticate with and only a new token can recover.
+        """
+        if not (self._password and self._user_id):
+            logger.error(
+                "Matrix: access token expired and no MATRIX_PASSWORD is "
+                "configured, so the bot cannot log in again. Generate a new "
+                "MATRIX_ACCESS_TOKEN and restart."
+            )
+            return
+
+        # Drop the expired token so connect() selects password login.
+        self._access_token = ""
+
         delay = 5
-        while not self._closing:
+        while not self._shutdown_requested:
             try:
                 if await self.connect(is_reconnect=True):
                     logger.info("Matrix: re-authenticated after token expiry")
