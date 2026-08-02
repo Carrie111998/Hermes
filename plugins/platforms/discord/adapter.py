@@ -4330,7 +4330,11 @@ class DiscordAdapter(BasePlatformAdapter):
         token = int(event.get("token") or 0)
         user_id = int(event.get("user_id") or 0)
         state = getattr(self, "_voice_playback_states", {}).get(guild_id)
-        active = bool(state is not None and state.token == token)
+        active = bool(
+            state is not None
+            and state.token == token
+            and not state.interrupted.is_set()
+        )
         guild = self._client.get_guild(guild_id) if self._client is not None else None
         authorized = bool(
             user_id
@@ -4356,6 +4360,8 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if effective_shadow or not active or not authorized:
             return
+        if not self._claim_voice_barge_in(guild_id, token):
+            return
         now = time.monotonic()
         live_tokens = getattr(self, "_voice_streaming_kws_live_tokens", None)
         if live_tokens is None:
@@ -4366,10 +4372,46 @@ class DiscordAdapter(BasePlatformAdapter):
                 live_tokens.pop(key, None)
         live_tokens[(guild_id, token)] = now
         interrupted = self._interrupt_voice_playback(guild_id, token)
+        if interrupted:
+            cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
+            if cfg.get("ack_enabled") and cfg.get("stop_ack_phrases"):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = getattr(self, "_voice_streaming_kws_loop", None)
+                if loop is not None and not loop.is_closed():
+                    loop.create_task(self._play_voice_barge_in_ack(guild_id, "stop"))
         logger.info(
             "Discord streaming KWS accepted playback=%s interrupted=%s",
             token,
             interrupted,
+        )
+
+    def _offer_authorized_voice_streaming_pcm(
+        self,
+        manager,
+        guild_id: int,
+        guild,
+        token: int,
+        user_id: int,
+        pcm: bytes,
+        received_at: float,
+    ) -> bool:
+        """Authorize mapped Discord audio before it enters local streaming ASR."""
+        if not self._is_allowed_user(
+            str(user_id),
+            guild=guild,
+            is_dm=False,
+        ):
+            return False
+        return bool(
+            manager.offer_pcm(
+                guild_id,
+                token,
+                user_id,
+                pcm,
+                received_at=received_at,
+            )
         )
 
     def _close_voice_streaming_kws_manager(self) -> None:
@@ -4757,12 +4799,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 playback_drained_callback = None
                 if kws_manager is not None:
                     playback_pcm_callback = (
-                        lambda token, user_id, pcm, received_at: kws_manager.offer_pcm(
+                        lambda token, user_id, pcm, received_at: self._offer_authorized_voice_streaming_pcm(
+                            kws_manager,
                             guild_id,
+                            channel.guild,
                             token,
                             user_id,
                             pcm,
-                            received_at=received_at,
+                            received_at,
                         )
                     )
                     playback_drained_callback = (
@@ -5216,6 +5260,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if playback_token is not None:
             live_tokens = getattr(self, "_voice_streaming_kws_live_tokens", {})
             streaming_live = live_tokens.pop((guild_id, playback_token), None) is not None
+            if streaming_live:
+                # Live KWS already interrupted, claimed, and scheduled the one
+                # stop ACK. Its tagged endpoint is not a model turn; only the
+                # next separately spoken, untagged utterance follows normal STT.
+                return
             if not (
                 self._voice_barge_in_enabled()
                 or self._voice_barge_in_monitor_only()
@@ -5313,16 +5362,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 current_state = getattr(self, "_voice_playback_states", {}).get(
                     guild_id
                 )
-                # A playback token is live only while its exact state remains
-                # installed. Receiver buffers may drain after playback cleanup;
-                # state removal is the strict epoch boundary for all live side
-                # effects (interrupt, ACK, claim, and model routing).
-                if current_state is None or current_state.token != playback_token:
+                # A playback token is live only while its exact, uninterrupted
+                # state remains installed. Teardown marks interruption before
+                # flushing buffers, making that epoch terminal for every batch
+                # side effect (interrupt, ACK, claim, and model routing).
+                if (
+                    current_state is None
+                    or current_state.token != playback_token
+                    or current_state.interrupted.is_set()
+                ):
                     logger.debug(
-                        "Discarded stale Discord barge-in for guild=%s playback=%s current=%s",
+                        "Discarded stale or terminal Discord barge-in for "
+                        "guild=%s playback=%s current=%s interrupted=%s",
                         guild_id,
                         playback_token,
                         current_state.token if current_state is not None else None,
+                        bool(current_state and current_state.interrupted.is_set()),
                     )
                     return
                 if not matched:
@@ -5363,7 +5418,11 @@ class DiscordAdapter(BasePlatformAdapter):
             elif is_whisper_hallucination(transcript):
                 return
 
-            logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+            logger.info(
+                "Voice input accepted user=%d transcript_chars=%d",
+                user_id,
+                len(transcript),
+            )
 
             if self._voice_input_callback:
                 await self._voice_input_callback(
@@ -5388,7 +5447,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     processing_stage,
                     type(e).__name__,
                 )
-            logger.warning("Voice input processing failed: %s", e, exc_info=True)
+            logger.warning(
+                "Voice input processing failed stage=%s type=%s",
+                processing_stage,
+                type(e).__name__,
+            )
         finally:
             try:
                 os.unlink(wav_path)

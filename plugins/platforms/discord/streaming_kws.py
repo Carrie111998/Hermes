@@ -66,6 +66,24 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]+", "", text)
 
 
+def _matches_phrase_prefix(text: str, phrase: str) -> bool:
+    """Match a phrase prefix only at a following lexical boundary."""
+    text = unicodedata.normalize("NFKC", str(text or "")).lower()
+    phrase = unicodedata.normalize("NFKC", str(phrase or "")).lower()
+    text = text.replace("멈추어", "멈춰")
+    phrase = phrase.replace("멈추어", "멈춰")
+    parts = re.findall(r"[0-9a-z가-힣]+", phrase)
+    if not parts:
+        return False
+    separators = r"[^0-9a-z가-힣]*"
+    pattern = (
+        r"^[^0-9a-z가-힣]*"
+        + separators.join(re.escape(part) for part in parts)
+        + r"(?![0-9a-z가-힣])"
+    )
+    return re.match(pattern, text) is not None
+
+
 @dataclass(frozen=True)
 class StreamingKwsConfig:
     enabled: bool = False
@@ -120,9 +138,9 @@ class FasterWhisperRollingEngine:
     """Rolling in-memory Korean phrase detector backed by faster-whisper."""
 
     def __init__(self, config: StreamingKwsConfig, phrases: Tuple[str, ...]):
-        from tools import lazy_deps
+        from tools.transcription_tools import ensure_faster_whisper_dependency
 
-        lazy_deps.ensure("stt.faster_whisper", prompt=False)
+        ensure_faster_whisper_dependency()
         import numpy as np
         from faster_whisper import WhisperModel
 
@@ -130,7 +148,6 @@ class FasterWhisperRollingEngine:
         self._phrases = tuple(str(p).strip() for p in phrases if str(p).strip())
         if not self._phrases:
             raise RuntimeError("Discord streaming KWS requires at least one phrase")
-        self._normalized_phrases = tuple(_normalize(p) for p in self._phrases)
         source = str(Path(config.model_dir).expanduser()) if config.model_dir else config.model
         self._window_samples = round(config.window_ms * 16000 / 1000)
         self._stride_samples = round(config.stride_ms * 16000 / 1000)
@@ -197,9 +214,8 @@ class FasterWhisperRollingEngine:
             hotwords=self._hotwords,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
-        normalized = _normalize(text)
-        for index, phrase in enumerate(self._normalized_phrases):
-            if phrase and normalized.startswith(phrase):
+        for index, phrase in enumerate(self._phrases):
+            if _matches_phrase_prefix(text, phrase):
                 return index
         return None
 
@@ -246,6 +262,7 @@ class DiscordStreamingKwsManager:
         self.phrases = tuple(phrases)
         self._on_detection = on_detection
         self._queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=config.queue_frames)
+        self._close_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._forced_end_lock = threading.Lock()
         self._forced_ends: set[Tuple[int, int]] = set()
@@ -342,23 +359,26 @@ class DiscordStreamingKwsManager:
         return accepted
 
     def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        try:
-            self._queue.put_nowait(_QueueItem("stop", 0, 0))
-        except queue.Full:
-            # Control shutdown must win over stale PCM.
+        with self._close_lock:
+            if not self._closed.is_set():
+                self._closed.set()
+                # Shutdown is terminal: discard every queued PCM/control item
+                # before waking the worker. In-flight inference may finish, but
+                # it cannot resume stale queued audio after this boundary.
+                self._discard_queue()
+                self._queue.put_nowait(_QueueItem("stop", 0, 0))
+        if self._thread is not threading.current_thread():
+            # Native inference cannot be force-cancelled safely. Keep close
+            # prompt and bounded; the worker observes _closed as soon as the
+            # in-flight call returns and exits without consuming more PCM.
+            self._thread.join(timeout=0.25)
+
+    def _discard_queue(self) -> None:
+        while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
-                pass
-            try:
-                self._queue.put_nowait(_QueueItem("stop", 0, 0))
-            except queue.Full:
-                pass
-        if self._thread is not threading.current_thread():
-            self._thread.join(timeout=3.0)
+                return
 
     def _run(self) -> None:
         engine = None
@@ -393,7 +413,11 @@ class DiscordStreamingKwsManager:
             observed_at: float,
         ) -> None:
             token_key = stream_key[:2]
-            if token_key in fired or token_key not in active:
+            if (
+                self._closed.is_set()
+                or token_key in fired
+                or token_key not in active
+            ):
                 return
             fired.add(token_key)
             self._bump("detections")
@@ -434,7 +458,7 @@ class DiscordStreamingKwsManager:
             return
         self._ready.set()
         try:
-            while True:
+            while not self._closed.is_set():
                 _drain_forced_ends()
                 try:
                     item = self._queue.get(timeout=0.1)
@@ -505,9 +529,12 @@ class DiscordStreamingKwsManager:
                         type(exc).__name__,
                     )
                     continue
+                if self._closed.is_set():
+                    return
                 if keyword_index is not None:
                     _emit(stream_key, keyword_index, item.received_at)
         finally:
+            self._discard_queue()
             if engine is not None:
                 try:
                     engine.close()

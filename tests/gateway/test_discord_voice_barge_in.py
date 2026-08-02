@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import json
+import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -133,6 +135,24 @@ async def _process_transcript(adapter, transcript, *, token=None):
             b"pcm",
             playback_token=token,
         )
+
+
+@pytest.mark.asyncio
+async def test_normal_voice_route_logs_metadata_without_transcript_content(caplog):
+    adapter = _make_adapter()
+    transcript = "private normal voice transcript canary"
+    caplog.set_level("INFO")
+
+    await _process_transcript(adapter, transcript)
+
+    adapter._voice_input_callback.assert_awaited_once_with(
+        guild_id=111,
+        user_id=42,
+        transcript=transcript,
+    )
+    assert "Voice input accepted user=42" in caplog.text
+    assert f"transcript_chars={len(transcript)}" in caplog.text
+    assert transcript not in caplog.text
 
 
 def test_phrase_matcher_accepts_stop_only_and_trailing_command():
@@ -599,6 +619,40 @@ async def test_expired_playback_token_cannot_ack_or_route_after_state_removal():
 
 
 @pytest.mark.asyncio
+async def test_leave_voice_channel_makes_interrupted_epoch_terminal_before_flush():
+    adapter = _make_adapter(
+        ack_enabled=True,
+        follow_up_ack_phrases=("네, 말씀하세요.",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    receiver = _Receiver()
+    adapter._voice_receivers[111] = receiver
+    state = adapter._begin_voice_playback(111)
+    receiver.flush_pending = MagicMock(
+        return_value=[(42, b"tagged teardown pcm", state.token)]
+    )
+
+    with (
+        patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav"),
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={
+                "success": True,
+                "transcript": "세린아 잠깐, teardown must not route",
+            },
+        ),
+        patch("tools.voice_mode.is_whisper_hallucination", return_value=False),
+    ):
+        await adapter.leave_voice_channel(111)
+
+    assert state.interrupted.is_set()
+    adapter.play_ack_in_voice.assert_not_awaited()
+    adapter._voice_input_callback.assert_not_awaited()
+    assert adapter._voice_barge_in_claims == set()
+    assert adapter._voice_playback_states == {}
+
+
+@pytest.mark.asyncio
 async def test_disconnect_interrupts_waiter_and_cleans_playback_state():
     adapter = _make_adapter()
     receiver = _Receiver()
@@ -739,6 +793,69 @@ def test_streaming_kws_alone_enables_playback_capture():
     assert adapter._voice_barge_in_capture_enabled() is True
 
 
+def test_streaming_kws_authorizes_pcm_before_unauthorized_wake_can_claim_token():
+    from plugins.platforms.discord.streaming_kws import (
+        DiscordStreamingKwsManager,
+        StreamingKwsConfig,
+    )
+
+    class DetectFirstFrameEngine:
+        def create_stream(self):
+            return object()
+
+        def process(self, _stream, _pcm):
+            return 0
+
+        def close(self):
+            pass
+
+    adapter = _make_adapter(enabled=False, monitor_only=False)
+    guild = MagicMock()
+    adapter._is_allowed_user = MagicMock(
+        side_effect=lambda user_id, **_kwargs: user_id == "43"
+    )
+    events = []
+    detected = threading.Event()
+
+    def on_detection(event):
+        events.append(event)
+        detected.set()
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=32),
+        ("하나야 잠깐",),
+        on_detection,
+        engine_factory=lambda *_args: DetectFirstFrameEngine(),
+    )
+    try:
+        assert manager.begin_playback(111, 7)
+        assert adapter._offer_authorized_voice_streaming_pcm(
+            manager,
+            111,
+            guild,
+            7,
+            42,
+            b"unauthorized wake pcm",
+            time.monotonic(),
+        ) is False
+        assert adapter._offer_authorized_voice_streaming_pcm(
+            manager,
+            111,
+            guild,
+            7,
+            43,
+            b"authorized wake pcm",
+            time.monotonic(),
+        ) is True
+
+        assert detected.wait(timeout=1)
+        assert [event["user_id"] for event in events] == [43]
+        assert manager.snapshot_stats()["offered_frames"] == 1
+        assert manager.snapshot_stats()["processed_frames"] == 1
+    finally:
+        manager.close()
+
+
 def test_streaming_kws_shadow_detection_has_no_side_effects():
     from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
 
@@ -828,7 +945,77 @@ def test_parent_monitor_only_forces_nested_streaming_live_to_shadow():
     )
 
 
-def test_streaming_kws_live_detection_interrupts_once_without_claiming_follow_up():
+@pytest.mark.asyncio
+async def test_streaming_live_detection_acks_once_across_real_playback_cleanup():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(
+        enabled=False,
+        monitor_only=False,
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+    )
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    receiver = _Receiver()
+    adapter._voice_receivers[111] = receiver
+
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = False
+    started = asyncio.Event()
+
+    def _play(_source, **_kwargs):
+        vc.is_playing.return_value = True
+        started.set()
+
+    def _stop():
+        vc.is_playing.return_value = False
+
+    vc.play.side_effect = _play
+    vc.stop.side_effect = _stop
+    adapter._voice_clients[111] = vc
+
+    with patch("plugins.platforms.discord.adapter.discord") as discord_mock:
+        discord_mock.FFmpegPCMAudio.return_value = MagicMock()
+        discord_mock.PCMVolumeTransformer.return_value = MagicMock()
+        play_task = asyncio.create_task(
+            adapter.play_in_voice_channel(111, "/tmp/x.mp3")
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        token = receiver.playback_token
+        assert token is not None
+        event = {"guild_id": 111, "token": token, "user_id": 42}
+
+        adapter._handle_voice_streaming_kws_detection(event)
+        adapter._handle_voice_streaming_kws_detection(event)
+
+        assert await asyncio.wait_for(play_task, timeout=1) is True
+
+    assert adapter._voice_playback_states == {}
+    await asyncio.sleep(0)
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+
+    # The tagged wake endpoint is consumed without a second ACK or model turn.
+    await _process_transcript(adapter, "세린아 잠깐", token=token)
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    adapter._voice_input_callback.assert_not_awaited()
+
+    # A separately spoken utterance after playback cleanup is ordinary input.
+    await _process_transcript(adapter, "내일 날씨 알려줘")
+    adapter._voice_input_callback.assert_awaited_once_with(
+        guild_id=111,
+        user_id=42,
+        transcript="내일 날씨 알려줘",
+    )
+
+
+def test_streaming_kws_live_detection_interrupts_and_claims_epoch_once():
     from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
 
     adapter = _make_adapter(enabled=False, monitor_only=False)
@@ -857,13 +1044,13 @@ def test_streaming_kws_live_detection_interrupts_once_without_claiming_follow_up
 
     assert state.interrupted.is_set()
     mixer.stop_speech.assert_called_once()
-    assert adapter._voice_barge_in_claims == set()
+    assert adapter._voice_barge_in_claims == {(111, state.token)}
     assert (111, state.token) in adapter._voice_streaming_kws_live_tokens
     adapter._voice_input_callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_streaming_kws_live_token_routes_only_trailing_follow_up():
+async def test_streaming_kws_live_token_consumes_entire_wake_utterance():
     from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
 
     adapter = _make_adapter(enabled=False, monitor_only=False)
@@ -887,11 +1074,7 @@ async def test_streaming_kws_live_token_routes_only_trailing_follow_up():
         token=state.token,
     )
 
-    adapter._voice_input_callback.assert_awaited_once_with(
-        guild_id=111,
-        user_id=42,
-        transcript="날씨 알려줘",
-    )
+    adapter._voice_input_callback.assert_not_awaited()
     assert (111, state.token) not in adapter._voice_streaming_kws_live_tokens
 
 
@@ -972,7 +1155,8 @@ async def test_monitor_only_stt_exception_logs_bounded_outcome(caplog):
     assert "outcome=exception" in decision_logs[0]
     assert "stage=stt" in decision_logs[0]
     assert "type=RuntimeError" in decision_logs[0]
-    assert "sensitive provider detail" not in decision_logs[0]
+    assert "Voice input processing failed stage=stt type=RuntimeError" in caplog.text
+    assert "sensitive provider detail" not in caplog.text
     adapter._voice_input_callback.assert_not_awaited()
 
 

@@ -97,6 +97,40 @@ def test_unknown_provider_fails_closed_before_loading_model():
         )
 
 
+def test_shared_faster_whisper_dependency_initialization_is_serialized(monkeypatch):
+    from tools.transcription_tools import ensure_faster_whisper_dependency
+
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    start = threading.Barrier(3)
+
+    def fake_ensure(*_args, **_kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+
+    monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+
+    def initialize():
+        start.wait(timeout=1)
+        ensure_faster_whisper_dependency()
+
+    threads = [threading.Thread(target=initialize) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=1)
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active == 1
+
+
 def test_faster_whisper_engine_downsamples_and_detects_rolling_window(
     monkeypatch,
 ):
@@ -171,6 +205,51 @@ def test_faster_whisper_engine_downsamples_and_detects_rolling_window(
             StreamingKwsConfig(enabled=True),
             (),
         )
+
+
+def test_faster_whisper_matcher_requires_lexical_boundary(monkeypatch):
+    import sys
+
+    pytest.importorskip("numpy")
+    from plugins.platforms.discord.streaming_kws import FasterWhisperRollingEngine
+
+    transcript = ["하나야 잠깐만"]
+
+    class FakeWhisperModel:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def transcribe(self, _audio, **_kwargs):
+            return iter([types.SimpleNamespace(text=transcript[0])]), object()
+
+    fake_module = types.ModuleType("faster_whisper")
+    fake_module.WhisperModel = FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_module)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+    engine = FasterWhisperRollingEngine(
+        StreamingKwsConfig(
+            enabled=True,
+            window_ms=800,
+            stride_ms=160,
+            min_audio_ms=400,
+        ),
+        ("하나야 잠깐",),
+    )
+    frame = b"\x10\x00\xf0\xff" * 960
+
+    longer_token = engine.create_stream()
+    result = None
+    for _ in range(20):
+        result = engine.process(longer_token, frame)
+    assert result is None
+
+    transcript[0] = "하나야 잠깐, 들어줘"
+    bounded_phrase = engine.create_stream()
+    result = None
+    for _ in range(20):
+        result = engine.process(bounded_phrase, frame)
+    assert result == 0
+    engine.close()
 
 
 def test_manager_fires_once_per_playback_and_resets_for_next_token():
@@ -257,6 +336,60 @@ def test_manager_queue_is_bounded_and_reports_drops():
     finally:
         release.set()
         manager.close()
+
+
+def test_close_discards_saturated_queue_after_blocked_inference():
+    entered = threading.Event()
+    release = threading.Event()
+    close_returned = threading.Event()
+    process_calls = []
+
+    class BlockingEngine(_FakeEngine):
+        def process(self, stream, _pcm):
+            process_calls.append(1)
+            entered.set()
+            assert release.wait(timeout=5)
+            stream["frames"] += 1
+            return 0
+
+    engine = BlockingEngine(None, None)
+    events = []
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=32),
+        ("하나야 잠깐",),
+        events.append,
+        engine_factory=lambda *_args: engine,
+    )
+    pcm = b"\x00" * 3840
+    assert manager.begin_playback(1, 41)
+    assert manager.offer_pcm(1, 41, 42, pcm)
+    assert entered.wait(timeout=1)
+    for _ in range(128):
+        manager.offer_pcm(1, 41, 42, pcm)
+    assert manager.snapshot_stats()["queue_drops"] > 0
+
+    closer = threading.Thread(
+        target=lambda: (manager.close(), close_returned.set()),
+        daemon=True,
+    )
+    closer.start()
+    try:
+        assert close_returned.wait(timeout=0.5), "close waited on blocked inference"
+        assert manager.offer_pcm(1, 41, 42, pcm) is False
+    finally:
+        release.set()
+        closer.join(timeout=2)
+
+    manager._thread.join(timeout=1)
+    assert not manager._thread.is_alive()
+    assert len(process_calls) == 1
+    assert events == []
+    assert engine.closed is True
+    assert manager.snapshot_stats()["queue_depth"] == 0
+
+    started = time.monotonic()
+    manager.close()
+    assert time.monotonic() - started < 0.1
 
 
 def test_manager_idle_flush_can_detect_final_short_phrase():

@@ -138,6 +138,9 @@ _local_model_name: Optional[str] = None
 # Without it, two concurrent voice messages can both see `_local_model is
 # None` and download/load the whisper model twice (#24767).
 _local_model_lock = threading.Lock()
+# Shared by batch STT and Discord streaming KWS so their first-use lazy
+# dependency checks/install cannot race in the same environment.
+_faster_whisper_dependency_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -296,6 +299,14 @@ def _normalize_local_command_model(model_name: Optional[str]) -> str:
     return _normalize_local_model(model_name)
 
 
+def ensure_faster_whisper_dependency() -> None:
+    """Serialize faster-whisper's first-use lazy dependency initialization."""
+    from tools import lazy_deps
+
+    with _faster_whisper_dependency_lock:
+        lazy_deps.ensure("stt.faster_whisper", prompt=False)
+
+
 def _try_lazy_install_stt() -> bool:
     """Attempt to lazy-install faster-whisper and return True on success.
 
@@ -305,12 +316,11 @@ def _try_lazy_install_stt() -> bool:
     the provider can use it immediately without a process restart.
     """
     try:
-        from tools.lazy_deps import ensure
         # prompt=False: never raise a blocking input() prompt mid-session.
         # Under the interactive CLI prompt_toolkit owns stdin, so a bare
         # input() deadlocks the terminal (#40490). The install is already
         # gated by security.allow_lazy_installs, so reaching here is opt-in.
-        ensure("stt.faster_whisper", prompt=False)
+        ensure_faster_whisper_dependency()
         # Re-check dynamically after install
         import importlib.util as _iu
         if _iu.find_spec("faster_whisper"):
