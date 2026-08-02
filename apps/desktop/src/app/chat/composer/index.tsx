@@ -686,7 +686,7 @@ export function ChatBar({
       const currentDraft = draftRef.current
 
       // Editing a queued turn → walk to the older entry.
-      if (queueEdit && stepQueuedEdit(-1)) {
+      if (queueEdit && (flushEditorToDraft(editorRef.current!), stepQueuedEdit(-1))) {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
 
@@ -728,6 +728,7 @@ export function ChatBar({
       if (queueEdit) {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
+        flushEditorToDraft(editorRef.current!)
         stepQueuedEdit(1)
 
         return
@@ -1228,7 +1229,7 @@ export function ChatBar({
                         </Button>
                         <Button
                           className="h-6 rounded-md px-2 text-[0.68rem]"
-                          onClick={() => exitQueuedEdit('save')}
+                          onClick={() => { flushEditorToDraft(editorRef.current!); exitQueuedEdit('save'); }}
                           type="button"
                         >
                           {t.common.save}
