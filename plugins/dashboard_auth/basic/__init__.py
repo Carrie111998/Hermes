@@ -226,10 +226,14 @@ class BasicAuthProvider(DashboardAuthProvider):
 
     # ---- OAuth methods: not used (pure-password provider) ------------------
 
+    supports_session = True
+
     def start_login(self, *, redirect_uri: str) -> LoginStart:
-        raise NotImplementedError(
-            "BasicAuthProvider is password-only; there is no OAuth redirect "
-            "flow. The login page POSTs to /auth/password-login instead."
+        # BasicAuthProvider is password-only (not OAuth). Redirect to the
+        # password login form directly instead of raising NotImplementedError.
+        return LoginStart(
+            redirect_url=f"/auth/password-login?redirect_uri={redirect_uri}",
+            cookie_payload={},
         )
 
     def complete_login(
