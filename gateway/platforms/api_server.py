@@ -3302,14 +3302,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, model_config, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       id, source, model, model_config, system_prompt,
+                       conversation_id, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         source,
                         model_name,
                         json.dumps(model_config) if model_config else None,
                         system_prompt,
+                        session_id,
                         _time.time(),
                     ),
                 )
@@ -3438,11 +3440,25 @@ class APIServerAdapter(BasePlatformAdapter):
         # SessionDB's native parent_session_id/end_reason visibility model rather
         # than inventing a parallel fork store.
         await asyncio.to_thread(db.end_session, source_id, "branched")
+
+        source_model_config = source.get("model_config")
+        if isinstance(source_model_config, str):
+            try:
+                source_model_config = json.loads(source_model_config)
+            except (TypeError, ValueError):
+                source_model_config = {}
+        if not isinstance(source_model_config, dict):
+            source_model_config = {}
+
+        fork_model_config = dict(source_model_config)
+        fork_model_config["_branched_from"] = source_id
+
         await asyncio.to_thread(db.create_session,
             fork_id,
             "api_server",
             model=source.get("model"),
             system_prompt=source.get("system_prompt"),
+            model_config=fork_model_config,
             parent_session_id=source_id,
         )
         messages = await asyncio.to_thread(db.get_messages, source_id)

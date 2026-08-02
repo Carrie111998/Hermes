@@ -449,7 +449,8 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
 
     with sqlite3.connect(str(output)) as verify:
         recovered_sessions = verify.execute(
-            "SELECT id, source, title, message_count FROM sessions ORDER BY id"
+            "SELECT id, source, title, message_count, conversation_id "
+            "FROM sessions ORDER BY id"
         ).fetchall()
         messages = verify.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     assert messages == 120, f"expected all 120 messages retained, got {messages}"
@@ -458,6 +459,11 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
     # Fabricated sessions must be identifiable and carry collision-safe titles.
     assert {row[0] for row in recovered_sessions} == set(messages_per_session)
     assert {row[1] for row in recovered_sessions} == {"recovered"}
+    assert {
+        str(row[0]): row[4] for row in recovered_sessions
+    } == {
+        session_id: session_id for session_id in messages_per_session
+    }
     recovered_titles = [str(row[2]) for row in recovered_sessions]
     assert all(title.startswith("[recovered ") for title in recovered_titles)
     assert len(set(recovered_titles)) == len(recovered_titles)

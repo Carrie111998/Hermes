@@ -410,6 +410,137 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _backfill_conversation_ids(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Persist stable logical identities for historical session rows.
+
+        Only unambiguous compression continuations inherit an ancestor's
+        identity. Branches, delegates, tool sessions, missing parents,
+        ambiguous relations, and cycles retain their own physical session ID.
+
+        Existing non-NULL identities are immutable and are never replaced.
+        """
+        raw_rows = cursor.execute(
+            """SELECT id, source, parent_session_id, end_reason,
+                      model_config, conversation_id
+               FROM sessions"""
+        ).fetchall()
+
+        def _value(row, index, name):
+            if isinstance(row, sqlite3.Row):
+                return row[name]
+            return row[index]
+
+        sessions = {
+            _value(row, 0, "id"): {
+                "id": _value(row, 0, "id"),
+                "source": _value(row, 1, "source"),
+                "parent_session_id": _value(
+                    row,
+                    2,
+                    "parent_session_id",
+                ),
+                "end_reason": _value(row, 3, "end_reason"),
+                "model_config": _value(row, 4, "model_config"),
+                "conversation_id": _value(
+                    row,
+                    5,
+                    "conversation_id",
+                ),
+            }
+            for row in raw_rows
+        }
+
+        def _parse_config(value):
+            if not value:
+                return {}
+
+            if isinstance(value, dict):
+                return value
+
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+
+            return parsed if isinstance(parsed, dict) else {}
+
+        def _resolve(session_id):
+            original_id = session_id
+            current_id = session_id
+            visited = set()
+
+            while True:
+                if current_id in visited:
+                    return original_id
+
+                visited.add(current_id)
+                child = sessions.get(current_id)
+
+                if child is None:
+                    return original_id
+
+                if (
+                    current_id != original_id
+                    and child["conversation_id"] is not None
+                ):
+                    return child["conversation_id"]
+
+                parent_id = child["parent_session_id"]
+
+                if not parent_id:
+                    return (
+                        child["conversation_id"]
+                        if child["conversation_id"] is not None
+                        else current_id
+                    )
+
+                parent = sessions.get(parent_id)
+
+                if parent is None:
+                    return (
+                        child["conversation_id"]
+                        if child["conversation_id"] is not None
+                        else current_id
+                    )
+
+                config = _parse_config(child["model_config"])
+
+                is_compression_continuation = (
+                    parent["end_reason"] == "compression"
+                    and config.get("_branched_from") is None
+                    and config.get("_delegate_from") is None
+                    and child["source"] != "tool"
+                )
+
+                if not is_compression_continuation:
+                    return (
+                        child["conversation_id"]
+                        if child["conversation_id"] is not None
+                        else current_id
+                    )
+
+                if parent["conversation_id"] is not None:
+                    return parent["conversation_id"]
+
+                current_id = parent_id
+
+        assignments = [
+            (_resolve(session_id), session_id)
+            for session_id, row in sessions.items()
+            if row["conversation_id"] is None
+        ]
+
+        cursor.executemany(
+            """UPDATE sessions
+               SET conversation_id = ?
+               WHERE id = ?
+                 AND conversation_id IS NULL""",
+            assignments,
+        )
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -724,6 +855,12 @@ class SessionSchemaMixin:
                 if fts5_available and self._db_has_legacy_inline_fts(cursor):
                     self.set_meta("fts_optimize_available", "1", cursor=cursor)
 
+            if current_version < 24:
+                # v24: persist a stable logical conversation identity.
+                # Column creation is handled declaratively above; this
+                # versioned migration classifies existing rows conservatively.
+                self._backfill_conversation_ids(cursor)
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at
@@ -764,6 +901,19 @@ class SessionSchemaMixin:
                     "UPDATE schema_version SET version = ?",
                     (SCHEMA_VERSION,),
                 )
+
+        # conversation_id is reconciled and historically backfilled above,
+        # so creating its index here avoids indexing every migration update.
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_conversation_id "
+                "ON sessions(conversation_id)"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "idx_sessions_conversation_id create skipped: %s",
+                exc,
+            )
 
         # Unique title index — always ensure it exists. Older databases may
         # contain duplicate aliases from before the constraint was enforced;
