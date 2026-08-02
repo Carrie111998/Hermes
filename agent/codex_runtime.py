@@ -458,6 +458,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    pending_agent_message: dict[str, Any] | None = None
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -586,6 +587,30 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 "_emit_interim_assistant_message raised", exc_info=True,
             )
 
+    def _buffer_agent_message_completed(item: dict) -> None:
+        """Hold completed agentMessage text until the next event proves it is
+        commentary, not the turn-final answer.
+
+        Codex app-server emits the final answer as a completed agentMessage too.
+        If the bridge publishes that immediately as interim commentary, Discord
+        sees one reply through the commentary path and then the gateway sends the
+        same final_response normally. A later tool/stream event proves the
+        buffered message was mid-turn commentary, so flush it then; otherwise the
+        normal final-response path owns delivery.
+        """
+        nonlocal pending_agent_message
+        if pending_agent_message is not None:
+            _fire_agent_message_completed(pending_agent_message)
+        pending_agent_message = item
+
+    def _flush_pending_agent_message() -> None:
+        nonlocal pending_agent_message
+        if pending_agent_message is None:
+            return
+        item = pending_agent_message
+        pending_agent_message = None
+        _fire_agent_message_completed(item)
+
     def on_event(note: dict) -> None:
         if not isinstance(note, dict):
             return
@@ -594,6 +619,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(params, dict):
             params = {}
         if method == "item/agentMessage/delta":
+            _flush_pending_agent_message()
             _fire_text_delta(params)
             return
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
@@ -604,13 +630,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         item_type = item.get("type") or ""
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
+            _flush_pending_agent_message()
             _fire_tool_started(item)
             return
         if method == "item/completed":
             if item_type in _CODEX_TOOL_ITEM_TYPES:
+                _flush_pending_agent_message()
                 _fire_tool_completed(item)
             elif item_type == "agentMessage":
-                _fire_agent_message_completed(item)
+                _buffer_agent_message_completed(item)
 
     return on_event
 

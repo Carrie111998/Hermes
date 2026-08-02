@@ -250,7 +250,12 @@ class TestToolProgressDispatch:
 
 
 class TestAgentMessageInterimDispatch:
-    def test_completed_agent_message_emits_interim(self):
+    def test_completed_agent_message_alone_is_not_emitted_as_interim(self):
+        """A lone completed agentMessage is usually the final answer.
+
+        Emitting it through the interim path duplicates the gateway's normal
+        final send on Discord when codex_app_server is active.
+        """
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
@@ -258,10 +263,56 @@ class TestAgentMessageInterimDispatch:
             "id": "am-1",
             "text": "I'll check the config first.",
         }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
+    def test_completed_agent_message_flushes_before_tool_event(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-1",
+            "text": "I'll check the config first.",
+        }))
+        bridge(_item_started({
+            "type": "commandExecution",
+            "id": "exec-1",
+            "command": "ls",
+        }))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
         )
 
+    def test_completed_agent_message_flushes_before_stream_delta(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-1",
+            "text": "I'll check the config first.",
+        }))
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"delta": "final"}})
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "I'll check the config first."}
+        )
+        agent._fire_stream_delta.assert_called_once_with("final")
+
+    def test_second_completed_agent_message_flushes_previous_only(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-1",
+            "text": "First interim.",
+        }))
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-2",
+            "text": "Final answer.",
+        }))
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "First interim."}
+        )
 
 
     def test_show_commentary_off_suppresses_interim(self):
@@ -274,11 +325,11 @@ class TestAgentMessageInterimDispatch:
         bridge(_item_completed({
             "type": "agentMessage", "id": "am-5", "text": "I'll check config.",
         }))
-        agent._emit_interim_assistant_message.assert_not_called()
-        # Tool progress is unaffected by the commentary toggle.
         bridge(_item_started({
             "type": "commandExecution", "id": "cmd-1", "command": "ls",
         }))
+        agent._emit_interim_assistant_message.assert_not_called()
+        # Tool progress is unaffected by the commentary toggle.
         agent.tool_progress_callback.assert_called_once()
 
 
