@@ -15,6 +15,10 @@ exclude-newer-span = "P14D"
 nemo-relay = false
 vercel = false
 huggingface-hub = false
+# 2026-08-02 xie laoban: setuptools 83.0.0 / mcp 1.28.1 都发布于 2026-07-19 之后
+# 但 pyproject.toml 钉死必须用, 用 override 跳过 uv.lock 时间过滤
+setuptools = false
+mcp = false
 
 [manifest]
 overrides = [{ name = "pynacl", specifier = ">=1.6,<1.7" }]
