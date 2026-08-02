@@ -2365,6 +2365,34 @@ def compress_context(
         except Exception:
             pass
 
+        # Persist durable facts extracted from the compression summary into
+        # the built-in memory store so they survive across sessions.  Only
+        # the LLM-generated summary has a "## Durable Facts" section; static
+        # fallbacks are skipped silently by the extractor.
+        try:
+            _raw_summary = getattr(
+                agent.context_compressor, "_last_raw_summary", None
+            )
+            if _raw_summary:
+                from agent.context_compressor import (
+                    extract_durable_facts_from_summary,
+                )
+                _facts = extract_durable_facts_from_summary(_raw_summary)
+                if _facts:
+                    _store = getattr(agent, "_memory_store", None)
+                    if _store is not None:
+                        for _fact in _facts:
+                            _store.add("memory", _fact)
+                        logger.info(
+                            "persisted %d durable fact(s) from compression "
+                            "summary to memory store",
+                            len(_facts),
+                        )
+        except Exception as _exc:
+            logger.debug(
+                "durable facts persistence after compression failed: %s", _exc
+            )
+
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),

@@ -1336,6 +1336,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_feasibility_skip = False
+        self._last_raw_summary: Optional[str] = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
@@ -1605,6 +1606,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_feasibility_skip = False
+        self._last_raw_summary: Optional[str] = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
@@ -2342,6 +2344,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
         self._last_feasibility_skip: bool = False
+        self._last_raw_summary: Optional[str] = None
         # When summary generation fails we now ABORT compression entirely
         # and return the original messages unchanged instead of dropping
         # the middle window with a static placeholder.  Callers inspect
@@ -3631,6 +3634,9 @@ Example:
 2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
 3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
 Be specific with file paths, commands, line numbers, and results.]
+
+## Durable Facts
+[1-3 concise, durable facts about the user or project that should be remembered across future sessions. These are stable preferences, recurring patterns, architectural conventions, or permanent context — NOT task-tracking items or one-time actions. Format each as a single sentence. Include only information that is likely to still be true and useful weeks from now. Only include facts that are NEW or UPDATED from previous compactions — do not repeat facts that were already recorded in earlier Durable Facts sections. If nothing new or durable was observed in these turns, write "None." Do NOT include API keys, tokens, passwords, or credentials.]
 
 ## Active State
 [Current working state — include:
@@ -5928,6 +5934,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_feasibility_skip = False
+        self._last_raw_summary = None
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -6392,6 +6399,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 reason=None if feasibility_skip else self._last_summary_error,
             )
 
+        # Record the raw summary for downstream consumers (e.g. durable-fact
+        # extraction into persistent memory).
+        self._last_raw_summary = summary
+
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may
         # have advanced it past a summary that sat beyond compress_end
@@ -6706,3 +6717,54 @@ def is_compaction_summary_message(message: Any) -> bool:
     else:
         content = message
     return ContextCompressor._is_context_summary_content(content)
+
+
+# ── Durable Facts Extraction ────────────────────────────────────────────────
+# Compression summaries include a "## Durable Facts" section (1-3 stable facts
+# about the user or project).  This function extracts them so downstream
+# consumers (``compress_context()`` in conversation_compression.py) can
+# persist them into ``MemoryStore`` — closing the gap between compression-time
+# fact recognition and permanent memory storage.
+
+_DURABLE_FACTS_RE = re.compile(
+    r'##\s+Durable\s+Facts\s*\n(.*?)(?=\n##\s+(?:Active State|Blocked|Key Decisions|Goal|Completed|Resolved|Relevant|Critical|[A-Z])|\n\Z)',
+    re.DOTALL,
+)
+
+
+def extract_durable_facts_from_summary(summary_text: str) -> list[str]:
+    """Extract Durable Facts entries from a compression summary.
+
+    The compression summary template includes::
+
+        ## Durable Facts
+        1. First durable fact about the user or project.
+        2. Second durable fact.
+        3. Third durable fact.
+
+    When the summariser writes ``None.`` (no new facts observed), an empty
+    list is returned.  Returned strings have the list-marker prefix stripped
+    and leading/trailing whitespace removed.
+    """
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        return []
+    match = _DURABLE_FACTS_RE.search(summary_text)
+    if not match:
+        return []
+    facts_section = match.group(1).strip()
+    if not facts_section or facts_section.lower() in ("none.", "none"):
+        return []
+    facts: list[str] = []
+    for line in facts_section.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Remove list markers: "1. ", "2. ", "- ", "* ", etc.
+        cleaned = re.sub(
+            r'^[\d]+\.\s*|^[-*\u2022]\s*|^\[\s*[\d]+\s*\]\s*',
+            "",
+            stripped,
+        ).strip()
+        if cleaned and cleaned.lower() not in ("none.", "none"):
+            facts.append(cleaned)
+    return facts
