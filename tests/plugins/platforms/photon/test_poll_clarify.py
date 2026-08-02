@@ -124,10 +124,14 @@ async def test_send_clarify_with_choices_sends_native_poll(
     adapter = _make_adapter(monkeypatch)
     poll_calls = _stub_sidecar_poll(adapter, monkeypatch)
 
-    marked: List[str] = []
+    marked: List[Tuple[str, Dict[str, Any]]] = []
     import tools.clarify_gateway as cg
 
-    monkeypatch.setattr(cg, "mark_awaiting_text", lambda cid: marked.append(cid))
+    monkeypatch.setattr(
+        cg,
+        "mark_awaiting_text",
+        lambda cid, **identity: marked.append((cid, identity)),
+    )
 
     result = await adapter.send_clarify(
         chat_id="+155****4567",
@@ -135,6 +139,8 @@ async def test_send_clarify_with_choices_sends_native_poll(
         choices=["A", "B", "C"],
         clarify_id="clar-1",
         session_key="sess-1",
+        generation=4,
+        responder_id="user-1",
     )
 
     assert result.success
@@ -144,6 +150,14 @@ async def test_send_clarify_with_choices_sends_native_poll(
     assert title == "Pick one"
     assert options == ["A", "B", "C"]
     # The vote returns as text, so text-capture must be enabled.
-    assert marked == ["clar-1"]
-
+    assert marked == [
+        (
+            "clar-1",
+            {
+                "session_key": "sess-1",
+                "generation": 4,
+                "responder_id": "user-1",
+            },
+        )
+    ]
 

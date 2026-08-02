@@ -338,13 +338,13 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # each dict is FIFO-capped via _bounded_put (oldest pending prompt
         # evicted first — an evicted button tap degrades to the plain-text
         # fallback path, same as after a gateway restart).
-        #   _clarify_state:        clarify_id → session_key (resolves via
-        #                          tools.clarify_gateway.resolve_gateway_clarify)
+        #   _clarify_state:        clarify_id → exact structural callback
+        #                          identity for resolve_gateway_clarify
         #   _exec_approval_state:  approval_id → session_key (resolves via
         #                          tools.approval.resolve_gateway_approval)
         #   _slash_confirm_state:  confirm_id → session_key (resolves via
         #                          tools.slash_confirm.resolve)
-        self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
+        self._clarify_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
         self._slash_confirm_state: "OrderedDict[str, str]" = OrderedDict()
 
@@ -762,6 +762,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Render a clarify prompt as native WhatsApp interactive buttons.
 
@@ -839,7 +842,18 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         result = await self._post_interactive(chat_id, interactive, reply_to=reply_to)
         if result.success:
-            self._bounded_put(self._clarify_state, clarify_id, session_key)
+            self._bounded_put(
+                self._clarify_state,
+                clarify_id,
+                {
+                    "session_key": session_key,
+                    "chat_id": str(chat_id),
+                    "generation": generation,
+                    "responder_id": (
+                        str(responder_id) if responder_id is not None else None
+                    ),
+                },
+            )
         return result
 
     async def send_exec_approval(
@@ -1705,14 +1719,36 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if len(parts) != 3:
                 return False
             _, clarify_id, choice = parts
-            session_key = self._clarify_state.pop(clarify_id, None)
-            if not session_key:
+            clarify_state = self._clarify_state.get(clarify_id)
+            if not isinstance(clarify_state, dict):
                 logger.info(
                     "[whatsapp_cloud] clarify tap with no matching state "
                     "(clarify_id=%s) — likely stale; falling back to text",
                     clarify_id,
                 )
                 return False
+            expected_responder_id = clarify_state.get("responder_id")
+            expected_chat_id = str(clarify_state.get("chat_id") or "")
+            if expected_chat_id and sender_id != expected_chat_id:
+                logger.warning(
+                    "[whatsapp_cloud] clarify tap rejected for non-matching "
+                    "chat (clarify_id=%s)",
+                    clarify_id,
+                )
+                return True
+            if (
+                expected_responder_id is not None
+                and sender_id != str(expected_responder_id)
+            ):
+                logger.warning(
+                    "[whatsapp_cloud] clarify tap rejected for non-matching "
+                    "responder (clarify_id=%s)",
+                    clarify_id,
+                )
+                return True
+            self._clarify_state.pop(clarify_id, None)
+            session_key = str(clarify_state.get("session_key") or "")
+            generation = clarify_state.get("generation")
             try:
                 from tools.clarify_gateway import resolve_gateway_clarify
             except ImportError:
@@ -1733,7 +1769,12 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 # current task" loop.
                 try:
                     from tools.clarify_gateway import mark_awaiting_text
-                    flipped = mark_awaiting_text(clarify_id)
+                    flipped = mark_awaiting_text(
+                        clarify_id,
+                        session_key=session_key,
+                        generation=generation,
+                        responder_id=sender_id,
+                    )
                 except Exception:
                     logger.exception(
                         "[whatsapp_cloud] mark_awaiting_text failed for %s",
@@ -1754,7 +1795,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 # Put state back since we popped it earlier — keep the
                 # clarify_id → session_key mapping live in case future
                 # taps land on the same prompt.
-                self._clarify_state[clarify_id] = session_key
+                self._clarify_state[clarify_id] = clarify_state
                 try:
                     await self.send(
                         str(raw_message.get("from") or ""),
@@ -1771,7 +1812,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     choice,
                 )
                 # Put state back so a follow-up text can still resolve.
-                self._clarify_state[clarify_id] = session_key
+                self._clarify_state[clarify_id] = clarify_state
                 return False
             # Use the title text as the resolved response so the agent
             # sees the human-readable answer, not the index. Title is
@@ -1780,7 +1821,13 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # persist that. Fall back to passing the index; the agent
             # has the prompt in context and can interpret it.
             response_text = str(inner.get("title") or str(idx + 1))
-            resolved = resolve_gateway_clarify(clarify_id, response_text)
+            resolved = resolve_gateway_clarify(
+                clarify_id,
+                response_text,
+                session_key=session_key,
+                generation=generation,
+                responder_id=sender_id,
+            )
             if not resolved:
                 # Resolver couldn't find a waiter (e.g. agent already
                 # timed out). Fall through to text dispatch.

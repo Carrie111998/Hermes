@@ -960,7 +960,12 @@ class TestSendClarifyButtons:
         assert buttons[2]["reply"]["id"] == "cl:abc123:2"
         body_text = payload["interactive"]["body"]["text"]
         assert "Alpha" in body_text and "Bravo" in body_text and "Charlie" in body_text
-        assert adapter._clarify_state["abc123"] == "sess-1"
+        assert adapter._clarify_state["abc123"] == {
+            "session_key": "sess-1",
+            "chat_id": "15551234567",
+            "generation": None,
+            "responder_id": None,
+        }
 
 
 class TestSendExecApprovalButtons:
@@ -1043,7 +1048,12 @@ class TestDispatchInteractiveReplyClarify:
         user's next message would collide with the still-blocked agent
         thread, producing an "Interrupting current task" loop."""
         adapter = _make_adapter()
-        adapter._clarify_state["q1"] = "sess-1"
+        adapter._clarify_state["q1"] = {
+            "session_key": "sess-1",
+            "chat_id": "15551234567",
+            "generation": None,
+            "responder_id": None,
+        }
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(
             return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
@@ -1052,7 +1062,7 @@ class TestDispatchInteractiveReplyClarify:
         flipped_ids = []
         monkeypatch.setattr(
             "tools.clarify_gateway.mark_awaiting_text",
-            lambda cid: flipped_ids.append(cid) or True,
+            lambda cid, **_identity: flipped_ids.append(cid) or True,
         )
 
         raw = {
@@ -1067,7 +1077,12 @@ class TestDispatchInteractiveReplyClarify:
 
         assert handled is True
         # State stays so text-intercept can resolve the next message
-        assert adapter._clarify_state.get("q1") == "sess-1"
+        assert adapter._clarify_state.get("q1") == {
+            "session_key": "sess-1",
+            "chat_id": "15551234567",
+            "generation": None,
+            "responder_id": None,
+        }
         # mark_awaiting_text was called with the right clarify_id
         assert flipped_ids == ["q1"]
         # Follow-up "type your answer" prompt was sent
@@ -1216,10 +1231,15 @@ class TestInteractiveReplyEndToEnd:
     @pytest.mark.asyncio
     async def test_recognized_tap_returns_none_no_text_dispatch(self, monkeypatch):
         adapter = _make_adapter()
-        adapter._clarify_state["q1"] = "sess-1"
+        adapter._clarify_state["q1"] = {
+            "session_key": "sess-1",
+            "chat_id": "15551234567",
+            "generation": None,
+            "responder_id": None,
+        }
         monkeypatch.setattr(
             "tools.clarify_gateway.resolve_gateway_clarify",
-            lambda cid, r: True,
+            lambda cid, r, **_identity: True,
         )
 
         raw = {
@@ -1399,4 +1419,3 @@ class TestReplyContextResolution:
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
         assert event.reply_to_is_own_message is False
-

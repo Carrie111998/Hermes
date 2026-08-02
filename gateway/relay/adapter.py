@@ -1841,6 +1841,9 @@ class RelayAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Native-button clarify over the relay (Phase 3).
 
@@ -1868,6 +1871,10 @@ class RelayAdapter(BasePlatformAdapter):
                     "clarify_id": clarify_id,
                     "choices": [str(c) for c in choices],
                     "chat_id": str(chat_id),
+                    "generation": generation,
+                    "responder_id": (
+                        str(responder_id) if responder_id is not None else None
+                    ),
                 },
             )
             result = await self._send_prompt(
@@ -1882,7 +1889,14 @@ class RelayAdapter(BasePlatformAdapter):
                 return result
             self._pending_prompts.pop(prompt_id, None)
         return await super().send_clarify(
-            chat_id, question, choices, clarify_id, session_key, metadata=metadata
+            chat_id,
+            question,
+            choices,
+            clarify_id,
+            session_key,
+            metadata=metadata,
+            generation=generation,
+            responder_id=responder_id,
         )
 
     async def _consume_prompt_response(self, event) -> bool:
@@ -1902,6 +1916,35 @@ class RelayAdapter(BasePlatformAdapter):
         option_id = str(pr.get("option_id") or "")
         if not prompt_id or not option_id:
             return False
+        # Validate the structural callback origin before consuming the prompt.
+        # A mismatched relay frame must neither resolve nor destroy the real
+        # user's still-pending prompt.
+        preview = self._pending_prompts.get(prompt_id)
+        if isinstance(preview, dict):
+            actual_chat_id = str(getattr(event.source, "chat_id", "") or "")
+            expected_chat_id = str(preview.get("chat_id") or "")
+            if expected_chat_id and actual_chat_id != expected_chat_id:
+                logger.warning(
+                    "relay prompt_response rejected for non-matching chat "
+                    "(prompt=%s)",
+                    prompt_id,
+                )
+                return True
+            if preview.get("kind") == "clarify":
+                expected_responder = preview.get("responder_id")
+                actual_responder = str(
+                    getattr(event.source, "user_id", "") or ""
+                )
+                if (
+                    expected_responder is not None
+                    and actual_responder != str(expected_responder)
+                ):
+                    logger.warning(
+                        "relay clarify response rejected for non-matching "
+                        "responder (prompt=%s)",
+                        prompt_id,
+                    )
+                    return True
         state = self._pop_prompt(prompt_id)
         if state is None:
             logger.info(
@@ -1971,11 +2014,22 @@ class RelayAdapter(BasePlatformAdapter):
                 )
 
                 clarify_id = str(state.get("clarify_id") or "")
+                generation = state.get("generation")
+                responder_id = getattr(event.source, "user_id", None)
                 if option_id == "other":
-                    mark_awaiting_text(clarify_id)
+                    flipped = mark_awaiting_text(
+                        clarify_id,
+                        session_key=session_key,
+                        generation=generation,
+                        responder_id=responder_id,
+                    )
                     await self.send(
                         chat_id,
-                        "✏️ Type your answer:",
+                        (
+                            "✏️ Type your answer:"
+                            if flipped
+                            else "⌛ Clarification expired or was rejected."
+                        ),
                         metadata=self._prompt_reply_metadata(event),
                     )
                 else:
@@ -1985,16 +2039,31 @@ class RelayAdapter(BasePlatformAdapter):
                     except ValueError:
                         idx = -1
                     if 0 <= idx < len(choices):
-                        resolve_gateway_clarify(clarify_id, str(choices[idx]))
+                        resolved = resolve_gateway_clarify(
+                            clarify_id,
+                            str(choices[idx]),
+                            session_key=session_key,
+                            generation=generation,
+                            responder_id=responder_id,
+                        )
                         await self.send(
                             chat_id,
-                            f"✅ {choices[idx]}",
+                            (
+                                f"✅ {choices[idx]}"
+                                if resolved
+                                else "⌛ Clarification expired or was rejected."
+                            ),
                             metadata=self._prompt_reply_metadata(event),
                         )
                     else:
                         # Unmappable option: flip to text capture so the user
                         # can answer by typing (never dead-end a clarify).
-                        mark_awaiting_text(clarify_id)
+                        mark_awaiting_text(
+                            clarify_id,
+                            session_key=session_key,
+                            generation=generation,
+                            responder_id=responder_id,
+                        )
             else:
                 logger.warning("relay prompt_response with unknown kind %r", kind)
         except Exception:  # noqa: BLE001 - a resolver failure must not kill the reader

@@ -856,9 +856,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
-        # Clarify button state: clarify_id → session_key (for the clarify tool's
-        # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
-        self._clarify_state: Dict[str, str] = {}
+        # Clarify button state: clarify_id → exact structural callback
+        # identity for the clarify tool's multiple-choice prompts.
+        self._clarify_state: Dict[str, Dict[str, Any]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -5539,6 +5539,9 @@ class TelegramAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Render a clarify prompt with one inline button per choice.
 
@@ -5607,7 +5610,14 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
-            self._clarify_state[clarify_id] = session_key
+            self._clarify_state[clarify_id] = {
+                "session_key": session_key,
+                "chat_id": str(normalize_telegram_chat_id(chat_id)),
+                "generation": generation,
+                "responder_id": (
+                    str(responder_id) if responder_id is not None else None
+                ),
+            }
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
@@ -6519,9 +6529,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
-                session_key = self._clarify_state.get(clarify_id)
-                if not session_key:
+                clarify_state = self._clarify_state.get(clarify_id)
+                if not isinstance(clarify_state, dict):
                     await query.answer(text="This prompt has already been resolved.")
+                    return
+                session_key = str(clarify_state.get("session_key") or "")
+                generation = clarify_state.get("generation")
+                expected_chat_id = str(clarify_state.get("chat_id") or "")
+                if expected_chat_id and str(query_chat_id) != expected_chat_id:
+                    await query.answer(
+                        text="This prompt cannot be answered from this chat."
+                    )
+                    return
+                expected_responder_id = clarify_state.get("responder_id")
+                if (
+                    expected_responder_id is not None
+                    and caller_id != str(expected_responder_id)
+                ):
+                    await query.answer(
+                        text="You're not authorized to answer this prompt."
+                    )
                     return
 
                 user_display = getattr(query.from_user, "first_name", "User")
@@ -6536,7 +6563,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     flipped = False
                     try:
                         from tools.clarify_gateway import mark_awaiting_text
-                        flipped = mark_awaiting_text(clarify_id)
+                        flipped = mark_awaiting_text(
+                            clarify_id,
+                            session_key=session_key,
+                            generation=generation,
+                            responder_id=caller_id,
+                        )
                     except Exception as exc:
                         logger.warning("[%s] mark_awaiting_text failed: %s", self.name, exc)
 
@@ -6587,7 +6619,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._clarify_state.pop(clarify_id, None)
                 try:
                     from tools.clarify_gateway import resolve_gateway_clarify
-                    resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+                    resolved = resolve_gateway_clarify(
+                        clarify_id,
+                        resolved_text,
+                        session_key=session_key,
+                        generation=generation,
+                        responder_id=caller_id,
+                    )
                 except Exception as exc:
                     logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
                     resolved = False

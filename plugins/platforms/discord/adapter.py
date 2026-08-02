@@ -8424,6 +8424,9 @@ class DiscordAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Render a clarify prompt with one Discord button per choice.
 
@@ -8518,6 +8521,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
+                    session_key=session_key,
+                    generation=generation,
+                    responder_id=responder_id,
                 )
             else:
                 embed.add_field(
@@ -10648,12 +10654,20 @@ def _define_discord_view_classes() -> None:
             clarify_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            session_key: str = "",
+            generation: Optional[int] = None,
+            responder_id: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.session_key = str(session_key or "")
+            self.generation = generation
+            self.responder_id = (
+                str(responder_id) if responder_id is not None else None
+            )
             self.resolved = False
 
             for index, choice in enumerate(self.choices):
@@ -10716,14 +10730,70 @@ def _define_discord_view_classes() -> None:
             self.add_item(other_btn)
 
         def _check_auth(self, interaction: "discord.Interaction") -> bool:
-            return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            if not _component_check_auth(
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+            ):
+                return False
+            actual_user_id = str(
+                getattr(getattr(interaction, "user", None), "id", "")
+            )
+            return (
+                self.responder_id is None
+                or actual_user_id == self.responder_id
             )
 
         def _make_choice_callback(self, index: int, choice: str):
             async def _callback(interaction: "discord.Interaction"):
                 await self._resolve_choice(interaction, index, choice)
             return _callback
+
+        async def _preflight_public_mutation(
+            self,
+            interaction: "discord.Interaction",
+        ) -> tuple[bool, bool]:
+            """Close the public-channel permission race without accepting yet.
+
+            Public-only mode re-checks visibility after one Discord response
+            boundary.  The preflight deliberately keeps the current orange
+            prompt and enabled controls unchanged; only the later exact core
+            transition is allowed to produce accepted UI.
+            """
+            if not _discord_public_only_policy_required():
+                return True, False
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                logger.debug(
+                    "Discord clarify public preflight failed for %s",
+                    self.clarify_id,
+                    exc_info=True,
+                )
+                return False, True
+            if _discord_policy_public_target_error(
+                getattr(interaction, "channel", None)
+            ):
+                return False, True
+            return True, True
+
+        async def _show_rejected(
+            self,
+            interaction: "discord.Interaction",
+            *,
+            response_consumed: bool,
+        ) -> None:
+            message = "This prompt expired or the response was rejected."
+            if response_consumed:
+                followup = getattr(interaction, "followup", None)
+                send = getattr(followup, "send", None)
+                if callable(send):
+                    await send(message, ephemeral=True)
+                return
+            await interaction.response.send_message(message, ephemeral=True)
 
         async def _resolve_choice(
             self,
@@ -10743,35 +10813,19 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-
-            embed = interaction.message.embeds[0] if (
-                interaction.message and interaction.message.embeds
-            ) else None
-            if embed:
-                user = getattr(interaction, "user", None)
-                display_name = getattr(user, "display_name", "user")
-                embed.color = discord.Color.green()
-                embed.set_footer(text=f"Answered by {display_name}: {choice}")
-
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                logger.debug(
-                    "Discord clarify edit_message failed for %s",
-                    self.clarify_id,
-                    exc_info=True,
-                )
-                try:
-                    await interaction.response.defer()
-                except Exception:
-                    pass
-
             if _discord_policy_public_target_error(
                 getattr(interaction, "channel", None)
             ):
+                await interaction.response.send_message(
+                    "This prompt cannot be answered from this location.",
+                    ephemeral=True,
+                )
+                return
+
+            preflight_ok, response_consumed = (
+                await self._preflight_public_mutation(interaction)
+            )
+            if not preflight_ok:
                 return
 
             # Resolve via the gateway clarify primitive — same mechanism as
@@ -10790,7 +10844,15 @@ def _define_discord_view_classes() -> None:
 
             try:
                 from tools.clarify_gateway import resolve_gateway_clarify
-                resolved = resolve_gateway_clarify(self.clarify_id, resolved_text)
+                resolved = resolve_gateway_clarify(
+                    self.clarify_id,
+                    resolved_text,
+                    session_key=self.session_key,
+                    generation=self.generation,
+                    responder_id=str(
+                        getattr(getattr(interaction, "user", None), "id", "")
+                    ),
+                )
                 logger.info(
                     "Discord clarify button resolved (id=%s, choice=%r, user=%s, ok=%s)",
                     self.clarify_id, resolved_text,
@@ -10798,10 +10860,50 @@ def _define_discord_view_classes() -> None:
                     resolved,
                 )
             except Exception as exc:
+                resolved = False
                 logger.error(
                     "Discord clarify resolve_gateway_clarify failed (id=%s): %s",
                     self.clarify_id, exc,
                 )
+
+            if not resolved:
+                await self._show_rejected(
+                    interaction,
+                    response_consumed=response_consumed,
+                )
+                return
+
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            if embed:
+                user = getattr(interaction, "user", None)
+                display_name = getattr(user, "display_name", "user")
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Answered by {display_name}: {choice}")
+
+            try:
+                if response_consumed:
+                    await interaction.edit_original_response(
+                        embed=embed,
+                        view=self,
+                    )
+                else:
+                    await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                logger.debug(
+                    "Discord clarify edit_message failed for %s",
+                    self.clarify_id,
+                    exc_info=True,
+                )
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
 
         async def _on_other(self, interaction: "discord.Interaction") -> None:
             """Flip the clarify entry into text-capture mode."""
@@ -10816,17 +10918,47 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            if _discord_policy_public_target_error(
+                getattr(interaction, "channel", None)
+            ):
+                await interaction.response.send_message(
+                    "This prompt cannot be answered from this location.",
+                    ephemeral=True,
+                )
+                return
+
+            preflight_ok, response_consumed = (
+                await self._preflight_public_mutation(interaction)
+            )
+            if not preflight_ok:
+                return
+
             # Don't pop the entry — the gateway's text-intercept needs it
             # until the user actually types. Just mark it as awaiting text
             # and disable the buttons so the user can't double-click.
             try:
                 from tools.clarify_gateway import mark_awaiting_text
-                mark_awaiting_text(self.clarify_id)
+                flipped = mark_awaiting_text(
+                    self.clarify_id,
+                    session_key=self.session_key,
+                    generation=self.generation,
+                    responder_id=str(
+                        getattr(getattr(interaction, "user", None), "id", "")
+                    ),
+                )
             except Exception as exc:
+                flipped = False
                 logger.warning(
                     "Discord clarify mark_awaiting_text failed (id=%s): %s",
                     self.clarify_id, exc,
                 )
+
+            if not flipped:
+                await self._show_rejected(
+                    interaction,
+                    response_consumed=response_consumed,
+                )
+                return
 
             self.resolved = True
             for child in self.children:
@@ -10844,7 +10976,13 @@ def _define_discord_view_classes() -> None:
                 )
 
             try:
-                await interaction.response.edit_message(embed=embed, view=self)
+                if response_consumed:
+                    await interaction.edit_original_response(
+                        embed=embed,
+                        view=self,
+                    )
+                else:
+                    await interaction.response.edit_message(embed=embed, view=self)
             except Exception:
                 try:
                     await interaction.response.defer()

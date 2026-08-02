@@ -100,6 +100,39 @@ class FailingClarifyAdapter(ProgressCaptureAdapter):
         return SendResult(success=False, error="delivery failed")
 
 
+class ResolveThenFailClarifyAdapter(ProgressCaptureAdapter):
+    """Resolves first, then reports a failed/timed-out delivery future."""
+
+    def __init__(self, *, raise_timeout: bool):
+        super().__init__(platform=Platform.DISCORD)
+        self.raise_timeout = raise_timeout
+
+    async def send_clarify(
+        self,
+        chat_id,
+        question,
+        choices,
+        clarify_id,
+        session_key,
+        metadata=None,
+        *,
+        generation=None,
+        responder_id=None,
+    ) -> SendResult:
+        from tools.clarify_gateway import resolve_gateway_clarify
+
+        assert resolve_gateway_clarify(
+            clarify_id,
+            "winner",
+            session_key=session_key,
+            generation=generation,
+            responder_id=responder_id,
+        )
+        if self.raise_timeout:
+            raise TimeoutError("delivery future timed out after callback")
+        return SendResult(success=False, error="late delivery failure")
+
+
 class ClarifyThenToolAgent:
     """Emits a clarify tool.started (with raw args) then a normal tool."""
 
@@ -290,6 +323,7 @@ async def test_gateway_never_classifies_clarify_question_text(
     """Every model-authored clarify call reaches the user unchanged."""
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    adapter.clarify_identity_version = "malformed-third-party-capability"
     adapter.clarify_response = response
     runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, "off")
@@ -306,6 +340,7 @@ async def test_gateway_never_classifies_clarify_question_text(
         chat_id="C1",
         chat_type="dm",
     )
+    run_generation = runner._begin_session_run_generation(session_key)
     result = await runner._run_agent(
         message="finish the task",
         context_prompt="",
@@ -313,6 +348,7 @@ async def test_gateway_never_classifies_clarify_question_text(
         source=source,
         session_id="sess-llm-semantic-authority",
         session_key=session_key,
+        run_generation=run_generation,
     )
 
     assert result["final_response"] == response
@@ -329,6 +365,47 @@ async def test_gateway_never_classifies_clarify_question_text(
         session_key,
         include_choice_prompts=True,
     ) is None
+
+
+def test_gateway_generation_owner_cancels_old_prompt_and_rejects_stale_worker(
+    tmp_path,
+):
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+        clarify_gateway._current_generations.clear()
+
+    runner = _make_runner(ProgressCaptureAdapter(), tmp_path)
+    session_key = "agent:main:slack:dm:generation-owner"
+    first = runner._begin_session_run_generation(session_key)
+    clarify_gateway.register(
+        "old-generation",
+        session_key,
+        "Old?",
+        ["A"],
+        generation=first,
+        identity_v1=True,
+    )
+
+    second = runner._begin_session_run_generation(session_key)
+    assert second == first + 1
+    assert clarify_gateway.wait_for_response(
+        "old-generation",
+        timeout=0.01,
+        session_key=session_key,
+        generation=first,
+    ) is None
+    with pytest.raises(ValueError, match="stale clarify generation"):
+        clarify_gateway.register(
+            "late-old-worker",
+            session_key,
+            "Late?",
+            ["A"],
+            generation=first,
+            identity_v1=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -379,3 +456,50 @@ async def test_failed_clarify_delivery_cancels_only_exact_request(
     assert result["final_response"] == (
         "[clarify prompt could not be delivered]|sibling=True"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_timeout", [False, True])
+async def test_resolver_winner_survives_late_delivery_failure_without_leak(
+    monkeypatch,
+    tmp_path,
+    raise_timeout,
+):
+    """A callback answer wins even if the send future later fails or times out."""
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+        clarify_gateway._current_generations.clear()
+
+    adapter = ResolveThenFailClarifyAdapter(raise_timeout=raise_timeout)
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = _install_fakes(monkeypatch, "off")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RoutineClarifyAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    session_key = "agent:main:discord:dm:C-race"
+    run_generation = runner._begin_session_run_generation(session_key)
+    result = await runner._run_agent(
+        message="start",
+        context_prompt="",
+        history=[],
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="C-race",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+        session_id="sess-resolve-delivery-race",
+        session_key=session_key,
+        run_generation=run_generation,
+    )
+
+    assert result["final_response"] == "winner"
+    with clarify_gateway._lock:
+        assert not clarify_gateway._entries
+        assert session_key not in clarify_gateway._session_index

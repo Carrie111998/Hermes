@@ -2441,6 +2441,7 @@ class APIServerAdapter(BasePlatformAdapter):
             Dict[str, Any],
         ] = {}
         self._api_clarifications_lock = threading.RLock()
+        self._api_clarify_generations: Dict[str, int] = {}
         self._api_pending_approvals: Dict[
             APIRequestScope,
             Dict[str, Any],
@@ -3239,12 +3240,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 clarify_id,
             ).internal_key
             normalized_choices = list(choices) if choices else None
-            clarify_gateway.register(
-                clarify_id=core_clarify_id,
-                session_key=scope,
-                question=question,
-                choices=normalized_choices,
-            )
+            with self._api_clarifications_lock:
+                clarify_generation = (
+                    int(self._api_clarify_generations.get(scope, 0)) + 1
+                )
+                self._api_clarify_generations[scope] = clarify_generation
+                # Serialize generation publication with registration for this
+                # API scope.  Without the outer lock, two concurrent callbacks
+                # could publish 2 then 1 before either registers.
+                clarify_gateway.update_session_generation(
+                    scope,
+                    clarify_generation,
+                )
+                clarify_gateway.register(
+                    clarify_id=core_clarify_id,
+                    session_key=scope,
+                    question=question,
+                    choices=normalized_choices,
+                    generation=clarify_generation,
+                    identity_v1=True,
+                )
             public_state = {
                 "id": clarify_id,
                 "object": "hermes.clarification",
@@ -3259,6 +3274,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "_scope": scope,
                 "_request_scope": session_scope,
                 "_core_clarify_id": core_clarify_id,
+                "_core_generation": clarify_generation,
             }
             clarification_scope = session_scope.bind(
                 "clarification-id",
@@ -3282,6 +3298,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 response = clarify_gateway.wait_for_response(
                     core_clarify_id,
                     timeout=float(timeout),
+                    session_key=scope,
+                    generation=clarify_generation,
                 )
                 if response is None or response == "":
                     return f"[user did not respond within {int(timeout / 60)}m]"
@@ -6403,6 +6421,7 @@ class APIServerAdapter(BasePlatformAdapter):
             core_clarify_id = str(
                 state.get("_core_clarify_id") or ""
             )
+            core_generation = state.get("_core_generation")
 
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
@@ -6410,6 +6429,12 @@ class APIServerAdapter(BasePlatformAdapter):
             resolved = resolve_gateway_clarify(
                 core_clarify_id,
                 response_text,
+                session_key=clarify_scope.internal_key,
+                generation=(
+                    int(core_generation)
+                    if core_generation is not None
+                    else None
+                ),
             )
         except Exception:
             resolved = False

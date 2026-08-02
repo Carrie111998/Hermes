@@ -21,6 +21,7 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
+        cm._current_generations.clear()
         cm._notify_cbs.clear()
 
 
@@ -83,6 +84,7 @@ class TestClarifyPrimitive:
             ["A"],
             generation=17,
             responder_id="user-1",
+            identity_v1=True,
         )
         exact = {
             "session_key": "sk-identity",
@@ -98,8 +100,148 @@ class TestClarifyPrimitive:
         assert cm.resolve_gateway_clarify(
             "identity", "A", **{**exact, "responder_id": "user-2"}
         ) is False
+        assert cm.resolve_gateway_clarify(
+            "identity",
+            "A",
+            session_key="sk-identity",
+            generation="not-an-integer",
+            responder_id="user-1",
+        ) is False
+        assert cm.resolve_gateway_clarify(
+            "identity", "A", generation=17, responder_id="user-1"
+        ) is False
         assert cm.resolve_gateway_clarify("identity", "A", **exact) is True
-        assert cm.wait_for_response("identity", timeout=1.0) == "A"
+        assert cm.wait_for_response(
+            "identity",
+            timeout=1.0,
+            session_key="sk-identity",
+            generation=17,
+        ) == "A"
+
+    def test_shared_identity_v1_session_does_not_invent_one_responder(self):
+        from tools import clarify_gateway as cm
+
+        cm.update_session_generation("sk-shared", 5)
+        cm.register(
+            "shared-prompt",
+            "sk-shared",
+            "Q?",
+            ["A"],
+            generation=5,
+            responder_id=None,
+            identity_v1=True,
+        )
+        assert cm.resolve_gateway_clarify(
+            "shared-prompt",
+            "A",
+            session_key="sk-shared",
+            generation=5,
+            responder_id="structural-participant-2",
+        ) is True
+
+    def test_identity_v1_registration_requires_session_and_generation(self):
+        from tools import clarify_gateway as cm
+
+        with pytest.raises(ValueError, match="requires session_key and generation"):
+            cm.register(
+                "missing-session",
+                "",
+                "Q?",
+                ["A"],
+                generation=1,
+                identity_v1=True,
+            )
+        with pytest.raises(ValueError, match="requires session_key and generation"):
+            cm.register(
+                "missing-generation",
+                "sk",
+                "Q?",
+                ["A"],
+                identity_v1=True,
+            )
+
+    def test_generation_boundary_cancels_old_and_rejects_stale_worker(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.update_session_generation("sk-generation", 7) == 0
+        cm.register(
+            "old-button",
+            "sk-generation",
+            "Old?",
+            ["A"],
+            generation=7,
+            identity_v1=True,
+        )
+
+        assert cm.update_session_generation("sk-generation", 8) == 1
+        assert cm.resolve_gateway_clarify(
+            "old-button",
+            "A",
+            session_key="sk-generation",
+            generation=7,
+        ) is False
+        with pytest.raises(ValueError, match="stale clarify generation"):
+            cm.register(
+                "stale-worker",
+                "sk-generation",
+                "Stale?",
+                ["A"],
+                generation=7,
+                identity_v1=True,
+            )
+
+        cm.register(
+            "current-button",
+            "sk-generation",
+            "Current?",
+            ["B"],
+            generation=8,
+            identity_v1=True,
+        )
+        assert cm.resolve_gateway_clarify(
+            "current-button",
+            "B",
+            session_key="sk-generation",
+            generation=8,
+        ) is True
+        assert cm.wait_for_response(
+            "current-button",
+            timeout=1.0,
+            session_key="sk-generation",
+            generation=8,
+        ) == "B"
+
+    def test_failed_delivery_consumes_answered_winner_without_leak(self):
+        from tools import clarify_gateway as cm
+
+        cm.update_session_generation("sk-delivery-race", 3)
+        cm.register(
+            "delivery-race",
+            "sk-delivery-race",
+            "Q?",
+            ["A"],
+            generation=3,
+            identity_v1=True,
+        )
+        assert cm.resolve_gateway_clarify(
+            "delivery-race",
+            "A",
+            session_key="sk-delivery-race",
+            generation=3,
+        ) is True
+
+        result = cm.complete_failed_delivery(
+            "delivery-race",
+            session_key="sk-delivery-race",
+            generation=3,
+        )
+        assert result is not None
+        assert result.answered is True
+        assert result.response == "A"
+        assert result.transitioned is False
+        with cm._lock:
+            assert "delivery-race" not in cm._entries
+            assert "sk-delivery-race" not in cm._session_index
 
     def test_duplicate_id_cannot_replace_live_request(self):
         """A duplicate id cannot redirect a response into another request."""

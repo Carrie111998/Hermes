@@ -1117,6 +1117,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         """Render multiple-choice clarify as a native WhatsApp poll.
 
@@ -1148,6 +1151,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             clarify_id=clarify_id,
             session_key=session_key,
             metadata=metadata,
+            generation=generation,
+            responder_id=responder_id,
         )
 
     async def send_location(

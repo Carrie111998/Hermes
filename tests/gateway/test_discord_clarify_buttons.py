@@ -51,6 +51,7 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
+        cm._current_generations.clear()
         cm._notify_cbs.clear()
 
 
@@ -162,6 +163,62 @@ class TestClarifyChoiceResolve:
             entry = cm._entries.get("cidC")
         assert entry is not None
         assert not entry.event.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resolver_result", [True, False])
+    async def test_accepted_ui_is_only_rendered_after_exact_resolver_wins(
+        self,
+        monkeypatch,
+        resolver_result,
+    ):
+        from tools import clarify_gateway as cm
+
+        cm.update_session_generation("sk-order", 9)
+        cm.register(
+            "cid-order",
+            "sk-order",
+            "Pick",
+            ["x"],
+            generation=9,
+            responder_id="42",
+            identity_v1=True,
+        )
+        view = ClarifyChoiceView(
+            choices=["x"],
+            clarify_id="cid-order",
+            allowed_user_ids={"42"},
+            session_key="sk-order",
+            generation=9,
+            responder_id="42",
+        )
+        interaction = _make_interaction(user_id="42")
+        observed = []
+        original_resolve = cm.resolve_gateway_clarify
+
+        def _resolve(*args, **kwargs):
+            # No green/disabled accepted state may be visible before the
+            # authority transition succeeds.
+            assert view.resolved is False
+            interaction.response.edit_message.assert_not_called()
+            interaction.response.send_message.assert_not_called()
+            observed.append((args, kwargs))
+            if resolver_result:
+                return original_resolve(*args, **kwargs)
+            return False
+
+        monkeypatch.setattr(cm, "resolve_gateway_clarify", _resolve)
+        await view._resolve_choice(interaction, index=0, choice="x")
+
+        assert len(observed) == 1
+        if resolver_result:
+            assert view.resolved is True
+            interaction.response.edit_message.assert_called_once()
+            interaction.response.send_message.assert_not_called()
+        else:
+            assert view.resolved is False
+            interaction.response.edit_message.assert_not_called()
+            interaction.response.send_message.assert_called_once()
+            assert interaction.response.send_message.call_args.kwargs["ephemeral"]
 
 
 # ===========================================================================

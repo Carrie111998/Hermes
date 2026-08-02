@@ -1946,18 +1946,33 @@ class PhotonAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         if not choices:
             # No choices → open-ended. Base behaviour (plain text; the next
             # message resolves it) is exactly right.
             return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
+                chat_id,
+                question,
+                choices,
+                clarify_id,
+                session_key,
+                metadata,
+                generation=generation,
+                responder_id=responder_id,
             )
         # The poll vote comes back as a normal text message, so enable
         # text-capture and let the gateway intercept resolve the clarify.
         from tools.clarify_gateway import mark_awaiting_text
 
-        mark_awaiting_text(clarify_id)
+        mark_awaiting_text(
+            clarify_id,
+            session_key=session_key,
+            generation=generation,
+            responder_id=responder_id,
+        )
         result = await self._sidecar_send_poll(chat_id, question, list(choices))
         if not result.success:
             # Native poll failed (old sidecar without /send-poll, or a send
@@ -1969,7 +1984,14 @@ class PhotonAdapter(BasePlatformAdapter):
                 result.error,
             )
             return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
+                chat_id,
+                question,
+                choices,
+                clarify_id,
+                session_key,
+                metadata,
+                generation=generation,
+                responder_id=responder_id,
             )
         return result
 
