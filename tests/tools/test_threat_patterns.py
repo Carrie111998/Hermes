@@ -196,6 +196,39 @@ class TestInvisibleUnicode:
         assert any(f.startswith("invisible_unicode_U+200B") for f in findings)
 
 
+    def test_zwj_inside_emoji_sequence_allowed(self):
+        # 🏄‍♂️ (surfer) and 👨‍👩‍👧‍👦 (family) use U+200D as part of the
+        # standard emoji ZWJ sequence — legitimate, not an injection.
+        surfer = "\U0001F3C4\u200d\u2642\ufe0f"   # 🏄 + ZWJ + ♂ + VS16
+        family = "\U0001F468\u200d\U0001F469\u200d\U0001F467\u200d\U0001F466"
+        for text in (f"surfing {surfer}!", f"family {family} out"):
+            findings = scan_for_threats(text, scope="all")
+            assert not any(
+                f.startswith("invisible_unicode_U+200D") for f in findings
+            ), (text, findings)
+
+
+    def test_bare_zwj_between_ascii_still_detected(self):
+        # A ZWJ glued between plain letters is the classic hiding trick.
+        findings = scan_for_threats("pay\u200dload", scope="all")
+        assert any(f.startswith("invisible_unicode_U+200D") for f in findings)
+
+
+    def test_zwj_mixed_emoji_and_bare_still_detected(self):
+        # One legitimate emoji ZWJ must not mask a bare injected ZWJ.
+        surfer = "\U0001F3C4\u200d\u2642\ufe0f"
+        findings = scan_for_threats(f"{surfer} ok\u200d", scope="all")
+        assert any(f.startswith("invisible_unicode_U+200D") for f in findings)
+
+
+    def test_other_invisible_chars_unaffected_by_emoji_zwj(self):
+        # The emoji exception is scoped to U+200D only — a zero-width space
+        # next to an emoji is still flagged.
+        surfer = "\U0001F3C4\u200d\u2642\ufe0f"
+        findings = scan_for_threats(f"{surfer}\u200b", scope="all")
+        assert any(f.startswith("invisible_unicode_U+200B") for f in findings)
+
+
     def test_invisible_chars_set_is_frozenset(self):
         # Pin: should be immutable so callers can't accidentally mutate the
         # shared set.

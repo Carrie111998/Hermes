@@ -192,6 +192,23 @@ class TestScanFile:
         assert any(fi.category == "injection" for fi in findings)
 
 
+    def test_zwj_in_emoji_sequence_allowed(self, tmp_path):
+        f = tmp_path / "good.md"
+        f.write_text(
+            "surfing \U0001F3C4\u200d\u2642\ufe0f and "
+            "family \U0001F468\u200d\U0001F469\u200d\U0001F467\u200d\U0001F466\n"
+        )
+        findings = scan_file(f, "good.md")
+        assert not any(fi.pattern_id == "invisible_unicode" for fi in findings)
+
+
+    def test_bare_zwj_still_detected_in_skill(self, tmp_path):
+        f = tmp_path / "bad.md"
+        f.write_text("normal text\u200d hidden\n")
+        findings = scan_file(f, "bad.md")
+        assert any(fi.pattern_id == "invisible_unicode" for fi in findings)
+
+
     def test_deduplication_per_pattern_per_line(self, tmp_path):
         f = tmp_path / "dup.sh"
         f.write_text("rm -rf / && rm -rf /home\n")
