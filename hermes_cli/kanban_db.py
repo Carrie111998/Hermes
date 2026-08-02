@@ -8711,6 +8711,13 @@ class DispatchResult:
     The reason alone is not the full diagnosis: the matching
     ``respawn_guarded`` event carries the PR URL, source comment, ownership
     class and expiry."""
+    respawn_guard_details: list[dict[str, Any]] = field(default_factory=list)
+    """Structured operator diagnostics, one per ``respawn_guarded`` entry.
+
+    Every record carries ``task_id`` and ``reason``. Active-PR suppressions
+    additionally carry the exact PR identity and expiry when the guard knows
+    them, allowing CLI and daemon logs to explain skips without a second DB
+    query."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -8722,6 +8729,68 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+
+    def add_respawn_guard(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        detail: Optional[Mapping[str, Any]] = None,
+        phase: Optional[str] = None,
+    ) -> None:
+        """Record a guarded task in legacy and operator-visible forms."""
+        self.respawn_guarded.append((task_id, reason))
+        diagnostic = dict(detail or {})
+        diagnostic.update({"task_id": task_id, "reason": reason})
+        if phase is not None:
+            diagnostic["phase"] = phase
+        self.respawn_guard_details.append(diagnostic)
+
+    def normalized_respawn_guard_details(self) -> list[dict[str, Any]]:
+        """Return one structured diagnostic for every guarded respawn."""
+        details = [dict(entry) for entry in self.respawn_guard_details]
+        return [
+            {
+                **(details[index] if index < len(details) else {}),
+                "task_id": task_id,
+                "reason": reason,
+            }
+            for index, (task_id, reason) in enumerate(self.respawn_guarded)
+        ]
+
+    def respawn_guard_log_lines(self) -> list[str]:
+        """Render stable, grep-friendly suppression log lines."""
+        lines: list[str] = []
+        for detail in self.normalized_respawn_guard_details():
+            fields = [
+                f"SKIP {detail['task_id']}",
+                f"respawn_guarded={detail['reason']}",
+            ]
+            pr_details = detail.get("pr_details")
+            rendered_pr_detail = False
+            if isinstance(pr_details, Sequence) and not isinstance(
+                pr_details, (str, bytes)
+            ):
+                for pr_detail in pr_details:
+                    if not isinstance(pr_detail, Mapping) or not pr_detail.get(
+                        "pr_url"
+                    ):
+                        continue
+                    fields.append(f"pr={pr_detail['pr_url']}")
+                    if pr_detail.get("expires_at") is not None:
+                        fields.append(f"expires={pr_detail['expires_at']}")
+                    rendered_pr_detail = True
+            if not rendered_pr_detail:
+                if detail.get("pr_url"):
+                    fields.append(f"pr={detail['pr_url']}")
+                if detail.get("expires_at") is not None:
+                    fields.append(f"expires={detail['expires_at']}")
+            if detail.get("phase"):
+                fields.append(f"phase={detail['phase']}")
+            if detail.get("continuation_denial"):
+                fields.append(f"denial={detail['continuation_denial']}")
+            lines.append(" ".join(fields))
+        return lines
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -11215,20 +11284,29 @@ def _active_pr_guard_detail(
     and when the window lapses — the four facts an operator needs to tell a
     real active-PR hold apart from a stale one without reading the DB.
     """
-    last_seen = max(
-        (
-            int(record.get("last_seen_at") or 0)
-            for record in owned
-            if record.get("last_seen_at") is not None
-        ),
-        default=0,
-    )
+    pr_details: list[dict[str, Any]] = []
+    for record in owned:
+        last_seen = int(record.get("last_seen_at") or 0)
+        expires_at = record.get("expires_at")
+        if expires_at is None and last_seen:
+            expires_at = last_seen + _RESPAWN_GUARD_PR_WINDOW
+        pr_details.append(
+            {
+                "pr_url": str(record["canonical_url"]),
+                "ownership": str(record.get("ownership") or "referenced"),
+                "source_comment_id": record.get("source_comment_id"),
+                "last_seen_at": last_seen or None,
+                "expires_at": int(expires_at) if expires_at is not None else None,
+            }
+        )
+    primary = pr_details[0] if pr_details else None
     detail: dict[str, Any] = {
-        "pr_url": str(owned[0]["canonical_url"]) if owned else None,
-        "pr_urls": [str(record["canonical_url"]) for record in owned],
-        "ownership": str(owned[0].get("ownership") or "referenced") if owned else None,
-        "source_comment_id": owned[0].get("source_comment_id") if owned else None,
-        "expires_at": (last_seen + _RESPAWN_GUARD_PR_WINDOW) if last_seen else None,
+        "pr_url": primary["pr_url"] if primary else None,
+        "pr_urls": [record["pr_url"] for record in pr_details],
+        "pr_details": pr_details,
+        "ownership": primary["ownership"] if primary else None,
+        "source_comment_id": primary["source_comment_id"] if primary else None,
+        "expires_at": primary["expires_at"] if primary else None,
         "window_seconds": _RESPAWN_GUARD_PR_WINDOW,
     }
     if disowned:
@@ -11323,7 +11401,13 @@ def evaluate_respawn_guard(
             and ended_at is not None
             and (now - int(ended_at)) < rl_cooldown
         ):
-            return RespawnGuardDecision(reason="rate_limit_cooldown")
+            return RespawnGuardDecision(
+                reason="rate_limit_cooldown",
+                detail={
+                    "expires_at": int(ended_at) + rl_cooldown,
+                    "window_seconds": rl_cooldown,
+                },
+            )
         # Cooldown disabled/elapsed: preserve the pre-continuation cheap-probe
         # contract. Rate-limited workers intentionally retry forever, including
         # when they already opened a PR, until quota returns or a newer outcome
@@ -11353,7 +11437,13 @@ def evaluate_respawn_guard(
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
-            return RespawnGuardDecision(reason="recent_success")
+            return RespawnGuardDecision(
+                reason="recent_success",
+                detail={
+                    "expires_at": completed_at + _RESPAWN_GUARD_SUCCESS_WINDOW,
+                    "window_seconds": _RESPAWN_GUARD_SUCCESS_WINDOW,
+                },
+            )
 
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     owned, disowned = _active_pr_candidates(conn, task_id, cutoff=pr_cutoff)
@@ -11382,8 +11472,6 @@ def evaluate_respawn_guard(
         authorization,
         now=now,
     )
-    if decision.reason is None:
-        return decision
     return replace(decision, detail=detail)
 
 
@@ -11825,7 +11913,12 @@ def _dispatch_once_locked(
             # inspected and attributed to a different card.
             record_respawn_guard_decision(conn, row["id"], guard_decision)
         if guard_decision.reason is not None:
-            result.respawn_guarded.append((row["id"], guard_decision.reason))
+            result.add_respawn_guard(
+                row["id"],
+                guard_decision.reason,
+                detail=guard_decision.detail,
+                phase="ready",
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -11852,8 +11945,20 @@ def _dispatch_once_locked(
                     guard_decision.continuation_authorization_id
                 ),
                 continuation_denial=exc.code,
+                detail={
+                    **(guard_decision.detail or {}),
+                    "continuation_denial": exc.code,
+                    "continuation_authorization_id": (
+                        guard_decision.continuation_authorization_id
+                    ),
+                },
             )
-            result.respawn_guarded.append((row["id"], "active_pr"))
+            result.add_respawn_guard(
+                row["id"],
+                "active_pr",
+                detail=raced.detail,
+                phase="claim_exception",
+            )
             record_respawn_guard_decision(
                 conn,
                 row["id"],
@@ -11872,8 +11977,10 @@ def _dispatch_once_locked(
             board_slug=board_slug,
             phase="ready",
         ):
-            result.respawn_guarded.append(
-                (claimed.id, "live_worker_process")
+            result.add_respawn_guard(
+                claimed.id,
+                "live_worker_process",
+                phase="ready",
             )
             continue
         try:
@@ -11980,8 +12087,10 @@ def _dispatch_once_locked(
             board_db=board_db,
             board_slug=board_slug,
         ):
-            result.respawn_guarded.append(
-                (row["id"], "live_worker_process")
+            result.add_respawn_guard(
+                row["id"],
+                "live_worker_process",
+                phase="review",
             )
             if not dry_run:
                 with write_txn(conn):
@@ -12010,8 +12119,10 @@ def _dispatch_once_locked(
             board_slug=board_slug,
             phase="review",
         ):
-            result.respawn_guarded.append(
-                (claimed.id, "live_worker_process")
+            result.add_respawn_guard(
+                claimed.id,
+                "live_worker_process",
+                phase="review",
             )
             continue
         try:
