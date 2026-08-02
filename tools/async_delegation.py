@@ -47,6 +47,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_state import resolve_busy_timeout_seconds
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
@@ -123,8 +124,13 @@ def _db_path():
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    busy_timeout = resolve_busy_timeout_seconds()
+    conn = sqlite3.connect(path, timeout=busy_timeout)
     try:
+        # connect(timeout=) already seeds busy_timeout, but stating the pragma
+        # keeps the wait budget greppable next to the other state.db openers
+        # and survives any future connection-factory swap.
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}")
         _initialize_schema(conn)
     except Exception:
         # A PRAGMA/DDL failure after a successful connect() must not leak the

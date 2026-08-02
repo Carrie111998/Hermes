@@ -226,3 +226,43 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
         "holographic": "delete",
         "response_store": "delete",
     }
+
+
+# --- database.busy_timeout_seconds ------------------------------------------
+
+
+def _configure_busy_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, value: object
+) -> None:
+    _write_config(
+        monkeypatch, tmp_path, {"database": {"busy_timeout_seconds": value}}
+    )
+
+
+def test_database_busy_timeout_has_a_canonical_default():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["database"]["busy_timeout_seconds"] == 30
+
+
+def test_resolve_busy_timeout_uses_real_database_config(monkeypatch, tmp_path):
+    from hermes_state import resolve_busy_timeout_seconds
+
+    _configure_busy_timeout(monkeypatch, tmp_path, 90)
+    assert resolve_busy_timeout_seconds() == 90.0
+
+
+def test_resolve_busy_timeout_defaults_when_unset(monkeypatch, tmp_path):
+    from hermes_state import resolve_busy_timeout_seconds
+
+    _write_config(monkeypatch, tmp_path, {"database": {}})
+    assert resolve_busy_timeout_seconds() == 30.0
+
+
+@pytest.mark.parametrize("bad", ["nonsense", -5, 0, None, {"a": 1}])
+def test_resolve_busy_timeout_rejects_unusable_values(monkeypatch, tmp_path, bad):
+    """A malformed operator setting must not leave writers with no wait budget."""
+    from hermes_state import resolve_busy_timeout_seconds
+
+    _configure_busy_timeout(monkeypatch, tmp_path, bad)
+    assert resolve_busy_timeout_seconds() == 30.0

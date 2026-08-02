@@ -831,3 +831,21 @@ def test_stale_monitor_keeps_sweeping_after_persistence_failure(monkeypatch):
         assert evt["status"] == "stalled"
     finally:
         gate.set()
+
+
+def test_connect_applies_configured_busy_timeout(tmp_path, monkeypatch):
+    """Writers must wait out a busy store instead of failing in seconds.
+
+    A gateway with a large WAL and several concurrent writers exhausts a
+    short budget routinely, and every such timeout costs a completion. The
+    budget is an operator setting (database.busy_timeout_seconds), so
+    _connect must read it rather than hardcode one.
+    """
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "resolve_busy_timeout_seconds", lambda: 45.0)
+    conn = ad._connect()
+    try:
+        busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        conn.close()
+    assert busy_ms == 45_000
