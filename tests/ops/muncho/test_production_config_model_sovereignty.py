@@ -118,8 +118,10 @@ def test_plan_is_read_only_and_binds_exact_target(tmp_path, monkeypatch):
     assert "agent.verify_on_stop=true" in plan["mutations"]
     assert "agent.verification_ledger_enabled=true" in plan["mutations"]
     assert "agent.gateway_notify_interval=180" in plan["mutations"]
+    assert "display.busy_input_mode=steer" in plan["mutations"]
+    assert "display.show_commentary=true" in plan["mutations"]
     assert (
-        "display.platforms.discord=final_answer_first_low_noise"
+        "display.platforms.discord=commentary_without_tool_noise"
         in plan["mutations"]
     )
 
@@ -200,14 +202,17 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
     }
     assert effective["goals"] == {"max_turns": 0}
     assert effective["command_allowlist"] == []
+    assert effective["display"]["busy_input_mode"] == "steer"
+    assert effective["display"]["show_commentary"] is True
     assert effective["display"]["platforms"]["discord"] == {
         "tool_progress": "off",
-        "interim_assistant_messages": False,
+        "interim_assistant_messages": True,
         "thinking_progress": False,
         "show_reasoning": False,
         "streaming": False,
         "long_running_notifications": True,
         "busy_ack_detail": False,
+        "busy_steer_ack_enabled": False,
     }
 
     rollback = module.rollback_plan(
@@ -295,18 +300,21 @@ def test_target_pins_discord_policy_and_preserves_other_display_preferences():
 
     assert effective["agent"]["gateway_notify_interval"] == 180
     assert effective["display"]["language"] == "bg"
+    assert effective["display"]["busy_input_mode"] == "steer"
+    assert effective["display"]["show_commentary"] is True
     assert effective["display"]["platforms"]["telegram"] == {
         "tool_progress": "new"
     }
     assert effective["display"]["platforms"]["discord"] == {
         "tool_progress": "off",
         "tool_preview_length": 17,
-        "interim_assistant_messages": False,
+        "interim_assistant_messages": True,
         "thinking_progress": False,
         "show_reasoning": False,
         "streaming": False,
         "long_running_notifications": True,
         "busy_ack_detail": False,
+        "busy_steer_ack_enabled": False,
     }
 
 

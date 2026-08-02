@@ -42,14 +42,19 @@ GATEWAY_UNIT = "hermes-cloud-gateway.service"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
 _STOPPED_GATEWAY_STATES = frozenset({"failed", "inactive"})
 _PRODUCTION_GATEWAY_NOTIFY_INTERVAL = 180
+_PRODUCTION_GLOBAL_DISPLAY_POLICY = {
+    "busy_input_mode": "steer",
+    "show_commentary": True,
+}
 _PRODUCTION_DISCORD_DISPLAY_POLICY = {
     "tool_progress": "off",
-    "interim_assistant_messages": False,
+    "interim_assistant_messages": True,
     "thinking_progress": False,
     "show_reasoning": False,
     "streaming": False,
     "long_running_notifications": True,
     "busy_ack_detail": False,
+    "busy_steer_ack_enabled": False,
 }
 
 PLAN_SCHEMA = "muncho-production-model-sovereignty-config-plan.v1"
@@ -77,7 +82,9 @@ MUTATIONS = (
     "command_allowlist=[]",
     "plugins={enabled:[],disabled:[]}",
     "hooks={};hooks_auto_accept=false",
-    "display.platforms.discord=final_answer_first_low_noise",
+    "display.busy_input_mode=steer",
+    "display.show_commentary=true",
+    "display.platforms.discord=commentary_without_tool_noise",
 )
 _STALE_MODEL_SENTENCE = (
     "gpt-5.6-sol; do not route GPT-5.5 through OPENAI_API_KEY."
@@ -420,6 +427,7 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     display = target.setdefault("display", {})
     if not isinstance(display, dict):
         raise ConfigGateError("config_display_surface_drifted")
+    display.update(copy.deepcopy(_PRODUCTION_GLOBAL_DISPLAY_POLICY))
     display_platforms = display.setdefault("platforms", {})
     if not isinstance(display_platforms, dict):
         raise ConfigGateError("config_display_platforms_surface_drifted")

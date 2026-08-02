@@ -484,14 +484,17 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
     assert effective["agent"]["verify_on_stop"] is True
     assert effective["agent"]["verification_ledger_enabled"] is True
     assert effective["agent"]["gateway_notify_interval"] == 180
+    assert effective["display"]["busy_input_mode"] == "steer"
+    assert effective["display"]["show_commentary"] is True
     assert effective["display"]["platforms"]["discord"] == {
         "tool_progress": "off",
-        "interim_assistant_messages": False,
+        "interim_assistant_messages": True,
         "thinking_progress": False,
         "show_reasoning": False,
         "streaming": False,
         "long_running_notifications": True,
         "busy_ack_detail": False,
+        "busy_steer_ack_enabled": False,
     }
     assert effective["compression"]["abort_on_summary_failure"] is True
     assert effective["tools"]["tool_search"] == {"enabled": "off"}
@@ -942,6 +945,36 @@ def test_rendered_unit_is_the_normal_sha_pinned_production_contract() -> None:
             "discord_display_policy",
         ),
         (
+            ("display", "busy_input_mode"),
+            "interrupt",
+            "global_display_policy",
+        ),
+        (
+            ("display", "show_commentary"),
+            False,
+            "global_display_policy",
+        ),
+        (
+            (
+                "display",
+                "platforms",
+                "discord",
+                "interim_assistant_messages",
+            ),
+            False,
+            "discord_display_policy",
+        ),
+        (
+            (
+                "display",
+                "platforms",
+                "discord",
+                "busy_steer_ack_enabled",
+            ),
+            True,
+            "discord_display_policy",
+        ),
+        (
             ("tools", "tool_search"),
             {"enabled": "on", "threshold_pct": 0},
             "tool_search",
@@ -990,7 +1023,7 @@ def test_overlay_migrates_prior_sealed_proof_gate_contract() -> None:
     assert effective["agent"]["verification_ledger_enabled"] is True
 
 
-def test_overlay_pins_low_noise_discord_and_preserves_unrelated_display() -> None:
+def test_overlay_pins_discord_steering_commentary_and_preserves_unrelated_display() -> None:
     source = _source_mapping()
     source["agent"]["gateway_notify_interval"] = 30
     source["display"] = {
@@ -1008,18 +1041,21 @@ def test_overlay_pins_low_noise_discord_and_preserves_unrelated_display() -> Non
 
     assert effective["agent"]["gateway_notify_interval"] == 180
     assert effective["display"]["language"] == "bg"
+    assert effective["display"]["busy_input_mode"] == "steer"
+    assert effective["display"]["show_commentary"] is True
     assert effective["display"]["platforms"]["telegram"] == {
         "tool_progress": "new"
     }
     assert effective["display"]["platforms"]["discord"] == {
         "tool_progress": "off",
         "tool_preview_length": 17,
-        "interim_assistant_messages": False,
+        "interim_assistant_messages": True,
         "thinking_progress": False,
         "show_reasoning": False,
         "streaming": False,
         "long_running_notifications": True,
         "busy_ack_detail": False,
+        "busy_steer_ack_enabled": False,
     }
     runtime.validate_production_gateway_config(effective)
 

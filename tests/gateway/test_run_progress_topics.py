@@ -1217,6 +1217,29 @@ class CommentaryAgent:
         }
 
 
+class ProductionCommentaryNoToolNoiseAgent:
+    """Probe the production split between commentary and technical progress."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        # Per-turn callback wiring must keep raw tool events fully disabled while
+        # preserving the natural-language commentary rail.
+        assert self.tool_progress_callback is None
+        assert self.interim_assistant_callback is not None
+        self.interim_assistant_callback(
+            "I'll verify the migration next.", already_streamed=False
+        )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -2211,6 +2234,46 @@ async def test_run_agent_interim_commentary_works_with_tool_progress_off(monkeyp
 
     assert result.get("already_sent") is not True
     assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_production_discord_surfaces_commentary_without_tool_noise(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ProductionCommentaryNoToolNoiseAgent,
+        session_id="sess-production-discord-commentary",
+        platform=Platform.DISCORD,
+        chat_id="1504852355588423801",
+        chat_type="channel",
+        thread_id=None,
+        config_data={
+            "display": {
+                "busy_input_mode": "steer",
+                "show_commentary": True,
+                "platforms": {
+                    "discord": {
+                        "busy_steer_ack_enabled": False,
+                        "tool_progress": "off",
+                        "interim_assistant_messages": True,
+                        "thinking_progress": False,
+                        "show_reasoning": False,
+                        "streaming": False,
+                        "long_running_notifications": True,
+                        "busy_ack_detail": False,
+                    }
+                },
+            }
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert [call["content"] for call in adapter.sent] == [
+        "I'll verify the migration next."
+    ]
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio
