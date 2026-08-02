@@ -24,6 +24,102 @@ def test_config_set_enables_final_boundary_enforcement(monkeypatch, tmp_path):
     assert kwargs["extra_body"]["provider"]["zdr"] is True
 
 
+def _write_raw_config(monkeypatch, tmp_path, text):
+    import hermes_cli.config as config_mod
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    config_mod._RAW_CONFIG_CACHE.clear()
+    config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    getattr(config_mod, "_CONFIG_LOAD_FAILURE_BY_PATH").clear()
+    return config_mod
+
+
+def test_invalid_yaml_enforces_zdr_fail_closed(monkeypatch, tmp_path, caplog):
+    _write_raw_config(monkeypatch, tmp_path, "openrouter: [")
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "enforcing ZDR fail closed" in caplog.text
+
+
+def test_parse_failure_state_clears_after_config_is_fixed(monkeypatch, tmp_path):
+    config_mod = _write_raw_config(monkeypatch, tmp_path, "openrouter: [")
+    failed_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        failed_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert failed_kwargs["extra_body"]["provider"]["zdr"] is True
+
+    config_mod.get_config_path().write_text(
+        "openrouter:\n  zdr: false\n", encoding="utf-8"
+    )
+    fixed_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        fixed_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert fixed_kwargs["extra_body"]["provider"]["zdr"] is False
+
+
+def test_quoted_zdr_value_enforces_zdr_fail_closed(monkeypatch, tmp_path, caplog):
+    _write_raw_config(monkeypatch, tmp_path, 'openrouter:\n  zdr: "true"\n')
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "openrouter.zdr must be a boolean" in caplog.text
+
+
+def test_non_mapping_config_root_enforces_zdr_fail_closed(
+    monkeypatch, tmp_path, caplog
+):
+    _write_raw_config(monkeypatch, tmp_path, "- openrouter\n- zdr\n")
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "could not be parsed" in caplog.text
+
+
+def test_explicit_false_from_real_config_preserves_caller_policy(
+    monkeypatch, tmp_path
+):
+    _write_raw_config(monkeypatch, tmp_path, "openrouter:\n  zdr: false\n")
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is False
+
+
 def test_shared_enforcement_overrides_false(monkeypatch):
     monkeypatch.setattr("hermes_cli.config.openrouter_zdr_enabled", lambda: True)
     kwargs = {

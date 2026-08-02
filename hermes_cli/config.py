@@ -246,6 +246,12 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# Path -> (mtime_ns, size) for a user config that the canonical loader could
+# not parse/merge. The effective config may be defaults or last-known-good,
+# but privacy-sensitive readers must be able to distinguish that degraded
+# state from an explicit setting. Entries are signature-bound so fixing or
+# replacing the file invalidates the failure without a separate reset hook.
+_CONFIG_LOAD_FAILURE_BY_PATH: Dict[str, Tuple[int, int]] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3156,11 +3162,28 @@ def openrouter_zdr_enabled() -> bool:
     """Return whether request-time OpenRouter ZDR enforcement is enabled.
 
     The mtime-keyed read-only cache lets profile config changes apply to the
-    next request without rebuilding an active conversation.
+    next request without rebuilding an active conversation.  This accessor is
+    intentionally strict because its result controls a privacy boundary:
+    unreadable/unparseable YAML and malformed ``openrouter``/``zdr`` values
+    raise so the final request guard can enforce ZDR fail closed instead of
+    mistaking loader defaults for an explicit opt-out.
     """
-    config = load_config_readonly()
+    with _CONFIG_LOCK:
+        config = load_config_readonly()
+        config_path = get_config_path()
+        if str(config_path) in _CONFIG_LOAD_FAILURE_BY_PATH:
+            raise RuntimeError(
+                f"OpenRouter ZDR state is unknown because {config_path} "
+                "could not be parsed"
+            )
+
     openrouter = config.get("openrouter")
-    return isinstance(openrouter, dict) and openrouter.get("zdr") is True
+    if not isinstance(openrouter, dict):
+        raise ValueError("effective openrouter config must be a mapping")
+    zdr = openrouter.get("zdr")
+    if not isinstance(zdr, bool):
+        raise ValueError("effective openrouter.zdr must be a boolean")
+    return zdr
 
 
 def write_platform_config_field(
@@ -3302,6 +3325,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
             user_sig = None
+            _CONFIG_LOAD_FAILURE_BY_PATH.pop(path_key, None)
 
         # Managed scope: fold the managed config file's (mtime, size) into the
         # cache signature so editing /etc/hermes/config.yaml invalidates the
@@ -3356,7 +3380,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+                _CONFIG_LOAD_FAILURE_BY_PATH.pop(path_key, None)
             except Exception as e:
+                _CONFIG_LOAD_FAILURE_BY_PATH[path_key] = user_sig
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
