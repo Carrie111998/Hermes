@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Collection, Dict, Optional, Tuple
 
+from events.outcomes import OutcomeState, OutcomeVerdict, evaluate_outcome
 from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
 
@@ -63,6 +64,7 @@ class Route:
     priority: Priority          # effective (clamped) priority
     wa_tier: Optional[str]      # immediate | urgent | important | None
     batch: bool                 # True only for TRACE below HIGH
+    verdict: OutcomeVerdict     # computed once; subscribers do not reinterpret
 
 
 # Topic keys. action_required and agents_memory are new in v3; consumers
@@ -264,6 +266,14 @@ _CRON_ACTION_RE = re.compile(
 )
 _CRON_ACTION_SCAN_CHARS = 800
 
+_HUMAN_ACTION_KINDS = frozenset({
+    "approval",
+    "decision",
+    "credential",
+    "credits",
+    "manual_intervention",
+})
+
 
 _NON_ACTIONABLE_STATES = frozenset({"healthy", "skipped"})
 
@@ -326,6 +336,14 @@ def cron_output_is_actionable(output_summary: str) -> bool:
     return bool(_CRON_ACTION_RE.search(text))
 
 
+def structured_human_gate(payload: dict) -> bool:
+    """Return whether structured payload evidence proves a human-only gate."""
+    return (
+        payload.get("action_required") is True
+        and payload.get("action_kind") in _HUMAN_ACTION_KINDS
+    )
+
+
 def classify(
     event: Event,
     known_topic_keys: Optional[Collection[str]] = None,
@@ -333,6 +351,7 @@ def classify(
     """Classify an event into its Route. Total: unknown/unmapped types
     surface as WARN on the alerts topic rather than vanishing into the
     group's General thread (pre-v3 ``"system"`` catch-all)."""
+    verdict = evaluate_outcome(event)
     spec = _POLICY.get(event.event_type)
     if spec is None:
         # Unrouted type — someone added an EventType without a policy
@@ -408,11 +427,30 @@ def classify(
                 topic_key = DAILY_BRIEF
             attention = Attention.INFO
 
+    # --- outcome + structured human-gate policy ------------------------
+    # Intrinsically actionable types stay ACT even when their operation
+    # failed: the outstanding approval/decision still belongs to Diego.
+    # Structured gates are authoritative for wrappers. Otherwise a failed or
+    # degraded INFO/TRACE wrapper promotes to WARN/Alerts.
+    if structured_human_gate(payload):
+        attention = Attention.ACT
+        topic_key = ACTION_REQUIRED
+    elif (
+        verdict.state in {OutcomeState.FAILED, OutcomeState.DEGRADED}
+        and attention in {Attention.INFO, Attention.TRACE}
+    ):
+        attention = Attention.WARN
+        topic_key = ALERTS
+
+    # Preserve routing-v3's single-failure domain demotion for explicit
+    # failure event types. Verdict-promoted wrappers are deliberately absent
+    # from JOBFLOW_DEMOTE_TYPES and therefore remain in Alerts.
     if et in JOBFLOW_DEMOTE_TYPES and _is_jobflow_source(event):
         topic_key = JOBFLOW
 
-    # --- effective priority: class floor/cap + per-type floor -----------
+    # --- effective priority: class/outcome/per-type floor + class cap ----
     priority = _clamp(event.priority, _class_floor(attention))
+    priority = _clamp(priority, verdict.priority_floor)
     priority = _clamp(priority, spec.priority_floor)
     priority = _cap(priority, _class_cap(attention))
 
@@ -426,6 +464,7 @@ def classify(
         priority=priority,
         wa_tier=wa_tier,
         batch=batch,
+        verdict=verdict,
     )
 
 

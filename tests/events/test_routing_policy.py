@@ -7,6 +7,7 @@ fails here instead of silently misrouting in production.
 
 import pytest
 
+from events.outcomes import OutcomeState
 from events.routing_policy import (
     ACTION_REQUIRED,
     AGENTS_MEMORY,
@@ -108,6 +109,106 @@ def test_apply_packet_clamped_to_high():
     # default priority NORMAL, ACT clamps to HIGH
     route = classify(make_event(EventType.APPLY_PACKET))
     assert route.priority is Priority.HIGH
+
+
+def test_route_carries_the_single_computed_verdict():
+    route = classify(make_event(
+        EventType.AGENT_ITERATION,
+        {"agent": "postgres-sync", "counters": {"exit_code": 1}},
+    ))
+
+    assert route.verdict.state is OutcomeState.FAILED
+    assert any(
+        item.path == "payload.counters.exit_code" for item in route.verdict.evidence
+    )
+
+
+def test_failed_agent_iteration_promotes_to_warn_alerts():
+    route = classify(make_event(
+        EventType.AGENT_ITERATION,
+        {
+            "agent": "tracker",
+            "reason": "success",
+            "counters": {"exit_code": 1},
+        },
+    ))
+
+    assert route.verdict.state is OutcomeState.FAILED
+    assert route.attention is Attention.WARN
+    assert route.topic_key == ALERTS
+    assert route.priority is Priority.HIGH
+    assert route.batch is False
+
+
+def test_degraded_trace_wrapper_promotes_to_warn_alerts():
+    route = classify(make_event(
+        EventType.AGENT_ITERATION,
+        {"agent": "scout", "result": "partial"},
+    ))
+
+    assert route.verdict.state is OutcomeState.DEGRADED
+    assert route.attention is Attention.WARN
+    assert route.topic_key == ALERTS
+
+
+def test_critical_failure_without_human_gate_is_not_act():
+    route = classify(make_event(
+        EventType.AGENT_ITERATION,
+        {"agent": "tracker", "status": "failed"},
+        priority=Priority.CRITICAL,
+    ))
+
+    assert route.attention is Attention.WARN
+    assert route.topic_key == ALERTS
+    assert route.wa_tier == WA_URGENT
+
+
+def test_failed_intrinsic_action_remains_actionable():
+    route = classify(make_event(
+        EventType.APPROVAL_REQUEST,
+        {"status": "failed", "action_required": True, "action_kind": "approval"},
+    ))
+
+    assert route.verdict.state is OutcomeState.FAILED
+    assert route.attention is Attention.ACT
+    assert route.topic_key == ACTION_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "action_kind",
+    ["approval", "decision", "credential", "credits", "manual_intervention"],
+)
+def test_structured_human_gate_is_act(action_kind):
+    route = classify(make_event(
+        EventType.AGENT_ITERATION,
+        {
+            "agent": "scout",
+            "result": "partial",
+            "action_required": True,
+            "action_kind": action_kind,
+        },
+    ))
+
+    assert route.attention is Attention.ACT
+    assert route.topic_key == ACTION_REQUIRED
+    assert route.batch is False
+
+
+@pytest.mark.parametrize("payload", [
+    {"action_required": True},
+    {"action_required": True, "action_kind": ""},
+    {"action_required": True, "action_kind": "operator"},
+    {"action_required": False, "action_kind": "credits"},
+    {"action_kind": "credits"},
+])
+def test_invalid_or_incomplete_human_gate_does_not_create_act(payload):
+    route = classify(make_event(
+        EventType.AGENT_ITERATION,
+        {"agent": "scout", "status": "failed", **payload},
+    ))
+
+    assert route.attention is Attention.WARN
+    assert route.topic_key == ALERTS
 
 
 # ----------------------------------------------------------- conditional hooks
