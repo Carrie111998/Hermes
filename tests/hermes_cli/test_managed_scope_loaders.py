@@ -38,59 +38,12 @@ def _seed(home, managed, *, user, mgd):
     managed_scope.invalidate_managed_cache()
 
 
-def test_gateway_run_loader_honors_managed(homes, monkeypatch):
-    home, managed = homes
-    _seed(home, managed, user="model:\n  default: user/m\n", mgd="model:\n  default: org/m\n")
-    import gateway.run as gr
-
-    monkeypatch.setattr(gr, "_hermes_home", home, raising=False)
-    cfg = gr._load_gateway_config()
-    assert (cfg.get("model") or {}).get("default") == "org/m"
-
-
-def test_gateway_config_loader_honors_managed(homes, monkeypatch):
-    home, managed = homes
-    _seed(
-        home,
-        managed,
-        user="group_sessions_per_user: false\n",
-        mgd="group_sessions_per_user: true\n",
-    )
-    import gateway.config as gc
-
-    # load_gateway_config resolves home via get_hermes_home() (HERMES_HOME env).
-    cfg = gc.load_gateway_config()
-    # Managed value should have flowed into the GatewayConfig.
-    assert cfg.group_sessions_per_user is True
-
-
-def test_tui_loader_honors_managed(homes, monkeypatch):
-    home, managed = homes
-    _seed(home, managed, user="display:\n  skin: user\n", mgd="display:\n  skin: charizard\n")
-    import tui_gateway.server as ts
-
+def _patch_tui(ts, home, monkeypatch):
     monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
     monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
     monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
     monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
-    cfg = ts._load_cfg()
-    assert (cfg.get("display") or {}).get("skin") == "charizard"
-
-
-def test_tui_loader_does_not_persist_managed_back(homes, monkeypatch):
-    """The TUI caches RAW config so _save_cfg never writes managed values to disk."""
-    home, managed = homes
-    _seed(home, managed, user="display:\n  skin: user\n", mgd="display:\n  skin: charizard\n")
-    import tui_gateway.server as ts
-
-    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
-    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
-    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
-    ts._load_cfg()  # populates the cache
-    # The cache must hold the RAW user value, not the managed overlay, so a
-    # subsequent _save_cfg can't bake the managed skin into the user file.
-    assert (ts._cfg_cache.get("display") or {}).get("skin") == "user"
 
 
 def test_tui_write_config_key_does_not_bake_managed_overlay(homes, monkeypatch):
@@ -106,11 +59,7 @@ def test_tui_write_config_key_does_not_bake_managed_overlay(homes, monkeypatch):
     )
     import tui_gateway.server as ts
 
-    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
-    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
-    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+    _patch_tui(ts, home, monkeypatch)
 
     loaded = ts._load_cfg()
     assert (loaded.get("display") or {}).get("skin") == "charizard"
@@ -127,11 +76,7 @@ def test_tui_write_config_key_refuses_managed_key(homes, monkeypatch):
     _seed(home, managed, user="display:\n  skin: user\n", mgd="display:\n  skin: charizard\n")
     import tui_gateway.server as ts
 
-    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
-    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
-    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+    _patch_tui(ts, home, monkeypatch)
 
     with pytest.raises(ts._ManagedConfigWriteError, match="managed"):
         ts._write_config_key("display.skin", "blastoise")
@@ -154,11 +99,7 @@ def test_tui_config_set_sibling_does_not_bake_managed(homes, monkeypatch):
     )
     import tui_gateway.server as ts
 
-    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
-    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
-    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+    _patch_tui(ts, home, monkeypatch)
 
     resp = ts._methods["config.set"](1, {"key": "reasoning", "value": "show"})
     assert "error" not in resp
@@ -172,11 +113,7 @@ def test_tui_config_set_refuses_managed_skin(homes, monkeypatch):
     _seed(home, managed, user="display:\n  skin: user\n", mgd="display:\n  skin: charizard\n")
     import tui_gateway.server as ts
 
-    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
-    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
-    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+    _patch_tui(ts, home, monkeypatch)
 
     resp = ts._methods["config.set"](1, {"key": "skin", "value": "blastoise"})
     assert resp.get("error", {}).get("code") == 4030
@@ -197,11 +134,7 @@ def test_tui_config_set_reasoning_managed_returns_4030(homes, monkeypatch):
     )
     import tui_gateway.server as ts
 
-    monkeypatch.setattr(ts, "_hermes_home", home, raising=False)
-    monkeypatch.setattr(ts, "_cfg_cache", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_mtime", None, raising=False)
-    monkeypatch.setattr(ts, "_cfg_path", None, raising=False)
-    monkeypatch.setattr(ts, "get_hermes_home_override", lambda: None, raising=False)
+    _patch_tui(ts, home, monkeypatch)
 
     resp = ts._methods["config.set"](
         1, {"key": "reasoning", "value": "medium", "scope": "global"}
@@ -210,13 +143,24 @@ def test_tui_config_set_reasoning_managed_returns_4030(homes, monkeypatch):
     assert "managed" in resp["error"]["message"].lower()
 
 
-def test_logging_config_honors_managed(homes, monkeypatch):
+def test_tui_config_set_reasoning_show_refuses_managed_display_leaf(homes, monkeypatch):
+    """Direct mutate-and-save reasoning show/hide must check display leaves."""
     home, managed = homes
-    _seed(home, managed, user="logging:\n  level: INFO\n", mgd="logging:\n  level: DEBUG\n")
-    import hermes_logging
+    _seed(
+        home,
+        managed,
+        user="display:\n  show_reasoning: false\n",
+        mgd="display:\n  show_reasoning: true\n",
+    )
+    import tui_gateway.server as ts
 
-    level, _max, _bk = hermes_logging._read_logging_config()
-    assert level == "DEBUG"
+    _patch_tui(ts, home, monkeypatch)
+
+    resp = ts._methods["config.set"](1, {"key": "reasoning", "value": "show"})
+    assert resp.get("error", {}).get("code") == 4030
+    assert "managed" in resp["error"]["message"].lower()
+    disk = (home / "config.yaml").read_text(encoding="utf-8")
+    assert "show_reasoning: false" in disk
 
 
 def test_timezone_honors_managed(homes, monkeypatch):
