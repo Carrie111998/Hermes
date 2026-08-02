@@ -79,6 +79,71 @@ def test_target_cloud_observation_signer_is_in_exact_offline_package() -> None:
     )
 
 
+def test_preparation_readback_is_in_exact_offline_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = "scripts/canary/owner_gate_preparation_readback.py"
+    assert (
+        "bin/muncho-owner-gate-preparation-readback"
+        in package.REQUIRED_ENTRYPOINTS
+    )
+    assert runtime in package.ROOT_RUNTIME_FILES
+    assert (
+        "ops/muncho/owner-gate/bin/"
+        "muncho-owner-gate-preparation-readback"
+        in package.REQUIRED_ASSET_FILES
+    )
+
+    def local_blob(
+        source_root: Path,
+        release_revision: str,
+        relative: str,
+        *,
+        required: bool,
+    ):
+        assert source_root == ROOT
+        assert release_revision == REVISION
+        selected = source_root / relative
+        if not selected.is_file():
+            if required:
+                raise package.OwnerGatePackageError(
+                    "owner_gate_package_git_object_missing"
+                )
+            return None
+        raw = selected.read_bytes()
+        mode = "100755" if selected.stat().st_mode & 0o111 else "100644"
+        return raw, mode
+
+    monkeypatch.setattr(package, "_git_blob", local_blob)
+    closure = package.resolve_runtime_source_closure(
+        ROOT,
+        release_revision=REVISION,
+    )
+    assert runtime in closure
+    assert "scripts/canary/trusted_signer_stage0.py" in closure
+    assert "scripts/canary/trusted_signer_provisioning.py" in closure
+
+
+def test_preparation_readback_has_only_the_release_pinned_root_sudo_command() -> None:
+    template = (
+        ROOT
+        / "ops/muncho/owner-gate/"
+        "muncho-owner-gate-provisioning.sudoers.in"
+    ).read_text(encoding="ascii")
+    exact = (
+        "/opt/muncho-owner-gate/releases/@RELEASE_SHA@/venv/bin/python "
+        "-I -B "
+        "/opt/muncho-owner-gate/releases/@RELEASE_SHA@/bin/"
+        "muncho-owner-gate-preparation-readback"
+    )
+    assert template.count(exact) == 1
+    assert (
+        "%google-sudoers ALL=(root) NOPASSWD: "
+        "MUNCHO_OWNER_GATE_PREPARATION_READBACK"
+    ) in template
+    assert "MUNCHO_OWNER_GATE_PREPARATION_READBACK =" in template
+
+
 def test_activation_evidence_stager_is_in_exact_release_closure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

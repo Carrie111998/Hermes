@@ -43,7 +43,13 @@ def _pin_release_key(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _production_ingress_envelope(plan, *, iam: bool) -> dict:
+def _production_ingress_envelope(
+    plan,
+    *,
+    iam: bool,
+    preparation_carrier_sha256: str = "a" * 64,
+    historical_v1: bool = False,
+) -> dict:
     phase = "post_iam" if iam else "inert"
     collected_at_unix = NOW - 1
     fresh_through_unix = collected_at_unix + ingress.FRESHNESS_SECONDS
@@ -159,7 +165,11 @@ def _production_ingress_envelope(plan, *, iam: bool) -> dict:
         "report_sha256": foundation.sha256_json(observation_body),
     }
     envelope_unsigned = {
-        "schema": ingress.ENVELOPE_SCHEMA,
+        "schema": (
+            ingress._HISTORICAL_ENVELOPE_SCHEMA
+            if historical_v1
+            else ingress.ENVELOPE_SCHEMA
+        ),
         "phase": phase,
         "release_revision": plan.spec.release_revision,
         "plan_sha256": plan.sha256,
@@ -183,11 +193,20 @@ def _production_ingress_envelope(plan, *, iam: bool) -> dict:
         "secret_material_recorded": False,
         "secret_digest_recorded": False,
     }
+    if not historical_v1:
+        envelope_unsigned["preparation_carrier_sha256"] = (
+            preparation_carrier_sha256
+        )
+    signature_domain = (
+        ingress._HISTORICAL_SIGNATURE_DOMAIN
+        if historical_v1
+        else ingress.SIGNATURE_DOMAIN
+    )
     signed = {
         **envelope_unsigned,
         "signature_ed25519_b64url": base64.urlsafe_b64encode(
             RELEASE_KEY.sign(
-                ingress.SIGNATURE_DOMAIN
+                signature_domain
                 + ingress._canonical(envelope_unsigned)
             )
         )
@@ -338,7 +357,13 @@ def _attest(body: dict, key: Ed25519PrivateKey) -> dict:
     }
 
 
-def _cloud(plan, key, *, iam: bool) -> dict:
+def _cloud(
+    plan,
+    key,
+    *,
+    iam: bool,
+    preparation_carrier_sha256: str = "a" * 64,
+) -> dict:
     executor_sa = f"{foundation.SERVICE_ACCOUNT_NAME}@{foundation.PROJECT}.iam.gserviceaccount.com"
     body = {
         "schema": preflight.CLOUD_OBSERVATION_SCHEMA,
@@ -469,11 +494,18 @@ def _cloud(plan, key, *, iam: bool) -> dict:
             "resource_ancestor_chain": [plan.spec.organization_resource],
             "terminal_receipt_sha256": "e" * 64,
             "host_observation_report_sha256": _host(
-                plan, Ed25519PrivateKey.generate(), iam=iam
+                plan,
+                Ed25519PrivateKey.generate(),
+                iam=iam,
+                preparation_carrier_sha256=preparation_carrier_sha256,
             )["report_sha256"],
             "host_observation_binding_sha256": "4" * 64,
             "production_ingress_observation_sha256": (
-                _production_ingress_envelope(plan, iam=iam)["envelope_sha256"]
+                _production_ingress_envelope(
+                    plan,
+                    iam=iam,
+                    preparation_carrier_sha256=preparation_carrier_sha256,
+                )["envelope_sha256"]
             ),
             "attached_sa_permission_probe_report_sha256": "3" * 64,
             "cloud_signer_provisioning_receipt_sha256": "f" * 64,
@@ -490,7 +522,13 @@ def _cloud(plan, key, *, iam: bool) -> dict:
     return _attest(body, key)
 
 
-def _host(plan, key, *, iam: bool) -> dict:
+def _host(
+    plan,
+    key,
+    *,
+    iam: bool,
+    preparation_carrier_sha256: str = "a" * 64,
+) -> dict:
     body = {
         "schema": preflight.HOST_OBSERVATION_SCHEMA,
         "phase": "post_iam" if iam else "inert",
@@ -501,7 +539,11 @@ def _host(plan, key, *, iam: bool) -> dict:
         ),
         "plan_sha256": plan.sha256,
         "production_ingress_observation_sha256": (
-            _production_ingress_envelope(plan, iam=iam)["envelope_sha256"]
+            _production_ingress_envelope(
+                plan,
+                iam=iam,
+                preparation_carrier_sha256=preparation_carrier_sha256,
+            )["envelope_sha256"]
         ),
         "observation_binding_sha256": "4" * 64,
         "release": {

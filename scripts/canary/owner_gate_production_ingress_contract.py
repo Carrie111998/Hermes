@@ -19,9 +19,15 @@ from typing import Any, Mapping, NoReturn
 
 OBSERVATION_SCHEMA = "muncho-owner-gate-production-ingress-observation.v1"
 ENVELOPE_SCHEMA = (
+    "muncho-owner-gate-release-signed-production-ingress-observation.v2"
+)
+SIGNATURE_DOMAIN = b"muncho-owner-gate/production-ingress-observation/v2\x00"
+_HISTORICAL_ENVELOPE_SCHEMA = (
     "muncho-owner-gate-release-signed-production-ingress-observation.v1"
 )
-SIGNATURE_DOMAIN = b"muncho-owner-gate/production-ingress-observation/v1\x00"
+_HISTORICAL_SIGNATURE_DOMAIN = (
+    b"muncho-owner-gate/production-ingress-observation/v1\x00"
+)
 PINNED_RELEASE_TRUST_PUBLIC_KEY_SHA256 = (
     "302bd03b449a4f46476d9d2dc8026acedaca17334154ba2cf8ba2a68c72992a0"
 )
@@ -191,6 +197,7 @@ _ENVELOPE_FIELDS = frozenset(
         "phase",
         "release_revision",
         "plan_sha256",
+        "preparation_carrier_sha256",
         "observation",
         "observer_report_sha256",
         "transport_authority",
@@ -202,6 +209,9 @@ _ENVELOPE_FIELDS = frozenset(
         "signature_ed25519_b64url",
         "envelope_sha256",
     }
+)
+_HISTORICAL_ENVELOPE_FIELDS = (
+    _ENVELOPE_FIELDS - {"preparation_carrier_sha256"}
 )
 
 
@@ -568,6 +578,58 @@ def validate_signed_production_ingress_observation(
 ) -> Mapping[str, Any]:
     """Validate signer pin, signature, transport binding, and freshness."""
 
+    return _validate_signed_production_ingress_observation(
+        value,
+        phase=phase,
+        release_revision=release_revision,
+        plan_sha256=plan_sha256,
+        release_public_key=release_public_key,
+        now_unix=now_unix,
+        envelope_schema=ENVELOPE_SCHEMA,
+        envelope_fields=_ENVELOPE_FIELDS,
+        signature_domain=SIGNATURE_DOMAIN,
+        preparation_carrier_required=True,
+    )
+
+
+def _validate_historical_signed_production_ingress_observation(
+    value: Any,
+    *,
+    phase: str,
+    release_revision: str,
+    plan_sha256: str,
+    release_public_key: Any,
+    now_unix: int,
+) -> Mapping[str, Any]:
+    """Validate the exact retired v1 envelope for historical cleanup only."""
+
+    return _validate_signed_production_ingress_observation(
+        value,
+        phase=phase,
+        release_revision=release_revision,
+        plan_sha256=plan_sha256,
+        release_public_key=release_public_key,
+        now_unix=now_unix,
+        envelope_schema=_HISTORICAL_ENVELOPE_SCHEMA,
+        envelope_fields=_HISTORICAL_ENVELOPE_FIELDS,
+        signature_domain=_HISTORICAL_SIGNATURE_DOMAIN,
+        preparation_carrier_required=False,
+    )
+
+
+def _validate_signed_production_ingress_observation(
+    value: Any,
+    *,
+    phase: str,
+    release_revision: str,
+    plan_sha256: str,
+    release_public_key: Any,
+    now_unix: int,
+    envelope_schema: str,
+    envelope_fields: frozenset[str],
+    signature_domain: bytes,
+    preparation_carrier_required: bool,
+) -> Mapping[str, Any]:
     checked_phase, revision, plan_digest = _binding(
         phase=phase,
         release_revision=release_revision,
@@ -575,7 +637,7 @@ def validate_signed_production_ingress_observation(
     )
     raw = _strict_mapping(
         value,
-        _ENVELOPE_FIELDS,
+        envelope_fields,
         code="owner_gate_production_ingress_envelope_invalid",
     )
     signed = {key: item for key, item in raw.items() if key != "envelope_sha256"}
@@ -589,10 +651,23 @@ def validate_signed_production_ingress_observation(
     if (
         type(now_unix) is not int
         or now_unix <= 0
-        or raw.get("schema") != ENVELOPE_SCHEMA
+        or raw.get("schema") != envelope_schema
         or raw.get("phase") != checked_phase
         or raw.get("release_revision") != revision
         or raw.get("plan_sha256") != plan_digest
+        or (
+            preparation_carrier_required
+            and (
+                not isinstance(
+                    raw.get("preparation_carrier_sha256"),
+                    str,
+                )
+                or _SHA256.fullmatch(
+                    raw["preparation_carrier_sha256"]
+                )
+                is None
+            )
+        )
         or type(signed_at) is not int
         or type(fresh) is not int
         or signed_at <= 0
@@ -628,7 +703,7 @@ def validate_signed_production_ingress_observation(
 
         release_public_key.verify(
             _decode_signature(raw.get("signature_ed25519_b64url")),
-            SIGNATURE_DOMAIN + _canonical(unsigned),
+            signature_domain + _canonical(unsigned),
         )
     except InvalidSignature as exc:
         _error("owner_gate_production_ingress_signature_invalid", exc)

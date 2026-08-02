@@ -243,6 +243,7 @@ def _production_ingress_envelope(
     phase: str,
     plan: foundation.OwnerGateFoundationPlan,
     release_key: Ed25519PrivateKey,
+    preparation_carrier_sha256: str = "a" * 64,
 ) -> Mapping[str, Any]:
     collected = NOW - 2
     observation_unsigned = {
@@ -383,6 +384,7 @@ def _production_ingress_envelope(
         "phase": phase,
         "release_revision": REVISION,
         "plan_sha256": plan.sha256,
+        "preparation_carrier_sha256": preparation_carrier_sha256,
         "observation": observation,
         "observer_report_sha256": observation["report_sha256"],
         "transport_authority": {
@@ -873,6 +875,8 @@ def _environment(
         "manifest": package_manifest,
         "post": post,
         "release_key": release_key,
+        "collector_private": collector_private,
+        "plan": plan,
         "project_number": str(direct_authority["project_number"]),
     }
 
@@ -995,6 +999,65 @@ def test_tampered_phase_specific_production_ingress_never_creates_seal(
     path.chmod(0o644)
     path.write_bytes(foundation.canonical_json_bytes(value))
     path.chmod(0o444)
+    environment["evidence_root"].chmod(0o500)
+
+    with pytest.raises(
+        activation.OwnerGateActivationSealError,
+        match="owner_gate_activation_evidence_invalid",
+    ):
+        _install(environment)
+    assert not environment["seal"].exists()
+
+
+def test_valid_cross_phase_carrier_splice_never_creates_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path, monkeypatch)
+    plan = environment["plan"]
+    collectors = environment["collector_private"]
+    post_ingress = _production_ingress_envelope(
+        phase="post_iam",
+        plan=plan,
+        release_key=environment["release_key"],
+        preparation_carrier_sha256="b" * 64,
+    )
+    post_host = _host_for_release(
+        plan,
+        collectors["host"],
+        iam=True,
+        package_manifest=environment["manifest"],
+        production_ingress_sha256=post_ingress["envelope_sha256"],
+    )
+    post_cloud = _cloud_for_release(
+        plan,
+        collectors["cloud"],
+        iam=True,
+        host_observation=post_host,
+    )
+    post_report = preflight.build_post_iam_preflight_report(
+        plan=plan,
+        production_ingress_observation=post_ingress,
+        release_public_key=environment["release_key"].public_key(),
+        cloud_observation=post_cloud,
+        host_observation=post_host,
+        cloud_collector_public_key=collectors["cloud"].public_key(),
+        host_collector_public_key=collectors["host"].public_key(),
+        now_unix=NOW - 1,
+    )
+    replacements = {
+        activation.POST_IAM_PRODUCTION_INGRESS_OBSERVATION_NAME: (
+            post_ingress
+        ),
+        activation.POST_IAM_CLOUD_OBSERVATION_NAME: post_cloud,
+        activation.POST_IAM_HOST_OBSERVATION_NAME: post_host,
+        activation.POST_IAM_PREFLIGHT_NAME: post_report,
+    }
+    environment["evidence_root"].chmod(0o700)
+    for name, value in replacements.items():
+        path = environment["evidence_root"] / name
+        path.chmod(0o644)
+        _write_exact(path, value)
     environment["evidence_root"].chmod(0o500)
 
     with pytest.raises(
