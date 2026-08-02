@@ -147,6 +147,44 @@ class TestFamilyRouting:
 
 
 class TestPayloadBuilder:
+    def test_pixverse_t2v_passes_vertical_aspect_ratio(self):
+        """PixVerse v6 text-to-video supports 9:16 and must not silently
+        fall back to its 16:9 API default."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        p = _build_payload(
+            FAL_FAMILIES["pixverse-v6"],
+            prompt="x",
+            image_url=None,
+            duration=5,
+            aspect_ratio="9:16",
+            resolution="540p",
+            negative_prompt=None,
+            audio=False,
+            seed=None,
+        )
+
+        assert p["aspect_ratio"] == "9:16"
+
+    def test_pixverse_i2v_omits_unsupported_aspect_ratio(self):
+        """PixVerse v6 image-to-video inherits the source image shape and its
+        endpoint schema does not accept aspect_ratio."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        p = _build_payload(
+            FAL_FAMILIES["pixverse-v6"],
+            prompt="x",
+            image_url="https://example.com/frame.png",
+            duration=5,
+            aspect_ratio="9:16",
+            resolution="540p",
+            negative_prompt=None,
+            audio=False,
+            seed=None,
+        )
+
+        assert "aspect_ratio" not in p
+
     def test_drops_unsupported_keys(self):
         """Veo enum-clamps duration, supports aspect+resolution+audio+neg."""
         from plugins.video_gen.fal import FAL_FAMILIES, _build_payload

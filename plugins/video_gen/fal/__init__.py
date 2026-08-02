@@ -90,7 +90,10 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "tier": "cheap",
         "text_endpoint": "fal-ai/pixverse/v6/text-to-video",
         "image_endpoint": "fal-ai/pixverse/v6/image-to-video",
-        "aspect_ratios": None,
+        "aspect_ratios": ("16:9", "4:3", "1:1", "3:4", "9:16", "2:3", "3:2", "21:9"),
+        # The v6 image-to-video endpoint inherits the source image's shape and
+        # rejects aspect_ratio; only text-to-video accepts it.
+        "aspect_ratio_t2v_only": True,
         "resolutions": ("360p", "540p", "720p", "1080p"),
         "durations": (1, 15),
         "audio": True,
@@ -264,7 +267,7 @@ def _build_payload(
     if seed is not None:
         payload["seed"] = seed
 
-    if family.get("aspect_ratios"):
+    if family.get("aspect_ratios") and not (image_url and family.get("aspect_ratio_t2v_only")):
         if aspect_ratio in family["aspect_ratios"]:
             payload["aspect_ratio"] = aspect_ratio
         # otherwise let the endpoint auto-crop / use its default
