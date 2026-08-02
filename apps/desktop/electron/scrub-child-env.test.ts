@@ -8,6 +8,7 @@ test('isCredentialEnvVar matches suffix and known names', () => {
   assert.equal(isCredentialEnvVar('OPENROUTER_API_KEY'), true)
   assert.equal(isCredentialEnvVar('HERMES_DESKTOP_REMOTE_TOKEN'), true)
   assert.equal(isCredentialEnvVar('AWS_SECRET_ACCESS_KEY'), true)
+  assert.equal(isCredentialEnvVar('FAL_KEY'), true)
   assert.equal(isCredentialEnvVar('PATH'), false)
   assert.equal(isCredentialEnvVar('HERMES_HOME'), false)
   assert.equal(isCredentialEnvVar('HERMES_DESKTOP'), false)
@@ -20,6 +21,7 @@ test('scrubDesktopChildEnv drops secrets and keeps operational keys', () => {
       HERMES_HOME: '/home/u/.hermes',
       OPENROUTER_API_KEY: 'sk-live',
       TELEGRAM_BOT_TOKEN: '123:abc',
+      FAL_KEY: 'fal-secret',
       HERMES_DESKTOP_REMOTE_TOKEN: 'remote-secret',
       EMPTY: ''
     },
@@ -35,5 +37,6 @@ test('scrubDesktopChildEnv drops secrets and keeps operational keys', () => {
   assert.equal(scrubbed.HERMES_DASHBOARD_SESSION_TOKEN, 'minted-session')
   assert.equal(scrubbed.OPENROUTER_API_KEY, undefined)
   assert.equal(scrubbed.TELEGRAM_BOT_TOKEN, undefined)
+  assert.equal(scrubbed.FAL_KEY, undefined)
   assert.equal(scrubbed.HERMES_DESKTOP_REMOTE_TOKEN, undefined)
 })
