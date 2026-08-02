@@ -2190,6 +2190,15 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+_CRON_SCRIPT_ENV_OVERRIDE_KEYS = frozenset(
+    {
+        "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+        "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+        "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    }
+)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -2226,9 +2235,11 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
-        env_overrides: Non-secret, job-scoped environment values applied after
-            the sanitized subprocess environment is built. This avoids
-            process-global environment mutation for concurrent cron jobs.
+        env_overrides: Job-scoped cron delivery-routing values applied after
+            the sanitized subprocess environment is built. Keys outside the
+            three ``HERMES_CRON_AUTO_DELIVER_*`` variables are ignored so this
+            parameter cannot reintroduce sanitized credentials or internal
+            environment state.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2300,7 +2311,13 @@ def _run_job_script(
         env = build_subprocess_env()
         env.update(env_overlay)
         if env_overrides:
-            env.update(env_overrides)
+            env.update(
+                {
+                    key: value
+                    for key, value in env_overrides.items()
+                    if key in _CRON_SCRIPT_ENV_OVERRIDE_KEYS
+                }
+            )
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into

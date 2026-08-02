@@ -180,8 +180,27 @@ def test_run_job_no_agent_clears_ambient_route_for_local_delivery(
 
 
 # ---------------------------------------------------------------------------
-# _run_job_script: shell-script support
+# _run_job_script: shell-script support and environment boundaries
 # ---------------------------------------------------------------------------
+
+
+def test_run_job_script_rejects_non_routing_env_overrides(hermes_env):
+    """Post-sanitization overrides are limited to cron delivery metadata."""
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "inspect-env.py"
+    script_path.write_text(
+        "import os\n"
+        "print(os.environ.get('UNRELATED_TEST_ONLY_ENV', '<absent>'))\n"
+    )
+
+    ok, output = _run_job_script(
+        "inspect-env.py",
+        env_overrides={"UNRELATED_TEST_ONLY_ENV": "must-not-pass"},
+    )
+
+    assert ok is True
+    assert output == "<absent>"
 
 
 def test_run_job_script_path_traversal_still_blocked(hermes_env):
