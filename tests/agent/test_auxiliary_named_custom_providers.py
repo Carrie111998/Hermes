@@ -408,3 +408,57 @@ class TestResolveProviderClientMainRuntimeCustom:
         assert model == "explicit-model"
         assert "explicit.example.com" in str(client.base_url)
         assert client.api_key == "sk-explicit"
+
+
+class TestKeyEnvReadsThroughSecretScope:
+    """#76574 residual #3: auxiliary_client key_env reads must honor the
+    active profile secret scope instead of the sticky process env."""
+
+    def test_fallback_entry_api_key_prefers_scope_over_environ(self, monkeypatch):
+        from agent.auxiliary_client import _fallback_entry_api_key
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        monkeypatch.setenv("MYRELAY_API_KEY", "from-process-env")
+        token = set_secret_scope({"MYRELAY_API_KEY": "from-profile-scope"})
+        try:
+            key = _fallback_entry_api_key({"key_env": "MYRELAY_API_KEY"})
+        finally:
+            reset_secret_scope(token)
+
+        assert key == "from-profile-scope"
+
+    def test_fallback_entry_api_key_falls_back_to_environ_without_scope(self, monkeypatch):
+        from agent.auxiliary_client import _fallback_entry_api_key
+
+        monkeypatch.setenv("MYRELAY_API_KEY", "from-process-env")
+        assert _fallback_entry_api_key({"key_env": "MYRELAY_API_KEY"}) == "from-process-env"
+
+    def test_named_custom_provider_key_env_reads_scope(self, tmp_path, monkeypatch):
+        """resolve_provider_client with a key_env-only provider must resolve
+        the key through the scope when one is installed."""
+        from agent.auxiliary_client import resolve_provider_client
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        monkeypatch.delenv("SCOPED_RELAY_KEY", raising=False)
+        _write_config(tmp_path, {
+            "providers": {
+                "scoped-relay": {
+                    "name": "scoped-relay",
+                    "base_url": "https://scoped-relay.test/v1",
+                    "key_env": "SCOPED_RELAY_KEY",
+                    "default_model": "m1",
+                },
+            },
+        })
+        token = set_secret_scope({"SCOPED_RELAY_KEY": "scope-key-123"})
+        try:
+            client, _model = resolve_provider_client(
+                provider="scoped-relay", model="m1"
+            )
+        finally:
+            reset_secret_scope(token)
+
+        # The key must come from the profile scope (process env has no
+        # SCOPED_RELAY_KEY at all), proving the scope-aware read works.
+        assert client is not None
+        assert getattr(client, "api_key", None) == "scope-key-123"

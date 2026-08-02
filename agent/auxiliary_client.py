@@ -5780,7 +5780,12 @@ def resolve_provider_client(
             custom_key = (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
-                custom_key = os.getenv(custom_key_env, "").strip()
+                from agent.secret_scope import get_secret
+
+                # Scope-aware read (#76574): same reasoning as
+                # _fallback_entry_api_key — never read another profile's
+                # value through the sticky process env.
+                custom_key = (get_secret(custom_key_env) or "").strip()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
