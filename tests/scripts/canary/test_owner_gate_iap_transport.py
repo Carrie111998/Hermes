@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from scripts.canary import full_canary_owner_launcher as launcher
+from scripts.canary import passkey_v2_production_storage_growth as production_storage
 from scripts.canary import owner_gate_owner_reauth as owner_reauth
 from scripts.canary import owner_gate_trust as owner_trust
 
@@ -794,6 +795,43 @@ def test_activation_factory_accepts_no_host_path_or_command(
         "gcloud_executable",
         "gcloud_configuration",
         "owner_identity",
+    )
+
+
+def test_production_storage_factory_uses_concrete_fixed_iap_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = _Configuration()
+    identity = _Identity(configuration)
+    host_identity = _HostIdentity()
+    boundary = launcher.build_exact_production_storage_growth_boundary(
+        release_sha=RELEASE,
+        owner_identity=identity,
+        gcloud_executable=_Executable(),
+        gcloud_configuration=configuration,
+        host_identity=host_identity,
+        known_hosts=_KnownHosts(),
+        popen_factory=_passthrough_factory([]),
+        timeout_seconds=5,
+    )
+    assert isinstance(
+        boundary,
+        production_storage.ProductionStoragePasskeyBoundary,
+    )
+    assert isinstance(boundary._transport, launcher.OwnerGateIapTransport)
+    assert tuple(
+        inspect.signature(
+            launcher.build_exact_production_storage_growth_boundary
+        ).parameters
+    ) == (
+        "release_sha",
+        "owner_identity",
+        "gcloud_executable",
+        "gcloud_configuration",
+        "host_identity",
+        "known_hosts",
+        "popen_factory",
+        "timeout_seconds",
     )
 
 
