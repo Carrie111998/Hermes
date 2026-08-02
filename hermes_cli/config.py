@@ -3618,9 +3618,13 @@ def save_config(
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 
-def _parse_env_value(raw_value: str) -> str:
-    """Parse the small .env value subset Hermes writes itself."""
-    value = raw_value.strip()
+def _unquote_env_value(value: str) -> Optional[str]:
+    """Unquote a fully-quoted .env value; ``None`` when not fully quoted.
+
+    Mirrors :func:`_quote_env_value` (the writer side): a value whose first
+    and last characters are matching quotes is unescaped. A ``#`` inside
+    the quotes is data, not a comment.
+    """
     if len(value) >= 2 and value[0] == value[-1] == '"':
         quoted = value[1:-1]
         parsed: list[str] = []
@@ -3638,6 +3642,50 @@ def _parse_env_value(raw_value: str) -> str:
         return "".join(parsed)
     if len(value) >= 2 and value[0] == value[-1] == "'":
         return value[1:-1]
+    return None
+
+
+def _parse_env_value(raw_value: str) -> str:
+    """Parse the small .env value subset Hermes writes itself.
+
+    Quoted values are unescaped and returned as-is (a ``#`` inside quotes
+    is data, not a comment). Unquoted values get any inline comment
+    stripped — a ``#`` preceded by whitespace starts a comment, matching
+    python-dotenv. Without this, lines like
+    ``MINIMAX_BASE_URL=https://api.minimax.io/anthropic  # note`` silently
+    include the comment text in the value, corrupting the resolved base
+    URL and failing later with an opaque 404 (#76544).
+    """
+    value = raw_value.strip()
+    unquoted = _unquote_env_value(value)
+    if unquoted is not None:
+        return unquoted
+    # Inline comments: a ``#`` preceded by whitespace ends the value.
+    # A value that starts with a quote may still carry a trailing comment
+    # (``"a # b"  # note``), so the scan honours quotes it opened — a ``#``
+    # inside those quotes is data, not a comment.
+    quote_char = None
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        if quote_char is None:
+            if ch in ('"', "'"):
+                quote_char = ch
+            elif ch == "#" and i > 0 and value[i - 1] in (" ", "\t"):
+                value = value[:i].rstrip()
+                break
+        else:
+            # Backslash escapes the next character inside double quotes.
+            if quote_char == '"' and ch == "\\" and i + 1 < n:
+                i += 1
+            elif ch == quote_char:
+                quote_char = None
+        i += 1
+    # A comment can also trail a quoted value — re-check once it is gone.
+    unquoted = _unquote_env_value(value)
+    if unquoted is not None:
+        return unquoted
     return value
 
 
