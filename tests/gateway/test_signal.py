@@ -1521,8 +1521,10 @@ class TestSignalTransportModeDetection:
     """Cover the mode-probe branches in ``_detect_transport_mode``."""
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
     async def test_native_mode_uses_v2_send(self, monkeypatch):
-        """``transport_mode="native"`` pins outbound to ``/v2/send``."""
+        """transport_mode=native pins text sends to POST /v2/send with the
+        flat SendMessageV2 payload (not a JSON-RPC envelope)."""
         adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
         adapter._stop_typing_indicator = AsyncMock()
 
@@ -1531,20 +1533,279 @@ class TestSignalTransportModeDetection:
         async def mock_post(url, **kwargs):
             captured.append({"url": url, "payload": kwargs.get("json", {})})
             resp = MagicMock()
-            resp.status_code = 200
+            resp.status_code = 201
             resp.raise_for_status = MagicMock()
-            resp.json.return_value = {"result": {"timestamp": 12345}}
+            resp.json.return_value = {"timestamp": "1712345678000"}
             return resp
 
         adapter.client = MagicMock(post=AsyncMock(side_effect=mock_post))
 
-        result = await adapter.send(chat_id="+155****4567", content="hi")
+        result = await adapter.send(chat_id=adapter.account, content="hi")
 
         assert result.success is True
         assert len(captured) == 1
         assert captured[0]["url"] == "http://localhost:8080/v2/send", (
             f"native mode should post to /v2/send, got {captured[0]['url']!r}"
         )
+        payload = captured[0]["payload"]
+        # Flat REST body — no jsonrpc/method/id envelope
+        assert "jsonrpc" not in payload
+        assert "method" not in payload
+        assert payload["number"] == adapter.account
+        assert payload["message"] == "hi"
+        assert payload["recipients"] == [adapter.account]
+
+    @pytest.mark.asyncio
+    async def test_native_send_group_uses_group_prefix(self, monkeypatch):
+        """Native REST group sends must prefix the group id with group.
+        (the id form from GET /v1/groups, not the raw internal_id)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter._stop_typing_indicator = AsyncMock()
+
+        captured = []
+
+        async def mock_post(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 201
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"timestamp": "1712345678000"}
+            return resp
+
+        adapter.client = MagicMock(post=AsyncMock(side_effect=mock_post))
+
+        result = await adapter.send(chat_id="group:cnkxxxxT0=", content="hi")
+
+        assert result.success is True
+        assert captured[0]["url"] == "http://localhost:8080/v2/send"
+        assert captured[0]["payload"]["recipients"] == ["group.cnkxxxxT0="]
+
+    @pytest.mark.asyncio
+    async def test_native_send_attachment_uses_base64_data_uris(self, monkeypatch, tmp_path):
+        """Native REST attachments must be base64 data URIs, not file paths."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter._stop_typing_indicator = AsyncMock()
+
+        captured = []
+
+        async def mock_post(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 201
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"timestamp": "1712345678000"}
+            return resp
+
+        adapter.client = MagicMock(post=AsyncMock(side_effect=mock_post))
+
+        file_path = tmp_path / "doc.pdf"
+        file_path.write_bytes(b"%PDF" + b"\x00" * 100)
+
+        result = await adapter.send_document(
+            chat_id=adapter.account, file_path=str(file_path), caption="report"
+        )
+
+        assert result.success is True
+        send_calls = [c for c in captured if c["url"].endswith("/v2/send")]
+        assert len(send_calls) == 1
+        payload = send_calls[0]["payload"]
+        assert len(payload["base64_attachments"]) == 1
+        uri = payload["base64_attachments"][0]
+        assert uri.startswith("data:;filename=doc.pdf;base64,")
+        assert uri.endswith("AAAAA=")
+        assert payload["message"] == "report"
+
+    @pytest.mark.asyncio
+    async def test_native_send_typing_uses_put_typing_indicator(self, monkeypatch):
+        """Native typing start → PUT /v1/typing-indicator/{number} with
+        {recipient} (flat, not sendTyping JSON-RPC)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        captured = []
+
+        async def mock_put(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 204
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        adapter.client = MagicMock(put=AsyncMock(side_effect=mock_put))
+
+        await adapter.send_typing(adapter.account)
+
+        assert len(captured) == 1
+        expected_url = f"http://localhost:8080/v1/typing-indicator/{quote(adapter.account, safe='')}"
+        assert captured[0]["url"] == expected_url
+        assert captured[0]["payload"] == {"recipient": adapter.account}
+
+    @pytest.mark.asyncio
+    async def test_native_stop_typing_uses_delete_typing_indicator(self, monkeypatch):
+        """Native typing stop → DELETE /v1/typing-indicator/{number}."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        captured = []
+
+        async def mock_delete(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 204
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        adapter.client = MagicMock(delete=AsyncMock(side_effect=mock_delete))
+
+        await adapter._stop_typing_indicator(adapter.account)
+
+        assert len(captured) == 1
+        expected_url = f"http://localhost:8080/v1/typing-indicator/{quote(adapter.account, safe='')}"
+        assert captured[0]["url"] == expected_url
+        assert captured[0]["payload"] == {"recipient": adapter.account}
+
+    @pytest.mark.asyncio
+    async def test_native_send_reaction_uses_post_reactions(self, monkeypatch):
+        """Native reaction → POST /v1/reactions/{number} with
+        {reaction, recipient, target_author, timestamp}."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        captured = []
+
+        async def mock_post(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 204
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        adapter.client = MagicMock(post=AsyncMock(side_effect=mock_post))
+
+        ok = await adapter.send_reaction(
+            chat_id=adapter.account,
+            emoji="👀",
+            target_author="+15551234000",
+            target_timestamp=1712345678000,
+        )
+
+        assert ok is True
+        assert len(captured) == 1
+        expected_url = f"http://localhost:8080/v1/reactions/{quote(adapter.account, safe='')}"
+        assert captured[0]["url"] == expected_url
+        assert captured[0]["payload"] == {
+            "reaction": "👀",
+            "recipient": adapter.account,
+            "target_author": "+15551234000",
+            "timestamp": 1712345678000,
+        }
+
+    @pytest.mark.asyncio
+    async def test_native_remove_reaction_uses_delete_reactions(self, monkeypatch):
+        """Native remove-reaction → DELETE /v1/reactions/{number}."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        captured = []
+
+        async def mock_delete(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 204
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        adapter.client = MagicMock(delete=AsyncMock(side_effect=mock_delete))
+
+        await adapter.remove_reaction(
+            chat_id=adapter.account,
+            target_author="+15551234000",
+            target_timestamp=1712345678000,
+        )
+
+        assert len(captured) == 1
+        expected_url = f"http://localhost:8080/v1/reactions/{quote(adapter.account, safe='')}"
+        assert captured[0]["url"] == expected_url
+        # The shared JSON-RPC path encodes removal via params["remove"];
+        # native mode translates that to the DELETE verb with a flat body.
+        assert captured[0]["payload"] == {
+            "reaction": "",
+            "recipient": adapter.account,
+            "target_author": "+15551234000",
+            "timestamp": 1712345678000,
+        }
+
+    @pytest.mark.asyncio
+    async def test_native_list_contacts_uses_get_contacts(self, monkeypatch):
+        """Native listContacts → GET /v1/contacts/{number} with
+        all_recipients=true query."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        captured = []
+
+        async def mock_get(url, **kwargs):
+            captured.append({"url": url, "params": kwargs.get("params", {})})
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = [
+                {"number": "+15551234000", "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+            ]
+            return resp
+
+        adapter.client = MagicMock(get=AsyncMock(side_effect=mock_get))
+
+        resolved = await adapter._resolve_recipient("+15551234000")
+
+        assert resolved == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert len(captured) == 1
+        expected_url = f"http://localhost:8080/v1/contacts/{quote(adapter.account, safe='')}"
+        assert captured[0]["url"] == expected_url
+        assert captured[0]["params"] == {"all_recipients": "true"}
+
+    @pytest.mark.asyncio
+    async def test_native_get_attachment_returns_base64_data(self, monkeypatch):
+        """Native getAttachment → GET /v1/attachments/{id}; raw bytes are
+        base64-encoded into the shared data contract."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        captured = []
+
+        async def mock_get(url, **kwargs):
+            captured.append({"url": url})
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.content = b"%PDF" + b"\x00" * 4
+            return resp
+
+        adapter.client = MagicMock(get=AsyncMock(side_effect=mock_get))
+
+        result = await adapter._rpc("getAttachment", {
+            "account": adapter.account,
+            "id": "att-123",
+        })
+
+        assert isinstance(result, dict)
+        assert result["data"] == "JVBERgAAAAA="
+        assert len(captured) == 1
+        assert captured[0]["url"] == "http://localhost:8080/v1/attachments/att-123"
+
+    @pytest.mark.asyncio
+    async def test_native_unknown_method_returns_none(self, monkeypatch):
+        """Unmapped JSON-RPC methods degrade to None in native mode rather
+        than POSTing a JSON-RPC envelope to a REST endpoint."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter.client = MagicMock(
+            post=AsyncMock(side_effect=AssertionError("should not POST"))
+        )
+        result = await adapter._rpc("listGroups", {"account": adapter.account})
+        assert result is None
+
+        """Unmapped JSON-RPC methods degrade to None in native mode rather
+        than POSTing a JSON-RPC envelope to a REST endpoint."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter.client = MagicMock(
+            post=AsyncMock(side_effect=AssertionError("should not POST"))
+        )
+        result = await adapter._rpc("listGroups", {"account": "+155****4567"})
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_detect_mode_native_when_receive_endpoint_returns_200(self, monkeypatch):

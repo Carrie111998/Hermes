@@ -284,9 +284,11 @@ class SignalAdapter(BasePlatformAdapter):
         self.transport_mode: str = "native"   # set during connect()
         # Outbound path for the active mode. ``/v2/send`` is the REST endpoint
         # for ``MODE=native``; ``/v1/rpc`` is the JSON-RPC endpoint used by
-        # both ``MODE=json-rpc`` and ``MODE=normal`` (#71636 / #71884
-        # reviewer feedback: PR was retargeting every outbound JSON-RPC method
-        # without picking the right route for the active transport mode).
+        # both ``MODE=json-rpc`` and ``MODE=normal``. This attribute records
+        # the probe result for diagnostics/tests; the actual request routing
+        # is decided per-call inside ``_rpc()`` (JSON-RPC envelope to
+        # ``/v1/rpc`` vs per-operation REST endpoints via
+        # ``_native_rest_call()``, #71884).
         # Seed from the operator override so tests that don't call
         # ``connect()`` (or operators who skip the probe) still hit the
         # right URL out of the box.
@@ -996,6 +998,22 @@ class SignalAdapter(BasePlatformAdapter):
             logger.warning("Signal: RPC called but client not connected")
             return None
 
+        # In native mode the daemon exposes per-operation REST endpoints
+        # (POST /v2/send, PUT/DELETE /v1/typing-indicator/{number},
+        # POST/DELETE /v1/reactions/{number}, GET /v1/contacts/{number},
+        # GET /v1/attachments/{id}) that take flat payloads, NOT the
+        # JSON-RPC 2.0 envelope used by /v1/rpc. Route each method to its
+        # documented REST endpoint with the matching payload shape
+        # (#71884 reviewer feedback: the previous code retargeted every
+        # JSON-RPC method to /v2/send without migrating the payloads).
+        if self.transport_mode == "native":
+            return await self._native_rest_call(
+                method, params,
+                log_failures=log_failures,
+                raise_on_rate_limit=raise_on_rate_limit,
+                timeout=timeout,
+            )
+
         if rpc_id is None:
             rpc_id = f"{method}_{int(time.time() * 1000)}"
 
@@ -1007,16 +1025,8 @@ class SignalAdapter(BasePlatformAdapter):
         }
 
         try:
-            # Outbound route is mode-dependent: ``/v2/send`` for native,
-            # ``/v1/rpc`` for json-rpc. ``connect()`` sets
-            # ``self._outbound_path`` from the transport-mode probe so a
-            # single daemon deployment always lands on the right endpoint
-            # without operator intervention (#71636 / #71884 reviewer
-            # feedback: the previous code retargeted every JSON-RPC method
-            # to ``/v1/rpc`` even on native deployments where that path
-            # returns 404).
             resp = await self.client.post(
-                f"{self.http_url}{self._outbound_path}",
+                f"{self.http_url}/v1/rpc",
                 json=payload,
                 timeout=timeout,
             )
@@ -1055,6 +1065,264 @@ class SignalAdapter(BasePlatformAdapter):
             else:
                 logger.debug("Signal RPC %s failed: %s", method, e)
             return None
+
+    async def _native_rest_call(
+        self,
+        method: str,
+        params: dict,
+        *,
+        log_failures: bool = True,
+        raise_on_rate_limit: bool = False,
+        timeout: float = 30.0,
+    ) -> Any:
+        """Translate a JSON-RPC method call to the native-mode REST API.
+
+        signal-cli-rest-api in ``MODE=native`` serves per-operation REST
+        endpoints with flat payloads, not the JSON-RPC 2.0 envelope that
+        ``/v1/rpc`` accepts (which native deployments do not expose):
+
+        ==============  =============================  ======================
+        JSON-RPC name   Native REST endpoint           HTTP
+        ==============  =============================  ======================
+        send            /v2/send                       POST
+        sendTyping      /v1/typing-indicator/{number}  PUT (start) / DELETE (stop)
+        sendReaction    /v1/reactions/{number}         POST
+        removeReaction  /v1/reactions/{number}         DELETE
+        listContacts    /v1/contacts/{number}          GET
+        getAttachment   /v1/attachments/{id}           GET
+        getContact      /v1/contacts/{number}/{uuid}   GET
+        ==============  =============================  ======================
+
+        Payloads differ from JSON-RPC params as well (see the signal-cli-rest-api
+        OpenAPI spec): ``send`` wants ``{number, message, recipients, ...}``
+        with group ids prefixed ``group.``; reactions use ``target_author`` /
+        ``timestamp``; typing uses ``recipient``; contacts are GET queries.
+        Responses are flat JSON (or 204 No Content), never a ``result`` wrapper.
+        """
+        if not self.client:
+            logger.warning("Signal: RPC called but client not connected")
+            return None
+
+        account = str(params.get("account") or self.account)
+
+        try:
+            if method == "send":
+                return await self._native_send(account, params, timeout, log_failures, raise_on_rate_limit)
+            if method == "sendTyping":
+                return await self._native_send_typing(account, params, timeout, log_failures)
+            if method == "sendReaction":
+                return await self._native_send_reaction(account, params, timeout, log_failures, remove=False)
+            if method == "removeReaction":
+                return await self._native_send_reaction(account, params, timeout, log_failures, remove=True)
+            if method == "listContacts":
+                return await self._native_list_contacts(account, params, timeout, log_failures)
+            if method == "getAttachment":
+                return await self._native_get_attachment(account, params, timeout, log_failures)
+            if method == "getContact":
+                return await self._native_get_contact(account, params, timeout, log_failures)
+
+            if log_failures:
+                logger.warning("Signal: no native REST route for method %s", method)
+            else:
+                logger.debug("Signal: no native REST route for method %s", method)
+            return None
+
+        except SignalRateLimitError:
+            raise
+        except Exception as e:
+            if log_failures:
+                logger.warning("Signal REST %s failed: %s", method, e)
+            else:
+                logger.debug("Signal REST %s failed: %s", method, e)
+            return None
+
+    # ------------------------------------------------------------------
+    # Native-mode REST outbound helpers (signal-cli-rest-api MODE=native)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _native_recipients(params: dict, account: str) -> List[str]:
+        """Build the ``recipients`` array for native REST sends.
+
+        DM recipients pass through as-is; group ids get the ``group.`` prefix
+        that the native REST API requires (the ``id`` form returned by
+        ``GET /v1/groups/{number}``, not the raw base64 ``internal_id``).
+        """
+        if params.get("groupId"):
+            gid = str(params["groupId"])
+            if not gid.startswith("group."):
+                gid = f"group.{gid}"
+            return [gid]
+        recipients = params.get("recipient") or []
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        return [str(r) for r in recipients]
+
+    async def _native_send(
+        self,
+        account: str,
+        params: dict,
+        timeout: float,
+        log_failures: bool,
+        raise_on_rate_limit: bool,
+    ) -> Any:
+        """POST /v2/send with the flat SendMessageV2 payload.
+
+        Attachments are sent as ``base64_attachments`` data URIs
+        (``data:;filename=...;base64,...``) — the native API does not accept
+        server-side file paths.
+        """
+        recipients = self._native_recipients(params, account)
+        if not recipients:
+            if log_failures:
+                logger.warning("Signal: native send requires a recipient or groupId")
+            else:
+                logger.debug("Signal: native send requires a recipient or groupId")
+            return None
+
+        body: Dict[str, Any] = {
+            "number": account,
+            "message": params.get("message", ""),
+            "recipients": recipients,
+        }
+        if params.get("textStyles") or params.get("textStyle"):
+            body["text_mode"] = "styled"
+
+        attachments = params.get("attachments")
+        if attachments:
+            data_uris = []
+            for path in attachments:
+                try:
+                    p = Path(path)
+                    raw = p.read_bytes()
+                except OSError as e:
+                    if log_failures:
+                        logger.warning("Signal: cannot read attachment %s: %s", path, e)
+                    return None
+                data_uris.append(
+                    "data:;filename={};base64,{}".format(
+                        quote(p.name, safe=""), base64.b64encode(raw).decode("ascii")
+                    )
+                )
+            body["base64_attachments"] = data_uris
+
+        resp = await self.client.post(
+            f"{self.http_url}/v2/send",
+            json=body,
+            timeout=timeout,
+        )
+        if resp.status_code == 429 and raise_on_rate_limit:
+            raise SignalRateLimitError("Rate limit exceeded", retry_after=None)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _native_send_typing(
+        self,
+        account: str,
+        params: dict,
+        timeout: float,
+        log_failures: bool,
+    ) -> Any:
+        """PUT (start) / DELETE (stop) /v1/typing-indicator/{number}."""
+        recipients = self._native_recipients(params, account)
+        if not recipients:
+            return None
+        url = f"{self.http_url}/v1/typing-indicator/{quote(account, safe='')}"
+        body = {"recipient": recipients[0]}
+        if params.get("stop"):
+            resp = await self.client.delete(url, json=body, timeout=timeout)
+        else:
+            resp = await self.client.put(url, json=body, timeout=timeout)
+        if resp.status_code in (200, 204):
+            return True
+        resp.raise_for_status()
+        return True
+
+    async def _native_send_reaction(
+        self,
+        account: str,
+        params: dict,
+        timeout: float,
+        log_failures: bool,
+        remove: bool = False,
+    ) -> Any:
+        """POST / DELETE /v1/reactions/{number} with a SendReactionRequest.
+
+        The shared JSON-RPC path encodes removal via ``params[\"remove\"]``
+        (the adapter's remove_reaction() calls sendReaction with an empty
+        emoji + remove flag), so honor that here as well.
+        """
+        recipients = self._native_recipients(params, account)
+        if not recipients:
+            return None
+        remove = remove or bool(params.get("remove"))
+        body = {
+            "reaction": params.get("emoji", ""),
+            "recipient": recipients[0],
+            "target_author": params.get("targetAuthor", ""),
+            "timestamp": params.get("targetTimestamp", 0),
+        }
+        url = f"{self.http_url}/v1/reactions/{quote(account, safe='')}"
+        if remove:
+            resp = await self.client.delete(url, json=body, timeout=timeout)
+        else:
+            resp = await self.client.post(url, json=body, timeout=timeout)
+        if resp.status_code in (200, 204):
+            return True
+        resp.raise_for_status()
+        return True
+
+    async def _native_list_contacts(
+        self,
+        account: str,
+        params: dict,
+        timeout: float,
+        log_failures: bool,
+    ) -> Any:
+        """GET /v1/contacts/{number}?all_recipients=true (if requested)."""
+        url = f"{self.http_url}/v1/contacts/{quote(account, safe='')}"
+        query = {}
+        if params.get("allRecipients"):
+            query["all_recipients"] = "true"
+        resp = await self.client.get(url, params=query, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _native_get_attachment(
+        self,
+        account: str,
+        params: dict,
+        timeout: float,
+        log_failures: bool,
+    ) -> Any:
+        """GET /v1/attachments/{id}; returns raw bytes (base64-encoded by
+        the caller-facing contract of _fetch_attachment)."""
+        att_id = params.get("id")
+        if not att_id:
+            return None
+        url = f"{self.http_url}/v1/attachments/{quote(str(att_id), safe='')}"
+        resp = await self.client.get(url, timeout=timeout)
+        resp.raise_for_status()
+        # Native REST serves the attachment file directly; the JSON-RPC
+        # contract returned {"data": "<base64>"}. Keep that shape so the
+        # shared _fetch_attachment consumer works unchanged.
+        return {"data": base64.b64encode(resp.content).decode("ascii")}
+
+    async def _native_get_contact(
+        self,
+        account: str,
+        params: dict,
+        timeout: float,
+        log_failures: bool,
+    ) -> Any:
+        """GET /v1/contacts/{number}/{uuid} — resolve by contact uuid."""
+        contact = params.get("contactAddress") or params.get("uuid")
+        if not contact:
+            return None
+        url = f"{self.http_url}/v1/contacts/{quote(account, safe='')}/{quote(str(contact), safe='')}"
+        resp = await self.client.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------
     # Formatting — markdown → Signal body ranges

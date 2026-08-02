@@ -113,12 +113,12 @@ SIGNAL_HOME_CHANNEL=+123****7890                  # Default delivery target for 
 
 #### Transport mode (advanced)
 
-`siganl-cli-rest-api` ships two transport shapes (selected via the daemon's `MODE=` env var):
+`signal-cli-rest-api` ships two transport shapes (selected via the daemon's `MODE=` env var):
 
 | Daemon `MODE` | Outbound route | Inbound route |
 |---------------|----------------|---------------|
-| `native` (docker-compose default) | `POST /v2/send` | `GET /v1/receive/{number}` (HTTP polling — Hermes supports this) |
-| `json-rpc` | `POST /v1/rpc` (JSON-RPC 2.0) | WebSocket `subscribeReceive` — **not yet implemented** in Hermes |
+| `native` (docker-compose default) | Per-operation REST: `POST /v2/send`, `PUT/DELETE /v1/typing-indicator/{number}`, `POST/DELETE /v1/reactions/{number}`, `GET /v1/contacts/{number}`, `GET /v1/attachments/{id}` | `GET /v1/receive/{number}` (HTTP polling — Hermes supports this) |
+| `json-rpc` | `POST /v1/rpc` (JSON-RPC 2.0 envelope for every method) | WebSocket `subscribeReceive` — **not yet implemented** in Hermes |
 | `json-rpc-native` | `POST /v2/send` (REST) | Hybrid — Hermes uses native polling |
 
 Hermes auto-detects the right outbound route during `connect()` by probing `GET /v1/about` and `GET /v1/receive/{number}`. To lock the choice, add `transport_mode` under `platforms.signal.extra` in `config.yaml`:
@@ -133,7 +133,9 @@ platforms:
       transport_mode: native   # or "json-rpc" (outbound only — inbound WebSocket is unimplemented)
 ```
 
-Defaults to `auto` (probe), which falls back to `native` if the probe fails (matches the docker-compose default). Operators running `MODE=json-rpc` should set `transport_mode: json-rpc` explicitly so outbound JSON-RPC calls land on `/v1/rpc` instead of `/v2/send` (which would 404).
+Defaults to `auto` (probe), which falls back to `native` if the probe fails (matches the docker-compose default). Operators running `MODE=json-rpc` should set `transport_mode: json-rpc` explicitly so outbound JSON-RPC calls land on `/v1/rpc` instead of the native REST routes (which would 404).
+
+Outbound payloads are translated per transport: native mode sends flat REST bodies (`{number, message, recipients}` with `group.<id>` for groups, base64 data-URI attachments, snake_case reaction fields), while json-rpc mode keeps the JSON-RPC 2.0 envelope. This is automatic — no per-call configuration is needed.
 
 Then start the gateway:
 
