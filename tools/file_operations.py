@@ -1001,6 +1001,23 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _escape_native_arg(self, arg: str) -> str:
+        """Escape *arg* for a native Windows binary (no MSYS path form).
+
+        ``_escape_shell_arg`` rewrites drive paths to the Git Bash
+        ``/c/Users/x`` form. That is correct for MSYS-aware tools (bash
+        builtins, grep from Git Bash), but native Windows executables such
+        as the WinGet ``rg.exe`` cannot read ``/c/...`` when MSYS argument
+        conversion is disabled (``MSYS2_ARG_CONV_EXCL=*``, which the Hermes
+        local env sets deliberately to stop flag mangling). Native tools
+        need the ``C:/Users/x`` form. On non-Windows hosts this is a no-op
+        — POSIX paths are identical either way.
+        """
+        from tools.environments.local import _msys_to_windows_path
+
+        native = _msys_to_windows_path(arg) if os.name == "nt" else arg
+        return "'" + native.replace("'", "'\"'\"'") + "'"
+
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
 
@@ -2272,15 +2289,27 @@ class ShellFileOperations(FileOperations):
         13.9% of production content searches return zero matches and give
         the model nothing to steer by. Run ONE cheap case-insensitive count
         probe; if it hits, say so. If the pattern contains regex
-        metacharacters, also probe it as a fixed string. Bounded: two rg
+        metacharacters, also probe it as a fixed string. Bounded: two
         invocations max, count-only output.
+
+        Uses whatever engine the main search would have used — rg when
+        available, grep otherwise — so the probe never silently dies in
+        an environment where the main search itself fell back to grep
+        (e.g. a test/sandbox PATH without rg on it).
         """
-        if not self._has_command('rg'):
+        engine, count_flags = self._probe_engine()
+        if engine is None:
             return None
-        glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        glob_expr = ""
+        if file_glob:
+            glob_flag = "--glob" if engine == "rg" else "--include"
+            glob_expr = f" {glob_flag} {self._escape_shell_arg(file_glob)}"
+        # Native rg.exe cannot read the MSYS /c/... form when MSYS arg
+        # conversion is disabled; grep (an MSYS tool) needs that form.
+        path_arg = self._escape_native_arg(path) if engine == "rg" else self._escape_shell_arg(path)
         probe = self._exec(
-            f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{engine} {count_flags}{glob_expr} "
+            f"{self._escape_shell_arg(pattern)} {path_arg} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2299,10 +2328,12 @@ class ShellFileOperations(FileOperations):
         # Hidden/ignored probe: rg skips dotdirs and .gitignore'd files by
         # default. When the pattern exists only there, say so instead of
         # returning a bare zero (bench case: match in .hidden/ silently
-        # missing from results).
+        # missing from results). Under grep, the case probe carries
+        # --exclude-dir='.*' (mirroring the main search); this probe
+        # drops that exclusion so dot-directory matches are found.
         hidden = self._exec(
-            f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{engine} {self._probe_hidden_flags(engine)}{glob_expr} "
+            f"{self._escape_shell_arg(pattern)} {path_arg} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2321,8 +2352,8 @@ class ShellFileOperations(FileOperations):
             )
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
-                f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+                f"{engine} -F {count_flags}{glob_expr} "
+                f"{self._escape_shell_arg(pattern)} {path_arg} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -2338,6 +2369,39 @@ class ShellFileOperations(FileOperations):
                     "escaping (or pass a simpler substring)."
                 )
         return None
+
+    def _probe_engine(self) -> "tuple[str | None, str]":
+        """Pick the search engine for zero-match probes.
+
+        Returns (engine, count_flags): ``rg`` with ``-i --count-matches``
+        when ripgrep is available; ``grep`` with ``-rniHc`` otherwise;
+        ``(None, "")`` when neither exists. Mirrors the main search's
+        engine precedence so the probe behaves identically to the search
+        that produced the zero.
+        """
+        if self._has_command('rg'):
+            return "rg", "-i --count-matches"
+        if self._has_command('grep'):
+            # -c emits per-file counts (path:count), which the probe
+            # parser expects; -H forces the filename even for a
+            # single-file search. --exclude-dir mirrors the main grep
+            # search (and rg's default) so hidden files are probed by
+            # the dedicated hidden probe, not the case probe.
+            return "grep", "-rniHc --exclude-dir='.*'"
+        return None, ""
+
+    def _probe_hidden_flags(self, engine: str) -> str:
+        """Flags for the hidden/ignored probe, per engine.
+
+        rg: ``--hidden --no-ignore --count-matches`` overrides the
+        default dotdir and .gitignore exclusion. grep: the case probe
+        carries ``--exclude-dir='.*'`` (mirroring the main search), so
+        the hidden probe must drop that exclusion — ``-rniHc`` with no
+        exclude descends into dot-directories and finds the matches.
+        """
+        if engine == "rg":
+            return "--hidden --no-ignore --count-matches"
+        return "-rniHc"
 
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
@@ -2442,9 +2506,11 @@ class ShellFileOperations(FileOperations):
 
         fetch_limit = limit + offset
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
+        # rg.exe is a native binary — pass the native drive form on Windows.
+        native_root = self._escape_native_arg(path)
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{native_root} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2455,7 +2521,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{native_root} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2539,7 +2605,10 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        # rg.exe on Windows is a native binary: it cannot read the MSYS
+        # /c/... form when MSYS argument conversion is disabled, so pass
+        # the native drive form (C:/...) for the search root.
+        cmd_parts.append(self._escape_native_arg(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,

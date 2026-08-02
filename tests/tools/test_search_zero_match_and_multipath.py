@@ -53,6 +53,67 @@ class TestZeroMatchProbe:
         assert "warning" not in r
 
 
+class TestZeroMatchProbeGrepFallback:
+    """Zero-match probes must still attach hints when rg is unavailable.
+
+    The main content search falls back to grep when ``rg`` is not on the
+    executed environment's PATH. The probe used to hard-require rg and
+    silently return no hint in that case — search worked (via grep) but
+    the zero-match steering was dead. These tests force the grep engine
+    and assert the same hints appear. Regression for the CI failure on
+    ``tests/tools/test_search_zero_match_and_multipath.py``.
+    """
+
+    @staticmethod
+    def _grep_ops(tmp_path):
+        from tools.environments.local import LocalEnvironment
+        from tools.file_operations import ShellFileOperations
+
+        d = tmp_path / "proj"
+        d.mkdir()
+        env = LocalEnvironment(cwd=str(d.parent))
+        ops = ShellFileOperations(env, cwd=str(d.parent))
+        # Simulate an environment with grep but no rg.
+        ops._has_command = lambda cmd: cmd == "grep"
+        return ops, d
+
+    def test_case_mismatch_hint_via_grep(self, tmp_path):
+        ops, d = self._grep_ops(tmp_path)
+        (d / "a.py").write_text("TOKEN_ALPHA = 'x'\n")
+        hint = ops._zero_match_probe("token_alpha", str(d), None)
+        assert hint and "case-insensitive" in hint
+
+    def test_literal_hint_via_grep(self, tmp_path):
+        ops, d = self._grep_ops(tmp_path)
+        (d / "meta.py").write_text("result = lookup[key+1]\n")
+        hint = ops._zero_match_probe("lookup[key+1]", str(d), None)
+        assert hint and "literal match" in hint
+
+    def test_hidden_only_hint_via_grep(self, tmp_path):
+        ops, d = self._grep_ops(tmp_path)
+        (d / ".secretdir").mkdir()
+        (d / ".secretdir" / "conf.cfg").write_text("HIDDEN_ONLY_TOKEN = true\n")
+        hint = ops._zero_match_probe("HIDDEN_ONLY_TOKEN", str(d), None)
+        assert hint and "hidden or gitignored" in hint
+
+    def test_true_zero_no_hint_via_grep(self, tmp_path):
+        ops, d = self._grep_ops(tmp_path)
+        (d / "a.py").write_text("x = 1\n")
+        assert ops._zero_match_probe("zzz_absent_zzz", str(d), None) is None
+
+    def test_probe_engine_prefers_rg_when_available(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+        from tools.file_operations import ShellFileOperations
+
+        d = tmp_path / "proj"
+        d.mkdir()
+        ops = ShellFileOperations(LocalEnvironment(cwd=str(d.parent)), cwd=str(d.parent))
+        ops._has_command = lambda cmd: cmd in ("rg", "grep")
+        engine, flags = ops._probe_engine()
+        assert engine == "rg"
+        assert "count-matches" in flags
+
+
 class TestMultiPathRecovery:
     def test_two_existing_paths_merged(self, proj):
         p = f"{proj / 'proj'} {proj / 'extra'}"
