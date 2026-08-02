@@ -2210,6 +2210,63 @@ class TestProbeGatewayHealth:
         assert call_count[0] == 2
 
 
+    def test_detailed_probe_sends_bearer_only_to_detailed(self, monkeypatch):
+        """API_SERVER_KEY authenticates /health/detailed but is never sent to
+        the public /health fallback (#76051)."""
+        import hermes_cli.web_server as ws
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_TIMEOUT", 1)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_API_KEY", "test-key")
+
+        seen = []  # (url, Authorization header or None)
+
+        def mock_urlopen(req, **kwargs):
+            seen.append((req.full_url, req.headers.get("Authorization")))
+            if req.full_url.endswith("/health/detailed"):
+                raise ConnectionError("detailed failed")
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            return mock_resp
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", mock_urlopen)
+        alive, body = ws._probe_gateway_health()
+
+        assert alive is True
+        assert body["status"] == "ok"
+        assert seen == [
+            ("http://gw:8642/health/detailed", "Bearer test-key"),
+            ("http://gw:8642/health", None),
+        ]
+
+
+    def test_probe_sends_no_auth_when_api_key_unset(self, monkeypatch):
+        """Without API_SERVER_KEY, neither probe carries credentials."""
+        import hermes_cli.web_server as ws
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_TIMEOUT", 1)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_API_KEY", "")
+
+        seen = []
+
+        def mock_urlopen(req, **kwargs):
+            seen.append(req.headers.get("Authorization"))
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            return mock_resp
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", mock_urlopen)
+        alive, _ = ws._probe_gateway_health()
+
+        assert alive is True
+        assert seen == [None]
+
+
 class TestStatusRemoteGateway:
     """Tests for /api/status with remote gateway health fallback."""
 

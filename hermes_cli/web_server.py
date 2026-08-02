@@ -1564,6 +1564,7 @@ def _apply_main_model_assignment(
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
+_GATEWAY_HEALTH_API_KEY = os.getenv("API_SERVER_KEY", "").strip()
 _GATEWAY_HEALTH_TIMEOUT_MAX = 1.0
 _GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
 try:
@@ -1610,6 +1611,9 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     Uses ``/health/detailed`` first (returns full state), falling back to
     the simpler ``/health`` endpoint.  Returns ``(is_alive, body_dict)``.
 
+    When ``API_SERVER_KEY`` is set, the detailed probe authenticates with a
+    Bearer token; the public ``/health`` fallback is never sent credentials.
+
     Accepts any of these as ``GATEWAY_HEALTH_URL``:
     - ``http://gateway:8642``                (base URL — recommended)
     - ``http://gateway:8642/health``         (explicit health path)
@@ -1631,6 +1635,12 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     for path in (f"{base}/health/detailed", f"{base}/health"):
         try:
             req = urllib.request.Request(path, method="GET")
+            # /health/detailed requires the gateway's API key when one is
+            # configured (a missing key 401s and spams the gateway log on
+            # every poll — #76051).  The public /health fallback stays
+            # credential-free so the key is never sent where it isn't needed.
+            if _GATEWAY_HEALTH_API_KEY and path.endswith("/health/detailed"):
+                req.add_header("Authorization", f"Bearer {_GATEWAY_HEALTH_API_KEY}")
             with urllib.request.urlopen(req, timeout=_GATEWAY_HEALTH_TIMEOUT) as resp:
                 if resp.status == 200:
                     body = json.loads(resp.read())
