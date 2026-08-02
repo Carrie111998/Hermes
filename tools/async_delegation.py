@@ -76,6 +76,9 @@ _records: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+# In-memory statuses that are still live work (must not be retention-pruned).
+# Matches active_count(); stalling is in-memory-only until force/normal finalize.
+_ACTIVE_RECORD_STATUSES = frozenset({"running", "stalling", "finalizing"})
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 # A pending completion whose delivery keeps failing is retried across claim
@@ -544,7 +547,7 @@ def active_count() -> int:
     with _records_lock:
         return sum(
             1 for r in _records.values()
-            if r.get("status") in {"running", "stalling", "finalizing"}
+            if r.get("status") in _ACTIVE_RECORD_STATUSES
         )
 
 
@@ -578,12 +581,13 @@ def _new_delegation_id() -> str:
 def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the retention cap.
 
-    Caller must hold ``_records_lock``.
+    Caller must hold ``_records_lock``. Only terminal statuses are eligible —
+    stalling/finalizing are still live and must survive until they finish.
     """
     completed = [
         (rid, r)
         for rid, r in _records.items()
-        if r.get("status") != "running"
+        if r.get("status") not in _ACTIVE_RECORD_STATUSES
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -774,8 +778,12 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        # Persist/enqueue failures must not leave the record stuck in
+        # finalizing (capacity/active_count zombies until process exit).
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -865,7 +873,16 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    _persist_completion(evt, result)
+    try:
+        _persist_completion(evt, result)
+    except Exception as exc:
+        # Durable write is best-effort relative to in-process delivery: still
+        # enqueue so the parent session learns the outcome this process.
+        logger.error(
+            "Async delegation %s: durable completion persist failed; "
+            "continuing with in-memory delivery: %s",
+            record.get("delegation_id"), exc,
+        )
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1017,8 +1034,10 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
@@ -1074,7 +1093,14 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
+    try:
+        _persist_completion(evt, combined)
+    except Exception as exc:
+        logger.error(
+            "Async delegation batch %s: durable completion persist failed; "
+            "continuing with in-memory delivery: %s",
+            event_record.get("delegation_id"), exc,
+        )
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1239,32 +1265,34 @@ def _finalize_stalled(delegation_id: str) -> None:
         ),
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
     }
-    if event_record.get("is_batch"):
-        _push_batch_completion_event(
-            event_record,
-            {
-                "results": [],
-                "error": error,
-                "total_duration_seconds": duration,
-                **stall_meta,
-            },
-            "stalled",
-        )
-    else:
-        _push_completion_event(
-            event_record,
-            {
-                "status": "stalled",
-                "summary": None,
-                "error": error,
-                "api_calls": 0,
-                "duration_seconds": duration,
-                "exit_reason": "stalled",
-                **stall_meta,
-            },
-            "stalled",
-        )
-    _finish_finalization(delegation_id, "stalled")
+    try:
+        if event_record.get("is_batch"):
+            _push_batch_completion_event(
+                event_record,
+                {
+                    "results": [],
+                    "error": error,
+                    "total_duration_seconds": duration,
+                    **stall_meta,
+                },
+                "stalled",
+            )
+        else:
+            _push_completion_event(
+                event_record,
+                {
+                    "status": "stalled",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": duration,
+                    "exit_reason": "stalled",
+                    **stall_meta,
+                },
+                "stalled",
+            )
+    finally:
+        _finish_finalization(delegation_id, "stalled")
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:

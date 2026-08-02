@@ -685,6 +685,96 @@ def test_concurrent_dispatch_respects_capacity():
     gate.set()
 
 
+def test_prune_retains_stalling_record_so_late_result_is_delivered(monkeypatch):
+    """Retention prune must not drop stalling records as if they were done.
+
+    If a stalling id is popped from _records, a late runner return hits
+    _begin_finalization's missing-record path and silently drops the result.
+    """
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 3)
+    gate = threading.Event()
+
+    def stall_runner():
+        gate.wait(timeout=30)
+        return {
+            "status": "completed",
+            "summary": "late",
+            "api_calls": 1,
+            "duration_seconds": 1,
+        }
+
+    stalled = ad.dispatch_async_delegation(
+        goal="stall", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s1", runner=stall_runner, max_async_children=8,
+        progress_fn=lambda: (0, False),
+    )
+    assert stalled["status"] == "dispatched"
+    sid = stalled["delegation_id"]
+
+    with ad._records_lock:
+        rec = ad._records[sid]
+        rec["status"] = "stalling"
+        rec["_interrupted_at"] = time.time()
+
+    for i in range(4):
+        done = ad.dispatch_async_delegation(
+            goal=f"g{i}", context=None, toolsets=None, role="leaf",
+            model="m", session_key="s1",
+            runner=lambda idx=i: {
+                "status": "completed",
+                "summary": f"ok{idx}",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+            },
+            max_async_children=8,
+        )
+        assert done["status"] == "dispatched"
+        assert _drain_for(done["delegation_id"], timeout=5.0) is not None
+
+    with ad._records_lock:
+        assert sid in ad._records
+        assert ad._records[sid].get("status") == "stalling"
+
+    gate.set()
+    evt = _drain_for(sid, timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "late"
+
+
+def test_persist_failure_still_finishes_and_enqueues(monkeypatch):
+    """Durable persist errors must not leave finalizing zombies or drop the queue event."""
+
+    def boom(_evt, _result):
+        raise RuntimeError("simulated sqlite failure")
+
+    monkeypatch.setattr(ad, "_persist_completion", boom)
+
+    res = ad.dispatch_async_delegation(
+        goal="g", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s1",
+        runner=lambda: {
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        },
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    did = res["delegation_id"]
+
+    evt = _drain_for(did, timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "ok"
+
+    with ad._records_lock:
+        status = ad._records.get(did, {}).get("status")
+    assert status == "completed"
+    assert ad.active_count() == 0
+
+
 # ---------------------------------------------------------------------------
 # Gateway routing: session_key -> platform/chat_id, rich formatting, injection
 # ---------------------------------------------------------------------------
