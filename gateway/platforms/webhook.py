@@ -18,6 +18,15 @@ Each route defines:
     (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
     and sub-second delivery matter more than agent reasoning.
 
+Root-action route contract:
+  - root_action_proposal: true enables the isolated immutable-action path
+  - deliver: telegram and deliver_extra.chat_id are fixed server config
+  - pythia_callback_url / pythia_callback_secret are fixed server config
+  - POST /webhooks/<route> accepts exactly action_id, parameter_digest,
+    preview, and expires_at; the route never invokes the model and requires
+    timestamp-bound X-Webhook-Signature-V2 (legacy V1 is rejected)
+  - Telegram callback data is ra:approve:<action_id> or ra:deny:<action_id>
+
 Security:
   - HMAC secret is required per route (validated at startup)
   - Rate limiting per route (fixed-window, configurable)
@@ -37,11 +46,14 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, Optional
 
 try:
@@ -58,6 +70,13 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+)
+from gateway.root_action_approval import (
+    PendingRootAction,
+    RootActionApprovalStore,
+    RootActionProtocolError,
+    RootActionProposal,
+    get_root_action_store,
 )
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
@@ -216,10 +235,22 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
+        # Shared process-local state for immutable root-action proposals. The
+        # Telegram adapter consumes records created by this webhook adapter.
+        self._root_action_store: RootActionApprovalStore = get_root_action_store()
 
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
         self._seen_deliveries: Dict[str, float] = {}
+
+        # Durable managed incident delivery bindings. Generic deliver_only
+        # idempotency remains TTL-based and process-local; the managed
+        # unraid-incidents route retains its exact request binding across
+        # restarts so a lost response cannot resend Telegram.
+        self._unraid_incident_records: Dict[str, dict] = {}
+        self._unraid_incident_records_path = self._incident_records_path()
+        self._load_unraid_incident_records()
+        self._unraid_incident_lock: Optional[asyncio.Lock] = None
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -281,6 +312,26 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"[webhook] Route '{name}' has deliver_only=true but "
                         f"deliver is '{deliver}'. Direct delivery requires a "
                         f"real target (telegram, discord, slack, github_comment, etc.)."
+                    )
+            if route.get("root_action_proposal"):
+                if secret == _INSECURE_NO_AUTH:
+                    raise ValueError(
+                        f"[webhook] Root-action route '{name}' requires HMAC-V2; "
+                        "INSECURE_NO_AUTH is not permitted"
+                    )
+                # Root-action proposals never enter the agent/deliver_only
+                # path. They must have a fixed Telegram target and a fixed
+                # Pythia callback secret; neither is accepted from a request.
+                extra = route.get("deliver_extra") or {}
+                if route.get("deliver", "telegram") != "telegram" or not extra.get("chat_id"):
+                    raise ValueError(
+                        f"[webhook] Root-action route '{name}' requires "
+                        "deliver=telegram and deliver_extra.chat_id"
+                    )
+                if not route.get("pythia_callback_url") or not route.get("pythia_callback_secret"):
+                    raise ValueError(
+                        f"[webhook] Root-action route '{name}' requires a fixed "
+                        "pythia_callback_url and pythia_callback_secret"
                     )
 
         # client_max_size makes aiohttp enforce the cap on every read path,
@@ -448,6 +499,228 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
+    @staticmethod
+    def _incident_records_path() -> Path:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "webhook_unraid_incidents.json"
+
+    def _load_unraid_incident_records(self) -> None:
+        try:
+            records = json.loads(
+                self._unraid_incident_records_path.read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return
+        if not isinstance(records, dict):
+            return
+        for request_id, binding in records.items():
+            if not isinstance(request_id, str) or not isinstance(binding, dict):
+                continue
+            revision = binding.get("state_revision")
+            revision_valid = (
+                isinstance(revision, int)
+                and not isinstance(revision, bool)
+                and 0 <= revision <= 2**63 - 1
+            ) or (isinstance(revision, str) and bool(revision.strip()))
+            delivery_state = binding.get("delivery_state", "delivered")
+            if (
+                isinstance(binding.get("incident_id"), str)
+                and bool(binding["incident_id"].strip())
+                and revision_valid
+                and delivery_state in {"pending", "retryable", "delivered"}
+            ):
+                self._unraid_incident_records[request_id] = {
+                    "incident_id": binding["incident_id"],
+                    "state_revision": revision,
+                    "delivery_state": delivery_state,
+                }
+
+    def _persist_unraid_incident_records(self) -> None:
+        path = self._unraid_incident_records_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(
+                    self._unraid_incident_records,
+                    stream,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _managed_incident_binding(
+        self, payload: Any, request_id: str
+    ) -> tuple[dict | None, str | None]:
+        incident = payload.get("incident") if isinstance(payload, dict) else None
+        if not isinstance(incident, dict):
+            return None, "managed incident payload requires incident object"
+        incident_id = incident.get("incident_id")
+        state_revision = incident.get("state_revision")
+        if not isinstance(incident_id, str) or not incident_id.strip():
+            return None, "managed incident payload requires incident.incident_id"
+        revision_valid = (
+            isinstance(state_revision, int)
+            and not isinstance(state_revision, bool)
+            and 0 <= state_revision <= 2**63 - 1
+        ) or (isinstance(state_revision, str) and bool(state_revision.strip()))
+        if not revision_valid:
+            return None, "managed incident payload requires bounded state_revision"
+        revision_text = str(state_revision)
+        expected_request_id = f"unraid:{incident_id.strip()}:{revision_text}"
+        if request_id != expected_request_id:
+            return None, "X-Request-ID does not match signed incident binding"
+        return {
+            "incident_id": incident_id.strip(),
+            "state_revision": state_revision,
+        }, None
+
+
+    async def _handle_managed_incident_delivery(
+        self,
+        *,
+        request: "web.Request",
+        route_config: dict,
+        payload: dict,
+        prompt: str,
+        event_type: str,
+        route_name: str,
+        request_id: str,
+    ) -> "web.Response":
+        binding, error = self._managed_incident_binding(payload, request_id)
+        if error is not None:
+            return web.json_response({"error": error}, status=400)
+        assert binding is not None
+
+        def replay_response(existing: dict) -> "web.Response":
+            if (
+                existing.get("incident_id") != binding["incident_id"]
+                or existing.get("state_revision") != binding["state_revision"]
+            ):
+                return web.json_response(
+                    {"error": "request binding conflicts with persisted incident"},
+                    status=409,
+                )
+            if existing.get("delivery_state") == "pending":
+                return web.json_response(
+                    {
+                        "status": "outcome_unknown",
+                        "error": "managed incident delivery outcome requires reconciliation",
+                        "request_id": request_id,
+                        **binding,
+                    },
+                    status=503,
+                )
+            return web.json_response(
+                {
+                    "status": "duplicate",
+                    "request_id": request_id,
+                    **binding,
+                },
+                status=200,
+            )
+
+        records = getattr(self, "_unraid_incident_records", {})
+        existing = records.get(request_id)
+        if existing is not None and existing.get("delivery_state") != "retryable":
+            return replay_response(existing)
+
+        lock = getattr(self, "_unraid_incident_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._unraid_incident_lock = lock
+        async with lock:
+            records = self._unraid_incident_records
+            existing = records.get(request_id)
+            if existing is not None and existing.get("delivery_state") != "retryable":
+                return replay_response(existing)
+            if existing is None and len(records) >= 4096:
+                return web.json_response(
+                    {"error": "managed incident idempotency capacity exhausted"},
+                    status=507,
+                )
+            records[request_id] = {**binding, "delivery_state": "pending"}
+            try:
+                self._persist_unraid_incident_records()
+            except OSError:
+                records.pop(request_id, None)
+                logger.exception(
+                    "[webhook] failed to persist managed incident intent %s",
+                    request_id,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Delivery state unavailable", "request_id": request_id},
+                    status=503,
+                )
+            delivery = {
+                "deliver": route_config.get("deliver", "log"),
+                "deliver_extra": self._render_delivery_extra(
+                    route_config.get("deliver_extra", {}), payload
+                ),
+                "payload": payload,
+            }
+            try:
+                result = await self._direct_deliver(prompt, delivery)
+            except Exception:
+                logger.exception(
+                    "[webhook] managed incident delivery failed route=%s request=%s",
+                    route_name,
+                    request_id,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Delivery failed", "request_id": request_id},
+                    status=502,
+                )
+            if not result.success:
+                records[request_id] = {**binding, "delivery_state": "retryable"}
+                try:
+                    self._persist_unraid_incident_records()
+                except OSError:
+                    records[request_id] = {**binding, "delivery_state": "pending"}
+                    logger.exception(
+                        "[webhook] failed to persist retryable incident delivery %s",
+                        request_id,
+                    )
+                    return web.json_response(
+                        {"status": "outcome_unknown", "error": "Delivery state unavailable", "request_id": request_id},
+                        status=503,
+                    )
+                return web.json_response(
+                    {"status": "error", "error": "Delivery failed", "request_id": request_id},
+                    status=502,
+                )
+            records[request_id] = {**binding, "delivery_state": "delivered"}
+            try:
+                self._persist_unraid_incident_records()
+            except OSError:
+                records[request_id] = {**binding, "delivery_state": "pending"}
+                logger.exception(
+                    "[webhook] failed to persist managed incident acknowledgement %s",
+                    request_id,
+                )
+                return web.json_response(
+                    {"status": "outcome_unknown", "error": "Delivery state unavailable", "request_id": request_id},
+                    status=503,
+                )
+            return web.json_response(
+                {
+                    "status": "delivered",
+                    "request_id": request_id,
+                    **binding,
+                },
+                status=200,
+            )
     def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
         """Return True when this delivery should be processed."""
         seen_at = self._seen_deliveries.get(delivery_id)
@@ -664,14 +937,22 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Webhook route is missing an HMAC secret"},
                 status=403,
             )
-        if secret != _INSECURE_NO_AUTH:
-            if not self._validate_signature(request, raw_body, secret):
-                logger.warning(
-                    "[webhook] Invalid signature for route %s", route_name
-                )
-                return web.json_response(
-                    {"error": "Invalid signature"}, status=401
-                )
+        if route_config.get("root_action_proposal"):
+            valid = (
+                secret != _INSECURE_NO_AUTH
+                and bool(request.headers.get("X-Webhook-Signature-V2"))
+                and self._validate_generic_v2_signature(request, raw_body, secret)
+            )
+        else:
+            valid = (
+                secret == _INSECURE_NO_AUTH
+                or self._validate_signature(request, raw_body, secret)
+            )
+        if not valid:
+            logger.warning("[webhook] Invalid signature for route %s", route_name)
+            return web.json_response(
+                {"error": "Invalid signature"}, status=401
+            )
 
         # ── Rate limiting (after auth) ───────────────────────────
         now = time.time()
@@ -695,6 +976,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+
+        if route_config.get("root_action_proposal"):
+            return await self._handle_root_action_proposal(
+                route_config, payload, profile=profile
+            )
 
         # Check event type filter
         event_type = (
@@ -799,7 +1085,22 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
-        # ── Idempotency ─────────────────────────────────────────
+        if route_name == "unraid-incidents" and route_config.get("deliver_only"):
+            request_id = request.headers.get("X-Request-ID", "").strip()
+            if not request_id:
+                return web.json_response(
+                    {"error": "managed incident route requires X-Request-ID"},
+                    status=400,
+                )
+            return await self._handle_managed_incident_delivery(
+                request=request,
+                route_config=route_config,
+                payload=payload,
+                prompt=prompt,
+                event_type=event_type,
+                route_name=route_name,
+                request_id=request_id,
+            )
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
         if not self._record_delivery_id(delivery_id, now):
@@ -929,6 +1230,92 @@ class WebhookAdapter(BasePlatformAdapter):
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
+            },
+            status=202,
+        )
+
+    async def _handle_root_action_proposal(
+        self, route_config: dict, payload: Any, *, profile: Optional[str]
+    ) -> "web.Response":
+        try:
+            proposal = RootActionProposal.from_payload(payload)
+            extra = route_config.get("deliver_extra") or {}
+            configured_chat_id = str(extra.get("chat_id", "")).strip()
+            if not configured_chat_id:
+                raise RootActionProtocolError(
+                    "root-action route requires a fixed Telegram target"
+                )
+            callback_url = route_config.get("pythia_callback_url")
+            callback_secret = route_config.get("pythia_callback_secret")
+            if not isinstance(callback_url, str) or not callback_url.startswith(
+                ("http://", "https://")
+            ):
+                raise RootActionProtocolError("invalid fixed Pythia callback URL")
+            if not isinstance(callback_secret, str) or not callback_secret:
+                raise RootActionProtocolError("missing fixed Pythia callback secret")
+            pending = PendingRootAction(
+                proposal=proposal,
+                callback_url=callback_url,
+                callback_secret=callback_secret,
+                chat_id=configured_chat_id,
+            )
+            inserted = self._root_action_store.put(pending)
+        except RootActionProtocolError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        if not inserted:
+            existing = self._root_action_store.get(proposal.action_id)
+            if existing is None:
+                return web.json_response(
+                    {"error": "Root-action proposal disappeared"},
+                    status=409,
+                )
+            if existing.message_id is None and existing.decision is None:
+                result = await self._deliver_root_action_proposal(
+                    existing, route_config, profile=profile
+                )
+                if not result.success:
+                    return web.json_response(
+                        {"error": "Telegram approval delivery failed"},
+                        status=502,
+                    )
+                if result.message_id:
+                    self._root_action_store.set_message_id(
+                        proposal.action_id, result.message_id
+                    )
+                existing = self._root_action_store.get(proposal.action_id)
+            elif existing.decision is not None and not existing.acknowledged:
+                adapter = self._telegram_adapter_for_profile(profile)
+                starter = getattr(adapter, "_start_root_action_delivery", None)
+                if callable(starter):
+                    starter(proposal.action_id)
+            acknowledged = bool(existing is not None and existing.acknowledged)
+            return web.json_response(
+                {
+                    "status": "resolved" if acknowledged else "pending",
+                    "action_id": proposal.action_id,
+                    "expires_at": proposal.expires_at,
+                },
+                status=200 if acknowledged else 202,
+            )
+
+        result = await self._deliver_root_action_proposal(
+            pending, route_config, profile=profile
+        )
+        if not result.success:
+            self._root_action_store.remove(proposal.action_id)
+            return web.json_response(
+                {"error": "Telegram approval delivery failed"}, status=502
+            )
+        if result.message_id:
+            self._root_action_store.set_message_id(
+                proposal.action_id, result.message_id
+            )
+        return web.json_response(
+            {
+                "status": "pending",
+                "action_id": proposal.action_id,
+                "expires_at": proposal.expires_at,
             },
             status=202,
         )
@@ -1140,6 +1527,25 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         return False
 
+    def _validate_generic_v2_signature(
+        self, request: "web.Request", body: bytes, secret: str
+    ) -> bool:
+        """Validate only the timestamp-bound generic HMAC-V2 contract."""
+        timestamp = request.headers.get("X-Webhook-Timestamp", "")
+        signature = request.headers.get("X-Webhook-Signature-V2", "")
+        if not timestamp or not signature:
+            return False
+        try:
+            timestamp_value = int(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if abs(int(time.time()) - timestamp_value) > 300:
+            return False
+        expected = hmac.new(
+            secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+        ).hexdigest()
+        return _hmac_str_equal(signature, expected)
+
     def _validate_svix_signature(
         self,
         body: bytes,
@@ -1279,6 +1685,67 @@ class WebhookAdapter(BasePlatformAdapter):
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
         )
+
+    def _telegram_adapter_for_profile(
+        self, profile: Optional[str]
+    ) -> Any:
+        if not self.gateway_runner:
+            return None
+        resolver = getattr(self.gateway_runner, "_authorization_adapter", None)
+        if callable(resolver):
+            try:
+                adapter = resolver(Platform.TELEGRAM, profile)
+            except Exception:
+                adapter = None
+            if adapter is not None:
+                return adapter
+        if profile:
+            profile_adapters = getattr(
+                self.gateway_runner, "_profile_adapters", {}
+            ) or {}
+            adapters = profile_adapters.get(profile)
+            return (
+                adapters.get(Platform.TELEGRAM)
+                if isinstance(adapters, dict)
+                else None
+            )
+        adapters = getattr(self.gateway_runner, "adapters", {}) or {}
+        return adapters.get(Platform.TELEGRAM)
+
+    async def _deliver_root_action_proposal(
+        self,
+        pending: PendingRootAction,
+        route_config: dict,
+        *,
+        profile: Optional[str],
+    ) -> SendResult:
+        """Send a root-action preview only through the selected profile."""
+        if not self.gateway_runner:
+            return SendResult(
+                success=False, error="No gateway runner for root-action delivery"
+            )
+        adapter = self._telegram_adapter_for_profile(profile)
+        if adapter is None:
+            return SendResult(
+                success=False,
+                error="Selected profile has no connected Telegram adapter",
+            )
+        sender = getattr(adapter, "send_root_action_proposal", None)
+        if not callable(sender):
+            return SendResult(
+                success=False,
+                error="Telegram adapter lacks root-action approval support",
+            )
+        try:
+            extra = route_config.get("deliver_extra") or {}
+            return await sender(
+                str(extra["chat_id"]),
+                pending.proposal.preview,
+                pending=pending,
+            )
+        except Exception as exc:
+            logger.warning("[webhook] root-action Telegram delivery failed: %s", exc)
+            return SendResult(success=False, error="Telegram delivery failed")
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict

@@ -1002,3 +1002,127 @@ def test_route_profile_validation_fails_closed():
         assert WebhookAdapter._route_allows_profile(
             {"profile": malformed}, "worker"
         ) is False
+
+
+
+@pytest.mark.asyncio
+async def test_managed_incident_ack_is_exact_and_durable(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_constants.get_hermes_home", lambda: tmp_path
+    )
+    route = {
+        "deliver_only": True,
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "-100123"},
+    }
+    payload = {"incident": {"incident_id": "inc-7", "state_revision": 4}}
+    request_id = "unraid:inc-7:4"
+    request = MagicMock()
+    adapter = _make_adapter()
+    async def direct_deliver(*_args, **_kwargs):
+        persisted = json.loads(
+            (tmp_path / "webhook_unraid_incidents.json").read_text(encoding="utf-8")
+        )
+        assert persisted[request_id]["delivery_state"] == "pending"
+        return SendResult(success=True)
+
+    adapter._direct_deliver = AsyncMock(side_effect=direct_deliver)
+    delivered = await adapter._handle_managed_incident_delivery(
+        request=request,
+        route_config=route,
+        payload=payload,
+        prompt="incident preview",
+        event_type="incident",
+        route_name="unraid-incidents",
+        request_id=request_id,
+    )
+    assert delivered.status == 200
+    assert json.loads(delivered.text) == {
+        "status": "delivered",
+        "request_id": request_id,
+        "incident_id": "inc-7",
+        "state_revision": 4,
+    }
+    restarted = _make_adapter()
+    restarted._direct_deliver = AsyncMock(return_value=SendResult(success=True))
+    duplicate = await restarted._handle_managed_incident_delivery(
+        request=request,
+        route_config=route,
+        payload=payload,
+        prompt="incident preview",
+        event_type="incident",
+        route_name="unraid-incidents",
+        request_id=request_id,
+    )
+    assert duplicate.status == 200
+    assert json.loads(duplicate.text) == {
+        "status": "duplicate",
+        "request_id": request_id,
+        "incident_id": "inc-7",
+        "state_revision": 4,
+    }
+    restarted._direct_deliver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_incident_definite_failure_is_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter = _make_adapter()
+    adapter._direct_deliver = AsyncMock(
+        side_effect=[
+            SendResult(success=False, error="Telegram rejected before delivery"),
+            SendResult(success=True),
+        ]
+    )
+    kwargs = {
+        "request": MagicMock(),
+        "route_config": {
+            "deliver_only": True,
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "-100123"},
+        },
+        "payload": {"incident": {"incident_id": "inc-retry", "state_revision": 1}},
+        "prompt": "incident preview",
+        "event_type": "incident",
+        "route_name": "unraid-incidents",
+        "request_id": "unraid:inc-retry:1",
+    }
+    failed = await adapter._handle_managed_incident_delivery(**kwargs)
+    assert failed.status == 502
+    assert adapter._unraid_incident_records[kwargs["request_id"]]["delivery_state"] == "retryable"
+    delivered = await adapter._handle_managed_incident_delivery(**kwargs)
+    assert delivered.status == 200
+    assert adapter._direct_deliver.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_managed_incident_binding_conflict_is_terminal_4xx(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_constants.get_hermes_home", lambda: tmp_path
+    )
+    adapter = _make_adapter()
+    route = {
+        "deliver_only": True,
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "-100123"},
+    }
+    adapter._direct_deliver = AsyncMock(return_value=SendResult(success=True))
+    await adapter._handle_managed_incident_delivery(
+        request=MagicMock(),
+        route_config=route,
+        payload={"incident": {"incident_id": "inc-8", "state_revision": 1}},
+        prompt="incident preview",
+        event_type="incident",
+        route_name="unraid-incidents",
+        request_id="unraid:inc-8:1",
+    )
+    conflict = await adapter._handle_managed_incident_delivery(
+        request=MagicMock(),
+        route_config=route,
+        payload={"incident": {"incident_id": "inc-8", "state_revision": 2}},
+        prompt="incident preview",
+        event_type="incident",
+        route_name="unraid-incidents",
+        request_id="unraid:inc-8:1",
+    )
+    assert conflict.status == 400

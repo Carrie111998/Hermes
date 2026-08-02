@@ -87,3 +87,17 @@ class TestCallbackAuthFailClosed:
         assert adapter._is_callback_user_authorized("12345") is True
 
 
+
+    def test_profile_bound_auth_does_not_use_primary_allowlist(
+        self, monkeypatch
+    ):
+        """A secondary adapter's denial wins over process-wide env allowlists."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+        primary = _make_adapter()
+        secondary = _make_adapter()
+        primary._authorization_check = lambda user, chat_type, chat_id: (
+            user == "primary-user"
+        )
+        secondary._authorization_check = lambda user, chat_type, chat_id: False
+        assert primary._is_callback_user_authorized("primary-user") is True
+        assert secondary._is_callback_user_authorized("primary-user") is False
