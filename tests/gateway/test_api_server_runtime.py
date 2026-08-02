@@ -1088,6 +1088,8 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
             kwargs["agent_configurator"](agent)
             assert agent._resume_from_tool_results is True
             assert "media.generate_image" in agent.valid_tool_names
+            assert "platform.prompt_enhance" in agent.valid_tool_names
+            assert "platform.internal_reconcile" not in agent.valid_tool_names
             assert "tool_search" in agent.valid_tool_names
             assert kwargs["user_message"] == ""
             assert [message["role"] for message in kwargs["conversation_history"]] == [
@@ -1118,6 +1120,11 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
                 "digest": digest,
             },
             "runtime_checkpoint": {
+                "activated_tool_names": [
+                    "media.generate_image",
+                    "platform.prompt_enhance",
+                    "platform.internal_reconcile",
+                ],
                 "message": {
                     "role": "assistant",
                     "content": None,
@@ -1137,6 +1144,16 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
                 "description": "generate an image",
                 "input_schema": {"type": "object", "properties": {}},
                 "exposure": "deferred",
+            }, {
+                "name": "platform.prompt_enhance",
+                "description": "enhance a prompt",
+                "input_schema": {"type": "object", "properties": {}},
+                "exposure": "deferred",
+            }, {
+                "name": "platform.internal_reconcile",
+                "description": "internal reconciliation",
+                "input_schema": {"type": "object", "properties": {}},
+                "exposure": "hidden",
             }],
         })
         assert response.status == 200
@@ -1145,6 +1162,61 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
         assert events[-1]["payload"]["text"] == "image complete"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_checkpoint_preserves_all_activated_deferred_tools():
+    queue = asyncio.Queue()
+    definitions = [{
+        "name": name,
+        "description": name,
+        "input_schema": {"type": "object", "properties": {}},
+        "exposure": "deferred",
+    } for name in ("media.generate_image", "platform.prompt_enhance")]
+    session = RuntimeBridgeSession(
+        "run_checkpoint_tools",
+        asyncio.get_running_loop(),
+        queue,
+        definitions,
+        10_000,
+        "agent_checkpoint_tools",
+    )
+    for query in ("media.generate_image", "platform.prompt_enhance"):
+        result = json.loads(session.search_and_activate_tools({"query": query}))
+        assert result["loaded_tools"] == [query]
+    session.agent_ref[0] = SimpleNamespace(
+        _runtime_checkpoint_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_image",
+                "function": {
+                    "name": "media.generate_image",
+                    "arguments": "{}",
+                },
+            }],
+        },
+    )
+
+    call = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        "media.generate_image",
+        {},
+        "call_image",
+    ))
+    checkpoint = await queue.get()
+    assert checkpoint["type"] == "checkpoint"
+    assert checkpoint["payload"]["activated_tool_names"] == [
+        "media.generate_image",
+        "platform.prompt_enhance",
+    ]
+    assert (await queue.get())["type"] == "tool_request"
+    assert session.submit_result({
+        "call_id": "call_image",
+        "ok": True,
+        "result": {"batch_status": "succeeded"},
+    })
+    assert json.loads(await call) == {"batch_status": "succeeded"}
 
 
 @pytest.mark.asyncio

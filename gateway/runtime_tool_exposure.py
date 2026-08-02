@@ -117,6 +117,11 @@ class RuntimeToolExposure:
         with self._lock:
             self.activated_names.update(names & self.deferred_names)
 
+    def snapshot_activated_names(self) -> list[str]:
+        """Return a stable checkpoint projection of loaded deferred Tools."""
+        with self._lock:
+            return sorted(self.activated_names & self.deferred_names)
+
     def is_callable(self, name: str) -> bool:
         direct_names = {
             str((schema.get("function") or {}).get("name") or "")

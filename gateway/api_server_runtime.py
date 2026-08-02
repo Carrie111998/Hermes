@@ -708,6 +708,18 @@ def _resume_runtime_history(
     ]
 
 
+def _runtime_checkpoint_activated_tool_names(checkpoint: Any) -> set[str]:
+    if not isinstance(checkpoint, dict):
+        raise ValueError("runtime_checkpoint must be an object")
+    raw_names = checkpoint.get("activated_tool_names", [])
+    if not isinstance(raw_names, list) or any(
+        not isinstance(name, str) or not name.strip()
+        for name in raw_names
+    ):
+        raise ValueError("runtime_checkpoint.activated_tool_names must contain Tool names")
+    return {name.strip() for name in raw_names}
+
+
 def _runtime_tool_middleware(**kwargs: Any) -> Any:
     session_id = str(kwargs.get("session_id") or "")
     tool_name = str(kwargs.get("tool_name") or "")
@@ -1103,7 +1115,10 @@ class RuntimeBridgeSession:
                 return json.dumps({"error": {"code": "idempotency_conflict", "message": "duplicate active tool call id"}})
             self.pending[call_id] = pending
         payload: dict[str, Any] = {"call_id": call_id, "name": name, "arguments": args}
-        self.emit("checkpoint", {"message": checkpoint})
+        self.emit("checkpoint", {
+            "message": checkpoint,
+            "activated_tool_names": self.tool_exposure.snapshot_activated_names(),
+        })
         self.emit("tool_request", payload)
         wait_timeout = (
             self.deadline_seconds
@@ -1318,17 +1333,21 @@ class APIServerRuntimeMixin:
                 ]
             if resuming:
                 history = _resume_runtime_history(normalized_messages, runtime_checkpoint, tool_results)
+                activated_tool_names = _runtime_checkpoint_activated_tool_names(
+                    runtime_checkpoint,
+                )
                 checkpoint_message = runtime_checkpoint.get("message")
                 checkpoint_calls = (
                     checkpoint_message.get("tool_calls")
                     if isinstance(checkpoint_message, dict)
                     else []
                 )
-                tool_exposure.activate_names({
+                activated_tool_names.update({
                     str((call.get("function") or {}).get("name") or "")
                     for call in checkpoint_calls or []
                     if isinstance(call, dict)
                 })
+                tool_exposure.activate_names(activated_tool_names)
                 user_message = ""
             else:
                 history = normalized_messages[:-1]
