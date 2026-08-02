@@ -667,6 +667,7 @@ const sidebars: SidebarsConfig = {
         'guides/local-llm-on-mac',
         'guides/daily-briefing-bot',
         'guides/team-telegram-assistant',
+        'guides/persistent-hosting',
         'guides/python-library',
         'guides/use-mcp-with-hermes',
         'guides/use-soul-with-hermes',

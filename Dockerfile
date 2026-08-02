@@ -70,7 +70,10 @@ RUN npm install --prefer-offline --no-audit && \
 # installs the deps reachable through the composite `[all]` extra
 # (handpicked set intended for the production image), plus gateway
 # messaging adapters that should work in the published image without a
-# first-boot lazy install.  We do NOT use `--all-extras`:
+# first-boot lazy install, plus the 1Password SDK so headless deployments
+# that bootstrap credentials from 1Password at gateway startup
+# (`[secrets.onepassword]` in config.yaml) work without a first-boot
+# network install into the venv.  We do NOT use `--all-extras`:
 # that would pull in `[rl]` (atroposlib + tinker + torch + wandb from
 # git), `[yc-bench]` (another git dep), and `[termux-all]` (Android
 # redundancy), none of which belong in the published container.
@@ -78,7 +81,7 @@ RUN npm install --prefer-offline --no-audit && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra onepassword
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.

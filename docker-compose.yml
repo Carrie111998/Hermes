@@ -37,6 +37,15 @@ services:
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
       # - API_SERVER_KEY=${API_SERVER_KEY}
+      # 1Password secrets bootstrap — pulls credentials (e.g. SLACK_BOT_TOKEN /
+      # SLACK_APP_TOKEN) from a 1Password item at gateway startup instead of
+      # storing them in ~/.hermes/.env.  Enable [secrets.onepassword] in
+      # ~/.hermes/config.yaml (see deploy/config.example.yaml), export
+      # OP_SERVICE_ACCOUNT_TOKEN in the host environment (or a .env file next
+      # to this compose file), then uncomment the line below.  NEVER write the
+      # token itself into this file.  Full guide:
+      # https://hermes-agent.nousresearch.com/docs/guides/persistent-hosting
+      # - OP_SERVICE_ACCOUNT_TOKEN=${OP_SERVICE_ACCOUNT_TOKEN}
       # Microsoft Teams — uncomment and fill in to enable Teams gateway.
       # Register your bot at https://dev.botframework.com/ to get these values.
       # - TEAMS_CLIENT_ID=${TEAMS_CLIENT_ID}

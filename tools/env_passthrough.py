@@ -49,6 +49,11 @@ def _is_hermes_provider_credential(name: str) -> bool:
     """True if ``name`` is a Hermes-managed provider credential (API key,
     token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST``.
 
+    The return value is a bare bool on purpose: this function's name matches
+    CodeQL's sensitive-data heuristics ("credential"), so anything it returns
+    is treated as secret-tainted by the clear-text-logging query. Callers
+    must never log a value derived from it — only counts or static strings.
+
     Skill-declared ``required_environment_variables`` frontmatter must
     not be able to override this list — that was the bypass in
     GHSA-rhgp-j443-p4rf where a malicious skill registered
@@ -83,21 +88,34 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
     Non-Hermes third-party API keys (TENOR_API_KEY, NOTION_TOKEN, etc.)
     pass through normally — they were never in the sandbox scrub list.
     """
+    registered = 0
+    refused = 0
     for name in var_names:
         name = name.strip()
         if not name:
             continue
         if _is_hermes_provider_credential(name):
-            logger.warning(
-                "env passthrough: refusing to register Hermes provider "
-                "credential %r (blocked by _HERMES_PROVIDER_ENV_BLOCKLIST). "
-                "Skills must not override the execute_code sandbox's "
-                "credential scrubbing; see GHSA-rhgp-j443-p4rf.",
-                name,
-            )
+            refused += 1
             continue
         _get_allowed().add(name)
-        logger.debug("env passthrough: registered %s", name)
+        registered += 1
+    if refused:
+        # Count only, static message — never log the variable name.
+        # Per CodeQL's clear-text-logging model, skill frontmatter names
+        # share a taint source with secret values, and anything returned
+        # by _is_hermes_provider_credential is itself heuristically
+        # sensitive ("credential"), so no per-name detail is loggable.
+        logger.warning(
+            "env passthrough: refused to register %d Hermes provider "
+            "credential(s) (blocked by _HERMES_PROVIDER_ENV_BLOCKLIST). "
+            "Skills must not override the execute_code sandbox's "
+            "credential scrubbing; see GHSA-rhgp-j443-p4rf.",
+            refused,
+        )
+    if registered:
+        # Count only — registered names are caller-supplied (tainted per
+        # CodeQL's model) and must not be logged verbatim.
+        logger.debug("env passthrough: registered %d variable(s)", registered)
 
 
 def _load_config_passthrough() -> frozenset[str]:
@@ -116,7 +134,13 @@ def _load_config_passthrough() -> frozenset[str]:
                 if isinstance(item, str) and item.strip():
                     result.add(item.strip())
     except Exception as e:
-        logger.debug("Could not read tools.env_passthrough from config: %s", e)
+        # Exception type only — str(e) could embed config file contents
+        # (e.g. YAML parse errors quote the offending line), which may
+        # include secrets.
+        logger.debug(
+            "Could not read tools.env_passthrough from config (%s)",
+            type(e).__name__,
+        )
 
     _config_passthrough = frozenset(result)
     return _config_passthrough

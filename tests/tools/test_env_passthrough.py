@@ -1,5 +1,6 @@
 """Tests for tools.env_passthrough — skill and config env var passthrough."""
 
+import logging
 import os
 import pytest
 import yaml
@@ -229,3 +230,75 @@ class TestTerminalIntegration:
         # Arbitrary skill-specific var
         register_env_passthrough(["MY_SKILL_CUSTOM_CONFIG"])
         assert is_env_passthrough("MY_SKILL_CUSTOM_CONFIG")
+
+
+class TestPassthroughLoggingWithholdsNames:
+    """The registration path must never write a variable name to the log.
+
+    Skill frontmatter is attacker-influenced, and CodeQL treats anything
+    derived from ``_is_hermes_provider_credential`` as secret-tainted
+    because the function name matches its sensitive-data heuristic. The
+    refusal warning used to interpolate the name; these tests pin the
+    replacement so it cannot drift back.
+    """
+
+    def test_no_variable_name_reaches_the_log(self, caplog):
+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
+
+        blocked = [
+            n for n, _ in zip(sorted(_HERMES_PROVIDER_ENV_BLOCKLIST), range(3))
+        ]
+        allowed = ["TENOR_API_KEY", "MY_SKILL_CUSTOM_CONFIG"]
+
+        with caplog.at_level("DEBUG", logger="tools.env_passthrough"):
+            register_env_passthrough(blocked + allowed)
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        for name in blocked + allowed:
+            assert name not in blob, f"{name} leaked into a log record"
+
+    def test_counts_are_reported(self, caplog):
+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
+
+        blocked = [
+            n for n, _ in zip(sorted(_HERMES_PROVIDER_ENV_BLOCKLIST), range(3))
+        ]
+
+        with caplog.at_level("DEBUG", logger="tools.env_passthrough"):
+            register_env_passthrough(blocked + ["TENOR_API_KEY"])
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert "refused to register 3 " in blob
+        assert "registered 1 variable(s)" in blob
+        # Still the actionable pointer, just without the name.
+        assert "GHSA-rhgp-j443-p4rf" in blob
+
+    def test_silent_when_nothing_is_refused(self, caplog):
+        with caplog.at_level("DEBUG", logger="tools.env_passthrough"):
+            register_env_passthrough(["TENOR_API_KEY"])
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_silent_for_empty_input(self, caplog):
+        with caplog.at_level("DEBUG", logger="tools.env_passthrough"):
+            register_env_passthrough(["", "   "])
+
+        assert not caplog.records
+
+    def test_config_read_failure_logs_type_not_payload(self, caplog, monkeypatch):
+        """A YAML parse error quotes the offending line, which may hold a
+        secret — so the handler logs the exception type, never ``str(e)``."""
+        secret = "SECRET_VALUE_that_must_not_be_logged"
+
+        def _boom(*args, **kwargs):
+            raise ValueError(f"while parsing: env_passthrough: [{secret}]")
+
+        monkeypatch.setattr(_ep_mod, "cfg_get", _boom)
+        _ep_mod._config_passthrough = None
+
+        with caplog.at_level("DEBUG", logger="tools.env_passthrough"):
+            _ep_mod._load_config_passthrough()
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert secret not in blob
+        assert "ValueError" in blob

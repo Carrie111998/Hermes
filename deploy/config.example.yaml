@@ -1,0 +1,48 @@
+# deploy/config.example.yaml — sample `secrets` section for a persistent
+# Hermes gateway host that bootstraps its credentials from 1Password.
+#
+# This is NOT a complete config file.  Merge the `secrets:` block below into
+# the gateway host's ~/.hermes/config.yaml (created by `hermes setup`), or —
+# preferred — let the interactive wizard write it for you:
+#
+#     OP_SERVICE_ACCOUNT_TOKEN=ops_...your-token... \
+#       hermes secrets onepassword setup --vault "Private" --item "Hermes Gateway"
+#
+# The service account token itself NEVER goes in this file.  It is the one
+# bootstrap secret and lives only in the process environment:
+#   - Docker Compose: exported on the host, passed through via
+#     `OP_SERVICE_ACCOUNT_TOKEN=${OP_SERVICE_ACCOUNT_TOKEN}` (see
+#     docker-compose.yml), or set in ~/.hermes/.env inside the data volume.
+#   - systemd: /etc/hermes/gateway.env (see gateway.env.example).
+#
+# Expected 1Password layout: an item titled "Hermes Gateway" in the vault
+# "Private", with one field per env var — e.g. fields labelled
+# SLACK_BOT_TOKEN and SLACK_APP_TOKEN.  Field labels map 1:1 onto env var
+# names (uppercased/underscored); use field_mapping for exceptions.
+
+secrets:
+  onepassword:
+    # Master switch.  When false the SDK is never contacted.
+    enabled: true
+    # Vault title to search.  Always set one on servers — empty means
+    # "search every vault the service account can read" (slower, broader
+    # blast radius if the token leaks).
+    vault: "Private"
+    # Item whose fields are mapped to env vars.
+    item: "Hermes Gateway"
+    # Env var that holds the service account token (the default).
+    service_account_token_env: "OP_SERVICE_ACCOUNT_TOKEN"
+    # Seconds to cache fetched secrets in-process; the long-lived gateway
+    # re-fetches after this interval so rotations in 1Password propagate
+    # without a restart.
+    cache_ttl_seconds: 300
+    # On a dedicated gateway host, 1Password is the source of truth: let it
+    # overwrite any stale values that might linger in ~/.hermes/.env.
+    override_existing: true
+    # Auto-install the onepassword-sdk package on first use.  The official
+    # Docker image ships the SDK pre-installed, so this only matters for
+    # bare-metal installs.
+    auto_install: true
+    # Optional field-label -> env-var overrides; empty uses the automatic
+    # uppercase/underscore mapping.
+    field_mapping: {}
