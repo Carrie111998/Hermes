@@ -68,6 +68,22 @@ describe("dashboard service worker cache boundary", () => {
   });
 
   it.each([
+    "/hermes/manifest.webmanifest",
+    "/hermes/favicon.ico",
+    "/hermes/pwa-icon-180.png",
+    "/hermes/pwa-icon-192.png",
+    "/hermes/pwa-icon-512.png",
+    "/hermes/pwa-icon.svg",
+  ])("refetches mutable PWA metadata on every request for %s", async (path) => {
+    const fetchHandler = await loadFetchHandler();
+    const respondWith = vi.fn();
+
+    fetchHandler({ request: request(path, "image"), respondWith });
+
+    expect(respondWith).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["/hermes/api/auth/me", "script"],
     ["/hermes/auth/login.js", "script"],
     ["/hermes/handoff", "script"],
