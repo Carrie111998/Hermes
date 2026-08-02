@@ -2184,6 +2184,58 @@ def _create_environment_with_watchdog(**kwargs):
     return payload
 
 
+# Hard ceiling on the transform_terminal_output plugin hook, which runs AFTER
+# the shell command has already finished (bash exited, output captured) but
+# BEFORE the result is returned to the model. Root-caused from a live
+# incident: bash.exe and the invoked script had both already exited cleanly
+# (confirmed via process list -- nothing related was still running) yet the
+# tool call sat showing "Running" for 18+ minutes with no completion or error
+# ever logged. The only unbounded work left in the foreground path once
+# env.execute() returns is this hook call -- it's wrapped in a bare
+# try/except Exception ("fail-open") which catches a raised error but not a
+# hang. Any third-party or user-installed plugin registering this hook can
+# therefore freeze every foreground terminal call forever, downstream of all
+# three env.execute()-side watchdogs above (which by definition can't help,
+# since the command they were guarding already finished).
+_HOOK_WATCHDOG_SECONDS = 20
+
+
+def _invoke_terminal_output_hook_with_watchdog(**kwargs):
+    """Run the transform_terminal_output hook on a daemon thread with a hard
+    ceiling. See _HOOK_WATCHDOG_SECONDS for rationale. Returns [] (same shape
+    as invoke_hook on the "no plugin handled it" path) on timeout or error,
+    matching the existing fail-open contract at the call site.
+    """
+    from hermes_cli.plugins import invoke_hook
+
+    result_queue = queue.Queue(maxsize=1)
+
+    def _run():
+        try:
+            result_queue.put(("ok", invoke_hook("transform_terminal_output", **kwargs)))
+        except BaseException as e:  # noqa: BLE001 - must forward any failure to the waiter
+            result_queue.put(("error", e))
+
+    threading.Thread(
+        target=_run, name="terminal-output-hook-watchdog", daemon=True,
+    ).start()
+    try:
+        kind, payload = result_queue.get(timeout=_HOOK_WATCHDOG_SECONDS)
+    except queue.Empty:
+        logger.warning(
+            "transform_terminal_output hook watchdog fired after %ds -- a "
+            "registered plugin never returned. Abandoning the worker thread "
+            "and returning the untransformed output so the agent turn can "
+            "continue.",
+            _HOOK_WATCHDOG_SECONDS,
+        )
+        return []
+
+    if kind == "error":
+        return []
+    return payload
+
+
 def _execute_foreground_with_watchdog(env, command, execute_kwargs, *, task_id, env_type):
     """Run env.execute() with a hard wall-clock ceiling.
 
@@ -2999,9 +3051,7 @@ def terminal_tool(
             # still subject to the final output limit below.
             # The hook is fail-open, and the first valid string return wins.
             try:
-                from hermes_cli.plugins import invoke_hook
-                hook_results = invoke_hook(
-                    "transform_terminal_output",
+                hook_results = _invoke_terminal_output_hook_with_watchdog(
                     command=command,
                     output=output,
                     returncode=returncode,
