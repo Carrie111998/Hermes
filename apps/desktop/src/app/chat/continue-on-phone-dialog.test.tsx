@@ -18,9 +18,7 @@ beforeEach(() => {
   } as Window['hermesDesktop']
 })
 
-function renderDialog(
-  overrides: Partial<React.ComponentProps<typeof ContinueOnPhoneDialog>> = {}
-) {
+function renderDialog(overrides: Partial<React.ComponentProps<typeof ContinueOnPhoneDialog>> = {}) {
   return render(
     <I18nProvider>
       <ContinueOnPhoneDialog
@@ -74,16 +72,12 @@ describe('ContinueOnPhoneDialog', () => {
     const qr = await screen.findByRole('img', { name: 'QR code for this Hermes session' })
     expect(qr.getAttribute('src')).toBe('data:image/png;base64,qr')
     expect(resolveUrl).toHaveBeenCalledWith('session-42', 'work')
-    expect(generateQr).toHaveBeenCalledWith(
-      'https://hermes.example.com/handoff#ticket=single-use-ticket'
-    )
+    expect(generateQr).toHaveBeenCalledWith('https://hermes.example.com/handoff#ticket=single-use-ticket')
 
     fireEvent.click(screen.getByRole('button', { name: 'Open in browser' }))
 
     await waitFor(() =>
-      expect(openExternal).toHaveBeenCalledWith(
-        'https://hermes.example.com/handoff#ticket=single-use-ticket'
-      )
+      expect(openExternal).toHaveBeenCalledWith('https://hermes.example.com/handoff#ticket=single-use-ticket')
     )
   })
 
@@ -93,7 +87,9 @@ describe('ContinueOnPhoneDialog', () => {
     renderDialog({ resolveUrl })
 
     expect(await screen.findByText('Browser sign-in is not supported')).toBeTruthy()
-    expect(screen.getByText('This dashboard uses token-only access. Configure browser sign-in to continue on a phone.')).toBeTruthy()
+    expect(
+      screen.getByText('This dashboard uses token-only access. Configure browser sign-in to continue on a phone.')
+    ).toBeTruthy()
 
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
   })

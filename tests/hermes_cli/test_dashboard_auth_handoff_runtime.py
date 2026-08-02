@@ -10,6 +10,7 @@ Proves the Approach D path against a **running** gated dashboard:
 
 Localhost only. No tunnel, public origin, phone hardware, or secret dump.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +30,7 @@ from websockets.exceptions import ConnectionClosedError, InvalidStatus
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import ws_tickets
+from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE
 from hermes_cli.dashboard_auth.ws_tickets import _reset_for_tests
 from hermes_state import SessionDB
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
@@ -131,7 +133,9 @@ def _desk_login(client: httpx.Client) -> None:
     ), f"desk login did not set session cookie: {list(client.cookies.keys())}"
 
 
-def _mint_ticket(client: httpx.Client, session_id: str, profile: str = "default") -> dict:
+def _mint_ticket(
+    client: httpx.Client, session_id: str, profile: str = "default"
+) -> dict:
     r = client.post(
         "/api/auth/handoff-ticket",
         json={"session_id": session_id, "profile": profile},
@@ -143,7 +147,9 @@ def _mint_ticket(client: httpx.Client, session_id: str, profile: str = "default"
     return body
 
 
-def _phone_consume(base: str, ticket: str, session_id: str, profile: str = "default") -> httpx.Client:
+def _phone_consume(
+    base: str, ticket: str, session_id: str, profile: str = "default"
+) -> httpx.Client:
     phone = httpx.Client(base_url=base, timeout=10.0, follow_redirects=False)
     r = phone.get(
         "/chat",
@@ -293,14 +299,12 @@ def test_s4_private_runtime_handoff_e2e(runtime_server):
             )
             # No cookies set; should not grant a session (302 with cookies would be bad).
             if r.status_code == 302:
-                assert not any(
-                    "hermes_session_at" in k for k in r.cookies.keys()
-                ), "replay must not mint a new session cookie"
+                assert not any(LINKED_DEVICE_COOKIE in k for k in r.cookies.keys()), (
+                    "replay must not mint a linked-device cookie"
+                )
             else:
                 assert r.status_code in (200, 401, 403)
-                assert not any(
-                    "hermes_session_at" in k for k in replay.cookies.keys()
-                )
+                assert not any(LINKED_DEVICE_COOKIE in k for k in replay.cookies.keys())
         finally:
             replay.close()
     finally:

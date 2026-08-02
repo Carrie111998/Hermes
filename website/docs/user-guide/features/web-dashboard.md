@@ -545,7 +545,7 @@ same auth gate as the rest of `/api/`.
 | `GET /api/system/stats` | Host stats — OS, CPU, memory, disk, uptime |
 | `GET /api/dashboard/remote-access` | The configured dashboard public URL (for [Link phone](#link-a-phone)); empty when unset |
 | `POST /api/auth/handoff-ticket` | Mint a single-use phone handoff ticket `{session_id, profile?}` (full desk only) |
-| `POST /api/auth/handoff-consume` | Same-origin fragment bootstrap exchange for a resume-scoped phone cookie |
+| `POST /api/auth/handoff-consume` | Same-origin fragment bootstrap exchange for a persistent, resume-only linked-device cookie |
 | `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git/pip installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 6h cache |
 | `GET /api/curator` · `PUT .../paused` · `POST .../run` | Skill-curator status + pause/resume + run |
 | `GET /api/portal` | Nous Portal auth + Tool Gateway routing (read-only) |

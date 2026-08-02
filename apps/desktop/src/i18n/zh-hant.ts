@@ -781,7 +781,16 @@ export const zhHant = defineLocale({
       sshErrTimeout: 'SSH 連線逾時。主機可能無法存取或處於睡眠狀態。',
       sshErrUpdateRequired: '使用 Desktop SSH 連線前，請更新遠端主機上的 Hermes。',
       sshErrUnknown: 'SSH 連線失敗。',
-      linkedDevicesTitle: '已連結裝置', linkedDevicesLoading: '正在載入已連結裝置…', linkedDevicesError: '無法載入已連結裝置。', linkedDevicesEmpty: '沒有已連結裝置', linkedDevicesEmptyDesc: '從聊天連結手機後會顯示在這裡。', linkedDevicesDates: (linked, used) => `連結於 ${linked} · 上次使用 ${used}`, linkedDevicesRevoke: '撤銷', linkedDevicesRevoking: '正在撤銷…', linkedDevicesRevoked: '已撤銷連結裝置。', linkedDevicesRevokeFailed: '無法撤銷連結裝置。'
+      linkedDevicesTitle: '已連結裝置',
+      linkedDevicesLoading: '正在載入已連結裝置…',
+      linkedDevicesError: '無法載入已連結裝置。',
+      linkedDevicesEmpty: '沒有已連結裝置',
+      linkedDevicesEmptyDesc: '從聊天連結手機後會顯示在這裡。',
+      linkedDevicesDates: (linked, used) => `連結於 ${linked} · 上次使用 ${used}`,
+      linkedDevicesRevoke: '撤銷',
+      linkedDevicesRevoking: '正在撤銷…',
+      linkedDevicesRevoked: '已撤銷連結裝置。',
+      linkedDevicesRevokeFailed: '無法撤銷連結裝置。'
     },
     keys: {
       loading: '正在載入 API 金鑰和憑證...',
@@ -1707,7 +1716,7 @@ export const zhHant = defineLocale({
       newWindow: '新視窗',
       continueOnPhone: '連結手機',
       continueOnPhoneTitle: '連結手機',
-      continueOnPhoneDesc: '用手機掃描 QR 碼，登入後繼續此工作階段。',
+      continueOnPhoneDesc: '用手機掃描 QR 碼即可安全開啟此對話，之後造訪時會自動重新連線。',
       continueOnPhonePreparing: '正在檢查安全遠端存取…',
       continueOnPhoneQrAlt: '此 Hermes 工作階段的 QR 碼',
       continueOnPhoneExpiresIn: seconds => `代碼將在 ${seconds} 秒後到期`,

@@ -722,7 +722,16 @@ export const ar = defineLocale({
       testFailed: 'فشل اختبار البوابة البعيدة',
       applyFailed: 'تعذر تطبيق إعدادات البوابة',
       saveFailed: 'تعذر حفظ إعدادات البوابة',
-      linkedDevicesTitle: 'الأجهزة المرتبطة', linkedDevicesLoading: 'جار تحميل الأجهزة المرتبطة…', linkedDevicesError: 'تعذر تحميل الأجهزة المرتبطة.', linkedDevicesEmpty: 'لا توجد أجهزة مرتبطة', linkedDevicesEmptyDesc: 'اربط هاتفاً من محادثة ليظهر هنا.', linkedDevicesDates: (linked, used) => `مرتبط ${linked} · آخر استخدام ${used}`, linkedDevicesRevoke: 'إلغاء الربط', linkedDevicesRevoking: 'جار الإلغاء…', linkedDevicesRevoked: 'تم إلغاء ربط الجهاز.', linkedDevicesRevokeFailed: 'تعذر إلغاء ربط الجهاز.'
+      linkedDevicesTitle: 'الأجهزة المرتبطة',
+      linkedDevicesLoading: 'جار تحميل الأجهزة المرتبطة…',
+      linkedDevicesError: 'تعذر تحميل الأجهزة المرتبطة.',
+      linkedDevicesEmpty: 'لا توجد أجهزة مرتبطة',
+      linkedDevicesEmptyDesc: 'اربط هاتفاً من محادثة ليظهر هنا.',
+      linkedDevicesDates: (linked, used) => `مرتبط ${linked} · آخر استخدام ${used}`,
+      linkedDevicesRevoke: 'إلغاء الربط',
+      linkedDevicesRevoking: 'جار الإلغاء…',
+      linkedDevicesRevoked: 'تم إلغاء ربط الجهاز.',
+      linkedDevicesRevokeFailed: 'تعذر إلغاء ربط الجهاز.'
     },
     keys: {
       loading: 'جار تحميل مفاتيح API وبيانات الاعتماد...',
@@ -1629,7 +1638,8 @@ export const ar = defineLocale({
       newWindow: 'فتح في نافذة جديدة',
       continueOnPhone: 'ربط الهاتف',
       continueOnPhoneTitle: 'ربط الهاتف',
-      continueOnPhoneDesc: 'امسح الرمز بهاتفك لفتح متابعة آمنة لهذه الجلسة.',
+      continueOnPhoneDesc:
+        'امسح رمز QR بهاتفك لفتح هذه المحادثة بأمان. ستتم إعادة الاتصال تلقائياً في الزيارات اللاحقة.',
       continueOnPhonePreparing: 'جار التحقق من الوصول الآمن عن بُعد...',
       continueOnPhoneQrAlt: 'رمز QR لجلسة Hermes هذه',
       continueOnPhoneExpiresIn: seconds => `ينتهي الرمز خلال ${seconds} ثانية`,
@@ -1642,9 +1652,11 @@ export const ar = defineLocale({
       continueOnPhoneInsecureUrlTitle: 'عنوان URL للوصول عن بُعد غير آمن',
       continueOnPhoneInsecureUrlDesc: 'استخدم عنوان URL عام للوحة تحكم HTTPS بلا بيانات اعتماد مضمنة.',
       continueOnPhoneUnreachableTitle: 'الوصول عن بُعد غير متاح',
-      continueOnPhoneUnreachableDesc: 'تعذر على Hermes الوصول إلى عنوان URL العام للوحة التحكم. تحقّق منه ثم حاول مجددا.',
+      continueOnPhoneUnreachableDesc:
+        'تعذر على Hermes الوصول إلى عنوان URL العام للوحة التحكم. تحقّق منه ثم حاول مجددا.',
       continueOnPhoneBrowserAuthTitle: 'تسجيل الدخول في المتصفح غير مدعوم',
-      continueOnPhoneBrowserAuthDesc: 'تستخدم لوحة التحكم هذه وصولا بالرمز فقط. اضبط تسجيل الدخول في المتصفح للمتابعة على الهاتف.',
+      continueOnPhoneBrowserAuthDesc:
+        'تستخدم لوحة التحكم هذه وصولا بالرمز فقط. اضبط تسجيل الدخول في المتصفح للمتابعة على الهاتف.',
       continueOnPhoneTicketFailedTitle: 'تعذر إنشاء رمز للهاتف',
       continueOnPhoneTicketFailedDesc: 'حاول مجددا لإنشاء رمز جديد للاستخدام لمرة واحدة.',
       continueOnPhoneCopyLink: 'نسخ الرابط',

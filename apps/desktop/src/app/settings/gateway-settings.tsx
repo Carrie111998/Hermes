@@ -22,15 +22,14 @@ import {
   Terminal
 } from '@/lib/icons'
 import { coerceRemoteUrlScheme } from '@/lib/remote-url'
-import { getLinkedDevices, revokeLinkedDevice } from '@/hermes'
-import type { LinkedDevice } from '@/types/hermes'
 import { selectableCardClass } from '@/lib/selectable-card'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $profiles, refreshActiveProfile } from '@/store/profile'
 
 import { CONTROL_TEXT } from './constants'
-import { EmptyState, ListRow, Pill, SettingsContent, SettingsSection, SettingsSkeleton } from './primitives'
+import { LinkedDevicesSettings } from './linked-devices-settings'
+import { EmptyState, ListRow, Pill, SettingsContent, SettingsSkeleton } from './primitives'
 import { enrichSelectedSshHost, selectSshHost } from './ssh-host-selection'
 
 type Mode = 'local' | 'remote' | 'cloud' | 'ssh'
@@ -168,26 +167,6 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   const cloudConnectSeq = useRef(0)
   const contextSeq = useRef(0)
   const [connectedCloudUrl, setConnectedCloudUrl] = useState('')
-  const [linkedDevices, setLinkedDevices] = useState<LinkedDevice[] | null>(null)
-  const [linkedDevicesError, setLinkedDevicesError] = useState(false)
-  const [revokingDevice, setRevokingDevice] = useState<string | null>(null)
-  const [confirmingDevice, setConfirmingDevice] = useState<string | null>(null)
-
-  const loadLinkedDevices = () => {
-    setLinkedDevicesError(false)
-    getLinkedDevices().then(result => setLinkedDevices(result.devices)).catch(() => setLinkedDevicesError(true))
-  }
-
-  useEffect(() => { loadLinkedDevices() }, [])
-
-  const revokeDevice = async (id: string) => {
-    setRevokingDevice(id)
-    try {
-      await revokeLinkedDevice(id)
-      setLinkedDevices(current => current?.filter(device => device.id !== id) ?? current)
-      notify({ kind: 'success', message: g.linkedDevicesRevoked })
-    } catch (error) { notifyError(error, g.linkedDevicesRevokeFailed) } finally { setRevokingDevice(null) }
-  }
 
   const acceptSavedConfig = (config: GatewaySettingsState) => {
     setState(config)
@@ -1479,12 +1458,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
       {lastTest ? <div className="mt-4 text-xs text-primary">{lastTest}</div> : null}
 
-      {!embedded ? <SettingsSection icon={Monitor} title={g.linkedDevicesTitle}>
-        {linkedDevices === null && !linkedDevicesError ? <div className="py-3 text-sm text-muted-foreground">{g.linkedDevicesLoading}</div> : null}
-        {linkedDevicesError ? <ListRow title={g.linkedDevicesError} action={<Button onClick={loadLinkedDevices} size="sm" variant="secondary">{t.common.retry}</Button>} /> : null}
-        {linkedDevices?.length === 0 ? <ListRow title={g.linkedDevicesEmpty} description={g.linkedDevicesEmptyDesc} /> : null}
-        {linkedDevices?.map(device => <ListRow key={device.id} title={device.label} description={g.linkedDevicesDates(new Date(device.created_at * 1000).toLocaleDateString(), new Date(device.last_seen_at * 1000).toLocaleDateString())} action={revokingDevice === device.id ? <span className="text-sm text-muted-foreground">{g.linkedDevicesRevoking}</span> : confirmingDevice === device.id ? <div className="flex gap-2"><Button onClick={() => void revokeDevice(device.id)} size="sm" variant="destructive">{t.common.confirm}</Button><Button onClick={() => setConfirmingDevice(null)} size="sm" variant="secondary">{t.common.cancel}</Button></div> : <Button onClick={() => setConfirmingDevice(device.id)} size="sm" variant="destructive">{g.linkedDevicesRevoke}</Button>} />)}
-      </SettingsSection> : null}
+      {!embedded ? <LinkedDevicesSettings /> : null}
 
       {/* Test/Save apply to local + remote. Cloud connects via the agent picker
           above (which applies a cloud connection on select), so its only

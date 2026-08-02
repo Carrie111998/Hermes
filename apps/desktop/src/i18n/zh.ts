@@ -942,7 +942,16 @@ export const zh: Translations = {
       sshErrTimeout: 'SSH 连接超时。主机可能无法访问或处于休眠状态。',
       sshErrUpdateRequired: '使用 Desktop SSH 连接前，请更新远程主机上的 Hermes。',
       sshErrUnknown: 'SSH 连接失败。',
-      linkedDevicesTitle: '已关联设备', linkedDevicesLoading: '正在加载已关联设备…', linkedDevicesError: '无法加载已关联设备。', linkedDevicesEmpty: '没有已关联设备', linkedDevicesEmptyDesc: '从聊天中关联手机后会显示在这里。', linkedDevicesDates: (linked, used) => `关联于 ${linked} · 上次使用 ${used}`, linkedDevicesRevoke: '撤销', linkedDevicesRevoking: '正在撤销…', linkedDevicesRevoked: '已撤销关联设备。', linkedDevicesRevokeFailed: '无法撤销关联设备。'
+      linkedDevicesTitle: '已关联设备',
+      linkedDevicesLoading: '正在加载已关联设备…',
+      linkedDevicesError: '无法加载已关联设备。',
+      linkedDevicesEmpty: '没有已关联设备',
+      linkedDevicesEmptyDesc: '从聊天中关联手机后会显示在这里。',
+      linkedDevicesDates: (linked, used) => `关联于 ${linked} · 上次使用 ${used}`,
+      linkedDevicesRevoke: '撤销',
+      linkedDevicesRevoking: '正在撤销…',
+      linkedDevicesRevoked: '已撤销关联设备。',
+      linkedDevicesRevokeFailed: '无法撤销关联设备。'
     },
     keys: {
       loading: '正在加载 API 密钥和凭据...',
@@ -2121,7 +2130,7 @@ export const zh: Translations = {
       openInSplit: '在分屏中打开',
       continueOnPhone: '关联手机',
       continueOnPhoneTitle: '关联手机',
-      continueOnPhoneDesc: '用手机扫描二维码，登录后继续此会话。',
+      continueOnPhoneDesc: '用手机扫描二维码即可安全打开此聊天，之后访问时会自动重新连接。',
       continueOnPhonePreparing: '正在检查安全远程访问…',
       continueOnPhoneQrAlt: '此 Hermes 会话的二维码',
       continueOnPhoneExpiresIn: seconds => `代码将在 ${seconds} 秒后过期`,

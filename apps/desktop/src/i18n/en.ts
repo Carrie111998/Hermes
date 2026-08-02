@@ -1938,7 +1938,7 @@ export const en: Translations = {
       openInSplit: 'Open in split',
       continueOnPhone: 'Link phone',
       continueOnPhoneTitle: 'Link phone',
-      continueOnPhoneDesc: 'Scan with your phone to open a resume-scoped handoff of this session.',
+      continueOnPhoneDesc: 'Scan with your phone to securely open this chat. Future visits reconnect automatically.',
       continueOnPhonePreparing: 'Checking secure remote access…',
       continueOnPhoneQrAlt: 'QR code for this Hermes session',
       continueOnPhoneExpiresIn: seconds => `Code expires in ${seconds}s`,
@@ -1953,7 +1953,8 @@ export const en: Translations = {
       continueOnPhoneUnreachableTitle: 'Remote access is unavailable',
       continueOnPhoneUnreachableDesc: 'Hermes could not reach the dashboard public URL. Check it and try again.',
       continueOnPhoneBrowserAuthTitle: 'Browser sign-in is not supported',
-      continueOnPhoneBrowserAuthDesc: 'This dashboard uses token-only access. Configure browser sign-in to continue on a phone.',
+      continueOnPhoneBrowserAuthDesc:
+        'This dashboard uses token-only access. Configure browser sign-in to continue on a phone.',
       continueOnPhoneTicketFailedTitle: 'Could not create a phone code',
       continueOnPhoneTicketFailedDesc: 'Try again to create a new, single-use code.',
       continueOnPhoneCopyLink: 'Copy link',

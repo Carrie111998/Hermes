@@ -20,13 +20,13 @@ import type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DashboardHandoffTicketResponse,
-  LinkedDevicesResponse,
   DashboardRemoteAccessResponse,
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
+  LinkedDevicesResponse,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -703,7 +703,10 @@ export function getLinkedDevices(): Promise<LinkedDevicesResponse> {
 }
 
 export function revokeLinkedDevice(id: string): Promise<{ ok: boolean }> {
-  return window.hermesDesktop.api<{ ok: boolean }>({ method: 'DELETE', path: `/api/auth/linked-devices/${encodeURIComponent(id)}` })
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    method: 'DELETE',
+    path: `/api/auth/linked-devices/${encodeURIComponent(id)}`
+  })
 }
 
 export function getLogs(params: {

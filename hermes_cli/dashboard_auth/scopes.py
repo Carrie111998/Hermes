@@ -20,9 +20,12 @@ from starlette.requests import Request
 
 # Scope names that must never appear on handoff tokens.
 # Canonical set — do not duplicate elsewhere (ws_tickets / middleware).
-FORBIDDEN_HANDOFF_SCOPES: frozenset[str] = frozenset(
-    {"*", "superuser", "API_SERVER_KEY", "admin"}
-)
+FORBIDDEN_HANDOFF_SCOPES: frozenset[str] = frozenset({
+    "*",
+    "superuser",
+    "API_SERVER_KEY",
+    "admin",
+})
 
 RESUME_SCOPE = "resume"
 
@@ -39,26 +42,37 @@ RESUME_WS_ENDPOINTS: frozenset[str] = frozenset({
 })
 
 # Exact REST paths always allowed for resume (method checked separately).
-_RESUME_REST_EXACT: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("GET", "/api/auth/me"),
-        ("POST", "/api/auth/ws-ticket"),
-        ("POST", "/auth/logout"),
-        ("POST", "/api/chat/image-upload"),
-    }
-)
+_RESUME_REST_EXACT: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/api/auth/me"),
+    ("POST", "/api/auth/ws-ticket"),
+    ("POST", "/auth/logout"),
+    ("POST", "/api/chat/image-upload"),
+})
 
 # GET /api/sessions/{bound_id} and a few read-only suffixes.
-_BOUND_SESSION_SUFFIXES: frozenset[str] = frozenset(
-    {
-        "",
-        "/messages",
-        "/latest-descendant",
-    }
-)
+_BOUND_SESSION_SUFFIXES: frozenset[str] = frozenset({
+    "",
+    "/messages",
+    "/latest-descendant",
+})
 
-_SESSION_PATH_RE = re.compile(
-    r"^/api/sessions/(?P<sid>[^/]+)(?P<rest>/.*)?$"
+_SESSION_PATH_RE = re.compile(r"^/api/sessions/(?P<sid>[^/]+)(?P<rest>/.*)?$")
+
+_RESUME_DOCUMENT_PATHS: frozenset[str] = frozenset({"/", "/chat"})
+_RESUME_STATIC_PATHS: frozenset[str] = frozenset({
+    "/favicon.ico",
+    "/manifest.webmanifest",
+    "/pwa-icon-180.png",
+    "/pwa-icon-192.png",
+    "/pwa-icon-512.png",
+    "/pwa-icon.svg",
+    "/sw.js",
+})
+_RESUME_STATIC_PREFIXES: tuple[str, ...] = (
+    "/assets/",
+    "/ds-assets/",
+    "/fonts/",
+    "/fonts-terminal/",
 )
 
 
@@ -125,17 +139,12 @@ def _path_only(request: Request) -> str:
 
 
 def _is_spa_or_static_get(method: str, path: str) -> bool:
-    """Allow GET of non-/api surfaces so /chat shell and assets can load."""
+    """Allow only the Chat document and its static/PWA assets."""
     if method != "GET":
         return False
-    if path.startswith("/api"):
-        return False
-    # Auth API under /auth/* except logout (POST, listed exact).
-    if path.startswith("/auth/"):
-        # GET /auth/login etc. is public already; if a scoped cookie is present
-        # allow navigating away without 403 on HTML/auth pages.
+    if path in _RESUME_DOCUMENT_PATHS or path in _RESUME_STATIC_PATHS:
         return True
-    return True
+    return any(path.startswith(prefix) for prefix in _RESUME_STATIC_PREFIXES)
 
 
 def _bound_session_get_allowed(path: str, sess: Any) -> bool:

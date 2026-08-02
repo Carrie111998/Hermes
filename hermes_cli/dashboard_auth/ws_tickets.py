@@ -27,8 +27,8 @@ token — so this module provides two credential shapes:
 3. **Single-use phone-handoff tickets** (``mint_handoff_ticket`` /
    ``consume_handoff_ticket``). Separate store + ``hnd_`` prefix so a handoff
    ticket can never be consumed as a WS ticket (or vice-versa). TTL = 120 s.
-   Payload binds a chat ``session_id`` + ``profile`` and mints a
-   resume-scoped browser session cookie on first consume. Never confers
+   Payload binds a chat ``session_id`` + ``profile`` and bootstraps a
+   persistent, resume-only linked device on first consume. Never confers
    ``API_SERVER_KEY`` / superuser / ``*`` scope.
 
 In-memory; the dashboard is a single process so no distributed coordination
@@ -39,8 +39,8 @@ tests can patch ``time.time`` cleanly.
 from __future__ import annotations
 
 import base64
-import hmac
 import hashlib
+import hmac
 import json
 import secrets
 import threading
@@ -92,7 +92,6 @@ _event_channel_key: Optional[bytes] = None
 #: credential, so audit logs distinguish them from browser-initiated tickets.
 INTERNAL_USER_ID = "server-internal"
 INTERNAL_PROVIDER = "server-internal"
-
 
 
 class TicketInvalid(Exception):
@@ -209,9 +208,6 @@ def mint_handoff_ticket(
     session_id: str,
     profile: str = "",
     user_id: str,
-    email: str = "",
-    display_name: str = "",
-    org_id: str = "",
     provider: str,
 ) -> str:
     """Mint a single-use phone-handoff ticket bound to a chat session.
@@ -238,9 +234,6 @@ def mint_handoff_ticket(
         "session_id": str(session_id).strip(),
         "profile": profile or "",
         "user_id": user_id,
-        "email": email or "",
-        "display_name": display_name or "",
-        "org_id": org_id or "",
         "provider": provider,
         "scopes": list(HANDOFF_SCOPES),
         "minted_at": now,
@@ -277,8 +270,6 @@ def consume_handoff_ticket(ticket: str) -> Dict[str, Any]:
     return info
 
 
-
-
 def _gc_expired_locked() -> None:
     """Drop expired WS tickets. Caller must hold ``_lock``."""
     now = int(time.time())
@@ -307,7 +298,7 @@ def internal_ws_credential() -> str:
     REST endpoint; it is only ever passed to a child process via its
     environment. See the module docstring for the threat-model rationale.
     """
-    global _internal_credential, _event_channel_key
+    global _internal_credential
     with _lock:
         if _internal_credential is None:
             _internal_credential = secrets.token_urlsafe(32)
@@ -343,7 +334,7 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
 
 def _reset_for_tests() -> None:
     """Test-only: drop all tickets, handoff tickets, and the internal credential."""
-    global _internal_credential
+    global _event_channel_key, _internal_credential
     with _lock:
         _tickets.clear()
         _handoff_tickets.clear()

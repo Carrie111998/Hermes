@@ -6,6 +6,7 @@
 No public tunnel and no external origin. The browser proof still verifies that
 the handoff capability never reaches the HTTP URL.
 """
+
 from __future__ import annotations
 
 import json
@@ -22,9 +23,10 @@ import uvicorn
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
+from hermes_cli.dashboard_auth import linked_devices
 from hermes_cli.dashboard_auth import ws_tickets
+from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE
 from hermes_cli.dashboard_auth.ws_tickets import (
-    HANDOFF_SESSION_TTL_SECONDS,
     HANDOFF_TTL_SECONDS,
     _reset_for_tests,
 )
@@ -134,9 +136,9 @@ def _consume_fragment(client: httpx.Client, base: str, ticket: str):
 
 
 def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
-    """F-04 + logout: short handoff TTL, 45m resume session, logout clears cookie."""
+    """One-time QR plus persistent linked device, including logout revoke."""
     assert HANDOFF_TTL_SECONDS == 120
-    assert HANDOFF_SESSION_TTL_SECONDS == 45 * 60
+    assert linked_devices.DEVICE_COOKIE_TTL_SECONDS == 90 * 24 * 60 * 60
 
     base = runtime_server["base"]
     sid = "s5-ttl-session"
@@ -161,8 +163,8 @@ def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
     try:
         expired = _consume_fragment(phone, base, ticket)
         # Expired: must not establish a resume session cookie.
-        assert not any("hermes_session_at" in k for k in phone.cookies.keys()), (
-            f"expired handoff must not set session cookies: {list(phone.cookies.keys())}"
+        assert not any(LINKED_DEVICE_COOKIE in k for k in phone.cookies.keys()), (
+            f"expired handoff must not link a device: {list(phone.cookies.keys())}"
         )
         assert expired.status_code == 401
     finally:
@@ -181,7 +183,7 @@ def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
         c = _consume_fragment(phone2, base, ticket2)
         assert c.status_code == 200, c.text
         assert c.json()["location"] == f"/chat?resume={sid}&profile=default"
-        assert any("hermes_session_at" in k for k in phone2.cookies.keys())
+        assert any(LINKED_DEVICE_COOKIE in k for k in phone2.cookies.keys())
         me = phone2.get("/api/auth/me")
         assert me.status_code == 200, me.text
         lo = phone2.post("/auth/logout")
@@ -198,7 +200,9 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
     # it asserts on the gated SPA's injected globals. `web_dist` is gitignored and
     # CI does not build it, so skip rather than fail there.
     if not (web_server.WEB_DIST / "index.html").is_file():
-        pytest.skip(f"SPA not built at {web_server.WEB_DIST}; run: cd web && npm run build")
+        pytest.skip(
+            f"SPA not built at {web_server.WEB_DIST}; run: cd web && npm run build"
+        )
 
     base = runtime_server["base"]
     sid = "s5-browser-session"
@@ -211,9 +215,7 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
             json={"session_id": sid, "profile": "default"},
         ).json()["ticket"]
 
-    which = subprocess.run(
-        ["which", "agent-browser"], capture_output=True, text=True
-    )
+    which = subprocess.run(["which", "agent-browser"], capture_output=True, text=True)
     if which.returncode != 0:
         pytest.skip("agent-browser not installed")
 

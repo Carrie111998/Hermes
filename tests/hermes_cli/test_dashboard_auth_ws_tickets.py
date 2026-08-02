@@ -152,9 +152,6 @@ class TestConcurrency:
 
 
 class TestInternalCredential:
-
-
-
     def test_reset_clears_and_remints(self):
         first = ws_tickets.internal_ws_credential()
         _reset_for_tests()
@@ -189,9 +186,6 @@ class TestHandoffTickets:
             session_id="sess-1",
             profile="default",
             user_id="u1",
-            email="u1@example.com",
-            display_name="U One",
-            org_id="org",
             provider="stub",
         )
         assert ticket.startswith(ws_tickets.HANDOFF_TICKET_PREFIX)
@@ -201,7 +195,7 @@ class TestHandoffTickets:
         assert info["profile"] == "default"
         assert info["user_id"] == "u1"
         assert info["scopes"] == list(ws_tickets.HANDOFF_SCOPES)
-        assert info["access_token"]
+        assert "access_token" not in info
 
     def test_ttl_is_120_seconds(self):
         assert ws_tickets.HANDOFF_TTL_SECONDS == 120
@@ -252,18 +246,6 @@ class TestHandoffTickets:
         scopes = set(info["scopes"])
         assert scopes == {"resume"}
         assert not scopes.intersection({"*", "superuser", "API_SERVER_KEY"})
-
-        session = ws_tickets.verify_handoff_session_token(info["access_token"])
-        assert session is not None
-        assert session.scopes == ("resume",)
-        assert session.refresh_token == ""
-        assert not set(session.scopes).intersection(
-            {"*", "superuser", "API_SERVER_KEY"}
-        )
-
-    def test_verify_handoff_session_rejects_ws_shaped_garbage(self):
-        assert ws_tickets.verify_handoff_session_token("not-a-handoff-token") is None
-        assert ws_tickets.verify_handoff_session_token("") is None
 
     def test_session_id_required(self):
         with pytest.raises(ValueError, match="session_id"):

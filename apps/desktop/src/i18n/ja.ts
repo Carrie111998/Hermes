@@ -807,7 +807,16 @@ export const ja = defineLocale({
       sshErrTimeout: 'SSH 接続がタイムアウトしました。ホストが到達不能、またはスリープ中の可能性があります。',
       sshErrUpdateRequired: 'Desktop SSH で接続する前に、リモートホストの Hermes を更新してください。',
       sshErrUnknown: 'SSH 接続に失敗しました。',
-      linkedDevicesTitle: 'リンク済みデバイス', linkedDevicesLoading: 'リンク済みデバイスを読み込んでいます…', linkedDevicesError: 'リンク済みデバイスを読み込めませんでした。', linkedDevicesEmpty: 'リンク済みデバイスはありません', linkedDevicesEmptyDesc: 'チャットからスマートフォンをリンクすると、ここに表示されます。', linkedDevicesDates: (linked, used) => `リンク: ${linked} · 最終使用: ${used}`, linkedDevicesRevoke: '取り消す', linkedDevicesRevoking: '取り消し中…', linkedDevicesRevoked: 'リンク済みデバイスを取り消しました。', linkedDevicesRevokeFailed: 'リンク済みデバイスを取り消せませんでした。'
+      linkedDevicesTitle: 'リンク済みデバイス',
+      linkedDevicesLoading: 'リンク済みデバイスを読み込んでいます…',
+      linkedDevicesError: 'リンク済みデバイスを読み込めませんでした。',
+      linkedDevicesEmpty: 'リンク済みデバイスはありません',
+      linkedDevicesEmptyDesc: 'チャットからスマートフォンをリンクすると、ここに表示されます。',
+      linkedDevicesDates: (linked, used) => `リンク: ${linked} · 最終使用: ${used}`,
+      linkedDevicesRevoke: '取り消す',
+      linkedDevicesRevoking: '取り消し中…',
+      linkedDevicesRevoked: 'リンク済みデバイスを取り消しました。',
+      linkedDevicesRevokeFailed: 'リンク済みデバイスを取り消せませんでした。'
     },
     keys: {
       loading: 'API キーと認証情報を読み込み中...',
@@ -1765,7 +1774,8 @@ export const ja = defineLocale({
       newWindow: '新しいウィンドウ',
       continueOnPhone: 'スマートフォンをリンク',
       continueOnPhoneTitle: 'スマートフォンをリンク',
-      continueOnPhoneDesc: 'スマートフォンで QR コードを読み取り、サインインしてこのセッションを続けます。',
+      continueOnPhoneDesc:
+        'スマートフォンで QR コードを読み取ると、このチャットが安全に開き、次回から自動で再接続します。',
       continueOnPhonePreparing: '安全なリモートアクセスを確認しています…',
       continueOnPhoneQrAlt: 'この Hermes セッションの QR コード',
       continueOnPhoneExpiresIn: seconds => `コードの有効期限はあと ${seconds} 秒です`,
@@ -1774,13 +1784,16 @@ export const ja = defineLocale({
       continueOnPhoneExpiredDesc: '読み取る準備ができたら新しいコードを作成してください。',
       continueOnPhoneNewCode: '新しいコードを作成',
       continueOnPhoneNotConfiguredTitle: 'リモートアクセスが設定されていません',
-      continueOnPhoneNotConfiguredDesc: 'ブラウザサインイン対応の HTTPS ダッシュボード公開 URL を設定してから、もう一度お試しください。',
+      continueOnPhoneNotConfiguredDesc:
+        'ブラウザサインイン対応の HTTPS ダッシュボード公開 URL を設定してから、もう一度お試しください。',
       continueOnPhoneInsecureUrlTitle: 'リモートアクセス URL が安全ではありません',
       continueOnPhoneInsecureUrlDesc: '埋め込み認証情報のない HTTPS ダッシュボード公開 URL を使用してください。',
       continueOnPhoneUnreachableTitle: 'リモートアクセスを利用できません',
-      continueOnPhoneUnreachableDesc: 'Hermes からダッシュボード公開 URL に到達できません。確認してから、もう一度お試しください。',
+      continueOnPhoneUnreachableDesc:
+        'Hermes からダッシュボード公開 URL に到達できません。確認してから、もう一度お試しください。',
       continueOnPhoneBrowserAuthTitle: 'ブラウザサインインに対応していません',
-      continueOnPhoneBrowserAuthDesc: 'このダッシュボードはトークン専用アクセスを使用しています。スマートフォンで続けるにはブラウザサインインを設定してください。',
+      continueOnPhoneBrowserAuthDesc:
+        'このダッシュボードはトークン専用アクセスを使用しています。スマートフォンで続けるにはブラウザサインインを設定してください。',
       continueOnPhoneTicketFailedTitle: 'スマートフォン用コードを作成できませんでした',
       continueOnPhoneTicketFailedDesc: 'もう一度試して、新しい使い捨てコードを作成してください。',
       continueOnPhoneCopyLink: 'リンクをコピー',

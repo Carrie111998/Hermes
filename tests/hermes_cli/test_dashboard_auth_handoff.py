@@ -1,10 +1,9 @@
 """Handoff ticket mint + gated middleware consume (QR phone-path server core).
 
-Covers Approach D security invariants + Oscar F-01..F-04 scoped authz:
-single-use handoff ticket → resume-scoped cookie session, default-deny API
-gate, session/profile bind, consume only on GET /chat, shortened session TTL.
-Without the public-SPA / tunnel surface (slice 2).
+Covers the one-time handoff bootstrap, persistent linked-device credential,
+default-deny API gate, session/profile binding and exact consume path.
 """
+
 from __future__ import annotations
 
 import os
@@ -17,15 +16,11 @@ from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import ws_tickets
 from hermes_cli.dashboard_auth.base import Session, TokenPrincipal
-from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE, SESSION_RT_COOKIE
 from hermes_cli.dashboard_auth import linked_devices
+from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE, SESSION_RT_COOKIE
 from hermes_cli.dashboard_auth.ws_tickets import _reset_for_tests
 from hermes_state import SessionDB
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
-
-# Existing security-path assertions below refer to the resume credential. The
-# protocol now names it explicitly as a linked-device cookie.
-SESSION_AT_COOKIE = LINKED_DEVICE_COOKIE
 
 
 @pytest.fixture
@@ -81,6 +76,13 @@ def _bare_cookie_names(client_or_response) -> set[str]:
                 bare = bare[len(pfx) :]
         names.add(bare)
     return names
+
+
+def _linked_secret(client) -> str:
+    for name, value in client.cookies.items():
+        if name.endswith(LINKED_DEVICE_COOKIE):
+            return value
+    raise AssertionError("missing linked-device cookie")
 
 
 def _mint(client, session_id: str, profile: str = "") -> str:
@@ -240,7 +242,7 @@ def test_fragment_consume_sets_scoped_cookie_and_uses_bound_target(gated_app):
     assert response.json() == {"location": "/chat?resume=fragment-session"}
     assert response.headers["cache-control"] == "no-store"
     bare = _bare_cookie_names(phone)
-    assert SESSION_AT_COOKIE in bare
+    assert LINKED_DEVICE_COOKIE in bare
     assert SESSION_RT_COOKIE not in bare
 
     me = phone.get("/api/auth/me")
@@ -333,7 +335,7 @@ def test_consume_valid_handoff_sets_cookie_and_302_strips_param(gated_app):
     assert "resume=chat-42" in loc
     assert "profile=default" in loc
     bare = _bare_cookie_names(phone)
-    assert SESSION_AT_COOKIE in bare, f"expected AT cookie, got {bare}"
+    assert LINKED_DEVICE_COOKIE in bare, f"expected AT cookie, got {bare}"
     # No refresh token for handoff sessions.
     assert SESSION_RT_COOKIE not in bare, (
         f"handoff must not set refresh cookie, got {bare}"
@@ -368,7 +370,7 @@ def test_replay_consumed_handoff_fails_closed(gated_app):
     loc = second.headers.get("location", "")
     assert "/login" in loc or "/auth/login" in loc, loc
     # No session cookie granted.
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(attacker)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(attacker)
 
 
 def test_expired_handoff_fails_closed(gated_app, monkeypatch):
@@ -385,7 +387,7 @@ def test_expired_handoff_fails_closed(gated_app, monkeypatch):
     assert r.status_code == 302
     loc = r.headers.get("location", "")
     assert "/login" in loc or "/auth/login" in loc, loc
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +428,7 @@ def test_ws_ticket_rejected_on_handoff_path(gated_app):
     assert r.status_code == 302
     loc = r.headers.get("location", "")
     assert "/login" in loc or "/auth/login" in loc, loc
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +458,7 @@ def test_handoff_minted_session_is_not_superuser(gated_app):
         for pfx in ("__Host-", "__Secure-"):
             if bare.startswith(pfx):
                 bare = bare[len(pfx) :]
-        if bare == SESSION_AT_COOKIE:
+        if bare == LINKED_DEVICE_COOKIE:
             at = value
             break
     assert at, "missing linked device cookie"
@@ -468,6 +470,149 @@ def test_handoff_minted_session_is_not_superuser(gated_app):
 
 def test_linked_device_inactivity_ttl_is_90_days():
     assert linked_devices.DEVICE_COOKIE_TTL_SECONDS == 90 * 24 * 60 * 60
+
+
+def test_linked_cookie_is_secure_http_only_lax_and_renews(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "cookie-contract")
+
+    phone, response = _fragment_consume(ticket)
+
+    set_cookie = response.headers["set-cookie"]
+    assert f"__Host-{LINKED_DEVICE_COOKIE}=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
+    assert "Secure" in set_cookie
+    assert f"Max-Age={linked_devices.DEVICE_COOKIE_TTL_SECONDS}" in set_cookie
+
+    renewed = phone.get("/api/auth/me")
+    assert renewed.status_code == 200
+    assert f"__Host-{LINKED_DEVICE_COOKIE}=" in renewed.headers["set-cookie"]
+
+
+def test_linked_device_expiry_is_sliding_and_clears_invalid_cookie(
+    gated_app, monkeypatch
+):
+    clock = {"now": 1_000_000}
+    monkeypatch.setattr(linked_devices, "_now", lambda: clock["now"])
+    _complete_stub_login(gated_app)
+    phone = _phone_consume(_mint(gated_app, "sliding-device"))
+
+    clock["now"] += linked_devices.DEVICE_COOKIE_TTL_SECONDS - 1
+    assert phone.get("/api/auth/me").status_code == 200
+    clock["now"] += linked_devices.DEVICE_COOKIE_TTL_SECONDS - 1
+    assert phone.get("/api/auth/me").status_code == 200
+
+    clock["now"] += linked_devices.DEVICE_COOKIE_TTL_SECONDS + 1
+    expired = phone.get("/api/auth/me", follow_redirects=False)
+    assert expired.status_code == 401
+    cleared = expired.headers.get_list("set-cookie")
+    host_values = [
+        value for value in cleared if f"__Host-{LINKED_DEVICE_COOKIE}" in value
+    ]
+    assert host_values, cleared
+    host_clear = host_values[0]
+    assert "Max-Age=0" in host_clear
+    assert "Secure" in host_clear
+    assert not any(name.endswith(LINKED_DEVICE_COOKIE) for name in phone.cookies.keys())
+
+
+def test_same_browser_repair_rotates_one_device_record(gated_app):
+    _complete_stub_login(gated_app)
+    phone = _phone_consume(_mint(gated_app, "first-bound-session"))
+    old_secret = _linked_secret(phone)
+    old_record = linked_devices.authenticate(old_secret)
+    assert old_record is not None
+
+    _phone, response = _fragment_consume(
+        _mint(gated_app, "second-bound-session"),
+        extra_headers={"Cookie": f"__Host-{LINKED_DEVICE_COOKIE}={old_secret}"},
+    )
+    new_secret = response.cookies.get(f"__Host-{LINKED_DEVICE_COOKIE}")
+    assert new_secret and new_secret != old_secret
+    new_record = linked_devices.authenticate(new_secret)
+
+    assert linked_devices.authenticate(old_secret) is None
+    assert new_record is not None
+    assert new_record["id"] == old_record["id"]
+    assert new_record["session_id"] == "second-bound-session"
+    assert len(linked_devices.list_devices()) == 1
+
+
+def test_full_session_manages_devices_but_linked_session_cannot(gated_app):
+    _complete_stub_login(gated_app)
+    phone = _phone_consume(_mint(gated_app, "managed-device"))
+    record = linked_devices.authenticate(_linked_secret(phone))
+    assert record is not None
+
+    assert phone.get("/api/auth/linked-devices").status_code == 403
+    assert phone.delete(f"/api/auth/linked-devices/{record['id']}").status_code == 403
+
+    listed = gated_app.get("/api/auth/linked-devices")
+    assert listed.status_code == 200
+    assert listed.headers["cache-control"] == "no-store"
+    assert listed.json()["devices"] == [
+        {
+            "id": record["id"],
+            "label": record["label"],
+            "created_at": record["created_at"],
+            "last_seen_at": record["last_seen_at"],
+        }
+    ]
+    revoked = gated_app.delete(f"/api/auth/linked-devices/{record['id']}")
+    assert revoked.status_code == 200
+    assert revoked.headers["cache-control"] == "no-store"
+    assert phone.get("/api/auth/me", follow_redirects=False).status_code == 401
+
+
+def test_loopback_desktop_can_manage_linked_devices(gated_app):
+    previous = web_server.app.state.auth_required
+    previous_host = web_server.app.state.bound_host
+    web_server.app.state.auth_required = False
+    web_server.app.state.bound_host = "127.0.0.1"
+    try:
+        desktop = TestClient(web_server.app, base_url="http://127.0.0.1")
+        desktop.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+        response = desktop.get("/api/auth/linked-devices")
+        assert response.status_code == 200, response.text
+    finally:
+        web_server.app.state.auth_required = previous
+        web_server.app.state.bound_host = previous_host
+
+
+def test_oauth_session_takes_precedence_over_linked_cookie(gated_app):
+    _complete_stub_login(gated_app)
+    phone = _phone_consume(_mint(gated_app, "precedence-device"))
+    assert phone.get("/api/auth/me").json()["scopes"] == ["resume"]
+
+    _complete_stub_login(phone)
+    full = phone.get("/api/auth/me")
+    assert full.status_code == 200
+    assert full.json()["provider"] == "stub"
+    assert full.json()["scopes"] == []
+    assert phone.get("/api/auth/linked-devices").status_code == 200
+
+
+def test_linked_device_silently_redirects_to_its_bound_chat(gated_app):
+    phone = _resume_phone(gated_app, "canonical-device-chat")
+
+    root = phone.get("/", follow_redirects=False)
+    hostile = phone.get(
+        "/chat?resume=another-session&profile=evil",
+        follow_redirects=False,
+    )
+
+    assert root.status_code == 302
+    assert root.headers["location"] == "/chat?resume=canonical-device-chat"
+    assert hostile.status_code == 302
+    assert hostile.headers["location"] == "/chat?resume=canonical-device-chat"
+
+
+@pytest.mark.parametrize("path", ["/settings", "/plugins", "/credentials", "/terminal"])
+def test_linked_device_cannot_open_non_chat_spa_routes(gated_app, path):
+    phone = _resume_phone(gated_app, "chat-only-device")
+    response = phone.get(path, follow_redirects=False)
+    assert response.status_code == 403, (path, response.status_code, response.text)
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +728,10 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
         assert getattr(ws.state, "ws_ticket_info", None) is not None
         assert ws.state.ws_ticket_info.get("bound_session_id") == "ws-bound"
         assert ws.state.ws_ticket_info.get("allowed_endpoints") is not None
-        assert getattr(ws.state, "ws_ticket_event_channel") == ticket_response["event_channel"]
+        assert (
+            getattr(ws.state, "ws_ticket_event_channel")
+            == ticket_response["event_channel"]
+        )
 
     # Unbound admin sockets still denied.
     for path in ("/api/ws", "/api/console"):
@@ -596,7 +744,9 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
         assert cred == "ticket"
 
 
-def test_resume_ws_ticket_binds_events_and_pty_sidecar_to_its_channel(gated_app, monkeypatch):
+def test_resume_ws_ticket_binds_events_and_pty_sidecar_to_its_channel(
+    gated_app, monkeypatch
+):
     """A resume ticket cannot select another session's event bridge channel."""
     import asyncio
 
@@ -670,15 +820,51 @@ def test_resume_ws_ticket_binds_events_and_pty_sidecar_to_its_channel(gated_app,
 
     async def fake_resolve_chat_argv_async(**kwargs):
         captured["sidecar_url"] = kwargs["sidecar_url"]
-        raise web_server.HTTPException(status_code=400, detail="stop after sidecar capture")
+        raise web_server.HTTPException(
+            status_code=400, detail="stop after sidecar capture"
+        )
 
     monkeypatch.setattr(web_server, "_ws_host_origin_reason", lambda _ws: None)
     monkeypatch.setattr(web_server, "_ws_client_reason", lambda _ws: None)
-    monkeypatch.setattr(web_server, "_resolve_chat_argv_async", fake_resolve_chat_argv_async)
+    monkeypatch.setattr(
+        web_server, "_resolve_chat_argv_async", fake_resolve_chat_argv_async
+    )
     asyncio.run(web_server.pty_ws(pty_ws))  # type: ignore[arg-type]
 
     assert f"channel={channel_a}" in captured["sidecar_url"]
     assert f"channel={channel_b}" not in captured["sidecar_url"]
+
+
+def test_revoked_device_closes_an_already_authenticated_ws(gated_app):
+    import asyncio
+
+    phone = _resume_phone(gated_app, "revoked-open-ws")
+    response = phone.post("/api/auth/ws-ticket")
+    assert response.status_code == 200
+
+    class _FakeWS:
+        def __init__(self):
+            self.query_params = {"ticket": response.json()["ticket"]}
+            self.headers = {}
+            self.client = type("C", (), {"host": "1.2.3.4"})()
+            self.app = web_server.app
+            self.url = type("U", (), {"path": "/api/pty"})()
+            self.state = type("S", (), {})()
+            self.closed = []
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+    ws = _FakeWS()
+    reason, _credential = web_server._ws_auth_reason(ws)  # type: ignore[arg-type]
+    assert reason is None
+    assert asyncio.run(web_server._linked_ws_device_allowed(ws)) is True
+
+    device_id = ws.state.ws_ticket_info["device_id"]
+    assert device_id
+    assert linked_devices.revoke(device_id)
+    assert asyncio.run(web_server._linked_ws_device_allowed(ws)) is False
+    assert ws.closed == [{"code": 4401, "reason": "linked device revoked"}]
 
 
 def test_full_dashboard_ws_ticket_keeps_client_event_channel_unbound(gated_app):
@@ -690,7 +876,10 @@ def test_full_dashboard_ws_ticket_keeps_client_event_channel_unbound(gated_app):
     assert "event_channel" not in ticket_response
 
     class _FakeWS:
-        query_params = {"ticket": ticket_response["ticket"], "channel": "dashboard-client"}
+        query_params = {
+            "ticket": ticket_response["ticket"],
+            "channel": "dashboard-client",
+        }
         headers = {}
         client = type("C", (), {"host": "1.2.3.4"})()
         app = web_server.app
@@ -780,7 +969,7 @@ def test_consume_ticket_wins_over_resume_query_mismatch(gated_app):
     assert "attacker-session" not in loc
     assert "profile=default" in loc
     assert "evil" not in loc
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -795,10 +984,10 @@ def test_api_config_with_handoff_does_not_set_cookies(gated_app):
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     phone.get(f"/api/config?handoff={ticket}", follow_redirects=False)
     # Must not mint cookies; ticket still live for /chat.
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
     r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r2.status_code == 302
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 def test_post_with_handoff_does_not_set_cookies(gated_app):
@@ -807,10 +996,10 @@ def test_post_with_handoff_does_not_set_cookies(gated_app):
 
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     phone.post(f"/chat?handoff={ticket}", follow_redirects=False)
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
     r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r2.status_code == 302
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 def test_root_with_handoff_does_not_set_cookies(gated_app):
@@ -819,7 +1008,7 @@ def test_root_with_handoff_does_not_set_cookies(gated_app):
 
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     phone.get(f"/?handoff={ticket}", follow_redirects=False)
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
 
 
 @pytest.mark.parametrize(
@@ -842,12 +1031,12 @@ def test_hostile_path_does_not_consume_handoff(gated_app, hostile_path):
 
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     phone.get(f"{hostile_path}?handoff={ticket}", follow_redirects=False)
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone), hostile_path
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone), hostile_path
 
     # Ticket remains valid for exact /chat once.
     r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r2.status_code == 302, (hostile_path, r2.status_code, r2.text)
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 def _handoff_scope_request(
@@ -928,11 +1117,11 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
     for path in ("/%63hat", "/chat%2F", "/api%2Fconfig%2Fchat"):
         phone2 = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
         phone2.get(f"{path}?handoff={ticket}", follow_redirects=False)
-        assert SESSION_AT_COOKIE not in _bare_cookie_names(phone2), path
+        assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone2), path
 
     r_ok = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r_ok.status_code == 302
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 def test_missing_or_non_byte_raw_path_does_not_authorise_consume():
@@ -948,9 +1137,7 @@ def test_missing_or_non_byte_raw_path_does_not_authorise_consume():
     assert not is_handoff_consume_request(_req("/chat", raw=123))
     assert not is_handoff_consume_request(_req("/chat", raw=b"/%63hat"))
     # Non-GET still rejected even with canonical raw.
-    assert not is_handoff_consume_request(
-        _req("/chat", raw=b"/chat", method="POST")
-    )
+    assert not is_handoff_consume_request(_req("/chat", raw=b"/chat", method="POST"))
     assert is_handoff_consume_request(_req("/chat", raw=b"/chat"))
 
 
@@ -994,23 +1181,23 @@ def test_missing_raw_path_live_middleware_does_not_consume(gated_app):
     stripped = StripRawPath(web_server.app)
     phone = TestClient(stripped, base_url="https://fly-app.fly.dev")
     phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
 
     forced = ForceDecodedChatStripRaw(web_server.app)
     phone_alias = TestClient(forced, base_url="https://fly-app.fly.dev")
     phone_alias.get(f"/%63hat?handoff={ticket}", follow_redirects=False)
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone_alias)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone_alias)
 
     # Ticket still valid once for exact /chat with present raw_path.
     phone_ok = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     r_ok = phone_ok.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r_ok.status_code == 302, r_ok.text
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone_ok)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone_ok)
 
     # Replay denied.
     phone_replay = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     phone_replay.get(f"/chat?handoff={ticket}", follow_redirects=False)
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone_replay)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone_replay)
 
 
 # ---------------------------------------------------------------------------
@@ -1033,7 +1220,7 @@ def test_bare_chat_with_forwarded_prefix_consumes_and_redirects(gated_app):
     loc = r.headers.get("location", "")
     assert loc.startswith("/hermes/chat?")
     assert "resume=pfx-hermes" in loc
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
     # Single-use: replay with same prefix must not mint again.
     phone2 = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
@@ -1042,7 +1229,7 @@ def test_bare_chat_with_forwarded_prefix_consumes_and_redirects(gated_app):
         headers={"X-Forwarded-Prefix": "/hermes"},
         follow_redirects=False,
     )
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone2)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone2)
 
 
 def test_nested_chat_with_matching_forwarded_prefix_does_not_consume(gated_app):
@@ -1056,11 +1243,11 @@ def test_nested_chat_with_matching_forwarded_prefix_does_not_consume(gated_app):
         headers={"X-Forwarded-Prefix": "/nested"},
         follow_redirects=False,
     )
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
 
     r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r2.status_code == 302
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 def test_api_config_chat_with_matching_forwarded_prefix_does_not_consume(gated_app):
@@ -1074,11 +1261,11 @@ def test_api_config_chat_with_matching_forwarded_prefix_does_not_consume(gated_a
         headers={"X-Forwarded-Prefix": "/api/config"},
         follow_redirects=False,
     )
-    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE not in _bare_cookie_names(phone)
 
     r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r2.status_code == 302
-    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+    assert LINKED_DEVICE_COOKIE in _bare_cookie_names(phone)
 
 
 # ---------------------------------------------------------------------------

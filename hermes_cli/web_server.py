@@ -14368,6 +14368,30 @@ else:
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
 
+
+async def _linked_ws_device_allowed(ws: "WebSocket") -> bool:
+    """Fail closed when a WS ticket's linked device is revoked or expired."""
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    device_id = ticket_info.get("device_id") if isinstance(ticket_info, dict) else ""
+    if not device_id:
+        return True
+
+    try:
+        from hermes_cli.dashboard_auth.linked_devices import is_active
+
+        allowed = is_active(device_id)
+    except Exception:
+        _log.warning("linked-device status check failed", exc_info=True)
+        allowed = False
+    if allowed:
+        return True
+
+    try:
+        await ws.close(code=4401, reason="linked device revoked")
+    except Exception:
+        pass
+    return False
+
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
 from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
@@ -14449,13 +14473,8 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
                 raw = text.encode("utf-8") if isinstance(text, str) else b""
             if not raw:
                 continue
-            ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
-            device_id = ticket_info.get("device_id") if isinstance(ticket_info, dict) else ""
-            if device_id:
-                from hermes_cli.dashboard_auth.linked_devices import is_active
-                if not is_active(device_id):
-                    await ws.close(code=4401, reason="linked device revoked")
-                    break
+            if not await _linked_ws_device_allowed(ws):
+                break
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
@@ -15032,6 +15051,8 @@ async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
 
     for sub in subs:
         try:
+            if not await _linked_ws_device_allowed(sub):
+                continue
             await sub.send_text(payload)
         except Exception:
             # Subscriber went away mid-send; the /api/events finally clause
@@ -15849,13 +15870,8 @@ async def pty_ws(ws: WebSocket) -> None:
 
             # A linked device may be revoked after this socket opened. Check
             # before every client message so it cannot keep driving the PTY.
-            ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
-            device_id = ticket_info.get("device_id") if isinstance(ticket_info, dict) else ""
-            if device_id:
-                from hermes_cli.dashboard_auth.linked_devices import is_active
-                if not is_active(device_id):
-                    await ws.close(code=4401, reason="linked device revoked")
-                    break
+            if not await _linked_ws_device_allowed(ws):
+                break
 
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)

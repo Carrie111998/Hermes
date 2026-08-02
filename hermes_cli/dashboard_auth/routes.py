@@ -13,6 +13,7 @@ The routes:
   GET  /api/auth/providers → list registered providers (login bootstrap)
   GET  /api/auth/me        → current Session as JSON (auth-required)
 """
+
 from __future__ import annotations
 
 import json
@@ -39,14 +40,14 @@ from hermes_cli.dashboard_auth.base import (
     ProviderError,
 )
 from hermes_cli.dashboard_auth.cookies import (
-    clear_pkce_cookie,
     clear_linked_device_cookie,
+    clear_pkce_cookie,
     clear_session_cookies,
     clear_sso_attempt_cookie,
     detect_https,
+    read_linked_device_cookie,
     read_pkce_cookie,
     read_session_cookies,
-    read_linked_device_cookie,
     set_pkce_cookie,
     set_session_cookies,
 )
@@ -125,6 +126,7 @@ def _prefix(request: Request) -> str:
     ``hermes_cli.dashboard_auth.prefix`` for the normalisation rules.
     """
     from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
     return prefix_from_request(request)
 
 
@@ -139,9 +141,7 @@ async def login_page(request: Request) -> HTMLResponse:
     # the redirect URL. Validate against the same same-origin rules the
     # callback applies (defence in depth — the gate already filters,
     # but /login is reachable directly too).
-    next_path = _validate_post_login_target(
-        request.query_params.get("next", "")
-    )
+    next_path = _validate_post_login_target(request.query_params.get("next", ""))
     return HTMLResponse(
         render_login_html(next_path=next_path),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
@@ -169,9 +169,7 @@ async def api_auth_providers() -> Any:
             {
                 "name": p.name,
                 "display_name": p.display_name,
-                "supports_password": bool(
-                    getattr(p, "supports_password", False)
-                ),
+                "supports_password": bool(getattr(p, "supports_password", False)),
             }
             for p in providers
         ],
@@ -241,9 +239,12 @@ async def auth_login(request: Request, provider: str, next: str = ""):
     safe_next = _validate_post_login_target(next)
     if safe_next:
         from urllib.parse import quote
+
         pkce = f"{pkce};next={quote(safe_next, safe='')}"
     set_pkce_cookie(
-        resp, payload=pkce, use_https=detect_https(request),
+        resp,
+        payload=pkce,
+        use_https=detect_https(request),
         prefix=_prefix(request),
     )
     return resp
@@ -328,9 +329,7 @@ async def auth_native_authorize(
         if len(sess_providers) == 1:
             p = sess_providers[0]
     if p is None:
-        raise HTTPException(
-            status_code=404, detail=f"Unknown provider: {provider!r}"
-        )
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider!r}")
     if not getattr(p, "supports_session", True) or getattr(
         p, "supports_password", False
     ):
@@ -374,7 +373,9 @@ async def auth_native_authorize(
         pkce = f"provider={p.name};{pkce}" if pkce else f"provider={p.name}"
     pkce = f"{pkce};broker={broker_state}"
     set_pkce_cookie(
-        resp, payload=pkce, use_https=detect_https(request),
+        resp,
+        payload=pkce,
+        use_https=detect_https(request),
         prefix=_prefix(request),
     )
     return resp
@@ -404,9 +405,7 @@ async def auth_callback(
     # ``next`` segment is optional (only present when /auth/login was
     # given a next= query). All keys live in the same flat namespace;
     # ``next`` carries a URL-encoded path so it never contains ``;``.
-    parts = dict(
-        seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg
-    )
+    parts = dict(seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg)
     provider_name = parts.get("provider", "")
     expected_state = parts.get("state", "")
     verifier = parts.get("verifier", "")
@@ -503,9 +502,7 @@ async def auth_callback(
 
         try:
             pending = native_flow.get_pending(broker_state)
-            gw_code = native_flow.complete_pending(
-                broker_state, session=session
-            )
+            gw_code = native_flow.complete_pending(broker_state, session=session)
         except native_flow.NativeFlowError:
             audit_log(
                 AuditEvent.NATIVE_TOKEN_FAILURE,
@@ -575,6 +572,7 @@ def _validate_post_login_target(raw: str) -> str:
     if not raw:
         return ""
     from urllib.parse import unquote
+
     decoded = unquote(raw)
     if not decoded.startswith("/") or decoded.startswith("//"):
         return ""
@@ -756,7 +754,8 @@ async def auth_logout(request: Request):
             except Exception as e:  # noqa: BLE001 — best-effort
                 _log.warning(
                     "dashboard-auth: revoke on %r failed: %s",
-                    provider.name, e,
+                    provider.name,
+                    e,
                 )
 
     sess = getattr(request.state, "session", None)
@@ -769,11 +768,17 @@ async def auth_logout(request: Request):
 
     prefix = _prefix(request)
     resp = RedirectResponse(url=f"{prefix}/login", status_code=302)
-    # A resume-scoped session was derived from a verified device credential.
-    # Revoke only that verified record, never an arbitrary stale cookie.
-    if getattr(sess, "device_id", ""):
-        from hermes_cli.dashboard_auth.linked_devices import revoke
-        revoke(sess.device_id)
+    # Revoke only a verified device. A full OAuth session can coexist with a
+    # linked-device cookie because full authority takes precedence.
+    from hermes_cli.dashboard_auth.linked_devices import authenticate, revoke
+
+    device_id = getattr(sess, "device_id", "")
+    if not device_id:
+        linked_secret = read_linked_device_cookie(request) or ""
+        linked_record = authenticate(linked_secret) if linked_secret else None
+        device_id = linked_record["id"] if linked_record else ""
+    if device_id:
+        revoke(device_id)
     clear_session_cookies(resp, prefix=prefix)
     clear_linked_device_cookie(resp, prefix=prefix)
     clear_pkce_cookie(resp, prefix=prefix)
@@ -997,7 +1002,7 @@ async def handoff_bootstrap(request: Request) -> HTMLResponse:
 
 @router.post("/api/auth/handoff-consume", name="auth_handoff_consume")
 async def api_auth_handoff_consume(request: Request):
-    """Exchange a same-origin fragment ticket for a resume-scoped cookie."""
+    """Exchange a same-origin fragment ticket for a linked-device cookie."""
     content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
     origin = _canonical_origin(
         request.headers.get("origin", ""),
@@ -1061,12 +1066,18 @@ def _full_dashboard_session_or_local_desk(request: Request):
     import time as _time
     from hermes_cli.dashboard_auth.base import Session as _Session
     from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
+
     sess = getattr(request.state, "session", None)
     if sess is None and not getattr(request.app.state, "auth_required", False):
         return _Session(
-            user_id="local-desk", email="", display_name="Local desk", org_id="",
-            provider="loopback", expires_at=int(_time.time()) + 3600,
-            access_token="", refresh_token="",
+            user_id="local-desk",
+            email="",
+            display_name="Local desk",
+            org_id="",
+            provider="loopback",
+            expires_at=int(_time.time()) + 3600,
+            access_token="",
+            refresh_token="",
         )
     require_full_dashboard_session(sess)
     return sess
@@ -1081,12 +1092,13 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
     session token and has no OAuth cookie — mint as a synthetic local-desk
     identity so Continue-on-phone can issue QR handoff tickets. The ticket
     binds ``session_id`` + optional ``profile`` and, on fragment-bootstrap
-    consume, mints a resume-scoped browser session cookie — never
+    consume, links that browser to the selected chat — never
     ``API_SERVER_KEY`` / superuser / ``*`` scope.
     """
     from hermes_cli.dashboard_auth.scopes import (
         validate_handoff_target,
     )
+
     sess = _full_dashboard_session_or_local_desk(request)
 
     session_id = (body.session_id or "").strip()
@@ -1100,7 +1112,11 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
         )
     except ValueError as exc:
         msg = str(exc)
-        code = 404 if "not found" in msg.lower() or "does not exist" in msg.lower() else 400
+        code = (
+            404
+            if "not found" in msg.lower() or "does not exist" in msg.lower()
+            else 400
+        )
         raise HTTPException(status_code=code, detail=msg) from exc
 
     from hermes_cli.dashboard_auth.ws_tickets import (
@@ -1113,9 +1129,6 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
             session_id=canon_sid,
             profile=canon_profile,
             user_id=sess.user_id,
-            email=getattr(sess, "email", "") or "",
-            display_name=getattr(sess, "display_name", "") or "",
-            org_id=getattr(sess, "org_id", "") or "",
             provider=sess.provider,
         )
     except ValueError as exc:
@@ -1141,17 +1154,24 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
 async def api_linked_devices(request: Request):
     """List local linked browsers. Only a full dashboard session may manage them."""
     from hermes_cli.dashboard_auth.linked_devices import list_devices
+
     _full_dashboard_session_or_local_desk(request)
-    return {"devices": list_devices()}
+    return JSONResponse(
+        {"devices": list_devices()},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-@router.delete("/api/auth/linked-devices/{device_id}", name="auth_linked_devices_revoke")
+@router.delete(
+    "/api/auth/linked-devices/{device_id}", name="auth_linked_devices_revoke"
+)
 async def api_revoke_linked_device(request: Request, device_id: str):
     from hermes_cli.dashboard_auth.linked_devices import revoke
+
     _full_dashboard_session_or_local_desk(request)
     if not revoke(device_id):
         raise HTTPException(status_code=404, detail="Linked device not found")
-    return {"ok": True}
+    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +1273,8 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
                 unreachable = provider.name
             _log.warning(
                 "dashboard-auth: provider %r unreachable during native refresh: %s",
-                provider.name, e,
+                provider.name,
+                e,
             )
             continue
         audit_log(

@@ -1137,7 +1137,9 @@ export interface LinkedDevice {
   last_seen_at: number
 }
 
-export interface LinkedDevicesResponse { devices: LinkedDevice[] }
+export interface LinkedDevicesResponse {
+  devices: LinkedDevice[]
+}
 
 export interface ActionResponse {
   name: string
