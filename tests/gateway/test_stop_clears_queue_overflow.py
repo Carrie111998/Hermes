@@ -8,8 +8,9 @@ only the adapter slot — so ``/stop`` dropped the queue head and let the tail
 (``B``, ``C``, …) promote and run on its own, one turn after another, while the
 user had been told ``⚡ Stopped.`` (#73060).
 
-The fix clears ``_queued_events`` alongside the slot, so a ``/stop`` leaves the
-session with an empty queue and nothing left to drain.
+The fix clears the session's ``conversation.queued_events`` alongside the slot
+(surfaced here through the ``_queued_events`` compat view), so a ``/stop`` leaves
+the session with an empty queue and nothing left to drain.
 """
 from __future__ import annotations
 
