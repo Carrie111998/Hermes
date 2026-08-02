@@ -637,23 +637,151 @@ def test_rollback_restores_predecessor_before_sudo_admission(
     assert observed_at_admission == [(b"old helper", b"old receipt\n")]
 
 
-@pytest.mark.parametrize(
-    ("reader_start_times", "expected_signals"),
-    (
-        ((101,), ()),
-        ((100, 101), ((4242, installer.signal.SIGTERM),)),
-    ),
-)
-def test_predecessor_pid_reuse_fails_closed_before_every_signal(
-    reader_start_times: tuple[int, ...],
-    expected_signals: tuple[tuple[int, int], ...],
+def test_failure_after_sudoers_replace_revokes_and_quiesces_before_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    discovered = _predecessor_identity(4242, start_time_ticks=100)
-    identities = iter(
-        _predecessor_identity(4242, start_time_ticks=value)
-        for value in reader_start_times
+    helper_path = tmp_path / "helper"
+    sudoers_path = tmp_path / "sudoers"
+    receipt_path = tmp_path / "receipt"
+    public_path = tmp_path / "public"
+    survived_path = tmp_path / "successor-survived"
+    old = {
+        helper_path: (0o555, b"old helper"),
+        sudoers_path: (0o440, b"old sudoers\n"),
+        receipt_path: (0o600, b"old receipt\n"),
+        public_path: (0o444, b"old public\n"),
+    }
+    for path, (mode, payload) in old.items():
+        path.write_bytes(payload)
+        path.chmod(mode)
+
+    original_write = installer._write_atomic
+    successor: list[subprocess.Popen[bytes]] = []
+    successor_identity: list[installer._ProcessIdentity] = []
+    admission_absent_during_quiesce: list[bool] = []
+
+    successor_source = r"""
+import fcntl
+import os
+import sys
+
+helper_path, receipt_path, lock_path, survived_path = sys.argv[1:]
+if open(helper_path, "rb").read() != b"new helper":
+    raise SystemExit(3)
+if open(receipt_path, "rb").read() != b"new receipt\n":
+    raise SystemExit(4)
+sys.stdout.write("successor-validated\n")
+sys.stdout.flush()
+lock = os.open(lock_path, os.O_RDWR)
+fcntl.flock(lock, fcntl.LOCK_EX)
+open(survived_path, "w").write("survived")
+"""
+
+    def fail_after_sudoers_replace(
+        path: Path, payload: bytes, **kwargs
+    ) -> None:
+        if path != sudoers_path or payload != b"new sudoers\n":
+            original_write(path, payload, **kwargs)
+            return
+        staged = tmp_path / ".sudoers-after-replace"
+        staged.write_bytes(payload)
+        staged.chmod(0o440)
+        os.replace(staged, path)
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                successor_source,
+                str(helper_path),
+                str(receipt_path),
+                str(tmp_path / ".execution.lock"),
+                str(survived_path),
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        successor.append(process)
+        successor_identity.append(
+            _predecessor_identity(process.pid, start_time_ticks=200)
+        )
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], 2)
+        assert readable
+        assert process.stdout.readline() == b"successor-validated\n"
+        raise installer.ProductionStorageInstallerError(
+            "simulated_after_sudoers_replace"
+        )
+
+    def quiesce() -> None:
+        if not successor or successor[0].poll() is not None:
+            return
+        process = successor[0]
+        identity = successor_identity[0]
+        admission_absent_during_quiesce.append(
+            not sudoers_path.exists()
+        )
+        installer._quiesce_predecessor_helpers(
+            authorized_client_uid=os.getuid(),
+            process_lister=lambda: (
+                (identity,) if process.poll() is None else ()
+            ),
+            identity_reader=lambda pid: (
+                identity
+                if pid == process.pid and process.poll() is None else None
+            ),
+            pidfd_opener=lambda pid, _flags: 99 if pid == process.pid else -1,
+            pidfd_signaler=lambda _descriptor, signum, _info, _flags: (
+                process.send_signal(signum)
+            ),
+            fd_closer=lambda _descriptor: None,
+        )
+
+    monkeypatch.setattr(installer, "_write_atomic", fail_after_sudoers_replace)
+    lock = installer._acquire_owner_execution_lock(
+        tmp_path, uid=os.getuid(), gid=os.getgid()
     )
-    signals: list[tuple[int, int]] = []
+    try:
+        with pytest.raises(
+            installer.ProductionStorageInstallerError,
+            match="simulated_after_sudoers_replace",
+        ):
+            installer._publish_owner_installation_transaction(
+                state_helper_path=helper_path,
+                state_helper_payload=b"new helper",
+                sudoers_path=sudoers_path,
+                sudoers_payload=b"new sudoers\n",
+                receipt_path=receipt_path,
+                receipt_payload=b"new receipt\n",
+                public_readiness_path=public_path,
+                build_public_readiness=lambda: {"schema": "new"},
+                attest_public_readiness=lambda: {"schema": "new"},
+                quiesce_predecessors=quiesce,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                sudoers_validator=lambda command, **_kwargs: (
+                    subprocess.CompletedProcess(command, 0, b"", b"")
+                ),
+            )
+    finally:
+        if successor and successor[0].poll() is None:
+            successor[0].kill()
+            successor[0].wait(timeout=2)
+        installer._release_owner_execution_lock(lock)
+    assert admission_absent_during_quiesce == [True]
+    assert successor and successor[0].returncode != 0
+    assert not survived_path.exists()
+    for path, (mode, payload) in old.items():
+        assert path.read_bytes() == payload
+        assert path.stat().st_mode & 0o777 == mode
+
+
+def test_predecessor_pid_reuse_before_pidfd_revalidation_fails_closed() -> None:
+    discovered = _predecessor_identity(4242, start_time_ticks=100)
+    reused = _predecessor_identity(4242, start_time_ticks=101)
+    signals: list[tuple[int, int, object, int]] = []
+    closed: list[int] = []
 
     with pytest.raises(
         installer.ProductionStorageInstallerError,
@@ -662,11 +790,70 @@ def test_predecessor_pid_reuse_fails_closed_before_every_signal(
         installer._quiesce_predecessor_helpers(
             authorized_client_uid=os.getuid(),
             process_lister=lambda: (discovered,),
-            identity_reader=lambda _pid: next(identities),
-            terminator=lambda pid, signum: signals.append((pid, signum)),
+            identity_reader=lambda _pid: reused,
+            pidfd_opener=lambda _pid, _flags: 99,
+            pidfd_signaler=lambda *args: signals.append(args),
+            fd_closer=closed.append,
             sleeper=lambda _seconds: None,
         )
-    assert tuple(signals) == expected_signals
+    assert signals == []
+    assert closed == [99]
+
+
+def test_predecessor_quiescence_fails_closed_without_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(installer.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(
+        installer.signal, "pidfd_send_signal", raising=False
+    )
+    with pytest.raises(
+        installer.ProductionStorageInstallerError,
+        match="production_storage_predecessor_pidfd_unavailable",
+    ):
+        installer._quiesce_predecessor_helpers(
+            authorized_client_uid=os.getuid(),
+            process_lister=lambda: (),
+        )
+
+
+def test_pid_reuse_after_final_check_signals_original_pidfd() -> None:
+    discovered = _predecessor_identity(4242, start_time_ticks=100)
+    reused = _predecessor_identity(4242, start_time_ticks=101)
+    numeric_identity = [discovered]
+    listing_calls = 0
+    pidfd_targets = {99: discovered}
+    signals: list[tuple[int, int, installer._ProcessIdentity]] = []
+
+    def list_processes() -> tuple[installer._ProcessIdentity, ...]:
+        nonlocal listing_calls
+        listing_calls += 1
+        return (discovered,) if listing_calls == 1 else ()
+
+    def final_revalidation(_pid: int) -> installer._ProcessIdentity:
+        current = numeric_identity[0]
+        numeric_identity[0] = reused
+        return current
+
+    def signal_pidfd(
+        descriptor: int, signum: int, _info: object, _flags: int
+    ) -> None:
+        signals.append((descriptor, signum, pidfd_targets[descriptor]))
+
+    installer._quiesce_predecessor_helpers(
+        authorized_client_uid=os.getuid(),
+        process_lister=list_processes,
+        identity_reader=final_revalidation,
+        pidfd_opener=lambda _pid, _flags: 99,
+        pidfd_signaler=signal_pidfd,
+        fd_closer=lambda _descriptor: None,
+        sleeper=lambda _seconds: None,
+    )
+    assert numeric_identity == [reused]
+    assert signals == [
+        (99, installer.signal.SIGTERM, discovered),
+        (99, installer.signal.SIGKILL, discovered),
+    ]
 
 
 def test_execution_lock_release_closes_fd_without_leak(tmp_path: Path) -> None:
@@ -789,6 +976,13 @@ open(continued_path, "w").write(cached_authority)
                         if pid == predecessor.pid
                         and predecessor.poll() is None else None
                     ),
+                    pidfd_opener=lambda pid, _flags: (
+                        99 if pid == predecessor.pid else -1
+                    ),
+                    pidfd_signaler=lambda _descriptor, signum, _info, _flags: (
+                        predecessor.send_signal(signum)
+                    ),
+                    fd_closer=lambda _descriptor: None,
                 )
             ),
             uid=os.getuid(),

@@ -782,7 +782,9 @@ def _quiesce_predecessor_helpers(
     identity_reader: Callable[[int], _ProcessIdentity | None] = (
         _read_process_identity
     ),
-    terminator: Callable[[int, int], None] = os.kill,
+    pidfd_opener: Callable[[int, int], int] | None = None,
+    pidfd_signaler: Callable[[int, int, Any, int], None] | None = None,
+    fd_closer: Callable[[int], None] = os.close,
     monotonic: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -793,6 +795,12 @@ def _quiesce_predecessor_helpers(
             authorized_client_uid=authorized_client_uid
         )
     )
+    opener = pidfd_opener or getattr(os, "pidfd_open", None)
+    signaler = pidfd_signaler or getattr(signal, "pidfd_send_signal", None)
+    if not callable(opener) or not callable(signaler):
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_pidfd_unavailable"
+        )
     deadline = monotonic() + 10.0
     empty_observations = 0
     while monotonic() < deadline:
@@ -824,51 +832,59 @@ def _quiesce_predecessor_helpers(
             sleeper(0.05)
             continue
         empty_observations = 0
-        for identity in identities:
-            try:
-                current = identity_reader(identity.pid)
-                if current is None:
+        handles: list[tuple[_ProcessIdentity, int]] = []
+        try:
+            for identity in identities:
+                try:
+                    descriptor = opener(identity.pid, 0)
+                except ProcessLookupError:
                     continue
-                if current != identity:
+                except OSError:
                     raise ProductionStorageInstallerError(
-                        "production_storage_predecessor_identity_changed"
+                        "production_storage_predecessor_pidfd_invalid"
+                    ) from None
+                try:
+                    current = identity_reader(identity.pid)
+                    if current != identity:
+                        raise ProductionStorageInstallerError(
+                            "production_storage_predecessor_identity_changed"
+                        )
+                    _validate_predecessor_identity(
+                        current,
+                        authorized_client_uid=authorized_client_uid,
                     )
-                _validate_predecessor_identity(
-                    current,
-                    authorized_client_uid=authorized_client_uid,
-                )
-                terminator(identity.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except ProductionStorageInstallerError:
-                raise
-            except OSError:
-                raise ProductionStorageInstallerError(
-                    "production_storage_predecessor_quiescence_invalid"
-                ) from None
-        sleeper(0.05)
-        for identity in identities:
-            current = identity_reader(identity.pid)
-            if current is None:
-                continue
-            if current != identity:
-                raise ProductionStorageInstallerError(
-                    "production_storage_predecessor_identity_changed"
-                )
-            try:
-                _validate_predecessor_identity(
-                    current,
-                    authorized_client_uid=authorized_client_uid,
-                )
-                terminator(identity.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except ProductionStorageInstallerError:
-                raise
-            except OSError:
-                raise ProductionStorageInstallerError(
-                    "production_storage_predecessor_quiescence_invalid"
-                ) from None
+                except Exception:
+                    try:
+                        fd_closer(descriptor)
+                    except OSError:
+                        pass
+                    raise
+                handles.append((identity, descriptor))
+            for _identity, descriptor in handles:
+                try:
+                    signaler(descriptor, signal.SIGTERM, None, 0)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    raise ProductionStorageInstallerError(
+                        "production_storage_predecessor_pidfd_invalid"
+                    ) from None
+            sleeper(0.05)
+            for _identity, descriptor in handles:
+                try:
+                    signaler(descriptor, signal.SIGKILL, None, 0)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    raise ProductionStorageInstallerError(
+                        "production_storage_predecessor_pidfd_invalid"
+                    ) from None
+        finally:
+            for _identity, descriptor in handles:
+                try:
+                    fd_closer(descriptor)
+                except OSError:
+                    pass
         sleeper(0.05)
     raise ProductionStorageInstallerError(
         "production_storage_predecessor_quiescence_timeout"
@@ -902,6 +918,7 @@ def _rollback_owner_installation(
     snapshots: Sequence[tuple[Path, int, bytes | None]],
     *,
     sudoers_path: Path,
+    quiesce_predecessors: Callable[[], None],
     uid: int,
     gid: int,
 ) -> None:
@@ -916,6 +933,11 @@ def _rollback_owner_installation(
             "production_storage_owner_install_rollback_failed"
         )
     try:
+        if sudoers_path.exists():
+            _remove_new_fixed_file(
+                sudoers_path, mode=0o440, uid=uid, gid=gid
+            )
+        quiesce_predecessors()
         for path, mode, payload in (
             *reversed(non_sudoers),
             sudoers_snapshot[0],
@@ -1014,6 +1036,7 @@ def _publish_owner_installation_transaction(
         _rollback_owner_installation(
             snapshots,
             sudoers_path=sudoers_path,
+            quiesce_predecessors=quiesce_predecessors,
             uid=uid,
             gid=gid,
         )
