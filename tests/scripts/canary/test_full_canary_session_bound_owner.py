@@ -10,6 +10,7 @@ import subprocess
 import sys
 import urllib.parse
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
 from gateway import canonical_writer_foundation_phase_b as foundation_phase_b
@@ -1359,6 +1360,118 @@ def test_schema_reconciliation_control_cli_dispatches_separate_bootstrap(
     assert call[1]["owner_identity"] is owner_identity
     assert ("support_activate", executable, RELEASE_SHA) in calls
     assert ("support_revalidate", executable, RELEASE_SHA) in calls
+
+
+def test_schema_reconciliation_control_validates_gate_with_post_read_time(
+    monkeypatch,
+):
+    plan_sha256 = "1" * 64
+    expected_username = (
+        launcher.SCHEMA_RECONCILIATION_CONTROL_ADMIN_USERNAME_PREFIX
+        + plan_sha256[:16]
+    )
+    authority = SimpleNamespace(
+        public_fingerprint=launcher.PHASE_B_OWNER_PUBLIC_KEY_FINGERPRINT,
+        public_key_ed25519_hex="2" * 64,
+        key_id="3" * 64,
+    )
+    owner_subject_sha256 = OWNER_SHA
+    gate = {
+        "release_revision": RELEASE_SHA,
+        "owner_subject_sha256": owner_subject_sha256,
+        "owner_public_key_ed25519_hex": authority.public_key_ed25519_hex,
+        "owner_key_id": authority.key_id,
+        "owner_public_fingerprint": authority.public_fingerprint,
+        "temporary_control_admin_username": expected_username,
+        "temporary_control_admin_username_sha256": hashlib.sha256(
+            expected_username.encode("ascii")
+        ).hexdigest(),
+        "plan_sha256": plan_sha256,
+        "expires_at_unix": 4_000,
+    }
+
+    class _Session:
+        gate_read = False
+
+        def read_gate(self):
+            self.gate_read = True
+            return gate
+
+        def close(self):
+            return None
+
+    session = _Session()
+
+    class _Identity:
+        def account_for_read_only_preflight(self):
+            return "owner@example.com"
+
+        def bind_approved_subject(self, expected):
+            assert expected == owner_subject_sha256
+            raise launcher.OwnerLauncherError("stop_after_gate_validation")
+
+    class _Signer:
+        def inspect(self):
+            return authority
+
+    observed = []
+
+    def validate_gate_for_owner(value, **kwargs):
+        assert session.gate_read is True
+        assert value is gate
+        observed.append(kwargs["now_unix"])
+        if kwargs["now_unix"] < 2_000:
+            raise ValueError("gate appears to be from the future")
+        return gate
+
+    monkeypatch.setattr(
+        launcher,
+        "_PhaseBOwnerExternalSigner",
+        _Signer,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "PHASE_B_PINNED_APPROVAL_SOURCE_SHA256",
+        hashlib.sha256(
+            authority.public_fingerprint.encode("ascii")
+        ).hexdigest(),
+    )
+    from gateway import (
+        canonical_writer_schema_reconciliation_control_bootstrap as control_bootstrap,
+    )
+
+    monkeypatch.setattr(
+        control_bootstrap,
+        "validate_gate_for_owner",
+        validate_gate_for_owner,
+    )
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="stop_after_gate_validation",
+    ):
+        launcher.bootstrap_schema_reconciliation_control(
+            release_sha=RELEASE_SHA,
+            transport=SimpleNamespace(
+                open_bootstrap=lambda release: (
+                    session
+                    if release == RELEASE_SHA
+                    else pytest.fail("wrong release")
+                )
+            ),
+            cloud_sql_client=object(),
+            owner_identity=_Identity(),
+            now=lambda: 2_000 if session.gate_read else 1_000,
+            signer=_Signer(),
+            secret_hardener=lambda: None,
+            provenance_guard=lambda release: (
+                None
+                if release == RELEASE_SHA
+                else pytest.fail("wrong release")
+            ),
+        )
+
+    assert observed == [2_000]
 
 
 @pytest.mark.parametrize(
