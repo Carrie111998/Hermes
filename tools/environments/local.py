@@ -337,6 +337,10 @@ def _build_provider_env_blocklist() -> frozenset:
         "TERMINAL_SSH_KEY",
         "LANGFUSE_SECRET_KEY",
         "HERMES_DASHBOARD_SESSION_TOKEN",
+        # Profile-scoped ACP selector. Child Hermes commands reload it from
+        # the active profile's .env; unrelated model-authored subprocesses
+        # must not inherit another profile's authentication mode.
+        "HERMES_ACP_AUTH_METHOD",
         "GATEWAY_ALLOWED_USERS",
         "GH_TOKEN",
         "GITHUB_APP_ID",
