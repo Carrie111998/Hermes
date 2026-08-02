@@ -924,13 +924,19 @@ def _resolve_named_custom_runtime(
     # fall through to OpenRouter.
     requested_norm = (requested_provider or "").strip().lower()
     if requested_norm and requested_norm != "custom":
-        try:
-            from hermes_cli.auth import resolve_provider as _resolve_provider
-
-            if _resolve_provider(requested_norm) == "custom":
-                requested_norm = "custom"
-        except Exception:
+        # If the requested name begins with the explicit custom: prefix, keep it as a
+        # named custom provider and skip the alias→custom rewrite. The rewrite
+        # would otherwise erase the user's chosen label from telemetry.
+        if requested_norm.startswith("custom:"):
             pass
+        else:
+            try:
+                from hermes_cli.auth import resolve_provider as _resolve_provider
+
+                if _resolve_provider(requested_norm) == "custom":
+                    requested_norm = "custom"
+            except Exception:
+                pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
         # Check credential pool first — mirrors the named-custom-provider path
@@ -939,6 +945,8 @@ def _resolve_named_custom_runtime(
         pool_result = _try_resolve_from_custom_pool(base_url, "custom", None)
         if pool_result:
             pool_result["source"] = "direct-alias"
+            # Bare custom direct alias: keep the canonical provider label.
+            pool_result["provider"] = "custom"
             return pool_result
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
@@ -979,6 +987,11 @@ def _resolve_named_custom_runtime(
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
+        # Preserve the original named provider label so telemetry and
+        # downstream agent metadata reflect the requested name, not the
+        # generic "custom" bucket. The pool_result is produced for this
+        # specific custom_provider entry, so the override is safe.
+        pool_result["provider"] = requested_provider
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
         model_name = custom_provider.get("model")
@@ -1016,7 +1029,7 @@ def _resolve_named_custom_runtime(
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
     result = {
-        "provider": "custom",
+        "provider": requested_provider,
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",

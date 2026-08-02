@@ -840,12 +840,47 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="local")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "local", (
+        f"Expected provider='local', got provider='{resolved['provider']}'"
+    )
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "http://1.2.3.4:1234/v1"
     assert resolved["api_key"] == "local-provider-key"
     assert resolved["requested_provider"] == "local"
     assert resolved["source"] == "custom_provider:Local"
+
+
+def test_named_custom_provider_preserves_provider_name_in_pool_result(monkeypatch):
+    """Pooled credentials for a named custom provider must keep the requested name."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    pool_return_value = {
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "base_url": "https://claude-cli.example.com/v1",
+        "api_key": "pooled-claude-key",
+        "source": "pool:claude-cli-pool",
+        "credential_pool": "fake-pool",
+    }
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: pool_return_value)
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "claude-cli",
+            "base_url": "https://claude-cli.example.com/v1",
+            "api_key": "not-used-when-pooled",
+        },
+    )
+
+    resolved = rp._resolve_named_custom_runtime(requested_provider="claude-cli")
+
+    assert resolved is not None
+    assert resolved["provider"] == "claude-cli", (
+        f"Expected provider='claude-cli', got provider='{resolved['provider']}'"
+    )
+    assert resolved["api_key"] == "pooled-claude-key"
+    assert resolved["source"] == "pool:claude-cli-pool"
 
 
 def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
@@ -950,7 +985,9 @@ def test_named_custom_provider_uses_providers_dict_when_list_missing(monkeypatch
 
     resolved = rp.resolve_runtime_provider(requested="openai-direct-primary")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "openai-direct-primary", (
+        f"Expected provider='openai-direct-primary', got provider='{resolved['provider']}'"
+    )
     assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "https://api.openai.com/v1"
     assert resolved["api_key"] == "dir-key"
@@ -990,7 +1027,9 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="mycorp-proxy")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "mycorp-proxy", (
+        f"Expected provider='mycorp-proxy', got provider='{resolved['provider']}'"
+    )
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "https://proxy.example.com/v1"
     assert resolved["api_key"] == "env-secret"
@@ -1039,7 +1078,9 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
 
     resolved = rp.resolve_runtime_provider(requested="custom:claude")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "custom:claude", (
+        f"Expected provider='custom:claude', got provider='{resolved['provider']}'"
+    )
     assert resolved["base_url"] == "https://gateway.example.com"
     assert resolved["api_key"] == "claude-secret"
     assert resolved["api_mode"] == "anthropic_messages"
@@ -1074,6 +1115,9 @@ def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="custom:local-llm")
 
+    assert resolved["provider"] == "custom:local-llm", (
+        f"Expected provider='custom:local-llm', got provider='{resolved['provider']}'"
+    )
     assert resolved["base_url"] == "http://localhost:1234/v1"
     # localhost is not openai.com — OPENAI_API_KEY must not leak to local endpoints (#28660)
     assert resolved["api_key"] == "no-key-required"
@@ -1272,6 +1316,37 @@ def test_resolve_requested_provider_precedence(monkeypatch):
     assert rp.resolve_requested_provider() == "auto"
 
 
+def test_resolve_runtime_provider_named_custom_from_model_config(monkeypatch):
+    """A model config with provider 'custom:minimax-cn' must resolve the named
+    providers entry and keep the requested name in the runtime provider label."""
+    monkeypatch.setenv("MINIMAX_CN_PROXY_KEY", "proxy-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {"provider": "custom:minimax-cn"},
+            "providers": {
+                "minimax-cn": {
+                    "name": "MiniMax CN Proxy",
+                    "api": "https://mimimax.cn/v1",
+                    "key_env": "MINIMAX_CN_PROXY_KEY",
+                    "transport": "chat_completions",
+                    "default_model": "MiniMax-M3",
+                }
+            },
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "custom:minimax-cn", (
+        f"Expected provider='custom:minimax-cn', got provider='{resolved['provider']}'"
+    )
+    assert resolved["base_url"] == "https://mimimax.cn/v1"
+    assert resolved["api_key"] == "proxy-secret"
+    assert resolved["api_mode"] == "chat_completions"
+
+
 def test_resolve_runtime_provider_named_custom_with_builtin_slug(monkeypatch):
     monkeypatch.setenv("MINIMAX_CN_PROXY_KEY", "proxy-secret")
     monkeypatch.setattr(
@@ -1293,7 +1368,9 @@ def test_resolve_runtime_provider_named_custom_with_builtin_slug(monkeypatch):
 
     resolved = rp.resolve_runtime_provider()
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "custom:minimax-cn", (
+        f"Expected provider='custom:minimax-cn', got provider='{resolved['provider']}'"
+    )
     assert resolved["base_url"] == "https://mimimax.cn/v1"
     assert resolved["api_key"] == "proxy-secret"
     assert resolved["api_mode"] == "chat_completions"
@@ -1439,6 +1516,9 @@ def test_named_custom_provider_api_mode(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="my-server")
 
+    assert resolved["provider"] == "my-server", (
+        f"Expected provider='my-server', got provider='{resolved['provider']}'"
+    )
     assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "http://localhost:8000/v1"
 
@@ -1457,6 +1537,9 @@ def test_named_custom_provider_without_api_mode_defaults(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="my-server")
 
+    assert resolved["provider"] == "my-server", (
+        f"Expected provider='my-server', got provider='{resolved['provider']}'"
+    )
     assert resolved["api_mode"] == "chat_completions"
 
 
@@ -1993,8 +2076,11 @@ def test_named_custom_runtime_propagates_model_direct_path(monkeypatch):
     monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
 
     resolved = rp.resolve_runtime_provider(requested="my-server")
+    assert resolved["provider"] == "my-server", (
+        f"Expected provider='my-server', got provider='{resolved['provider']}'"
+    )
     assert resolved["model"] == "qwen3.6-plus"
-    assert resolved["provider"] == "custom"
+    assert resolved["api_key"] == "test-key"
 
 
 def test_named_custom_runtime_propagates_extra_body_direct_path(monkeypatch):
@@ -2016,6 +2102,9 @@ def test_named_custom_runtime_propagates_extra_body_direct_path(monkeypatch):
     monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
 
     resolved = rp.resolve_runtime_provider(requested="my-gemma")
+    assert resolved["provider"] == "my-gemma", (
+        f"Expected provider='my-gemma', got provider='{resolved['provider']}'"
+    )
     assert resolved["request_overrides"] == {
         "extra_body": {
             "enable_thinking": True,
@@ -2049,6 +2138,9 @@ def test_named_custom_runtime_propagates_model_pool_path(monkeypatch):
     )
 
     resolved = rp.resolve_runtime_provider(requested="my-server")
+    assert resolved["provider"] == "my-server", (
+        f"Expected provider='my-server', got provider='{resolved['provider']}'"
+    )
     assert resolved["model"] == "qwen3.6-plus", (
         "model must be injected into pool result"
     )
@@ -2080,6 +2172,9 @@ def test_named_custom_runtime_propagates_extra_body_pool_path(monkeypatch):
     )
 
     resolved = rp.resolve_runtime_provider(requested="my-gemma")
+    assert resolved["provider"] == "my-gemma", (
+        f"Expected provider='my-gemma', got provider='{resolved['provider']}'"
+    )
     assert resolved["request_overrides"] == {
         "extra_body": {"enable_thinking": True}
     }
@@ -2099,6 +2194,9 @@ def test_named_custom_runtime_no_model_when_absent(monkeypatch):
     monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
 
     resolved = rp.resolve_runtime_provider(requested="my-server")
+    assert resolved["provider"] == "my-server", (
+        f"Expected provider='my-server', got provider='{resolved['provider']}'"
+    )
     assert "model" not in resolved
 
 
@@ -3255,7 +3353,9 @@ def test_named_custom_provider_with_extra_headers(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="customhost")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "customhost", (
+        f"Expected provider='customhost', got provider='{resolved['provider']}'"
+    )
     assert resolved["base_url"] == "https://custom.host.ai/v1"
     assert resolved["api_key"] == "custom-host-key"
     assert resolved["extra_headers"] == {
@@ -3284,7 +3384,9 @@ def test_named_custom_provider_without_extra_headers_omits_key(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="plainhost")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "plainhost", (
+        f"Expected provider='plainhost', got provider='{resolved['provider']}'"
+    )
     assert "extra_headers" not in resolved
 
 
@@ -3337,7 +3439,9 @@ def test_providers_dict_entry_surfaces_extra_headers(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="my-proxy")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "my-proxy", (
+        f"Expected provider='my-proxy', got provider='{resolved['provider']}'"
+    )
     assert resolved["extra_headers"] == {"CF-Access-Client-Id": "xxxx.access"}
 
 
@@ -3369,6 +3473,9 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     resolved = rp._resolve_named_custom_runtime(requested_provider="custom:lmstudio")
 
     assert resolved is not None
+    assert resolved["provider"] == "custom:lmstudio", (
+        f"Expected provider='custom:lmstudio', got provider='{resolved['provider']}'"
+    )
     assert resolved["extra_headers"] == {
         "CF-Access-Client-Id": "xxx.access",
         "CF-Access-Client-Secret": "yyy",
