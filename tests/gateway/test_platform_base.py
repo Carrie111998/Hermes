@@ -827,6 +827,66 @@ class TestMediaDeliveryDefaultMode:
             linked_notes.resolve()
         )
 
+    def test_symlinked_sibling_credential_denied_when_enumeration_fails(
+        self, tmp_path, monkeypatch,
+    ):
+        """Symlink sibling + unreadable profiles/ must still deny credentials.
+
+        resolve() drops ``profiles/<name>/`` ancestry for directory-symlink
+        homes, and ``_iter_hermes_profile_dirs`` returns [] when listing fails.
+        Lexical ancestry on the submitted absolute path must close that
+        conjunction while non-credential sibling files remain deliverable.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        alice = profiles_dir / "alice"
+        bob_link = profiles_dir / "bob"
+        alice.mkdir(parents=True)
+        external_bob = tmp_path / "external_bob"
+        external_bob.mkdir()
+        secret = external_bob / ".env"
+        secret.write_text("SECRET=1")
+        token = external_bob / "mcp-tokens" / "t.json"
+        token.parent.mkdir()
+        token.write_text("{}")
+        notes = external_bob / "notes.md"
+        notes.write_text("# ok\n")
+        try:
+            bob_link.symlink_to(external_bob, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlink creation is unavailable")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        real_iterdir = type(profiles_dir).iterdir
+
+        def _iterdir_raises(self):
+            if self.resolve() == profiles_dir.resolve():
+                raise PermissionError("profiles dir not readable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(type(profiles_dir), "iterdir", _iterdir_raises)
+
+        import gateway.platforms.base as base
+
+        linked_secret = bob_link / ".env"
+        linked_token = bob_link / "mcp-tokens" / "t.json"
+        linked_notes = bob_link / "notes.md"
+
+        assert base._iter_hermes_profile_dirs() == []
+        assert base._path_is_profile_tree_credential(linked_secret.resolve()) is False
+        assert base._path_is_lexical_profile_tree_credential(linked_secret) is True
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_secret)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_token)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_notes)) == str(
+            linked_notes.resolve()
+        )
+
     def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):
         """Integration credentials at the HERMES_HOME root (google_token.json)
         must never be deliverable, even though they aren't the historically

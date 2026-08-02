@@ -1328,6 +1328,32 @@ def _path_is_profile_tree_credential(resolved: Path) -> bool:
     return _rel_matches_hermes_root_credential(Path(*parts[1:]))
 
 
+def _path_is_lexical_profile_tree_credential(absolute: Path) -> bool:
+    """Deny profile credentials using lexical ancestry (no symlink resolve).
+
+    ``validate_media_delivery_path`` canonicalizes candidates before the
+    denylist runs. A ``profiles/<name>`` directory symlink therefore loses
+    its profile-tree prefix on the resolved path, and when
+    ``_iter_hermes_profile_dirs`` also returns empty the discovered-home
+    denylist cannot recover the target. Matching the normalized absolute
+    input against ``<root>/profiles/<name>/<credential...>`` closes that
+    conjunction without depending on directory enumeration.
+    """
+    try:
+        profiles_root = Path(os.path.normpath(str(_HERMES_ROOT.expanduser() / "profiles")))
+        candidate = Path(os.path.normpath(str(absolute)))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        rel = candidate.relative_to(profiles_root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) < 2:
+        return False
+    return _rel_matches_hermes_root_credential(Path(*parts[1:]))
+
+
 def _profile_cache_roots() -> List[Path]:
     """Return per-profile canonical cache roots under the shared Hermes root.
 
@@ -1433,13 +1459,15 @@ def _media_delivery_denied_paths() -> List[Path]:
     #
     # Sibling/inactive profiles under <root>/profiles/<name>/ use the same
     # credential file/dir policy. Denial is layered:
-    #   1. Structural match in ``_path_is_profile_tree_credential`` — works
-    #      without listing ``profiles/`` (POSIX execute-only dirs).
-    #   2. Discovered profile homes below — covers directory-symlink siblings
+    #   1. Lexical match in ``_path_is_lexical_profile_tree_credential`` —
+    #      preserves ``profiles/<name>/`` ancestry from the submitted path
+    #      even when resolve() collapses a directory symlink and listing fails.
+    #   2. Structural match in ``_path_is_profile_tree_credential`` — works
+    #      without listing ``profiles/`` (POSIX execute-only dirs) for
+    #      ordinary (non-symlink) sibling paths after resolve.
+    #   3. Discovered profile homes below — covers directory-symlink siblings
     #      (``profiles/bob -> /elsewhere``) whose resolved targets sit outside
-    #      the structural profiles root after ``validate_media_delivery_path``
-    #      canonicalizes the candidate. Enumeration alone would fail open on
-    #      unreadable ``profiles/``; the structural check covers that case.
+    #      the structural profiles root when enumeration succeeds.
     hermes_dirs: List[Path] = []
     for base in (_HERMES_HOME, _HERMES_ROOT):
         try:
@@ -1465,7 +1493,7 @@ def _media_delivery_denied_paths() -> List[Path]:
     return denied
 
 
-def _path_under_denied_prefix(resolved: Path) -> bool:
+def _path_under_denied_prefix(resolved: Path, lexical: Optional[Path] = None) -> bool:
     """Return True if ``resolved`` lives under a deny-listed system path.
 
     One narrow exception: when a denied prefix IS the running user's own home,
@@ -1478,9 +1506,18 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     denied paths, so they stay blocked regardless of this exception — it can
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
+
+    ``lexical`` is the normalized absolute input before symlink resolution.
+    When present, sibling-profile credential policy is also applied to that
+    ancestry so a ``profiles/<name>`` directory symlink cannot drop the
+    profile-tree prefix before denial runs.
     """
-    # Structural sibling-profile credential check first — independent of
-    # whether ``profiles/`` can be listed.
+    # Lexical sibling-profile credential check — independent of resolve()
+    # and of whether ``profiles/`` can be listed.
+    if lexical is not None and _path_is_lexical_profile_tree_credential(lexical):
+        return True
+    # Structural sibling-profile credential check on the resolved path —
+    # independent of whether ``profiles/`` can be listed.
     if _path_is_profile_tree_credential(resolved):
         return True
     try:
@@ -1565,6 +1602,11 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not expanded.is_absolute():
         return None
 
+    # Keep a symlink-preserving lexical form for sibling-profile credential
+    # policy. resolve() below collapses directory-symlink profile homes and
+    # would otherwise erase ``profiles/<name>/`` ancestry before denial.
+    lexical = Path(os.path.normpath(str(expanded)))
+
     try:
         resolved = expanded.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
@@ -1591,7 +1633,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``,
     # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
     if not _media_delivery_strict_mode():
-        if _path_under_denied_prefix(resolved):
+        if _path_under_denied_prefix(resolved, lexical=lexical):
             return None
         return str(resolved)
 
@@ -1601,7 +1643,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # credential locations remain blocked even when "recent" — see
     # ``_MEDIA_DELIVERY_DENIED_PREFIXES`` for the denylist.
     window = _media_delivery_recency_seconds()
-    if window > 0 and not _path_under_denied_prefix(resolved):
+    if window > 0 and not _path_under_denied_prefix(resolved, lexical=lexical):
         if _file_is_recently_produced(resolved, window):
             return str(resolved)
 
