@@ -77,6 +77,7 @@ class TestClarifyPrimitive:
         """Session, generation, and responder identity are exact protocol fields."""
         from tools import clarify_gateway as cm
 
+        cm.update_session_generation("sk-identity", 17)
         cm.register(
             "identity",
             "sk-identity",
@@ -151,6 +152,15 @@ class TestClarifyPrimitive:
                 generation=1,
                 identity_v1=True,
             )
+        with pytest.raises(ValueError, match="stale clarify generation"):
+            cm.register(
+                "unpublished-generation",
+                "sk",
+                "Q?",
+                ["A"],
+                generation=1,
+                identity_v1=True,
+            )
         with pytest.raises(ValueError, match="requires session_key and generation"):
             cm.register(
                 "missing-generation",
@@ -210,6 +220,46 @@ class TestClarifyPrimitive:
             session_key="sk-generation",
             generation=8,
         ) == "B"
+
+    def test_claim_retire_is_bounded_and_never_reuses_stale_authority(self):
+        from tools import clarify_gateway as cm
+
+        first = cm.claim_session_generation("ephemeral")
+        assert cm.retire_session_generation("ephemeral", first) is True
+        assert "ephemeral" not in cm._current_generations
+
+        second = cm.claim_session_generation("ephemeral")
+        assert second > first
+        with pytest.raises(ValueError, match="stale clarify generation"):
+            cm.register(
+                "stale-after-retire",
+                "ephemeral",
+                "Old?",
+                ["A"],
+                generation=first,
+                identity_v1=True,
+            )
+
+        cm.register(
+            "fresh-after-retire",
+            "ephemeral",
+            "New?",
+            ["B"],
+            generation=second,
+            identity_v1=True,
+        )
+        assert cm.retire_session_generation("ephemeral", second) is False
+        third = cm.claim_session_generation("ephemeral")
+        assert third > second
+        assert cm.retire_session_generation("ephemeral", second) is False
+        assert cm._current_generations["ephemeral"] == third
+        assert cm.retire_session_generation("ephemeral", third) is True
+
+        for index in range(1_000):
+            scope = f"high-cardinality-{index}"
+            generation = cm.claim_session_generation(scope)
+            assert cm.retire_session_generation(scope, generation) is True
+        assert cm._current_generations == {}
 
     def test_failed_delivery_consumes_answered_winner_without_leak(self):
         from tools import clarify_gateway as cm

@@ -98,6 +98,11 @@ _session_index: Dict[str, List[str]] = {}
 # same lock as the entries so a session boundary and a late callback cannot
 # cross between two separately-protected states.
 _current_generations: Dict[str, int] = {}
+# Process-wide authority sequence.  One scalar keeps generation allocation
+# bounded even when an API listener sees an unbounded number of distinct
+# conversation scopes.  Session retirement removes the per-scope authority;
+# a later incarnation still receives a token that no stale closure can reuse.
+_generation_sequence = 0
 
 
 # =========================================================================
@@ -142,17 +147,50 @@ def register(
             raise ValueError(f"clarify_id is already registered: {clarify_id}")
         if entry.identity_v1:
             current = _current_generations.get(entry.session_key)
-            if current is None:
-                _current_generations[entry.session_key] = int(entry.generation)
-            elif current != entry.generation:
+            if current != entry.generation:
                 raise ValueError(
-                    "stale clarify generation: "
+                    "stale clarify generation (unpublished or superseded): "
                     f"session={entry.session_key!r} current={current} "
                     f"requested={entry.generation}"
                 )
         _entries[clarify_id] = entry
         _session_index.setdefault(entry.session_key, []).append(clarify_id)
     return entry
+
+
+def _update_session_generation_locked(
+    normalized_session: str,
+    normalized_generation: int,
+) -> int:
+    """Publish a generation while ``_lock`` is held."""
+
+    current = _current_generations.get(normalized_session)
+    live_identity_entries = [
+        entry
+        for clarify_id in list(_session_index.get(normalized_session, []))
+        if (entry := _entries.get(clarify_id)) is not None
+        and entry.identity_v1
+        and entry.state == _STATE_PENDING
+    ]
+    # Generations are monotonic authority.  Never roll back merely because
+    # the previous prompt has already completed: doing so would let an old
+    # publisher revive its stale buttons after the newer entry disappeared.
+    if current is not None and normalized_generation < current:
+        raise ValueError("clarify generation cannot move backwards")
+
+    _current_generations[normalized_session] = normalized_generation
+    cancelled = 0
+    for entry in live_identity_entries:
+        if entry.generation == normalized_generation:
+            continue
+        if _transition_locked(
+            entry,
+            _STATE_CANCELLED,
+            "",
+            remove=True,
+        ):
+            cancelled += 1
+    return cancelled
 
 
 def update_session_generation(session_key: str, generation: int) -> int:
@@ -170,36 +208,67 @@ def update_session_generation(session_key: str, generation: int) -> int:
         raise ValueError("session_key is required")
     normalized_generation = int(generation)
 
+    global _generation_sequence
     with _lock:
-        current = _current_generations.get(normalized_session)
-        live_identity_entries = [
-            entry
-            for clarify_id in list(_session_index.get(normalized_session, []))
-            if (entry := _entries.get(clarify_id)) is not None
-            and entry.identity_v1
-            and entry.state == _STATE_PENDING
-        ]
-        # Generations are monotonic authority.  Never roll back merely because
-        # the previous prompt has already completed: doing so would let an old
-        # publisher revive its stale buttons after the newer entry disappeared.
-        if current is not None and normalized_generation < current:
-            raise ValueError(
-                "clarify generation cannot move backwards"
-            )
+        _generation_sequence = max(
+            _generation_sequence,
+            normalized_generation,
+        )
+        return _update_session_generation_locked(
+            normalized_session,
+            normalized_generation,
+        )
 
-        _current_generations[normalized_session] = normalized_generation
-        cancelled = 0
-        for entry in live_identity_entries:
-            if entry.generation == normalized_generation:
-                continue
-            if _transition_locked(
-                entry,
-                _STATE_CANCELLED,
-                "",
-                remove=True,
+
+def claim_session_generation(session_key: str) -> int:
+    """Allocate and publish a globally unique generation for one session.
+
+    The allocator is a single scalar, so high-cardinality API session churn
+    does not create a second per-session retention map.  Publication and old
+    prompt cancellation share the clarify registry lock.
+    """
+
+    normalized_session = str(session_key or "")
+    if not normalized_session:
+        raise ValueError("session_key is required")
+
+    global _generation_sequence
+    with _lock:
+        _generation_sequence += 1
+        generation = _generation_sequence
+        _update_session_generation_locked(normalized_session, generation)
+        return generation
+
+
+def retire_session_generation(
+    session_key: str,
+    expected_generation: int,
+) -> bool:
+    """Retire one exact session authority after its worker is quiescent.
+
+    Retirement never cancels entries and never affects a newer authority.  A
+    caller must first end/cancel the exact generation's pending work, then call
+    this method at a structurally proven worker lifecycle boundary.
+    """
+
+    normalized_session = str(session_key or "")
+    if not normalized_session:
+        raise ValueError("session_key is required")
+    normalized_generation = int(expected_generation)
+
+    with _lock:
+        if _current_generations.get(normalized_session) != normalized_generation:
+            return False
+        for clarify_id in _session_index.get(normalized_session, []):
+            entry = _entries.get(clarify_id)
+            if (
+                entry is not None
+                and entry.identity_v1
+                and entry.generation == normalized_generation
             ):
-                cancelled += 1
-        return cancelled
+                return False
+        _current_generations.pop(normalized_session, None)
+        return True
 
 
 def _remove_from_indices_locked(entry: _ClarifyEntry) -> None:

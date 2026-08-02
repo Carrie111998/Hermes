@@ -66,6 +66,12 @@ def api_runtime(monkeypatch, tmp_path):
         )
     )
     adapter._session_db = session_db
+    from tools import clarify_gateway as clarify_module
+
+    with clarify_module._lock:
+        clarify_module._entries.clear()
+        clarify_module._session_index.clear()
+        clarify_module._current_generations.clear()
 
     runtime = {
         "provider": "openai-codex",
@@ -227,6 +233,10 @@ def api_runtime(monkeypatch, tmp_path):
         approval_module._gateway_queues.clear()
         approval_module._gateway_notify_cbs.clear()
         adapter._api_pending_approvals.clear()
+        with clarify_module._lock:
+            clarify_module._entries.clear()
+            clarify_module._session_index.clear()
+            clarify_module._current_generations.clear()
         adapter._response_store.close()
         close = getattr(session_db, "close", None)
         if callable(close):
@@ -512,6 +522,121 @@ async def test_chat_clarification_round_trip_uses_exact_structured_id(api_runtim
             headers=AUTH_HEADERS,
         )
         assert (await final_poll.json())["data"] == []
+
+
+def test_api_clarify_authority_retirement_is_bounded_and_aba_safe(
+    api_runtime,
+    monkeypatch,
+):
+    adapter = api_runtime.adapter
+    from tools import clarify_gateway
+
+    def _finish_immediately(
+        _clarify_id,
+        timeout,
+        *,
+        session_key=None,
+        generation=None,
+    ):
+        del timeout
+        clarify_gateway.clear_session(
+            session_key,
+            generation=generation,
+        )
+        return None
+
+    monkeypatch.setattr(
+        clarify_gateway,
+        "wait_for_response",
+        _finish_immediately,
+    )
+
+    first_callback = adapter._make_api_clarify_callback("retired-session")
+    first_callback("First?", ["A"])
+    first_authority = first_callback._api_clarify_authority
+    first_generation = first_authority.generation
+    assert first_generation is not None
+    assert adapter._retire_api_clarify_authority(first_authority) is True
+
+    # A stale closure is permanently fenced and cannot republish its retired
+    # token even after a new turn for the same public session starts.
+    second_callback = adapter._make_api_clarify_callback("retired-session")
+    second_callback("Second?", ["B"])
+    second_authority = second_callback._api_clarify_authority
+    assert second_authority.generation > first_generation
+    assert first_callback("Late stale?", ["C"]).startswith(
+        "[clarification unavailable"
+    )
+    assert adapter._retire_api_clarify_authority(second_authority) is True
+
+    # Distinct session churn retains no per-scope authority map in either the
+    # API adapter or clarify core.
+    for index in range(500):
+        callback = adapter._make_api_clarify_callback(f"scope-{index}")
+        callback("Q?", ["A"])
+        assert adapter._retire_api_clarify_authority(
+            callback._api_clarify_authority
+        ) is True
+    with clarify_gateway._lock:
+        assert clarify_gateway._current_generations == {}
+    assert not hasattr(adapter, "_api_clarify_generations")
+
+
+def test_api_active_release_fences_but_retires_only_at_worker_boundary(
+    api_runtime,
+    monkeypatch,
+):
+    adapter = api_runtime.adapter
+    from tools import clarify_gateway
+
+    def _finish_immediately(
+        _clarify_id,
+        timeout,
+        *,
+        session_key=None,
+        generation=None,
+    ):
+        del timeout
+        clarify_gateway.clear_session(
+            session_key,
+            generation=generation,
+        )
+        return None
+
+    monkeypatch.setattr(
+        clarify_gateway,
+        "wait_for_response",
+        _finish_immediately,
+    )
+    callback = adapter._make_api_clarify_callback("active-cleanup")
+    callback("Q?", ["A"])
+    authority = callback._api_clarify_authority
+
+    class Agent:
+        release_count = 0
+        _session_messages = ["large"]
+
+        def release_clients(self):
+            self.release_count += 1
+
+    agent = Agent()
+    agent._api_clarify_authority = authority
+    agent._api_clarify_scope = authority.scope
+
+    adapter._release_api_cached_agent(agent)
+    assert authority.active is True
+    assert authority.accepting is False
+    assert authority.scope in clarify_gateway._current_generations
+    assert agent.release_count == 0
+    assert callback("Late?", ["B"]).startswith("[clarification unavailable")
+
+    # Only the execution owner may cross this boundary.
+    assert adapter._retire_api_agent_clarifications(agent) is True
+    assert authority.scope not in clarify_gateway._current_generations
+    adapter._release_api_cached_agent(agent)
+    assert agent.release_count == 1
+    assert agent._session_messages == []
+    assert id(agent) not in adapter._api_deferred_agent_releases
 
 
 @pytest.mark.asyncio

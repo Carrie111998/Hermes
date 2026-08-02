@@ -1859,6 +1859,22 @@ class RelayAdapter(BasePlatformAdapter):
         registry maps ids back to the real strings on the answer.
         """
         if choices and self.descriptor.supports_op("prompt"):
+            scoped_metadata = self._with_scope(chat_id, metadata)
+            expected_platform = (
+                self._platform_by_chat.get(str(chat_id))
+                or self.descriptor.platform
+            )
+            conversation_identity = {
+                "platform": str(
+                    getattr(expected_platform, "value", expected_platform) or ""
+                ),
+                "scope_id": str(scoped_metadata.get("scope_id") or ""),
+                "thread_id": str(
+                    scoped_metadata.get("thread_id")
+                    or scoped_metadata.get("thread_ts")
+                    or ""
+                ),
+            }
             options = [
                 {"id": f"c{i}", "label": str(choice)[:75]}
                 for i, choice in enumerate(choices)
@@ -1875,6 +1891,7 @@ class RelayAdapter(BasePlatformAdapter):
                     "responder_id": (
                         str(responder_id) if responder_id is not None else None
                     ),
+                    "conversation_identity": conversation_identity,
                 },
             )
             result = await self._send_prompt(
@@ -1883,7 +1900,7 @@ class RelayAdapter(BasePlatformAdapter):
                 text=f"❓ {question}",
                 prompt_id=prompt_id,
                 options=options,
-                metadata=metadata,
+                metadata=scoped_metadata,
             )
             if result is not None:
                 return result
@@ -1931,6 +1948,28 @@ class RelayAdapter(BasePlatformAdapter):
                 )
                 return True
             if preview.get("kind") == "clarify":
+                expected_identity = preview.get("conversation_identity")
+                if isinstance(expected_identity, dict):
+                    actual_platform = getattr(event.source, "platform", None)
+                    actual_identity = {
+                        "platform": str(
+                            getattr(actual_platform, "value", actual_platform)
+                            or ""
+                        ),
+                        "scope_id": str(
+                            getattr(event.source, "scope_id", None) or ""
+                        ),
+                        "thread_id": str(
+                            getattr(event.source, "thread_id", None) or ""
+                        ),
+                    }
+                    if actual_identity != expected_identity:
+                        logger.warning(
+                            "relay clarify response rejected for non-matching "
+                            "conversation identity (prompt=%s)",
+                            prompt_id,
+                        )
+                        return True
                 expected_responder = preview.get("responder_id")
                 actual_responder = str(
                     getattr(event.source, "user_id", "") or ""

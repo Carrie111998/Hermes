@@ -285,6 +285,30 @@ class _APIServerSessionBinding(list):
         super().__init__(tokens)
         self.capability_epoch_sha256 = capability_epoch_sha256
 
+
+class _APIClarifyAuthority:
+    """Exact, turn-owned authority for API clarification callbacks.
+
+    A callback closure keeps this object, not a reusable per-session counter.
+    Cleanup first fences ``accepting`` while the worker can still run, then
+    retires its exact core generation only at the worker lifecycle boundary.
+    """
+
+    __slots__ = (
+        "accepting",
+        "active",
+        "generation",
+        "retired",
+        "scope",
+    )
+
+    def __init__(self, scope: str) -> None:
+        self.scope = scope
+        self.generation: Optional[int] = None
+        self.accepting = True
+        self.active = True
+        self.retired = False
+
 class _APIServerCleanupHandle:
     """Private exact-binding handle for fail-closed cleanup retries.
 
@@ -2441,7 +2465,6 @@ class APIServerAdapter(BasePlatformAdapter):
             Dict[str, Any],
         ] = {}
         self._api_clarifications_lock = threading.RLock()
-        self._api_clarify_generations: Dict[str, int] = {}
         self._api_pending_approvals: Dict[
             APIRequestScope,
             Dict[str, Any],
@@ -3018,8 +3041,17 @@ class APIServerAdapter(BasePlatformAdapter):
             authority=request_authority,
         ).internal_key
 
-    def _clear_api_clarify_scope(self, scope: str) -> None:
-        """Cancel one API conversation's pending clarify requests."""
+    def _clear_api_clarify_scope(
+        self,
+        scope: str,
+        *,
+        generation: Optional[int] = None,
+    ) -> None:
+        """Cancel one API conversation's pending clarify requests.
+
+        When ``generation`` is supplied, cleanup is exact and cannot consume a
+        newer turn's public or core prompt for the same conversation scope.
+        """
 
         if not scope:
             return
@@ -3031,30 +3063,106 @@ class APIServerAdapter(BasePlatformAdapter):
                     clarify_id
                     for clarify_id, state in pending.items()
                     if state.get("_scope") == scope
+                    and (
+                        generation is None
+                        or state.get("_core_generation") == generation
+                    )
                 ]
                 for clarify_id in stale_ids:
                     pending.pop(clarify_id, None)
         try:
             from tools.clarify_gateway import clear_session
 
-            clear_session(scope)
+            clear_session(scope, generation=generation)
         except Exception:
             logger.debug("Failed to clear API clarify scope", exc_info=True)
+
+    def _cancel_api_clarify_authority(
+        self,
+        authority: Optional[_APIClarifyAuthority],
+    ) -> None:
+        """Fence a live callback and wake only its exact pending prompt."""
+
+        if authority is None:
+            return
+        with self._api_clarifications_lock:
+            authority.accepting = False
+            generation = authority.generation
+            if generation is not None:
+                self._clear_api_clarify_scope(
+                    authority.scope,
+                    generation=generation,
+                )
+
+    def _retire_api_clarify_authority(
+        self,
+        authority: Optional[_APIClarifyAuthority],
+    ) -> bool:
+        """Retire exact clarify authority after its worker can no longer run."""
+
+        if authority is None:
+            return False
+        from tools import clarify_gateway
+
+        with self._api_clarifications_lock:
+            if authority.retired:
+                return False
+            authority.accepting = False
+            authority.active = False
+            authority.retired = True
+            generation = authority.generation
+            if generation is None:
+                return True
+            self._clear_api_clarify_scope(
+                authority.scope,
+                generation=generation,
+            )
+            return clarify_gateway.retire_session_generation(
+                authority.scope,
+                generation,
+            )
+
+    def _cancel_api_agent_clarifications(self, agent: Any) -> None:
+        """Fence an agent's exact turn callback without retiring it early."""
+
+        authority = getattr(agent, "_api_clarify_authority", None)
+        if authority is not None:
+            self._cancel_api_clarify_authority(authority)
+            return
+        self._clear_api_clarify_scope(
+            str(getattr(agent, "_api_clarify_scope", "") or "")
+        )
+
+    def _retire_api_agent_clarifications(self, agent: Any) -> bool:
+        """Retire an agent's exact turn callback at worker completion."""
+
+        return self._retire_api_clarify_authority(
+            getattr(agent, "_api_clarify_authority", None)
+        )
 
     def _release_api_cached_agent(self, agent: Any) -> None:
         """Soft-release a cache-evicted agent without tearing down task state."""
 
         if agent is None:
             return
-        self._clear_api_clarify_scope(
-            str(getattr(agent, "_api_clarify_scope", "") or "")
-        )
+        authority = getattr(agent, "_api_clarify_authority", None)
+        if authority is not None and authority.active:
+            self._cancel_api_clarify_authority(authority)
+        else:
+            self._retire_api_clarify_authority(authority)
+            if authority is None:
+                self._clear_api_clarify_scope(
+                    str(getattr(agent, "_api_clarify_scope", "") or "")
+                )
         cache_lock = getattr(self, "_api_agent_cache_lock", None)
         active_agents = getattr(self, "_api_active_agents", {})
         deferred_releases = getattr(self, "_api_deferred_agent_releases", None)
         if cache_lock is not None and deferred_releases is not None:
             with cache_lock:
-                is_active = id(agent) in active_agents
+                is_active = bool(
+                    (authority is not None and authority.active)
+                    or id(agent) in active_agents
+                )
                 if is_active:
                     deferred_releases.add(id(agent))
         else:
@@ -3064,6 +3172,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Fence it from future lookup now, but let the exact execution
             # owner release provider clients after the worker exits.
             return
+        if cache_lock is not None and deferred_releases is not None:
+            with cache_lock:
+                deferred_releases.discard(id(agent))
         try:
             release = getattr(agent, "release_clients", None)
             if callable(release):
@@ -3160,15 +3271,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "Failed to interrupt retired API session agent",
                     exc_info=True,
                 )
-            self._clear_api_clarify_scope(
-                str(
-                    getattr(agent, "_api_clarify_scope", "")
-                    or self._api_clarify_scope(
-                        normalized_session,
-                        request_authority=request_authority,
-                    )
-                )
-            )
+            self._cancel_api_agent_clarifications(agent)
             self._clear_api_approval_scope(
                 normalized_session,
                 approval_session_key=str(
@@ -3230,6 +3333,7 @@ class APIServerAdapter(BasePlatformAdapter):
             authority=request_authority,
         )
         scope = session_scope.internal_key
+        authority = _APIClarifyAuthority(scope)
 
         def _clarify(question: str, choices) -> str:
             from tools import clarify_gateway
@@ -3240,18 +3344,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 clarify_id,
             ).internal_key
             normalized_choices = list(choices) if choices else None
+            clarification_scope = session_scope.bind(
+                "clarification-id",
+                clarify_id,
+            )
             with self._api_clarifications_lock:
-                clarify_generation = (
-                    int(self._api_clarify_generations.get(scope, 0)) + 1
-                )
-                self._api_clarify_generations[scope] = clarify_generation
-                # Serialize generation publication with registration for this
-                # API scope.  Without the outer lock, two concurrent callbacks
-                # could publish 2 then 1 before either registers.
-                clarify_gateway.update_session_generation(
-                    scope,
-                    clarify_generation,
-                )
+                if (
+                    authority.retired
+                    or not authority.active
+                    or not authority.accepting
+                ):
+                    return "[clarification unavailable: session ended]"
+                if authority.generation is None:
+                    authority.generation = (
+                        clarify_gateway.claim_session_generation(scope)
+                    )
+                clarify_generation = authority.generation
                 clarify_gateway.register(
                     clarify_id=core_clarify_id,
                     session_key=scope,
@@ -3260,27 +3368,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     generation=clarify_generation,
                     identity_v1=True,
                 )
-            public_state = {
-                "id": clarify_id,
-                "object": "hermes.clarification",
-                "status": "pending",
-                "session_id": str(session_id or ""),
-                "question": question,
-                "choices": normalized_choices,
-                "created_at": time.time(),
-                "response_endpoint": (
-                    f"/v1/clarifications/{clarify_id}/response"
-                ),
-                "_scope": scope,
-                "_request_scope": session_scope,
-                "_core_clarify_id": core_clarify_id,
-                "_core_generation": clarify_generation,
-            }
-            clarification_scope = session_scope.bind(
-                "clarification-id",
-                clarify_id,
-            )
-            with self._api_clarifications_lock:
+                public_state = {
+                    "id": clarify_id,
+                    "object": "hermes.clarification",
+                    "status": "pending",
+                    "session_id": str(session_id or ""),
+                    "question": question,
+                    "choices": normalized_choices,
+                    "created_at": time.time(),
+                    "response_endpoint": (
+                        f"/v1/clarifications/{clarify_id}/response"
+                    ),
+                    "_scope": scope,
+                    "_request_scope": session_scope,
+                    "_core_clarify_id": core_clarify_id,
+                    "_core_generation": clarify_generation,
+                }
                 self._api_pending_clarifications[
                     clarification_scope
                 ] = public_state
@@ -3311,6 +3414,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         None,
                     )
 
+        _clarify._api_clarify_authority = authority
         return _clarify
 
     @staticmethod
@@ -5576,6 +5680,11 @@ class APIServerAdapter(BasePlatformAdapter):
             notify_callback=clarify_notify_callback,
             request_authority=request_authority,
         )
+        clarify_authority = getattr(
+            clarify_callback,
+            "_api_clarify_authority",
+            None,
+        )
 
         cache_key = agent_session_scope if session_id else None
         current_message_count = self._api_session_message_count(session_id)
@@ -5610,6 +5719,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._release_api_cached_agent(stale_agent)
 
         if cached_agent is not None:
+            # The per-session run lock proves the previous turn is quiescent
+            # before this mutable cached agent is rebound to a fresh callback.
+            self._retire_api_agent_clarifications(cached_agent)
             GatewayRunner._init_cached_agent_for_turn(cached_agent, 0)
             cached_agent.stream_delta_callback = stream_delta_callback
             cached_agent.tool_progress_callback = tool_progress_callback
@@ -5629,6 +5741,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id,
                 request_authority=request_authority,
             )
+            cached_agent._api_clarify_authority = clarify_authority
             cached_agent._api_request_authority = request_authority
             cached_agent._api_agent_session_scope = agent_session_scope
             logger.debug(
@@ -5664,11 +5777,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
-        agent = AIAgent(**agent_kwargs)
+        try:
+            agent = AIAgent(**agent_kwargs)
+        except Exception:
+            # Constructor failure is a lifecycle boundary too.  This is
+            # normally an unclaimed lazy authority, but exact retirement also
+            # covers constructors that invoked the callback before failing.
+            self._retire_api_clarify_authority(clarify_authority)
+            raise
         agent._api_clarify_scope = self._api_clarify_scope(
             session_id,
             request_authority=request_authority,
         )
+        agent._api_clarify_authority = clarify_authority
         agent._api_request_authority = request_authority
         agent._api_agent_session_scope = agent_session_scope
         agent._api_raw_gateway_session_key = gateway_session_key
@@ -11317,9 +11438,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # interrupt() cannot wake a thread blocked in Event.wait().  Cancel
             # the exact API clarify scope so the worker can unwind and perform
             # its mandatory capability cleanup.
-            self._clear_api_clarify_scope(
-                str(getattr(agent, "_api_clarify_scope", "") or "")
-            )
+            self._cancel_api_agent_clarifications(agent)
             self._clear_api_approval_scope(
                 str(getattr(agent, "session_id", "") or ""),
                 approval_session_key=str(
@@ -11757,6 +11876,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         # left running.
                         if agent is not None:
                             _clear_turn_process_ownership(agent)
+                            # This runs while the per-conversation execution
+                            # lock is still held.  The old callback can no
+                            # longer execute, and a queued next turn cannot yet
+                            # attach its fresh authority.
+                            self._retire_api_agent_clarifications(agent)
                         try:
                             self._attempt_api_server_cleanup_once(
                                 cleanup_handle,
@@ -12529,6 +12653,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # intentionally surviving background work.
                             if agent is not None:
                                 _clear_turn_process_ownership(agent)
+                                self._retire_api_agent_clarifications(agent)
                             # Linearize stop ownership at the execution/cleanup
                             # boundary. A stop received while the model is still
                             # executing cancels the run; a later stop received
@@ -13189,9 +13314,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _reap_disconnected_agent_processes(
                 agent, source="api_server_run_stop"
             )
-            self._clear_api_clarify_scope(
-                str(getattr(agent, "_api_clarify_scope", "") or "")
-            )
+            self._cancel_api_agent_clarifications(agent)
 
         # Stop is cooperative and returns immediately.  The existing task
         # remains the sole owner of its executor thread and exact Canonical
@@ -13515,9 +13638,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent.interrupt("API server shutting down")
             except Exception:
                 pass
-            self._clear_api_clarify_scope(
-                str(getattr(agent, "_api_clarify_scope", "") or "")
-            )
+            self._cancel_api_agent_clarifications(agent)
             self._clear_api_approval_scope(
                 str(getattr(agent, "session_id", "") or ""),
                 approval_session_key=str(

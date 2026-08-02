@@ -70,12 +70,20 @@ def _event(
     text: str = "/once",
     chat_id: str = "c1",
     user_id: str = "u1",
+    platform: str = "telegram",
+    scope_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.COMMAND,
         source=SessionSource(
-            platform="telegram", chat_id=chat_id, chat_type="dm", user_id=user_id
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=user_id,
+            scope_id=scope_id,
+            thread_id=thread_id,
         ),
         prompt_response=prompt_response,
     )
@@ -204,6 +212,7 @@ async def test_clarify_prompt_identity_mismatch_does_not_consume_real_prompt(
         ["alpha"],
         "cl-identity",
         "s",
+        metadata={"scope_id": "scope-1", "thread_id": "thread-1"},
         generation=4,
         responder_id="u1",
     )
@@ -216,16 +225,45 @@ async def test_clarify_prompt_identity_mismatch_does_not_consume_real_prompt(
 
     response = {"prompt_id": prompt_id, "option_id": "c0"}
     assert await adapter._consume_prompt_response(
-        _event(response, chat_id="other-chat")
+        _event(
+            response,
+            chat_id="other-chat",
+            scope_id="scope-1",
+            thread_id="thread-1",
+        )
     ) is True
     assert prompt_id in adapter._pending_prompts
     assert await adapter._consume_prompt_response(
-        _event(response, user_id="other-user")
+        _event(
+            response,
+            user_id="other-user",
+            scope_id="scope-1",
+            thread_id="thread-1",
+        )
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(response, scope_id="other-scope", thread_id="thread-1")
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(response, scope_id="scope-1", thread_id="other-thread")
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(
+            response,
+            platform="discord",
+            scope_id="scope-1",
+            thread_id="thread-1",
+        )
     ) is True
     assert prompt_id in adapter._pending_prompts
     assert resolved == []
 
-    assert await adapter._consume_prompt_response(_event(response)) is True
+    assert await adapter._consume_prompt_response(
+        _event(response, scope_id="scope-1", thread_id="thread-1")
+    ) is True
     assert prompt_id not in adapter._pending_prompts
     assert len(resolved) == 1
     assert resolved[0][1] == {
