@@ -439,6 +439,7 @@ class _PluginManagerState:
         self._slack_action_handlers = list(manager._slack_action_handlers)
         self._discovered = manager._discovered
         self._generation = manager._generation
+        self._live_context_generation = manager._live_context_generation
 
 
 class _PluginRegistrationView:
@@ -485,6 +486,7 @@ class _PluginRegistrationView:
         self._slack_action_handlers = list(state._slack_action_handlers)
         self._discovered = state._discovered
         self._generation = state._generation
+        self._live_context_generation = state._live_context_generation
         self._cli_ref = cli_ref
         self._lock = threading.RLock()
         self._transaction_tools_registered: List[str] = []
@@ -537,7 +539,30 @@ class _RegistrationTransaction:
         from tools.registry import registry as tool_registry
 
         self.manager = manager
-        self.manager_before = manager._snapshot_owned_state()
+        self.replace_owned = replace_owned
+        self.tool_registry = tool_registry
+        self.external_transactions = _external_registry_transactions()
+        locks = [
+            manager._lock,
+            tool_registry._lock,
+            *(
+                self.external_transactions[surface].lock
+                for surface in _EXTERNAL_COMMIT_SURFACES
+            ),
+        ]
+        for lock in locks:
+            lock.acquire()
+        try:
+            self.manager_before = _PluginManagerState(manager)
+            self.tool_snapshot = tool_registry._take_transaction_snapshot()
+            self.external_snapshots = {
+                surface: self.external_transactions[surface].take_snapshot()
+                for surface in _EXTERNAL_COMMIT_SURFACES
+            }
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
         self.manager_view = _PluginRegistrationView(
             self.manager_before,
             manager._cli_ref,
@@ -559,8 +584,6 @@ class _RegistrationTransaction:
             self.manager_view._slack_action_handlers = []
         self.manager_view._discovered = True
 
-        self.tool_registry = tool_registry
-        self.tool_snapshot = tool_registry._take_transaction_snapshot()
         removed_tool_names = (
             self.manager_before._plugin_tool_names if replace_owned else set()
         )
@@ -579,11 +602,6 @@ class _RegistrationTransaction:
             remove_policy_names=removed_policy_names,
         )
 
-        self.external_transactions = _external_registry_transactions()
-        self.external_snapshots = {
-            surface: transaction.take_snapshot()
-            for surface, transaction in self.external_transactions.items()
-        }
         self.external_views = {}
         for surface, transaction in self.external_transactions.items():
             remove_keys = (
@@ -596,6 +614,11 @@ class _RegistrationTransaction:
                 remove_keys=remove_keys,
             )
         self.contexts: List["PluginContext"] = []
+        self.context_generation = (
+            self.manager_before._live_context_generation + 1
+            if replace_owned
+            else self.manager_before._live_context_generation
+        )
 
     def context_targets(self) -> Dict[str, tuple[Any, Any]]:
         return {
@@ -617,9 +640,17 @@ class _RegistrationTransaction:
             for surface, transaction in self.external_transactions.items()
         }
         with self.manager_view._lock:
+            self.manager_view._live_context_generation = self.context_generation
             next_manager = _PluginManagerState(self.manager_view)
             self.manager_view._freeze()
 
+        revoke_generation = (
+            self.manager_before._live_context_generation
+            if self.replace_owned
+            else None
+        )
+        if revoke_generation is not None:
+            self.manager._begin_live_context_revocation(revoke_generation)
         locks = [
             self.manager._lock,
             self.tool_registry._lock,
@@ -662,10 +693,13 @@ class _RegistrationTransaction:
                 context._registration_registry = self.tool_registry
                 context._registration_manager = self.manager
                 context._registration_external_registries = None
+                context._managed_generation = self.context_generation
             self.manager._install_owned_state_locked(next_manager)
         finally:
             for lock in reversed(locks):
                 lock.release()
+            if revoke_generation is not None:
+                self.manager._cancel_live_context_revocation(revoke_generation)
 
 
 class _ForceSweepAbort(RuntimeError):
@@ -695,15 +729,32 @@ class PluginContext:
         # Direct/runtime contexts leave this unset and target the live registry.
         self._registration_registry = registration_registry
         self._registration_external_registries = registration_external_registries
+        self._managed_generation: Optional[int] = None
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+
+    def _ensure_live_locked(self, target: Any) -> None:
+        generation = self._managed_generation
+        if generation is None or not isinstance(target, PluginManager):
+            return
+        if target._live_context_generation != generation:
+            raise RuntimeError(
+                f"Plugin context for {self.manifest.name!r} is no longer live"
+            )
+
+    def _acquire_live_lease(self, target: Any) -> Callable[[], None]:
+        generation = self._managed_generation
+        if generation is None or not isinstance(target, PluginManager):
+            return lambda: None
+        return target._acquire_live_context_lease(self.manifest.name, generation)
 
     def _record_external_registration(self, surface: str, name: str) -> None:
         target = self._registration_manager
         recorder = getattr(target, "_record_external_registration", None)
         if recorder is not None:
             with target._lock:
+                self._ensure_live_locked(target)
                 recorder(surface, name)
 
     def _register_external_value(
@@ -713,15 +764,22 @@ class PluginContext:
         live_register: Callable[[Any], Any],
     ) -> Optional[str]:
         targets = self._registration_external_registries
+        target = self._registration_manager
         if targets is None:
-            result = live_register(value)
-            if surface == "secret" and not result:
-                return None
-            name = value.name
+            release_live = self._acquire_live_lease(target)
+            try:
+                result = live_register(value)
+                if surface == "secret" and not result:
+                    return None
+                name = value.name
+                if name:
+                    self._record_external_registration(surface, name)
+            finally:
+                release_live()
         else:
             transaction, staged = targets[surface]
             name = transaction.register(staged, value)
-        if name:
+        if targets is not None and name:
             self._record_external_registration(surface, name)
         return name
 
@@ -827,27 +885,33 @@ class PluginContext:
         if target_registry is None:
             from tools.registry import registry as target_registry
 
-        target_registry.register(
-            name=name,
-            toolset=toolset,
-            schema=schema,
-            handler=handler,
-            check_fn=check_fn,
-            requires_env=requires_env,
-            is_async=is_async,
-            description=description,
-            emoji=emoji,
-            override=override,
-        )
         target = self._registration_manager
-        with target._lock:
-            target._plugin_tool_names.add(name)
-            registered = getattr(
-                target, "_transaction_tools_registered", None
+        resolved_description = description or schema.get("description", "")
+        release_live = self._acquire_live_lease(target)
+        try:
+            target_registry.register(
+                name=name,
+                toolset=toolset,
+                schema=schema,
+                handler=handler,
+                check_fn=check_fn,
+                requires_env=requires_env,
+                is_async=is_async,
+                description=resolved_description,
+                emoji=emoji,
+                override=override,
             )
-            if registered is not None and name not in registered:
-                registered.append(name)
-            target._generation += 1
+            with target._lock:
+                self._ensure_live_locked(target)
+                target._plugin_tool_names.add(name)
+                registered = getattr(
+                    target, "_transaction_tools_registered", None
+                )
+                if registered is not None and name not in registered:
+                    registered.append(name)
+                target._generation += 1
+        finally:
+            release_live()
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
@@ -924,6 +988,7 @@ class PluginContext:
         as the default dispatch function via ``set_defaults(func=...)``."""
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             target._cli_commands[name] = {
                 "name": name,
                 "help": help,
@@ -985,6 +1050,7 @@ class PluginContext:
 
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             target._plugin_commands[clean] = {
                 "handler": handler,
                 "description": description or "Plugin command",
@@ -1051,6 +1117,7 @@ class PluginContext:
             return
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             if getattr(target, "_frozen", False):
                 raise RuntimeError("plugin registration transaction is frozen")
             if target._context_engine is not None:
@@ -1426,11 +1493,17 @@ class PluginContext:
         )
         targets = self._registration_external_registries
         if targets is None:
-            platform_registry.register(entry)
+            target = self._registration_manager
+            release_live = self._acquire_live_lease(target)
+            try:
+                platform_registry.register(entry)
+                self._record_external_registration("platform", name)
+            finally:
+                release_live()
         else:
             _transaction, staged = targets["platform"]
             staged.register(entry)
-        self._record_external_registration("platform", name)
+            self._record_external_registration("platform", name)
         logger.debug(
             "Plugin %s registered platform: %s",
             self.manifest.name,
@@ -1488,6 +1561,7 @@ class PluginContext:
             )
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             target._slack_action_handlers.append(
                 (action_id, callback, self.manifest.name)
             )
@@ -1602,6 +1676,7 @@ class PluginContext:
                 merged_defaults[k] = v
 
         with target._lock:
+            self._ensure_live_locked(target)
             target._aux_tasks[key] = {
                 "key": key,
                 "display_name": display_name,
@@ -1633,6 +1708,7 @@ class PluginContext:
             )
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             target._hooks.setdefault(hook_name, []).append(callback)
             target._generation += 1
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
@@ -1657,6 +1733,7 @@ class PluginContext:
             )
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             target._middleware.setdefault(kind, []).append(callback)
             target._generation += 1
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
@@ -1699,6 +1776,7 @@ class PluginContext:
         qualified = f"{self.manifest.name}:{name}"
         target = self._registration_manager
         with target._lock:
+            self._ensure_live_locked(target)
             target._plugin_skills[qualified] = {
                 "path": path,
                 "plugin": self.manifest.name,
@@ -1750,12 +1828,61 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._live_context_generation = 0
+        self._live_context_condition = threading.Condition(threading.RLock())
+        self._live_context_active: Dict[int, int] = {}
+        self._live_context_revoking: set[int] = set()
 
     def _record_external_registration(self, surface: str, name: str) -> None:
         self._plugin_external_names.setdefault(surface, set()).add(name)
         if surface == "platform":
             self._plugin_platform_names.add(name)
         self._generation += 1
+
+    def _acquire_live_context_lease(
+        self,
+        plugin_name: str,
+        generation: int,
+    ) -> Callable[[], None]:
+        with self._live_context_condition:
+            if (
+                self._live_context_generation != generation
+                or generation in self._live_context_revoking
+            ):
+                raise RuntimeError(
+                    f"Plugin context for {plugin_name!r} is no longer live"
+                )
+            self._live_context_active[generation] = (
+                self._live_context_active.get(generation, 0) + 1
+            )
+
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            with self._live_context_condition:
+                active = self._live_context_active.get(generation, 0)
+                if active <= 1:
+                    self._live_context_active.pop(generation, None)
+                    self._live_context_condition.notify_all()
+                else:
+                    self._live_context_active[generation] = active - 1
+
+        return release
+
+    def _begin_live_context_revocation(self, generation: int) -> None:
+        with self._live_context_condition:
+            self._live_context_revoking.add(generation)
+            while self._live_context_active.get(generation, 0):
+                self._live_context_condition.wait()
+
+    def _cancel_live_context_revocation(self, generation: int) -> None:
+        with self._live_context_condition:
+            self._live_context_revoking.discard(generation)
+            self._live_context_condition.notify_all()
 
     def _snapshot_owned_state(self) -> _PluginManagerState:
         """Take a non-aliasing checkpoint under the manager state lock."""
@@ -1777,6 +1904,7 @@ class PluginManager:
         self._aux_tasks = state._aux_tasks
         self._slack_action_handlers = state._slack_action_handlers
         self._discovered = state._discovered
+        self._live_context_generation = state._live_context_generation
         self._generation = max(self._generation, state._generation) + 1
 
     def discover_and_load(self, force: bool = False) -> None:

@@ -20,6 +20,7 @@ from agent.video_gen_provider import VideoGenProvider
 from agent.web_search_provider import WebSearchProvider
 from gateway.platform_registry import PlatformEntry, PlatformRegistry
 from hermes_cli.dashboard_auth import DashboardAuthProvider
+import hermes_cli.plugins as plugins_module
 from hermes_cli.plugins import PluginManager
 from tools.registry import registry
 
@@ -605,6 +606,137 @@ def test_force_reload_removes_registrations_absent_from_new_generation(
         assert module_namespace not in registry._plugin_override_policy
 
 
+def test_force_reload_preserves_same_key_external_replacement_after_manager_snapshot(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    namespace = "same-key-replacement"
+    old_values = _external_values("generation-a", namespace)
+    _support(old_values, "generation-a", released=True)
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    replacement_values = _external_values("direct-replacement", namespace)
+    new_values = _external_values("generation-b", namespace)
+    _support(new_values, "generation-b", released=True)
+    replacement_written = threading.Event()
+    snapshot_entered = threading.Event()
+    original_transactions = plugins_module._external_registry_transactions
+
+    class _ImageSnapshotBarrier:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+            self._started = False
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+        def take_snapshot(self):
+            if not self._started:
+                self._started = True
+                snapshot_entered.set()
+
+                def write_replacement() -> None:
+                    _register_external_direct(
+                        "image_gen",
+                        replacement_values["image_gen"],
+                        isolated_registries,
+                    )
+                    replacement_written.set()
+
+                writer = threading.Thread(target=write_replacement, daemon=True)
+                writer.start()
+                replacement_written.wait(timeout=0.2)
+            return self._wrapped.take_snapshot()
+
+    def transactions_with_barrier():
+        transactions = original_transactions()
+        transactions["image_gen"] = _ImageSnapshotBarrier(transactions["image_gen"])
+        return transactions
+
+    monkeypatch.setattr(
+        plugins_module,
+        "_external_registry_transactions",
+        transactions_with_barrier,
+    )
+
+    manager.discover_and_load(force=True)
+
+    assert snapshot_entered.is_set()
+    assert replacement_written.is_set()
+    observed = _read_external_generation(replacement_values, isolated_registries)
+    assert observed["image_gen"] is replacement_values["image_gen"]
+
+
+def test_force_reload_preserves_same_key_tool_replacement_after_manager_snapshot(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "same-key-tool")
+    _support(
+        old_values,
+        "generation-a",
+        released=True,
+        register_generation_state=True,
+    )
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    new_values = _external_values("generation-b", "same-key-tool")
+    _support(
+        new_values,
+        "generation-b",
+        released=True,
+        register_generation_state=True,
+    )
+    replacement_written = threading.Event()
+    snapshot_calls = 0
+    original_snapshot = registry._take_transaction_snapshot
+
+    def replacement_handler(args, **kwargs):
+        return "direct-replacement"
+
+    def write_replacement() -> None:
+        registry.register(
+            name=_TOOL_NAME,
+            toolset="h1_transaction",
+            schema={
+                "name": _TOOL_NAME,
+                "description": "direct replacement",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=replacement_handler,
+        )
+        replacement_written.set()
+
+    def snapshot_with_barrier():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            writer = threading.Thread(target=write_replacement, daemon=True)
+            writer.start()
+            assert not replacement_written.wait(timeout=0.2)
+        else:
+            assert replacement_written.wait(timeout=5)
+        return original_snapshot()
+
+    monkeypatch.setattr(
+        registry,
+        "_take_transaction_snapshot",
+        snapshot_with_barrier,
+    )
+
+    manager.discover_and_load(force=True)
+
+    assert snapshot_calls >= 1
+    assert replacement_written.wait(timeout=5)
+    assert registry.get_entry(_TOOL_NAME).handler is replacement_handler
+
+
 @pytest.mark.parametrize(
     "conflict_surface",
     [
@@ -687,3 +819,206 @@ def test_context_retained_after_commit_targets_live_external_registries(
     from agent.image_gen_registry import get_provider
 
     assert get_provider(late.name) is late
+
+
+def test_retained_context_live_registration_does_not_validate_under_live_locks(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("initial", "lock-validation")
+    support = _support(values, "initial", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    from agent import image_gen_registry
+
+    observations: list[tuple[str, bool, bool, bool]] = []
+
+    def observe(label: str) -> None:
+        observations.append(
+            (
+                label,
+                manager._lock._is_owned(),
+                registry._lock._is_owned(),
+                image_gen_registry._lock._is_owned(),
+            )
+        )
+
+    class _ObservedImageProvider(_ImageProvider):
+        @property
+        def name(self) -> str:
+            observe("provider.name")
+            return super().name
+
+    class _ObservedSchema(dict):
+        def get(self, key, default=None):
+            if key == "description":
+                observe("schema.get")
+            return super().get(key, default)
+
+    provider = _ObservedImageProvider("h1-lock-validation-late-image", "late")
+    support.saved_context.register_image_gen_provider(provider)
+    support.saved_context.register_tool(
+        "h1_lock_validation_late_tool",
+        "h1_transaction",
+        _ObservedSchema(
+            {
+                "name": "h1_lock_validation_late_tool",
+                "description": "late",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ),
+        lambda args, **kwargs: "late",
+    )
+
+    assert observations
+    assert all(
+        not any((manager_locked, tool_locked, external_locked))
+        for _, manager_locked, tool_locked, external_locked in observations
+    ), observations
+
+
+def test_successful_force_reload_revokes_prior_retained_context_before_mutation(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "revoked-context")
+    support = _support(
+        old_values,
+        "generation-a",
+        released=True,
+        register_generation_state=True,
+    )
+    support.saved_contexts = []
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_contexts.append(ctx)\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_context = support.saved_contexts[-1]
+
+    new_values = _external_values(
+        "generation-b",
+        "revoked-context",
+    )
+    support = _support(
+        new_values,
+        "generation-b",
+        released=True,
+        register_generation_state=True,
+    )
+    support.saved_contexts = []
+    manager.discover_and_load(force=True)
+    new_context = support.saved_contexts[-1]
+    assert manager._live_context_revoking == set()
+
+    stale_external = _ImageProvider("h1-revoked-context-late-image", "stale")
+    stale_tool_name = "h1_revoked_context_late_tool"
+    stale_platform_name = "h1-revoked-context-late-platform"
+    stale_hook = lambda **kwargs: "stale"
+
+    with pytest.raises(RuntimeError, match="no longer live"):
+        old_context.register_image_gen_provider(stale_external)
+    with pytest.raises(RuntimeError, match="no longer live"):
+        old_context.register_tool(
+            stale_tool_name,
+            "h1_transaction",
+            {
+                "name": stale_tool_name,
+                "description": "stale",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            lambda args, **kwargs: "stale",
+        )
+    with pytest.raises(RuntimeError, match="no longer live"):
+        old_context.register_hook("post_tool_call", stale_hook)
+    with pytest.raises(RuntimeError, match="no longer live"):
+        old_context.register_platform(
+            name=stale_platform_name,
+            label="Stale",
+            adapter_factory=lambda config: "stale",
+            check_fn=lambda: True,
+        )
+
+    from agent.image_gen_registry import get_provider
+
+    assert get_provider(stale_external.name) is None
+    assert registry.get_entry(stale_tool_name) is None
+    assert isolated_registries.get(stale_platform_name) is None
+    assert stale_hook not in manager._hooks.get("post_tool_call", [])
+
+    live_external = _ImageProvider("h1-revoked-context-live-image", "live")
+    live_tool_name = "h1_revoked_context_live_tool"
+    live_hook = lambda **kwargs: "live"
+    new_context.register_image_gen_provider(live_external)
+    new_context.register_tool(
+        live_tool_name,
+        "h1_transaction",
+        {
+            "name": live_tool_name,
+            "description": "live",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        lambda args, **kwargs: "live",
+    )
+    new_context.register_hook("post_tool_call", live_hook)
+
+    assert get_provider(live_external.name) is live_external
+    assert registry.get_entry(live_tool_name) is not None
+    assert live_hook in manager._hooks["post_tool_call"]
+
+
+def test_failed_force_reload_keeps_prior_retained_context_live(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "failed-force-context")
+    support = _support(old_values, "generation-a", released=True)
+    support.saved_contexts = []
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_contexts.append(ctx)\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_context = support.saved_contexts[-1]
+
+    new_values = _external_values("generation-b", "failed-force-context")
+    support = _support(new_values, "generation-b", released=True, fail=True)
+    support.saved_contexts = []
+    manager.discover_and_load(force=True)
+
+    retained_external = _ImageProvider("h1-failed-force-live-image", "retained")
+    retained_hook = lambda **kwargs: "retained"
+    old_context.register_image_gen_provider(retained_external)
+    old_context.register_hook("post_tool_call", retained_hook)
+
+    from agent.image_gen_registry import get_provider
+
+    assert support.saved_contexts
+    assert get_provider(retained_external.name) is retained_external
+    assert retained_hook in manager._hooks["post_tool_call"]
