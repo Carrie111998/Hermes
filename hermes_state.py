@@ -3163,6 +3163,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return None
         return str(rows[0]["id"])
 
+    def session_ids_for_thread_scope(
+        self,
+        *,
+        source: str,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+    ) -> set:
+        """All session ids (any lifecycle state) sharing one thread origin.
+
+        Unlike find_session_by_origin (latest *live* session only), this
+        returns every session id that ever ran under this exact
+        platform + chat + thread, so a caller can filter a result set down
+        to "this scope's own sessions" -- see tools/session_search_tool.py's
+        default-scoped discovery/browse filtering and
+        docs/design/thread-scope-isolation.md.
+        """
+        if not source or chat_id in (None, ""):
+            return set()
+        query = "SELECT id FROM sessions WHERE LOWER(source) = LOWER(?) AND chat_id = ?"
+        params: list = [source, str(chat_id)]
+        query += " AND COALESCE(thread_id, '') = COALESCE(?, '')"
+        params.append(str(thread_id) if thread_id else None)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return {str(r["id"]) for r in rows}
+
     def find_latest_gateway_session_for_peer(
         self,
         *,

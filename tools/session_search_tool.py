@@ -139,6 +139,36 @@ def _resolve_lineage(db, session_id: str) -> str:
     return _resolve_to_parent(db, session_id)[0]
 
 
+def _resolve_thread_scope_ids(db, current_session_id: Optional[str]) -> Optional[set]:
+    """Session ids sharing the caller's thread origin, or None when unscoped.
+
+    Root-cause fix for cross-thread progress contamination (see
+    docs/design/thread-scope-isolation.md): on a thread-bearing platform
+    (Discord, etc.), two threads under the same channel must not surface
+    each other's sessions as discovery/browse hits by default. Returns
+    None (no filter applied) when the calling session has no thread_id --
+    CLI/DM conversations have no sibling-thread ambiguity to guard against,
+    and unscoped cross-session recall there is the tool's intended job.
+    """
+    if not current_session_id:
+        return None
+    try:
+        current = db.get_session(current_session_id)
+    except Exception:
+        return None
+    if not current:
+        return None
+    thread_id = current.get("thread_id")
+    source = current.get("source")
+    chat_id = current.get("chat_id")
+    if not thread_id or not source or not chat_id:
+        return None
+    try:
+        return db.session_ids_for_thread_scope(source=source, chat_id=chat_id, thread_id=thread_id)
+    except Exception:
+        return None
+
+
 def _is_compression_ended(db, session_id: str) -> bool:
     """Return True if *session_id* itself ended with ``end_reason='compression'``.
 
@@ -416,9 +446,18 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    link_profile: str = None,
+    include_unscoped: bool = False,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
+        scope_ids = (
+            None if include_unscoped else _resolve_thread_scope_ids(db, current_session_id)
+        )
         sessions = db.list_sessions_rich(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
@@ -431,6 +470,8 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
         for s in sessions:
             sid = s.get("id", "")
             if current_root and (sid == current_root or sid == current_session_id):
+                continue
+            if scope_ids is not None and sid not in scope_ids:
                 continue
             # Skip child / delegation sessions
             if s.get("parent_session_id"):
@@ -453,6 +494,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             "mode": "browse",
             "results": results,
             "count": len(results),
+            "scoped_to_current_thread": scope_ids is not None,
             "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
         }, ensure_ascii=False)
     except Exception as e:
@@ -606,6 +648,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    scope_ids: Optional[set] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -622,6 +665,8 @@ def _title_match_result(
 
     lineage_root = _resolve_lineage(db, session_id)
     if current_lineage_root and lineage_root == current_lineage_root:
+        return None
+    if scope_ids is not None and lineage_root not in scope_ids and session_id not in scope_ids:
         return None
 
     try:
@@ -677,11 +722,13 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
     link_profile: str = None,
+    include_unscoped: bool = False,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    scope_ids = None if include_unscoped else _resolve_thread_scope_ids(db, current_session_id)
+    title_result = _title_match_result(db, query, current_lineage_root, scope_ids=scope_ids)
 
     try:
         raw_results = db.search_messages(
@@ -759,6 +806,8 @@ def _discover(
             # that's been summarised away — let them through.
             if not is_compacted_hit:
                 continue
+        if scope_ids is not None and resolved_sid not in scope_ids and raw_sid not in scope_ids:
+            continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
             row["_lineage_root"] = resolved_sid
@@ -821,6 +870,7 @@ def _discover(
         "results": results,
         "count": len(results),
         "sessions_searched": len(seen_sessions),
+        "scoped_to_current_thread": scope_ids is not None,
     }
     _annotate_rebuild_status(db, _final_payload)
     return json.dumps(_final_payload, ensure_ascii=False)
@@ -840,6 +890,7 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    include_unscoped: bool = False,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -851,6 +902,15 @@ def session_search(
     Pass ``profile`` to read another profile's sessions (e.g. resolving an
     ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
     anchor is set — the agent has asked for a specific slice.
+
+    Discovery and browse default to the CALLING session's own thread scope
+    when the platform has one (e.g. a Discord thread): other threads under
+    the same channel are excluded, so a progress question asked in one
+    thread can't surface another thread's unrelated work as if it were this
+    conversation's own history. Pass ``include_unscoped=True`` to search
+    across every thread/session in the profile instead — do this only when
+    the user explicitly asks to search other conversations, not by default
+    when answering "what's the status of this."
     """
     if db is None:
         try:
@@ -926,7 +986,10 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(
+            db, limit, current_session_id, link_profile=profile,
+            include_unscoped=include_unscoped,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -948,6 +1011,7 @@ def session_search(
         sort=sort_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        include_unscoped=include_unscoped,
     )
 
 
@@ -1112,6 +1176,19 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "include_unscoped": {
+                "type": "boolean",
+                "description": (
+                    "Discovery/browse shapes only. On a thread-bearing platform (e.g. "
+                    "Discord), discovery/browse default to THIS conversation's own "
+                    "thread — other threads in the same channel are excluded so their "
+                    "unrelated work never reads as this thread's own history or "
+                    "progress. Set True only when the user explicitly asks to search "
+                    "other conversations/threads too. Never set True to answer a "
+                    "'what's the status of this' question — that must stay scoped."
+                ),
+                "default": False,
+            },
         },
         "required": [],
     },
@@ -1134,6 +1211,7 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         profile=args.get("profile"),
+        include_unscoped=bool(args.get("include_unscoped", False)),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
     ),
