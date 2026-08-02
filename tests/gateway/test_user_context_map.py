@@ -388,9 +388,13 @@ class TestE2EUserContextInjection:
         assert "User B context." in prompt_b
         assert "User A context." not in prompt_b
 
-    def test_shared_multi_user_session_no_user_context(self):
-        """In a shared multi-user session, user_context is not injected
-        because it is per-sender, not per-chat."""
+    def test_shared_multi_user_session_excludes_user_context(self):
+        """In a shared multi-user session, user_context is NOT rendered in
+        the system prompt. Different senders alternate in the same shared
+        thread/group, so per-sender context in the pinned prompt would bust
+        the cache on every turn switch (same reason sender identity is omitted
+        at session.py:556-568). The value is still resolved on the context
+        object for potential per-turn use, but not rendered."""
         config = GatewayConfig(
             user_context_map={"telegram:123": "context for alice"},
             group_sessions_per_user=False,
@@ -403,8 +407,43 @@ class TestE2EUserContextInjection:
             user_name="alice",
         )
         ctx = build_session_context(source, config)
-        # In shared sessions, user_context is still resolved (it's per-sender)
-        # but the prompt uses session-level context. The context is still
-        # rendered since it's keyed on the sender, not the session type.
+        # The context is resolved on the SessionContext object...
+        assert ctx.user_context == "context for alice"
+        assert ctx.shared_multi_user_session is True
+        # ...but NOT rendered in the system prompt (cache-safe).
         prompt = build_session_context_prompt(ctx)
-        assert "context for alice" in prompt
+        assert "**User Context:**" not in prompt
+        assert "context for alice" not in prompt
+
+    def test_shared_session_cache_stability_across_senders(self):
+        """Two different senders in the same shared session produce the same
+        pinned system prompt bytes (user_context excluded for both)."""
+        config = GatewayConfig(
+            user_context_map={
+                "telegram:111": "context for alice",
+                "telegram:222": "context for bob",
+            },
+            group_sessions_per_user=False,
+        )
+        source_a = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="group-1",
+            chat_type="group",
+            user_id="111",
+            user_name="alice",
+        )
+        source_b = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="group-1",
+            chat_type="group",
+            user_id="222",
+            user_name="bob",
+        )
+        ctx_a = build_session_context(source_a, config)
+        ctx_b = build_session_context(source_b, config)
+        prompt_a = build_session_context_prompt(ctx_a)
+        prompt_b = build_session_context_prompt(ctx_b)
+        # Both senders get the same system prompt bytes (no per-sender context)
+        assert prompt_a == prompt_b
+        assert "context for alice" not in prompt_a
+        assert "context for bob" not in prompt_b

@@ -601,7 +601,16 @@ def build_session_context_prompt(
     # Rendered after identity so the agent has the sender's stable context
     # guidance without editing SOUL.md. The value is pinned per session and
     # does not change mid-conversation, preserving prompt caching.
-    if context.user_context:
+    #
+    # EXCLUDED from shared multi-user sessions: in a shared thread/group,
+    # multiple senders contribute to the same conversation. Each sender's
+    # user_context differs, so rendering it in the pinned system prompt
+    # would bust the cache when the turn switches from sender A to sender B
+    # (the existing code at :556-568 already omits per-sender identity for
+    # the same reason). The per-sender context remains available for a
+    # future per-turn injection path; it is simply not baked into the
+    # cached system prompt in shared sessions.
+    if context.user_context and not context.shared_multi_user_session:
         lines.append("")
         lines.append(
             f"**User Context:** {_format_untrusted_prompt_value(context.user_context)}"
