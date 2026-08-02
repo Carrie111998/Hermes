@@ -614,6 +614,37 @@ def _needle_in_path_component(needle: str, path: str) -> bool:
     return False
 
 
+def _created_skill_names_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> Set[str]:
+    """Return skill names the model created earlier in this run.
+
+    A same-run ``skill_manage action=create`` umbrella is a legitimate
+    consolidation destination even when the post-run snapshot misses it
+    (``added`` can come back empty for bookkeeping reasons). Without this
+    seed, ``_reconcile_classification`` judged every ``absorbed_into``
+    declaration targeting a freshly-created umbrella as a hallucination
+    and misfiled the deleted skill as pruned (#76588).
+    """
+    names: Set[str] = set()
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("name") or (tc.get("function") or {}).get("name", "")
+        if fn != "skill_manage":
+            continue
+        raw = tc.get("arguments") or {}
+        args = raw if isinstance(raw, dict) else {}
+        if isinstance(raw, str):
+            try:
+                args = json.loads(raw)
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            continue
+        if args.get("action") == "create" and args.get("name"):
+            names.add(str(args["name"]))
+    return names
+
+
 def _classify_removed_skills(
     removed: List[str],
     added: List[str],
@@ -666,8 +697,14 @@ def _classify_removed_skills(
 
     # Build a set of "destination" skill names: anything still present after
     # the run plus anything newly added this run. A removed skill being
-    # referenced from one of these is the consolidation signal.
-    destinations = set(after_names) | set(added or [])
+    # referenced from one of these is the consolidation signal. Same-run
+    # created umbrellas are also destinations even when the post-run
+    # snapshot misses them (#76588).
+    destinations = (
+        set(after_names)
+        | set(added or [])
+        | _created_skill_names_from_tool_calls(tool_calls)
+    )
 
     for name in removed:
         if not name:
@@ -1044,7 +1081,13 @@ def _build_rename_summary(
         tool_calls=tool_calls,
     )
     model_block = _parse_structured_summary(model_final)
-    destinations = set(after_names) | set(added)
+    # Same-run created umbrellas are valid destinations even when the
+    # post-run snapshot missed them (#76588).
+    destinations = (
+        set(after_names)
+        | set(added)
+        | _created_skill_names_from_tool_calls(tool_calls)
+    )
     absorbed_declarations = _extract_absorbed_into_declarations(tool_calls)
     classification = _reconcile_classification(
         removed=removed,
@@ -1169,7 +1212,13 @@ def _write_run_report(
         tool_calls=llm_meta.get("tool_calls", []) or [],
     )
     model_block = _parse_structured_summary(llm_meta.get("final", "") or "")
-    destinations = set(after_names) | set(added or [])
+    # Same-run created umbrellas are valid destinations even when the
+    # post-run snapshot missed them (#76588).
+    destinations = (
+        set(after_names)
+        | set(added or [])
+        | _created_skill_names_from_tool_calls(llm_meta.get("tool_calls", []) or [])
+    )
     # Authoritative signal: extract per-delete `absorbed_into` declarations
     # from this run's tool calls. These beat both the YAML summary block and
     # the substring heuristic — the model is telling us directly, at the

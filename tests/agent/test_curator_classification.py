@@ -520,3 +520,62 @@ def test_rename_summary_mixed_consolidation_and_pruning(curator_env):
 
 
 
+
+
+def test_same_run_created_umbrella_is_valid_destination(curator_env):
+    """#76588: absorbed_into pointing at an umbrella created earlier in the
+    SAME run must classify as consolidated even when the post-run snapshot
+    reports added=[] and misses the umbrella."""
+    calls = [
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "create", "name": "external-coding-agents",
+            "content": "# External coding agents\nAbsorbs claude-code, codex, opencode guides.\n",
+        })},
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "delete", "name": "claude-code",
+            "absorbed_into": "external-coding-agents",
+        })},
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "delete", "name": "opencode",
+            "absorbed_into": "external-coding-agents",
+        })},
+    ]
+    result = curator_env._classify_removed_skills(
+        removed=["claude-code", "opencode"],
+        added=[],  # bookkeeping defect: umbrella not recorded as added
+        after_names={"keeper"},  # umbrella also missing from post-run snapshot
+        tool_calls=calls,
+    )
+    consolidated = {e["name"]: e["into"] for e in result["consolidated"]}
+    assert consolidated.get("claude-code") == "external-coding-agents"
+    assert consolidated.get("opencode") == "external-coding-agents"
+    assert result["pruned"] == []
+
+
+def test_reconcile_accepts_same_run_created_umbrella(curator_env):
+    """End-to-end reconcile: the absorbed_into declaration is authoritative
+    once the same-run-created umbrella is seeded into destinations."""
+    calls = [
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "create", "name": "kanban-workflow",
+            "content": "# Kanban workflow\n",
+        })},
+        {"name": "skill_manage", "arguments": json.dumps({
+            "action": "delete", "name": "kanban-orchestrator",
+            "absorbed_into": "kanban-workflow",
+        })},
+    ]
+    classification = curator_env._reconcile_classification(
+        removed=["kanban-orchestrator"],
+        heuristic={"consolidated": [], "pruned": []},
+        model_block={"consolidations": [], "prunings": []},
+        destinations=(
+            {"keeper"}
+            | set([])
+            | curator_env._created_skill_names_from_tool_calls(calls)
+        ),
+        absorbed_declarations=curator_env._extract_absorbed_into_declarations(calls),
+    )
+    consolidated = {e["name"]: e["into"] for e in classification["consolidated"]}
+    assert consolidated.get("kanban-orchestrator") == "kanban-workflow"
+    assert classification["pruned"] == []
