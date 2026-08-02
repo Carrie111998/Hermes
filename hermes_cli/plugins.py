@@ -527,6 +527,20 @@ class _PluginRegistrationView:
         self._frozen = True
 
 
+class _PluginPublicationCapability:
+    """Host-owned, fail-closed authority for one managed publication."""
+
+    __slots__ = ("_published",)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_published", False)
+
+    def _activate(self) -> None:
+        # This is the final, non-failing publication point. Bypass plugin-
+        # controlled attribute hooks so activation can never be ambiguous.
+        object.__setattr__(self, "_published", True)
+
+
 @dataclass(frozen=True)
 class _PluginContextBinding:
     """One coherent authority target captured by a registration mutation."""
@@ -535,6 +549,7 @@ class _PluginContextBinding:
     manager: Any
     external_registries: Any
     managed_generation: Optional[int]
+    publication_capability: Optional[_PluginPublicationCapability] = None
 
 
 class _RegistrationTransaction:
@@ -661,9 +676,7 @@ class _RegistrationTransaction:
             if self.replace_owned
             else None
         )
-        context_locks = [
-            context._registration_lock for context in self.contexts
-        ]
+        context_locks = [self.manager._context_registration_lock]
         live_registry_locks = [
             self.manager._lock,
             self.tool_registry._lock,
@@ -675,6 +688,8 @@ class _RegistrationTransaction:
         acquired_locks: List[Any] = []
         revocation_started = False
         publication_started = False
+        publication_committed = False
+        publication_capability = _PluginPublicationCapability()
         context_bindings_before: List[
             tuple[PluginContext, _PluginContextBinding]
         ] = []
@@ -684,7 +699,13 @@ class _RegistrationTransaction:
             # registry lock. This blocks retained contexts before publication
             # can swap or restore their single coherent authority reference.
             for lock in context_locks:
-                lock.acquire()
+                # A registration callback may wait for this commit thread.
+                # Never wait back while it owns the shared context lock: abort
+                # this candidate and let the live registration complete.
+                if not lock.acquire(blocking=False):
+                    raise _ForceSweepAbort(
+                        "plugin publication conflicted with an active registration"
+                    )
                 acquired_locks.append(lock)
             if revoke_generation is not None:
                 # Claim cleanup before the call: an injected BaseException may
@@ -733,10 +754,13 @@ class _RegistrationTransaction:
                     manager=self.manager,
                     external_registries=None,
                     managed_generation=self.context_generation,
+                    publication_capability=publication_capability,
                 )
             self.manager._install_owned_state_locked(next_manager)
+            publication_capability._activate()
+            publication_committed = True
         except BaseException as primary:
-            if publication_started:
+            if publication_started and not publication_committed:
                 rollback_errors: List[BaseException] = []
                 rollback_steps = [
                     (
@@ -820,7 +844,11 @@ class PluginContext:
     ):
         self.manifest = manifest
         self._manager = manager
-        self._registration_lock = threading.RLock()
+        # Every context owned by this manager, including staged transaction
+        # contexts, shares the live manager's reentrant registration lock.
+        # Cross-context callback nesting is therefore same-thread re-entry,
+        # never independent-lock acquisition in an opposing order.
+        self._registration_lock = manager._context_registration_lock
         # Managed discovery supplies isolated registry transaction views.
         # Direct/runtime contexts leave them unset and target live registries.
         self._registration_binding = _PluginContextBinding(
@@ -832,6 +860,16 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+
+    def _registration_binding_locked(self) -> _PluginContextBinding:
+        """Read and validate the one authority binding under its owner lock."""
+        binding = self._registration_binding
+        capability = binding.publication_capability
+        if capability is not None and not capability._published:
+            raise RuntimeError(
+                f"Plugin context for {self.manifest.name!r} is not published"
+            )
+        return binding
 
     def _ensure_live_locked(
         self,
@@ -996,7 +1034,7 @@ class PluginContext:
             )
 
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target_registry = binding.registry
             if target_registry is None:
                 from tools.registry import registry as target_registry
@@ -1103,7 +1141,7 @@ class PluginContext:
         arguments/sub-subparsers.  If *handler_fn* is provided it is set
         as the default dispatch function via ``set_defaults(func=...)``."""
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1171,7 +1209,7 @@ class PluginContext:
             pass  # If commands module isn't available, skip the check
 
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1244,7 +1282,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1288,7 +1326,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             self._register_external_value(
                 binding, "image_gen", provider, register_provider
             )
@@ -1325,7 +1363,7 @@ class PluginContext:
             return
         try:
             with self._registration_lock:
-                binding = self._registration_binding
+                binding = self._registration_binding_locked()
                 name = self._register_external_value(
                     binding,
                     "dashboard",
@@ -1368,7 +1406,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             self._register_external_value(
                 binding,
                 "video_gen",
@@ -1403,7 +1441,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             self._register_external_value(
                 binding, "web", provider, _register_web_provider
             )
@@ -1439,7 +1477,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             self._register_external_value(
                 binding,
                 "browser",
@@ -1493,7 +1531,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             registered = self._register_external_value(
                 binding, "secret", source, register_source
             )
@@ -1536,7 +1574,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             name = self._register_external_value(
                 binding,
                 "tts",
@@ -1589,7 +1627,7 @@ class PluginContext:
             )
             return
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             name = self._register_external_value(
                 binding,
                 "stt",
@@ -1652,7 +1690,7 @@ class PluginContext:
             **entry_kwargs,
         )
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             targets = binding.external_registries
             if targets is None:
                 release_live = self._acquire_live_lease(binding)
@@ -1724,7 +1762,7 @@ class PluginContext:
                 f"action handler with an empty action_id."
             )
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1835,7 +1873,7 @@ class PluginContext:
                 merged_defaults[k] = v
 
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1883,7 +1921,7 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1914,7 +1952,7 @@ class PluginContext:
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1963,7 +2001,7 @@ class PluginContext:
 
         qualified = f"{self.manifest.name}:{name}"
         with self._registration_lock:
-            binding = self._registration_binding
+            binding = self._registration_binding_locked()
             target = binding.manager
             release_live = self._acquire_live_lease(binding)
             try:
@@ -1995,6 +2033,7 @@ class PluginManager:
         # Discovery writers serialize here while readers keep using the live
         # generation. Plugin callbacks are never invoked under registry locks.
         self._discovery_lock = threading.RLock()
+        self._context_registration_lock = threading.RLock()
         self._lock = threading.RLock()
         self._generation = 0
         self._plugins: Dict[str, LoadedPlugin] = {}
@@ -2147,9 +2186,11 @@ class PluginManager:
         """Load plugins, publishing a force reload as one complete generation."""
         if force:
             self._reject_reentrant_force_reload(self._live_context_generation)
+            self._force_discover_and_load()
+            return
         with self._discovery_lock:
             with self._lock:
-                if self._discovered and not force:
+                if self._discovered:
                     return
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
@@ -2158,7 +2199,33 @@ class PluginManager:
                     self._generation += 1
                 return
 
-            if force:
+            with self._lock:
+                self._discovered = True
+                self._generation += 1
+            try:
+                self._discover_and_load_inner()
+            except BaseException:
+                with self._lock:
+                    self._discovered = False
+                    self._generation += 1
+                raise
+
+    def _force_discover_and_load(self) -> None:
+        """Stage and publish a force generation while owning shared authority."""
+        # Acquire before discovery invokes any candidate callback. If a live
+        # registration owns the lock, fail closed without waiting back on a
+        # callback that may itself be waiting for this reload.
+        if not self._context_registration_lock.acquire(blocking=False):
+            return
+        try:
+            with self._discovery_lock:
+                if env_var_enabled("HERMES_SAFE_MODE"):
+                    logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
+                    with self._lock:
+                        self._discovered = True
+                        self._generation += 1
+                    return
+
                 transaction = _RegistrationTransaction(
                     self,
                     replace_owned=True,
@@ -2182,18 +2249,8 @@ class PluginManager:
                 except BaseException:
                     _restore_module_namespace(_NS_PARENT, module_snapshot)
                     raise
-                return
-
-            with self._lock:
-                self._discovered = True
-                self._generation += 1
-            try:
-                self._discover_and_load_inner()
-            except BaseException:
-                with self._lock:
-                    self._discovered = False
-                    self._generation += 1
-                raise
+        finally:
+            self._context_registration_lock.release()
 
     def _discover_and_load_inner(
         self,

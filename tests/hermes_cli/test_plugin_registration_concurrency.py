@@ -985,6 +985,112 @@ def test_failed_initial_publication_restores_candidate_context_targets(
     assert late_hook not in manager._hooks.get("post_tool_call", [])
 
 
+def test_failed_binding_rollback_leaves_retained_candidate_without_live_authority(
+    tmp_path, monkeypatch, isolated_registries, caplog
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("candidate", "binding-rollback-failure")
+    support = _support(values, "candidate", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    primary = _InjectedBaseException("injected after tentative live binding")
+    rollback_failure = _InjectedBaseException("injected binding rollback failure")
+    original_install = manager._install_owned_state_locked
+
+    def install_then_interrupt(state) -> None:
+        original_install(state)
+        raise primary
+
+    monkeypatch.setattr(manager, "_install_owned_state_locked", install_then_interrupt)
+    original_setattr = plugins_module.PluginContext.__setattr__
+    binding_assignments = 0
+
+    def fail_binding_rollback(self, name, value) -> None:
+        nonlocal binding_assignments
+        if self is support.saved_context and name == "_registration_binding":
+            binding_assignments += 1
+            if binding_assignments == 2:
+                raise rollback_failure
+        original_setattr(self, name, value)
+
+    monkeypatch.setattr(plugins_module.PluginContext, "__setattr__", fail_binding_rollback)
+
+    with pytest.raises(_InjectedBaseException) as raised:
+        manager.discover_and_load()
+
+    assert raised.value is primary
+    assert binding_assignments == 2
+    assert any(
+        "Plugin publication rollback failed for context[0]" in record.message
+        for record in caplog.records
+    )
+    assert any("rollback failed" in note.lower() for note in primary.__notes__)
+
+    candidate_context = support.saved_context
+    escaped_tool = "h1_failed_rollback_escape_tool"
+    escaped_platform = "h1-failed-rollback-escape-platform"
+    escaped_hook = "h1_failed_rollback_escape_hook"
+    escaped_command = "h1-failed-rollback-escape-command"
+    mutations = [
+        lambda: candidate_context.register_tool(
+            escaped_tool,
+            "h1_transaction",
+            {
+                "name": escaped_tool,
+                "description": "must not escape",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            lambda args, **kwargs: "escaped",
+        ),
+        lambda: candidate_context.register_platform(
+            name=escaped_platform,
+            label="Must not escape",
+            adapter_factory=lambda config: "escaped",
+            check_fn=lambda: True,
+        ),
+        lambda: candidate_context.register_hook(escaped_hook, lambda **kwargs: "escaped"),
+        lambda: candidate_context.register_command(
+            escaped_command,
+            lambda raw_args: "escaped",
+        ),
+    ]
+    escaped_surfaces = []
+    for surface, mutate in zip(
+        ("tool", "platform", "hook", "command"),
+        mutations,
+        strict=True,
+    ):
+        try:
+            mutate()
+        except RuntimeError as exc:
+            assert "not published" in str(exc)
+        else:  # pragma: no cover - deterministic RED assertion on the base
+            escaped_surfaces.append(surface)
+
+    assert escaped_surfaces == []
+
+    binding = candidate_context._registration_binding
+    assert binding.manager is manager
+    assert binding.managed_generation == manager._live_context_generation
+    assert binding.publication_capability is not None
+    assert binding.publication_capability._published is False
+
+    assert registry.get_entry(escaped_tool) is None
+    assert isolated_registries.get(escaped_platform) is None
+    assert escaped_hook not in manager._hooks
+    assert escaped_command not in manager._plugin_commands
+
+
 def _mutate_retained_candidate(context, surface: str, name: str) -> None:
     if surface == "tool":
         context.register_tool(
@@ -1168,6 +1274,126 @@ def test_failed_initial_publication_restores_binding_before_retained_candidate_m
         assert name not in manager._plugin_external_names["platform"]
     else:
         assert name not in manager._hooks
+
+
+def test_commit_does_not_deadlock_reverse_nested_candidate_context_registration(
+    isolated_registries,
+):
+    manager = PluginManager()
+    transaction = plugins_module._RegistrationTransaction(manager)
+    manifest_a = plugins_module.PluginManifest(name="h1-lock-a")
+    manifest_b = plugins_module.PluginManifest(name="h1-lock-b")
+    context_kwargs = {
+        "registration_manager": transaction.manager_view,
+        "registration_registry": transaction.tool_view,
+        "registration_external_registries": transaction.context_targets(),
+    }
+    context_a = plugins_module.PluginContext(manifest_a, manager, **context_kwargs)
+    context_b = plugins_module.PluginContext(manifest_b, manager, **context_kwargs)
+    transaction.contexts.extend((context_a, context_b))
+
+    commit_attempted_context_lock = threading.Event()
+    commit_ident: list[int] = []
+
+    class _ObservedRLock:
+        def __init__(self, lock) -> None:
+            self._lock = lock
+
+        def acquire(self, *args, **kwargs):
+            if commit_ident and threading.get_ident() == commit_ident[0]:
+                commit_attempted_context_lock.set()
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self) -> None:
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.release()
+
+    wrappers = {}
+    for context in (context_a, context_b):
+        lock = context._registration_lock
+        wrapper = wrappers.setdefault(id(lock), _ObservedRLock(lock))
+        context._registration_lock = wrapper
+    if hasattr(manager, "_context_registration_lock"):
+        lock = manager._context_registration_lock
+        manager._context_registration_lock = wrappers.setdefault(
+            id(lock), _ObservedRLock(lock)
+        )
+
+    callback_entered = threading.Event()
+    registration_done = threading.Event()
+    registration_failures: list[BaseException] = []
+
+    class _ReverseNestedSchema(dict):
+        def get(self, key, default=None):
+            if key == "description":
+                callback_entered.set()
+                assert commit_attempted_context_lock.wait(timeout=5)
+                context_a.register_hook(
+                    "h1_reverse_nested_hook",
+                    lambda **kwargs: "must not publish",
+                )
+            return super().get(key, default)
+
+    def register_from_context_b() -> None:
+        try:
+            context_b.register_tool(
+                "h1_reverse_nested_tool",
+                "h1_transaction",
+                _ReverseNestedSchema(
+                    {
+                        "name": "h1_reverse_nested_tool",
+                        "description": "must not publish",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ),
+                lambda args, **kwargs: "must not publish",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            registration_failures.append(exc)
+        finally:
+            registration_done.set()
+
+    registration_thread = threading.Thread(
+        target=register_from_context_b,
+        daemon=True,
+    )
+    registration_thread.start()
+    assert callback_entered.wait(timeout=5)
+
+    commit_done = threading.Event()
+    commit_failures: list[BaseException] = []
+
+    def commit() -> None:
+        commit_ident.append(threading.get_ident())
+        try:
+            transaction.commit()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            commit_failures.append(exc)
+        finally:
+            commit_done.set()
+
+    commit_thread = threading.Thread(target=commit, daemon=True)
+    commit_thread.start()
+
+    assert commit_attempted_context_lock.wait(timeout=5)
+    assert registration_done.wait(timeout=5), "reverse nested registration deadlocked"
+    assert commit_done.wait(timeout=5), "commit deadlocked on reverse context order"
+    registration_thread.join(timeout=1)
+    commit_thread.join(timeout=1)
+    assert not registration_thread.is_alive()
+    assert not commit_thread.is_alive()
+    assert len(commit_failures) == 1
+    assert isinstance(commit_failures[0], plugins_module._ForceSweepAbort)
+    assert len(registration_failures) == 1
+    assert "frozen" in str(registration_failures[0])
+    assert registry.get_entry("h1_reverse_nested_tool") is None
+    assert "h1_reverse_nested_hook" not in manager._hooks
 
 
 def test_retained_context_live_registration_does_not_validate_under_live_locks(
