@@ -294,7 +294,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_delivery_payload, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_delivery_execution, create_execution, finish_execution, get_execution, mark_execution_ambiguous, mark_execution_running, read_delivery_artifact, require_canonical_scheduled_for, require_scheduler_source
+from cron.executions import create_delivery_execution, create_execution, finish_execution, get_execution, mark_execution_ambiguous, mark_execution_running, read_delivery_artifacts, require_canonical_scheduled_for, require_scheduler_source
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1480,6 +1480,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
+    on_provider_contact=None,
 ) -> bool:
     """Send media and return True only when every attachment is confirmed."""
     from pathlib import Path
@@ -1494,17 +1495,29 @@ def _send_media_via_adapter(
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                send = adapter.send_voice
+                send_kwargs = {"chat_id": chat_id, "audio_path": media_path, "metadata": metadata}
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                send = adapter.send_video
+                send_kwargs = {"chat_id": chat_id, "video_path": media_path, "metadata": metadata}
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                send = adapter.send_image_file
+                send_kwargs = {"chat_id": chat_id, "image_path": media_path, "metadata": metadata}
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                send = adapter.send_document
+                send_kwargs = {"chat_id": chat_id, "file_path": media_path, "metadata": metadata}
+
+            async def invoke_media(send=send, send_kwargs=send_kwargs):
+                if on_provider_contact is not None:
+                    on_provider_contact()
+                return await send(**send_kwargs)
+
+            coro = invoke_media()
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
+                coro.close()
                 logger.warning(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
@@ -1624,6 +1637,17 @@ class DeliveryOutcome:
         return (self.error or "").startswith(value)
 
 
+def _delivery_target_key(target: dict) -> str:
+    """Canonical per-target identity shared by contact and receipt evidence."""
+    return json.dumps({
+        "platform": str(target.get("platform") or "").lower(),
+        "chat_id": str(target.get("chat_id") or ""),
+        "thread_id": (
+            None if target.get("thread_id") is None else str(target.get("thread_id"))
+        ),
+    }, sort_keys=True)
+
+
 def _delivery_outcome(
     *, receipts: List[dict], errors: Optional[List[str]] = None,
     suppressed: bool = False,
@@ -1647,18 +1671,20 @@ def _delivery_outcome(
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, targets: Optional[List[dict]] = None,
     receipts: Optional[List[dict]] = None,
+    provider_contacts: Optional[dict] = None,
 ) -> DeliveryOutcome:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
     When ``adapters`` and ``loop`` are provided (gateway is running), tries to
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
-    the standalone HTTP path cannot encrypt.  Falls back to standalone send if
-    the adapter path fails or is unavailable.
+    the standalone HTTP path cannot encrypt. Falls back to standalone only
+    when the live path is unavailable or proven not to have invoked an adapter.
 
     Returns a typed terminal outcome and one actual-route receipt per target.
     """
     receipt_evidence = receipts if receipts is not None else []
+    contact_evidence = provider_contacts if provider_contacts is not None else {}
     targets = _resolve_delivery_targets(job) if targets is None else targets
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -1760,6 +1786,10 @@ def _deliver_result(
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        target_key = _delivery_target_key(target)
+
+        def mark_provider_contact(transport_name: str) -> None:
+            contact_evidence.setdefault(target_key, transport_name)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1799,7 +1829,14 @@ def _deliver_result(
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        try:
+            transport = resolve_delivery_transport(platform, config, adapters)
+        except Exception as exc:
+            msg = f"delivery setup for {platform_name}:{chat_id} failed: {exc}"
+            logger.error("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            record_outcome(target, thread_id, "failed", "none", msg)
+            continue
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -2029,6 +2066,7 @@ def _deliver_result(
                             route_target,
                             text_to_send,
                             route_metadata,
+                            on_provider_contact=lambda: mark_provider_contact("live"),
                         ),
                         loop,
                     )
@@ -2092,9 +2130,9 @@ def _deliver_result(
                                     "confirmation timed out after dispatch",
                                 )
                         except Exception as ex:
-                            # A real send error (not a slow confirmation) — fall
-                            # through to the standalone path so the message is
-                            # still delivered.
+                            # The outer handler consults the exact adapter-call
+                            # marker. Post-contact exceptions are ambiguous;
+                            # only pre-contact failures may fall through.
                             target_errors.append(f"live adapter send failed: {ex}")
                             raise
 
@@ -2134,7 +2172,14 @@ def _deliver_result(
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                contacted = contact_evidence.get(target_key) == "live"
+                                if contacted:
+                                    logger.warning(
+                                        "Job '%s': %s; outcome is ambiguous and "
+                                        "standalone fallback is unsafe",
+                                        job["id"], msg,
+                                    )
+                                elif transport is not None and transport.is_relay:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -2143,6 +2188,12 @@ def _deliver_result(
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
+                                if contacted:
+                                    delivery_errors.append(msg)
+                                    record_outcome(
+                                        target, thread_id, "ambiguous", "live", msg,
+                                    )
+                                    target_ambiguous = True
                             elif (
                                 send_raw_response
                                 and thread_id
@@ -2183,17 +2234,26 @@ def _deliver_result(
                         loop,
                         job,
                         platform=platform,
+                        on_provider_contact=lambda: mark_provider_contact("live"),
                     )
                     if not media_confirmed:
                         msg = (
                             "text may have been delivered but one or more media "
                             f"attachments were not confirmed for {platform_name}:{chat_id}"
                         )
-                        delivery_errors.append(msg)
-                        record_outcome(target, thread_id, "ambiguous", "live", msg)
                         adapter_ok = False
-                        timed_out = True
-                        target_ambiguous = True
+                        if contact_evidence.get(target_key) == "live":
+                            delivery_errors.append(msg)
+                            record_outcome(target, thread_id, "ambiguous", "live", msg)
+                            timed_out = True
+                            target_ambiguous = True
+                        else:
+                            target_errors.append(msg)
+                            logger.warning(
+                                "Job '%s': media send failed before provider contact, "
+                                "falling back to standalone",
+                                job["id"],
+                            )
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -2238,7 +2298,15 @@ def _deliver_result(
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if transport is not None and transport.is_relay:
+                if contact_evidence.get(target_key) == "live":
+                    logger.warning(
+                        "Job '%s': %s; outcome is ambiguous and standalone fallback is unsafe",
+                        job["id"], err_msg,
+                    )
+                    delivery_errors.append(err_msg)
+                    record_outcome(target, thread_id, "ambiguous", "live", err_msg)
+                    target_ambiguous = True
+                elif transport is not None and transport.is_relay:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
@@ -4687,18 +4755,30 @@ def _clear_cron_execution_context() -> None:
         _VAR_MAP[name].set("")
 
 
-def _materialize_delivery_artifact(job_id: str, execution_id: str, content: str) -> tuple[str, str]:
+def _materialize_delivery_artifact(
+    job_id: str, execution_id: str, content: str,
+) -> tuple[str, str, List[dict]]:
     """Bind a delivery attempt to exact media bytes or exact delivered text."""
     from gateway.platforms.base import BasePlatformAdapter
 
     media_files, _cleaned = BasePlatformAdapter.extract_media(content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    media_artifacts = []
+    for media_path, is_voice in media_files:
+        media = Path(media_path).expanduser().resolve(strict=True)
+        payload = media.read_bytes()
+        media_artifacts.append({
+            "path": str(media),
+            "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+            "is_voice": bool(is_voice),
+        })
     if len(media_files) == 1:
         artifact = Path(media_files[0][0]).expanduser().resolve(strict=True)
     else:
         artifact = save_delivery_payload(job_id, execution_id, content).resolve(strict=True)
     digest = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
-    return str(artifact), digest
+    return str(artifact), digest, media_artifacts
 
 
 def _bind_delivery_content_to_execution_artifact(
@@ -4710,10 +4790,19 @@ def _bind_delivery_content_to_execution_artifact(
     """Make dispatch consume only the bytes owned and proved by its execution."""
     from gateway.platforms.base import BasePlatformAdapter
 
-    payload = read_delivery_artifact(str(delivery_execution["id"]))
+    manifest, payloads = read_delivery_artifacts(str(delivery_execution["id"]))
+    payload = payloads[str(manifest["payload"]["path"])]
     owned_path = str(delivery_execution["artifact_path"])
     media_files, _cleaned = BasePlatformAdapter.extract_media(content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    owned_media = manifest.get("media") or []
+    if owned_media:
+        if len(owned_media) != len(media_files):
+            raise ValueError("delivery artifact manifest does not match MEDIA directives")
+        bound = content
+        for (source, _is_voice), owned in zip(media_files, owned_media):
+            bound = bound.replace(str(source), str(owned["path"]), 1)
+        return bound
     if len(media_files) == 1:
         source = str(Path(media_files[0][0]).expanduser().resolve(strict=True))
         expected_source = str(Path(source_artifact_path).expanduser().resolve(strict=True))
@@ -4772,7 +4861,7 @@ def run_one_job(
     job["_resolved_delivery_targets"] = _resolve_delivery_targets(job)
     delivery_execution_id = None
     delivery_receipts: List[dict] = []
-    delivery_dispatch_started = False
+    delivery_provider_contacts = {}
     delivery_terminal = False
     producer_terminal = False
     try:
@@ -4941,13 +5030,14 @@ def run_one_job(
             if should_deliver:
                 delivery_targets = list(job["_resolved_delivery_targets"])
                 if delivery_targets:
-                    artifact_path, artifact_sha256 = _materialize_delivery_artifact(
+                    artifact_path, artifact_sha256, media_artifacts = _materialize_delivery_artifact(
                         job["id"], execution_id, deliver_content,
                     )
                     delivery_execution = create_delivery_execution(
                         producer_execution_id=execution_id,
                         artifact_path=artifact_path,
                         artifact_sha256=artifact_sha256,
+                        media_artifacts=media_artifacts,
                         delivery_targets=delivery_targets,
                     )
                     delivery_execution_id = delivery_execution["id"]
@@ -4959,42 +5049,37 @@ def run_one_job(
                         delivery_execution=delivery_execution,
                     )
                     try:
-                        delivery_dispatch_started = True
                         delivery_outcome = _deliver_result(
                             job, execution_content, adapters=adapters, loop=loop,
                             targets=delivery_targets,
                             receipts=delivery_receipts,
+                            provider_contacts=delivery_provider_contacts,
                         )
                     except Exception as de:
-                        detail = f"delivery raised after dispatch began: {de}"
-                        logger.error("Delivery outcome is ambiguous for job %s: %s", job["id"], de)
+                        detail = f"delivery raised: {de}"
+                        logger.error("Delivery failed unexpectedly for job %s: %s", job["id"], de)
                         evidenced = {
-                            json.dumps(receipt.get("requested_target"), sort_keys=True)
+                            _delivery_target_key(receipt.get("requested_target") or {})
                             for receipt in delivery_receipts
                         }
                         for target in delivery_targets:
-                            if json.dumps(target, sort_keys=True) not in evidenced:
+                            if _delivery_target_key(target) not in evidenced:
+                                contacted_transport = delivery_provider_contacts.get(
+                                    _delivery_target_key(target)
+                                )
                                 delivery_receipts.append({
                                     "requested_target": target,
                                     "actual_target": target,
-                                    "status": "ambiguous",
-                                    "transport": "live",
+                                    "status": "ambiguous" if contacted_transport else "failed",
+                                    "transport": contacted_transport or "none",
                                     "error": detail,
                                     "provider_receipt_id": None,
                                 })
-                        if delivery_receipts and not any(
-                            receipt.get("status") == "ambiguous"
-                            for receipt in delivery_receipts
-                        ):
-                            delivery_receipts[-1] = {
-                                **delivery_receipts[-1],
-                                "status": "ambiguous",
-                                "transport": "live",
-                                "error": detail,
-                                "provider_receipt_id": None,
-                            }
+                        ambiguous = any(
+                            receipt.get("status") == "ambiguous" for receipt in delivery_receipts
+                        )
                         delivery_outcome = DeliveryOutcome(
-                            state=DeliveryState.AMBIGUOUS,
+                            state=DeliveryState.AMBIGUOUS if ambiguous else DeliveryState.FAILED,
                             receipts=tuple(delivery_receipts),
                             error=detail,
                         )
@@ -5064,33 +5149,23 @@ def run_one_job(
         try:
             if delivery_execution_id and not delivery_terminal:
                 evidenced = {
-                    json.dumps(receipt.get("requested_target"), sort_keys=True)
+                    _delivery_target_key(receipt.get("requested_target") or {})
                     for receipt in delivery_receipts
                 }
-                receipt_status = "ambiguous" if delivery_dispatch_started else "failed"
-                transport = "live" if delivery_dispatch_started else "none"
                 for target in delivery_targets:
-                    if json.dumps(target, sort_keys=True) not in evidenced:
+                    if _delivery_target_key(target) not in evidenced:
+                        transport = delivery_provider_contacts.get(
+                            _delivery_target_key(target)
+                        )
                         delivery_receipts.append({
                             "requested_target": target,
                             "actual_target": target,
-                            "status": receipt_status,
-                            "transport": transport,
+                            "status": "ambiguous" if transport else "failed",
+                            "transport": transport or "none",
                             "error": _err_text,
                             "provider_receipt_id": None,
                         })
-                if delivery_dispatch_started:
-                    if delivery_receipts and not any(
-                        receipt.get("status") == "ambiguous"
-                        for receipt in delivery_receipts
-                    ):
-                        delivery_receipts[-1] = {
-                            **delivery_receipts[-1],
-                            "status": "ambiguous",
-                            "transport": "live",
-                            "error": _err_text,
-                            "provider_receipt_id": None,
-                        }
+                if any(receipt.get("status") == "ambiguous" for receipt in delivery_receipts):
                     mark_execution_ambiguous(
                         delivery_execution_id,
                         error=_err_text,

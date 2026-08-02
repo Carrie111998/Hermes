@@ -296,7 +296,7 @@ class TestDeliverResultWrapping:
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
-            _deliver_result(job, "Here is today's summary.")
+            result = _deliver_result(job, "Here is today's summary.")
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
@@ -305,6 +305,9 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+        assert result.state is DeliveryState.DELIVERED
+        assert result.receipts[0]["status"] == "delivered"
+        assert result.receipts[0]["transport"] == "standalone"
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -421,7 +424,7 @@ class TestDeliverResultWrapping:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _deliver_result(
+            result = _deliver_result(
                 job,
                 f"Here is TTS\nMEDIA:{media_path}",
                 adapters={Platform.DISCORD: adapter},
@@ -438,6 +441,9 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+        assert result.state is DeliveryState.DELIVERED
+        assert result.receipts[0]["status"] == "delivered"
+        assert result.receipts[0]["transport"] == "live"
 
 
 class TestDeliverResultErrorReturns:
@@ -460,6 +466,132 @@ class TestDeliverResultErrorReturns:
             result = _deliver_result(job, "Output.")
         assert result is not None
         assert "not configured" in result
+
+    def test_live_adapter_exception_after_contact_is_ambiguous_without_fallback(self):
+        from concurrent.futures import Future
+
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        adapter = AsyncMock()
+        adapter.send.side_effect = ConnectionError("response lost after accept")
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def run_coro(coro, _loop):
+            import asyncio
+
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        standalone = AsyncMock(return_value={"success": True})
+        target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+        contacts = {}
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=run_coro),
+            patch("tools.send_message_tool._send_to_platform", new=standalone),
+        ):
+            result = _deliver_result(
+                {"id": "contact-boundary", "deliver": "telegram:123"},
+                "payload",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                targets=[target],
+                provider_contacts=contacts,
+            )
+
+        assert result.state is DeliveryState.AMBIGUOUS
+        assert result.receipts == ({
+            "requested_target": target,
+            "actual_target": target,
+            "status": "ambiguous",
+            "transport": "live",
+            "error": "live adapter delivery to telegram:123 failed: response lost after accept",
+            "provider_receipt_id": None,
+        },)
+        assert contacts == {json.dumps(target, sort_keys=True): "live"}
+        standalone.assert_not_awaited()
+
+    def test_transport_resolution_exception_is_failed_before_contact(self):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+        )
+        target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+        contacts = {}
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch(
+                "gateway.delivery.resolve_delivery_transport",
+                side_effect=RuntimeError("adapter registry unavailable"),
+            ),
+        ):
+            result = _deliver_result(
+                {"id": "resolve-boundary", "deliver": "telegram:123"},
+                "payload",
+                targets=[target],
+                provider_contacts=contacts,
+            )
+
+        assert result.state is DeliveryState.FAILED
+        assert result.receipts == ({
+            "requested_target": target,
+            "actual_target": target,
+            "status": "failed",
+            "transport": "none",
+            "error": "delivery setup for telegram:123 failed: adapter registry unavailable",
+            "provider_receipt_id": None,
+        },)
+        assert contacts == {}
+
+    def test_media_scheduling_failure_before_contact_safely_falls_back(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        media = tmp_path / "owned.png"
+        media.write_bytes(b"owned media")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,),
+        )
+        adapter = AsyncMock()
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        standalone = AsyncMock(return_value={"success": True})
+        target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+        contacts = {}
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("agent.async_utils.safe_schedule_threadsafe", return_value=None),
+            patch("tools.send_message_tool._send_to_platform", new=standalone),
+        ):
+            result = _deliver_result(
+                {"id": "media-pre-contact", "deliver": "telegram:123"},
+                f"MEDIA:{media}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                targets=[target],
+                provider_contacts=contacts,
+            )
+
+        assert contacts == {}
+        assert result.state is DeliveryState.DELIVERED
+        assert result.receipts[0]["transport"] == "standalone"
+        standalone.assert_awaited_once()
 
 
 class TestRunJobSessionPersistence:
@@ -1519,9 +1651,10 @@ class TestSendMediaViaAdapter:
         from concurrent.futures import Future
 
         def fake_run_coro(coro, _loop):
-            coro.close()
+            import asyncio
+
             completed = Future()
-            completed.set_result(MagicMock(success=True))
+            completed.set_result(asyncio.run(coro))
             return completed
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
@@ -1530,8 +1663,8 @@ class TestSendMediaViaAdapter:
 
     def test_multiple_media_files_all_delivered(self, tmp_path, monkeypatch):
         adapter = MagicMock()
-        adapter.send_voice = AsyncMock()
-        adapter.send_image_file = AsyncMock()
+        adapter.send_voice = AsyncMock(return_value=MagicMock(success=True))
+        adapter.send_image_file = AsyncMock(return_value=MagicMock(success=True))
         voice_path = self._safe_media_path(tmp_path, monkeypatch, "voice.mp3")
         photo_path = self._safe_media_path(tmp_path, monkeypatch, "photo.jpg")
         media_files = [(str(voice_path), False), (str(photo_path), False)]
@@ -2490,8 +2623,8 @@ class TestSendMediaTimeoutCancelsFuture:
         from concurrent.futures import Future
 
         adapter = MagicMock()
-        adapter.send_image_file = AsyncMock()
-        adapter.send_video = AsyncMock()
+        adapter.send_image_file = AsyncMock(return_value=MagicMock(success=True))
+        adapter.send_video = AsyncMock(return_value=MagicMock(success=True))
 
         # First file: future that times out. Second file: future that resolves OK.
         timeout_future = Future()
@@ -2506,13 +2639,19 @@ class TestSendMediaTimeoutCancelsFuture:
         timeout_future.result = MagicMock(side_effect=TimeoutError("timed out"))
 
         ok_future = Future()
-        ok_future.set_result(MagicMock(success=True))
 
-        futures_iter = iter([timeout_future, ok_future])
+        call_count = 0
 
         def fake_run_coro(coro, _loop):
-            coro.close()
-            return next(futures_iter)
+            nonlocal call_count
+            import asyncio
+
+            call_count += 1
+            if call_count == 1:
+                coro.close()
+                return timeout_future
+            ok_future.set_result(asyncio.run(coro))
+            return ok_future
 
         root = tmp_path / "media-cache"
         slow = root / "slow.png"

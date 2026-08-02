@@ -93,6 +93,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              artifact_path TEXT,
              artifact_sha256 TEXT,
              artifact_size_bytes INTEGER,
+             artifact_manifest TEXT,
              authorized_delivery_targets TEXT,
              delivery_receipts TEXT
            )"""
@@ -113,6 +114,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("artifact_path", "TEXT"),
         ("artifact_sha256", "TEXT"),
         ("artifact_size_bytes", "INTEGER"),
+        ("artifact_manifest", "TEXT"),
         ("authorized_delivery_targets", "TEXT"),
         ("delivery_receipts", "TEXT"),
     ):
@@ -238,6 +240,7 @@ def create_delivery_execution(
     producer_execution_id: str,
     artifact_path: str,
     artifact_sha256: str,
+    media_artifacts: Optional[List[Dict[str, Any]]] = None,
     delivery_targets: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Claim a delivery attempt only for completed producer bytes."""
@@ -253,6 +256,24 @@ def create_delivery_execution(
     actual_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     if actual_digest != expected_digest:
         raise ValueError("artifact digest does not match exact bytes")
+
+    normalized_media = []
+    for index, entry in enumerate(media_artifacts or []):
+        if not isinstance(entry, dict):
+            raise ValueError("media artifact is invalid")
+        media_path = Path(str(entry.get("path") or "")).expanduser().resolve(strict=True)
+        media_payload = media_path.read_bytes()
+        media_digest = str(entry.get("sha256") or "").lower()
+        actual_media_digest = "sha256:" + hashlib.sha256(media_payload).hexdigest()
+        if media_digest != actual_media_digest or entry.get("size_bytes") != len(media_payload):
+            raise ValueError(f"media artifact {index} does not match exact bytes")
+        normalized_media.append({
+            "source_path": media_path,
+            "payload": media_payload,
+            "sha256": actual_media_digest,
+            "size_bytes": len(media_payload),
+            "is_voice": bool(entry.get("is_voice", False)),
+        })
 
     normalized_targets = []
     for target in delivery_targets:
@@ -278,6 +299,7 @@ def create_delivery_execution(
         pass
     suffix = resolved.suffix if len(resolved.suffix) <= 16 else ""
     owned_path = artifact_dir / f"{execution_id}{suffix}"
+    owned_paths: List[Path] = []
     now = _hermes_now().isoformat()
     pid = os.getpid()
     with _transaction() as conn:
@@ -287,32 +309,65 @@ def create_delivery_execution(
         if (producer is None or producer["kind"] != "producer"
                 or producer["status"] not in ("completed", "failed")):
             raise ValueError("delivery execution requires a terminal producer execution")
-        fd = os.open(owned_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                owned_path.chmod(0o400)
-            except OSError:
-                pass
+            def write_owned(path: Path, exact_payload: bytes) -> None:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                owned_paths.append(path)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(exact_payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    path.chmod(0o400)
+                except OSError:
+                    pass
+
+            write_owned(owned_path, payload)
+            owned_media = []
+            for index, entry in enumerate(normalized_media):
+                if len(normalized_media) == 1 and entry["source_path"] == resolved:
+                    media_owned_path = owned_path
+                else:
+                    media_suffix = entry["source_path"].suffix
+                    if len(media_suffix) > 16:
+                        media_suffix = ""
+                    media_owned_path = artifact_dir / (
+                        f"{execution_id}-media-{index:03d}{media_suffix}"
+                    )
+                    write_owned(media_owned_path, entry["payload"])
+                owned_media.append({
+                    "path": str(media_owned_path),
+                    "sha256": entry["sha256"],
+                    "size_bytes": entry["size_bytes"],
+                    "is_voice": entry["is_voice"],
+                })
+            manifest = {
+                "version": 1,
+                "payload": {
+                    "path": str(owned_path),
+                    "sha256": actual_digest,
+                    "size_bytes": len(payload),
+                },
+                "media": owned_media,
+            }
             conn.execute(
                 """INSERT INTO executions
                    (id, job_id, source, process_id, pid, process_started_at,
                     status, claimed_at, scheduled_for, kind, parent_execution_id,
-                    artifact_path, artifact_sha256, artifact_size_bytes,
+                    artifact_path, artifact_sha256, artifact_size_bytes, artifact_manifest,
                     authorized_delivery_targets)
-                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, 'delivery', ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, 'delivery', ?, ?, ?, ?, ?, ?)""",
                 (
                     execution_id, producer["job_id"], producer["source"], _PROCESS_ID, pid,
                     _process_start_time(pid), now, producer["scheduled_for"], producer["id"],
                     str(owned_path), actual_digest, len(payload),
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":")),
                     json.dumps(normalized_targets, sort_keys=True, separators=(",", ":")),
                 ),
             )
         except BaseException:
-            owned_path.unlink(missing_ok=True)
+            for path in owned_paths:
+                path.unlink(missing_ok=True)
             raise
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -324,19 +379,52 @@ def create_delivery_execution(
 
 def read_delivery_artifact(execution_id: str) -> bytes:
     """Read execution-owned bytes only after proving their durable digest and size."""
+    manifest, payloads = read_delivery_artifacts(execution_id)
+    return payloads[str(manifest["payload"]["path"])]
+
+
+def read_delivery_artifact_manifest(execution_id: str) -> Dict[str, Any]:
+    """Return the ordered owned manifest after revalidating every exact file."""
+    manifest, _payloads = read_delivery_artifacts(execution_id)
+    return manifest
+
+
+def read_delivery_artifacts(execution_id: str) -> tuple[Dict[str, Any], Dict[str, bytes]]:
+    """Read and validate the manifest and every owned payload in one pass."""
     with _transaction() as conn:
         row = conn.execute(
-            """SELECT kind, artifact_path, artifact_sha256, artifact_size_bytes
+            """SELECT kind, artifact_path, artifact_sha256, artifact_size_bytes,
+                      artifact_manifest
                FROM executions WHERE id=?""",
             (str(execution_id),),
         ).fetchone()
     if row is None or row["kind"] != "delivery" or not row["artifact_path"]:
         raise ValueError("delivery artifact does not belong to a delivery execution")
-    payload = Path(row["artifact_path"]).read_bytes()
-    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
-    if digest != row["artifact_sha256"] or len(payload) != row["artifact_size_bytes"]:
-        raise ValueError("delivery artifact bytes no longer match durable proof")
-    return payload
+    if row["artifact_manifest"]:
+        manifest = json.loads(row["artifact_manifest"])
+    else:
+        # Existing ledgers predate multi-artifact ownership. Their single
+        # artifact remains fully verifiable through the original columns.
+        manifest = {
+            "version": 0,
+            "payload": {
+                "path": row["artifact_path"],
+                "sha256": row["artifact_sha256"],
+                "size_bytes": row["artifact_size_bytes"],
+            },
+            "media": [],
+        }
+    entries = [manifest.get("payload")] + list(manifest.get("media") or [])
+    payloads = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise ValueError("delivery artifact manifest is invalid")
+        exact_payload = Path(entry["path"]).read_bytes()
+        digest = "sha256:" + hashlib.sha256(exact_payload).hexdigest()
+        if digest != entry.get("sha256") or len(exact_payload) != entry.get("size_bytes"):
+            raise ValueError("delivery artifact bytes no longer match durable proof")
+        payloads[str(entry["path"])] = exact_payload
+    return manifest, payloads
 
 
 def _normalize_target(target: Dict[str, Any], *, label: str) -> Dict[str, Any]:

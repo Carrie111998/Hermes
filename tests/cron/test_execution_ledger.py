@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -153,6 +154,32 @@ def test_delivery_execution_owns_immutable_artifact_bytes(monkeypatch, tmp_path)
     )
 
 
+def test_pre_manifest_delivery_row_remains_readable_after_schema_migration(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    source = tmp_path / "legacy-owned.txt"
+    source.write_bytes(b"legacy exact bytes")
+    producer = _create(executions, "legacy-delivery")
+    executions.finish_execution(producer["id"], success=True)
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=str(source),
+        artifact_sha256=f"sha256:{hashlib.sha256(source.read_bytes()).hexdigest()}",
+        delivery_targets=[{"platform": "telegram", "chat_id": "-100123"}],
+    )
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET artifact_manifest=NULL WHERE id=?",
+            (delivery["id"],),
+        )
+
+    assert executions.read_delivery_artifact(delivery["id"]) == b"legacy exact bytes"
+    manifest = executions.read_delivery_artifact_manifest(delivery["id"])
+    assert manifest["version"] == 0
+    assert manifest["media"] == []
+
+
 def test_dispatch_content_uses_claimed_bytes_after_source_mutation(monkeypatch, tmp_path):
     import cron.scheduler as scheduler
     from gateway.platforms.base import BasePlatformAdapter
@@ -178,6 +205,265 @@ def test_dispatch_content_uses_claimed_bytes_after_source_mutation(monkeypatch, 
 
     assert Path(media[0][0]).read_bytes() == b"bytes at claim"
     assert Path(media[0][0]) == Path(delivery["artifact_path"])
+
+
+def test_multi_media_dispatch_uses_ordered_execution_owned_bytes(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+    from gateway.platforms.base import BasePlatformAdapter
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    first = tmp_path / "mutable-first.png"
+    second = tmp_path / "mutable-second.pdf"
+    first.write_bytes(b"first bytes at claim")
+    second.write_bytes(b"second bytes at claim")
+    content = f"claimed report\nMEDIA:{first}\nMEDIA:{second}"
+    producer = _create(executions, "multi-media")
+    executions.finish_execution(producer["id"], success=True)
+
+    artifact_path, artifact_sha256, media_artifacts = scheduler._materialize_delivery_artifact(
+        "multi-media", producer["id"], content,
+    )
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        media_artifacts=media_artifacts,
+        delivery_targets=[{"platform": "telegram", "chat_id": "-100123"}],
+    )
+    first.write_bytes(b"mutated first")
+    second.write_bytes(b"mutated second")
+
+    bound = scheduler._bind_delivery_content_to_execution_artifact(
+        content,
+        source_artifact_path=artifact_path,
+        delivery_execution=delivery,
+    )
+    media, cleaned = BasePlatformAdapter.extract_media(bound)
+    owned_paths = [Path(path) for path, _is_voice in media]
+    manifest = json.loads(delivery["artifact_manifest"])
+
+    assert cleaned.strip() == "claimed report"
+    assert [path.read_bytes() for path in owned_paths] == [
+        b"first bytes at claim", b"second bytes at claim",
+    ]
+    assert all(path not in (first.resolve(), second.resolve()) for path in owned_paths)
+    assert [entry["path"] for entry in manifest["media"]] == [
+        str(path) for path in owned_paths
+    ]
+    assert all(entry["sha256"].startswith("sha256:") for entry in manifest["media"])
+    assert [entry["size_bytes"] for entry in manifest["media"]] == [
+        len(b"first bytes at claim"), len(b"second bytes at claim"),
+    ]
+
+
+def test_tampered_owned_media_fails_closed_before_dispatch(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.pdf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    content = f"MEDIA:{first}\nMEDIA:{second}"
+    producer = _create(executions, "tampered-media")
+    executions.finish_execution(producer["id"], success=True)
+    artifact_path, artifact_sha256, media_artifacts = scheduler._materialize_delivery_artifact(
+        "tampered-media", producer["id"], content,
+    )
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        media_artifacts=media_artifacts,
+        delivery_targets=[{"platform": "telegram", "chat_id": "-100123"}],
+    )
+    owned_second = Path(json.loads(delivery["artifact_manifest"])["media"][1]["path"])
+    owned_second.chmod(0o600)
+    owned_second.write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="artifact bytes no longer match durable proof"):
+        scheduler._bind_delivery_content_to_execution_artifact(
+            content,
+            source_artifact_path=artifact_path,
+            delivery_execution=delivery,
+        )
+
+
+def _patch_real_delivery_run(
+    monkeypatch, tmp_path, scheduler, target, *, final_response="delivery payload",
+):
+    payload_path = tmp_path / "delivery-payload.txt"
+    output_path = tmp_path / "producer-output.txt"
+
+    def save_payload(_job_id, _execution_id, content):
+        payload_path.write_text(content)
+        return payload_path
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda _job, *, defer_agent_teardown=None: (
+            True, "producer output", final_response, None,
+        ),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: output_path)
+    monkeypatch.setattr(scheduler, "save_delivery_payload", save_payload)
+    monkeypatch.setattr(scheduler, "_resolve_delivery_targets", lambda _job: [target])
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler, "load_config", lambda: {"cron": {"wrap_response": False}},
+    )
+
+
+def test_run_one_job_persists_live_post_contact_exception_as_ambiguous(
+    monkeypatch, tmp_path,
+):
+    import asyncio
+    from concurrent.futures import Future
+
+    import cron.scheduler as scheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    producer = _create(executions, "durable-live-exception")
+    targets = [
+        {"platform": "telegram", "chat_id": "123", "thread_id": None},
+        {"platform": "telegram", "chat_id": "456", "thread_id": None},
+    ]
+    _patch_real_delivery_run(monkeypatch, tmp_path, scheduler, targets[0])
+    monkeypatch.setattr(scheduler, "_resolve_delivery_targets", lambda _job: targets)
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    adapter = AsyncMock()
+    adapter.send.side_effect = [
+        ConnectionError("response lost after accept"),
+        MagicMock(success=True),
+    ]
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def run_coro(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_coro)
+    standalone = AsyncMock(return_value={"success": True})
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone)
+
+    assert scheduler.run_one_job({
+        "id": "durable-live-exception",
+        "execution_id": producer["id"],
+        "deliver": "telegram:123",
+    }, adapters={Platform.TELEGRAM: adapter}, loop=loop) is True
+
+    delivery = next(
+        row for row in executions.list_executions(job_id="durable-live-exception")
+        if row["kind"] == "delivery"
+    )
+    receipts = json.loads(delivery["delivery_receipts"])
+    assert delivery["status"] == "unknown"
+    assert delivery["delivery_state"] == "ambiguous"
+    assert [receipt["status"] for receipt in receipts] == ["ambiguous", "delivered"]
+    assert [receipt["transport"] for receipt in receipts] == ["live", "live"]
+    assert json.loads(delivery["delivery_targets"]) == [targets[1]]
+    standalone.assert_not_awaited()
+
+
+def test_run_one_job_persists_resolution_failure_as_pre_contact_failed(
+    monkeypatch, tmp_path,
+):
+    import cron.scheduler as scheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    producer = _create(executions, "durable-setup-exception")
+    target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+    _patch_real_delivery_run(monkeypatch, tmp_path, scheduler, target)
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(
+        "gateway.delivery.resolve_delivery_transport",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("adapter registry unavailable")
+        ),
+    )
+    standalone = AsyncMock(return_value={"success": True})
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone)
+
+    assert scheduler.run_one_job({
+        "id": "durable-setup-exception",
+        "execution_id": producer["id"],
+        "deliver": "telegram:123",
+    }) is True
+
+    delivery = next(
+        row for row in executions.list_executions(job_id="durable-setup-exception")
+        if row["kind"] == "delivery"
+    )
+    receipts = json.loads(delivery["delivery_receipts"])
+    assert delivery["status"] == "failed"
+    assert delivery["delivery_state"] == "failed"
+    assert receipts[0]["status"] == "failed"
+    assert receipts[0]["transport"] == "none"
+    standalone.assert_not_awaited()
+
+
+def test_run_one_job_revalidates_every_owned_media_before_transport_contact(
+    monkeypatch, tmp_path,
+):
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    first = tmp_path / "claimed-first.png"
+    second = tmp_path / "claimed-second.pdf"
+    first.write_bytes(b"first claimed bytes")
+    second.write_bytes(b"second claimed bytes")
+    content = f"report\nMEDIA:{first}\nMEDIA:{second}"
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,),
+    )
+    producer = _create(executions, "durable-owned-tamper")
+    target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+    _patch_real_delivery_run(
+        monkeypatch, tmp_path, scheduler, target, final_response=content,
+    )
+    create_delivery = scheduler.create_delivery_execution
+
+    def create_then_tamper(**kwargs):
+        delivery = create_delivery(**kwargs)
+        owned = Path(json.loads(delivery["artifact_manifest"])["media"][1]["path"])
+        owned.chmod(0o600)
+        owned.write_bytes(b"tampered after claim")
+        return delivery
+
+    monkeypatch.setattr(scheduler, "create_delivery_execution", create_then_tamper)
+    dispatch = MagicMock()
+    monkeypatch.setattr(scheduler, "_deliver_result", dispatch)
+
+    assert scheduler.run_one_job({
+        "id": "durable-owned-tamper",
+        "execution_id": producer["id"],
+        "deliver": "telegram:123",
+    }) is False
+    dispatch.assert_not_called()
+
+    delivery = next(
+        row for row in executions.list_executions(job_id="durable-owned-tamper")
+        if row["kind"] == "delivery"
+    )
+    receipts = json.loads(delivery["delivery_receipts"])
+    assert delivery["status"] == "failed"
+    assert receipts[0]["status"] == "failed"
+    assert receipts[0]["transport"] == "none"
 
 
 def test_delivery_execution_rejects_unfinished_parent_and_changed_bytes(monkeypatch, tmp_path):
@@ -812,7 +1098,7 @@ def test_run_one_job_records_delivery_on_a_distinct_artifact_bound_execution(mon
     )
     monkeypatch.setattr(
         scheduler, "_materialize_delivery_artifact",
-        lambda *_args: ("/tmp/exact-image.png", f"sha256:{'a' * 64}"),
+        lambda *_args: ("/tmp/exact-image.png", f"sha256:{'a' * 64}", []),
     )
     created = []
     monkeypatch.setattr(
@@ -848,6 +1134,7 @@ def test_run_one_job_records_delivery_on_a_distinct_artifact_bound_execution(mon
         "producer_execution_id": "exec-delivered",
         "artifact_path": "/tmp/exact-image.png",
         "artifact_sha256": f"sha256:{'a' * 64}",
+        "media_artifacts": [],
         "delivery_targets": concrete_targets,
     }]
     assert resolutions == ["job-delivered"]
@@ -902,7 +1189,7 @@ def test_confirmed_delivery_survives_job_summary_write_failure(monkeypatch):
     monkeypatch.setattr(scheduler, "_deliver_result", confirmed_delivery)
     monkeypatch.setattr(
         scheduler, "_materialize_delivery_artifact",
-        lambda *_args: ("/tmp/exact-image.png", f"sha256:{'b' * 64}"),
+        lambda *_args: ("/tmp/exact-image.png", f"sha256:{'b' * 64}", []),
     )
     monkeypatch.setattr(
         scheduler, "create_delivery_execution", lambda **_kwargs: {"id": "delivery-exec"},

@@ -99,7 +99,7 @@ class TestSyncMode:
         jobs = [
             {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
              "schedule": "every 5m", "enabled": True,
-             "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
+             "next_run_at": "2020-01-01T00:00:00+00:00", "deliver": "local"}
             for i in range(3)
         ]
 
@@ -139,7 +139,7 @@ class TestSequentialPool:
             "prompt": "test",
             "schedule": "every 5m",
             "enabled": True,
-            "next_run_at": "2020-01-01T00:00:00",
+            "next_run_at": "2020-01-01T00:00:00+00:00",
             "deliver": "local",
             "workdir": str(tmp_path),  # makes it sequential
         }
@@ -198,7 +198,7 @@ class TestTickBatchAdvance:
         jobs = [
             {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
              "schedule": "every 5m", "enabled": True,
-             "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
+             "next_run_at": "2020-01-01T00:00:00+00:00", "deliver": "local"}
             for i in range(4)
         ]
 

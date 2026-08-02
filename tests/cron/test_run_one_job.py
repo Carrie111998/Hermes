@@ -42,7 +42,7 @@ def _patch_delivery_attempt(monkeypatch):
     )
     monkeypatch.setattr(
         s, "_materialize_delivery_artifact",
-        lambda *_args: ("/tmp/delivery.txt", f"sha256:{'a' * 64}"),
+        lambda *_args: ("/tmp/delivery.txt", f"sha256:{'a' * 64}", []),
     )
     monkeypatch.setattr(
         s, "create_delivery_execution", lambda **_kwargs: {"id": "d" * 32},
@@ -69,7 +69,10 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None, targets=None, receipts=None):
+    def fake_deliver(
+        job, content, adapters=None, loop=None, targets=None, receipts=None,
+        provider_contacts=None,
+    ):
         calls.append(("deliver", job["id"]))
         receipts.append({
             "requested_target": targets[0], "actual_target": targets[0],
@@ -289,7 +292,10 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def fake_deliver(job, content, adapters=None, loop=None, targets=None, receipts=None):
+    def fake_deliver(
+        job, content, adapters=None, loop=None, targets=None, receipts=None,
+        provider_contacts=None,
+    ):
         order.append("deliver")
         receipts.append({
             "requested_target": targets[0], "actual_target": targets[0],
@@ -331,7 +337,10 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
         defer_agent_teardown.append(FakeAgent())
         return (True, "out", "final response", None)
 
-    def boom_deliver(job, content, adapters=None, loop=None, targets=None, receipts=None):
+    def boom_deliver(
+        job, content, adapters=None, loop=None, targets=None, receipts=None,
+        provider_contacts=None,
+    ):
         order.append("deliver-raise")
         raise RuntimeError("send blew up")
 

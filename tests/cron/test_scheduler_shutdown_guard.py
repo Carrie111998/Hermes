@@ -103,7 +103,8 @@ class TestStandaloneDeliverySkipsDuringShutdown:
             result = _deliver_result(job, "daily report body")
 
         send_mock.assert_called_once()
-        assert result is None
+        assert result.state.value == "delivered"
+        assert result.receipts[0]["transport"] == "standalone"
 
 
 class TestSourceGuardrail:
@@ -118,5 +119,4 @@ class TestSourceGuardrail:
     def test_helper_defined(self, source):
         assert "def _interpreter_shutting_down(" in source
         assert "#58720" in source
-
 
