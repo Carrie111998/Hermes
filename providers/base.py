@@ -64,6 +64,10 @@ class ProviderProfile:
     external_command_env: str = ""
     external_args_env: str = ""
     external_auth_args: tuple[str, ...] = ()
+    # Optional CLI flag used to bind each ACP process to the model selected in
+    # Hermes (for example ``--model``). Empty means the ACP server owns model
+    # selection and the requested model remains only an ACP prompt hint.
+    external_model_arg: str = ""
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside

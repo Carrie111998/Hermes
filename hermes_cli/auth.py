@@ -6807,6 +6807,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     command = command or (getattr(profile, "external_command", "") if profile else "") or "copilot"
     raw_args = os.getenv(args_env, "").strip() if args_env else ""
     args = shlex.split(raw_args) if raw_args else list(getattr(profile, "external_args", ()) or ("--acp", "--stdio"))
+    model_arg = str(getattr(profile, "external_model_arg", "") or "").strip() if profile else ""
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -6831,6 +6832,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         "name": pconfig.name,
         "command": command,
         "args": args,
+        "model_arg": model_arg,
         "resolved_command": resolved_command,
         "base_url": base_url,
         "logged_in": logged_in,
@@ -7047,6 +7049,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     command = command or (getattr(profile, "external_command", "") if profile else "") or "copilot"
     raw_args = os.getenv(args_env, "").strip() if args_env else ""
     args = shlex.split(raw_args) if raw_args else list(getattr(profile, "external_args", ()) or ("--acp", "--stdio"))
+    model_arg = str(getattr(profile, "external_model_arg", "") or "").strip() if profile else ""
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
@@ -7061,6 +7064,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
+        "model_arg": model_arg,
         "source": "process",
     }
 

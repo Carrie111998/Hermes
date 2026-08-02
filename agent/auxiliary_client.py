@@ -1735,8 +1735,8 @@ def _maybe_wrap_anthropic(
     except ImportError:
         pass
     try:
-        from agent.copilot_acp_client import CopilotACPClient
-        if _safe_isinstance(client_obj, CopilotACPClient):
+        from agent.copilot_acp_client import ExternalACPClient
+        if _safe_isinstance(client_obj, ExternalACPClient):
             return client_obj
     except ImportError:
         pass
@@ -5068,8 +5068,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     except ImportError:
         pass
     try:
-        from agent.copilot_acp_client import CopilotACPClient
-        if isinstance(sync_client, CopilotACPClient):
+        from agent.copilot_acp_client import ExternalACPClient
+        if isinstance(sync_client, ExternalACPClient):
             return sync_client, model
     except ImportError:
         pass
@@ -5779,6 +5779,7 @@ def resolve_provider_client(
         base_url = str(creds.get("base_url", "")).strip()
         command = str(creds.get("command", "")).strip() or None
         args = list(creds.get("args") or [])
+        model_arg = str(creds.get("model_arg", "")).strip() or None
         if not final_model:
             logger.warning(
                 "resolve_provider_client: external ACP provider requested but no model "
@@ -5791,13 +5792,19 @@ def resolve_provider_client(
                 "process credentials are incomplete"
             )
             return None, None
-        from agent.copilot_acp_client import CopilotACPClient
+        from agent.copilot_acp_client import ExternalACPClient
+        from providers import get_provider_profile
 
-        client = CopilotACPClient(
+        profile = get_provider_profile(provider)
+
+        client = ExternalACPClient(
             api_key=api_key,
             base_url=base_url,
             command=command,
             args=args,
+            provider_name=provider,
+            display_name=(profile.display_name if profile else provider),
+            model_arg=model_arg,
         )
         logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode

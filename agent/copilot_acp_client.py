@@ -1,9 +1,9 @@
-"""OpenAI-compatible shim that forwards Hermes requests to `copilot --acp`.
+"""OpenAI-compatible shim that forwards Hermes requests to an ACP process.
 
-This adapter lets Hermes treat the GitHub Copilot ACP server as a chat-style
-backend. Each request starts a short-lived ACP session, sends the formatted
-conversation as a single prompt, collects text chunks, and converts the result
-back into the minimal shape Hermes expects from an OpenAI client.
+Each request starts a short-lived ACP session, sends the formatted conversation
+as a single prompt, collects text chunks, and converts the result back into the
+minimal shape Hermes expects from an OpenAI client. ``CopilotACPClient`` remains
+as a compatibility alias for third-party imports.
 """
 
 from __future__ import annotations
@@ -381,7 +381,7 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
 
 
 class _ACPChatCompletions:
-    def __init__(self, client: "CopilotACPClient"):
+    def __init__(self, client: "ExternalACPClient"):
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
@@ -389,12 +389,12 @@ class _ACPChatCompletions:
 
 
 class _ACPChatNamespace:
-    def __init__(self, client: "CopilotACPClient"):
+    def __init__(self, client: "ExternalACPClient"):
         self.completions = _ACPChatCompletions(client)
 
 
-class CopilotACPClient:
-    """Minimal OpenAI-client-compatible facade for Copilot ACP."""
+class ExternalACPClient:
+    """Minimal OpenAI-client-compatible facade for a local ACP process."""
 
     def __init__(
         self,
@@ -407,6 +407,9 @@ class CopilotACPClient:
         acp_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
+        provider_name: str | None = None,
+        display_name: str | None = None,
+        model_arg: str | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -414,6 +417,10 @@ class CopilotACPClient:
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
+        self._provider_name = (provider_name or self.api_key or "external-acp").strip()
+        default_display = "Copilot" if self._provider_name == "copilot-acp" else self._provider_name
+        self._display_name = (display_name or default_display or "External").strip()
+        self._model_arg = (model_arg or "").strip()
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
@@ -436,6 +443,12 @@ class CopilotACPClient:
                 proc.kill()
             except Exception:
                 pass
+
+    def _build_process_args(self, model: str | None = None) -> list[str]:
+        process_args = [self._acp_command, *self._acp_args]
+        if self._model_arg and model:
+            process_args.extend((self._model_arg, model))
+        return process_args
 
     def _create_chat_completion(
         self,
@@ -473,6 +486,7 @@ class CopilotACPClient:
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model=model,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -495,20 +509,26 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=model or self._provider_name,
         )
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+    ) -> tuple[str, str]:
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
             from hermes_cli._subprocess_compat import windows_hide_flags
 
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                self._build_process_args(model),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -520,13 +540,13 @@ class CopilotACPClient:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                f"Could not start {self._display_name} ACP command "
+                f"'{self._acp_command}'."
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(f"{self._display_name} ACP process did not expose stdin/stdout pipes.")
 
         self.is_closed = False
         with self._active_process_lock:
@@ -593,7 +613,7 @@ class CopilotACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        f"{self._display_name} ACP {method} failed: {err.get('message') or err}"
                     )
                 return msg.get("result")
 
@@ -614,8 +634,8 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise RuntimeError(f"{self._display_name} ACP process exited early: {stderr_text}")
+            raise TimeoutError(f"Timed out waiting for {self._display_name} ACP response to {method}.")
 
         try:
             _request(
@@ -644,7 +664,7 @@ class CopilotACPClient:
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(f"{self._display_name} ACP did not return a sessionId.")
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -754,3 +774,8 @@ class CopilotACPClient:
         process.stdin.write(json.dumps(response) + "\n")
         process.stdin.flush()
         return True
+
+
+# Backward compatibility for callers importing the historical provider-specific
+# name. New code should use ``ExternalACPClient``.
+CopilotACPClient = ExternalACPClient

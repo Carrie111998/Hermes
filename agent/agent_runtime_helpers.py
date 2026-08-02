@@ -2017,9 +2017,17 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
     if str(client_kwargs.get("base_url", "")).startswith("acp://"):
-        from agent.copilot_acp_client import CopilotACPClient
+        from agent.copilot_acp_client import ExternalACPClient
 
-        client = CopilotACPClient(**client_kwargs)
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(agent.provider)
+        client = ExternalACPClient(
+            **client_kwargs,
+            provider_name=agent.provider,
+            display_name=(profile.display_name if profile else agent.provider),
+            model_arg=(profile.external_model_arg if profile else ""),
+        )
         _ra().logger.info(
             "External ACP client created (%s, shared=%s) %s",
             reason,
