@@ -1,12 +1,12 @@
 ---
 sidebar_position: 4
 title: "Memory Providers"
-description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory"
+description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory, Memori, Doubao Vector"
 ---
 
 # Memory Providers
 
-Hermes Agent ships with 8 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
+Hermes Agent ships with 10 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ Or set manually in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
+  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory, memori, doubao_vector
 ```
 
 ## How It Works
@@ -654,6 +654,52 @@ hermes memory setup
 
 ---
 
+### Doubao Vector
+
+Local-first semantic memory powered by Volces Ark's `doubao-embedding-vision` model. Only the text being embedded is sent to Ark; vectors and metadata stay under `$HERMES_HOME`, so profiles remain fully isolated.
+
+| | |
+|---|---|
+| **Best for** | Chinese-first semantic recall with a local vector index and no extra service to run |
+| **Requires** | A [Volces Ark](https://console.volcengine.com/ark) API key |
+| **Data storage** | Local — `$HERMES_HOME/doubao_vector_memory/index.json` |
+| **Cost** | Volces Ark embedding pricing (per-token) |
+
+**Tools (3):** `doubao_vector_store` (store explicit text), `doubao_vector_search` (semantic similarity search), `doubao_vector_stats` (index status)
+
+**Setup:**
+```bash
+hermes config set memory.provider doubao_vector
+echo "DOUBAO_EMBEDDING_API_KEY=your-key" >> ~/.hermes/.env
+```
+
+If `DOUBAO_EMBEDDING_API_KEY` is not set, the provider reuses `providers.custom.api_key` (or `model.api_key`) from config.
+
+**Key features:**
+- Local vector index (cosine similarity) with profile isolation under `$HERMES_HOME`
+- Mirrors built-in memory writes and completed user turns into the vector index
+- Automatic context fencing — strips memory fences from captured turns to prevent recursive memory pollution
+- Explicit tool calls for store/search/stats
+
+**Config:** `$HERMES_HOME/doubao_vector_memory.json`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `base_url` | `https://ark.cn-beijing.volces.com/api/coding/v3` | OpenAI-compatible embedding endpoint |
+| `model` | `doubao-embedding-vision` | Embedding model |
+| `max_results` | `8` | Max items per recall/search |
+| `min_score` | `0.18` | Minimum cosine similarity for prefetch recall |
+| `timeout` | `30.0` | API timeout (seconds) |
+| `max_text_chars` | `6000` | Truncate stored text to N chars |
+| `max_items` | `2000` | Max items kept in the local index |
+| `auto_capture` | `true` | Store cleaned user turns after each response |
+| `auto_recall` | `true` | Inject relevant memory context before turns |
+| `capture_assistant` | `false` | Also store assistant turns (off by default) |
+
+**Environment variables:** `DOUBAO_EMBEDDING_API_KEY` (optional; falls back to `providers.custom.api_key`).
+
+---
+
 ## Provider Comparison
 
 | Provider | Storage | Cost | Tools | Dependencies | Unique Feature |
@@ -667,12 +713,13 @@ hermes memory setup
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
 | **Supermemory** | Cloud/Self-hosted | Free/Paid | 4 | `supermemory` | Context fencing + session graph ingest + multi-container |
 | **Memori** | Cloud | Free/Paid | 5 | `hermes-memori` | Tool-aware memory + structured recall |
+| **Doubao Vector** | Local | Free/Paid | 3 | None | Local-first Chinese embedding via Volces Ark |
 
 ## Profile Isolation
 
 Each provider's data is isolated per [profile](/user-guide/profiles):
 
-- **Local storage providers** (Holographic, ByteRover) use `$HERMES_HOME/` paths which differ per profile
+- **Local storage providers** (Holographic, ByteRover, Doubao Vector) use `$HERMES_HOME/` paths which differ per profile
 - **Config file providers** (Honcho, Mem0, Hindsight, Supermemory) store config in `$HERMES_HOME/` so each profile has its own credentials
 - **Cloud providers** (RetainDB) auto-derive profile-scoped project names
 - **Env var providers** (OpenViking) are configured via each profile's `.env` file

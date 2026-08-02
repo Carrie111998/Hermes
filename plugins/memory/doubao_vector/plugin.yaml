@@ -1,0 +1,5 @@
+name: doubao_vector
+version: 1.0.0
+description: "Local semantic memory provider powered by Volces Ark doubao-embedding-vision"
+hooks:
+  - on_session_end
