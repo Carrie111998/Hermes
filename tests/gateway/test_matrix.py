@@ -1814,6 +1814,79 @@ class TestMatrixDynamicRoomNames:
         ]
 
     @pytest.mark.asyncio
+    async def test_restart_preserves_existing_semantic_room_name(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "✅ Existing semantic title"}
+        )
+        event = self._event()
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [
+            "🟡 Existing semantic title",
+            "✅ Existing semantic title",
+        ]
+        self.adapter._client.get_state_event.assert_awaited_once_with(
+            "!room:ex", "m.room.name"
+        )
+
+    @pytest.mark.asyncio
+    async def test_initial_room_name_read_failure_falls_back_to_hermes(self):
+        self.adapter._client.get_state_event = AsyncMock(
+            side_effect=PermissionError("forbidden")
+        )
+
+        await self.adapter.on_processing_start(self._event())
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Hermes"]
+
+    @pytest.mark.asyncio
+    async def test_newer_semantic_title_wins_over_delayed_initial_state_read(self):
+        initial_read_started = asyncio.Event()
+        release_initial_read = asyncio.Event()
+
+        async def delayed_room_name(*args, **kwargs):
+            initial_read_started.set()
+            await release_initial_read.wait()
+            return {"name": "✅ Stale persisted title"}
+
+        self.adapter._client.get_state_event = AsyncMock(side_effect=delayed_room_name)
+        event = self._event()
+
+        await self.adapter.on_processing_start(event)
+        await asyncio.wait_for(initial_read_started.wait(), timeout=0.05)
+        newer_title = asyncio.create_task(
+            self.adapter.on_session_title_changed(event.source, "Newer semantic title")
+        )
+        await asyncio.sleep(0)
+        release_initial_read.set()
+        await newer_title
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Newer semantic title"]
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
+            "Newer semantic title"
+        )
+
+    @pytest.mark.asyncio
     async def test_failure_and_cancelled_share_unsuccessful_terminal_state(self):
         from gateway.platforms.base import ProcessingOutcome
 

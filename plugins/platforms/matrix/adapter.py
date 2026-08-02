@@ -3652,6 +3652,26 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dynamic_room_name_bases[room_id] = "Hermes"
         return "Hermes"
 
+    async def _initialize_dynamic_room_name_base(self, room_id: str) -> None:
+        """Recover the stable base from room state on the first render."""
+        if room_id in self._dynamic_room_name_bases:
+            return
+        base = "Hermes"
+        try:
+            current_name = await self._get_room_name(room_id)
+            if current_name:
+                base = self._sanitize_dynamic_room_name(current_name)
+        except Exception:
+            logger.debug(
+                "Matrix: failed to initialize dynamic room name for %s",
+                room_id,
+                exc_info=True,
+            )
+        # A semantic-title callback may have installed a newer base while the
+        # state request was in flight. Never replace that newer in-memory value.
+        if room_id not in self._dynamic_room_name_bases:
+            self._dynamic_room_name_bases[room_id] = base
+
     async def _send_dynamic_room_name(self, room_id: str, name: str) -> bool:
         """Best-effort, deduplicated ``m.room.name`` state update."""
         if not self._client or not self._dynamic_room_name_enabled:
@@ -3678,6 +3698,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # so a delayed working update cannot overwrite a newer terminal state.
         lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
         async with lock:
+            await self._initialize_dynamic_room_name_base(room_id)
             base = self._dynamic_room_name_base(room_id)
             status = self._dynamic_room_name_status.get(room_id, "idle")
             prefix = {
