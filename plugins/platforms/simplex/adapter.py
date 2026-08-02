@@ -51,6 +51,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -838,7 +839,14 @@ class SimplexAdapter(BasePlatformAdapter):
                 )
                 cmd_str = f"/_send #{chat_id[6:]} json {composed}"
             else:
-                cmd_str = f"@{chat_id} {content}"
+                # Bare "@<id> text" fails with contactNotFound on
+                # simplex-chat v6.5.6.1 (the @ command only accepts the
+                # contact's display name, not the numeric ID). The
+                # structured /_send form addresses by numeric ID.
+                composed = json.dumps(
+                    [{"msgContent": {"type": "text", "text": content}}]
+                )
+                cmd_str = f"/_send @{chat_id} json {composed}"
 
             await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
 
@@ -1174,9 +1182,9 @@ async def _standalone_send(
 
     ``thread_id`` and ``force_document`` are accepted for signature parity
     with other plugins but are not meaningful here. ``media_files`` is
-    accepted but only the text body is delivered — SimpleX file transfers
-    require the daemon's filesystem-backed flow, which an ephemeral
-    connection cannot drive safely.
+    supported: images are delivered via the structured ``/_send @<id> json``
+    form with a JPEG thumbnail (same code path as the live adapter), so
+    standalone cron/CLI sends can attach files.
     """
     try:
         import websockets as _wsclient
@@ -1191,31 +1199,93 @@ async def _standalone_send(
         return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
 
     try:
-        if chat_id.startswith("group:"):
-            group_id = chat_id[6:]
-            composed = json.dumps(
-                [{"msgContent": {"type": "text", "text": message}}]
-            )
-            cmd_str = f"/_send #{group_id} json {composed}"
-        else:
-            # Direct contacts are addressed by display name without brackets.
-            cmd_str = f"@{chat_id} {message}"
-
-        payload = {
-            "corrId": f"{_CORR_PREFIX}snd-{int(time.time() * 1000)}",
-            "cmd": cmd_str,
-        }
-
         async with _wsclient.connect(
             ws_url, open_timeout=10, close_timeout=5
         ) as ws:
+            if chat_id.startswith("group:"):
+                group_id = chat_id[6:]
+                composed = json.dumps(
+                    [{"msgContent": {"type": "text", "text": message}}]
+                )
+                cmd_str = f"/_send #{group_id} json {composed}"
+            elif media_files:
+                # Structured /_send addresses by numeric contact ID and
+                # carries the file path + thumbnail in one payload.
+                numeric_id = chat_id.split("|")[0] if "|" in chat_id else chat_id
+                items = []
+                for media_path, _is_voice in media_files:
+                    thumb = _make_jpeg_thumb(media_path)
+                    items.append(
+                        {
+                            "filePath": media_path,
+                            "msgContent": {
+                                "type": "image",
+                                "image": thumb,
+                                "text": message or "",
+                            },
+                        }
+                    )
+                composed = json.dumps(items)
+                cmd_str = f"/_send @{numeric_id} json {composed}"
+            else:
+                # Direct contacts are addressed by display name without
+                # brackets (the @ command rejects numeric IDs).
+                display_name = chat_id.split("|")[-1] if "|" in chat_id else chat_id
+                cmd_str = f"@{display_name} {message}"
+
+            payload = {
+                "corrId": f"{_CORR_PREFIX}snd-{int(time.time() * 1000)}",
+                "cmd": cmd_str,
+            }
+
             await ws.send(json.dumps(payload))
-            # Give the daemon a moment to process the command before closing.
-            await asyncio.sleep(0.5)
+            if media_files:
+                # Media sends are async on the daemon side (XFTP upload).
+                # Closing the socket before the daemon confirms would abort
+                # the transfer — wait for the newChatItems ack (or a short
+                # timeout) so the file actually lands.
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.monotonic())
+                        try:
+                            rtype = json.loads(raw).get("resp", {}).get("type", "")
+                        except Exception:
+                            rtype = ""
+                        if rtype == "newChatItems":
+                            break
+                    except asyncio.TimeoutError:
+                        break
+            else:
+                # Give the daemon a moment to process the command before
+                # closing (text commands are synchronous).
+                await asyncio.sleep(0.5)
 
         return {"success": True, "platform": "simplex", "chat_id": chat_id}
     except Exception as e:
         return {"error": f"SimpleX send failed: {e}"}
+
+
+def _make_jpeg_thumb(path: str, max_size: int = 128) -> str:
+    """JPEG data-URI thumbnail for SimpleX image previews (empty on failure).
+
+    SimpleX requires a non-empty image payload; an empty string yields a
+    false-success (daemon reports sndComplete but the client never renders).
+    """
+    try:
+        from PIL import Image
+        import base64 as _b64
+        import io as _io
+
+        with Image.open(path) as im:
+            im.thumbnail((max_size, max_size))
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            buf = _io.BytesIO()
+            im.save(buf, format="JPEG", quality=75)
+        return "data:image/jpg;base64," + _b64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
 
 
 def interactive_setup() -> None:
