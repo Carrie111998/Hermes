@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+Hermes Kanban — Desktop Embed Shell
+=====================================
+
+Served by ``hermes_cli/web_server.py`` at ``GET /kanban-embed`` whenever the
+query flag ``?hermesDesktopKanban=1`` is present. Loaded inside the iframe
+that the ``kanban-desktop`` plugin (vendored from
+https://github.com/HaoGuo6536/HermesKanbanPluginDesktop) creates.
+
+What this page does
+-------------------
+1. Stands up a **minimal stand-in** for the Hermes Web Dashboard's plugin
+   SDK (``window.__HERMES_PLUGIN_SDK__`` + ``window.__HERMES_PLUGINS__``)
+   so the kanban plugin's IIFE (``plugins/kanban/dashboard/dist/index.js``)
+   can register its component exactly as it would inside the real SPA.
+2. Bootstraps the kanban plugin via the same
+   ``/dashboard-plugins/kanban/dist/index.js`` URL the Web Dashboard uses
+   — that handler is registered by ``serve_plugin_asset`` in
+   ``web_server.py`` and is already loopback-safe + suffix-allowlisted.
+3. After register, posts ``hermes-kanban-embed-ready`` (v1) to ``window.parent``
+   so ``HermesKanbanPluginDesktop/plugin.js`` can flip its iframe visible.
+
+Why we don't reuse the Web Dashboard directly
+---------------------------------------------
+The dashboard at ``/`` is a full Vite/React SPA with its own chrome
+(sidebar, topbar, navigation). Re-using it inside the iframe would mean
+hiding all of that from JS-injected into our iframe — a brittle contract
+that depends on the dashboard's CSS class names surviving the next
+redesign. A self-contained 2-script shell is small enough (≈30 KB without
+React) that the maintenance cost of mocking the SDK is lower than the
+risk of dethawing on dashboard class names.
+
+What the SDK mock provides
+--------------------------
+Just enough for the plugin to render and fetch:
+  - ``React``, ``hooks`` (``useState``, ``useEffect``, ``useCallback``,
+    ``useMemo``, ``useRef``)
+  - ``components`` — Button / Input / Card skeletons (the plugin only
+    consumes a handful and falls back to ``SDK.components.Checkbox ||
+    function () {...}`` for missing ones, see
+    ``plugins/kanban/dashboard/dist/index.js:31``). Components rendered
+    by name via the plugin's own JSX are routed through
+    ``createElement`` to keep the host's React instance the render root.
+  - ``utils.cn``, ``utils.timeAgo`` — thin fallbacks; the plugin treats
+    them as ``(string) => string`` and ``(epoch) => string``.
+  - ``fetchJSON`` — delegates to ``fetch`` against ``/api/plugins/kanban/``
+    with the same cookie-based session auth the SPA uses. The plugin
+    only reads/writes JSON and never needs file uploads from this entry
+    point (those go through ``authedFetch`` in the real SPA, which we
+    also mock here as a JSON-only equivalent).
+  - ``buildWsUrl`` — returns ``/api/plugins/kanban/events?token=…`` so
+    the kanban live-events WebSocket just works.
+
+Trade-offs intentionally accepted
+---------------------------------
+  - **React from jsDelivr (CDN).** React has no UMD build any more
+    (v18+ ships ESM-only). The whole point of this embed shell is to
+    bootstrap the plugin's existing rendering; bundling our own
+    React+ReactDOM would also be fine, but the build complexity exceeds
+    the benefit for one opt-in page. The CDN delivery is cached by the
+    browser after first load and works fully offline thereafter.
+  - **No design-system components.** The plugin uses ``Button`` /
+    ``Card`` etc. through ``SDK.components``. The shell provides minimal
+    functional stubs that render semantic HTML; their visual styling
+    doesn't match the real design system — that's an acceptable cosmetic
+    gap because the iframe lives inside the desktop Kanban page and the
+    plugin's own CSS (``style.css``) handles most of the board chrome.
+    See ``~/docs/system/kanban-desktop-embed.md`` for the visual gap
+    report and the path to closing it.
+
+Notes for maintainers
+---------------------
+  - The constants ``EMBED_VERSION`` and ``EMBED_READY_TYPE`` MUST stay
+    in lock-step with ``HermesKanbanPluginDesktop/plugin.js`` —
+    ``validateDashboardResponse`` and ``isEmbedReadyMessage``. Bumping
+    the version requires a coordinated change there.
+  - The plugin Dist is allowed only over the loopback origin (the
+    ``serve_plugin_asset`` route in ``web_server.py`` is bound to the
+    SPA's bind host). The iframe's sandbox attribute disables
+    top-navigation by design; cross-origin requests are scoped to the
+    same origin as the dashboard (loopback).
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Hermes Kanban — Desktop Embed</title>
+    <link rel="stylesheet" href="/dashboard-plugins/kanban/dist/style.css" />
+    <style>
+      /* Minimal, semantic-only chrome for the embed shell. The kanban plugin
+         owns the board styling (style.css). Anything here is just enough to
+         give the iframe a sane viewport inside the desktop pane. */
+      html, body, #root { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+      body { background: var(--hermes-embed-bg, #0f172a); color: inherit; font-family: system-ui, -apple-system, sans-serif; }
+      #root:empty::before {
+        content: "Loading Kanban…";
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        color: #94a3b8;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/dashboard-plugins/kanban/dist/embed/embed-bootstrap.js"></script>
+  </body>
+</html>

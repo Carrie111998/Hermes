@@ -194,3 +194,10 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# Runtime / build-lock state that leaks into the repo root but is never a code
+# change — ignore so `git status` stays clean and hermes-safe-update's drift
+# allowlist is not tripped by them. Added 2026-08-02 alongside WIP relocation.
+.bytecode-fingerprint
+.hermes-runtime/
+.web_ui_build.lock
