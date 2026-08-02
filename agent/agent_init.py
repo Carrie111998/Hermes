@@ -2527,9 +2527,11 @@ def init_agent(
         agent._speculative_compression_manager = (
             get_default_manager() if agent.speculative_compression_enabled else None
         )
+        agent._speculative_runtime_override = None
     except Exception:
         agent.speculative_compression_enabled = False
         agent._speculative_compression_manager = None
+        agent._speculative_runtime_override = None
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)

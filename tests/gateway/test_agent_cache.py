@@ -10,6 +10,7 @@ Verifies that the agent cache correctly:
 """
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -106,7 +107,9 @@ class TestAgentConfigSignature:
             cached = cache.get(session_key)
             if cached is not None and cached[1] == signature:
                 return cached[0]
-            agent = object()
+            agent = SimpleNamespace(
+                _speculative_runtime_override=True if not created else None
+            )
             created.append(agent)
             cache[session_key] = (agent, signature)
             return agent
@@ -121,6 +124,7 @@ class TestAgentConfigSignature:
         assert first is not rebuilt
         assert rebuilt is reused
         assert len(created) == 2
+        assert rebuilt._speculative_runtime_override is None
 
 
     def test_cache_keys_key_order_does_not_matter(self):
@@ -254,6 +258,7 @@ class TestAgentCacheLifecycle:
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
         )
+        agent._speculative_runtime_override = True
         with runner._agent_cache_lock:
             runner._agent_cache[session_key] = (agent, "sig123")
 
@@ -261,6 +266,7 @@ class TestAgentCacheLifecycle:
 
         with runner._agent_cache_lock:
             assert session_key not in runner._agent_cache
+        assert agent._speculative_runtime_override is None
 
 
 class TestAgentCacheBoundedGrowth:

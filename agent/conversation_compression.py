@@ -101,6 +101,18 @@ COMPACTION_STATUS = (
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
+def _restore_speculative_candidate(agent: Any, candidate: Any) -> None:
+    """Best-effort requeue for a candidate rejected before durable install."""
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    restore = getattr(manager, "restore_candidate", None)
+    if not callable(restore):
+        return
+    try:
+        restore(str(getattr(agent, "session_id", "") or ""), candidate)
+    except Exception:
+        logger.debug("speculative candidate restore failed", exc_info=True)
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -2818,6 +2830,18 @@ def compress_context(
             _spec_compressor_fp = getattr(
                 speculative_candidate, "compressor_fingerprint", None
             )
+            # This is the linearization point for the runtime kill switch:
+            # the flag may have changed while this caller waited for the
+            # session lock. No candidate may cross this final gate into
+            # assemble/commit after /speculative off has returned.
+            if not getattr(agent, "speculative_compression_enabled", False):
+                agent._speculative_install_status = "rejected"
+                _release_lock()
+                _restore_speculative_candidate(agent, speculative_candidate)
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
             _spec_live_compressor_fp = None
             if _spec_compressor_fp is not None:
                 try:
@@ -2866,6 +2890,28 @@ def compress_context(
                     if _candidate_made_progress is not None
                     else True
                 )
+                if not live_compressor._last_compression_made_progress:
+                    # The worker already classified this as an ineffective
+                    # synchronous compression attempt. Carry that verdict to
+                    # the foreground compressor so speculative no-ops cannot
+                    # bypass the same anti-thrash/overflow-warning path.
+                    record_ineffective = getattr(
+                        live_compressor,
+                        "_record_ineffective_compression_verdict",
+                        None,
+                    )
+                    if callable(record_ineffective):
+                        record_ineffective(
+                            int(
+                                getattr(
+                                    live_compressor,
+                                    "_ineffective_compression_count",
+                                    0,
+                                )
+                                or 0
+                            )
+                            + 1
+                        )
                 _candidate_savings_pct = getattr(
                     speculative_candidate, "savings_pct", None
                 )
@@ -3556,6 +3602,14 @@ def compress_context(
                     new_session_id=agent.session_id or "",
                     old_session_id=_boundary_parent,
                 )
+
+        # Context-engine/session rebinding can reset per-call compressor
+        # fields. Preserve the speculative verdict that was captured before
+        # those callbacks so the foreground accounting remains authoritative.
+        if speculative_candidate is not None:
+            agent.context_compressor._last_compression_made_progress = (
+                _compression_made_progress
+            )
 
         # Notify memory providers of the compaction boundary so provider-cached
         # per-session state (Hindsight's _document_id, accumulated turn buffers,

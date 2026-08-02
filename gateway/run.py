@@ -23142,6 +23142,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             return
 
+        # Runtime slash-command overrides belong to the cached agent only.
+        # Any rebuild/reset path that evicts it must let the next init derive
+        # speculative wiring from config.yaml again.
+        try:
+            agent._speculative_runtime_override = None
+        except Exception:
+            pass
+
         # Don't tear down an agent that's actively mid-turn — its client,
         # sandbox and child subagents are in use by the running request.
         running_ids = {

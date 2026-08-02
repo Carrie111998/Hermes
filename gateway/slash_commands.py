@@ -3800,7 +3800,7 @@ class GatewaySlashCommandsMixin:
     async def _handle_speculative_command(self, event: MessageEvent) -> str:
         """Report or change speculative compression on the session agent."""
         args = (event.get_command_args() or "").strip().lower()
-        if args not in {"", "on", "off"}:
+        if args not in {"", "on", "off", "status"}:
             return "Usage: /speculative [on|off]"
 
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -3822,7 +3822,7 @@ class GatewaySlashCommandsMixin:
                 except Exception:
                     agent = None
 
-        if args and agent is not None:
+        if args in {"on", "off"} and agent is not None:
             try:
                 from agent.speculative_compression import configure_speculative_compression
 

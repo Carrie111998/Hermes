@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 
 from agent.speculative_compression import (
@@ -9,6 +10,14 @@ from agent.speculative_compression import (
 )
 from hermes_state import SessionDB
 from run_agent import AIAgent
+
+
+class _RestoreManager:
+    def __init__(self):
+        self.restored = []
+
+    def restore_candidate(self, session_id, candidate):
+        self.restored.append((session_id, candidate))
 
 
 def _agent_with_candidate_db(tmp_path):
@@ -192,3 +201,129 @@ def test_failed_durable_commit_rejects_candidate_and_releases_lock(
 
     assert agent._speculative_install_status == "rejected"
     assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_off_after_lock_wait_rejects_and_restores_before_commit(tmp_path, monkeypatch):
+    """The kill switch linearizes after lock acquisition, before assemble."""
+    agent, db, session_id = _agent_with_candidate_db(tmp_path)
+    manager = _RestoreManager()
+    agent._speculative_compression_manager = manager
+    messages = _messages()
+    candidate = _candidate(messages, session_id)
+    other_holder = "other-thread-holder"
+    assert db.try_acquire_compression_lock(session_id, other_holder)
+
+    acquired = threading.Event()
+    release_wait = threading.Event()
+    real_try_acquire = db.try_acquire_compression_lock
+
+    def wait_for_switch(*args, **kwargs):
+        acquired.set()
+        assert release_wait.wait(2)
+        return real_try_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(db, "try_acquire_compression_lock", wait_for_switch)
+    commit_calls = []
+    monkeypatch.setattr(
+        db,
+        "publish_compression_child",
+        lambda *args, **kwargs: commit_calls.append((args, kwargs)),
+    )
+    result = []
+
+    def install():
+        result.append(
+            agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=100,
+                speculative_candidate=candidate,
+            )
+        )
+
+    thread = threading.Thread(target=install)
+    thread.start()
+    assert acquired.wait(2)
+    agent.speculative_compression_enabled = False
+    db.release_compression_lock(session_id, other_holder)
+    release_wait.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result[0][0] == messages
+    assert agent._speculative_install_status == "rejected"
+    assert manager.restored == [(session_id, candidate)]
+    assert commit_calls == []
+    assert agent.session_id == session_id
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_speculative_and_sync_accounting_share_progress_and_warning_state(
+    tmp_path, monkeypatch
+):
+    agent, _db, session_id = _agent_with_candidate_db(tmp_path)
+    compressor = agent.context_compressor
+    messages = _messages()
+
+    no_progress = SpeculativeCandidate(
+        session_id=session_id,
+        source_fingerprint=fingerprint_messages(messages[:1]),
+        boundary_fingerprint=fingerprint_messages([messages[1]]),
+        cut_index=1,
+        compress_start=0,
+        original_count=len(messages),
+        compressed_prefix=(messages[0],),
+        created_at=time.monotonic(),
+        made_progress=False,
+    )
+    returned, _ = agent._compress_context(
+        messages, "sys", approx_tokens=100, speculative_candidate=no_progress
+    )
+    assert returned == messages
+    assert compressor.compression_count == 1
+    assert compressor._last_compression_made_progress is False
+    assert compressor._ineffective_compression_count == 1
+
+    installed_candidate = _candidate(messages, session_id)
+    installed_candidate = SpeculativeCandidate(
+        **{
+            **installed_candidate.__dict__,
+            "made_progress": True,
+        }
+    )
+    installed, _ = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=100,
+        speculative_candidate=installed_candidate,
+    )
+    assert installed[0]["content"] == "prepared summary"
+    assert compressor.compression_count == 2
+    assert compressor._last_compression_made_progress is True
+    assert compressor._ineffective_compression_count == 1
+
+    # The provider-level verdict after the successful candidate install is the
+    # same real-usage accounting used by synchronous compaction.
+    compressor.update_from_response({"prompt_tokens": compressor.threshold_tokens})
+    assert compressor._ineffective_compression_count == 2
+
+    def synchronous_fallback(current_messages, **_kwargs):
+        compressor.compression_count += 1
+        compressor._last_compression_made_progress = True
+        return [
+            {"role": "user", "content": "synchronous summary"},
+            *current_messages[1:],
+        ]
+
+    monkeypatch.setattr(compressor, "compress", synchronous_fallback)
+    agent._compression_feasibility_checked = True
+    agent._compress_context(messages, "sys", approx_tokens=100, force=True)
+    assert compressor.compression_count == 3
+    assert compressor._last_compression_made_progress is False
+    assert compressor._ineffective_compression_count == 2
+
+    should_compress, block_reason = compressor.should_compress_info(
+        compressor.threshold_tokens
+    )
+    assert should_compress is False
+    assert block_reason == "ineffective"

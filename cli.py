@@ -10822,12 +10822,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Report or change speculative compression for the live CLI agent."""
         parts = cmd_original.split(None, 1)
         raw_arg = parts[1].strip().lower() if len(parts) > 1 else ""
-        if raw_arg not in {"", "on", "off"}:
+        if raw_arg not in {"", "on", "off", "status"}:
             _cprint("  Usage: /speculative [on|off]")
             return
 
         agent = getattr(self, "agent", None)
-        if raw_arg and agent is not None:
+        if raw_arg in {"on", "off"} and agent is not None:
             try:
                 from agent.speculative_compression import configure_speculative_compression
 

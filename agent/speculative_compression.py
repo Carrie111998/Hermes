@@ -197,33 +197,7 @@ def is_builtin_compression_eligible(
         return False
 
 
-def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
-    """Apply the runtime speculative-compression switch to *agent*.
-
-    Enabling mirrors the construction-time wiring: normalize the current
-    ``compression.speculative`` settings, require ordinary compression and
-    built-in-compressor eligibility, then attach the process manager.  The
-    slash-command switch is intentionally session-local; it does not write
-    config.yaml.
-    """
-
-    manager = getattr(agent, "_speculative_compression_manager", None)
-    if not enabled:
-        # Clear the flag before cancelling work so a racing foreground or
-        # tool-wait path cannot start more speculative work during invalidation.
-        setattr(agent, "speculative_compression_enabled", False)
-        invalidate = getattr(manager, "invalidate_session", None)
-        if callable(invalidate):
-            try:
-                invalidate(str(getattr(agent, "session_id", "") or ""))
-            except Exception:
-                logger.debug(
-                    "speculative compression invalidation failed for session=%s",
-                    getattr(agent, "session_id", ""),
-                    exc_info=True,
-                )
-        return False
-
+def _config_speculative_settings() -> SpeculativeCompressionSettings:
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -231,15 +205,16 @@ def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
     except Exception:
         config = {}
     compression = config.get("compression", {}) if isinstance(config, Mapping) else {}
-    raw_settings = compression.get("speculative", {}) if isinstance(compression, Mapping) else {}
-    raw_settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
-    # A runtime ``/speculative on`` is an explicit session override.  Keep all
-    # configured thresholds/gates, but do not require the persisted opt-in bit
-    # to be true for this session.
-    raw_settings["enabled"] = True
-    settings = normalize_speculative_compression_settings(raw_settings)
-    setattr(agent, "speculative_compression_settings", settings)
+    raw_settings = (
+        compression.get("speculative", {})
+        if isinstance(compression, Mapping)
+        else {}
+    )
+    return normalize_speculative_compression_settings(raw_settings)
 
+
+def _apply_speculative_settings(agent: Any, settings: SpeculativeCompressionSettings) -> bool:
+    setattr(agent, "speculative_compression_settings", settings)
     eligible = bool(
         getattr(agent, "compression_enabled", False)
         and settings.enabled
@@ -260,6 +235,52 @@ def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
     return bool(getattr(agent, "speculative_compression_enabled", False))
 
 
+def reset_speculative_compression_to_config(agent: Any) -> bool:
+    """Clear the session override and restore config-driven wiring."""
+
+    setattr(agent, "_speculative_runtime_override", None)
+    return _apply_speculative_settings(agent, _config_speculative_settings())
+
+
+def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
+    """Apply the runtime speculative-compression switch to *agent*.
+
+    Enabling mirrors the construction-time wiring: normalize the current
+    ``compression.speculative`` settings, require ordinary compression and
+    built-in-compressor eligibility, then attach the process manager.  The
+    slash-command switch is intentionally session-local; it does not write
+    config.yaml.
+    """
+
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    setattr(agent, "_speculative_runtime_override", bool(enabled))
+    if not enabled:
+        # Clear the flag before cancelling work so a racing foreground or
+        # tool-wait path cannot start more speculative work during invalidation.
+        setattr(agent, "speculative_compression_enabled", False)
+        invalidate = getattr(manager, "invalidate_session", None)
+        if callable(invalidate):
+            try:
+                invalidate(str(getattr(agent, "session_id", "") or ""))
+            except Exception:
+                logger.debug(
+                    "speculative compression invalidation failed for session=%s",
+                    getattr(agent, "session_id", ""),
+                    exc_info=True,
+                )
+        return False
+
+    settings = _config_speculative_settings()
+    raw_settings = dict(vars(settings))
+    raw_settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
+    # A runtime ``/speculative on`` is an explicit session override.  Keep all
+    # configured thresholds/gates, but do not require the persisted opt-in bit
+    # to be true for this session.
+    raw_settings["enabled"] = True
+    settings = normalize_speculative_compression_settings(raw_settings)
+    return _apply_speculative_settings(agent, settings)
+
+
 def speculative_compression_status(agent: Any) -> str:
     """Return the authoritative operator-facing runtime switch state."""
 
@@ -267,25 +288,36 @@ def speculative_compression_status(agent: Any) -> str:
         return (
             "Speculative compression: enabled=False; eligible=False "
             "(api_mode=uninitialized, context_engine=uninitialized); "
-            "install_status=uninitialized"
+            "install_status=uninitialized; runtime_override=None; blocker=uninitialized"
         )
     api_mode = str(getattr(agent, "api_mode", None) or "unknown")
     context_engine = getattr(agent, "context_compressor", None)
     engine_name = type(context_engine).__name__ if context_engine is not None else "none"
     try:
-        eligible = is_builtin_compression_eligible(
+        builtin_eligible = is_builtin_compression_eligible(
             api_mode=api_mode,
             context_engine=context_engine,
         )
     except Exception:
-        eligible = False
+        builtin_eligible = False
+    eligible = bool(getattr(agent, "compression_enabled", False) and builtin_eligible)
+    if not getattr(agent, "compression_enabled", False):
+        blocker = "compression_disabled"
+    elif api_mode == "codex_app_server":
+        blocker = "codex_app_server"
+    elif not builtin_eligible:
+        blocker = "context_engine_not_builtin"
+    else:
+        blocker = "none"
     install_status = getattr(agent, "_speculative_install_status", None)
     if not isinstance(install_status, str) or not install_status:
         install_status = "none"
     return (
         f"Speculative compression: enabled={bool(getattr(agent, 'speculative_compression_enabled', False))}; "
         f"eligible={bool(eligible)} (api_mode={api_mode}, context_engine={engine_name}); "
-        f"install_status={install_status}"
+        f"install_status={install_status}; "
+        f"runtime_override={getattr(agent, '_speculative_runtime_override', None)!s}; "
+        f"blocker={blocker}"
     )
 
 
@@ -1238,6 +1270,7 @@ __all__ = [
     "get_default_manager",
     "is_builtin_compression_eligible",
     "normalize_speculative_compression_settings",
+    "reset_speculative_compression_to_config",
     "schedule_tool_wait_candidate",
     "speculative_compression_status",
     "shutdown_default_manager",
