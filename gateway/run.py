@@ -12744,9 +12744,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # Relay is shared process-level ingress in multiplex mode. The
-            # active profile owns the one connection; connector-stamped
-            # source.profile routes inbound turns to secondary profiles.
+            # Relay and WhatsApp are shared process-level ingress in multiplex
+            # mode: one connection, owned by the active profile, with
+            # route-stamped source.profile fanning inbound turns out to
+            # secondary profiles. WhatsApp joins Relay here because the bridge
+            # is a single authenticated session tied to one phone number — a
+            # secondary profile has no credentials of its own to bring, so
+            # letting it construct an adapter only produces a connect/retry
+            # loop that stalls startup for every other profile behind it.
             if (
                 getattr(self.config, "multiplex_profiles", False)
                 and platform in (Platform.RELAY, Platform.WHATSAPP)
@@ -15734,17 +15739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        # [LOCAL PATCH] Create the session INSIDE the routed profile's scope so
-        # SessionStore._db resolves to that profile's state.db (not default).
-        # Without this the session is physically created in the default profile's
-        # state.db — leaking default history/memory (e.g. IBKR agenda) into
-        # routed cgpt/yltc replies even though the agent run itself is scoped.
-        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            _pscope_home = self._resolve_profile_home_for_source(source)
-            with _profile_runtime_scope(_pscope_home):
-                session_entry = await self.async_session_store.get_or_create_session(source)
-        else:
-            session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
