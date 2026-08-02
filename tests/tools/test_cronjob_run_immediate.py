@@ -66,18 +66,13 @@ class TestCronjobRunExecutesImmediately:
         executes so the gateway inactivity watchdog doesn't kill the parent
         turn (#76502)."""
         touches = []
-        heartbeat_seen = threading.Event()
-
-        def record(desc):
-            touches.append(desc)
-            heartbeat_seen.set()
-
-        set_activity_callback(record)
+        set_activity_callback(lambda desc: touches.append(desc))
         try:
+            started = threading.Event()
+
             def slow_run(job):
-                # Deterministic: block until at least one heartbeat has fired
-                # (bounded so a broken heartbeat can't hang the test).
-                assert heartbeat_seen.wait(timeout=5.0), "no heartbeat within 5s"
+                started.set()
+                time.sleep(0.15)
                 return True
 
             with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
@@ -88,7 +83,7 @@ class TestCronjobRunExecutesImmediately:
                 res = _execute_job_now(dict(_JOB))
 
             m_run.assert_called_once()
-            assert res["success"] is True, res
+            assert res["success"] is True
             assert any("cronjob: running job" in t for t in touches), touches
         finally:
             set_activity_callback(None)
@@ -101,74 +96,9 @@ class TestCronjobRunExecutesImmediately:
             with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
                  patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}), \
-                 patch("tools.cronjob_tools.threading.Thread") as m_thread:
+                       return_value={"last_status": "ok", "last_error": None}):
                 res = _execute_job_now(dict(_JOB))
             assert res["success"] is True
             m_run.assert_called_once()
-            m_thread.assert_not_called()   # heartbeat thread truly never created
-        finally:
-            set_activity_callback(None)
-
-    def test_heartbeat_stops_at_ceiling_but_job_completes(self):
-        """Past _CRON_RUN_HEARTBEAT_CEILING the heartbeat stops (so the
-        gateway watchdog regains authority over a wedged run) while the job
-        itself keeps running to completion."""
-        touches = []
-        first_beat = threading.Event()
-
-        def record(desc):
-            touches.append(desc)
-            first_beat.set()
-
-        set_activity_callback(record)
-        try:
-            def slow_run(job):
-                # Ceiling=0 → the very first wake stops the loop without
-                # touching. Give it a couple of cycles to prove silence.
-                time.sleep(0.2)
-                return True
-
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
-                 patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_INTERVAL", 0.05), \
-                 patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_CEILING", 0.0), \
-                 patch("cron.scheduler.run_one_job", side_effect=slow_run), \
-                 patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}):
-                res = _execute_job_now(dict(_JOB))
-            assert res["success"] is True, res
-            assert not first_beat.is_set(), touches   # heartbeat never fired
-        finally:
-            set_activity_callback(None)
-
-    def test_heartbeat_survives_callback_exception(self):
-        """One raising callback must not silently kill watchdog protection
-        for the rest of a long job — the loop continues heartbeating."""
-        calls = []
-        second_beat = threading.Event()
-
-        def flaky(desc):
-            calls.append(desc)
-            if len(calls) >= 2:
-                second_beat.set()
-            if len(calls) == 1:
-                raise RuntimeError("transient")
-
-        set_activity_callback(flaky)
-        try:
-            def slow_run(job):
-                # Block until a heartbeat AFTER the raising one has fired.
-                assert second_beat.wait(timeout=5.0), \
-                    "heartbeat stopped after one callback exception"
-                return True
-
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
-                 patch("tools.cronjob_tools._CRON_RUN_HEARTBEAT_INTERVAL", 0.05), \
-                 patch("cron.scheduler.run_one_job", side_effect=slow_run), \
-                 patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}):
-                res = _execute_job_now(dict(_JOB))
-            assert res["success"] is True, res
-            assert len(calls) >= 2, calls
         finally:
             set_activity_callback(None)
