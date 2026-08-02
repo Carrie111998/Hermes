@@ -350,3 +350,27 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
+
+
+# Parser regression coverage for the canonical review handoff syntax.
+def test_submit_review_parser_defaults_orion_for_multi_word_summary():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "submit-review", "t_abc12345", "PR", "opened", "and", "verified"
+    ])
+    assert args.reviewer == "orion"
+    assert args.summary == ["PR", "opened", "and", "verified"]
+
+
+def test_submit_review_parser_accepts_explicit_reviewer_flag():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "submit-review", "t_abc12345", "ready", "for", "review",
+        "--reviewer", "reviewer"
+    ])
+    assert args.reviewer == "reviewer"
+    assert args.summary == ["ready", "for", "review"]
