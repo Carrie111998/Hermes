@@ -4621,8 +4621,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
-                if not release_nested.wait(timeout=5):
-                    raise TimeoutError("notification turn was not released")
+                # The parent test releases this gate in ``finally``. Avoid a
+                # wall-clock timeout here: under a saturated full-suite worker,
+                # the coordinator can be descheduled after the event is set
+                # even though the ownership protocol is making progress.
+                release_nested.wait()
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
@@ -4651,8 +4654,8 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     try:
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
-        assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
+        assert nested_started.wait(timeout=30)
+        threads[0].join(timeout=30)
         assert not threads[0].is_alive()
         # Membership, not order: the completion_queue is process-global, and
         # notification pollers leaked by earlier session.init tests in this
@@ -4663,7 +4666,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         # with a deadline (an event may be transiently held by a poller
         # mid-cycle) and assert exactly {batch_2, batch_3} come back.
         queued: dict = {}
-        deadline = time.time() + 5.0
+        deadline = time.time() + 30.0
         while time.time() < deadline and set(queued) != {
             "proc_batch_2",
             "proc_batch_3",
@@ -4677,7 +4680,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     finally:
         release_nested.set()
         for thread in threads:
-            thread.join(timeout=5)
+            thread.join(timeout=30)
         server._sessions.pop("sid_a", None)
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
@@ -16113,7 +16116,7 @@ def test_session_resume_rejects_invalid_profile_before_opening_db(
     assert response["error"]["code"] == 4008
     assert response["error"]["message"] == "invalid or unavailable profile"
 
-def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
+def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
     """The trim boundary must not retain the just-pruned history snapshots."""
     observed = {}
     cleanup_order = []
@@ -16151,8 +16154,10 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         observed["history"] = caller_locals.get("history")
         observed["run_kwargs"] = caller_locals.get("run_kwargs")
 
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir(mode=0o700)
     session = _session(agent=_Agent())
-    session["profile_home"] = "/tmp/test-profile"
+    session["profile_home"] = str(profile_home)
     session["history"] = [
         {"role": "tool", "tool_call_id": "old", "content": "x" * 20_000}
     ]

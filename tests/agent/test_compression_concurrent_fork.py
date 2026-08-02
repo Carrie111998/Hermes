@@ -963,7 +963,7 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
         for name in state_fields:
             setattr(agent.context_compressor, name, f"mutated-{name}")
         provider_returned.set()
-        assert allow_compress_return.wait(timeout=5)
+        assert allow_compress_return.wait(timeout=30)
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] cancelled summary"},
             {"role": "user", "content": "tail"},
