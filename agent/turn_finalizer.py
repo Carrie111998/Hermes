@@ -475,9 +475,16 @@ def finalize_turn(
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
+                # Skip the footer when the response is a silence marker
+                # ([SILENT], NO_REPLY, etc.) — the response will be
+                # suppressed by the cron scheduler, so appending a
+                # verifier footer would push the [SILENT] marker off the
+                # last line and break silence detection (#75772).
+                from gateway.response_filters import is_autonomous_silence_response
+                if not is_autonomous_silence_response(final_response):
+                    footer = agent._format_file_mutation_failure_footer(_failed)
+                    if footer:
+                        final_response = final_response.rstrip() + "\n\n" + footer
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
