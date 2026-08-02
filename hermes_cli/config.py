@@ -3145,6 +3145,32 @@ def _load_user_config_for_mutation(config_path: Path) -> Dict[str, Any]:
     return loaded
 
 
+def _load_user_config_for_cli_mutation(config_path: Path) -> Dict[str, Any]:
+    """CLI ``config set`` / ``unset`` entry: map parse refuses to SystemExit.
+
+    Library callers (``save_config``, ``atomic_config_write``, TUI gateway)
+    keep the raw :class:`RuntimeError` from
+    :func:`require_readable_config_before_write`. Interactive CLI mutations
+    instead exit with the established ``Cannot parse`` guidance (#75431)
+    so users get a clean error instead of a traceback. Unreadable-file
+    refuses (permission / I/O) still propagate as RuntimeError.
+    """
+    try:
+        return require_readable_config_before_write(config_path)
+    except RuntimeError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError):
+            raise
+        detail = cause if cause is not None else exc
+        print(
+            f"✗ Cannot parse {config_path}: {detail}\n"
+            f"  The file contains a YAML syntax error. Fix the error\n"
+            f"  in your config file first, then retry.\n"
+            f"  (hermes config edit will open it in your editor.)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
 
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
@@ -4936,8 +4962,8 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
     config_path = get_config_path()
-    user_config = require_readable_config_before_write(config_path)
-    
+    user_config = _load_user_config_for_cli_mutation(config_path)
+
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
@@ -5137,7 +5163,7 @@ def unset_config_value(key: str):
         return
 
     config_path = get_config_path()
-    user_config = require_readable_config_before_write(config_path)
+    user_config = _load_user_config_for_cli_mutation(config_path)
 
     removed = _unset_nested(user_config, key)
 

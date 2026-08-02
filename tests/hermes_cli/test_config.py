@@ -286,7 +286,7 @@ class TestSaveAndLoadRoundtrip:
         config_path.write_text(original, encoding="utf-8")
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            with pytest.raises(RuntimeError, match="not valid YAML"):
+            with pytest.raises(SystemExit):
                 set_config_value("model.default", "gpt-4o")
 
         assert config_path.read_text(encoding="utf-8") == original
@@ -302,7 +302,7 @@ class TestSaveAndLoadRoundtrip:
         (tmp_path / ".env").write_text("TERMINAL_TIMEOUT=30\n", encoding="utf-8")
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            with pytest.raises(RuntimeError, match="not valid YAML"):
+            with pytest.raises(SystemExit):
                 unset_config_value("terminal.timeout")
 
         assert config_path.read_text(encoding="utf-8") == original
@@ -318,7 +318,7 @@ class TestSaveAndLoadRoundtrip:
         config_path.write_text(original, encoding="utf-8")
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            with pytest.raises(RuntimeError, match="must be a mapping"):
+            with pytest.raises(SystemExit):
                 set_config_value("model.default", "gpt-4o")
 
         assert config_path.read_text(encoding="utf-8") == original
@@ -333,7 +333,7 @@ class TestSaveAndLoadRoundtrip:
         config_path.write_text(original, encoding="utf-8")
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            with pytest.raises(RuntimeError, match="must be a mapping"):
+            with pytest.raises(SystemExit):
                 unset_config_value("model.default")
 
         assert config_path.read_text(encoding="utf-8") == original
