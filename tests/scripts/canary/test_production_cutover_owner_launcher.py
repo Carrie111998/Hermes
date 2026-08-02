@@ -4287,6 +4287,7 @@ def test_successor_rebind_owner_action_is_closed_and_runtime_gated(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    launch_authority_sha256 = "5" * 64
     calls: list[tuple[str, str]] = []
     result = {"schema": "fixed-successor-result", "ok": True}
     monkeypatch.setattr(
@@ -4297,7 +4298,10 @@ def test_successor_rebind_owner_action_is_closed_and_runtime_gated(
     monkeypatch.setattr(
         successor_rebind,
         "owner_apply_framed_stdin",
-        lambda: calls.append(("dispatch", REVISION)) or result,
+        lambda *, expected_launch_authority_sha256: (
+            calls.append(("dispatch", expected_launch_authority_sha256))
+            or result
+        ),
     )
 
     assert owner.main(
@@ -4305,11 +4309,45 @@ def test_successor_rebind_owner_action_is_closed_and_runtime_gated(
             "upstream-sync-successor-owner-apply",
             "--revision",
             REVISION,
+            "--launch-authority-sha256",
+            launch_authority_sha256,
         )
     ) == 0
 
-    assert calls == [("runtime", REVISION), ("dispatch", REVISION)]
+    assert calls == [
+        ("runtime", REVISION),
+        ("dispatch", launch_authority_sha256),
+    ]
     assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        (),
+        ("--launch-authority-sha256", "not-a-sha256"),
+        ("--launch-authority-sha256", "A" * 64),
+    ),
+    ids=("missing", "malformed", "uppercase"),
+)
+def test_successor_rebind_owner_action_requires_exact_launch_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(
+        owner,
+        "_active_owner_runtime_attestation",
+        lambda _revision: pytest.fail("runtime gate must not run"),
+    )
+    with pytest.raises(SystemExit):
+        owner.main(
+            (
+                "upstream-sync-successor-owner-apply",
+                "--revision",
+                REVISION,
+                *extra,
+            )
+        )
 
 
 def test_successor_rebind_owner_action_rejects_any_extra_argument() -> None:
@@ -4319,6 +4357,8 @@ def test_successor_rebind_owner_action_rejects_any_extra_argument() -> None:
                 "upstream-sync-successor-owner-apply",
                 "--revision",
                 REVISION,
+                "--launch-authority-sha256",
+                "5" * 64,
                 "--path",
                 "/tmp/forbidden",
             )

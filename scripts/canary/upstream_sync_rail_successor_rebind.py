@@ -23,6 +23,7 @@ import argparse
 import copy
 import ctypes
 import errno
+import fcntl
 import hashlib
 import os
 import re
@@ -30,7 +31,7 @@ import stat
 import struct
 import sys
 import tempfile
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, Protocol, Sequence
@@ -53,7 +54,13 @@ STARTED_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-started.v1"
 ARCHIVE_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-archive.v1"
 TERMINAL_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-terminal.v1"
 OWNER_REQUEST_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-owner-request.v3"
-OWNER_RESULT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-owner-result.v3"
+OWNER_RESULT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-owner-result.v4"
+LAUNCH_AUTHORITY_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-launch-authority.v1"
+)
+LAUNCH_ENVELOPE_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-launch-envelope.v1"
+)
 ROLLBACK_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-rollback.v1"
 ROLLBACK_INTENT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-rollback-intent.v1"
 OPERATION = "dual-upstream-sync-successor-rebind"
@@ -72,10 +79,10 @@ EVIDENCE_ROOT = Path(
 RUNTIME_RELATIVE = Path("scripts/canary/upstream_sync_rail_successor_rebind.py")
 FOUNDATION_V4_WRAPPER = Path("/usr/libexec/muncho-release-foundation-exec-v4")
 FOUNDATION_V4_WRAPPER_SHA256 = (
-    "69a93dba1b6177ef015fb61aa8b65fef5b8ca9173f7a76848867236ba17c746b"
+    "ec42244687691eca23822b36a5457c4fd851b8ce771db4824b16033bf4099bb1"
 )
 PREEXEC_VERIFIER_SHA256 = (
-    "4cb6d6924a86393776a723597a5110c19fbf6d71f7f5bd37550b29dc407030aa"
+    "c4f2b69a7a369ba19cbd699dd95419033a022259fb10f59bc5ed0c3eeb154b4e"
 )
 SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER = Path(
     "/usr/libexec/muncho-successor-runtime-foundation-exec"
@@ -1406,10 +1413,16 @@ def _validate_stage0_bundle(
             or plan.get("source_tree_oid") != request["source_tree_oid"]
             or plan.get("builder_terminal_receipt_sha256")
             != request["stage_c_builder_terminal_receipt_sha256"]
+            or bundle.input_internal_identities.get(
+                "builder_terminal_receipt_sha256"
+            )
+            != request["stage_c_builder_terminal_receipt_sha256"]
             or bundle.builder_receipt.get("source_tree_oid")
             != request["source_tree_oid"]
             or bundle.builder_receipt.get("receipt_sha256")
-            != request["stage_c_builder_terminal_receipt_sha256"]
+            != bundle.input_internal_identities.get(
+                "candidate_seal_receipt_sha256"
+            )
             or foundation_wrapper_sha256
             != request["successor_runtime_foundation_wrapper_sha256"]
             or launcher_sha256
@@ -1433,6 +1446,171 @@ def _validate_stage0_bundle(
         raise UpstreamSyncRailSuccessorRebindError(
             "upstream_sync_successor_stage0_binding_invalid"
         ) from exc
+
+
+def _launch_authority(
+    *,
+    request: Mapping[str, Any],
+    bundle: release_stage0.VerifiedLaunchBundle,
+) -> dict[str, Any]:
+    """Derive one deterministic logical identity for every remote phase."""
+
+    checked = validate_owner_request(request)
+    try:
+        unsigned = {
+            "schema": LAUNCH_AUTHORITY_SCHEMA,
+            "operation": OPERATION,
+            "request_sha256": checked["request_sha256"],
+            "target_revision": checked["target_revision"],
+            "predecessor_revision": checked["predecessor_revision"],
+            "predecessor_activation_receipt_sha256": checked[
+                "predecessor_activation_receipt_sha256"
+            ],
+            "predecessor_trust_sha256": bundle.predecessor_trust[
+                "trust_sha256"
+            ],
+            "stage_c_host_artifact_manifest_sha256": checked[
+                "stage_c_host_artifact_manifest_sha256"
+            ],
+            "stage_c_release_update_publication_sha256": checked[
+                "stage_c_release_update_publication_sha256"
+            ],
+            "stage_c_builder_terminal_receipt_sha256": checked[
+                "stage_c_builder_terminal_receipt_sha256"
+            ],
+            "candidate_seal_receipt_sha256": bundle.builder_receipt[
+                "receipt_sha256"
+            ],
+            "whole_tree_manifest_sha256": bundle.builder_manifest[
+                "manifest_sha256"
+            ],
+            "input_internal_identities_sha256": activation._sha256(  # noqa: SLF001
+                activation._canonical(  # noqa: SLF001
+                    bundle.input_internal_identities
+                )
+            ),
+            "release_root": str(bundle.release_root),
+            "source_tree_oid": checked["source_tree_oid"],
+            "secret_material_recorded": False,
+            "secret_digest_recorded": False,
+        }
+    except (KeyError, TypeError) as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_launch_authority_invalid"
+        ) from exc
+    return validate_launch_authority(
+        {
+            **unsigned,
+            "launch_authority_sha256": activation._sha256(  # noqa: SLF001
+                activation._canonical(unsigned)  # noqa: SLF001
+            ),
+        },
+        request=checked,
+    )
+
+
+def validate_launch_authority(
+    value: Any,
+    *,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    checked = validate_owner_request(request)
+    fields = {
+        "schema",
+        "operation",
+        "request_sha256",
+        "target_revision",
+        "predecessor_revision",
+        "predecessor_activation_receipt_sha256",
+        "predecessor_trust_sha256",
+        "stage_c_host_artifact_manifest_sha256",
+        "stage_c_release_update_publication_sha256",
+        "stage_c_builder_terminal_receipt_sha256",
+        "candidate_seal_receipt_sha256",
+        "whole_tree_manifest_sha256",
+        "input_internal_identities_sha256",
+        "release_root",
+        "source_tree_oid",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "launch_authority_sha256",
+    }
+    unsigned = (
+        {
+            name: item
+            for name, item in value.items()
+            if name != "launch_authority_sha256"
+        }
+        if isinstance(value, Mapping)
+        else {}
+    )
+    bindings = {
+        name: checked[name]
+        for name in (
+            "request_sha256",
+            "target_revision",
+            "predecessor_revision",
+            "predecessor_activation_receipt_sha256",
+            "stage_c_host_artifact_manifest_sha256",
+            "stage_c_release_update_publication_sha256",
+            "stage_c_builder_terminal_receipt_sha256",
+            "source_tree_oid",
+        )
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != fields
+        or value.get("schema") != LAUNCH_AUTHORITY_SCHEMA
+        or value.get("operation") != OPERATION
+        or any(value.get(name) != expected for name, expected in bindings.items())
+        or any(
+            _SHA256.fullmatch(str(value.get(name, ""))) is None
+            for name in (
+                "candidate_seal_receipt_sha256",
+                "whole_tree_manifest_sha256",
+                "predecessor_trust_sha256",
+                "input_internal_identities_sha256",
+                "launch_authority_sha256",
+            )
+        )
+        or value.get("release_root")
+        != str(rail.release_root(checked["target_revision"]))
+        or value.get("secret_material_recorded") is not False
+        or value.get("secret_digest_recorded") is not False
+        or value.get("launch_authority_sha256")
+        != activation._sha256(  # noqa: SLF001
+            activation._canonical(unsigned)  # noqa: SLF001
+        )
+    ):
+        _fail("upstream_sync_successor_launch_authority_invalid")
+    return copy.deepcopy(dict(value))
+
+
+def _encode_launch_envelope(
+    *,
+    request: Mapping[str, Any],
+    launch_authority: Mapping[str, Any],
+) -> bytes:
+    checked = validate_owner_request(request)
+    authority = validate_launch_authority(launch_authority, request=checked)
+    request_frame = encode_owner_request(checked)
+    unsigned = {
+        "schema": LAUNCH_ENVELOPE_SCHEMA,
+        "request_frame_hex": request_frame.hex(),
+        "launch_authority": authority,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    envelope = {
+        **unsigned,
+        "envelope_sha256": activation._sha256(  # noqa: SLF001
+            activation._canonical(unsigned)  # noqa: SLF001
+        ),
+    }
+    raw = activation._canonical(envelope) + b"\n"  # noqa: SLF001
+    if len(raw) > 64 * 1024:
+        _fail("upstream_sync_successor_launch_envelope_invalid")
+    return raw
 
 
 def _stage_pending_path(path: Path, digest: str) -> Path:
@@ -1603,18 +1781,163 @@ def _fsync_directory(path: Path) -> None:
             os.close(descriptor)
 
 
+@contextmanager
+def _stage_parent_lock(path: Path, *, root_owned: bool):
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        state = os.fstat(descriptor)
+        expected_uid = 0 if root_owned else activation._effective_uid()  # noqa: SLF001
+        if (
+            not stat.S_ISDIR(state.st_mode)
+            or state.st_uid != expected_uid
+            or stat.S_IMODE(state.st_mode) & 0o022
+        ):
+            _fail("upstream_sync_successor_stage_invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _read_stage_pending_prefix(
+    path: Path,
+    *,
+    raw: bytes,
+    root_owned: bool,
+) -> tuple[bytes, os.stat_result]:
+    descriptor: int | None = None
+    try:
+        before = os.lstat(path)
+        expected_uid = 0 if root_owned else activation._effective_uid()  # noqa: SLF001
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != expected_uid
+            or stat.S_IMODE(before.st_mode) not in {0o600, 0o444}
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > len(raw)
+        ):
+            _fail("upstream_sync_successor_stage_invalid")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        reached = os.lstat(path)
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    prefix = b"".join(chunks)
+    if (
+        remaining
+        or not raw.startswith(prefix)
+        or len(
+            {
+                activation._identity(item)  # noqa: SLF001
+                for item in (before, opened, after, reached)
+            }
+        )
+        != 1
+    ):
+        _fail("upstream_sync_successor_stage_invalid")
+    return prefix, before
+
+
+def _finalize_recovered_stage_pending(
+    path: Path,
+    *,
+    raw: bytes,
+    state: os.stat_result,
+    root_owned: bool,
+) -> None:
+    """Durably finalize a complete recovered stage inode before linking."""
+
+    descriptor: int | None = None
+    expected_uid = 0 if root_owned else activation._effective_uid()  # noqa: SLF001
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if activation._identity(opened) != activation._identity(state):  # noqa: SLF001
+            _fail("upstream_sync_successor_stage_invalid")
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        reached = os.lstat(path)
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if any(
+        not stat.S_ISREG(item.st_mode)
+        or stat.S_ISLNK(item.st_mode)
+        or item.st_dev != state.st_dev
+        or item.st_ino != state.st_ino
+        or item.st_uid != expected_uid
+        or item.st_nlink != 1
+        or item.st_size != len(raw)
+        or stat.S_IMODE(item.st_mode) != 0o444
+        for item in (after, reached)
+    ):
+        _fail("upstream_sync_successor_stage_invalid")
+    _read_staged_exact(path, raw=raw, root_owned=root_owned)
+
+
 def _stage_create_only(
     value: Mapping[str, Any],
     *,
     path: Path,
     root_owned: bool,
+    after_pending_fsync: Callable[[], None] | None = None,
+    after_final_link: Callable[[], None] | None = None,
+    before_pending_finalize: Callable[[], None] | None = None,
+    before_pending_fsync: Callable[[], None] | None = None,
 ) -> release_builder.FileIdentity:
-    """Publish exact immutable bytes without an overwrite-capable edge.
-
-    The deterministic pending inode makes crashes before or after ``link(2)``
-    recoverable.  A foreign target, foreign pending file, symlink, or unrelated
-    hard link is never removed or replaced.
-    """
+    """Publish exact immutable bytes under one serialized crash protocol."""
 
     raw = activation._canonical(value) + b"\n"  # noqa: SLF001
     digest = activation._sha256(raw)  # noqa: SLF001
@@ -1630,48 +1953,99 @@ def _stage_create_only(
             "upstream_sync_successor_stage_parent_invalid"
         ) from exc
 
-    target_exists = os.path.lexists(path)
-    pending_exists = os.path.lexists(pending)
-    if target_exists:
-        if pending_exists:
-            _read_pending_transaction_inode(
-                target=path,
-                pending=pending,
-                raw=raw,
-                root_owned=root_owned,
-            )
-            try:
-                pending.unlink()
-            except OSError as exc:
-                raise UpstreamSyncRailSuccessorRebindError(
-                    "upstream_sync_successor_stage_invalid"
-                ) from exc
-            _fsync_directory(path.parent)
-        return _read_staged_exact(path, raw=raw, root_owned=root_owned)
-
-    if pending_exists:
-        _read_staged_exact(pending, raw=raw, root_owned=root_owned)
-    else:
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+    with _stage_parent_lock(path, root_owned=root_owned):
+        pending_pattern = re.compile(
+            rf"^\.{re.escape(path.name)}\.([0-9a-f]{{64}})\.stage$"
         )
+        try:
+            conflicts = tuple(
+                name
+                for name in os.listdir(path.parent)
+                if pending_pattern.fullmatch(name) and name != pending.name
+            )
+        except OSError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_stage_invalid"
+            ) from exc
+        if conflicts:
+            _fail("upstream_sync_successor_stage_invalid")
+        if os.path.lexists(path):
+            if os.path.lexists(pending):
+                _read_pending_transaction_inode(
+                    target=path,
+                    pending=pending,
+                    raw=raw,
+                    root_owned=root_owned,
+                )
+                try:
+                    pending.unlink()
+                except OSError as exc:
+                    raise UpstreamSyncRailSuccessorRebindError(
+                        "upstream_sync_successor_stage_invalid"
+                    ) from exc
+                _fsync_directory(path.parent)
+            return _read_staged_exact(path, raw=raw, root_owned=root_owned)
+
         descriptor: int | None = None
         try:
-            descriptor = os.open(pending, flags, 0o444)
-            os.fchmod(descriptor, 0o444)
-            if root_owned and activation._effective_uid() == 0:  # noqa: SLF001
-                os.fchown(descriptor, 0, 0)
-            view = memoryview(raw)
+            if os.path.lexists(pending):
+                prefix, _state = _read_stage_pending_prefix(
+                    pending,
+                    raw=raw,
+                    root_owned=root_owned,
+                )
+                if prefix == raw:
+                    _finalize_recovered_stage_pending(
+                        pending,
+                        raw=raw,
+                        state=_state,
+                        root_owned=root_owned,
+                    )
+                    view = memoryview(b"")
+                else:
+                    pending.unlink()
+                    _fsync_directory(path.parent)
+                    descriptor = os.open(
+                        pending,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                    os.fchmod(descriptor, 0o600)
+                    if root_owned and activation._effective_uid() == 0:  # noqa: SLF001
+                        os.fchown(descriptor, 0, 0)
+                    view = memoryview(raw)
+            else:
+                descriptor = os.open(
+                    pending,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                os.fchmod(descriptor, 0o600)
+                if root_owned and activation._effective_uid() == 0:  # noqa: SLF001
+                    os.fchown(descriptor, 0, 0)
+                view = memoryview(raw)
             while view:
                 written = os.write(descriptor, view)
                 if written <= 0:
                     _fail("upstream_sync_successor_stage_invalid")
                 view = view[written:]
-            os.fsync(descriptor)
+            if descriptor is not None:
+                if before_pending_finalize is not None:
+                    before_pending_finalize()
+                os.fchmod(descriptor, 0o444)
+                if before_pending_fsync is not None:
+                    before_pending_fsync()
+                os.fsync(descriptor)
+                if after_pending_fsync is not None:
+                    after_pending_fsync()
         except UpstreamSyncRailSuccessorRebindError:
             raise
         except OSError as exc:
@@ -1682,23 +2056,25 @@ def _stage_create_only(
             if descriptor is not None:
                 os.close(descriptor)
         _read_staged_exact(pending, raw=raw, root_owned=root_owned)
-    try:
-        os.link(pending, path, follow_symlinks=False)
-    except FileExistsError:
-        _fail("upstream_sync_successor_stage_raced")
-    except OSError as exc:
-        raise UpstreamSyncRailSuccessorRebindError(
-            "upstream_sync_successor_stage_invalid"
-        ) from exc
-    try:
-        pending.unlink()
-    except OSError as exc:
-        raise UpstreamSyncRailSuccessorRebindError(
-            "upstream_sync_successor_stage_invalid"
-        ) from exc
-    _fsync_directory(path.parent)
-    return _read_staged_exact(path, raw=raw, root_owned=root_owned)
-
+        try:
+            os.link(pending, path, follow_symlinks=False)
+        except FileExistsError:
+            _fail("upstream_sync_successor_stage_raced")
+        except OSError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_stage_invalid"
+            ) from exc
+        _fsync_directory(path.parent)
+        if after_final_link is not None:
+            after_final_link()
+        try:
+            pending.unlink()
+        except OSError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_stage_invalid"
+            ) from exc
+        _fsync_directory(path.parent)
+        return _read_staged_exact(path, raw=raw, root_owned=root_owned)
 
 def _remove_just_created_stage(
     value: Mapping[str, Any],
@@ -2807,6 +3183,7 @@ def _owner_result(
     *,
     request: Mapping[str, Any],
     authority: Mapping[str, Any],
+    launch_authority_sha256: str,
     preflight_value: Mapping[str, Any],
     terminal: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2816,6 +3193,7 @@ def _owner_result(
         "request_sha256": request["request_sha256"],
         "target_revision": request["target_revision"],
         **{name: request[name] for name in _OWNER_RUNTIME_IDENTITY_FIELDS},
+        "launch_authority_sha256": launch_authority_sha256,
         "authority_sha256": authority["authority_sha256"],
         "preflight_receipt_sha256": preflight_value["receipt_sha256"],
         "terminal_receipt_sha256": terminal["receipt_sha256"],
@@ -2837,6 +3215,7 @@ def validate_owner_result(
     value: Any,
     *,
     request: Mapping[str, Any],
+    expected_launch_authority_sha256: str,
 ) -> dict[str, Any]:
     expected_request = validate_owner_request(request)
     fields = {
@@ -2845,6 +3224,7 @@ def validate_owner_result(
         "request_sha256",
         "target_revision",
         *_OWNER_RUNTIME_IDENTITY_FIELDS,
+        "launch_authority_sha256",
         "authority_sha256",
         "preflight_receipt_sha256",
         "terminal_receipt_sha256",
@@ -2872,9 +3252,12 @@ def validate_owner_result(
             result.get(name) != expected_request[name]
             for name in _OWNER_RUNTIME_IDENTITY_FIELDS
         )
+        or result.get("launch_authority_sha256")
+        != expected_launch_authority_sha256
         or any(
             _SHA256.fullmatch(str(result.get(name, ""))) is None
             for name in (
+                "launch_authority_sha256",
                 "authority_sha256",
                 "preflight_receipt_sha256",
                 "terminal_receipt_sha256",
@@ -2931,10 +3314,13 @@ def _owner_apply(
     require_root: bool,
     activation_lock_factory: Callable[[], Any] | None,
     stage0_verifier: Stage0Verifier = release_stage0.verify_stage0,
+    expected_launch_authority_sha256: str,
 ) -> dict[str, Any]:
     """Apply only while canonical Stage 0 keeps every trust input open."""
 
     request = validate_owner_request(request_value)
+    if _SHA256.fullmatch(expected_launch_authority_sha256 or "") is None:
+        _fail("upstream_sync_successor_launch_authority_invalid")
     try:
         verified = stage0_verifier(
             expected_predecessor_activation_receipt_sha256=request[
@@ -2947,6 +3333,12 @@ def _owner_apply(
                 bundle=bundle,
                 release_trust_root=release_trust_root,
             )
+            launch_authority = _launch_authority(request=request, bundle=bundle)
+            if (
+                launch_authority["launch_authority_sha256"]
+                != expected_launch_authority_sha256
+            ):
+                _fail("upstream_sync_successor_launch_authority_drifted")
             result = _owner_apply_verified(
                 request,
                 staged_root=staged_root,
@@ -2961,6 +3353,9 @@ def _owner_apply(
                 require_root=require_root,
                 activation_lock_factory=activation_lock_factory,
                 stability_guard=bundle.assert_stable,
+                launch_authority_sha256=launch_authority[
+                    "launch_authority_sha256"
+                ],
             )
             bundle.assert_stable()
             return result
@@ -2987,6 +3382,7 @@ def _owner_apply_verified(
     require_root: bool,
     activation_lock_factory: Callable[[], Any] | None,
     stability_guard: Callable[[], None],
+    launch_authority_sha256: str,
 ) -> dict[str, Any]:
     """Author, stage, rebind, and verify one exact successor transaction."""
 
@@ -3198,12 +3594,17 @@ def _owner_apply_verified(
     return _owner_result(
         request=request,
         authority=authority,
+        launch_authority_sha256=launch_authority_sha256,
         preflight_value=preflight_value,
         terminal=verified,
     )
 
 
-def owner_apply(request: Mapping[str, Any]) -> dict[str, Any]:
+def owner_apply(
+    request: Mapping[str, Any],
+    *,
+    expected_launch_authority_sha256: str,
+) -> dict[str, Any]:
     checked = validate_owner_request(request)
     runtime_path = rail.release_root(checked["target_revision"]) / RUNTIME_RELATIVE
     return _owner_apply(
@@ -3219,13 +3620,20 @@ def owner_apply(request: Mapping[str, Any]) -> dict[str, Any]:
         host=_SystemdHost(root_owned=True),
         require_root=True,
         activation_lock_factory=None,
+        expected_launch_authority_sha256=expected_launch_authority_sha256,
     )
 
 
-def owner_apply_framed_stdin() -> dict[str, Any]:
+def owner_apply_framed_stdin(
+    *,
+    expected_launch_authority_sha256: str,
+) -> dict[str, Any]:
     """Consume the sole fixed framed owner request from process stdin."""
 
-    if sys.stdin.isatty():
+    if (
+        sys.stdin.isatty()
+        or _SHA256.fullmatch(expected_launch_authority_sha256 or "") is None
+    ):
         _fail("upstream_sync_successor_owner_cli_invalid")
     frame = sys.stdin.buffer.read(_OWNER_FRAME_MAX_BYTES + 9)
     request = decode_owner_request(frame)
@@ -3266,18 +3674,23 @@ def owner_apply_framed_stdin() -> dict[str, Any]:
         expected_staging_pyvenv_cfg_sha256=request[
             "remote_owner_runtime_staging_pyvenv_cfg_sha256"
         ],
+        expected_launch_authority_sha256=expected_launch_authority_sha256,
     )
-    return owner_apply(request)
+    return owner_apply(
+        request,
+        expected_launch_authority_sha256=expected_launch_authority_sha256,
+    )
 
 
 class OwnerRebindTransport(Protocol):
-    """One fixed IAP edge; callers cannot provide argv, paths, or targets."""
+    """One fixed IAP edge; no caller-selected argv, paths, or targets."""
 
-    def invoke_successor_rebind(
+    def execute_successor_rebind(
         self,
         *,
-        target_revision: str,
-        request_frame: bytes,
+        request: Mapping[str, Any],
+        launch_authority: Mapping[str, Any],
+        stability_guard: Callable[[], None],
     ) -> bytes: ...
 
 
@@ -3339,17 +3752,24 @@ class _ProductionOwnerRebindTransport:
         )
         self._foundation = foundation
         self._account = self._identity.account_for_read_only_preflight()
-        self._prepare_build_promote(request)
 
     def _foundation_call(
         self,
         request: Mapping[str, Any],
         operation: str,
         *,
+        launch_authority: Mapping[str, Any],
         extra_argv: tuple[str, ...] = (),
-        input_bytes: bytes = b"",
+        payload: Mapping[str, Any] | None = None,
         timeout_seconds: float,
     ) -> Mapping[str, Any]:
+        phase_frame = self._foundation.build_phase_frame(
+            operation=operation,
+            revision=request["target_revision"],
+            launch_authority=launch_authority,
+            payload=payload,
+        )
+        input_bytes = activation._canonical(phase_frame) + b"\n"  # noqa: SLF001
         completed = self._transport._run_remote_input(  # noqa: SLF001
             (
                 str(SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER),
@@ -3362,8 +3782,8 @@ class _ProductionOwnerRebindTransport:
             ),
             account=self._account,
             input_bytes=input_bytes,
-            maximum_input_bytes=self._foundation.runtime.MAX_MANIFEST_BYTES,
-            maximum_output_bytes=self._foundation.runtime.MAX_MANIFEST_BYTES,
+            maximum_input_bytes=64 * 1024,
+            maximum_output_bytes=64 * 1024,
             timeout_seconds=timeout_seconds,
         )
         raw = completed.stdout
@@ -3383,13 +3803,22 @@ class _ProductionOwnerRebindTransport:
             _fail("upstream_sync_successor_owner_runtime_foundation_failed")
         return copy.deepcopy(dict(value))
 
-    def _prepare_build_promote(self, request: Mapping[str, Any]) -> None:
+    def _prepare_build_promote(
+        self,
+        request: Mapping[str, Any],
+        *,
+        launch_authority: Mapping[str, Any],
+        stability_guard: Callable[[], None],
+    ) -> None:
         revision = request["target_revision"]
+        stability_guard()
         prepared = self._foundation_call(
             request,
             "prepare-runtime",
+            launch_authority=launch_authority,
             timeout_seconds=120.0,
         )
+        stability_guard()
         expected_staging_base = (
             self._foundation.RELEASE_BASE / f".{revision}.builder-staging"
         )
@@ -3399,6 +3828,7 @@ class _ProductionOwnerRebindTransport:
             self._foundation_call(
                 request,
                 "build-runtime-as-dedicated-builder",
+                launch_authority=launch_authority,
                 extra_argv=(
                     request["source_tree_oid"],
                     request["stage_c_builder_terminal_receipt_sha256"],
@@ -3408,7 +3838,11 @@ class _ProductionOwnerRebindTransport:
             revision=revision,
             staging_root=expected_staging_base / revision,
         )
+        stability_guard()
         expected_staging = {
+            "launch_authority_sha256": launch_authority[
+                "launch_authority_sha256"
+            ],
             "publication_sha256": request[
                 "remote_owner_runtime_staging_publication_sha256"
             ],
@@ -3450,17 +3884,24 @@ class _ProductionOwnerRebindTransport:
             staging_tree_sha256=built["tree_sha256"],
             staging_interpreter_sha256=built["interpreter_sha256"],
             staging_pyvenv_cfg_sha256=built["pyvenv_cfg_sha256"],
+            launch_authority_sha256=launch_authority[
+                "launch_authority_sha256"
+            ],
         )
         promoted = self._foundation.validate_publication(
             self._foundation_call(
                 request,
                 "promote-runtime",
-                input_bytes=activation._canonical(frame) + b"\n",  # noqa: SLF001
+                launch_authority=launch_authority,
+                payload=frame,
                 timeout_seconds=2_400.0,
             ),
             revision=revision,
         )
         expected_final = {
+            "launch_authority_sha256": launch_authority[
+                "launch_authority_sha256"
+            ],
             "publication_sha256": request["remote_owner_runtime_publication_sha256"],
             "manifest_sha256": request["remote_owner_runtime_manifest_sha256"],
             "attestation_sha256": request["remote_owner_runtime_attestation_sha256"],
@@ -3469,52 +3910,81 @@ class _ProductionOwnerRebindTransport:
         }
         if any(promoted[name] != value for name, value in expected_final.items()):
             _fail("upstream_sync_successor_owner_runtime_foundation_failed")
+        stability_guard()
 
     def invoke_successor_rebind(
         self,
         *,
         target_revision: str,
         request_frame: bytes,
+        launch_authority: Mapping[str, Any],
+        stability_guard: Callable[[], None],
     ) -> bytes:
         if target_revision != self._target_revision:
             _fail("upstream_sync_successor_owner_target_changed")
         request = decode_owner_request(request_frame)
         if request["request_sha256"] != self._request_sha256:
             _fail("upstream_sync_successor_owner_request_changed")
+        authority = validate_launch_authority(
+            launch_authority,
+            request=request,
+        )
+        launch_authority_sha256 = authority["launch_authority_sha256"]
+        launch_envelope = _encode_launch_envelope(
+            request=request,
+            launch_authority=authority,
+        )
+        stability_guard()
         completed = self._transport._run_remote_input(  # noqa: SLF001
             (
                 str(FOUNDATION_V4_WRAPPER),
                 target_revision,
                 "successor-rebind-owner-apply",
                 *self._runtime_identities,
+                launch_authority_sha256,
             ),
             account=self._account,
-            input_bytes=request_frame,
-            maximum_input_bytes=_OWNER_FRAME_MAX_BYTES + 8,
+            input_bytes=launch_envelope,
+            maximum_input_bytes=64 * 1024,
             maximum_output_bytes=64 * 1024,
             timeout_seconds=2_400.0,
         )
+        stability_guard()
         return completed.stdout
 
-
-def owner_run(
-    request_value: Mapping[str, Any],
-    *,
-    transport: OwnerRebindTransport | None = None,
-) -> dict[str, Any]:
-    request = validate_owner_request(request_value)
-    selected = transport or _ProductionOwnerRebindTransport(request)
-    try:
-        raw = selected.invoke_successor_rebind(
-            target_revision=request["target_revision"],
-            request_frame=encode_owner_request(request),
+    def execute_successor_rebind(
+        self,
+        *,
+        request: Mapping[str, Any],
+        launch_authority: Mapping[str, Any],
+        stability_guard: Callable[[], None],
+    ) -> bytes:
+        checked = validate_owner_request(request)
+        authority = validate_launch_authority(
+            launch_authority,
+            request=checked,
         )
-    except UpstreamSyncRailSuccessorRebindError:
-        raise
-    except Exception as exc:
-        raise UpstreamSyncRailSuccessorRebindError(
-            "upstream_sync_successor_owner_transport_failed"
-        ) from exc
+        self._prepare_build_promote(
+            checked,
+            launch_authority=authority,
+            stability_guard=stability_guard,
+        )
+        return self.invoke_successor_rebind(
+            target_revision=checked["target_revision"],
+            request_frame=encode_owner_request(checked),
+            launch_authority=authority,
+            stability_guard=stability_guard,
+        )
+
+
+
+
+def _finish_owner_run(
+    raw: bytes,
+    *,
+    request: Mapping[str, Any],
+    launch_authority: Mapping[str, Any],
+) -> dict[str, Any]:
     if not isinstance(raw, bytes) or not raw.endswith(b"\n") or len(raw) > 64 * 1024:
         _fail("upstream_sync_successor_owner_transport_failed")
     try:
@@ -3523,8 +3993,83 @@ def owner_run(
         raise UpstreamSyncRailSuccessorRebindError(
             "upstream_sync_successor_owner_transport_failed"
         ) from exc
-    return validate_owner_result(value, request=request)
+    return validate_owner_result(
+        value,
+        request=request,
+        expected_launch_authority_sha256=launch_authority[
+            "launch_authority_sha256"
+        ],
+    )
 
+
+def _owner_run_for_test(
+    request_value: Mapping[str, Any],
+    *,
+    transport: OwnerRebindTransport,
+    launch_authority: Mapping[str, Any],
+    stability_guard: Callable[[], None],
+) -> dict[str, Any]:
+    """Explicit test seam; production owner_run never accepts a transport."""
+
+    request = validate_owner_request(request_value)
+    authority = validate_launch_authority(launch_authority, request=request)
+    stability_guard()
+    try:
+        raw = transport.execute_successor_rebind(
+            request=request,
+            launch_authority=authority,
+            stability_guard=stability_guard,
+        )
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except release_stage0.ProductionReleaseUpdateStage0Error:
+        raise
+    except Exception as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_owner_transport_failed"
+        ) from exc
+    stability_guard()
+    return _finish_owner_run(
+        raw,
+        request=request,
+        launch_authority=authority,
+    )
+
+
+def owner_run(request_value: Mapping[str, Any]) -> dict[str, Any]:
+    """Verify and hold canonical Stage0 before constructing any transport."""
+
+    request = validate_owner_request(request_value)
+    try:
+        verified = release_stage0.verify_stage0(
+            expected_predecessor_activation_receipt_sha256=request[
+                "predecessor_activation_receipt_sha256"
+            ]
+        )
+        with verified as bundle:
+            _validate_stage0_bundle(
+                request=request,
+                bundle=bundle,
+                release_trust_root=rail.RELEASES_ROOT,
+            )
+            authority = _launch_authority(request=request, bundle=bundle)
+            bundle.assert_stable()
+            selected = _ProductionOwnerRebindTransport(request)
+            bundle.assert_stable()
+            result = _owner_run_for_test(
+                request,
+                transport=selected,
+                launch_authority=authority,
+                stability_guard=bundle.assert_stable,
+            )
+            bundle.assert_stable()
+            return result
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except release_stage0.ProductionReleaseUpdateStage0Error as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage0_invalid"
+        ) from exc
 
 def _verify(
     *,
@@ -3779,6 +4324,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--expected-authority-sha256")
     parser.add_argument("--expected-preflight-sha256")
+    parser.add_argument("--launch-authority-sha256")
     parser.add_argument("--target-revision")
     parser.add_argument("--target-package-manifest-sha256")
     parser.add_argument("--predecessor-revision")
@@ -3852,6 +4398,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (
             arguments.expected_authority_sha256 is not None
             or arguments.expected_preflight_sha256 is not None
+            or arguments.launch_authority_sha256 is not None
             or any(item is None for item in owner_fields)
         ):
             _fail("upstream_sync_successor_owner_cli_invalid")
@@ -3947,13 +4494,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (
             arguments.expected_authority_sha256 is not None
             or arguments.expected_preflight_sha256 is not None
+            or _SHA256.fullmatch(arguments.launch_authority_sha256 or "") is None
             or any(item is not None for item in owner_fields)
             or sys.stdin.isatty()
         ):
             _fail("upstream_sync_successor_owner_cli_invalid")
-        _write_stdout(owner_apply_framed_stdin())
+        _write_stdout(
+            owner_apply_framed_stdin(
+                expected_launch_authority_sha256=(
+                    arguments.launch_authority_sha256
+                )
+            )
+        )
         return 0
-    if any(item is not None for item in owner_fields):
+    if (
+        any(item is not None for item in owner_fields)
+        or arguments.launch_authority_sha256 is not None
+    ):
         _fail("upstream_sync_successor_owner_cli_invalid")
     if _SHA256.fullmatch(arguments.expected_authority_sha256 or "") is None:
         _fail("upstream_sync_successor_authority_identity_invalid")

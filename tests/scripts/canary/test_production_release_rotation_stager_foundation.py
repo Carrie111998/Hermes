@@ -665,8 +665,13 @@ def test_successor_rebind_v4_wrapper_has_only_one_fixed_action() -> None:
     assert "successor-rebind-owner-apply" in raw
     assert "upstream-sync-successor-owner-apply" in verifier
     assert "owner-apply-fixed" not in raw
-    assert 'if [ "$#" -ne 8 ]' in raw
+    assert 'if [ "$#" -ne 9 ]' in raw
     assert 'if [ "$operation" != successor-rebind-owner-apply ]' in raw
+    assert "launch_authority_sha256=$9" in raw
+    assert '"$launch_authority_sha256"' in raw
+    assert '"$launch_authority_sha256"' in raw.rsplit(
+        "exec /usr/bin/python3 -I -S -B", 1
+    )[1]
     assert "runtime_base=/usr/lib/muncho-successor-rebind-runtime" in raw
     assert "production_successor_rebind_owner_runtime_preexec" in raw
     assert "exec /usr/bin/python3 -I -S -B" in raw

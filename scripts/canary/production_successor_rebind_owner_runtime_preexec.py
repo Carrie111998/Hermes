@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -23,6 +24,70 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_MANIFEST = 32 * 1024 * 1024
 _MAX_ENTRIES = 200_000
 _MAX_BYTES = 4 * 1024 * 1024 * 1024
+_LAUNCH_ENVELOPE_MAX_BYTES = 64 * 1024
+_LAUNCH_AUTHORITY_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-launch-authority.v1"
+)
+_LAUNCH_ENVELOPE_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-launch-envelope.v1"
+)
+_OWNER_REQUEST_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-owner-request.v3"
+)
+_OWNER_OPERATION = "dual-upstream-sync-successor-rebind"
+_OWNER_REQUEST_REVISION_FIELDS = frozenset({
+    "target_revision",
+    "predecessor_revision",
+    "source_tree_oid",
+})
+_OWNER_REQUEST_DIGEST_FIELDS = frozenset({
+    "target_package_manifest_sha256",
+    "predecessor_activation_receipt_sha256",
+    "stage_c_host_artifact_manifest_sha256",
+    "stage_c_release_update_publication_sha256",
+    "stage_c_builder_terminal_receipt_sha256",
+    "rebind_runtime_sha256",
+    "foundation_wrapper_sha256",
+    "controller_owner_runtime_manifest_sha256",
+    "controller_owner_runtime_attestation_sha256",
+    "controller_owner_runtime_tree_sha256",
+    "controller_owner_runtime_interpreter_sha256",
+    "remote_owner_runtime_publication_sha256",
+    "remote_owner_runtime_manifest_sha256",
+    "remote_owner_runtime_attestation_sha256",
+    "remote_owner_runtime_tree_sha256",
+    "remote_owner_runtime_interpreter_sha256",
+    "remote_owner_runtime_staging_publication_sha256",
+    "remote_owner_runtime_staging_manifest_sha256",
+    "remote_owner_runtime_staging_attestation_sha256",
+    "remote_owner_runtime_staging_tree_sha256",
+    "remote_owner_runtime_staging_interpreter_sha256",
+    "remote_owner_runtime_staging_pyvenv_cfg_sha256",
+    "remote_owner_runtime_builder_receipt_sha256",
+    "remote_owner_runtime_wheel_sha256",
+    "preexec_verifier_sha256",
+    "successor_runtime_foundation_wrapper_sha256",
+    "successor_runtime_foundation_launcher_sha256",
+    "successor_runtime_controller_manifest_file_sha256",
+    "request_sha256",
+})
+_OWNER_REQUEST_POLICY_FIELDS = frozenset({
+    "caller_selected_paths_allowed",
+    "caller_selected_commands_allowed",
+    "caller_selected_targets_allowed",
+    "manual_json_allowed",
+    "semantic_decisions_allowed",
+    "secret_material_recorded",
+    "secret_digest_recorded",
+})
+_OWNER_REQUEST_FIELDS = frozenset({"schema", "operation"}).union(
+    _OWNER_REQUEST_REVISION_FIELDS,
+    _OWNER_REQUEST_DIGEST_FIELDS,
+    _OWNER_REQUEST_POLICY_FIELDS,
+)
+_CONTROLLER_RELEASES_ROOT = Path(
+    "/opt/adventico-ai-platform/hermes-agent-releases"
+)
 _MANIFEST_FIELDS = frozenset({
     "schema",
     "revision",
@@ -69,6 +134,212 @@ def _canonical(value: Any) -> bytes:
 
 def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _decode_launch_envelope(
+    raw: bytes,
+    *,
+    revision: str,
+    expected_launch_authority_sha256: str,
+) -> bytes:
+    try:
+        envelope = json.loads(raw[:-1].decode("ascii", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        _fail("successor_runtime_preexec_launch_envelope_invalid", exc)
+    fields = {
+        "schema",
+        "request_frame_hex",
+        "launch_authority",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "envelope_sha256",
+    }
+    unsigned = (
+        {
+            name: item
+            for name, item in envelope.items()
+            if name != "envelope_sha256"
+        }
+        if isinstance(envelope, Mapping)
+        else {}
+    )
+    if (
+        not raw.endswith(b"\n")
+        or len(raw) > _LAUNCH_ENVELOPE_MAX_BYTES
+        or not isinstance(envelope, Mapping)
+        or set(envelope) != fields
+        or envelope.get("schema") != _LAUNCH_ENVELOPE_SCHEMA
+        or envelope.get("secret_material_recorded") is not False
+        or envelope.get("secret_digest_recorded") is not False
+        or _SHA256.fullmatch(str(envelope.get("envelope_sha256", ""))) is None
+        or envelope.get("envelope_sha256") != _sha(_canonical(unsigned))
+        or raw != _canonical(envelope) + b"\n"
+    ):
+        _fail("successor_runtime_preexec_launch_envelope_invalid")
+    authority = envelope["launch_authority"]
+    authority_fields = {
+        "schema",
+        "operation",
+        "request_sha256",
+        "target_revision",
+        "predecessor_revision",
+        "predecessor_activation_receipt_sha256",
+        "predecessor_trust_sha256",
+        "stage_c_host_artifact_manifest_sha256",
+        "stage_c_release_update_publication_sha256",
+        "stage_c_builder_terminal_receipt_sha256",
+        "candidate_seal_receipt_sha256",
+        "whole_tree_manifest_sha256",
+        "input_internal_identities_sha256",
+        "release_root",
+        "source_tree_oid",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "launch_authority_sha256",
+    }
+    authority_unsigned = (
+        {
+            name: item
+            for name, item in authority.items()
+            if name != "launch_authority_sha256"
+        }
+        if isinstance(authority, Mapping)
+        else {}
+    )
+    if (
+        not isinstance(authority, Mapping)
+        or set(authority) != authority_fields
+        or authority.get("schema") != _LAUNCH_AUTHORITY_SCHEMA
+        or authority.get("operation")
+        != "dual-upstream-sync-successor-rebind"
+        or authority.get("target_revision") != revision
+        or any(
+            _REVISION.fullmatch(str(authority.get(name, ""))) is None
+            for name in (
+                "target_revision",
+                "predecessor_revision",
+                "source_tree_oid",
+            )
+        )
+        or authority.get("target_revision") == authority.get("predecessor_revision")
+        or any(
+            _SHA256.fullmatch(str(authority.get(name, ""))) is None
+            for name in (
+                "request_sha256",
+                "predecessor_activation_receipt_sha256",
+                "predecessor_trust_sha256",
+                "stage_c_host_artifact_manifest_sha256",
+                "stage_c_release_update_publication_sha256",
+                "stage_c_builder_terminal_receipt_sha256",
+                "candidate_seal_receipt_sha256",
+                "whole_tree_manifest_sha256",
+                "input_internal_identities_sha256",
+                "launch_authority_sha256",
+            )
+        )
+        or authority.get("release_root")
+        != str(
+            _CONTROLLER_RELEASES_ROOT
+            / f"hermes-agent-{revision[:12]}"
+        )
+        or authority.get("launch_authority_sha256")
+        != expected_launch_authority_sha256
+        or authority.get("launch_authority_sha256")
+        != _sha(_canonical(authority_unsigned))
+        or authority.get("secret_material_recorded") is not False
+        or authority.get("secret_digest_recorded") is not False
+    ):
+        _fail("successor_runtime_preexec_launch_authority_invalid")
+    try:
+        request_frame = bytes.fromhex(str(envelope["request_frame_hex"]))
+    except ValueError as exc:
+        _fail("successor_runtime_preexec_owner_frame_invalid", exc)
+    if (
+        len(request_frame) < 9
+        or len(request_frame) > 16 * 1024 + 8
+        or request_frame[:4] != b"MSR2"
+        or int.from_bytes(request_frame[4:8], "big") != len(request_frame) - 8
+    ):
+        _fail("successor_runtime_preexec_owner_frame_invalid")
+    try:
+        request = json.loads(request_frame[8:].decode("ascii", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        _fail("successor_runtime_preexec_owner_frame_invalid", exc)
+    request_unsigned = (
+        {
+            name: item
+            for name, item in request.items()
+            if name != "request_sha256"
+        }
+        if isinstance(request, Mapping)
+        else {}
+    )
+    if (
+        not isinstance(request, Mapping)
+        or set(request) != _OWNER_REQUEST_FIELDS
+        or request_frame[8:] != _canonical(request)
+        or request.get("schema") != _OWNER_REQUEST_SCHEMA
+        or request.get("operation") != _OWNER_OPERATION
+        or any(
+            _REVISION.fullmatch(str(request.get(name, ""))) is None
+            for name in _OWNER_REQUEST_REVISION_FIELDS
+        )
+        or request.get("target_revision") == request.get("predecessor_revision")
+        or any(
+            _SHA256.fullmatch(str(request.get(name, ""))) is None
+            for name in _OWNER_REQUEST_DIGEST_FIELDS
+        )
+        or any(
+            request.get(name) is not False
+            for name in _OWNER_REQUEST_POLICY_FIELDS
+        )
+        or request.get("target_revision") != revision
+        or request.get("request_sha256") != _sha(_canonical(request_unsigned))
+        or request.get("request_sha256") != authority.get("request_sha256")
+        or request.get("predecessor_revision")
+        != authority.get("predecessor_revision")
+        or request.get("predecessor_activation_receipt_sha256")
+        != authority.get("predecessor_activation_receipt_sha256")
+        or request.get("stage_c_host_artifact_manifest_sha256")
+        != authority.get("stage_c_host_artifact_manifest_sha256")
+        or request.get("stage_c_release_update_publication_sha256")
+        != authority.get("stage_c_release_update_publication_sha256")
+        or request.get("stage_c_builder_terminal_receipt_sha256")
+        != authority.get("stage_c_builder_terminal_receipt_sha256")
+        or request.get("source_tree_oid") != authority.get("source_tree_oid")
+    ):
+        _fail("successor_runtime_preexec_owner_frame_invalid")
+    return request_frame
+
+
+def _install_sealed_stdin(raw: bytes) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.memfd_create(
+            "muncho-successor-owner-request",
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                _fail("successor_runtime_preexec_owner_frame_invalid")
+            view = view[written:]
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        fcntl.fcntl(
+            descriptor,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE,
+        )
+        os.dup2(descriptor, 0, inheritable=True)
+    except (AttributeError, OSError) as exc:
+        _fail("successor_runtime_preexec_owner_frame_invalid", exc)
+    finally:
+        if descriptor not in {None, 0}:
+            os.close(descriptor)
 
 
 def _identity(item: os.stat_result) -> tuple[int, ...]:
@@ -442,9 +713,24 @@ def verify_staged(
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = tuple(sys.argv[1:] if argv is None else argv)
-    if len(arguments) != 5:
+    if len(arguments) != 6:
         _fail("successor_runtime_preexec_argv_invalid")
-    revision, manifest_sha, tree_sha, interpreter_sha, attestation_sha = arguments
+    (
+        revision,
+        manifest_sha,
+        tree_sha,
+        interpreter_sha,
+        attestation_sha,
+        launch_authority_sha256,
+    ) = arguments
+    if _SHA256.fullmatch(launch_authority_sha256 or "") is None:
+        _fail("successor_runtime_preexec_argv_invalid")
+    envelope_raw = sys.stdin.buffer.read(_LAUNCH_ENVELOPE_MAX_BYTES + 1)
+    request_frame = _decode_launch_envelope(
+        envelope_raw,
+        revision=revision,
+        expected_launch_authority_sha256=launch_authority_sha256,
+    )
     interpreter = verify(
         revision=revision,
         expected_manifest_sha256=manifest_sha,
@@ -458,6 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "LC_ALL": "C.UTF-8",
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
     }
+    _install_sealed_stdin(request_frame)
     os.execve(
         interpreter,
         (
@@ -473,6 +760,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "upstream-sync-successor-owner-apply",
             "--revision",
             revision,
+            "--launch-authority-sha256",
+            launch_authority_sha256,
         ),
         environment,
     )

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import os
+import signal
 import shutil
 import stat
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,6 +23,9 @@ from scripts.canary import production_release_consumer_inventory as inventory
 from scripts.canary import production_release_rotation_stager_installer as foundation
 from scripts.canary import (
     production_successor_rebind_owner_runtime as foundation_runtime,
+)
+from scripts.canary import (
+    production_successor_rebind_owner_runtime_preexec as runtime_preexec,
 )
 from scripts.canary import production_cutover_owner_launcher as owner_launcher
 from scripts.canary import upstream_sync_rail_cutover as activation
@@ -216,6 +224,7 @@ class FakeStage0Bundle:
         return {
             "release_revision": self.predecessor_trust_revision,
             "activation_receipt_sha256": PREDECESSOR_RECEIPT,
+            "trust_sha256": "a" * 64,
         }
 
     @property
@@ -244,18 +253,22 @@ class FakeStage0Bundle:
 
     @property
     def input_internal_identities(self) -> dict[str, str]:
-        return {"host_artifact_manifest_sha256": self.host_manifest_sha256}
+        return {
+            "host_artifact_manifest_sha256": self.host_manifest_sha256,
+            "builder_terminal_receipt_sha256": STAGE_C_BUILDER_RECEIPT,
+            "candidate_seal_receipt_sha256": "b" * 64,
+        }
 
     @property
     def builder_manifest(self) -> dict[str, str]:
-        return {"release_revision": TARGET}
+        return {"release_revision": TARGET, "manifest_sha256": "c" * 64}
 
     @property
     def builder_receipt(self) -> dict[str, str]:
         return {
             "release_revision": TARGET,
             "source_tree_oid": SOURCE_TREE,
-            "receipt_sha256": STAGE_C_BUILDER_RECEIPT,
+            "receipt_sha256": "b" * 64,
         }
 
     def assert_stable(self) -> None:
@@ -268,6 +281,21 @@ class FakeStage0Bundle:
 
     def __exit__(self, *_args: Any) -> None:
         return None
+
+
+def _fake_launch_authority(request: dict[str, Any]) -> dict[str, Any]:
+    return successor._launch_authority(  # noqa: SLF001
+        request=request,
+        bundle=FakeStage0Bundle(
+            release_root=rail.release_root(TARGET),
+            host_manifest_sha256=request[
+                "stage_c_host_artifact_manifest_sha256"
+            ],
+            publication_sha256=request[
+                "stage_c_release_update_publication_sha256"
+            ],
+        ),
+    )
 
 
 @dataclass
@@ -346,6 +374,10 @@ class OwnerHarness:
             require_root=False,
             activation_lock_factory=lambda: nullcontext(),
             stage0_verifier=selected_verifier,
+            expected_launch_authority_sha256=successor._launch_authority(  # noqa: SLF001
+                request=self.request,
+                bundle=self.stage0_bundle,
+            )["launch_authority_sha256"],
         )
 
 
@@ -1445,6 +1477,157 @@ def test_create_only_stage_recovers_its_exact_pending_inode(
     assert not pending.exists()
 
 
+@pytest.mark.parametrize("crash_point", ("pending", "linked"))
+def test_create_only_stage_replays_both_durable_crash_points(
+    tmp_path: Path,
+    crash_point: str,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    pending = successor._stage_pending_path(  # noqa: SLF001
+        target,
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+    def crash() -> None:
+        raise KeyboardInterrupt
+
+    callbacks = (
+        {"after_pending_fsync": crash}
+        if crash_point == "pending"
+        else {"after_final_link": crash}
+    )
+    with pytest.raises(KeyboardInterrupt):
+        successor._stage_create_only(  # noqa: SLF001
+            value,
+            path=target,
+            root_owned=False,
+            **callbacks,
+        )
+
+    assert pending.read_bytes() == raw
+    assert (target.exists()) is (crash_point == "linked")
+    successor._stage_create_only(  # noqa: SLF001
+        value,
+        path=target,
+        root_owned=False,
+    )
+    assert target.read_bytes() == raw
+    assert target.stat().st_mode & 0o777 == 0o444
+    assert target.stat().st_nlink == 1
+    assert not pending.exists()
+
+
+def test_create_only_stage_recovers_immutable_prefix_but_preserves_foreign_pending(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    digest = hashlib.sha256(raw).hexdigest()
+    pending = successor._stage_pending_path(target, digest)  # noqa: SLF001
+    pending.write_bytes(raw[: len(raw) // 2])
+    pending.chmod(0o444)
+
+    successor._stage_create_only(  # noqa: SLF001
+        value,
+        path=target,
+        root_owned=False,
+    )
+    assert target.read_bytes() == raw
+    assert not pending.exists()
+
+    other = parent / "other.json"
+    foreign = successor._stage_pending_path(other, "f" * 64)  # noqa: SLF001
+    foreign.write_bytes(b"foreign\n")
+    foreign.chmod(0o444)
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage_invalid",
+    ):
+        successor._stage_create_only(  # noqa: SLF001
+            value,
+            path=other,
+            root_owned=False,
+        )
+    assert foreign.read_bytes() == b"foreign\n"
+    assert not other.exists()
+
+
+@pytest.mark.parametrize(
+    ("kill_hook", "pending_mode"),
+    (
+        ("before_pending_finalize", 0o600),
+        ("before_pending_fsync", 0o444),
+    ),
+)
+def test_create_only_stage_recovers_real_sigkill_and_fsyncs_inode_before_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kill_hook: str,
+    pending_mode: int,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    pending = successor._stage_pending_path(  # noqa: SLF001
+        target,
+        hashlib.sha256(raw).hexdigest(),
+    )
+    script = (
+        "import os,signal,sys;"
+        "from pathlib import Path;"
+        "from scripts.canary.upstream_sync_rail_successor_rebind "
+        "import _stage_create_only;"
+        "kill=lambda:os.kill(os.getpid(),signal.SIGKILL);"
+        "_stage_create_only("
+        "{'schema':'exact.test.v1','secret_material_recorded':False},"
+        "path=Path(sys.argv[1]),root_owned=False,**{sys.argv[2]:kill})"
+    )
+    completed = subprocess.run(
+        (sys.executable, "-B", "-c", script, str(target), kill_hook),
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert completed.returncode == -signal.SIGKILL
+    assert not target.exists()
+    assert pending.read_bytes() == raw
+    assert pending.stat().st_mode & 0o777 == pending_mode
+    pending_inode = pending.stat().st_ino
+    real_fsync = successor.os.fsync
+    fsynced_inodes: list[int] = []
+
+    def observe_fsync(descriptor: int) -> None:
+        fsynced_inodes.append(os.fstat(descriptor).st_ino)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(successor.os, "fsync", observe_fsync)
+    successor._stage_create_only(  # noqa: SLF001
+        value,
+        path=target,
+        root_owned=False,
+    )
+
+    assert pending_inode in fsynced_inodes
+    assert target.read_bytes() == raw
+    assert target.stat().st_mode & 0o777 == 0o444
+    assert target.stat().st_nlink == 1
+    assert not pending.exists()
+
+
 def test_stage_cleanup_never_removes_same_bytes_on_a_different_inode(
     tmp_path: Path,
 ) -> None:
@@ -1552,25 +1735,409 @@ def test_owner_request_frame_and_transport_are_closed_to_manual_fields() -> None
         successor.encode_owner_request(foreign_sender)
 
     class FakeTransport:
-        def invoke_successor_rebind(
+        def execute_successor_rebind(
             self,
             *,
-            target_revision: str,
-            request_frame: bytes,
+            request: dict[str, Any],
+            launch_authority: dict[str, Any],
+            stability_guard: Callable[[], None],
         ) -> bytes:
-            checked = successor.decode_owner_request(request_frame)
-            assert target_revision == TARGET
+            stability_guard()
+            checked = successor.validate_owner_request(request)
             result = successor._owner_result(  # noqa: SLF001
                 request=checked,
                 authority={"authority_sha256": "5" * 64},
+                launch_authority_sha256=launch_authority[
+                    "launch_authority_sha256"
+                ],
                 preflight_value={"receipt_sha256": "6" * 64},
                 terminal={"receipt_sha256": "7" * 64},
             )
             return activation._canonical(result) + b"\n"  # noqa: SLF001
 
-    result = successor.owner_run(request, transport=FakeTransport())
+    bundle = FakeStage0Bundle(
+        release_root=rail.release_root(TARGET),
+        host_manifest_sha256=request["stage_c_host_artifact_manifest_sha256"],
+        publication_sha256=request[
+            "stage_c_release_update_publication_sha256"
+        ],
+    )
+    launch_authority = successor._launch_authority(  # noqa: SLF001
+        request=request,
+        bundle=bundle,
+    )
+    result = successor._owner_run_for_test(  # noqa: SLF001
+        request,
+        transport=FakeTransport(),
+        launch_authority=launch_authority,
+        stability_guard=bundle.assert_stable,
+    )
     assert result["request_sha256"] == request["request_sha256"]
     assert result["caller_selected_commands_allowed"] is False
+
+
+def test_owner_run_holds_stage0_before_inert_transport_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    events: list[str] = []
+    owner.stage0_bundle.stable_hook = lambda: events.append("stable")
+
+    def verify_stage0(
+        *,
+        expected_predecessor_activation_receipt_sha256: str,
+    ) -> FakeStage0Bundle:
+        assert expected_predecessor_activation_receipt_sha256 == PREDECESSOR_RECEIPT
+        events.append("verify")
+        return owner.stage0_bundle
+
+    class Transport:
+        def __init__(self, request: dict[str, Any]) -> None:
+            assert request == owner.request
+            assert events[0] == "verify"
+            assert "stable" in events
+            events.append("construct")
+
+        def execute_successor_rebind(
+            self,
+            *,
+            request: dict[str, Any],
+            launch_authority: dict[str, Any],
+            stability_guard: Callable[[], None],
+        ) -> bytes:
+            events.append("execute")
+            stability_guard()
+            result = successor._owner_result(  # noqa: SLF001
+                request=request,
+                authority={"authority_sha256": "5" * 64},
+                launch_authority_sha256=launch_authority[
+                    "launch_authority_sha256"
+                ],
+                preflight_value={"receipt_sha256": "6" * 64},
+                terminal={"receipt_sha256": "7" * 64},
+            )
+            return activation._canonical(result) + b"\n"  # noqa: SLF001
+
+    monkeypatch.setattr(successor.release_stage0, "verify_stage0", verify_stage0)
+    monkeypatch.setattr(successor, "_ProductionOwnerRebindTransport", Transport)
+
+    result = successor.owner_run(owner.request)
+
+    assert result["request_sha256"] == owner.request["request_sha256"]
+    assert events.index("verify") < events.index("construct") < events.index("execute")
+    assert events[events.index("verify") + 1] == "stable"
+    assert events[events.index("construct") + 1] == "stable"
+    assert owner.stage0_bundle.stable_assertions >= 6
+
+
+def test_owner_run_stage0_drift_after_prepare_blocks_every_later_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    events: list[str] = []
+
+    def verify_stage0(**_kwargs: Any) -> FakeStage0Bundle:
+        events.append("verify")
+        return owner.stage0_bundle
+
+    def stable() -> None:
+        owner.stage0_bundle.stable_assertions += 1
+        events.append("stable")
+        if "prepare" in events:
+            raise successor.release_stage0.ProductionReleaseUpdateStage0Error(
+                "release_update_stage0_release_drift"
+            )
+
+    owner.stage0_bundle.assert_stable = stable  # type: ignore[method-assign]
+
+    class Transport:
+        def __init__(self, _request: dict[str, Any]) -> None:
+            events.append("construct")
+
+        def execute_successor_rebind(
+            self,
+            *,
+            request: dict[str, Any],
+            launch_authority: dict[str, Any],
+            stability_guard: Callable[[], None],
+        ) -> bytes:
+            del request, launch_authority
+            events.append("prepare")
+            stability_guard()
+            events.extend(("build", "promote", "rebind"))
+            return b"unreachable\n"
+
+    monkeypatch.setattr(successor.release_stage0, "verify_stage0", verify_stage0)
+    monkeypatch.setattr(successor, "_ProductionOwnerRebindTransport", Transport)
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage0_invalid",
+    ):
+        successor.owner_run(owner.request)
+
+    assert "prepare" in events
+    assert "build" not in events
+    assert "promote" not in events
+    assert "rebind" not in events
+
+
+def test_owner_apply_has_no_unbound_launch_authority_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+
+    def valid_stage0(**_kwargs: Any) -> FakeStage0Bundle:
+        return owner.stage0_bundle
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="launch_authority_drifted",
+    ):
+        successor._owner_apply(  # noqa: SLF001
+            owner.request,
+            staged_root=owner.harness.staged_root,
+            authority_path=owner.harness.authority_path,
+            preflight_path=owner.harness.preflight_path,
+            runtime_path=owner.harness.runtime_path,
+            systemd_root=owner.harness.systemd_root,
+            evidence_root=owner.harness.evidence_root,
+            release_trust_root=owner.harness.releases,
+            root_owned=False,
+            host=owner.harness.host,
+            require_root=False,
+            activation_lock_factory=lambda: nullcontext(),
+            stage0_verifier=valid_stage0,
+            expected_launch_authority_sha256="f" * 64,
+        )
+
+    assert not owner.harness.authority_path.exists()
+    assert not owner.harness.preflight_path.exists()
+    assert owner.harness.host.calls == []
+
+
+def test_remote_phase_rejects_suffix_only_controller_release_root() -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
+    )
+    authority = _fake_launch_authority(request)
+    foreign = {
+        **authority,
+        "release_root": f"/tmp/foreign/hermes-agent-{TARGET[:12]}",
+    }
+    unsigned = {
+        name: value
+        for name, value in foreign.items()
+        if name != "launch_authority_sha256"
+    }
+    foreign["launch_authority_sha256"] = hashlib.sha256(
+        activation._canonical(unsigned)  # noqa: SLF001
+    ).hexdigest()
+
+    with pytest.raises(
+        foundation_runtime.SuccessorRebindOwnerRuntimeError,
+        match="launch_authority_invalid",
+    ):
+        foundation_runtime.build_phase_frame(
+            operation="prepare-runtime",
+            revision=TARGET,
+            launch_authority=foreign,
+        )
+
+
+def test_preexec_rejects_self_consistent_authority_request_mismatch_before_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
+    )
+    authority = _fake_launch_authority(request)
+    envelope = activation._decode(  # noqa: SLF001
+        successor._encode_launch_envelope(  # noqa: SLF001
+            request=request,
+            launch_authority=authority,
+        )[:-1]
+    )
+    mismatched_authority = {
+        **authority,
+        "request_sha256": "f" * 64,
+    }
+    authority_unsigned = {
+        name: value
+        for name, value in mismatched_authority.items()
+        if name != "launch_authority_sha256"
+    }
+    mismatched_authority["launch_authority_sha256"] = hashlib.sha256(
+        activation._canonical(authority_unsigned)  # noqa: SLF001
+    ).hexdigest()
+    envelope_unsigned = {
+        **{
+            name: value
+            for name, value in envelope.items()
+            if name != "envelope_sha256"
+        },
+        "launch_authority": mismatched_authority,
+    }
+    tampered = {
+        **envelope_unsigned,
+        "envelope_sha256": hashlib.sha256(
+            activation._canonical(envelope_unsigned)  # noqa: SLF001
+        ).hexdigest(),
+    }
+    raw = activation._canonical(tampered) + b"\n"  # noqa: SLF001
+
+    class Stdin:
+        buffer = io.BytesIO(raw)
+
+    monkeypatch.setattr(runtime_preexec.sys, "stdin", Stdin())
+    monkeypatch.setattr(
+        runtime_preexec,
+        "verify",
+        lambda **_kwargs: pytest.fail("runtime proof must not run"),
+    )
+    monkeypatch.setattr(
+        runtime_preexec.os,
+        "execve",
+        lambda *_args: pytest.fail("target exec must not run"),
+    )
+
+    with pytest.raises(
+        runtime_preexec.SuccessorRuntimePreExecError,
+        match="owner_frame_invalid",
+    ):
+        runtime_preexec.main(
+            (
+                TARGET,
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                mismatched_authority["launch_authority_sha256"],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("schema", "extra", "missing", "policy", "digest"),
+)
+def test_preexec_rejects_structurally_invalid_self_consistent_owner_request(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
+    )
+    authority = _fake_launch_authority(request)
+    envelope = activation._decode(  # noqa: SLF001
+        successor._encode_launch_envelope(  # noqa: SLF001
+            request=request,
+            launch_authority=authority,
+        )[:-1]
+    )
+    malformed = dict(request)
+    if mutation == "schema":
+        malformed["schema"] = "foreign-owner-request.v1"
+    elif mutation == "extra":
+        malformed["extra_policy"] = False
+    elif mutation == "missing":
+        malformed.pop("remote_owner_runtime_wheel_sha256")
+    elif mutation == "policy":
+        malformed["manual_json_allowed"] = True
+    else:
+        malformed["remote_owner_runtime_manifest_sha256"] = "not-a-digest"
+    request_unsigned = {
+        name: value
+        for name, value in malformed.items()
+        if name != "request_sha256"
+    }
+    malformed["request_sha256"] = hashlib.sha256(
+        activation._canonical(request_unsigned)  # noqa: SLF001
+    ).hexdigest()
+    request_raw = activation._canonical(malformed)  # noqa: SLF001
+    request_frame = b"MSR2" + len(request_raw).to_bytes(4, "big") + request_raw
+    rebound_authority = {
+        **authority,
+        "request_sha256": malformed["request_sha256"],
+    }
+    authority_unsigned = {
+        name: value
+        for name, value in rebound_authority.items()
+        if name != "launch_authority_sha256"
+    }
+    rebound_authority["launch_authority_sha256"] = hashlib.sha256(
+        activation._canonical(authority_unsigned)  # noqa: SLF001
+    ).hexdigest()
+    envelope_unsigned = {
+        **{
+            name: value
+            for name, value in envelope.items()
+            if name != "envelope_sha256"
+        },
+        "request_frame_hex": request_frame.hex(),
+        "launch_authority": rebound_authority,
+    }
+    malformed_envelope = {
+        **envelope_unsigned,
+        "envelope_sha256": hashlib.sha256(
+            activation._canonical(envelope_unsigned)  # noqa: SLF001
+        ).hexdigest(),
+    }
+    raw = activation._canonical(malformed_envelope) + b"\n"  # noqa: SLF001
+
+    class Stdin:
+        buffer = io.BytesIO(raw)
+
+    monkeypatch.setattr(runtime_preexec.sys, "stdin", Stdin())
+    monkeypatch.setattr(
+        runtime_preexec,
+        "verify",
+        lambda **_kwargs: pytest.fail("runtime proof must not run"),
+    )
+    monkeypatch.setattr(
+        runtime_preexec.os,
+        "execve",
+        lambda *_args: pytest.fail("target exec must not run"),
+    )
+
+    with pytest.raises(
+        runtime_preexec.SuccessorRuntimePreExecError,
+        match="owner_frame_invalid",
+    ):
+        runtime_preexec.main(
+            (
+                TARGET,
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                rebound_authority["launch_authority_sha256"],
+            )
+        )
 
 
 def test_production_transport_keeps_controller_and_remote_runtime_proofs_separate(
@@ -1633,17 +2200,14 @@ def test_production_transport_keeps_controller_and_remote_runtime_proofs_separat
         ),
     )
     monkeypatch.setattr(owner_launcher, "ProductionCutoverTransport", Transport)
-    monkeypatch.setattr(
-        successor._ProductionOwnerRebindTransport,  # noqa: SLF001
-        "_prepare_build_promote",
-        lambda _self, _request: None,
-    )
-
     transport = successor._ProductionOwnerRebindTransport(request)  # noqa: SLF001
+    launch_authority = _fake_launch_authority(request)
     assert (
         transport.invoke_successor_rebind(
             target_revision=TARGET,
             request_frame=successor.encode_owner_request(request),
+            launch_authority=launch_authority,
+            stability_guard=lambda: None,
         )
         == b"exact\n"
     )
@@ -1658,6 +2222,7 @@ def test_production_transport_keeps_controller_and_remote_runtime_proofs_separat
             request["remote_owner_runtime_interpreter_sha256"],
             request["remote_owner_runtime_attestation_sha256"],
             successor.PREEXEC_VERIFIER_SHA256,
+            launch_authority["launch_authority_sha256"],
         )
     ]
     assert request["remote_owner_runtime_manifest_sha256"] != local["manifest_sha256"]
@@ -1723,6 +2288,13 @@ def test_production_transport_runs_fixed_prepare_build_promote_before_rebind(
         "tree_sha256": request["remote_owner_runtime_tree_sha256"],
         "interpreter_sha256": request["remote_owner_runtime_interpreter_sha256"],
     }
+    launch_authority = _fake_launch_authority(request)
+    built["launch_authority_sha256"] = launch_authority[
+        "launch_authority_sha256"
+    ]
+    promoted["launch_authority_sha256"] = launch_authority[
+        "launch_authority_sha256"
+    ]
     frame = {"schema": "fixed-promotion-frame"}
     monkeypatch.setattr(
         foundation_runtime,
@@ -1775,9 +2347,10 @@ def test_production_transport_runs_fixed_prepare_build_promote_before_rebind(
 
     transport = successor._ProductionOwnerRebindTransport(request)  # noqa: SLF001
     assert (
-        transport.invoke_successor_rebind(
-            target_revision=TARGET,
-            request_frame=successor.encode_owner_request(request),
+        transport.execute_successor_rebind(
+            request=request,
+            launch_authority=launch_authority,
+            stability_guard=lambda: None,
         )
         == b"exact-rebind-result\n"
     )
@@ -1800,9 +2373,12 @@ def test_production_transport_runs_fixed_prepare_build_promote_before_rebind(
         ),
         (foundation_prefix[0], "promote-runtime", *foundation_prefix[1:]),
     ]
-    assert calls[0][1] == b""
-    assert calls[1][1] == b""
-    assert calls[2][1] == activation._canonical(frame) + b"\n"  # noqa: SLF001
+    assert all(input_bytes for _argv, input_bytes in calls)
+    for _argv, input_bytes in calls[:3]:
+        phase = activation._decode(input_bytes[:-1])  # noqa: SLF001
+        assert phase["launch_authority"] == launch_authority
+    assert activation._decode(calls[2][1][:-1])["payload"] == frame  # noqa: SLF001
+    assert calls[3][0][-1] == launch_authority["launch_authority_sha256"]
 
 
 def test_production_transport_rejects_controller_proof_mismatch_without_using_remote(

@@ -5,7 +5,7 @@ fixed_wrapper=/usr/libexec/muncho-release-foundation-exec-v4
 runtime_base=/usr/lib/muncho-successor-rebind-runtime
 library_base=/usr/lib/muncho-release-updater-releases
 
-if [ "$#" -ne 8 ]; then
+if [ "$#" -ne 9 ]; then
   exit 2
 fi
 
@@ -17,6 +17,7 @@ expected_tree_sha256=$5
 expected_interpreter_sha256=$6
 expected_attestation_sha256=$7
 expected_preexec_sha256=$8
+launch_authority_sha256=$9
 
 if [ "${#revision}" -ne 40 ]; then
   exit 2
@@ -27,13 +28,14 @@ for digest in \
   "$expected_tree_sha256" \
   "$expected_interpreter_sha256" \
   "$expected_attestation_sha256" \
-  "$expected_preexec_sha256"
+  "$expected_preexec_sha256" \
+  "$launch_authority_sha256"
 do
   if [ "${#digest}" -ne 64 ]; then
     exit 2
   fi
 done
-case "$revision$expected_wrapper_sha256$expected_manifest_sha256$expected_tree_sha256$expected_interpreter_sha256$expected_attestation_sha256$expected_preexec_sha256" in
+case "$revision$expected_wrapper_sha256$expected_manifest_sha256$expected_tree_sha256$expected_interpreter_sha256$expected_attestation_sha256$expected_preexec_sha256$launch_authority_sha256" in
   *[!0-9a-f]*) exit 2 ;;
 esac
 if [ "$operation" != successor-rebind-owner-apply ]; then
@@ -110,4 +112,5 @@ exec /usr/bin/python3 -I -S -B -c \
   "$expected_manifest_sha256" \
   "$expected_tree_sha256" \
   "$expected_interpreter_sha256" \
-  "$expected_attestation_sha256"
+  "$expected_attestation_sha256" \
+  "$launch_authority_sha256"
