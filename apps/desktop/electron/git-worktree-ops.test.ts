@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   addWorktree,
@@ -15,6 +15,12 @@ import {
   sanitizeBranch,
   switchBranch
 } from './git-worktree-ops'
+
+// Git for Windows can spend several seconds starting credential/path helpers
+// even for local temporary repositories. Keep the normal timeout elsewhere,
+// but give this subprocess-heavy suite enough room on Windows so it measures
+// assertions instead of process startup latency.
+if (process.platform === 'win32') vi.setConfig({ testTimeout: 30_000 })
 
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
