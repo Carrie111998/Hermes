@@ -1404,6 +1404,7 @@ You can switch between providers at any time with `hermes model` — no restart 
 | Feature | Provider | Env Variable |
 |---------|----------|--------------|
 | Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL` |
+| Web search + fetch (free) | [TinyFish](https://agent.tinyfish.ai/) | `TINYFISH_API_KEY` |
 | Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
