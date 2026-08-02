@@ -12,6 +12,7 @@ import {
   Archive,
   BarChart3,
   Bell,
+  Cpu,
   Download,
   Globe,
   Info,
@@ -36,6 +37,7 @@ import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { OverlayIconButton } from '../overlays/overlay-chrome'
 import { OverlayMain, OverlayNav, type OverlayNavGroup, OverlaySplitLayout } from '../overlays/overlay-split-layout'
 import { OverlayView } from '../overlays/overlay-view'
+import { FederationDevicesOverlay } from '../federation/federation-devices-overlay'
 import { SKILLS_ROUTE } from '../routes'
 
 import { AboutSettings } from './about-settings'
@@ -64,6 +66,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'notifications',
   'billing',
   'plugins',
+  'federation',
   'sessions',
   'about'
 ]
@@ -263,6 +266,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('plugins')
       },
       {
+        active: activeView === 'federation',
+        icon: Cpu,
+        id: 'federation',
+        label: 'Federation',
+        onSelect: () => setActiveView('federation')
+      },
+      {
         active: activeView === 'sessions',
         icon: Archive,
         id: 'sessions',
@@ -397,6 +407,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
       <BillingSettings />
     ) : activeView === 'plugins' ? (
       <PluginsSettings />
+    ) : activeView === 'federation' ? (
+      <FederationDevicesOverlay />
     ) : (
       <SessionsSettings />
     )
@@ -407,6 +419,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         <OverlayNav footer={navFooter} groups={navGroups} />
 
         <OverlayMain className="px-0 pb-0">{activeSettingsContent}</OverlayMain>
+
       </OverlaySplitLayout>
     </OverlayView>
   )
