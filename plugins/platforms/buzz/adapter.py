@@ -922,9 +922,12 @@ class BuzzAdapter(BasePlatformAdapter):
         self._trim_seen(state)
 
     async def _discover_dms(self, *, seed: bool) -> None:
-        """Watch DM conversations.  New ones found mid-run dispatch from their
-        beginning (a fresh conversation has no history worth suppressing);
-        ones present at startup are seeded like channels.
+        """Refresh conversations that may appear after startup.
+
+        With an empty channel filter, every joined channel is watched, so new
+        regular channels must be enrolled as they appear. Explicit channel
+        filters remain bounded, but DMs are always discovered. New finds
+        dispatch from their beginning; startup finds are seeded like channels.
 
         ``dms list`` is only a best-effort source: on some hosted relays it
         returns ``[]`` even when DM conversations exist (#68871).  Those DMs
@@ -955,7 +958,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
+            if ch_id in self._channel_state:
+                continue
+            # Empty self.channels means "all joined channels".  With an
+            # explicit filter, only the DM-shaped fallback may expand the
+            # runtime watch set.
+            if self.channels and not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")

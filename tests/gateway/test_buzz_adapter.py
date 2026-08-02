@@ -360,10 +360,9 @@ class TestDmClassification:
 
 
     @pytest.mark.asyncio
-    async def test_dm_shaped_channel_discovered_when_dms_list_empty(self):
-        """Fallback discovery: with `dms list` broken (returns []), a
-        DM-shaped `channels list` entry gets watched; real channels not
-        already watched are left alone."""
+    async def test_all_joined_mode_discovers_new_channels_mid_run(self):
+        """An empty channel filter means every joined channel, including
+        channels added after the adapter connected."""
         a = _make_adapter()
         cli = _ScriptedCli()
         cli.script("dms", "list", [])
@@ -374,6 +373,26 @@ class TestDmClassification:
         ])
         a._run_cli = cli
         await a._discover_dms(seed=False)
+
+        assert a._channel_state[DM_CHANNEL]["chat_type"] == "group"
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+        assert a._channel_names[CHANNEL] == "general"
+
+    @pytest.mark.asyncio
+    async def test_explicit_channel_filter_only_auto_discovers_dms(self):
+        """A configured channel allow-list stays bounded while DM discovery
+        remains available."""
+        a = _make_adapter({"channels": ["configured-channel"]})
+        cli = _ScriptedCli()
+        cli.script("dms", "list", [])
+        cli.script("channels", "list", [
+            {"channel_id": DM_CHANNEL, "name": "DM", "description": "", "created_at": 1},
+            {"channel_id": CHANNEL, "name": "general",
+             "description": "General conversation and community updates.", "created_at": 2},
+        ])
+        a._run_cli = cli
+        await a._discover_dms(seed=False)
+
         # Watched as group; the p-tag latch flips it on the first real DM.
         assert a._channel_state[DM_CHANNEL]["chat_type"] == "group"
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
