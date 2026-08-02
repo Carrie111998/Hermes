@@ -5083,6 +5083,38 @@ def run_one_job(
                             receipts=tuple(delivery_receipts),
                             error=detail,
                         )
+                    delivered_ids = [
+                        str(receipt.get("provider_receipt_id") or "").strip()
+                        for receipt in delivery_receipts
+                        if receipt.get("status") == "delivered"
+                    ]
+                    duplicate_ids = {
+                        provider_id for provider_id in delivered_ids
+                        if provider_id and delivered_ids.count(provider_id) > 1
+                    }
+                    evidence_failures = []
+                    for receipt in delivery_receipts:
+                        if receipt.get("status") != "delivered":
+                            continue
+                        provider_id = str(receipt.get("provider_receipt_id") or "").strip()
+                        if provider_id and provider_id not in duplicate_ids:
+                            continue
+                        reason = (
+                            "delivery confirmed without durable provider receipt evidence"
+                            if not provider_id else
+                            "delivery provider receipt evidence is duplicated"
+                        )
+                        receipt["status"] = "ambiguous"
+                        receipt["error"] = reason
+                        receipt["provider_receipt_id"] = provider_id or None
+                        evidence_failures.append(reason)
+                    if evidence_failures:
+                        evidence_error = "; ".join(dict.fromkeys(evidence_failures))
+                        delivery_outcome = DeliveryOutcome(
+                            state=DeliveryState.AMBIGUOUS,
+                            receipts=tuple(delivery_receipts),
+                            error=evidence_error,
+                        )
                     delivery_error = delivery_outcome.error
                     actual_delivery_targets = [
                         receipt["actual_target"] for receipt in delivery_receipts

@@ -473,7 +473,7 @@ def _validate_delivery_evidence(
         error = None if receipt.get("error") is None else str(receipt.get("error"))
         provider_receipt_id = (
             None if receipt.get("provider_receipt_id") is None
-            else str(receipt.get("provider_receipt_id"))
+            else str(receipt.get("provider_receipt_id")).strip() or None
         )
         if status not in ("delivered", "failed", "ambiguous"):
             raise ValueError("delivery receipt status is invalid")
@@ -483,6 +483,8 @@ def _validate_delivery_evidence(
             raise ValueError("delivered receipt cannot carry an error")
         if status == "delivered" and transport == "none":
             raise ValueError("delivered receipt requires a dispatched transport")
+        if status == "delivered" and not provider_receipt_id:
+            raise ValueError("delivered receipt requires provider receipt evidence")
         if status in ("failed", "ambiguous") and not error:
             raise ValueError(f"{status} receipt requires error evidence")
         if status == "ambiguous" and transport == "none":
@@ -509,6 +511,12 @@ def _validate_delivery_evidence(
         receipt["actual_target"] for receipt in normalized_receipts
         if receipt["status"] == "delivered"
     ]
+    delivered_provider_ids = [
+        receipt["provider_receipt_id"] for receipt in normalized_receipts
+        if receipt["status"] == "delivered"
+    ]
+    if len(set(delivered_provider_ids)) != len(delivered_provider_ids):
+        raise ValueError("delivery provider receipt IDs must be unique")
     if normalized_actual != confirmed_actual:
         raise ValueError("delivery targets must contain only confirmed actual targets")
     statuses = [receipt["status"] for receipt in normalized_receipts]

@@ -340,7 +340,7 @@ def test_run_one_job_persists_live_post_contact_exception_as_ambiguous(
     adapter = AsyncMock()
     adapter.send.side_effect = [
         ConnectionError("response lost after accept"),
-        MagicMock(success=True),
+        MagicMock(success=True, raw_response={"message_id": "message-456"}),
     ]
     loop = MagicMock()
     loop.is_running.return_value = True
@@ -374,6 +374,117 @@ def test_run_one_job_persists_live_post_contact_exception_as_ambiguous(
     assert [receipt["transport"] for receipt in receipts] == ["live", "live"]
     assert json.loads(delivery["delivery_targets"]) == [targets[1]]
     standalone.assert_not_awaited()
+
+
+def test_run_one_job_persists_missing_provider_receipt_as_ambiguous(
+    monkeypatch, tmp_path,
+):
+    import asyncio
+    from concurrent.futures import Future
+
+    import cron.scheduler as scheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    producer = _create(executions, "durable-missing-provider-receipt")
+    target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+    _patch_real_delivery_run(monkeypatch, tmp_path, scheduler, target)
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    adapter = AsyncMock()
+    adapter.send.return_value = MagicMock(success=True, raw_response={})
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def run_coro(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_coro)
+    standalone = AsyncMock(return_value={"success": True, "message_id": "retry"})
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone)
+
+    assert scheduler.run_one_job({
+        "id": "durable-missing-provider-receipt",
+        "execution_id": producer["id"],
+        "deliver": "telegram:123",
+    }, adapters={Platform.TELEGRAM: adapter}, loop=loop) is True
+
+    delivery = next(
+        row for row in executions.list_executions(
+            job_id="durable-missing-provider-receipt",
+        ) if row["kind"] == "delivery"
+    )
+    receipts = json.loads(delivery["delivery_receipts"])
+    assert delivery["status"] == "unknown"
+    assert delivery["delivery_state"] == "ambiguous"
+    assert receipts[0]["status"] == "ambiguous"
+    assert receipts[0]["transport"] == "live"
+    assert "without durable provider receipt evidence" in receipts[0]["error"]
+    standalone.assert_not_awaited()
+
+
+def test_run_one_job_persists_duplicate_provider_receipts_as_ambiguous(
+    monkeypatch, tmp_path,
+):
+    import asyncio
+    from concurrent.futures import Future
+
+    import cron.scheduler as scheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    producer = _create(executions, "durable-duplicate-provider-receipt")
+    targets = [
+        {"platform": "telegram", "chat_id": "123", "thread_id": None},
+        {"platform": "telegram", "chat_id": "456", "thread_id": None},
+    ]
+    _patch_real_delivery_run(monkeypatch, tmp_path, scheduler, targets[0])
+    monkeypatch.setattr(scheduler, "_resolve_delivery_targets", lambda _job: targets)
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    adapter = AsyncMock()
+    adapter.send.side_effect = [
+        MagicMock(success=True, raw_response={"message_id": "duplicate-message"}),
+        MagicMock(success=True, raw_response={"message_id": "duplicate-message"}),
+    ]
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def run_coro(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_coro)
+
+    assert scheduler.run_one_job({
+        "id": "durable-duplicate-provider-receipt",
+        "execution_id": producer["id"],
+        "deliver": "telegram:123",
+    }, adapters={Platform.TELEGRAM: adapter}, loop=loop) is True
+
+    delivery = next(
+        row for row in executions.list_executions(
+            job_id="durable-duplicate-provider-receipt",
+        ) if row["kind"] == "delivery"
+    )
+    receipts = json.loads(delivery["delivery_receipts"])
+    assert delivery["status"] == "unknown"
+    assert delivery["delivery_state"] == "ambiguous"
+    assert [receipt["status"] for receipt in receipts] == ["ambiguous", "ambiguous"]
+    assert all("receipt evidence is duplicated" in receipt["error"] for receipt in receipts)
 
 
 def test_run_one_job_persists_resolution_failure_as_pre_contact_failed(
@@ -762,6 +873,42 @@ def test_delivery_terminal_evidence_requires_dispatch_and_success_coherence(monk
         executions.finish_execution(
             delivery["id"], success=True, delivery_status="failed",
             delivery_error="failed before dispatch", delivery_receipts=[failed],
+        )
+
+    missing_provider = {**delivered, "provider_receipt_id": None}
+    with pytest.raises(ValueError, match="delivered receipt requires provider receipt evidence"):
+        delivery = claim_delivery("missing-provider-id")
+        executions.finish_execution(
+            delivery["id"], success=True, delivery_status="delivered",
+            delivery_targets=[requested], delivery_receipts=[missing_provider],
+        )
+
+    second_target = {"platform": "discord", "chat_id": "456", "thread_id": None}
+    artifact = tmp_path / "duplicate-provider.txt"
+    artifact.write_bytes(b"duplicate provider evidence")
+    producer = _create(executions, "producer-duplicate-provider")
+    executions.finish_execution(producer["id"], success=True)
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=str(artifact),
+        artifact_sha256=f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
+        delivery_targets=[requested, second_target],
+    )
+    executions.mark_execution_running(delivery["id"])
+    duplicate_receipts = [
+        {**delivered, "provider_receipt_id": "provider-message-1"},
+        {
+            **delivered,
+            "requested_target": second_target,
+            "actual_target": second_target,
+            "provider_receipt_id": "provider-message-1",
+        },
+    ]
+    with pytest.raises(ValueError, match="provider receipt IDs must be unique"):
+        executions.finish_execution(
+            delivery["id"], success=True, delivery_status="delivered",
+            delivery_targets=[requested, second_target],
+            delivery_receipts=duplicate_receipts,
         )
 
 
