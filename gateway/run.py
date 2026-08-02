@@ -2794,6 +2794,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_via_service: bool = False
     _detached_restart_helper_started: bool = False
     _restart_command_source: Optional[SessionSource] = None
+    _restart_capability: Optional[object] = None
+    _active_restart_capability: Optional[object] = None
+    _external_restart_signal_authorized_until: float = 0.0
+    _restart_exit_watchdog_started: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
@@ -2888,6 +2892,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_via_service = False
         self._detached_restart_helper_started = False
         self._restart_command_source: Optional[SessionSource] = None
+        # Restart authority is process-local and intentionally cannot be
+        # serialized into a helper script or inherited by a tool subprocess.
+        # Raw calls to request_restart() are rejected unless they flow through
+        # one of the explicit authorization methods below.
+        self._restart_capability = object()
+        self._active_restart_capability: Optional[object] = None
+        self._external_restart_signal_authorized_until = 0.0
+        self._restart_exit_watchdog_started = False
         # Monotonic-ish wall clock of when this GatewayRunner was constructed.
         # Used by the /restart redelivery guard to bound the window in which a
         # missing dedup marker is treated as a stale redelivery.
@@ -6390,9 +6402,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("Failed to launch systemd planned-restart helper: %s", e)
 
+    def _request_authorized_restart(
+        self, *, detached: bool = False, via_service: bool = False
+    ) -> bool:
+        """Request a restart using this runner's process-local capability."""
+        capability = getattr(self, "_restart_capability", None)
+        if capability is None:
+            # Partial GatewayRunner instances in legacy tests predate the
+            # capability. Production runners always initialize it in __init__.
+            return self.request_restart(detached=detached, via_service=via_service)
+        self._active_restart_capability = capability
+        try:
+            return self.request_restart(detached=detached, via_service=via_service)
+        finally:
+            self._active_restart_capability = None
+
+    def _authorize_external_restart_signal(self, *, ttl_seconds: float) -> None:
+        """Permit one SIGUSR1 restart for an explicitly requested /update.
+
+        SIGUSR1 carries no sender identity or payload, so
+        ``restart_signal_policy=explicit_only`` denies it by default. The
+        /update handler opens this one-shot, in-memory window only after it has
+        successfully launched the user-requested updater.
+        """
+        self._external_restart_signal_authorized_until = (
+            time.monotonic() + max(0.0, float(ttl_seconds))
+        )
+
+    def _request_restart_from_external_signal(self) -> bool:
+        """Consume a fresh updater authorization and request one restart."""
+        deadline = getattr(self, "_external_restart_signal_authorized_until", 0.0)
+        self._external_restart_signal_authorized_until = 0.0
+        policy = getattr(self.config, "restart_signal_policy", "legacy")
+        if deadline <= time.monotonic() and policy == "explicit_only":
+            logger.warning(
+                "Blocked unauthorized SIGUSR1 gateway restart request under "
+                "gateway.restart_signal_policy=explicit_only; use the "
+                "authenticated /restart command"
+            )
+            return False
+        return self._request_authorized_restart(detached=False, via_service=True)
+
+    def _arm_restart_exit_watchdog(
+        self,
+        *,
+        via_service: bool,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        """Hard-exit if an authorized restart wedges after its drain budget.
+
+        This daemon thread is independent of the asyncio loop and its
+        executors. It is the final backstop for cleanup code that blocks the
+        loop or for a non-daemon worker that never returns.
+        """
+        if getattr(self, "_restart_exit_watchdog_started", False):
+            return
+        self._restart_exit_watchdog_started = True
+        timeout = (
+            max(0.01, float(timeout_seconds))
+            if timeout_seconds is not None
+            else max(30.0, float(self._restart_drain_timeout) + 45.0)
+        )
+        exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE if via_service else 0
+
+        def _force_exit_after_deadline() -> None:
+            time.sleep(timeout)
+            logger.critical(
+                "Authorized gateway restart exceeded %.1fs; forcing process "
+                "exit with code %d so the supervisor/helper can relaunch it",
+                timeout,
+                exit_code,
+            )
+            _exit_after_graceful_shutdown(exit_code)
+
+        threading.Thread(
+            target=_force_exit_after_deadline,
+            daemon=True,
+            name="gateway-restart-exit-watchdog",
+        ).start()
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+        capability = getattr(self, "_restart_capability", None)
+        if capability is not None and getattr(
+            self, "_active_restart_capability", None
+        ) is not capability:
+            logger.warning(
+                "Blocked unauthorized in-process gateway restart request; use "
+                "the authenticated /restart command"
+            )
+            return False
         if self._restart_task_started:
             return False
+        if capability is not None:
+            self._arm_restart_exit_watchdog(via_service=via_service)
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -8449,8 +8551,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self._stop_task
 
     async def wait_for_shutdown(self) -> None:
-        """Wait for shutdown signal."""
+        """Wait until the complete stop task finishes, not just its early event.
+
+        ``_shutdown_event`` is set before final process-global cleanup so active
+        handlers stop accepting work promptly. Callers that are about to exit
+        the process must also await ``_stop_task`` or they can race SQLite,
+        executor, and runtime-lock teardown.
+        """
         await self._shutdown_event.wait()
+        stop_task = self._stop_task
+        current_task = asyncio.current_task()
+        if stop_task is not None and stop_task is not current_task:
+            await asyncio.shield(stop_task)
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
@@ -20281,6 +20393,43 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+_MCP_SHUTDOWN_TIMEOUT = 25.0
+
+
+async def _shutdown_mcp_servers_bounded(
+    timeout: float = _MCP_SHUTDOWN_TIMEOUT,
+) -> bool:
+    """Shut MCP down off-loop without allowing it to wedge process exit."""
+    errors: list[BaseException] = []
+
+    def _shutdown() -> None:
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+
+            shutdown_mcp_servers()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(
+        target=_shutdown,
+        daemon=True,
+        name="gateway-mcp-shutdown",
+    )
+    thread.start()
+    stopped = await _await_thread_exit(thread, timeout)
+    if not stopped:
+        logger.error(
+            "MCP shutdown exceeded %.1fs; abandoning the daemon cleanup thread "
+            "so gateway process exit can continue",
+            timeout,
+        )
+        return False
+    if errors:
+        logger.debug("MCP shutdown failed: %s", errors[0])
+        return False
+    return True
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -20591,7 +20740,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
-        runner.request_restart(detached=False, via_service=True)
+        runner._request_restart_from_external_signal()
     
     loop = asyncio.get_running_loop()
 
@@ -20722,11 +20871,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             if runner.exit_reason:
                 logger.error("Gateway exiting with failure: %s", runner.exit_reason)
             return False
-        try:
-            from tools.mcp_tool import shutdown_mcp_servers
-            shutdown_mcp_servers()
-        except Exception:
-            pass
+        await _shutdown_mcp_servers_bounded()
         if runner.exit_code is not None:
             raise SystemExit(runner.exit_code)
         return True
@@ -20802,12 +20947,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
-    # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
+    # Close MCP server connections without letting a deadlocked MCP lock or
+    # event-loop thread strand the gateway after teardown.
+    await _shutdown_mcp_servers_bounded()
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
@@ -20837,6 +20979,32 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         raise SystemExit(75)
 
     return True
+
+
+def _run_gateway_without_executor_join(config: Optional[GatewayConfig]) -> bool:
+    """Run the gateway loop without asyncio.run's unbounded executor join.
+
+    ``asyncio.run`` calls ``loop.shutdown_default_executor()`` before it
+    returns. A wedged tool/LLM worker therefore prevents the caller from ever
+    reaching the ``os._exit`` backstop. Gateway teardown already owns all
+    graceful cleanup; here we cancel any stragglers, give cancellation one loop
+    turn, close without joining the executor, and let the caller hard-exit.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(start_gateway(config))
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.sleep(0))
+            except BaseException:
+                pass
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 def main():
@@ -20879,7 +21047,7 @@ def main():
     # same os._exit backstop means EVERY exit path is wedge-proof, not just the
     # boolean-return ones.
     try:
-        success = asyncio.run(start_gateway(config))
+        success = _run_gateway_without_executor_join(config)
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).

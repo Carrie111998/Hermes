@@ -148,6 +148,15 @@ def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     return default
 
 
+def _normalize_restart_signal_policy(value: Any, default: str = "legacy") -> str:
+    """Normalize the policy governing process-external SIGUSR1 restarts."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"legacy", "explicit_only"}:
+            return normalized
+    return default
+
+
 def _ensure_platform_extra_dict(platforms_data: dict, name: str) -> tuple[dict, dict]:
     """Get-or-create ``platforms_data[name]`` and its nested ``extra`` dict.
 
@@ -700,6 +709,12 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
+    # ``legacy`` accepts any same-user SIGUSR1 restart request for backwards
+    # compatibility with graceful systemd CLI restarts. ``explicit_only``
+    # accepts SIGUSR1 only during a user-requested /update; normal restarts must
+    # originate from the authenticated /restart command.
+    restart_signal_policy: str = "legacy"
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -816,6 +831,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "restart_signal_policy": self.restart_signal_policy,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -869,11 +885,20 @@ class GatewayConfig:
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
         multiplex_profiles = data.get("multiplex_profiles")
-        nested_gateway = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
+        nested_gateway_raw = data.get("gateway")
+        nested_gateway: Dict[str, Any] = (
+            nested_gateway_raw if isinstance(nested_gateway_raw, dict) else {}
+        )
         if multiplex_profiles is None and isinstance(nested_gateway, dict):
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
             multiplex_profiles = nested_gateway.get("multiplex_profiles")
+        restart_signal_policy = _normalize_restart_signal_policy(
+            data.get(
+                "restart_signal_policy",
+                nested_gateway.get("restart_signal_policy", "legacy"),
+            )
+        )
         # Operator override: GATEWAY_MULTIPLEX_PROFILES wins over config.yaml when
         # set to a recognized value. Hosted deployments (Nous Portal / Fly) stamp
         # it on the container so the single multiplexed gateway — which the
@@ -925,6 +950,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            restart_signal_policy=restart_signal_policy,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
@@ -1046,9 +1072,15 @@ def load_gateway_config() -> GatewayConfig:
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
+                if "restart_signal_policy" in gateway_section:
+                    gw_data["restart_signal_policy"] = gateway_section[
+                        "restart_signal_policy"
+                    ]
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
+            if "restart_signal_policy" in yaml_cfg:
+                gw_data["restart_signal_policy"] = yaml_cfg["restart_signal_policy"]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict):

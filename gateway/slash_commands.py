@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -85,6 +85,15 @@ def _model_switch_skew_guard() -> Optional[str]:
 
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
+
+    if TYPE_CHECKING:
+        def _request_authorized_restart(
+            self, *, detached: bool = False, via_service: bool = False
+        ) -> bool: ...
+
+        def _authorize_external_restart_signal(
+            self, *, ttl_seconds: float
+        ) -> None: ...
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1315,9 +1324,9 @@ class GatewaySlashCommandsMixin:
         ) not in ("", "0")
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
         if _under_service or _in_container:
-            self.request_restart(detached=False, via_service=True)
+            self._request_authorized_restart(detached=False, via_service=True)
         else:
-            self.request_restart(detached=True, via_service=False)
+            self._request_authorized_restart(detached=True, via_service=False)
         if active_agents:
             return t("gateway.draining", count=active_agents)
         return EphemeralReply(t("gateway.restart.restarting"))
@@ -4652,5 +4661,10 @@ class GatewaySlashCommandsMixin:
             exit_code_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
 
+        # The updater's final graceful-restart request arrives as SIGUSR1.
+        # Authorize exactly one such signal only after this authenticated
+        # /update command successfully launched the updater. The updater has a
+        # one-hour command timeout; five minutes of headroom covers teardown.
+        self._authorize_external_restart_signal(ttl_seconds=3900)
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")

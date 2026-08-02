@@ -1655,6 +1655,29 @@ group_sessions_per_user: true  # true = per-user isolation in groups/channels, f
 
 For the behavior details and examples, see [Sessions](/user-guide/sessions) and the [Discord guide](/user-guide/messaging/discord).
 
+## Restart Signal Authorization
+
+By default, Hermes preserves compatibility with same-user service tools that
+request a graceful restart by sending `SIGUSR1`:
+
+```yaml
+gateway:
+  restart_signal_policy: legacy
+```
+
+For a self-hosted gateway where an agent subprocess must never be able to
+restart its own supervisor, use:
+
+```yaml
+gateway:
+  restart_signal_policy: explicit_only
+```
+
+In `explicit_only` mode, arbitrary `SIGUSR1` restart requests are ignored and
+logged. The authenticated `/restart` command remains available. A
+user-requested `/update` receives a single-use, in-memory authorization for its
+required post-update restart; failed or unrelated helper scripts do not.
+
 ## Unauthorized DM Behavior
 
 Control what Hermes does when an unknown user sends a direct message:

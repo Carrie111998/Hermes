@@ -71,6 +71,9 @@ def make_restart_runner(
     runner._restart_detached = False
     runner._restart_via_service = False
     runner._detached_restart_helper_started = False
+    # Unit tests should never arm the real process-exit watchdog. Tests that
+    # exercise it explicitly reset this flag and patch the hard-exit function.
+    runner._restart_exit_watchdog_started = True
     runner._restart_command_source = None
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._stop_task = None

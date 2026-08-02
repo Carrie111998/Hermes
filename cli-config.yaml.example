@@ -598,6 +598,13 @@ session_reset:
 # local runtime lease registry cannot be read or locked.
 max_concurrent_sessions: null
 
+# Process-external SIGUSR1 restart policy. "legacy" preserves graceful
+# same-user service CLI restarts. Use "explicit_only" on self-hosted gateways
+# where restarts must originate from the authenticated /restart command (or the
+# restart phase of a user-requested /update), never from an agent subprocess.
+gateway:
+  restart_signal_policy: legacy
+
 # When true, group/channel chats use one session per participant when the platform
 # provides a user ID. This is the secure default and prevents users in the same
 # room from sharing context, interrupts, and token costs. Set false only if you

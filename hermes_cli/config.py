@@ -2861,6 +2861,13 @@ DEFAULT_CONFIG = {
         # producing ~/.hermes/sessions/sessions.json entirely.
         "write_sessions_json": True,
 
+        # Controls process-external SIGUSR1 restart requests. ``legacy`` keeps
+        # graceful same-user CLI restarts compatible. ``explicit_only`` denies
+        # arbitrary signals and accepts restart authority only from the
+        # authenticated /restart command or an in-progress, user-requested
+        # /update.
+        "restart_signal_policy": "legacy",
+
         # Scale-to-zero idle detection (Phase 0). The gateway watches for idle
         # and, when an instance is opted in via the NAS "Labs" toggle (carried as
         # the HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent

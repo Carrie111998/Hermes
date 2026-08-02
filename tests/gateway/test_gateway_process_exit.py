@@ -1,3 +1,7 @@
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -80,6 +84,45 @@ def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):
     # Our os._exit sentinel must be what terminates main() — not SystemExit.
     with pytest.raises(_ExitCalled):
         gateway_run.main()
+
+
+def test_main_escapes_a_stuck_default_executor_during_loop_teardown():
+    """The force-exit backstop must run before asyncio joins worker threads.
+
+    ``asyncio.run`` waits indefinitely in ``shutdown_default_executor`` when a
+    worker is wedged. Run the real entrypoint in a child process so the test
+    proves that the process itself exits rather than merely mocking ``os._exit``.
+    """
+    project_root = Path(gateway_run.__file__).resolve().parent.parent
+    code = textwrap.dedent(
+        """
+        import asyncio
+        import threading
+
+        import gateway.run as gateway_run
+
+        blocker = threading.Event()
+
+        async def fake_start_gateway(config=None):
+            asyncio.get_running_loop().run_in_executor(None, blocker.wait)
+            return True
+
+        gateway_run.start_gateway = fake_start_gateway
+        gateway_run.sys.argv = ["gateway.run"]
+        gateway_run.main()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_main_routes_systemexit_through_os_exit(monkeypatch):

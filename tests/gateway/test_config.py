@@ -326,6 +326,18 @@ class TestGatewayConfigRoundtrip:
 
         assert config.max_concurrent_sessions == 2
 
+    def test_restart_signal_policy_roundtrips_and_normalizes(self):
+        strict = GatewayConfig.from_dict(
+            {"gateway": {"restart_signal_policy": "explicit_only"}}
+        )
+        invalid = GatewayConfig.from_dict(
+            {"gateway": {"restart_signal_policy": "anything"}}
+        )
+
+        assert strict.restart_signal_policy == "explicit_only"
+        assert strict.to_dict()["restart_signal_policy"] == "explicit_only"
+        assert invalid.restart_signal_policy == "legacy"
+
     def test_roundtrip_preserves_unauthorized_dm_behavior(self):
         config = GatewayConfig(
             unauthorized_dm_behavior="ignore",
@@ -404,6 +416,19 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
+
+    def test_restart_signal_policy_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n  restart_signal_policy: explicit_only\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.restart_signal_policy == "explicit_only"
 
     def test_multiplex_profiles_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.multiplex_profiles: true`` (the nested form written by

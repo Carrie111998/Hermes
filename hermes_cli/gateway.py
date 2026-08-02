@@ -248,10 +248,13 @@ def _request_gateway_self_restart(pid: int) -> bool:
 def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
 
-    SIGUSR1 is wired in gateway/run.py to ``request_restart(via_service=True)``
-    which drains in-flight agent runs (up to ``agent.restart_drain_timeout``
-    seconds), then exits.  Both systemd (``Restart=always``) and launchd
-    (unconditional ``<key>KeepAlive</key><true/>``) restart on any exit.
+    SIGUSR1 is wired in gateway/run.py to the restart authorization gate. With
+    ``gateway.restart_signal_policy=legacy`` (the compatibility default), the
+    gate routes it to ``request_restart(via_service=True)`` and drains in-flight
+    agent runs. With ``explicit_only``, arbitrary external signals are denied;
+    only the one-shot signal from a user-requested /update is accepted.
+    Both systemd (``Restart=always``) and launchd (unconditional
+    ``<key>KeepAlive</key><true/>``) restart on any accepted restart exit.
 
     This is the drain-aware alternative to ``systemctl restart`` / ``SIGTERM``,
     which SIGKILL in-flight agents after a short timeout.
