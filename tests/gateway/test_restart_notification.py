@@ -32,6 +32,45 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     assert gateway_run._planned_restart_notification_pending() is False
 
 
+@pytest.mark.asyncio
+async def test_planned_restart_notifies_exact_thread_without_home_channel():
+    runner, adapter = make_restart_runner()
+
+    delivered = await runner._send_planned_restart_target_notifications(
+        [
+            {
+                "platform": "telegram",
+                "chat_id": "parent-42",
+                "chat_type": "group",
+                "thread_id": "topic-7",
+                "message_id": "shutdown-anchor",
+            }
+        ]
+    )
+
+    assert delivered == {("telegram", "parent-42", "topic-7")}
+    assert getattr(adapter, "sent_calls") == [
+        (
+            "parent-42",
+            "♻️ Gateway online — Hermes is back and ready.",
+            {"thread_id": "topic-7"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_planned_restart_target_respects_notification_opt_out():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
+
+    delivered = await runner._send_planned_restart_target_notifications(
+        [{"platform": "telegram", "chat_id": "42"}]
+    )
+
+    assert delivered == set()
+    assert getattr(adapter, "sent_calls") == []
+
+
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
 
 
@@ -411,5 +450,3 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     await runner._notify_active_sessions_of_shutdown()
 
     adapter.send.assert_not_awaited()
-
-

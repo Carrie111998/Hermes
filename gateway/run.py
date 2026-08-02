@@ -1662,7 +1662,7 @@ def _planned_restart_notification_path() -> Path:
 
 
 def _planned_restart_notification_pending() -> bool:
-    """Return True when a non-chat planned restart should notify home channels."""
+    """Return True when a non-chat restart should emit startup notifications."""
     return _planned_restart_notification_path().exists()
 
 
@@ -9046,12 +9046,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(self) -> list[Dict[str, Any]]:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the very start of stop() — adapters are still connected so
         messages can be delivered. Best-effort: individual send failures are
-        logged and swallowed so they never block the shutdown sequence.
+        logged and swallowed so they never block the shutdown sequence. Returns
+        the exact routing targets that successfully received the notice, so a
+        signal-triggered restart can notify those same destinations on startup.
         """
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
@@ -9066,6 +9068,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
+        notified_targets: list[Dict[str, Any]] = []
         for session_key in active:
             source = None
             try:
@@ -9149,6 +9152,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                target: Dict[str, Any] = {
+                    "platform": platform_str,
+                    "chat_id": chat_id,
+                }
+                if source is not None:
+                    chat_type = getattr(source, "chat_type", None)
+                    if chat_type:
+                        target["chat_type"] = str(chat_type)
+                    message_id = getattr(source, "message_id", None)
+                    if message_id:
+                        target["message_id"] = str(message_id)
+                if thread_id:
+                    target["thread_id"] = str(thread_id)
+                notified_targets.append(target)
                 logger.info(
                     "Sent shutdown notification to active chat %s:%s",
                     platform_str, chat_id,
@@ -9161,7 +9178,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
-            return
+            return notified_targets
 
         # Suppress ONLY the home-channel broadcast when the drain that is ending
         # in this shutdown asked us to be quiet (e.g. a NAS auto-update image
@@ -9183,7 +9200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Home-channel shutdown broadcast suppressed by drain marker "
                     "(suppress_notification=true)"
                 )
-                return
+                return notified_targets
         except Exception as e:
             # Never let the suppression check block the shutdown broadcast —
             # fail toward the louder, more-visible behaviour.
@@ -9232,6 +9249,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                target = {
+                    "platform": platform.value,
+                    "chat_id": str(home.chat_id),
+                }
+                if home.thread_id:
+                    target["thread_id"] = str(home.thread_id)
+                notified_targets.append(target)
                 logger.info(
                     "Sent shutdown notification to home channel %s:%s",
                     platform.value,
@@ -9244,6 +9268,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.chat_id,
                     e,
                 )
+
+        return notified_targets
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
         for agent in active_agents.values():
@@ -11120,6 +11146,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Notify the chat that initiated /restart that the gateway is back.
         chat_restart_notification_pending = _restart_notification_pending()
         planned_restart_notification_pending = _planned_restart_notification_pending()
+        planned_restart_notification_data: Dict[str, Any] = {}
+        if planned_restart_notification_pending:
+            try:
+                loaded = json.loads(
+                    _planned_restart_notification_path().read_text(encoding="utf-8")
+                )
+                if isinstance(loaded, dict):
+                    planned_restart_notification_data = loaded
+            except Exception as exc:
+                logger.warning("Failed to read planned restart notification marker: %s", exc)
         # Capture, before _send_restart_notification() unlinks the marker,
         # whether this process booted from a chat-originated /restart. Used as
         # a one-shot signal by the /restart redelivery guard so a missing
@@ -11129,15 +11165,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._booted_from_restart = True
         await self._send_restart_notification()
 
-        # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
+        # Send a lightweight "gateway is back" message after non-chat restart
+        # paths. Prefer the exact destinations that successfully received the
+        # shutdown notice, then fall back to configured home channels. A
+        # chat-originated /restart already has its precise reply target in
+        # .restart_notify.json, so keep that lifecycle in the originating
+        # chat/topic instead of also leaking it to the home channel.
         if planned_restart_notification_pending:
             try:
+                delivered_targets = await self._send_planned_restart_target_notifications(
+                    planned_restart_notification_data.get("targets", [])
+                )
                 await self._send_home_channel_startup_notifications(
-                    skip_targets=None,
+                    skip_targets=delivered_targets,
                 )
             finally:
                 _clear_planned_restart_notification()
@@ -12246,7 +12286,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
+            shutdown_notification_targets = await self._notify_active_sessions_of_shutdown()
             logger.info(
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),
@@ -12536,7 +12576,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if active_agents:
                 self._increment_restart_failure_counts(set(active_agents.keys()))
 
-            if self._restart_requested and self._restart_command_source is None:
+            should_notify_after_restart = (
+                getattr(self, "_restart_command_source", None) is None
+                and (
+                    self._restart_requested
+                    or getattr(self, "_signal_initiated_shutdown", False)
+                )
+            )
+            if should_notify_after_restart:
                 try:
                     atomic_json_write(
                         _planned_restart_notification_path(),
@@ -12544,6 +12591,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "requested_at": time.time(),
                             "via_service": bool(self._restart_via_service),
                             "detached": bool(self._restart_detached),
+                            "targets": shutdown_notification_targets or [],
                         },
                         indent=None,
                     )
@@ -20538,6 +20586,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Home-channel startup notification failed for %s:%s: %s",
                     platform.value,
                     home.chat_id,
+                    exc,
+                )
+
+        return delivered
+
+    async def _send_planned_restart_target_notifications(
+        self,
+        targets: Any,
+    ) -> set[tuple[str, str, Optional[str]]]:
+        """Notify exact destinations that received a pre-restart shutdown notice.
+
+        Targets are persisted only after their shutdown notice was delivered.
+        Startup delivery is best-effort and uses the same platform notification
+        opt-out as chat- and home-target restart messages.
+        """
+        delivered: set[tuple[str, str, Optional[str]]] = set()
+        if not isinstance(targets, list):
+            return delivered
+
+        message = "♻️ Gateway online — Hermes is back and ready."
+        for raw_target in targets:
+            if not isinstance(raw_target, dict):
+                continue
+            platform_str = raw_target.get("platform")
+            chat_id = raw_target.get("chat_id")
+            if not platform_str or not chat_id:
+                continue
+
+            try:
+                platform = Platform(str(platform_str))
+            except ValueError:
+                logger.warning(
+                    "Planned restart notification skipped: unknown platform %s",
+                    platform_str,
+                )
+                continue
+
+            thread_id = raw_target.get("thread_id")
+            target = (
+                platform.value,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+            )
+            if target in delivered:
+                continue
+
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                logger.debug(
+                    "Planned restart notification skipped: no live transport for %s",
+                    platform.value,
+                )
+                continue
+
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                logger.info(
+                    "Planned restart notification suppressed: %s has gateway_restart_notification=false",
+                    platform.value,
+                )
+                continue
+
+            try:
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    str(chat_id),
+                    str(thread_id) if thread_id else None,
+                    chat_type=raw_target.get("chat_type"),
+                    reply_to_message_id=raw_target.get("message_id"),
+                    adapter=transport.adapter,
+                )
+                result = await transport.send(
+                    platform,
+                    str(chat_id),
+                    message,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.warning(
+                        "Planned restart notification to %s:%s was not delivered: %s",
+                        platform.value,
+                        chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue
+
+                delivered.add(target)
+                logger.info(
+                    "Sent planned restart notification to %s:%s",
+                    platform.value,
+                    chat_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Planned restart notification failed for %s:%s: %s",
+                    platform.value,
+                    chat_id,
                     exc,
                 )
 

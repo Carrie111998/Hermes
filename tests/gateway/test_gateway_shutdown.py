@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -227,6 +228,50 @@ async def test_signal_initiated_shutdown_persists_running_not_stopped(tmp_path, 
     )
 
 
+@pytest.mark.asyncio
+async def test_signal_shutdown_records_delivered_thread_for_recovery(tmp_path, monkeypatch):
+    """A container/S6 restart must remember the exact active destination that
+    received the shutdown notice, even when no home channel is configured."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner._signal_initiated_shutdown = True
+
+    source = make_restart_source(
+        chat_id="parent-42", chat_type="group", thread_id="topic-7"
+    )
+    source.message_id = "active-message"
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    running_agent.interrupt.side_effect = lambda *a, **k: runner._running_agents.clear()
+    runner._running_agents[session_key] = running_agent
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    marker = json.loads((tmp_path / ".restart_pending.json").read_text())
+    assert marker["targets"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "parent-42",
+            "chat_type": "group",
+            "thread_id": "topic-7",
+            "message_id": "active-message",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_does_not_queue_recovery_notification(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert not (tmp_path / ".restart_pending.json").exists()
+
+
 # ── #42126: zombie PID must be treated as dead in _pid_exists ────────────────
 # Under systemd Restart=always, the old gateway becomes a zombie (still in the
 # process table, not yet reaped) when the replacement starts. _pid_exists must
@@ -269,5 +314,3 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
-
