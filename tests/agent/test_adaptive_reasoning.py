@@ -51,9 +51,9 @@ def _apply(agent, directive, *, turn_id=None):
     )
 
 
-def test_quality_first_baseline_and_model_authored_escalation_are_turn_scoped():
+def test_responsive_baseline_and_model_authored_escalation_are_turn_scoped():
     agent = _agent()
-    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "medium"}
 
     receipt = _apply(agent, {"effort": "xhigh"})
     assert receipt["status"] == "applied"
@@ -63,26 +63,33 @@ def test_quality_first_baseline_and_model_authored_escalation_are_turn_scoped():
     }
 
     agent._current_turn_id = "turn-2"
-    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "medium"}
     reset_adaptive_reasoning_turn(agent, "turn-2")
-    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "medium"}
 
 
-def test_verified_route_has_static_high_floor_without_task_classification():
-    for configured in ("minimal", "low", "medium", "high", "", "unknown"):
+def test_verified_route_has_static_medium_floor_without_task_classification():
+    for configured in ("minimal", "low", "medium", "", "unknown"):
         agent = _agent(reasoning_config={"enabled": True, "effort": configured})
         assert effective_reasoning_config(agent) == {
             "enabled": True,
-            "effort": "high",
+            "effort": "medium",
         }
 
-    # A deeper explicit operator baseline remains authoritative. The adaptive
-    # action only ever raises from that baseline and never classifies task text.
+    # Deeper explicit operator baselines remain authoritative. The adaptive
+    # action only ever raises from the selected baseline and never classifies
+    # task text.
+    for configured in ("high", "xhigh", "max"):
+        agent = _agent(
+            reasoning_config={"enabled": True, "effort": configured},
+            cap="max",
+        )
+        assert effective_reasoning_config(agent) == {
+            "enabled": True,
+            "effort": configured,
+        }
+
     agent = _agent(reasoning_config={"enabled": True, "effort": "xhigh"})
-    assert effective_reasoning_config(agent) == {
-        "enabled": True,
-        "effort": "xhigh",
-    }
     receipt = _apply(agent, {"effort": "high"})
     assert receipt["status"] == "rejected"
     assert receipt["reason"] == "below_user_baseline"
@@ -155,7 +162,7 @@ def test_lower_static_cap_rejects_model_authored_max():
     assert receipt["status"] == "rejected"
     assert receipt["reason"] == "above_policy_cap"
     assert receipt["max_effort"] == "xhigh"
-    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "medium"}
 
 
 def test_malformed_adaptive_policy_sections_and_caps_fail_closed():
@@ -284,7 +291,7 @@ def test_late_prior_turn_worker_cannot_mutate_new_turn():
 
     assert receipt["status"] == "rejected"
     assert receipt["reason"] == "originating_turn_expired"
-    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "medium"}
 
 
 def test_verified_backend_gate_rejects_copilot_github_and_custom_routes():
@@ -376,7 +383,7 @@ def test_live_policy_refresh_revokes_cap_and_disable_without_prompt_mutation():
         agent,
         {"adaptive_reasoning": {"enabled": True, "max_effort": "high"}},
     )
-    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert effective_reasoning_config(agent) == {"enabled": True, "effort": "medium"}
     assert _apply(agent, {"effort": "xhigh"})["reason"] == "above_policy_cap"
 
     refresh_adaptive_reasoning_policy(agent, {"adaptive_reasoning": False})
@@ -415,7 +422,7 @@ def test_todo_receipt_applies_only_after_successful_tool_result():
         )
         == error
     )
-    assert effective_reasoning_config(other)["effort"] == "high"
+    assert effective_reasoning_config(other)["effort"] == "medium"
 
 
 def test_todo_schema_exposes_static_model_authored_effort_directive():
@@ -428,6 +435,8 @@ def test_todo_schema_exposes_static_model_authored_effort_directive():
         "max",
     ]
     assert set(reasoning["properties"]) == {"effort"}
+    assert "responsive baseline is medium" in reasoning["description"]
+    assert "raise effort in your first plan call" in reasoning["description"]
     assert "You may choose max for the most demanding work" in reasoning["description"]
     assert "policy receipt rejects" in reasoning["description"]
 
@@ -500,7 +509,7 @@ def test_next_call_changes_effort_without_changing_cache_prefix_or_roles():
         is_codex_backend=True,
     )
 
-    assert first["reasoning"]["effort"] == "high"
+    assert first["reasoning"]["effort"] == "medium"
     assert second["reasoning"]["effort"] == "xhigh"
     assert first["instructions"] == second["instructions"] == system
     assert first["tools"] == second["tools"]

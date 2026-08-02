@@ -19,7 +19,7 @@ from typing import Any, Mapping
 
 _EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 _EFFORT_INDEX = {value: index for index, value in enumerate(_EFFORT_ORDER)}
-_DEFAULT_BASELINE = "high"
+_DEFAULT_BASELINE = "medium"
 _DEFAULT_CAP = "max"
 _MAX_CHANGES_PER_TURN = 4
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -146,18 +146,17 @@ def _base_reasoning_config(agent: Any) -> dict[str, Any] | None:
         configured_effort = _normalize_effort(
             configured.get("effort"), default=_DEFAULT_BASELINE
         )
-        # The verified GPT-5.6-sol route is quality-first even when an older
-        # config still carries ``minimal``, ``low``, or ``medium``.  This is a
-        # static capability floor, not a task classifier: no prompt, message,
-        # tool argument, or task metadata is inspected.  Explicitly disabling
-        # reasoning above remains authoritative, while an operator-selected
-        # deeper baseline (xhigh/max) is preserved.
+        # The verified GPT-5.6-sol route has a static ``medium`` floor. This
+        # keeps routine calls responsive without classifying prompt text. The
+        # acting model may raise later calls in the turn through the exact
+        # ``todo.reasoning`` directive; an operator-selected deeper baseline
+        # remains authoritative.
         effort = max(
             (configured_effort, _DEFAULT_BASELINE),
             key=lambda item: _EFFORT_INDEX[item],
         )
         return {"enabled": True, "effort": effort}
-    # Only the verified GPT-5.6 Codex route receives the quality-first default.
+    # Only the verified GPT-5.6 Codex route receives the responsive default.
     if _is_verified_gpt56_codex(agent):
         return {"enabled": True, "effort": _DEFAULT_BASELINE}
     return configured

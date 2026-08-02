@@ -42,6 +42,8 @@ GATEWAY_UNIT = "hermes-cloud-gateway.service"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
 _STOPPED_GATEWAY_STATES = frozenset({"failed", "inactive"})
 _PRODUCTION_GATEWAY_NOTIFY_INTERVAL = 180
+_PRODUCTION_REASONING_BASELINE = "medium"
+_MIGRATABLE_REASONING_BASELINES = frozenset({"medium", "high"})
 _PRODUCTION_GLOBAL_DISPLAY_POLICY = {
     "busy_input_mode": "steer",
     "show_commentary": True,
@@ -63,6 +65,7 @@ ROLLBACK_RECEIPT_SCHEMA = (
     "muncho-production-model-sovereignty-config-rollback-receipt.v1"
 )
 MUTATIONS = (
+    "agent.reasoning_effort=medium",
     "agent.adaptive_reasoning={enabled:true,max_effort:max}",
     "agent.background_review_enabled=false",
     "agent.tool_use_enforcement=true",
@@ -288,7 +291,10 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     }:
         raise ConfigGateError("config_model_route_drifted")
     agent = _required_mapping(target, "agent")
-    if agent.get("reasoning_effort") != "high" or agent.get("max_turns") != 90:
+    if (
+        agent.get("reasoning_effort") not in _MIGRATABLE_REASONING_BASELINES
+        or agent.get("max_turns") != 90
+    ):
         raise ConfigGateError("config_agent_baseline_drifted")
     if (
         agent.get("task_completion_guidance") is not True
@@ -306,6 +312,7 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     elif "gpt-5.5" in hint.casefold():
         raise ConfigGateError("config_environment_hint_drifted")
     agent["environment_hint"] = hint
+    agent["reasoning_effort"] = _PRODUCTION_REASONING_BASELINE
     agent["adaptive_reasoning"] = {"enabled": True, "max_effort": "max"}
     if agent.get("background_review_enabled") not in {None, False}:
         raise ConfigGateError("config_background_review_policy_drifted")

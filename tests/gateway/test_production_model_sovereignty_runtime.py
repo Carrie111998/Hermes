@@ -476,6 +476,7 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
     }.intersection(effective["auxiliary"])
     assert effective["curator"]["interval_hours"] == 168
     assert effective["kanban"]["failure_limit"] == 2
+    assert effective["agent"]["reasoning_effort"] == "medium"
     assert effective["agent"]["adaptive_reasoning"] == {
         "enabled": True,
         "max_effort": "max",
@@ -552,6 +553,23 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
     }
     assert effective["goals"] == {"max_turns": 0}
     assert "discord" not in effective["platforms"]
+
+
+def test_production_reasoning_baseline_migrates_once_without_semantic_routing() -> None:
+    source = _source_mapping()
+    source["agent"]["reasoning_effort"] = "medium"
+
+    effective = runtime.overlay_production_gateway_config(source)
+
+    assert effective["agent"]["reasoning_effort"] == "medium"
+    runtime.validate_production_gateway_config(effective)
+
+    source["agent"]["reasoning_effort"] = "low"
+    with pytest.raises(
+        runtime.ProductionContractError,
+        match="production_agent_baseline_drifted",
+    ):
+        runtime.overlay_production_gateway_config(source)
 
 
 def test_validator_rejects_legacy_direct_helper_compatibility() -> None:
