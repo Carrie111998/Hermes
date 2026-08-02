@@ -5,7 +5,14 @@ const STATIC_PATH_PREFIXES = [
   "/fonts-terminal/",
   "/ds-assets/",
 ];
-const STATIC_DESTINATIONS = new Set(["font", "image", "script", "style"]);
+const STATIC_PATHS = new Set([
+  "/manifest.webmanifest",
+  "/favicon.ico",
+  "/pwa-icon-180.png",
+  "/pwa-icon-192.png",
+  "/pwa-icon-512.png",
+  "/pwa-icon.svg",
+]);
 const SCOPE_PATH = new URL(self.registration.scope).pathname.replace(/\/$/, "");
 
 function stripScope(pathname) {
@@ -38,11 +45,8 @@ function isStaticAsset(request, url) {
   if (request.method !== "GET") return false;
   if (url.origin !== self.location.origin) return false;
   const pathname = stripScope(url.pathname);
-  if (pathname === "/manifest.webmanifest") return true;
-  if (pathname === "/favicon.ico") return true;
-  if (pathname === "/api" || pathname.startsWith("/api/")) return false;
   return (
-    STATIC_DESTINATIONS.has(request.destination) ||
+    STATIC_PATHS.has(pathname) ||
     STATIC_PATH_PREFIXES.some((prefix) => pathname.startsWith(prefix))
   );
 }
