@@ -2182,7 +2182,13 @@ def _discover_projection_fragments(
             for revision, (_candidate, _authority, payloads) in sources.items()
             if payloads[name] == raw
         ]
-        if len(matches) != 1:
+        # Several exact immutable releases may intentionally project the same
+        # byte sequence (most commonly an unchanged public key or config).
+        # Every candidate above has already been validated against its own
+        # release authority.  The source mapping needs one deterministic
+        # representative of those byte-equivalent histories, not an otherwise
+        # artificial requirement that the bytes appeared in only one release.
+        if not matches:
             _stable_error("trusted_signer_projection_reconciliation_invalid")
         source_revisions[name] = matches[0]
     intent = _build_projection_reconciliation_intent(
