@@ -122,6 +122,15 @@ gateway:
 
 The opt-out applies to **all** send paths — final answers, streamed updates, interim commentary, tool-progress bubbles, and out-of-process cron delivery (`deliver=buzz`).
 
+### Threads and interactive prompts
+
+Pending interactive questions are scoped to the Buzz thread where Hermes sent
+them. A reply in that thread can answer the pending prompt, while an unrelated
+top-level channel post starts its own conversation instead of being consumed as
+the answer to an older clarification. Hermes can still share conversation
+history across Buzz threads; only the pending interaction and its delivery route
+are thread-scoped.
+
 ## Access control
 
 By default the allow-list is empty, which means every community member who mentions the agent gets a response only if `BUZZ_ALLOW_ALL_USERS=true`; otherwise restrict access by listing npubs or hex pubkeys in `BUZZ_ALLOWED_USERS` (or `allowed_users` in config.yaml). Community membership itself is enforced by the relay — only members can post.
