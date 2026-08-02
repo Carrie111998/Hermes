@@ -846,6 +846,202 @@ class TestModelsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# /v1/profiles endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestProfilesEndpoint:
+    @staticmethod
+    def _app(adapter: APIServerAdapter) -> web.Application:
+        app = web.Application()
+        app.router.add_get("/v1/profiles", adapter._handle_profiles)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_requires_configured_api_key_before_inventory(self, adapter):
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            side_effect=AssertionError("inventory must not run"),
+        ):
+            async with TestClient(TestServer(self._app(adapter))) as client:
+                response = await client.get("/v1/profiles")
+                data = await response.json()
+
+        assert response.status == 403
+        assert data["error"]["code"] == (
+            "profile_inventory_auth_required"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_bearer_before_inventory(self, auth_adapter):
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            side_effect=AssertionError("inventory must not run"),
+        ):
+            async with TestClient(TestServer(self._app(auth_adapter))) as client:
+                response = await client.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer wrong"},
+                )
+
+        assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_named_profile_authority_rejected_before_inventory(
+        self,
+        auth_adapter,
+    ):
+        from gateway.platforms.api_server import _api_request_profile
+
+        request = MagicMock()
+        with patch.object(
+            auth_adapter,
+            "_check_auth",
+            return_value=None,
+        ), patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            side_effect=AssertionError("inventory must not run"),
+        ):
+            token = _api_request_profile.set("builder")
+            try:
+                response = await auth_adapter._handle_profiles(request)
+            finally:
+                _api_request_profile.reset(token)
+
+        assert response.status == 403
+        assert json.loads(response.body)["error"]["code"] == (
+            "profile_inventory_default_authority_required"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_complete_allowlisted_inventory(self, auth_adapter):
+        auth_adapter.gateway_runner = MagicMock()
+        auth_adapter.gateway_runner.config.multiplex_profiles = False
+        private_path = "/Users/operator/.hermes/profiles/builder"
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ), patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[
+                ("default", "/private/default"),
+                ("builder", private_path),
+            ],
+        ):
+            async with TestClient(TestServer(self._app(auth_adapter))) as client:
+                response = await client.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 200
+        assert data["object"] == "list"
+        assert data["version"] == 1
+        assert data["complete"] is True
+        assert data["active_profile"] == "default"
+        assert data["data"] == [
+            {
+                "id": "default",
+                "object": "hermes.profile",
+                "is_default": True,
+                "is_active": True,
+                "served": True,
+            },
+            {
+                "id": "builder",
+                "object": "hermes.profile",
+                "is_default": False,
+                "is_active": False,
+                "served": False,
+            },
+        ]
+        assert set(data) == {
+            "object",
+            "version",
+            "complete",
+            "active_profile",
+            "data",
+        }
+        serialized = json.dumps(data)
+        for forbidden in (
+            private_path,
+            "description",
+            "provider",
+            "model",
+            "alias",
+            "distribution",
+            "skill",
+            "env",
+            "credential",
+        ):
+            assert forbidden not in serialized
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [("default", "/private/default"), ("default", "/private/duplicate")],
+            [("default", "/private/default"), ("../escape", "/private/escape")],
+            [("default", "/private/default"), (123, "/private/non-string")],
+            [("default", "/private/default"), (" builder", "/private/leading-space")],
+            [("default", "/private/default"), ("builder ", "/private/trailing-space")],
+            [("builder", "/private/builder")],
+        ],
+    )
+    async def test_invalid_inventory_fails_closed_without_reflection(
+        self,
+        auth_adapter,
+        rows,
+    ):
+        private_marker = "/private/"
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ), patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=rows,
+        ):
+            async with TestClient(TestServer(self._app(auth_adapter))) as client:
+                response = await client.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                body = await response.text()
+
+        assert response.status == 503
+        assert json.loads(body)["error"]["code"] == "profile_inventory_unavailable"
+        assert private_marker not in body
+
+    @pytest.mark.asyncio
+    async def test_oversized_inventory_fails_closed(self, auth_adapter):
+        rows = [("default", "/private/default")]
+        rows.extend(
+            (f"profile-{index}", f"/private/{index}")
+            for index in range(1_000)
+        )
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="default",
+        ), patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=rows,
+        ):
+            async with TestClient(TestServer(self._app(auth_adapter))) as client:
+                response = await client.get(
+                    "/v1/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await response.json()
+
+        assert response.status == 409
+        assert data["error"]["code"] == (
+            "profile_inventory_too_large"
+        )
+
+
+# ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
 # ---------------------------------------------------------------------------
 
@@ -2845,5 +3041,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
-

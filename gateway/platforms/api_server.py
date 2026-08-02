@@ -7,6 +7,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
+- GET  /v1/profiles                — default-listener profile inventory
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
@@ -129,6 +130,9 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+PROFILE_INVENTORY_VERSION = 1
+MAX_PROFILE_INVENTORY_SIZE = 1_000
+PROFILE_INVENTORY_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -1915,6 +1919,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("GET", "/v1/profiles", self._handle_profiles),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
@@ -2899,6 +2904,126 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"object": "list", "data": models})
 
+    async def _profile_inventory_request_profile(self) -> str:
+        """Return the profile that owns inventory authority for this request.
+
+        A multiplex prefix is authoritative when present. For an unprefixed
+        request, resolve the process profile off the event loop so a standalone
+        named-profile listener cannot be mistaken for the default listener.
+        """
+        routed_profile = _api_request_profile.get()
+        if routed_profile:
+            return routed_profile
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return str(await asyncio.to_thread(get_active_profile_name) or "")
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve API-server profile inventory authority: %s",
+                type(exc).__name__,
+            )
+            return ""
+
+    async def _handle_profiles(self, request: "web.Request") -> "web.Response":
+        """GET /v1/profiles — return a bounded, secret-free global roster.
+
+        Complete inventory is a control-plane capability owned by the default
+        listener. A named profile's valid API key authenticates that profile,
+        but intentionally does not grant a global roster response.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Profile inventory requires API key authentication",
+                    code="profile_inventory_auth_required",
+                ),
+                status=403,
+            )
+
+        request_profile = await self._profile_inventory_request_profile()
+        if request_profile != "default":
+            return web.json_response(
+                _openai_error(
+                    "Profile inventory requires the default listener",
+                    code="profile_inventory_default_authority_required",
+                ),
+                status=403,
+            )
+
+        def _load_snapshot() -> tuple[str, List[tuple]]:
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                profiles_to_serve,
+            )
+
+            active = get_active_profile_name() or "default"
+            return active, profiles_to_serve(multiplex=True)
+
+        try:
+            active_profile, raw_profiles = await asyncio.to_thread(_load_snapshot)
+            if len(raw_profiles) > MAX_PROFILE_INVENTORY_SIZE:
+                return web.json_response(
+                    _openai_error(
+                        "Profile inventory is too large to return safely",
+                        code="profile_inventory_too_large",
+                    ),
+                    status=409,
+                )
+
+            profile_ids: List[str] = []
+            seen: set[str] = set()
+            for raw_name, _profile_home in raw_profiles:
+                if not isinstance(raw_name, str):
+                    raise ValueError("non-string profile identifier")
+                profile_id = raw_name
+                if PROFILE_INVENTORY_ID_RE.fullmatch(profile_id) is None:
+                    raise ValueError("invalid profile identifier")
+                if profile_id in seen:
+                    raise ValueError("duplicate profile identifier")
+                seen.add(profile_id)
+                profile_ids.append(profile_id)
+
+            if "default" not in seen:
+                raise ValueError("default profile missing")
+            if active_profile != "default":
+                raise ValueError("listener profile changed during inventory")
+
+            runner = getattr(self, "gateway_runner", None)
+            config = getattr(runner, "config", None)
+            multiplex = bool(getattr(config, "multiplex_profiles", False))
+            served_ids = set(profile_ids) if multiplex else {"default"}
+        except Exception:
+            logger.exception("GET /v1/profiles failed")
+            return web.json_response(
+                _openai_error(
+                    "Profile inventory is temporarily unavailable",
+                    err_type="server_error",
+                    code="profile_inventory_unavailable",
+                ),
+                status=503,
+            )
+
+        return web.json_response({
+            "object": "list",
+            "version": PROFILE_INVENTORY_VERSION,
+            "complete": True,
+            "active_profile": active_profile,
+            "data": [
+                {
+                    "id": profile_id,
+                    "object": "hermes.profile",
+                    "is_default": profile_id == "default",
+                    "is_active": profile_id == active_profile,
+                    "served": profile_id in served_ids,
+                }
+                for profile_id in profile_ids
+            ],
+        })
+
     async def _handle_model_options(self, request: "web.Request") -> "web.Response":
         """GET /api/model/options — return Hermes provider/model inventory.
 
@@ -2947,6 +3072,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        inventory_profile = await self._profile_inventory_request_profile()
+        profile_inventory_available = bool(
+            self._api_key and inventory_profile == "default"
+        )
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -2987,6 +3117,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "profile_inventory": profile_inventory_available,
+                "profile_inventory_version": PROFILE_INVENTORY_VERSION,
+                "profile_inventory_complete": profile_inventory_available,
+                "profile_inventory_scope": "default_listener",
+                "profile_inventory_requires_api_key": True,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -2997,6 +3132,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
                 "models": {"method": "GET", "path": "/v1/models"},
+                "profiles": {"method": "GET", "path": "/v1/profiles"},
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
