@@ -153,9 +153,10 @@ def _try_install_speculative_candidate(
     except Exception:
         # Any install failure (candidate splice, durable commit, system-prompt
         # rebuild) degrades to the unchanged synchronous path — the optional
-        # speculative path must never crash the turn.
+        # speculative path must never crash the turn. The candidate is NOT
+        # restored: a deterministic failure would loop on every pressure
+        # check; the next tool-wait snapshot regenerates it instead.
         logger.debug("speculative candidate install failed", exc_info=True)
-        _restore_speculative_candidate(agent, candidate)
         _emit_speculative_status(
             agent,
             "fallback",
@@ -164,10 +165,14 @@ def _try_install_speculative_candidate(
         )
         return messages, None, False, force_sync
     if getattr(agent, "_speculative_install_status", None) != "installed":
-        # Deferred by lock contention (or rejected as stale by the commit
-        # path). A still-valid candidate must not be lost — requeue it so a
-        # later attempt can reclaim it instead of re-running the summary LLM.
-        _restore_speculative_candidate(agent, candidate)
+        # Only a lock-contended install is worth requeuing: the candidate is
+        # still valid and a later attempt can reclaim it without re-running
+        # the summary LLM. A rejection (stale / expired / compressor
+        # mismatch) must NOT be restored — reclaiming it would loop
+        # claim → reject → restore on every pressure check, re-running
+        # pre-compress hooks each time.
+        if getattr(agent, "_speculative_install_status", None) == "deferred_lock":
+            _restore_speculative_candidate(agent, candidate)
         _emit_speculative_status(
             agent,
             "fallback",

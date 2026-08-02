@@ -98,13 +98,16 @@ def test_thresholds_ignore_cap_above_ratio_watermark():
     assert speculative_thresholds(Compressor(), settings) == (137_200, 166_600)
 
 
-def test_thresholds_disable_speculation_on_collapsed_watermarks():
-    """A small window whose floor collapses soft==hard disables speculation."""
+def test_thresholds_collapse_to_hard_only_on_small_windows():
+    """A small window whose floor collapses soft==hard still schedules at the
+    collapse point (hard-only tool-wait overlap), never above the window."""
     from agent.context_compressor import ContextCompressor
 
     compressor = ContextCompressor(model="test", config_context_length=64_000)
     settings = normalize_speculative_compression_settings({})
-    assert speculative_thresholds(compressor, settings) == (2**63 - 1, 2**63 - 1)
+    soft, hard = speculative_thresholds(compressor, settings)
+    assert soft == hard == 54_400
+    assert soft < 64_000
 
 
 def test_invalid_boolean_warns_and_falls_back_to_default(caplog):

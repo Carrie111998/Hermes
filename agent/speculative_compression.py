@@ -367,7 +367,9 @@ class SpeculativeCandidate:
 
     def is_expired(self, max_age_seconds: float, *, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else now
-        return now - self.created_at > max(0.0, float(max_age_seconds))
+        # >= so an explicit 0 means immediate expiry even at the creation
+        # timestamp (elapsed 0 with max_age 0 must already be expired).
+        return now - self.created_at >= max(0.0, float(max_age_seconds))
 
     def matches(
         self, messages: List[Dict[str, Any]], session_id: str | None = None
@@ -542,10 +544,11 @@ def speculative_thresholds(
         )
     if hard <= soft:
         # The minimum-window floor collapsed the watermarks (e.g. a 64K
-        # window yields identical soft/hard triggers). There is no useful
-        # overlap window — disable speculation entirely rather than
-        # degenerating into hard-only mode.
-        return (2**63 - 1, 2**63 - 1)
+        # window yields identical soft/hard triggers). Fall back to
+        # hard-only tool-wait overlap: schedule at the collapse point and
+        # let the bounded hard wait decide between a ready candidate and
+        # the synchronous fallback.
+        hard = soft
     _cap_raw = getattr(compressor, "threshold_tokens_cap", None)
     try:
         _cap = int(_cap_raw) if _cap_raw else None
@@ -617,25 +620,24 @@ def schedule_tool_wait_candidate(
     # Do not start NEW worker work while the summary LLM is in failure
     # cooldown or the anti-thrash breaker has backed off: every worker call
     # would exercise the exact backend/strategy under backoff. A candidate
-    # already prepared before the block stays installable (the foreground
-    # install path does not re-run the summary LLM).
-    _cooldown_fn = getattr(compressor, "get_active_compression_failure_cooldown", None)
+    _cooldown_fn = getattr(
+        compressor, "get_active_compression_failure_cooldown", None
+    )
     if callable(_cooldown_fn):
         try:
             if _cooldown_fn():
                 return "blocked_cooldown"
         except Exception:
             pass
-    _info_fn = getattr(compressor, "should_compress_info", None)
-    if callable(_info_fn):
+    # Gate on the breaker DIRECTLY (not should_compress_info, which reports
+    # no block below the normal compression threshold — with a configured
+    # threshold above start_ratio, an already-tripped ineffective breaker
+    # would still launch workers between the speculative soft trigger and
+    # the normal threshold).
+    _blocked_fn = getattr(compressor, "_automatic_compression_blocked", None)
+    if callable(_blocked_fn):
         try:
-            _info_result = _info_fn(int(request_tokens))
-            _block_reason = (
-                _info_result[1]
-                if isinstance(_info_result, tuple) and len(_info_result) > 1
-                else None
-            )
-            if _block_reason == "ineffective":
+            if _blocked_fn():
                 return "blocked_ineffective"
         except Exception:
             pass
@@ -798,6 +800,7 @@ class SpeculativeCompressionManager:
         for sid, job in list(self._entries.items()):
             if (
                 job.future.done()
+                and job.published.is_set()
                 and job.rerun_snapshot is None
                 and (
                     job.candidate is None
@@ -928,10 +931,13 @@ class SpeculativeCompressionManager:
             factory = job.rerun_factory
             if pending is not None and factory is not None:
                 if job.candidate is not None and (
-                    pending.source_fingerprint == job.candidate.source_fingerprint
+                    pending.source_fingerprint
+                    == job.candidate.source_fingerprint
                     and pending.boundary_fingerprint
                     == job.candidate.boundary_fingerprint
                     and pending.cut_index == job.candidate.cut_index
+                    and pending.compressor_fingerprint
+                    == job.candidate.compressor_fingerprint
                 ):
                     # Rerun dedup must compare the complete snapshot identity:
                     # a boundary-only change makes the old candidate unusable
@@ -968,7 +974,10 @@ class SpeculativeCompressionManager:
             replaced = False
             with self._lock:
                 current = self._entries.get(session_id)
-                if current is None or current.future is future:
+                # Only replace when the entry still holds OUR finished job. If
+                # it was invalidated (popped) during the unlocked transition,
+                # the rerun must NOT resurrect the session — drop it instead.
+                if current is not None and current.future is future:
                     self._entries[session_id] = new_job
                     replaced = True
             if replaced:

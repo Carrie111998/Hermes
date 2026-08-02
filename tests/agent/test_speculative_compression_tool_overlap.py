@@ -175,10 +175,7 @@ def test_schedule_gate_skips_during_cooldown(monkeypatch):
 def test_schedule_gate_skips_after_ineffective_passes(monkeypatch):
     manager = Manager()
     agent = _agent(manager)
-    agent.context_compressor.should_compress_info = lambda _tokens: (
-        False,
-        "ineffective",
-    )
+    agent.context_compressor._automatic_compression_blocked = lambda: True
     monkeypatch.setattr(
         "agent.speculative_compression.is_builtin_compression_eligible",
         lambda **_kwargs: True,
@@ -190,3 +187,28 @@ def test_schedule_gate_skips_after_ineffective_passes(monkeypatch):
     )
     assert result == "blocked_ineffective"
     assert manager.calls == []
+
+
+def test_schedule_gate_ignores_below_normal_threshold_when_unblocked(monkeypatch):
+    """The breaker gate must not mistake 'below normal threshold' for a
+    block — scheduling happens above the speculative soft trigger, which can
+    sit below a raised compression.threshold."""
+    manager = Manager()
+    agent = _agent(manager)
+    # should_compress_info would report no block below the normal threshold;
+    # the breaker itself says unblocked, so scheduling proceeds.
+    agent.context_compressor.should_compress_info = lambda _tokens: (
+        False,
+        None,
+    )
+    monkeypatch.setattr(
+        "agent.speculative_compression.is_builtin_compression_eligible",
+        lambda **_kwargs: True,
+    )
+    result = schedule_tool_wait_candidate(
+        agent,
+        [{"role": "user", "content": "old"}, {"role": "user", "content": "tail"}],
+        800,
+    )
+    assert result == "started"
+    assert len(manager.calls) == 1

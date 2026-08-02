@@ -145,11 +145,14 @@ def test_manager_registers_callback_without_deadlock():
     add_done_callback runs synchronously on a completed future; registering
     it while holding the non-reentrant manager lock froze every session
     sharing the default manager (verified critical). The callback must be
-    registered outside the lock.
+    registered outside the lock. The loop runs in a bounded thread so a
+    regression FAILS the test instead of hanging the suite.
     """
     manager = SpeculativeCompressionManager(max_workers=1)
     snapshot = _snapshot()
-    try:
+    outcome = {}
+
+    def _loop():
         for _ in range(20):  # repeat to make a fast-completion race likely
             assert (
                 manager.maybe_start(
@@ -161,27 +164,50 @@ def test_manager_registers_callback_without_deadlock():
                 "session-1", _snapshot_messages(), wait_seconds=2
             )
             assert candidate is not None
+        outcome["ok"] = True
+
+    try:
+        thread = threading.Thread(target=_loop, name="deadlock-probe")
+        thread.start()
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "manager deadlocked (callback race)"
+        assert outcome.get("ok") is True
     finally:
         manager.shutdown()
 
 
 def test_manager_prunes_completed_entries_on_access():
-    """Completed entries with no live candidate are dropped on access."""
-    manager = SpeculativeCompressionManager(
-        max_workers=1, clock=lambda: time.monotonic() + 10_000
-    )
+    """Completed entries are pruned on manager access, not before it."""
+    offset = [0.0]
+
+    def clock():
+        return time.monotonic() + offset[0]
+
+    manager = SpeculativeCompressionManager(max_workers=1, clock=clock)
     snapshot = _snapshot()
     try:
         assert (
             manager.maybe_start(
                 "session-1", snapshot, lambda: InstantWorker(snapshot),
-                max_age_seconds=1,
+                max_age_seconds=60,
             )
             == "started"
         )
-        # Let the job complete, then age it out (clock is +10_000s).
-        time.sleep(0.05)
-        manager.take_matching_candidate("session-1", _snapshot_messages())
+        # Let the job complete and publish while the candidate is still fresh
+        # — _finish_job must NOT prune it.
+        candidate = manager.take_matching_candidate(
+            "session-1", _snapshot_messages(), wait_seconds=2
+        )
+        assert candidate is not None
+        # Requeue, age it out, and verify a later access prunes it.
+        manager.restore_candidate("session-1", candidate)
+        offset[0] = 10_000
+        assert (
+            manager.take_matching_candidate(
+                "session-1", _snapshot_messages(), max_age_seconds=60
+            )
+            is None
+        )
         assert "session-1" not in manager._entries
     finally:
         manager.shutdown()
@@ -231,12 +257,75 @@ def test_manager_rerun_on_boundary_only_change():
             == "coalesced"
         )
         release.set()
-        manager.take_matching_candidate(
+        candidate = manager.take_matching_candidate(
             "session-1", _snapshot_messages(), wait_seconds=2
         )
         # The prefix matched but the boundary changed: the old candidate is
-        # unusable, so the rerun must run.
+        # unusable, so the rerun must run. The rerun candidate targets the
+        # NEW boundary, so it cannot match the old-boundary live messages
+        # either — take correctly rejects it (stale), never the old one.
         assert len(calls) == 2
+        assert candidate is None
+    finally:
+        release.set()
+        manager.shutdown()
+
+
+def test_manager_rerun_on_compressor_fingerprint_change():
+    """A coalesced snapshot differing only in the compressor fingerprint
+    (model/context change while the first worker runs) gets a rerun — the
+    old-config candidate must not be published."""
+    manager = SpeculativeCompressionManager(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    snapshot = _snapshot()
+    calls = []
+
+    class Worker:
+        def __init__(self, snap):
+            self.snap = snap
+
+        def compress(self, messages, **_kwargs):
+            calls.append(self.snap.compressor_fingerprint[:8])
+            started.set()
+            release.wait(2)
+            return [
+                {"role": "user", "content": "summary"},
+                *messages[self.snap.cut_index :],
+            ]
+
+    newer = SpeculativeSnapshot(
+        session_id=snapshot.session_id,
+        messages=snapshot.messages,
+        source_fingerprint=snapshot.source_fingerprint,
+        boundary_fingerprint=snapshot.boundary_fingerprint,
+        compressor_fingerprint="newcomp" + (snapshot.compressor_fingerprint or "")[7:],
+        cut_index=snapshot.cut_index,
+        compress_start=snapshot.compress_start,
+        original_count=snapshot.original_count,
+        request_tokens=snapshot.request_tokens,
+        captured_at=snapshot.captured_at,
+    )
+    assert newer.compressor_fingerprint != snapshot.compressor_fingerprint
+    try:
+        assert (
+            manager.maybe_start("session-1", snapshot, lambda: Worker(snapshot))
+            == "started"
+        )
+        assert started.wait(1)
+        assert (
+            manager.maybe_start("session-1", newer, lambda: Worker(newer))
+            == "coalesced"
+        )
+        release.set()
+        candidate = manager.take_matching_candidate(
+            "session-1", _snapshot_messages(), wait_seconds=2
+        )
+        # Only the rerun worker (new fingerprint) ran; its candidate matches
+        # the new fingerprint and is the one published.
+        assert len(calls) == 2
+        assert candidate is not None
+        assert candidate.compressor_fingerprint == newer.compressor_fingerprint
     finally:
         release.set()
         manager.shutdown()
