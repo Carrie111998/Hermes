@@ -50,7 +50,7 @@ You can also set or auto-generate the description later with `hermes profile des
 hermes profile create work --clone
 ```
 
-Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into the new profile. Same API keys, model, and capabilities, but fresh sessions and memory. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
+Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, skills, and memory files (`memories/MEMORY.md` / `memories/USER.md`) into the new profile. Same API keys, model, capabilities, and remembered facts, but fresh sessions. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality. To start with completely fresh memory, delete the profile's `memories/` directory after cloning, or use `--clone-all` and clear it there too.
 
 ### Clone everything (`--clone-all`)
 
