@@ -13,14 +13,15 @@
  *
  * Pull: session rows now carry `pinned`, and the list endpoints back-fill
  * pinned conversations past their LIMIT, so a row's absence from a page no
- * longer says anything about its pin state. That makes the server row
- * authoritative: adopt pins this app hasn't seen, and drop local pins the
- * server says are gone. Only rows actually present in the payload are
- * consulted, so a backend predating the flag (`pinned === undefined`) leaves
- * the local set untouched.
+ * longer says anything about its pin state. Adopt pins this app hasn't seen.
+ * Drop local pins the server reports unpinned **only after** we previously
+ * mirrored them (confirmed server true) — never-synced localStorage pins push
+ * instead of being wiped on boot. Only rows present in the payload are
+ * consulted; `pinned === undefined` leaves the local set untouched.
  */
 
 import { setSessionPinnedRemote } from '@/hermes'
+import { arraysEqual } from '@/lib/storage'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
 
@@ -33,6 +34,9 @@ const pending = new Set<string>()
 // be read as the server disagreeing with us. Cleared when the write settles —
 // the request's own lifetime is the guard, so nothing can leave one open.
 const unconfirmed = new Map<string, boolean>()
+// normalizeLocalPinIds / pinSession write $pinnedSessionIds and would re-enter
+// reconcile via the atom listener; collapse those into one pass.
+let reconciling = false
 
 function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
@@ -54,13 +58,50 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
 }
 
 /**
+ * Collapse tip/root aliases in localStorage onto durable `sessionPinId` keys.
+ * Idempotent once the list is clean — prevents leftover tips from surviving an
+ * unpin of the root and then re-pushing `pinned=true`.
+ */
+function normalizeLocalPinIds(): void {
+  const sessions = $sessions.get()
+
+  if (sessions.length === 0) {
+    return
+  }
+
+  const prev = $pinnedSessionIds.get()
+  const next: string[] = []
+  const seen = new Set<string>()
+
+  for (const id of prev) {
+    const row = sessions.find(entry => sessionMatchesStoredId(entry, id))
+    const durable = row ? sessionPinId(row) : id
+
+    if (seen.has(durable)) {
+      continue
+    }
+
+    seen.add(durable)
+    next.push(durable)
+  }
+
+  if (!arraysEqual(prev, next)) {
+    $pinnedSessionIds.set(next)
+  }
+}
+
+/**
  * Adopt the server's pin state for every row in the current page.
  *
- * Runs after the push pass so local intent is already fenced (`pending` /
- * `unconfirmed`) by the time the page is read — a fresh local toggle whose
- * PATCH hasn't landed yet must win over the stale row, not be reverted by it
- * (#74570). Remote pins adopted here are marked mirrored before the local set
- * changes, so the re-entrant reconcile doesn't echo them back as a PATCH.
+ * Runs AFTER local unpin pushes so a user clear is already in `unconfirmed` as
+ * false — otherwise pull would re-adopt `row.pinned === true` in the same tick
+ * and the pin would bounce back ("cannot unpin"). Remote pins the local set
+ * has not seen are still adopted; mirrored pins avoid a redundant PATCH.
+ *
+ * Drop rule (2026-08-01): only drop a local pin when we previously confirmed
+ * the server had it (`mirrored`). localStorage-only pins that never completed
+ * a PATCH must **push**, not pull-unpin — otherwise boot / upgrade wipes the
+ * whole Pinned section while state.db still has pinned=0 (LevelDB restore case).
  */
 function pullRemotePins(): void {
   const local = new Set($pinnedSessionIds.get())
@@ -74,32 +115,46 @@ function pullRemotePins(): void {
     // Pins are keyed on the durable lineage root so they survive compression
     // tip rotation; the row may surface under either identity.
     const pinId = sessionPinId(row)
-    const heldLocally = local.has(pinId) || local.has(row.id)
+    const heldLocally =
+      local.has(pinId) || local.has(row.id) || [...local].some(id => sessionMatchesStoredId(row, id))
 
     // A write of ours the page hasn't caught up to yet is newer than the page.
+    // unconfirmed is set synchronously in writePin before the network settles;
+    // local unpin pushes run before this pull so the same tick cannot re-adopt.
     const awaited = unconfirmed.has(pinId) ? unconfirmed.get(pinId) : unconfirmed.get(row.id)
 
     if (awaited !== undefined && awaited !== row.pinned) {
       continue
     }
 
-    // Local intent still waiting on its PATCH (row unresolved when the push
-    // pass ran) is also newer than the page — never revert it.
-    if (pending.has(pinId) || pending.has(row.id)) {
-      continue
-    }
-
     if (row.pinned && !heldLocally) {
-      // Mark mirrored first: pinSession fires the pin listener synchronously,
-      // and the nested reconcile must not see this as a new pin to PATCH.
-      mirrored.add(pinId)
       pinSession(pinId)
+      // Already true server-side; record it so the push pass doesn't re-PATCH.
+      mirrored.add(pinId)
     } else if (!row.pinned && heldLocally) {
-      // Same discipline on the way down: forget the mirror before the nested
-      // reconcile runs, or it re-PATCHes pinned=false the server already has.
+      const wasMirrored =
+        mirrored.has(pinId) || mirrored.has(row.id) || [...mirrored].some(id => sessionMatchesStoredId(row, id))
+
+      if (!wasMirrored) {
+        // Boot migration / never-synced local pin: keep local; push pass PATCHes true.
+        continue
+      }
+
+      // Confirmed server true earlier; now false → another client (or explicit) unpin.
+      // Lineage-aware unpin clears tip + root aliases in one shot.
+      unpinSession(pinId)
       mirrored.delete(pinId)
       mirrored.delete(row.id)
-      unpinSession(local.has(pinId) ? pinId : row.id)
+
+      for (const id of [...mirrored]) {
+        if (sessionMatchesStoredId(row, id)) {
+          mirrored.delete(id)
+        }
+      }
+    } else if (row.pinned && heldLocally) {
+      // Keep mirror bookkeeping on the durable id even when localStorage still
+      // holds a tip alias (normalizeLocalPinIds will collapse it).
+      mirrored.add(pinId)
     }
   }
 }
@@ -110,48 +165,85 @@ function reconcile(): void {
     return
   }
 
-  // Push before pull. The pin listener fires synchronously on a local toggle,
-  // so this reconcile runs before the PATCH for that toggle exists anywhere.
-  // The push pass below records the intent (`pending`, then `unconfirmed` via
-  // writePin) — only then may the pull read the page, where those fences stop
-  // the still-stale row from silently reverting the user's action (#74570).
-  const current = new Set($pinnedSessionIds.get())
+  if (reconciling) {
+    return
+  }
 
-  // Unpinned: anything we were tracking that's no longer in the set.
-  for (const id of [...mirrored, ...pending]) {
-    if (!current.has(id)) {
-      mirrored.delete(id)
+  reconciling = true
+
+  try {
+    // Collapse tip/root duplicates before pull/push so an unpin of either id
+    // cannot leave a sibling alias that re-asserts pinned=true.
+    normalizeLocalPinIds()
+
+    const sessions = $sessions.get()
+    // Snapshot local set BEFORE pull. User unpins must win this tick: push
+    // false + unconfirmed first, else pull re-adopts server pinned=true and the
+    // pin visually "cannot be cleared".
+    const currentBeforePull = new Set($pinnedSessionIds.get())
+
+    // Unpinned: anything we were tracking that's no longer in the set (or only
+    // remains as a collapsed alias of a still-pinned durable id).
+    for (const id of [...mirrored, ...pending]) {
+      const stillHeld =
+        currentBeforePull.has(id) ||
+        [...currentBeforePull].some(held => {
+          const row = sessions.find(entry => sessionMatchesStoredId(entry, held) || sessionMatchesStoredId(entry, id))
+
+          return row ? sessionMatchesStoredId(row, held) && sessionMatchesStoredId(row, id) : held === id
+        })
+
+      if (!stillHeld) {
+        mirrored.delete(id)
+        pending.delete(id)
+        // writePin sets unconfirmed=false before the network settles so the
+        // pull pass below will not re-adopt a stale row.pinned===true page.
+        void writePin(id, false, profileFor(id)).catch(() => {})
+      }
+    }
+
+    pullRemotePins()
+
+    const current = new Set($pinnedSessionIds.get())
+
+    // Newly pinned: hold until we can resolve the row (for its profile).
+    for (const id of current) {
+      if (
+        !mirrored.has(id) &&
+        ![...mirrored].some(m => {
+          const row = sessions.find(entry => sessionMatchesStoredId(entry, m) || sessionMatchesStoredId(entry, id))
+
+          return row ? sessionMatchesStoredId(row, m) && sessionMatchesStoredId(row, id) : m === id
+        })
+      ) {
+        pending.add(id)
+      }
+    }
+
+    // Flush whatever we can resolve now; unresolved ids (row not loaded yet)
+    // retry on the next $sessions change.
+    for (const id of [...pending]) {
+      const row = $sessions.get().find(entry => sessionMatchesStoredId(entry, id))
+
+      if (!row) {
+        continue
+      }
+
+      const durable = sessionPinId(row)
+
       pending.delete(id)
-      void writePin(id, false, profileFor(id)).catch(() => {})
+      pending.delete(durable)
+      mirrored.add(durable)
+      // Always PATCH the durable id so tip/root never diverge server-side.
+      void writePin(durable, true, row.profile).catch(() => {
+        // Let a later reconcile retry the mirror.
+        mirrored.delete(durable)
+        pending.add(durable)
+      })
     }
+  } finally {
+    reconciling = false
   }
-
-  // Newly pinned: hold until we can resolve the row (for its profile).
-  for (const id of current) {
-    if (!mirrored.has(id)) {
-      pending.add(id)
-    }
-  }
-
-  // Flush whatever we can resolve now; unresolved ids (row not loaded yet)
-  // retry on the next $sessions change.
-  for (const id of [...pending]) {
-    const row = $sessions.get().find(entry => sessionMatchesStoredId(entry, id))
-
-    if (!row) {
-      continue
-    }
-
-    pending.delete(id)
-    mirrored.add(id)
-    void writePin(id, true, row.profile).catch(() => {
-      // Let a later reconcile retry the mirror.
-      mirrored.delete(id)
-      pending.add(id)
-    })
-  }
-
-  pullRemotePins()
 }
 
 // Sync once, then re-sync on pin-set and session-list changes. Call once per app.

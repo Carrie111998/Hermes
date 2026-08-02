@@ -8,6 +8,7 @@ import { Codecs, persistentAtom } from '@/lib/persisted'
 import { arraysEqual, insertUniqueId, readKey } from '@/lib/storage'
 
 import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, togglePane } from './panes'
+import { $sessions, idsShareLineage, sessionMatchesStoredId, sessionPinId } from './session'
 
 export const SIDEBAR_DEFAULT_WIDTH = 237
 export const SIDEBAR_MAX_WIDTH = 360
@@ -403,17 +404,36 @@ export function setSidebarResizing(resizing: boolean) {
   $isSidebarResizing.set(resizing)
 }
 
+/**
+ * Pin a session for the sidebar / tab chrome.
+ *
+ * Keys are durable lineage roots (`sessionPinId`). Historical localStorage rows
+ * and compression tip rotation can leave tip ids next to roots for the same
+ * conversation. Always collapse aliases onto the durable id — otherwise
+ * `unpinSession(root)` leaves a tip behind, `watchSessionPins` re-PATCHes
+ * `pinned=true` for the leftover tip, and the user cannot clear the pin.
+ */
 export function pinSession(sessionId: string, index?: number) {
+  const sessions = $sessions.get()
+  const row = sessions.find(entry => sessionMatchesStoredId(entry, sessionId))
+  const durableId = row ? sessionPinId(row) : sessionId
   const prev = $pinnedSessionIds.get()
+  const stripped = prev.filter(id => id !== durableId && !idsShareLineage(id, durableId, sessions))
+  const insertAt = index ?? stripped.length
 
-  setOrderIds($pinnedSessionIds, insertUniqueId(prev, sessionId, index ?? prev.filter(id => id !== sessionId).length))
+  setOrderIds($pinnedSessionIds, insertUniqueId(stripped, durableId, insertAt))
 }
 
+/**
+ * Unpin a session. Drop every stored id that names the same conversation
+ * (live tip and lineage root), not only an exact string match.
+ */
 export function unpinSession(sessionId: string) {
-  setOrderIds(
-    $pinnedSessionIds,
-    $pinnedSessionIds.get().filter(id => id !== sessionId)
-  )
+  const sessions = $sessions.get()
+  const prev = $pinnedSessionIds.get()
+  const next = prev.filter(id => id !== sessionId && !idsShareLineage(id, sessionId, sessions))
+
+  setOrderIds($pinnedSessionIds, next)
 }
 
 // Replace the whole pinned order at once (drag-reorder hands back the new order
