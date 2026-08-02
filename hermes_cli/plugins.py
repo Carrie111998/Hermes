@@ -527,6 +527,16 @@ class _PluginRegistrationView:
         self._frozen = True
 
 
+@dataclass(frozen=True)
+class _PluginContextBinding:
+    """One coherent authority target captured by a registration mutation."""
+
+    registry: Any
+    manager: Any
+    external_registries: Any
+    managed_generation: Optional[int]
+
+
 class _RegistrationTransaction:
     """One isolated plugin registration or complete force-reload candidate."""
 
@@ -651,7 +661,10 @@ class _RegistrationTransaction:
             if self.replace_owned
             else None
         )
-        locks = [
+        context_locks = [
+            context._registration_lock for context in self.contexts
+        ]
+        live_registry_locks = [
             self.manager._lock,
             self.tool_registry._lock,
             *(
@@ -660,31 +673,32 @@ class _RegistrationTransaction:
             ),
         ]
         acquired_locks: List[Any] = []
+        revocation_started = False
         publication_started = False
-        context_bindings_before = [
-            (
-                context,
-                context._registration_registry,
-                context._registration_manager,
-                context._registration_external_registries,
-                context._managed_generation,
-            )
-            for context in self.contexts
-        ]
-
-        def restore_context_binding(binding: tuple[Any, ...]) -> None:
-            context, registry, manager, external_registries, generation = binding
-            context._registration_registry = registry
-            context._registration_manager = manager
-            context._registration_external_registries = external_registries
-            context._managed_generation = generation
+        context_bindings_before: List[
+            tuple[PluginContext, _PluginContextBinding]
+        ] = []
 
         try:
-            if revoke_generation is not None:
-                self.manager._begin_live_context_revocation(revoke_generation)
-            for lock in locks:
+            # Binding locks always precede every live manager/tool/external
+            # registry lock. This blocks retained contexts before publication
+            # can swap or restore their single coherent authority reference.
+            for lock in context_locks:
                 lock.acquire()
                 acquired_locks.append(lock)
+            if revoke_generation is not None:
+                # Claim cleanup before the call: an injected BaseException may
+                # occur after the manager adds the marker but before returning.
+                revocation_started = True
+                self.manager._begin_live_context_revocation(revoke_generation)
+            for lock in live_registry_locks:
+                lock.acquire()
+                acquired_locks.append(lock)
+
+            context_bindings_before = [
+                (context, context._registration_binding)
+                for context in self.contexts
+            ]
             if self.manager._generation != self.manager_before._generation:
                 raise RegistryTransactionConflict(
                     "manager",
@@ -714,10 +728,12 @@ class _RegistrationTransaction:
                     prepared_external[surface],
                 )
             for context in self.contexts:
-                context._registration_registry = self.tool_registry
-                context._registration_manager = self.manager
-                context._registration_external_registries = None
-                context._managed_generation = self.context_generation
+                context._registration_binding = _PluginContextBinding(
+                    registry=self.tool_registry,
+                    manager=self.manager,
+                    external_registries=None,
+                    managed_generation=self.context_generation,
+                )
             self.manager._install_owned_state_locked(next_manager)
         except BaseException as primary:
             if publication_started:
@@ -743,7 +759,9 @@ class _RegistrationTransaction:
                     *(
                         (
                             f"context[{index}]",
-                            lambda binding=binding: restore_context_binding(binding),
+                            lambda binding=binding: setattr(
+                                binding[0], "_registration_binding", binding[1]
+                            ),
                         )
                         for index, binding in enumerate(context_bindings_before)
                     ),
@@ -775,7 +793,7 @@ class _RegistrationTransaction:
         finally:
             for lock in reversed(acquired_locks):
                 lock.release()
-            if revoke_generation is not None:
+            if revocation_started:
                 self.manager._cancel_live_context_revocation(revoke_generation)
 
 
@@ -786,6 +804,7 @@ class _ForceSweepAbort(RuntimeError):
 # ---------------------------------------------------------------------------
 # PluginContext  – handed to each plugin's ``register()`` function
 # ---------------------------------------------------------------------------
+
 
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
@@ -801,20 +820,27 @@ class PluginContext:
     ):
         self.manifest = manifest
         self._manager = manager
-        self._registration_manager = registration_manager or manager
-        # Managed discovery supplies an isolated ToolRegistry transaction view.
-        # Direct/runtime contexts leave this unset and target the live registry.
-        self._registration_registry = registration_registry
-        self._registration_external_registries = registration_external_registries
-        self._managed_generation: Optional[int] = None
+        self._registration_lock = threading.RLock()
+        # Managed discovery supplies isolated registry transaction views.
+        # Direct/runtime contexts leave them unset and target live registries.
+        self._registration_binding = _PluginContextBinding(
+            registry=registration_registry,
+            manager=registration_manager or manager,
+            external_registries=registration_external_registries,
+            managed_generation=None,
+        )
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
 
-    def _ensure_live_locked(self, target: Any) -> None:
+    def _ensure_live_locked(
+        self,
+        binding: _PluginContextBinding,
+        target: Any,
+    ) -> None:
         if getattr(target, "_frozen", False):
             raise RuntimeError("plugin registration view is frozen")
-        generation = self._managed_generation
+        generation = binding.managed_generation
         if generation is None or not isinstance(target, PluginManager):
             return
         if target._live_context_generation != generation:
@@ -822,44 +848,53 @@ class PluginContext:
                 f"Plugin context for {self.manifest.name!r} is no longer live"
             )
 
-    def _acquire_live_lease(self, target: Any) -> Callable[[], None]:
-        generation = self._managed_generation
+    def _acquire_live_lease(
+        self,
+        binding: _PluginContextBinding,
+    ) -> Callable[[], None]:
+        target = binding.manager
+        generation = binding.managed_generation
         if generation is None or not isinstance(target, PluginManager):
             return lambda: None
         return target._acquire_live_context_lease(self.manifest.name, generation)
 
-    def _record_external_registration(self, surface: str, name: str) -> None:
-        target = self._registration_manager
+    def _record_external_registration(
+        self,
+        binding: _PluginContextBinding,
+        surface: str,
+        name: str,
+    ) -> None:
+        target = binding.manager
         recorder = getattr(target, "_record_external_registration", None)
         if recorder is not None:
             with target._lock:
-                self._ensure_live_locked(target)
+                self._ensure_live_locked(binding, target)
                 recorder(surface, name)
 
     def _register_external_value(
         self,
+        binding: _PluginContextBinding,
         surface: str,
         value: Any,
         live_register: Callable[[Any], Any],
     ) -> Optional[str]:
-        targets = self._registration_external_registries
-        target = self._registration_manager
+        targets = binding.external_registries
         if targets is None:
-            release_live = self._acquire_live_lease(target)
+            release_live = self._acquire_live_lease(binding)
             try:
                 result = live_register(value)
                 if surface == "secret" and not result:
                     return None
                 name = value.name
                 if name:
-                    self._record_external_registration(surface, name)
+                    self._record_external_registration(binding, surface, name)
             finally:
                 release_live()
         else:
             transaction, staged = targets[surface]
             name = transaction.register(staged, value)
-        if targets is not None and name:
-            self._record_external_registration(surface, name)
+            if name:
+                self._record_external_registration(binding, surface, name)
         return name
 
     # -- host-owned LLM access ----------------------------------------------
@@ -960,37 +995,39 @@ class PluginContext:
                 f"in config.yaml to allow this plugin to replace built-in tools."
             )
 
-        target_registry = self._registration_registry
-        if target_registry is None:
-            from tools.registry import registry as target_registry
+        with self._registration_lock:
+            binding = self._registration_binding
+            target_registry = binding.registry
+            if target_registry is None:
+                from tools.registry import registry as target_registry
 
-        target = self._registration_manager
-        resolved_description = description or schema.get("description", "")
-        release_live = self._acquire_live_lease(target)
-        try:
-            target_registry.register(
-                name=name,
-                toolset=toolset,
-                schema=schema,
-                handler=handler,
-                check_fn=check_fn,
-                requires_env=requires_env,
-                is_async=is_async,
-                description=resolved_description,
-                emoji=emoji,
-                override=override,
-            )
-            with target._lock:
-                self._ensure_live_locked(target)
-                target._plugin_tool_names.add(name)
-                registered = getattr(
-                    target, "_transaction_tools_registered", None
+            target = binding.manager
+            resolved_description = description or schema.get("description", "")
+            release_live = self._acquire_live_lease(binding)
+            try:
+                target_registry.register(
+                    name=name,
+                    toolset=toolset,
+                    schema=schema,
+                    handler=handler,
+                    check_fn=check_fn,
+                    requires_env=requires_env,
+                    is_async=is_async,
+                    description=resolved_description,
+                    emoji=emoji,
+                    override=override,
                 )
-                if registered is not None and name not in registered:
-                    registered.append(name)
-                target._generation += 1
-        finally:
-            release_live()
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._plugin_tool_names.add(name)
+                    registered = getattr(
+                        target, "_transaction_tools_registered", None
+                    )
+                    if registered is not None and name not in registered:
+                        registered.append(name)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
@@ -1065,18 +1102,24 @@ class PluginContext:
         The *setup_fn* receives an argparse subparser and should add any
         arguments/sub-subparsers.  If *handler_fn* is provided it is set
         as the default dispatch function via ``set_defaults(func=...)``."""
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._cli_commands[name] = {
-                "name": name,
-                "help": help,
-                "description": description,
-                "setup_fn": setup_fn,
-                "handler_fn": handler_fn,
-                "plugin": self.manifest.name,
-            }
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._cli_commands[name] = {
+                        "name": name,
+                        "help": help,
+                        "description": description,
+                        "setup_fn": setup_fn,
+                        "handler_fn": handler_fn,
+                        "plugin": self.manifest.name,
+                    }
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
 
     # -- slash command registration -------------------------------------------
@@ -1127,21 +1170,27 @@ class PluginContext:
         except Exception:
             pass  # If commands module isn't available, skip the check
 
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._plugin_commands[clean] = {
-                "handler": handler,
-                "description": description or "Plugin command",
-                "plugin": self.manifest.name,
-                "args_hint": (args_hint or "").strip(),
-            }
-            registered = getattr(
-                target, "_transaction_commands_registered", None
-            )
-            if registered is not None and clean not in registered:
-                registered.append(clean)
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._plugin_commands[clean] = {
+                        "handler": handler,
+                        "description": description or "Plugin command",
+                        "plugin": self.manifest.name,
+                        "args_hint": (args_hint or "").strip(),
+                    }
+                    registered = getattr(
+                        target, "_transaction_commands_registered", None
+                    )
+                    if registered is not None and clean not in registered:
+                        registered.append(clean)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
     # -- tool dispatch -------------------------------------------------------
@@ -1194,20 +1243,24 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            if getattr(target, "_frozen", False):
-                raise RuntimeError("plugin registration transaction is frozen")
-            if target._context_engine is not None:
-                logger.warning(
-                    "Plugin '%s' tried to register a context engine, but one is "
-                    "already registered. Only one context engine plugin is allowed.",
-                    self.manifest.name,
-                )
-                return
-            target._context_engine = engine
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    if target._context_engine is not None:
+                        logger.warning(
+                            "Plugin '%s' tried to register a context engine, but one is "
+                            "already registered. Only one context engine plugin is allowed.",
+                            self.manifest.name,
+                        )
+                        return
+                    target._context_engine = engine
+                    target._generation += 1
+            finally:
+                release_live()
         logger.info(
             "Plugin '%s' registered context engine: %s",
             self.manifest.name, engine.name,
@@ -1234,7 +1287,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._register_external_value("image_gen", provider, register_provider)
+        with self._registration_lock:
+            binding = self._registration_binding
+            self._register_external_value(
+                binding, "image_gen", provider, register_provider
+            )
         logger.info(
             "Plugin '%s' registered image_gen provider: %s",
             self.manifest.name, provider.name,
@@ -1267,11 +1324,14 @@ class PluginContext:
             )
             return
         try:
-            name = self._register_external_value(
-                "dashboard",
-                provider,
-                register_provider,
-            )
+            with self._registration_lock:
+                binding = self._registration_binding
+                name = self._register_external_value(
+                    binding,
+                    "dashboard",
+                    provider,
+                    register_provider,
+                )
         except (TypeError, ValueError) as e:
             logger.warning(
                 "Plugin '%s' failed to register dashboard-auth provider "
@@ -1307,11 +1367,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._register_external_value(
-            "video_gen",
-            provider,
-            _register_video_provider,
-        )
+        with self._registration_lock:
+            binding = self._registration_binding
+            self._register_external_value(
+                binding,
+                "video_gen",
+                provider,
+                _register_video_provider,
+            )
         logger.info(
             "Plugin '%s' registered video_gen provider: %s",
             self.manifest.name, provider.name,
@@ -1339,7 +1402,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._register_external_value("web", provider, _register_web_provider)
+        with self._registration_lock:
+            binding = self._registration_binding
+            self._register_external_value(
+                binding, "web", provider, _register_web_provider
+            )
         logger.info(
             "Plugin '%s' registered web provider: %s",
             self.manifest.name, provider.name,
@@ -1371,11 +1438,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._register_external_value(
-            "browser",
-            provider,
-            _register_browser_provider,
-        )
+        with self._registration_lock:
+            binding = self._registration_binding
+            self._register_external_value(
+                binding,
+                "browser",
+                provider,
+                _register_browser_provider,
+            )
         logger.info(
             "Plugin '%s' registered browser provider: %s",
             self.manifest.name, provider.name,
@@ -1422,7 +1492,12 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        if self._register_external_value("secret", source, register_source):
+        with self._registration_lock:
+            binding = self._registration_binding
+            registered = self._register_external_value(
+                binding, "secret", source, register_source
+            )
+        if registered:
             logger.info(
                 "Plugin '%s' registered secret source: %s",
                 self.manifest.name, source.name,
@@ -1460,11 +1535,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        name = self._register_external_value(
-            "tts",
-            provider,
-            _register_tts_provider,
-        )
+        with self._registration_lock:
+            binding = self._registration_binding
+            name = self._register_external_value(
+                binding,
+                "tts",
+                provider,
+                _register_tts_provider,
+            )
         if name is None:
             return
         logger.info(
@@ -1510,11 +1588,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        name = self._register_external_value(
-            "stt",
-            provider,
-            _register_stt_provider,
-        )
+        with self._registration_lock:
+            binding = self._registration_binding
+            name = self._register_external_value(
+                binding,
+                "stt",
+                provider,
+                _register_stt_provider,
+            )
         if name is None:
             return
         logger.info(
@@ -1570,19 +1651,23 @@ class PluginContext:
             source="plugin",
             **entry_kwargs,
         )
-        targets = self._registration_external_registries
-        if targets is None:
-            target = self._registration_manager
-            release_live = self._acquire_live_lease(target)
-            try:
-                platform_registry.register(entry)
-                self._record_external_registration("platform", name)
-            finally:
-                release_live()
-        else:
-            _transaction, staged = targets["platform"]
-            staged.register(entry)
-            self._record_external_registration("platform", name)
+        with self._registration_lock:
+            binding = self._registration_binding
+            targets = binding.external_registries
+            if targets is None:
+                release_live = self._acquire_live_lease(binding)
+                try:
+                    platform_registry.register(entry)
+                    self._record_external_registration(
+                        binding, "platform", name
+                    )
+                finally:
+                    release_live()
+            else:
+                _transaction, staged = targets["platform"]
+                staged.register(entry)
+                self._record_external_registration(binding, "platform", name)
+
         logger.debug(
             "Plugin %s registered platform: %s",
             self.manifest.name,
@@ -1638,13 +1723,19 @@ class PluginContext:
                 f"Plugin '{self.manifest.name}' tried to register a Slack "
                 f"action handler with an empty action_id."
             )
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._slack_action_handlers.append(
-                (action_id, callback, self.manifest.name)
-            )
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._slack_action_handlers.append(
+                        (action_id, callback, self.manifest.name)
+                    )
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered Slack action handler: %s",
             self.manifest.name,
@@ -1729,17 +1820,6 @@ class PluginContext:
                 f"Pick a plugin-namespaced key (e.g. '{self.manifest.name}_{key}')."
             )
 
-        # Reject duplicate registrations across plugins
-        target = self._registration_manager
-        with target._lock:
-            existing = target._aux_tasks.get(key)
-        if existing is not None and existing.get("plugin") != self.manifest.name:
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' cannot register auxiliary task "
-                f"{key!r} — already registered by plugin "
-                f"'{existing.get('plugin')}'"
-            )
-
         # Normalize defaults — plugin owns the schema, but we ensure routing
         # fields exist with sensible types so consumers don't crash.
         merged_defaults: Dict[str, Any] = {
@@ -1754,16 +1834,33 @@ class PluginContext:
             for k, v in defaults.items():
                 merged_defaults[k] = v
 
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._aux_tasks[key] = {
-                "key": key,
-                "display_name": display_name,
-                "description": description,
-                "defaults": merged_defaults,
-                "plugin": self.manifest.name,
-            }
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    existing = target._aux_tasks.get(key)
+                    if (
+                        existing is not None
+                        and existing.get("plugin") != self.manifest.name
+                    ):
+                        raise ValueError(
+                            f"Plugin '{self.manifest.name}' cannot register auxiliary task "
+                            f"{key!r} — already registered by plugin "
+                            f"'{existing.get('plugin')}'"
+                        )
+                    target._aux_tasks[key] = {
+                        "key": key,
+                        "display_name": display_name,
+                        "description": description,
+                        "defaults": merged_defaults,
+                        "plugin": self.manifest.name,
+                    }
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered auxiliary task: %s (%s)",
             self.manifest.name,
@@ -1785,11 +1882,17 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._hooks.setdefault(hook_name, []).append(callback)
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._hooks.setdefault(hook_name, []).append(callback)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1810,11 +1913,17 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._middleware.setdefault(kind, []).append(callback)
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._middleware.setdefault(kind, []).append(callback)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1853,16 +1962,22 @@ class PluginContext:
             raise FileNotFoundError(f"SKILL.md not found at {path}")
 
         qualified = f"{self.manifest.name}:{name}"
-        target = self._registration_manager
-        with target._lock:
-            self._ensure_live_locked(target)
-            target._plugin_skills[qualified] = {
-                "path": path,
-                "plugin": self.manifest.name,
-                "bare_name": name,
-                "description": description,
-            }
-            target._generation += 1
+        with self._registration_lock:
+            binding = self._registration_binding
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._plugin_skills[qualified] = {
+                        "path": path,
+                        "plugin": self.manifest.name,
+                        "bare_name": name,
+                        "description": description,
+                    }
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered skill: %s",
             self.manifest.name, qualified,

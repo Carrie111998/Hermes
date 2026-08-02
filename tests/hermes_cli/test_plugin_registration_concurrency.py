@@ -985,6 +985,191 @@ def test_failed_initial_publication_restores_candidate_context_targets(
     assert late_hook not in manager._hooks.get("post_tool_call", [])
 
 
+def _mutate_retained_candidate(context, surface: str, name: str) -> None:
+    if surface == "tool":
+        context.register_tool(
+            name,
+            "h1_transaction",
+            {
+                "name": name,
+                "description": "concurrent retained candidate",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            lambda args, **kwargs: "concurrent",
+        )
+        return
+    if surface == "hook":
+        context.register_hook(name, lambda *args, **kwargs: "concurrent")
+        return
+    context.register_platform(
+        name=name,
+        label="Concurrent retained candidate",
+        adapter_factory=lambda config: "concurrent",
+        check_fn=lambda: True,
+    )
+
+
+@pytest.mark.parametrize("surface", ["tool", "platform", "hook"])
+def test_initial_publication_hides_tentative_binding_from_retained_candidate_mutation(
+    tmp_path, monkeypatch, isolated_registries, surface
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("candidate", f"atomic-success-{surface}")
+    support = _support(values, "candidate", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    publication_paused = threading.Event()
+    release_publication = threading.Event()
+    original_install = manager._install_owned_state_locked
+
+    def pause_before_manager_install(state) -> None:
+        publication_paused.set()
+        assert release_publication.wait(timeout=5)
+        original_install(state)
+
+    monkeypatch.setattr(manager, "_install_owned_state_locked", pause_before_manager_install)
+    discovery_thread, discovery_done, discovery_failures = _start_discovery(manager)
+    assert publication_paused.wait(timeout=5)
+    context = support.saved_context
+    binding_captured = threading.Event()
+    mutation_started = threading.Event()
+    mutation_done = threading.Event()
+    mutation_failures: list[BaseException] = []
+    original_acquire = context._acquire_live_lease
+
+    def observe_binding_capture(*args, **kwargs):
+        binding_captured.set()
+        return original_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(context, "_acquire_live_lease", observe_binding_capture)
+    name = f"h1_atomic_success_{surface}"
+
+    def mutate() -> None:
+        mutation_started.set()
+        try:
+            _mutate_retained_candidate(context, surface, name)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            mutation_failures.append(exc)
+        finally:
+            mutation_done.set()
+
+    mutation_thread = threading.Thread(target=mutate, daemon=True)
+    mutation_thread.start()
+    assert mutation_started.wait(timeout=5)
+    captured_before_publication = binding_captured.wait(timeout=0.2)
+    release_publication.set()
+    _join(discovery_thread, discovery_done)
+    assert mutation_done.wait(timeout=5)
+    mutation_thread.join(timeout=1)
+
+    assert not captured_before_publication
+    assert discovery_failures == []
+    assert mutation_failures == []
+    assert not mutation_thread.is_alive()
+    if surface == "tool":
+        assert registry.get_entry(name) is not None
+        assert name in manager._plugin_tool_names
+    elif surface == "platform":
+        assert isolated_registries.get(name) is not None
+        assert name in manager._plugin_external_names["platform"]
+    else:
+        assert len(manager._hooks.get(name, [])) == 1
+
+
+@pytest.mark.parametrize("surface", ["tool", "platform", "hook"])
+def test_failed_initial_publication_restores_binding_before_retained_candidate_mutation(
+    tmp_path, monkeypatch, isolated_registries, surface
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("candidate", f"atomic-rollback-{surface}")
+    support = _support(values, "candidate", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    rollback_paused = threading.Event()
+    release_rollback = threading.Event()
+    original_install = manager._install_owned_state_locked
+
+    def install_then_pause_and_interrupt(state) -> None:
+        original_install(state)
+        rollback_paused.set()
+        assert release_rollback.wait(timeout=5)
+        raise KeyboardInterrupt("injected after manager install")
+
+    monkeypatch.setattr(
+        manager,
+        "_install_owned_state_locked",
+        install_then_pause_and_interrupt,
+    )
+    discovery_thread, discovery_done, discovery_failures = _start_discovery(manager)
+    assert rollback_paused.wait(timeout=5)
+    context = support.saved_context
+    binding_captured = threading.Event()
+    mutation_started = threading.Event()
+    mutation_done = threading.Event()
+    mutation_failures: list[BaseException] = []
+    original_acquire = context._acquire_live_lease
+
+    def observe_binding_capture(*args, **kwargs):
+        binding_captured.set()
+        return original_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(context, "_acquire_live_lease", observe_binding_capture)
+    name = f"h1_atomic_rollback_{surface}"
+
+    def mutate() -> None:
+        mutation_started.set()
+        try:
+            _mutate_retained_candidate(context, surface, name)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            mutation_failures.append(exc)
+        finally:
+            mutation_done.set()
+
+    mutation_thread = threading.Thread(target=mutate, daemon=True)
+    mutation_thread.start()
+    assert mutation_started.wait(timeout=5)
+    captured_before_rollback = binding_captured.wait(timeout=0.2)
+    release_rollback.set()
+    _join(discovery_thread, discovery_done)
+    assert mutation_done.wait(timeout=5)
+    mutation_thread.join(timeout=1)
+
+    assert not captured_before_rollback
+    assert len(discovery_failures) == 1
+    assert isinstance(discovery_failures[0], KeyboardInterrupt)
+    assert len(mutation_failures) == 1
+    assert "frozen" in str(mutation_failures[0])
+    assert not mutation_thread.is_alive()
+    if surface == "tool":
+        assert registry.get_entry(name) is None
+        assert name not in manager._plugin_tool_names
+    elif surface == "platform":
+        assert isolated_registries.get(name) is None
+        assert name not in manager._plugin_external_names["platform"]
+    else:
+        assert name not in manager._hooks
+
+
 def test_retained_context_live_registration_does_not_validate_under_live_locks(
     tmp_path, monkeypatch, isolated_registries
 ):
