@@ -146,8 +146,18 @@ async def test_list_sessions_can_include_detailed_model_and_aux_usage(adapter, s
         "compression",
         model="gpt-5.6-luna",
         billing_provider="openai-codex",
+        billing_base_url="https://route-a.invalid/v1",
         input_tokens=30,
         output_tokens=10,
+    )
+    session_db.record_auxiliary_usage(
+        session_id,
+        "compression",
+        model="gpt-5.6-luna",
+        billing_provider="openai-codex",
+        billing_base_url="https://route-b.invalid/v1",
+        input_tokens=7,
+        output_tokens=3,
     )
 
     app = _create_session_app(adapter)
@@ -181,8 +191,57 @@ async def test_list_sessions_can_include_detailed_model_and_aux_usage(adapter, s
     assert usage[0]["first_seen"] > 0
     assert usage[0]["last_seen"] >= usage[0]["first_seen"]
     assert usage[1]["model"] == "gpt-5.6-luna"
-    assert usage[1]["input_tokens"] == 30
-    assert usage[1]["output_tokens"] == 10
+    assert usage[1]["api_call_count"] == 2
+    assert usage[1]["input_tokens"] == 37
+    assert usage[1]["output_tokens"] == 13
+    assert "billing_base_url" not in usage[1]
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_merges_usage_across_compression_lineage(
+    adapter, session_db
+):
+    root_id = session_db.create_session(
+        "usage-compression-root", "discord", model="gpt-5.6-sol"
+    )
+    session_db.update_token_counts(
+        root_id,
+        input_tokens=100,
+        output_tokens=20,
+        model="gpt-5.6-sol",
+        billing_provider="openai-codex",
+        billing_mode="subscription_included",
+        api_call_count=1,
+    )
+    session_db.end_session(root_id, "compression")
+    tip_id = session_db.create_session(
+        "usage-compression-tip",
+        "discord",
+        model="gpt-5.6-sol",
+        parent_session_id=root_id,
+    )
+    session_db.update_token_counts(
+        tip_id,
+        input_tokens=50,
+        output_tokens=10,
+        model="gpt-5.6-sol",
+        billing_provider="openai-codex",
+        billing_mode="subscription_included",
+        api_call_count=1,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get("/api/sessions?include_usage=true&limit=20")
+        assert response.status == 200
+        body = await response.json()
+
+    logical = next(row for row in body["data"] if row["id"] == tip_id)
+    assert len(logical["usage_by_model"]) == 1
+    usage = logical["usage_by_model"][0]
+    assert usage["api_call_count"] == 2
+    assert usage["input_tokens"] == 150
+    assert usage["output_tokens"] == 30
 
 
 @pytest.mark.asyncio

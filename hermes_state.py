@@ -4642,11 +4642,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             rows = conn.execute(
                 f"""
                 SELECT session_id, model, billing_provider, billing_mode, task,
-                       api_call_count, input_tokens, output_tokens,
-                       cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                       estimated_cost_usd, actual_cost_usd, first_seen, last_seen
+                       SUM(api_call_count) AS api_call_count,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(cache_read_tokens) AS cache_read_tokens,
+                       SUM(cache_write_tokens) AS cache_write_tokens,
+                       SUM(reasoning_tokens) AS reasoning_tokens,
+                       SUM(estimated_cost_usd) AS estimated_cost_usd,
+                       SUM(actual_cost_usd) AS actual_cost_usd,
+                       MIN(first_seen) AS first_seen,
+                       MAX(last_seen) AS last_seen
                 FROM session_model_usage
                 WHERE session_id IN ({placeholders})
+                GROUP BY session_id, model, billing_provider, billing_mode, task
                 ORDER BY session_id, task, model, billing_provider, billing_mode
                 """,
                 ids,

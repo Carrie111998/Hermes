@@ -3100,10 +3100,69 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         payloads = [self._session_response(session) for session in sessions]
         if include_usage:
-            usage_by_session = await asyncio.to_thread(
-                db.get_session_model_usage,
-                [str(session.get("id") or "") for session in sessions],
-            )
+            def _load_usage():
+                lineages = {}
+                for session in sessions:
+                    session_id = str(session.get("id") or "")
+                    lineages[session_id] = (
+                        [session_id]
+                        if include_children
+                        else db.get_compression_lineage(session_id)
+                    )
+                usage_by_raw_session = db.get_session_model_usage(
+                    list(dict.fromkeys(
+                        lineage_id
+                        for lineage in lineages.values()
+                        for lineage_id in lineage
+                    ))
+                )
+                merged = {}
+                counter_fields = (
+                    "api_call_count",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "reasoning_tokens",
+                )
+                cost_fields = ("estimated_cost_usd", "actual_cost_usd")
+                for session_id, lineage in lineages.items():
+                    rows = {}
+                    for lineage_id in lineage:
+                        for source in usage_by_raw_session.get(lineage_id, []):
+                            key = tuple(
+                                str(source.get(field) or "")
+                                for field in (
+                                    "task",
+                                    "model",
+                                    "billing_provider",
+                                    "billing_mode",
+                                )
+                            )
+                            if key not in rows:
+                                rows[key] = dict(source)
+                                continue
+                            target = rows[key]
+                            for field in counter_fields:
+                                target[field] = int(target.get(field) or 0) + int(
+                                    source.get(field) or 0
+                                )
+                            for field in cost_fields:
+                                target[field] = float(target.get(field) or 0.0) + float(
+                                    source.get(field) or 0.0
+                                )
+                            target["first_seen"] = min(
+                                float(target.get("first_seen") or 0.0),
+                                float(source.get("first_seen") or 0.0),
+                            )
+                            target["last_seen"] = max(
+                                float(target.get("last_seen") or 0.0),
+                                float(source.get("last_seen") or 0.0),
+                            )
+                    merged[session_id] = [rows[key] for key in sorted(rows)]
+                return merged
+
+            usage_by_session = await asyncio.to_thread(_load_usage)
             for payload in payloads:
                 payload["usage_by_model"] = usage_by_session.get(
                     str(payload.get("id") or ""), []
