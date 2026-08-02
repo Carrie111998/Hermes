@@ -738,7 +738,7 @@ def _collect_gateway_skill_entries(
         for _ext in get_external_skills_dirs():
             try:
                 _allowed_roots.append(_P(_ext).resolve())
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
@@ -757,7 +757,7 @@ def _collect_gateway_skill_entries(
             # the outer ``except``.
             try:
                 sp = _P(skill_path).resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not any(sp.is_relative_to(root) for root in _allowed_roots):
                 continue
