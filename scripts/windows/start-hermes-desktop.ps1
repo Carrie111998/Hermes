@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$HermesRoot = "",
     [string]$Cwd = "",
     [string]$HermesHome = ""
@@ -52,6 +52,13 @@ if ($sourceDesktopRunning) {
     exit 0
 }
 
+
+# Refuse worktree roots — User/agent mistakes keep relaunching .worktrees\* with --skip-build.
+$normalizedRoot = [System.IO.Path]::GetFullPath($HermesRoot)
+if ($normalizedRoot -match '(?i)[\\/]\.worktrees[\\/]') {
+    throw "Refusing Hermes Desktop launch from worktree: $normalizedRoot`nUse canonical repo: C:\Users\downl\Documents\New project\hermes-agent"
+}
 Set-Location -LiteralPath $HermesRoot
-& $PythonExe -m hermes_cli.main desktop --source --skip-build --hermes-root $HermesRoot --cwd $Cwd
+# Never pass --skip-build here: stale/missing install-stamp and wrong-root launches fail closed.
+& $PythonExe -m hermes_cli.main desktop --source --hermes-root $HermesRoot --cwd $Cwd
 exit $LASTEXITCODE

@@ -1,4 +1,4 @@
-# One-shot: stop Hermes Desktop, rebuild from Documents source, retarget
+﻿# One-shot: stop Hermes Desktop, rebuild from Documents source, retarget
 # shortcuts, restart Desktop, and restart llama hot-swap (RTX 5060 Ti).
 #
 # Usage (PowerShell):
@@ -27,6 +27,9 @@ if (-not (Test-Path -LiteralPath $RepoRoot)) {
     throw "RepoRoot not found: $RepoRoot"
 }
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+if ($RepoRoot -match '(?i)[\\/]\.worktrees[\\/]') {
+    throw "Refuse worktree RepoRoot: $RepoRoot — pass canonical Documents\...\hermes-agent only"
+}
 
 Write-Step "=== Hermes Desktop + llama hot-standby restart ==="
 Write-Step "RepoRoot = $RepoRoot"
@@ -76,10 +79,10 @@ if (-not $SkipDesktopRebuild) {
 if (-not $SkipRetarget) {
     $retarget = Join-Path $RepoRoot "scripts\windows\Retarget-HermesDesktopShortcut.ps1"
     if (Test-Path -LiteralPath $retarget) {
-        Write-Step "Retarget Desktop shortcuts → Documents source"
+        Write-Step "Retarget Desktop shortcuts 竊・Documents source"
         & powershell -NoProfile -ExecutionPolicy Bypass -File $retarget -RepoRoot $RepoRoot
     } else {
-        Write-Warning "Retarget script missing — pull main (#46) first"
+        Write-Warning "Retarget script missing 窶・pull main (#46) first"
     }
 }
 
@@ -91,7 +94,7 @@ if (-not $SkipLlama) {
     Write-Step "llama hot-swap -ForceRestart -WarmSecondary (WaitSeconds=$LlamaWaitSeconds)"
     & powershell -NoProfile -ExecutionPolicy Bypass -File $hotswap -ForceRestart -WarmSecondary -WaitSeconds $LlamaWaitSeconds
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "llama hot-swap exited $LASTEXITCODE — check ~/.hermes/logs and GGUF paths"
+        Write-Warning "llama hot-swap exited $LASTEXITCODE 窶・check ~/.hermes/logs and GGUF paths"
     }
 }
 
