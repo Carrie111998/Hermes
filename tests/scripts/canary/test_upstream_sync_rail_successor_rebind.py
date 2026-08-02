@@ -1386,6 +1386,52 @@ def test_stage_cleanup_never_removes_same_bytes_on_a_different_inode(
     assert target.read_bytes() == raw
 
 
+@pytest.mark.parametrize("same_bytes", (False, True), ids=("foreign", "same-bytes"))
+def test_stage_cleanup_restores_swap_after_read_without_deleting_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    same_bytes: bool,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    identity = successor._stage_create_only(  # noqa: SLF001
+        value,
+        path=target,
+        root_owned=False,
+    )
+    expected_raw = target.read_bytes()
+    replacement_raw = expected_raw if same_bytes else b"foreign replacement\n"
+    real_rename = successor._rename_noreplace  # noqa: SLF001
+    swapped = False
+
+    def swap_then_rename(source: Path, destination: Path) -> None:
+        nonlocal swapped
+        if source == target and not swapped:
+            swapped = True
+            source.unlink()
+            _write(source, replacement_raw, mode=0o444)
+        real_rename(source, destination)
+
+    monkeypatch.setattr(successor, "_rename_noreplace", swap_then_rename)
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage_cleanup_failed",
+    ):
+        successor._remove_just_created_stage(  # noqa: SLF001
+            value,
+            path=target,
+            identity=identity,
+            root_owned=False,
+        )
+
+    assert swapped is True
+    assert target.read_bytes() == replacement_raw
+    assert not tuple(parent.glob(f".{target.name}.cleanup-quarantine.*"))
+
+
 def test_owner_request_frame_and_transport_are_closed_to_manual_fields() -> None:
     request = successor.build_owner_request(
         target_revision=TARGET,

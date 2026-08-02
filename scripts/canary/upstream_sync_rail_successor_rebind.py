@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
+import errno
 import hashlib
 import os
 import re
 import stat
 import struct
 import sys
+import tempfile
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1445,9 +1448,11 @@ def _remove_just_created_stage(
     identity: release_builder.FileIdentity,
     root_owned: bool,
 ) -> None:
-    """Remove only the exact immutable inode created by this owner attempt."""
+    """Quarantine, rebind, then remove only this owner's exact inode."""
 
     raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    quarantine_root: Path | None = None
+    quarantined: Path | None = None
     try:
         observed, metadata = activation._read_regular(  # noqa: SLF001
             path,
@@ -1460,14 +1465,121 @@ def _remove_just_created_stage(
             or observed != raw
         ):
             _fail("upstream_sync_successor_stage_cleanup_failed")
-        path.unlink()
+        quarantine_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{path.name}.cleanup-quarantine.",
+                dir=path.parent,
+            )
+        )
+        os.chmod(quarantine_root, 0o700)
+        if root_owned and activation._effective_uid() == 0:  # noqa: SLF001
+            os.chown(quarantine_root, 0, 0)
+        quarantine_metadata = quarantine_root.lstat()
+        if (
+            not stat.S_ISDIR(quarantine_metadata.st_mode)
+            or stat.S_IMODE(quarantine_metadata.st_mode) != 0o700
+            or root_owned
+            and (quarantine_metadata.st_uid != 0 or quarantine_metadata.st_gid != 0)
+        ):
+            _fail("upstream_sync_successor_stage_cleanup_failed")
+        quarantined = quarantine_root / "candidate"
+        _rename_noreplace(path, quarantined)
+        _fsync_directory(path.parent)
+        _fsync_directory(quarantine_root)
+        try:
+            moved_raw, moved_metadata = activation._read_regular(  # noqa: SLF001
+                quarantined,
+                maximum=activation.MAX_JSON_BYTES,
+                modes=frozenset({0o444}),
+                root_owned=root_owned,
+            )
+            moved_identity = release_builder.FileIdentity.from_stat(
+                moved_metadata
+            )
+            moved_is_exact = (
+                moved_identity.device == identity.device
+                and moved_identity.inode == identity.inode
+                and moved_identity.mode == identity.mode
+                and moved_identity.uid == identity.uid
+                and moved_identity.gid == identity.gid
+                and moved_identity.links == identity.links
+                and moved_identity.size == identity.size
+                and moved_identity.modified_ns == identity.modified_ns
+                and moved_raw == raw
+            )
+        except activation.UpstreamSyncRailCutoverError:
+            moved_is_exact = False
+        if not moved_is_exact:
+            _rename_noreplace(quarantined, path)
+            _fsync_directory(path.parent)
+            _fsync_directory(quarantine_root)
+            quarantine_root.rmdir()
+            _fsync_directory(path.parent)
+            _fail("upstream_sync_successor_stage_cleanup_failed")
+        quarantined.unlink()
+        _fsync_directory(quarantine_root)
+        quarantine_root.rmdir()
         _fsync_directory(path.parent)
     except UpstreamSyncRailSuccessorRebindError:
         raise
     except (OSError, activation.UpstreamSyncRailCutoverError) as exc:
+        if (
+            quarantine_root is not None
+            and quarantined is not None
+            and not os.path.lexists(quarantined)
+        ):
+            try:
+                quarantine_root.rmdir()
+                _fsync_directory(path.parent)
+            except OSError:
+                pass
         raise UpstreamSyncRailSuccessorRebindError(
             "upstream_sync_successor_stage_cleanup_failed"
         ) from exc
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """Atomically move one pathname only when the destination is absent."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source)
+    target_raw = os.fsencode(target)
+    if sys.platform == "darwin":
+        try:
+            rename = libc.renamex_np
+        except AttributeError as exc:
+            raise OSError(
+                errno.ENOSYS,
+                "atomic no-replace rename is unavailable",
+            ) from exc
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_raw, target_raw, 0x00000004)  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:
+            raise OSError(
+                errno.ENOSYS,
+                "atomic no-replace rename is unavailable",
+            ) from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_raw, -100, target_raw, 1)  # RENAME_NOREPLACE
+    else:
+        raise OSError(
+            errno.ENOSYS,
+            "atomic no-replace rename is unavailable",
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), str(source))
 
 
 def _stage_create_only_guarded(
