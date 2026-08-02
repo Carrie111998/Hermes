@@ -3569,7 +3569,9 @@ class ContextCompressor(ContextEngine):
         # consistency — otherwise the inflated total still exceeds
         # ``threshold_tokens`` and re-triggers compression after a successful
         # compaction (the \"compression deadlock\" bug, issue #40803).
-        self.last_total_tokens = max(0, usage.get("total_tokens", 0) - cache_read)
+        if "total_tokens" in usage:
+            self.last_total_tokens = max(0, usage["total_tokens"] - cache_read)
+        # else: preserve existing last_total_tokens (provider may omit total_tokens)
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
             if self.last_prompt_tokens < self.threshold_tokens:
