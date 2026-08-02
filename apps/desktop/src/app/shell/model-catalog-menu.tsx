@@ -184,6 +184,10 @@ export function ModelCatalogMenu({
   )
 
   const selectFamily = async (family: ModelFamily, provider: ModelOptionProvider) => {
+    if (!isProviderReady(provider)) {
+      return
+    }
+
     const caps = provider.capabilities?.[family.id]
     const preset = controller.presetFor(provider.slug, family.id)
 
