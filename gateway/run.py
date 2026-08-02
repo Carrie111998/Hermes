@@ -77,6 +77,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+_CHANNEL_CONTEXT_FILE_MAX_CHARS = 20_000
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
@@ -3106,6 +3107,33 @@ def _load_gateway_runtime_config() -> dict:
 
     expanded = _expand_env_vars(cfg)
     return expanded if isinstance(expanded, dict) else {}
+
+
+def _load_channel_context_file_snapshot(path: str) -> Optional[str]:
+    """Read a configured channel context file for session-start snapshotting."""
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return None
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(raw_path))
+        context_path = Path(expanded)
+        if not context_path.is_absolute():
+            context_path = (_hermes_home / context_path).resolve()
+        with context_path.open(encoding="utf-8") as context_stream:
+            content = context_stream.read(_CHANNEL_CONTEXT_FILE_MAX_CHARS + 1).strip()
+    except Exception as exc:
+        logger.warning("Failed to read channel_context_files entry %r: %s", raw_path, exc)
+        return None
+    if not content:
+        return None
+    truncated = False
+    if len(content) > _CHANNEL_CONTEXT_FILE_MAX_CHARS:
+        content = content[:_CHANNEL_CONTEXT_FILE_MAX_CHARS].rstrip()
+        truncated = True
+    header = f"[Initial channel context loaded from {context_path}]"
+    if truncated:
+        header += f"\n[Context truncated to {_CHANNEL_CONTEXT_FILE_MAX_CHARS} characters.]"
+    return f"{header}\n{content}"
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
@@ -13704,6 +13732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
+                channel_context_file=event.channel_context_file,
                 internal=event.internal,
                 timestamp=event.timestamp,
             )
@@ -13735,6 +13764,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
+                    channel_context_file=event.channel_context_file,
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
@@ -13758,6 +13788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
+                channel_context_file=event.channel_context_file,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
@@ -15724,6 +15755,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _resolve_event_channel_context_file(self, event, source) -> Optional[str]:
+        """Resolve configured context even for synthetic events lacking adapter fields."""
+        context_file = getattr(event, "channel_context_file", None)
+        if context_file:
+            return context_file
+        adapter = self._adapter_for_source(source)
+        resolver = getattr(adapter, "_resolve_channel_context_file", None)
+        if not callable(resolver):
+            return None
+        channel_id = str(source.thread_id or source.chat_id or "")
+        parent_id = str(source.parent_chat_id or "") or None
+        try:
+            resolved = resolver(channel_id, parent_id)
+            if resolved is None:
+                return None
+            resolved_path = str(resolved).strip()
+            return resolved_path or None
+        except Exception:
+            logger.debug(
+                "Failed to resolve channel context file for synthetic event",
+                exc_info=True,
+            )
+            return None
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -15979,6 +16034,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # was_auto_reset is already consumed in the cleanup block above
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
+
+        initial_context_prompt = getattr(session_entry, "initial_context_prompt", None)
+        context_initialized = getattr(session_entry, "initial_context_initialized", True)
+        if not context_initialized:
+            context_file = self._resolve_event_channel_context_file(event, source)
+            snapshot = (
+                _load_channel_context_file_snapshot(context_file)
+                if context_file
+                else None
+            )
+            try:
+                initialized, authoritative_prompt = (
+                    await self.async_session_store.initialize_context_prompt(
+                        session_key,
+                        session_entry.session_id,
+                        snapshot,
+                    )
+                )
+                if initialized:
+                    initial_context_prompt = authoritative_prompt
+            except Exception:
+                logger.debug("Failed to initialize channel context snapshot", exc_info=True)
+        if initial_context_prompt:
+            context_prompt = (context_prompt + "\n\n" + initial_context_prompt).strip()
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
@@ -18423,19 +18502,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Resolve the bound text channel's channel_prompt so voice input gets
         # the same per-channel context as typed messages (#50149).
         channel_prompt: Optional[str] = None
-        resolver = getattr(adapter, "_resolve_channel_prompt", None)
-        if callable(resolver):
+        prompt_resolver = getattr(adapter, "_resolve_channel_prompt", None)
+        if callable(prompt_resolver):
             try:
-                resolved = resolver(str(text_ch_id))
+                resolved = prompt_resolver(str(text_ch_id))
                 channel_prompt = resolved if isinstance(resolved, str) else None
             except Exception:
                 channel_prompt = None
+        channel_context_file: Optional[str] = None
+        context_file_resolver = getattr(adapter, "_resolve_channel_context_file", None)
+        if callable(context_file_resolver):
+            try:
+                resolved = context_file_resolver(str(text_ch_id))
+                channel_context_file = resolved if isinstance(resolved, str) else None
+            except Exception:
+                channel_context_file = None
         event = MessageEvent(
             source=source,
             text=transcript,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt,
+            channel_context_file=channel_context_file,
         )
 
         await adapter.handle_message(event)

@@ -751,6 +751,35 @@ def build_session_context_prompt(
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+_INITIAL_CONTEXT_MODEL_CONFIG_KEY = "gateway_initial_context_prompt"
+_INITIAL_CONTEXT_INITIALIZED_KEY = "gateway_initial_context_initialized"
+
+
+def _initial_context_from_model_config(
+    raw_config: Any,
+) -> tuple[bool, Optional[str]]:
+    """Decode durable context state; legacy sessions count as initialized."""
+    try:
+        config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+    except Exception:
+        config = {}
+    if not isinstance(config, dict) or not config.get(_INITIAL_CONTEXT_INITIALIZED_KEY):
+        return True, None
+    prompt = config.get(_INITIAL_CONTEXT_MODEL_CONFIG_KEY)
+    return True, prompt if isinstance(prompt, str) else None
+
+
+def initial_context_model_config(
+    initialized: bool,
+    prompt: Optional[str],
+) -> Dict[str, Any]:
+    """Build model_config fields that preserve a snapshot across a branch."""
+    if not initialized:
+        return {}
+    return {
+        _INITIAL_CONTEXT_INITIALIZED_KEY: True,
+        _INITIAL_CONTEXT_MODEL_CONFIG_KEY: prompt,
+    }
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -806,6 +835,13 @@ class SessionEntry:
     
     # Last API-reported prompt tokens (for accurate compression pre-check)
     last_prompt_tokens: int = 0
+
+    # Optional per-session context snapshotted from a configured channel file
+    # when the session is first created. This lets new Discord/Slack threads
+    # inherit parent-channel state once without drifting if the source file
+    # changes later.
+    initial_context_prompt: Optional[str] = None
+    initial_context_initialized: bool = False
     
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
@@ -877,6 +913,8 @@ class SessionEntry:
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
+            "initial_context_prompt": self.initial_context_prompt,
+            "initial_context_initialized": self.initial_context_initialized,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "expiry_finalized": self.expiry_finalized,
@@ -958,6 +996,10 @@ class SessionEntry:
             cache_write_tokens=data.get("cache_write_tokens", 0),
             total_tokens=data.get("total_tokens", 0),
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
+            initial_context_prompt=data.get("initial_context_prompt"),
+            # Routing entries written before this feature represent existing
+            # conversations and must not acquire newly configured context.
+            initial_context_initialized=data.get("initial_context_initialized", True),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             expiry_finalized=data.get("expiry_finalized", data.get("memory_flushed", False)),
@@ -1812,6 +1854,9 @@ class SessionStore:
             created_at = datetime.fromtimestamp(float(started_at)) if started_at else now
         except (TypeError, ValueError, OSError):
             created_at = now
+        context_initialized, context_prompt = _initial_context_from_model_config(
+            row.get("model_config")
+        )
         return SessionEntry(
             session_key=session_key,
             session_id=str(row["id"]),
@@ -1821,6 +1866,8 @@ class SessionStore:
             display_name=source.chat_name,
             platform=source.platform,
             chat_type=source.chat_type,
+            initial_context_initialized=context_initialized,
+            initial_context_prompt=context_prompt,
         )
 
     def _find_gateway_session_row(
@@ -2702,6 +2749,87 @@ class SessionStore:
             self._save()
             return True
 
+    def _persist_initial_context_to_db_locked(
+        self,
+        session_id: str,
+        prompt: Optional[str],
+    ) -> None:
+        """Best-effort session-identity persistence for resume/branch hydration."""
+        if not self._db:
+            return
+        try:
+            updates = initial_context_model_config(True, prompt)
+            patcher = getattr(self._db, "patch_session_model_config", None)
+            if callable(patcher):
+                patcher(session_id, updates)
+                return
+            row = self._db.get_session(session_id)
+            if not row:
+                return
+            raw_config = row.get("model_config")
+            try:
+                config = json.loads(raw_config) if raw_config else {}
+            except Exception:
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            config.update(updates)
+            self._db.update_session_meta(
+                session_id,
+                json.dumps(config),
+                model=row.get("model"),
+            )
+        except Exception:
+            logger.debug("Failed to persist initial channel context in session DB", exc_info=True)
+
+    def _load_initial_context_from_db_locked(
+        self,
+        session_id: str,
+    ) -> tuple[bool, Optional[str]]:
+        """Hydrate a snapshot by immutable session ID for resume/branch flows."""
+        if not self._db:
+            return True, None
+        try:
+            row = self._db.get_session(session_id)
+            if not row:
+                return True, None
+            return _initial_context_from_model_config(row.get("model_config"))
+        except Exception:
+            logger.debug("Failed to hydrate initial channel context from session DB", exc_info=True)
+            return True, None
+
+    def initialize_context_prompt(
+        self,
+        session_key: str,
+        session_id: str,
+        prompt: Optional[str],
+    ) -> tuple[bool, Optional[str]]:
+        """Atomically initialize a session's stable channel-context snapshot.
+
+        The session-id guard prevents a delayed first-turn write from attaching
+        context to a replacement conversation. Persistence failures keep the
+        authoritative in-memory value so the system prefix cannot drift between
+        turns in the running process.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != session_id:
+                return False, None
+            if entry.initial_context_initialized:
+                return True, entry.initial_context_prompt
+            entry.initial_context_prompt = prompt
+            entry.initial_context_initialized = True
+            try:
+                self._save()
+            except Exception:
+                logger.warning(
+                    "Failed to persist initial channel context routing snapshot",
+                    exc_info=True,
+                )
+            self._persist_initial_context_to_db_locked(session_id, prompt)
+            return True, entry.initial_context_prompt
+
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
     ) -> None:
@@ -3017,6 +3145,9 @@ class SessionStore:
             db_end_session_id = old_entry.session_id
 
             now = _now()
+            context_initialized, context_prompt = (
+                self._load_initial_context_from_db_locked(target_session_id)
+            )
             new_entry = SessionEntry(
                 session_key=session_key,
                 session_id=target_session_id,
@@ -3026,6 +3157,8 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                initial_context_prompt=context_prompt,
+                initial_context_initialized=context_initialized,
             )
 
             self._entries[session_key] = new_entry

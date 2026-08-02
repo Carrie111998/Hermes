@@ -4,6 +4,7 @@ Tests the _handle_resume_command handler (switch to a previously-named session)
 across gateway messenger platforms.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -61,6 +62,43 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
     runner.session_store = mock_store
 
     return runner
+
+
+@pytest.mark.asyncio
+async def test_branch_inherits_channel_context_snapshot(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        parent_id = "parent-session"
+        db.create_session(parent_id, source="telegram")
+        event = _make_event(text="/branch context-fork")
+        runner = _make_runner(db, current_session_id=parent_id, event=event)
+        mock_get_or_create = getattr(runner.session_store, "get_or_create_session")
+        current_entry = mock_get_or_create.return_value
+        current_entry.initial_context_initialized = True
+        current_entry.initial_context_prompt = "stable branch context"
+        mock_load_transcript = getattr(runner.session_store, "load_transcript")
+        mock_load_transcript.return_value = [
+            {"role": "user", "content": "hello"}
+        ]
+        runner._clear_session_boundary_security_state = MagicMock()
+        runner._evict_cached_agent = MagicMock()
+
+        await runner._handle_branch_command(event)
+
+        children = [
+            row
+            for row in db.list_sessions_rich()
+            if row["id"] != parent_id
+        ]
+        assert len(children) == 1
+        child_config = json.loads(children[0]["model_config"])
+        assert child_config["_branched_from"] == parent_id
+        assert child_config["gateway_initial_context_initialized"] is True
+        assert child_config["gateway_initial_context_prompt"] == "stable branch context"
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------

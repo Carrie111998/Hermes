@@ -38,6 +38,7 @@ from gateway.session import (
     AsyncSessionStore,
     SessionSource,
     build_session_key,
+    initial_context_model_config,
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
@@ -2595,6 +2596,7 @@ class GatewaySlashCommandsMixin:
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
+            channel_context_file=event.channel_context_file,
         )
         
         # Let the normal message handler process it
@@ -2727,6 +2729,7 @@ class GatewaySlashCommandsMixin:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    channel_context_file=event.channel_context_file,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -4614,6 +4617,13 @@ class GatewaySlashCommandsMixin:
             branch_title = await self._session_db.get_next_title_in_lineage(base)
 
         parent_session_id = current_entry.session_id
+        branch_model_config = {"_branched_from": parent_session_id}
+        branch_model_config.update(
+            initial_context_model_config(
+                getattr(current_entry, "initial_context_initialized", True),
+                getattr(current_entry, "initial_context_prompt", None),
+            )
+        )
 
         # Create the new session with parent link.
         # Persist a stable ``_branched_from`` marker in model_config so
@@ -4625,7 +4635,7 @@ class GatewaySlashCommandsMixin:
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id},
+                model_config=branch_model_config,
                 parent_session_id=parent_session_id,
             )
         except Exception as e:

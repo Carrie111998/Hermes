@@ -200,6 +200,23 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_patch_session_model_config_preserves_existing_keys(self, db):
+        db.create_session(
+            session_id="s-config-patch",
+            source="gateway",
+            model_config={"gateway_runtime": {"provider": "openai-codex"}},
+        )
+
+        db.patch_session_model_config(
+            "s-config-patch",
+            {"gateway_initial_context_prompt": "stable context"},
+        )
+
+        session = db.get_session("s-config-patch")
+        config = json.loads(session["model_config"])
+        assert config["gateway_runtime"] == {"provider": "openai-codex"}
+        assert config["gateway_initial_context_prompt"] == "stable context"
+
 
 
 

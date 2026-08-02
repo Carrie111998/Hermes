@@ -4008,6 +4008,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def patch_session_model_config(
+        self,
+        session_id: str,
+        updates: Dict[str, Any],
+    ) -> None:
+        """Atomically merge keys into a session's JSON model_config."""
+        self.flush_token_counts()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            try:
+                config = json.loads(raw) if raw else {}
+            except Exception:
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            config.update(updates)
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config), session_id),
+            )
+
+        self._execute_write(_do)
+
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):
