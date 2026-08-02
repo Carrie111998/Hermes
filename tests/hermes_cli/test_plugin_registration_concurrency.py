@@ -889,6 +889,143 @@ def test_retained_context_live_registration_does_not_validate_under_live_locks(
     ), observations
 
 
+def test_retained_context_reentrant_force_reload_during_validation_fails_closed(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("initial", "reentrant-force")
+    support = _support(values, "initial", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    provider_name = "h1-reentrant-force-validation-image"
+
+    class _ReentrantImageProvider(_ImageProvider):
+        @property
+        def name(self) -> str:
+            manager.discover_and_load(force=True)
+            return super().name
+
+    failures: list[BaseException] = []
+    done = threading.Event()
+
+    def register_from_retained_context() -> None:
+        try:
+            support.saved_context.register_image_gen_provider(
+                _ReentrantImageProvider(provider_name, "late")
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=register_from_retained_context, daemon=True)
+    thread.start()
+
+    assert done.wait(timeout=5), "reentrant force reload self-deadlocked"
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert "force reload cannot run from a live plugin registration" in str(failures[0])
+
+    from agent.image_gen_registry import get_provider
+
+    assert get_provider(provider_name) is None
+
+
+def test_force_reload_fails_closed_instead_of_waiting_on_live_validation(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "lease-cycle")
+    support = _support(old_values, "generation-a", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_context = support.saved_context
+
+    validation_started = threading.Event()
+    force_done = threading.Event()
+    registration_done = threading.Event()
+    registration_failures: list[BaseException] = []
+
+    class _WaitingImageProvider(_ImageProvider):
+        @property
+        def name(self) -> str:
+            validation_started.set()
+            if not force_done.wait(timeout=5):
+                raise RuntimeError("force reload did not finish")
+            return super().name
+
+    provider_name = "h1-live-validation-waits-for-force"
+
+    def register_provider() -> None:
+        try:
+            old_context.register_image_gen_provider(
+                _WaitingImageProvider(provider_name, "late")
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            registration_failures.append(exc)
+        finally:
+            registration_done.set()
+
+    registration_thread = threading.Thread(target=register_provider, daemon=True)
+    registration_thread.start()
+    assert validation_started.wait(timeout=5)
+
+    new_values = _external_values("generation-b", "lease-cycle")
+    support = _support(new_values, "generation-b", released=True)
+    force_failures: list[BaseException] = []
+
+    def force_reload() -> None:
+        try:
+            manager.discover_and_load(force=True)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            force_failures.append(exc)
+        finally:
+            force_done.set()
+
+    force_thread = threading.Thread(target=force_reload, daemon=True)
+    force_thread.start()
+
+    assert force_done.wait(timeout=5), "force reload waited on live validation"
+    assert registration_done.wait(timeout=5), "live validation did not resume"
+    force_thread.join(timeout=1)
+    registration_thread.join(timeout=1)
+    assert not force_thread.is_alive()
+    assert not registration_thread.is_alive()
+    assert force_failures == []
+    assert registration_failures == []
+    assert manager._live_context_generation == 0
+    assert manager._live_context_revoking == set()
+
+    from agent.image_gen_registry import get_provider
+
+    assert get_provider(provider_name) is not None
+
+
 def test_successful_force_reload_revokes_prior_retained_context_before_mutation(
     tmp_path, monkeypatch, isolated_registries
 ):
@@ -1022,3 +1159,160 @@ def test_failed_force_reload_keeps_prior_retained_context_live(
     assert support.saved_contexts
     assert get_provider(retained_external.name) is retained_external
     assert retained_hook in manager._hooks["post_tool_call"]
+
+
+def test_force_reload_interrupt_after_revocation_keeps_old_context_live(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "revocation-interrupt")
+    support = _support(old_values, "generation-a", released=True)
+    support.saved_contexts = []
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_contexts.append(ctx)\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_context = support.saved_contexts[-1]
+
+    support = _support(
+        _external_values("generation-b", "revocation-interrupt"),
+        "generation-b",
+        released=True,
+    )
+    support.saved_contexts = []
+    original_begin = manager._begin_live_context_revocation
+
+    def interrupt_after_begin(generation: int) -> None:
+        original_begin(generation)
+        raise KeyboardInterrupt("injected after revocation")
+
+    monkeypatch.setattr(
+        manager,
+        "_begin_live_context_revocation",
+        interrupt_after_begin,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="injected after revocation"):
+        manager.discover_and_load(force=True)
+
+    assert manager._live_context_generation == 0
+    assert manager._live_context_revoking == set()
+    retained_tool = "h1_revocation_interrupt_tool"
+    retained_platform = "h1-revocation-interrupt-platform"
+    old_context.register_tool(
+        retained_tool,
+        "h1_transaction",
+        {
+            "name": retained_tool,
+            "description": "retained",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        lambda args, **kwargs: "retained",
+    )
+    old_context.register_platform(
+        name=retained_platform,
+        label="Retained",
+        adapter_factory=lambda config: "retained",
+        check_fn=lambda: True,
+    )
+    assert registry.get_entry(retained_tool) is not None
+    assert isolated_registries.get(retained_platform) is not None
+
+
+def test_force_reload_lock_acquisition_interrupt_releases_prior_locks(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "lock-interrupt")
+    support = _support(old_values, "generation-a", released=True)
+    support.saved_contexts = []
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_contexts.append(ctx)\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_context = support.saved_contexts[-1]
+
+    from agent import image_gen_registry
+
+    original_lock = image_gen_registry._registry_state._lock
+
+    class _InterruptingLock:
+        def __init__(self) -> None:
+            self.acquire_count = 0
+
+        def acquire(self, *args, **kwargs):
+            self.acquire_count += 1
+            if self.acquire_count == 2:
+                raise KeyboardInterrupt("injected lock acquisition failure")
+            return original_lock.acquire(*args, **kwargs)
+
+        def release(self) -> None:
+            original_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.release()
+
+    interrupting_lock = _InterruptingLock()
+    monkeypatch.setattr(image_gen_registry._registry_state, "_lock", interrupting_lock)
+    support = _support(
+        _external_values("generation-b", "lock-interrupt"),
+        "generation-b",
+        released=True,
+    )
+    support.saved_contexts = []
+
+    with pytest.raises(KeyboardInterrupt, match="injected lock acquisition failure"):
+        manager.discover_and_load(force=True)
+
+    assert interrupting_lock.acquire_count == 2
+    assert manager._live_context_generation == 0
+    assert manager._live_context_revoking == set()
+
+    retained_tool = "h1_lock_interrupt_tool"
+    done = threading.Event()
+    failures: list[BaseException] = []
+
+    def register_from_other_thread() -> None:
+        try:
+            old_context.register_tool(
+                retained_tool,
+                "h1_transaction",
+                {
+                    "name": retained_tool,
+                    "description": "retained",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                lambda args, **kwargs: "retained",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=register_from_other_thread, daemon=True)
+    thread.start()
+    assert done.wait(timeout=5), "previously acquired commit lock was leaked"
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert failures == []
+    assert registry.get_entry(retained_tool) is not None

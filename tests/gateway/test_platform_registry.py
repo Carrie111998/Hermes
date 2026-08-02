@@ -145,6 +145,48 @@ class TestPlatformRegistry:
         assert loader_calls == 1
         assert results == [entry, entry]
 
+    def test_failing_deferred_loader_unblocks_all_waiters_without_retry(self):
+        reg = PlatformRegistry()
+        name = "deferred-failure"
+        loader_entered = threading.Event()
+        release_loader = threading.Event()
+        loader_calls = 0
+        loader_calls_lock = threading.Lock()
+
+        def _loader():
+            nonlocal loader_calls
+            with loader_calls_lock:
+                loader_calls += 1
+            loader_entered.set()
+            assert release_loader.wait(timeout=5)
+            raise RuntimeError("planned deferred loader failure")
+
+        reg.register_deferred(name, _loader)
+        results = []
+        failures = []
+
+        def _read():
+            try:
+                results.append(reg.get(name))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        threads = [threading.Thread(target=_read, daemon=True) for _ in range(4)]
+        threads[0].start()
+        assert loader_entered.wait(timeout=5)
+        for thread in threads[1:]:
+            thread.start()
+        release_loader.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert failures == []
+        assert results == [None, None, None, None]
+        assert loader_calls == 1
+        assert reg.get(name) is None
+        assert loader_calls == 1
+
     @pytest.mark.parametrize("accessor_name", ["all_entries", "plugin_entries"])
     def test_concurrent_deferred_loaders_can_reenter_iterating_accessor(
         self, accessor_name

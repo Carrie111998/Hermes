@@ -649,8 +649,6 @@ class _RegistrationTransaction:
             if self.replace_owned
             else None
         )
-        if revoke_generation is not None:
-            self.manager._begin_live_context_revocation(revoke_generation)
         locks = [
             self.manager._lock,
             self.tool_registry._lock,
@@ -659,9 +657,13 @@ class _RegistrationTransaction:
                 for surface in _EXTERNAL_COMMIT_SURFACES
             ),
         ]
-        for lock in locks:
-            lock.acquire()
+        acquired_locks: List[Any] = []
         try:
+            if revoke_generation is not None:
+                self.manager._begin_live_context_revocation(revoke_generation)
+            for lock in locks:
+                lock.acquire()
+                acquired_locks.append(lock)
             if self.manager._generation != self.manager_before._generation:
                 raise RegistryTransactionConflict(
                     "manager",
@@ -696,7 +698,7 @@ class _RegistrationTransaction:
                 context._managed_generation = self.context_generation
             self.manager._install_owned_state_locked(next_manager)
         finally:
-            for lock in reversed(locks):
+            for lock in reversed(acquired_locks):
                 lock.release()
             if revoke_generation is not None:
                 self.manager._cancel_live_context_revocation(revoke_generation)
@@ -1831,6 +1833,7 @@ class PluginManager:
         self._live_context_generation = 0
         self._live_context_condition = threading.Condition(threading.RLock())
         self._live_context_active: Dict[int, int] = {}
+        self._live_context_active_by_thread: Dict[tuple[int, int], int] = {}
         self._live_context_revoking: set[int] = set()
 
     def _record_external_registration(self, surface: str, name: str) -> None:
@@ -1844,6 +1847,8 @@ class PluginManager:
         plugin_name: str,
         generation: int,
     ) -> Callable[[], None]:
+        owner_thread_id = threading.get_ident()
+        owner_key = (generation, owner_thread_id)
         with self._live_context_condition:
             if (
                 self._live_context_generation != generation
@@ -1854,6 +1859,9 @@ class PluginManager:
                 )
             self._live_context_active[generation] = (
                 self._live_context_active.get(generation, 0) + 1
+            )
+            self._live_context_active_by_thread[owner_key] = (
+                self._live_context_active_by_thread.get(owner_key, 0) + 1
             )
 
         released = False
@@ -1870,14 +1878,32 @@ class PluginManager:
                     self._live_context_condition.notify_all()
                 else:
                     self._live_context_active[generation] = active - 1
+                thread_active = self._live_context_active_by_thread.get(owner_key, 0)
+                if thread_active <= 1:
+                    self._live_context_active_by_thread.pop(owner_key, None)
+                else:
+                    self._live_context_active_by_thread[owner_key] = thread_active - 1
 
         return release
 
+    def _reject_reentrant_force_reload(self, generation: int) -> None:
+        with self._live_context_condition:
+            if self._live_context_active_by_thread.get(
+                (generation, threading.get_ident()),
+                0,
+            ):
+                raise RuntimeError(
+                    "force reload cannot run from a live plugin registration"
+                )
+
     def _begin_live_context_revocation(self, generation: int) -> None:
         with self._live_context_condition:
+            self._reject_reentrant_force_reload(generation)
+            if self._live_context_active.get(generation, 0):
+                raise _ForceSweepAbort(
+                    "plugin force reload conflicted with an active live registration"
+                )
             self._live_context_revoking.add(generation)
-            while self._live_context_active.get(generation, 0):
-                self._live_context_condition.wait()
 
     def _cancel_live_context_revocation(self, generation: int) -> None:
         with self._live_context_condition:
@@ -1909,6 +1935,8 @@ class PluginManager:
 
     def discover_and_load(self, force: bool = False) -> None:
         """Load plugins, publishing a force reload as one complete generation."""
+        if force:
+            self._reject_reentrant_force_reload(self._live_context_generation)
         with self._discovery_lock:
             with self._lock:
                 if self._discovered and not force:
