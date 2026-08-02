@@ -195,28 +195,51 @@ def _memory_cards() -> list[dict[str, Any]]:
 
     ``MEMORY.md`` / ``USER.md`` are prose split on bare ``§`` separators; each
     chunk becomes one card. Every chunk is surfaced — the graph shows everything.
+
+    When a profile is active, cards from the non-profile root
+    (``~/.hermes/memories/``) are layered in FIRST so the learning graph
+    reflects the same additive memory the system prompt sees.  Duplicate chunks
+    (same text in both layers) are de-duplicated, keeping the global wording.
     """
-    base = get_hermes_home() / "memories"
+    from hermes_constants import get_default_hermes_root
+
+    active = get_hermes_home() / "memories"
+    root_mem = get_default_hermes_root() / "memories"
+    try:
+        same = active.resolve() == root_mem.resolve()
+    except OSError:
+        same = active == root_mem
+    layer_dirs: list[Path] = []
+    if not same and root_mem.exists():
+        layer_dirs.append(root_mem)
+    layer_dirs.append(active)
+
     cards: list[dict[str, Any]] = []
-    for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
-        path = base / fname
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-            file_ts = _to_int_ts(path.stat().st_mtime)
-        except OSError:
-            continue
-        for chunk_idx, chunk in enumerate(c.strip() for c in text.split("\n§\n")):
-            if not chunk:
+    seen_bodies: set[str] = set()
+    for base in layer_dirs:
+        for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
+            path = base / fname
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+                file_ts = _to_int_ts(path.stat().st_mtime)
+            except OSError:
                 continue
-            first = chunk.splitlines()[0].strip().lstrip("# ").strip()
-            cards.append(
-                {
-                    "source": source,
-                    "timestamp": file_ts + chunk_idx if file_ts is not None else None,
-                    "title": (first[:80] + "…") if len(first) > 80 else first,
-                    "body": chunk[:1200],
-                }
-            )
+            for chunk_idx, chunk in enumerate(c.strip() for c in text.split("\n§\n")):
+                if not chunk:
+                    continue
+                dedup_key = chunk.strip()
+                if dedup_key in seen_bodies:
+                    continue
+                seen_bodies.add(dedup_key)
+                first = chunk.splitlines()[0].strip().lstrip("# ").strip()
+                cards.append(
+                    {
+                        "source": source,
+                        "timestamp": file_ts + chunk_idx if file_ts is not None else None,
+                        "title": (first[:80] + "…") if len(first) > 80 else first,
+                        "body": chunk[:1200],
+                    }
+                )
     return cards
 
 

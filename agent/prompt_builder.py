@@ -1997,6 +1997,15 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
     soul_path = get_hermes_home() / "SOUL.md"
+    # Profile-scoped SOUL.md may be a small auto-seeded stub (create_profile()
+    # writes a ~500 byte default).  Fall back to the root persona so
+    # profile-scoped sessions still get the full identity.  Threshold is
+    # conservative: a real per-profile override would be substantially larger.
+    if not soul_path.exists() or soul_path.stat().st_size < 2000:
+        from hermes_constants import get_default_hermes_root
+        root_soul = get_default_hermes_root() / "SOUL.md"
+        if root_soul.exists() and root_soul.resolve() != soul_path.resolve():
+            soul_path = root_soul
     if not soul_path.exists():
         return None
     try:

@@ -54,6 +54,30 @@ def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
 
+
+def _resolve_memory_files() -> tuple[Path, "Path | None"]:
+    """Return ``(active_dir, global_dir_or_None)`` for additive memory loading.
+
+    When a profile is active, ``HERMES_HOME`` points at
+    ``~/.hermes/profiles/<name>/`` and ``active_dir`` is the profile's
+    ``memories/``.  The non-profile root (``~/.hermes/memories/``) is returned
+    as ``global_dir`` so callers can layer global entries beneath profile
+    entries (or vice-versa).  When no profile is active, ``active_dir`` already
+    IS the global dir and ``global_dir`` is ``None`` — callers must NOT
+    double-load in that case.
+
+    The equality check is by resolved path, so a profile whose HERMES_HOME
+    happens to equal the root (misconfiguration) is handled safely.
+    """
+    from hermes_constants import get_default_hermes_root
+    active = get_memory_dir()
+    root_mem = get_default_hermes_root() / "memories"
+    try:
+        same = active.resolve() == root_mem.resolve()
+    except OSError:
+        same = active == root_mem
+    return active, (None if same else root_mem)
+
 # Stable header prefixes for the system-prompt memory blocks rendered by
 # MemoryStore._render_block. Exported so compression's prompt-retention check
 # (agent/conversation_compression.py) can detect a leftover block for a
@@ -217,11 +241,24 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
+        mem_dir, global_mem_dir = _resolve_memory_files()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        # Layered load: global entries first (base layer), then profile entries
+        # on top.  When no profile is active, global_mem_dir is None and we
+        # load only the active (=global) dir — no double-load.  Dedup below
+        # keeps the FIRST occurrence, so a fact present in both layers resolves
+        # to the global wording (intentional: global = stable, profile = add).
+        mem_entries: list[str] = []
+        user_entries: list[str] = []
+        if global_mem_dir is not None and global_mem_dir.exists():
+            mem_entries += self._read_file(global_mem_dir / "MEMORY.md")
+            user_entries += self._read_file(global_mem_dir / "USER.md")
+        mem_entries += self._read_file(mem_dir / "MEMORY.md")
+        user_entries += self._read_file(mem_dir / "USER.md")
+
+        self.memory_entries = mem_entries
+        self.user_entries = user_entries
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))

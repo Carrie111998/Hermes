@@ -84,6 +84,29 @@ ollama_cloud = OllamaCloudProfile(
     default_aux_model="nemotron-3-nano:30b",
     env_vars=("OLLAMA_API_KEY",),
     base_url="https://ollama.com/v1",
+    # Katalog für /model-Picker. Reihenfolge = Empfehlung.
+    # kimi-k3 absichtlich NICHT hier — es ist "extra usage only" (402 ohne
+    # Bonus-Credits) und sollte nicht als Standardoption auftauchen.
+    # Wenn kimi-k3 gewünscht: explizit `hermes model` auswählen, dann aber
+    # mit Credits-Bewusstsein.
+    fallback_models=(
+        "kimi-k2.6",
+        "kimi-k2.7-code",
+        "glm-5.2",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "minimax-m3",
+        "minimax-m2.7",
+        "qwen3.5:397b",
+        "nemotron-3-ultra",
+        "nemotron-3-super",
+        "mistral-large-3:675b",
+        "gpt-oss:120b",
+        "gemma4:31b",
+        "glm-5.1",
+        "nemotron-3-nano:30b",
+        "gpt-oss:20b",
+    ),
 )
 
 register_provider(ollama_cloud)
