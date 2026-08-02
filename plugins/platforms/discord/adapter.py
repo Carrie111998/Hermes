@@ -658,6 +658,12 @@ class VoiceReceiver:
     def begin_playback_capture(self, token: int) -> None:
         """Enable and tag inbound capture for one TTS playback."""
         with self._lock:
+            # Audio buffered before TTS belongs to the completed conversational
+            # turn. It must never be relabeled as playback-overlap input or
+            # concatenated with the wake utterance for this epoch.
+            self._buffers.clear()
+            self._last_packet_time.clear()
+            self._buffer_playback_tokens.clear()
             self._playback_capture_token = token
             self._playback_transport_stats[token] = defaultdict(int)
             self._playback_seen_ssrcs[token] = set()

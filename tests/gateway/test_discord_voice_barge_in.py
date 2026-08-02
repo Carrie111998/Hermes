@@ -356,6 +356,28 @@ def test_playback_capture_reactivates_a_started_receiver_left_paused():
     assert receiver._packet_debug_count == 1
 
 
+def test_playback_capture_discards_pre_playback_pcm_before_tagging_new_epoch():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+
+    receiver = VoiceReceiver(vc)
+    receiver._buffers[100].extend(b"prior utterance pcm")
+    receiver._last_packet_time[100] = 123.0
+    receiver._buffer_playback_tokens[100] = 99
+
+    receiver.begin_playback_capture(7)
+
+    assert dict(receiver._buffers) == {}
+    assert receiver._last_packet_time == {}
+    assert receiver._buffer_playback_tokens == {}
+    assert receiver._playback_capture_token == 7
+
+
 @pytest.mark.asyncio
 async def test_ack_phrases_round_robin_deterministically_and_independently_by_kind():
     adapter = _make_adapter(
