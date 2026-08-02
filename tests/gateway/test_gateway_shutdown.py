@@ -272,6 +272,35 @@ async def test_explicit_stop_does_not_queue_recovery_notification(tmp_path, monk
     assert not (tmp_path / ".restart_pending.json").exists()
 
 
+@pytest.mark.asyncio
+async def test_explicit_stop_for_restart_queues_delivered_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner._restart_after_stop_requested = True
+
+    source = make_restart_source(
+        chat_id="parent-42", chat_type="group", thread_id="topic-7"
+    )
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    running_agent.interrupt.side_effect = lambda *a, **k: runner._running_agents.clear()
+    runner._running_agents[session_key] = running_agent
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    marker = json.loads((tmp_path / ".restart_pending.json").read_text())
+    assert marker["targets"] == [
+        {
+            "platform": "telegram",
+            "chat_id": "parent-42",
+            "chat_type": "group",
+            "thread_id": "topic-7",
+        }
+    ]
+
+
 # ── #42126: zombie PID must be treated as dead in _pid_exists ────────────────
 # Under systemd Restart=always, the old gateway becomes a zombie (still in the
 # process table, not yet reaped) when the replacement starts. _pid_exists must

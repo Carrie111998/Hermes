@@ -126,6 +126,14 @@ def build_gateway_parser(
         action="store_true",
         help="Stop ALL gateway processes across all profiles",
     )
+    gateway_stop.add_argument(
+        "--for-restart",
+        action="store_true",
+        help=(
+            "Stop the current gateway but notify interrupted chats when it is "
+            "started again (for externally coordinated runtime replacement)"
+        ),
+    )
 
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser(

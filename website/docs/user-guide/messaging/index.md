@@ -158,9 +158,17 @@ hermes gateway install      # Install as a user service (Linux) / launchd servic
 sudo hermes gateway install --system   # Linux only: install a boot-time system service
 hermes gateway start        # Start the default service
 hermes gateway stop         # Stop the default service
+hermes gateway stop --for-restart  # Stop for an externally coordinated restart
 hermes gateway status       # Check default service status
 hermes gateway status --system         # Linux only: inspect the system service explicitly
 ```
+
+Use `gateway stop --for-restart` when an external deploy or runtime manager
+must keep the gateway down while it replaces or validates the runtime, then
+starts it separately. Hermes records a short-lived, process-bound restart
+intent and sends the one-shot online notice to chats that received the shutdown
+warning. A normal `gateway stop` remains a final stop and queues no recovery
+notice.
 
 ### Optional Linux event-loop watchdog
 

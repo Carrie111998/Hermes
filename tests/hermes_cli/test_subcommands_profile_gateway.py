@@ -61,6 +61,13 @@ def test_gateway_and_proxy_dispatch():
     assert px.func is _h_proxy
 
 
+def test_gateway_stop_for_restart_flag_is_public():
+    args = _gateway_parser().parse_args(["gateway", "stop", "--for-restart"])
+
+    assert args.gateway_command == "stop"
+    assert args.for_restart is True
+
+
 
 
 def test_gateway_enroll_dispatch():

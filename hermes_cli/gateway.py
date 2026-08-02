@@ -7065,6 +7065,24 @@ def _gateway_command_inner(args):
 
         stop_all = getattr(args, "all", False)
         system = getattr(args, "system", False)
+        stop_for_restart = getattr(args, "for_restart", False)
+
+        if stop_for_restart:
+            if stop_all:
+                print_error("--for-restart cannot be combined with --all")
+                sys.exit(2)
+            from gateway.status import (
+                get_running_pid,
+                write_restart_after_stop_marker,
+            )
+
+            running_pid = get_running_pid()
+            if running_pid is None:
+                print_error("No running gateway found to prepare for restart")
+                sys.exit(1)
+            if not write_restart_after_stop_marker(running_pid):
+                print_error("Could not persist the gateway restart intent; stop aborted")
+                sys.exit(1)
 
         # Phase 4: inside a container with s6, dispatch via the service
         # manager. ``--all`` iterates every registered profile gateway

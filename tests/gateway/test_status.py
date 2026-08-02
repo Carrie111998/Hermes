@@ -773,6 +773,23 @@ class TestPlannedStopMarker:
         assert result is False
 
 
+class TestRestartAfterStopMarker:
+    """Tests for the public stop-now/start-later restart intent."""
+
+    def test_marker_roundtrip_targets_only_the_same_gateway(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 42)
+
+        assert status.write_restart_after_stop_marker(os.getpid()) is True
+        marker = tmp_path / ".gateway-restart-after-stop.json"
+        payload = json.loads(marker.read_text())
+        assert payload["target_pid"] == os.getpid()
+        assert payload["target_start_time"] == 42
+
+        assert status.consume_restart_after_stop_marker_for_self() is True
+        assert not marker.exists()
+
+
 class TestReadProcessCmdlinePsFallback:
     """Tests for _read_process_cmdline falling back to ps on non-Linux."""
 
@@ -1127,4 +1144,3 @@ class TestResolveGatewayLiveness:
         # expected_home is what stops a recycled PID belonging to another
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
-

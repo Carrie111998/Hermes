@@ -1579,6 +1579,8 @@ _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
 _TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
 _PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
 _PLANNED_STOP_MARKER_TTL_S = 60
+_RESTART_AFTER_STOP_MARKER_FILENAME = ".gateway-restart-after-stop.json"
+_RESTART_AFTER_STOP_MARKER_TTL_S = 60
 
 
 def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
@@ -1595,6 +1597,12 @@ def _get_planned_stop_marker_path() -> Path:
     """Return the path to the intentional gateway stop marker file."""
     home = _get_process_hermes_home()
     return home / _PLANNED_STOP_MARKER_FILENAME
+
+
+def _get_restart_after_stop_marker_path() -> Path:
+    """Return the path to the explicit stop-now/start-later restart intent."""
+    home = _get_process_hermes_home()
+    return home / _RESTART_AFTER_STOP_MARKER_FILENAME
 
 
 def _marker_is_stale(written_at: str, ttl_s: int) -> bool:
@@ -2073,6 +2081,36 @@ def write_planned_stop_marker(target_pid: int) -> bool:
         return True
     except (OSError, PermissionError):
         return False
+
+
+def write_restart_after_stop_marker(target_pid: int) -> bool:
+    """Request a one-shot recovery notice after an explicit stop and start.
+
+    The PID and process start time bind the short-lived request to the current
+    gateway, so a stale marker cannot turn an unrelated later start into a
+    misleading recovery announcement.
+    """
+    try:
+        record = {
+            "target_pid": target_pid,
+            "target_start_time": _get_process_start_time(target_pid),
+            "requester_pid": os.getpid(),
+            "written_at": _utc_now_iso(),
+        }
+        _write_json_file(_get_restart_after_stop_marker_path(), record)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def consume_restart_after_stop_marker_for_self() -> bool:
+    """Return True when this gateway was explicitly stopped for a restart."""
+    return _consume_pid_marker_for_self(
+        _get_restart_after_stop_marker_path(),
+        pid_field="target_pid",
+        start_time_field="target_start_time",
+        ttl_s=_RESTART_AFTER_STOP_MARKER_TTL_S,
+    )
 
 
 def consume_planned_stop_marker_for_self() -> bool:

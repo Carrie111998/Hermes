@@ -12581,6 +12581,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and (
                     self._restart_requested
                     or getattr(self, "_signal_initiated_shutdown", False)
+                    or getattr(self, "_restart_after_stop_requested", False)
                 )
             )
             if should_notify_after_restart:
@@ -25902,6 +25903,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             except Exception as e:
                 logger.debug("Planned stop marker check failed: %s", e)
 
+        restart_after_stop = False
+        if not planned_takeover:
+            try:
+                from gateway.status import consume_restart_after_stop_marker_for_self
+
+                restart_after_stop = consume_restart_after_stop_marker_for_self()
+            except Exception as e:
+                logger.debug("Restart-after-stop marker check failed: %s", e)
+        runner._restart_after_stop_requested = restart_after_stop
+
         # Fast (<10ms) snapshot of who's asking us to shut down — runs
         # synchronously inside the asyncio signal handler, so we keep it
         # purely stdlib + /proc reads, no subprocesses.  See PR #15826
@@ -25923,6 +25934,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
+            )
+        elif planned_stop and restart_after_stop:
+            logger.info(
+                "Received %s as a planned gateway stop for external restart — exiting cleanly",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
         elif planned_stop:
             logger.info(

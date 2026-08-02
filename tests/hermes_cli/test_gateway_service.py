@@ -235,6 +235,31 @@ class TestGeneratedSystemdUnits:
 
 
 class TestGatewayStopCleanup:
+    def test_stop_for_restart_persists_public_restart_intent(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(status, "get_running_pid", lambda: 4242)
+        monkeypatch.setattr(
+            status,
+            "write_restart_after_stop_marker",
+            lambda pid: calls.append(pid) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_dispatch_via_service_manager_if_s6",
+            lambda action: action == "stop",
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="stop",
+                all=False,
+                system=False,
+                for_restart=True,
+            )
+        )
+
+        assert calls == [4242]
+
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):
         """Without --all, stop uses systemd (if available) and does NOT call
         the global kill_gateway_processes()."""
@@ -1755,4 +1780,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-
