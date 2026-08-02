@@ -5586,10 +5586,18 @@ class AIAgent:
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
             self._anthropic_client = build_anthropic_bedrock_client(region)
-        elif getattr(self, "provider", None) == "vertex":
+        elif (
+            getattr(self, "provider", None) == "vertex"
+            and "claude" in (getattr(self, "model", None) or "").lower()
+        ):
             from agent.anthropic_adapter import build_anthropic_vertex_client
-            project = getattr(self, "_vertex_project", "") or os.environ.get("VERTEX_PROJECT_ID", "")
-            region = getattr(self, "_vertex_region", "global") or "global"
+            from agent.vertex_adapter import _resolve_project_override, _resolve_region
+            project = (
+                getattr(self, "_vertex_project", "")
+                or _resolve_project_override()
+                or ""
+            )
+            region = getattr(self, "_vertex_region", None) or _resolve_region()
             self._anthropic_client = build_anthropic_vertex_client(project, region)
         else:
             from agent.anthropic_adapter import build_anthropic_client

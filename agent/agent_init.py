@@ -1004,7 +1004,7 @@ def init_agent(
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).
         _is_bedrock_anthropic = agent.provider == "bedrock"
-        _is_vertex_anthropic = agent.provider == "vertex"
+        _is_vertex_anthropic = agent.provider == "vertex" and "claude" in (agent.model or "").lower()
         if _is_bedrock_anthropic:
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
@@ -1021,8 +1021,13 @@ def init_agent(
                 print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
         elif _is_vertex_anthropic:
             from agent.anthropic_adapter import build_anthropic_vertex_client
-            _vertex_project = getattr(agent, "project_id", None) or os.environ.get("VERTEX_PROJECT_ID") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID") or ""
-            _vertex_region = getattr(agent, "region", None) or os.environ.get("VERTEX_REGION") or "global"
+            from agent.vertex_adapter import _resolve_project_override, _resolve_region
+            _vertex_project = (
+                getattr(agent, "project_id", None)
+                or _resolve_project_override()
+                or ""
+            )
+            _vertex_region = getattr(agent, "region", None) or _resolve_region()
             agent._vertex_project = _vertex_project
             agent._vertex_region = _vertex_region
             agent._anthropic_client = build_anthropic_vertex_client(_vertex_project, _vertex_region)

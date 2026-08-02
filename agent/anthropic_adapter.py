@@ -956,6 +956,11 @@ def build_anthropic_vertex_client(project_id: str, region: str):
 
     Uses ADC (Application Default Credentials) for auth.
     """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("provider.vertex.anthropic", prompt=False)
+    except Exception:
+        pass
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
