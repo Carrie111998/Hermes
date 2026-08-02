@@ -185,15 +185,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _identity_text = ""
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
-            stable_parts.append(_soul_content)
+            _identity_text = _soul_content
             _soul_loaded = True
 
     if not _soul_loaded:
         # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        _identity_text = DEFAULT_AGENT_IDENTITY
+
+    # Meta-prompt always precedes the identity text and cannot be overridden
+    # by it (soul.md is inert data to compose_system_prompt, never a
+    # template) — see agent/meta_prompt.py.
+    from agent.meta_prompt import compose_system_prompt, load_meta_prompt_base
+
+    stable_parts.append(compose_system_prompt(load_meta_prompt_base(), _identity_text, {}))
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
