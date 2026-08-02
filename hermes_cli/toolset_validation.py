@@ -12,7 +12,75 @@ significant debugging to find. Surfacing invalid toolset names (and the
 zero-tools end state) loudly turns that silent failure into an actionable one.
 """
 
-from typing import Callable, List
+from typing import Any, Callable, Dict, List, Tuple
+
+
+def _unknown_toolset_warning(
+    platform: str,
+    name: str,
+    is_valid_toolset: Callable[[str], bool],
+) -> str:
+    """Build a consistent warning for an invalid toolset reference."""
+    suggestion = f"hermes-{platform}"
+    hint = (
+        f" — did you mean '{suggestion}'?"
+        if is_valid_toolset(suggestion)
+        else ""
+    )
+    return (
+        f"platform '{platform}' references unknown toolset "
+        f"'{name}'{hint}"
+    )
+
+
+def clean_platform_toolsets(
+    platform_toolsets: object,
+    is_valid_toolset: Callable[[str], bool],
+) -> Tuple[object, List[str], bool]:
+    """Drop invalid toolset names while preserving all valid entries.
+
+    If removing invalid entries empties a platform's list override, the platform
+    key is removed so Hermes falls back to the platform defaults instead of
+    treating an explicit empty list as "disable the defaults".
+    """
+    if not isinstance(platform_toolsets, dict) or not platform_toolsets:
+        return platform_toolsets, [], False
+
+    cleaned: Dict[str, Any] = {}
+    warnings: List[str] = []
+    changed = False
+
+    for platform, raw in platform_toolsets.items():
+        if isinstance(raw, list):
+            kept = []
+            removed_invalid = False
+            for entry in raw:
+                if isinstance(entry, str) and entry and not is_valid_toolset(entry):
+                    warnings.append(
+                        _unknown_toolset_warning(platform, entry, is_valid_toolset)
+                    )
+                    changed = True
+                    removed_invalid = True
+                    continue
+                kept.append(entry)
+            if kept:
+                cleaned[platform] = kept
+            elif removed_invalid:
+                changed = True
+            else:
+                cleaned[platform] = raw
+            continue
+
+        if isinstance(raw, str) and raw and not is_valid_toolset(raw):
+            warnings.append(_unknown_toolset_warning(platform, raw, is_valid_toolset))
+            changed = True
+            continue
+
+        cleaned[platform] = raw
+
+    if not changed:
+        return platform_toolsets, warnings, False
+    return cleaned, warnings, True
 
 
 def validate_platform_toolsets(
@@ -55,16 +123,7 @@ def validate_platform_toolsets(
             if is_valid_toolset(name):
                 valid_count += 1
                 continue
-            suggestion = f"hermes-{platform}"
-            hint = (
-                f" — did you mean '{suggestion}'?"
-                if is_valid_toolset(suggestion)
-                else ""
-            )
-            warnings.append(
-                f"platform '{platform}' references unknown toolset "
-                f"'{name}'{hint}"
-            )
+            warnings.append(_unknown_toolset_warning(platform, name, is_valid_toolset))
 
     if valid_count == 0:
         warnings.append(

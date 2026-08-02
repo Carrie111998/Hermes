@@ -1116,8 +1116,14 @@ def _unset_nested(config, dotted_key: str) -> bool:
         try:
             current.pop(int(last))
             removed = True
-        except (TypeError, ValueError, IndexError):
+        except IndexError:
             return False
+        except (TypeError, ValueError):
+            try:
+                current.remove(last)
+                removed = True
+            except ValueError:
+                return False
     elif isinstance(current, dict):
         if last not in current:
             return False
@@ -1147,6 +1153,24 @@ def _unset_nested(config, dotted_key: str) -> bool:
         break
 
     return removed
+
+
+def _drop_empty_platform_toolset_overrides(config: Dict[str, Any]) -> bool:
+    """Remove empty platform_toolsets overrides so defaults apply again."""
+    platform_toolsets = config.get("platform_toolsets")
+    if not isinstance(platform_toolsets, dict):
+        return False
+
+    cleaned = {
+        platform: raw for platform, raw in platform_toolsets.items() if raw != []
+    }
+    if cleaned == platform_toolsets:
+        return False
+    if cleaned:
+        config["platform_toolsets"] = cleaned
+    else:
+        config.pop("platform_toolsets", None)
+    return True
 
 
 def _is_env_config_key(key: str) -> bool:
@@ -2256,10 +2280,25 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     # error or warning. Surface it loudly instead. See #38798.
     try:
         from toolsets import validate_toolset
-        from hermes_cli.toolset_validation import validate_platform_toolsets
+        from hermes_cli.toolset_validation import (
+            clean_platform_toolsets,
+            validate_platform_toolsets,
+        )
 
-        ts_warnings = validate_platform_toolsets(
-            read_raw_config().get("platform_toolsets"), validate_toolset
+        cleaned_toolsets, ts_warnings, ts_changed = clean_platform_toolsets(
+            config.get("platform_toolsets"), validate_toolset
+        )
+        if ts_changed:
+            if cleaned_toolsets:
+                config["platform_toolsets"] = cleaned_toolsets
+            else:
+                config.pop("platform_toolsets", None)
+            _persist_migration(config)
+
+        ts_warnings.extend(
+            validate_platform_toolsets(
+                config.get("platform_toolsets"), validate_toolset
+            )
         )
         for w in ts_warnings:
             results["warnings"].append(w)
@@ -5117,6 +5156,9 @@ def unset_config_value(key: str):
     if not removed:
         print(f"Config key not set: {key}", file=sys.stderr)
         sys.exit(1)
+
+    if key.startswith("platform_toolsets."):
+        _drop_empty_platform_toolset_overrides(user_config)
 
     ensure_hermes_home()
     from utils import atomic_yaml_write
