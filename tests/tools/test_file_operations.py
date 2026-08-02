@@ -723,3 +723,45 @@ class TestReadUtf8SampleBoundary:
 
         assert result.is_binary is True
         assert result.error is not None
+
+    def test_read_file_rejects_invalid_byte_at_extended_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "invalid-at-extended-boundary.md"
+        path.write_bytes(b"a" * 999 + "ç".encode("utf-8") + b"ab\xfftail\n")
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is True
+        assert result.error is not None
+
+    def test_read_file_raw_rejects_invalid_byte_at_extended_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "invalid-at-extended-boundary.md"
+        path.write_bytes(b"a" * 999 + "ç".encode("utf-8") + b"ab\xfftail\n")
+
+        result = ops.read_file_raw(str(path))
+
+        assert result.is_binary is True
+        assert result.error is not None
+
+    def test_read_file_accepts_valid_character_split_by_extended_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "extended-boundary.md"
+        path.write_bytes(b"a" * 999 + "🧪é\ntext\n".encode("utf-8"))
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "🧪é" in result.content
+
+    def test_read_file_raw_accepts_valid_character_split_by_extended_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "extended-boundary.md"
+        path.write_bytes(b"a" * 999 + "🧪é\ntext\n".encode("utf-8"))
+
+        result = ops.read_file_raw(str(path))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "🧪é" in result.content

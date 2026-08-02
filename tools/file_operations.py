@@ -886,6 +886,39 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def _sample_ends_with_incomplete_utf8(self, path: str, sample_limit: int) -> bool:
+        """Prove that a raw sample ends with an incomplete valid UTF-8 sequence.
+
+        The terminal stream may replace undecodable bytes before this class
+        sees them, so the decoded U+FFFD at the sample boundary is ambiguous.
+        ``od`` keeps this probe bounded and emits ASCII hex, allowing strict
+        decoding of the original bytes without sending binary data through
+        the terminal stream. If the probe is unavailable or malformed, fail
+        closed and leave the replacement character intact.
+        """
+        if not self._has_command("od"):
+            return False
+
+        raw_result = self._exec(
+            f"od -An -v -tx1 -N {sample_limit} "
+            f"{self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        if raw_result.exit_code != 0:
+            return False
+
+        try:
+            raw_sample = bytes.fromhex(raw_result.stdout)
+        except ValueError:
+            return False
+        if len(raw_sample) != sample_limit:
+            return False
+
+        try:
+            raw_sample.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return exc.reason == "unexpected end of data" and exc.end == len(raw_sample)
+        return False
     
     def _binary_sample(self, path: str, file_size: int) -> str:
         """Return a UTF-8-safe sample for binary detection.
@@ -916,9 +949,16 @@ class ShellFileOperations(FileOperations):
         # The extended probe can itself end in a newly split character. Do
         # not let that second boundary hide an undecodable replacement from
         # the original 1000-byte window. If the file ends within the probe,
-        # retain the replacement: it is truncated/invalid file content.
-        if file_size <= extended_limit or extended.count("\ufffd") != 1:
-            return extended
+        # retain the replacement: it is truncated/invalid file content. A
+        # raw-byte probe is required before removing any replacement; a real
+        # invalid byte at this boundary must remain fail-closed. Return the
+        # original sample on an unproven path so its boundary U+FFFD remains
+        # inside the 1000-character binary-detection window.
+        if (
+            file_size <= extended_limit
+            or not self._sample_ends_with_incomplete_utf8(path, extended_limit)
+        ):
+            return sample
         return extended[:-1]
 
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
