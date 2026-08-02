@@ -777,8 +777,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--notifier-profile", default=None,
         help="Name of the gateway profile that will deliver this subscription; "
              "must match a running gateway's own profile name, not the "
-             "invoking shell's profile. Leave unset so any gateway may "
-             "deliver it.",
+             "invoking shell's profile. Leave unset to make it a "
+             "legacy/unowned row, delivered only by whichever gateway holds "
+             "the dispatcher singleton lock.",
     )
 
     p_nlist = sub.add_parser(

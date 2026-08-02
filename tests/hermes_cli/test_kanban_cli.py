@@ -169,10 +169,13 @@ def test_notify_subscribe_cli_leaves_notifier_profile_unset_by_default(
     A gateway serving only a named, non-default profile then treats that
     stamp as belonging to a *different* owner it has no adapter for, and
     silently skips delivery forever (see gateway/kanban_watchers.py's
-    owner check). Leaving the stamp unset makes the subscription
-    deliverable by any gateway, matching legacy/unowned-row behavior,
-    unless the caller explicitly names the serving profile via
-    ``--notifier-profile``.
+    owner check). Leaving the stamp unset makes the subscription a
+    legacy/unowned row instead, delivered only by whichever gateway holds
+    the dispatcher singleton lock (see
+    ``test_legacy_subscription_requires_confirmed_dispatcher_lock_owner``
+    and ``test_notify_subscribe_cli_unset_profile_delivers_as_dispatcher_owner``
+    in tests/gateway/test_kanban_notifier.py), unless the caller explicitly
+    names the serving profile via ``--notifier-profile``.
     """
     monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
     monkeypatch.delenv("HERMES_PROFILE", raising=False)
