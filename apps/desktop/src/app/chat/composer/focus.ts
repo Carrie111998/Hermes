@@ -67,8 +67,15 @@ interface SubmitDetail {
 
 let activeTarget: ComposerTarget = 'main'
 
-const composerTargetOf = (el: HTMLElement | undefined): ComposerTarget | null =>
-  (el?.dataset.composerTarget as ComposerTarget | undefined) ?? null
+const composerTargetOf = (el: HTMLElement | undefined): ComposerTarget | null => {
+  const target = el?.dataset.composerTarget
+
+  // Truthy rather than `?? null`: a present-but-empty `data-composer-target` is
+  // not a routing key, and letting `''` through would resolve `'active'` to a
+  // target no composer answers to — the exact class of dropped keystroke this
+  // resolver exists to prevent. Callers fall back to `'main'` on null.
+  return target ? (target as ComposerTarget) : null
+}
 
 /**
  * The chat surface currently on screen (`data-composer-target` hung off each

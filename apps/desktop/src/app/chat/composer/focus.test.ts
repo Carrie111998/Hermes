@@ -225,6 +225,16 @@ describe('resolveActive / keep-alive tab heal', () => {
     expect(mainSaw).toEqual(['main'])
   })
 
+  it('does not adopt a present-but-empty composer target as a routing key', () => {
+    // `[data-composer-target]` matches on attribute presence, so a surface
+    // stamped with an empty value is a candidate. Routing to '' would address a
+    // composer that cannot exist and drop the keystroke — fall back to main.
+    mountSurface('')
+    markActiveComposer('tile:closed')
+
+    expect(getActiveComposer()).toBe('main')
+  })
+
   it('holds an edit claim while the edit composer root is mounted', () => {
     const root = document.createElement('div')
     root.dataset.slot = 'aui_edit-composer-root'
