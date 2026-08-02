@@ -1589,6 +1589,27 @@ class MatrixAdapter(BasePlatformAdapter):
                     olm.share_keys_min_trust = TrustState.UNVERIFIED
                     olm.send_keys_min_trust = TrustState.UNVERIFIED
 
+                    # Override the default key-request policy. mautrix's
+                    # default_allow_key_share only serves key requests to the
+                    # bot's OWN user (self.client.mxid) and silently rejects
+                    # everyone else (code=None). For a personal agent whose
+                    # operator is a different Matrix account, that makes the
+                    # "Request keys" recovery path dead on arrival: if a
+                    # proactive key share is missed (e.g. device list stale
+                    # right after a gateway restart), the owner's client shows
+                    # m.bad.encrypted and any m.room_key_request is dropped.
+                    # Explicitly allow the configured allowed users (the
+                    # owner) while preserving default behaviour for everyone
+                    # else.
+                    async def _allow_key_share(device, request) -> bool:
+                        if device.user_id == client.mxid:
+                            return True
+                        if device.user_id in self._allowed_user_ids:
+                            return True
+                        return await olm.default_allow_key_share(device, request)
+
+                    olm.allow_key_share = _allow_key_share
+
                     await olm.load()
 
                     if not await self._verify_device_keys_on_server(client, olm):
