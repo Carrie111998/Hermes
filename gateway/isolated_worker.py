@@ -1257,13 +1257,6 @@ def _wrapped_execution_parts(command: str) -> tuple[str, str] | None:
     )
 
 
-def _executed_payload(command: str) -> str:
-    """Extract the exact BaseEnvironment payload, else classify all input."""
-
-    wrapped = _wrapped_execution_parts(command)
-    return wrapped[0] if wrapped is not None else command
-
-
 def _executed_virtual_cwd(command: str, fallback: Path) -> Path:
     wrapped = _wrapped_execution_parts(command)
     if wrapped is None:
@@ -1286,76 +1279,6 @@ def _executed_virtual_cwd(command: str, fallback: Path) -> Path:
     except ValueError as exc:
         raise ProtocolError("wrapped_cwd_outside_lease") from exc
     return candidate
-
-
-def _project_binding(lease: "_Lease", host_cwd: Path) -> dict[str, Any]:
-    try:
-        from agent.coding_context import project_facts_for
-
-        facts = project_facts_for(host_cwd)
-    except Exception:
-        return {
-            "applicability": "unknown",
-            "project_root": "",
-            "verify_commands_digest": "",
-            "material_fingerprint": "",
-        }
-    if not facts:
-        return {
-            "applicability": "not_applicable",
-            "project_root": "",
-            "verify_commands_digest": hashlib.sha256(b"[]").hexdigest(),
-        }
-    try:
-        project_root = Path(str(facts["root"])).resolve()
-        relative = project_root.relative_to(lease.root.resolve())
-    except (KeyError, OSError, ValueError):
-        return {
-            "applicability": "unknown",
-            "project_root": "",
-            "verify_commands_digest": "",
-            "material_fingerprint": "",
-        }
-    commands = [
-        str(command).strip()
-        for command in (facts.get("verifyCommands") or [])
-        if str(command).strip()
-    ]
-    return {
-        "applicability": "applicable",
-        "project_root": str(VIRTUAL_WORKSPACE_ROOT / relative),
-        "verify_commands_digest": hashlib.sha256(
-            canonical_bytes(commands)
-        ).hexdigest(),
-    }
-
-
-def _project_binding_for_changes(
-    lease: "_Lease",
-    changed_paths: Sequence[str],
-    fallback_cwd: Path,
-) -> dict[str, Any]:
-    bindings: list[dict[str, Any]] = []
-    for raw in changed_paths:
-        try:
-            relative = Path(raw).relative_to(VIRTUAL_WORKSPACE_ROOT)
-        except ValueError:
-            continue
-        candidate = lease.root / relative
-        bindings.append(
-            _project_binding(
-                lease,
-                candidate if candidate.is_dir() else candidate.parent,
-            )
-        )
-    bindings.append(_project_binding(lease, fallback_cwd))
-    for binding in bindings:
-        if binding["applicability"] == "applicable":
-            return binding
-    for binding in bindings:
-        if binding["applicability"] == "unknown":
-            return binding
-    return bindings[-1]
 
 
 def _validate_verification(value: Any) -> dict[str, str] | None:
@@ -1447,17 +1370,15 @@ def _validate_proof_state(value: Any, lease_id: str) -> dict[str, Any]:
 
 
 def _proof_status(state: Mapping[str, Any]) -> str:
-    verification = state.get("last_verification")
-    if not isinstance(verification, Mapping):
-        return "unverified"
-    if verification.get("status") == "failed":
-        return "failed"
-    if (
-        verification.get("status") == "passed"
-        and state["verified_generation"] == state["edit_generation"]
-    ):
-        return "passed"
-    return "stale"
+    """Return the compatibility status for a structural-only receipt.
+
+    Verification sufficiency is model-authored.  The v1 wire schema retains
+    this field for compatibility, but the worker never derives it from command
+    text or exit output and therefore always reports the neutral value.
+    """
+
+    del state
+    return "unverified"
 
 
 def _validate_proof_receipt(value: Any, lease_id: str) -> dict[str, Any]:
@@ -1571,7 +1492,6 @@ class _Execution:
     output_limit: int
     command: str
     pre_snapshot: _MaterialSnapshot | None
-    start_edit_generation: int
     host_cwd: Path
     started_monotonic: float = field(default_factory=time.monotonic)
     stdout: bytearray = field(default_factory=bytearray)
@@ -1944,6 +1864,18 @@ class IsolatedWorkerServer:
             "material_fingerprint": "",
         }
 
+    @staticmethod
+    def _structural_proof_state(state: Mapping[str, Any]) -> dict[str, Any]:
+        """Project a legacy proof sidecar onto non-semantic runtime facts."""
+
+        projected = dict(state)
+        projected["verified_generation"] = 0
+        projected["last_verification"] = None
+        projected["applicability"] = "unknown"
+        projected["project_root"] = ""
+        projected["verify_commands_digest"] = ""
+        return projected
+
     def _proof_authority_usage(self) -> tuple[int, int]:
         """Validate and bound the server-only persisted proof sidecars."""
 
@@ -1988,9 +1920,8 @@ class IsolatedWorkerServer:
             try:
                 snapshot = _material_snapshot(lease.root, lease.root)
                 state["material_fingerprint"] = _material_fingerprint(snapshot)
-                state.update(_project_binding(lease, lease.root))
             except (OSError, ProtocolError, ValueError):
-                state["applicability"] = "unknown"
+                state["material_fingerprint"] = ""
             self._write_proof_state(lease, state)
             return dict(state)
         try:
@@ -2020,7 +1951,9 @@ class IsolatedWorkerServer:
             raise ProtocolError("proof_state_json_invalid") from exc
         if canonical_bytes(decoded) != payload:
             raise ProtocolError("proof_state_not_canonical")
-        state = _validate_proof_state(decoded, lease.lease_id)
+        state = self._structural_proof_state(
+            _validate_proof_state(decoded, lease.lease_id)
+        )
         lease.proof_state = dict(state)
         return dict(state)
 
@@ -2120,7 +2053,6 @@ class IsolatedWorkerServer:
         *,
         mutation_detection: str,
         changed_paths: Sequence[str] = (),
-        verification: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return _validate_proof_receipt(
             {
@@ -2132,14 +2064,10 @@ class IsolatedWorkerServer:
                 "mutation_detection": mutation_detection,
                 "changed_paths": list(changed_paths),
                 "pending_paths": list(state["pending_paths"]),
-                "verification": (
-                    dict(verification)
-                    if verification is not None
-                    else state["last_verification"]
-                ),
-                "applicability": state["applicability"],
-                "project_root": state["project_root"],
-                "verify_commands_digest": state["verify_commands_digest"],
+                "verification": None,
+                "applicability": "unknown",
+                "project_root": "",
+                "verify_commands_digest": "",
                 "material_fingerprint": state["material_fingerprint"],
             },
             str(state["lease_id"]),
@@ -2159,15 +2087,15 @@ class IsolatedWorkerServer:
             snapshot = snapshot or _material_snapshot(lease.root, scan_cwd)
             fingerprint = _material_fingerprint(snapshot)
         except (OSError, ProtocolError, ValueError):
-            # If proof was ever claimed, an unreadable material view must make
-            # it stale.  Initial empty leases remain merely unknown.
-            if state["last_verification"] is not None:
+            # A previously observed material view becoming unreadable is a
+            # structural uncertainty: advance the mutation generation without
+            # interpreting why the snapshot failed.
+            if state.get("material_fingerprint"):
                 state["edit_generation"] += 1
                 state["pending_paths"] = self._merge_proof_paths(
                     state["pending_paths"],
                     [str(VIRTUAL_WORKSPACE_ROOT)],
                 )
-            state["applicability"] = "unknown"
             state["material_fingerprint"] = ""
             return self._write_proof_state(lease, state)
 
@@ -2178,20 +2106,8 @@ class IsolatedWorkerServer:
                 state["pending_paths"],
                 [snapshot.scope or str(VIRTUAL_WORKSPACE_ROOT)],
             )
-            binding = _project_binding_for_changes(
-                lease,
-                [snapshot.scope or str(VIRTUAL_WORKSPACE_ROOT)],
-                scan_cwd,
-            )
-            if not (
-                state["pending_paths"]
-                and state["applicability"] == "applicable"
-                and binding["applicability"] != "applicable"
-            ):
-                state.update(binding)
         elif not previous and (
-            state["last_verification"] is not None
-            or state["pending_paths"]
+            state["pending_paths"]
             or state["edit_generation"] > 0
         ):
             state["edit_generation"] += 1
@@ -2205,15 +2121,10 @@ class IsolatedWorkerServer:
     def _proof_status_receipt(self, lease: _Lease) -> dict[str, Any]:
         with lease.proof_lock:
             state = self._read_proof_state(lease)
-            scan_cwd = lease.root
-            if state["project_root"]:
-                scan_cwd = lease.root / Path(state["project_root"]).relative_to(
-                    VIRTUAL_WORKSPACE_ROOT
-                )
             state = self._reconcile_material_state(
                 lease,
                 state,
-                scan_cwd=scan_cwd,
+                scan_cwd=lease.root,
             )
             return self._proof_receipt(state, mutation_detection="status")
 
@@ -2230,7 +2141,6 @@ class IsolatedWorkerServer:
             relative = first.relative_to(VIRTUAL_WORKSPACE_ROOT)
             host_candidate = lease.root / relative
             host_cwd = host_candidate if host_candidate.is_dir() else host_candidate.parent
-            state.update(_project_binding(lease, host_cwd))
             already_observed = (
                 observed_generation == state["edit_generation"]
                 and set(normalized).issubset(set(state["pending_paths"]))
@@ -2247,7 +2157,6 @@ class IsolatedWorkerServer:
                 )
             except (OSError, ProtocolError, ValueError):
                 state["material_fingerprint"] = ""
-                state["applicability"] = "unknown"
             state = self._write_proof_state(lease, state)
             return self._proof_receipt(
                 state,
@@ -3117,44 +3026,16 @@ class IsolatedWorkerServer:
         )
         with lease.proof_lock:
             proof_state = self._read_proof_state(lease)
-            classification_cwd = host_cwd
-            if (
-                proof_state["applicability"] == "applicable"
-                and proof_state["project_root"]
-            ):
-                classification_cwd = lease.root / Path(
-                    proof_state["project_root"]
-                ).relative_to(VIRTUAL_WORKSPACE_ROOT)
             try:
-                from agent.verification_evidence import (
-                    classify_verification_command,
-                )
-
-                verification_candidate = (
-                    classify_verification_command(
-                        _executed_payload(params["command"]),
-                        cwd=classification_cwd,
-                        session_id=lease.lease_id,
-                        exit_code=-1,
-                        output="",
-                    )
-                    is not None
-                )
-            except Exception:
-                verification_candidate = True
-            pre_snapshot = None
-            if verification_candidate:
-                try:
-                    pre_snapshot = _material_snapshot(lease.root, host_cwd)
-                except (OSError, ProtocolError, ValueError):
-                    pre_snapshot = None
-                proof_state = self._reconcile_material_state(
-                    lease,
-                    proof_state,
-                    scan_cwd=host_cwd,
-                    snapshot=pre_snapshot,
-                )
-            start_edit_generation = int(proof_state["edit_generation"])
+                pre_snapshot = _material_snapshot(lease.root, host_cwd)
+            except (OSError, ProtocolError, ValueError):
+                pre_snapshot = None
+            proof_state = self._reconcile_material_state(
+                lease,
+                proof_state,
+                scan_cwd=host_cwd,
+                snapshot=pre_snapshot,
+            )
         timeout = min(
             params["timeout_seconds"], self.policy.maximum_timeout_seconds
         )
@@ -3275,7 +3156,6 @@ class IsolatedWorkerServer:
                 output_limit=self.policy.maximum_output_bytes,
                 command=params["command"],
                 pre_snapshot=pre_snapshot,
-                start_edit_generation=start_edit_generation,
                 host_cwd=host_cwd,
             )
             lease.active_executions.append(execution)
@@ -3512,7 +3392,6 @@ class IsolatedWorkerServer:
         with lease.usage_lock, lease.proof_lock:
             sibling_writable = bool(lease.active_executions)
             state = self._read_proof_state(lease)
-            pending_before = bool(state["pending_paths"])
             changed_paths: list[str] = []
             mutation_detection = "unchanged"
             post_snapshot: _MaterialSnapshot | None = None
@@ -3552,80 +3431,11 @@ class IsolatedWorkerServer:
                 changed_paths = [str(VIRTUAL_WORKSPACE_ROOT)]
 
             if mutation_detection in {"changed", "unknown"}:
-                binding = _project_binding_for_changes(
-                    lease,
-                    changed_paths,
-                    execution.host_cwd,
-                )
-                if not (
-                    pending_before
-                    and state["applicability"] == "applicable"
-                    and binding["applicability"] != "applicable"
-                ):
-                    state.update(binding)
                 state["edit_generation"] += 1
                 state["pending_paths"] = self._merge_proof_paths(
                     state["pending_paths"],
                     changed_paths,
                 )
-
-            returncode = execution.process.poll()
-            classification_failed = type(returncode) is not int
-            verification: dict[str, str] | None = None
-            if not classification_failed:
-                try:
-                    from agent.verification_evidence import (
-                        classify_verification_command,
-                    )
-
-                    classification_cwd = execution.host_cwd
-                    if (
-                        state["applicability"] == "applicable"
-                        and state["project_root"]
-                    ):
-                        classification_cwd = lease.root / Path(
-                            state["project_root"]
-                        ).relative_to(VIRTUAL_WORKSPACE_ROOT)
-                    evidence = classify_verification_command(
-                        _executed_payload(execution.command),
-                        cwd=classification_cwd,
-                        session_id=lease.lease_id,
-                        exit_code=int(returncode),
-                        output=(
-                            bytes(execution.stdout) + bytes(execution.stderr)
-                        ).decode("utf-8", errors="replace"),
-                    )
-                except Exception:
-                    evidence = None
-                    classification_failed = True
-                if evidence is not None:
-                    verification = {
-                        "canonical_command": str(evidence.canonical_command),
-                        "kind": str(evidence.kind),
-                        "scope": str(evidence.scope),
-                        "status": str(evidence.status),
-                    }
-                    state["last_verification"] = verification
-                    if (
-                        evidence.status == "passed"
-                        and mutation_detection == "unchanged"
-                        and state["edit_generation"]
-                        == execution.start_edit_generation
-                    ):
-                        state["verified_generation"] = state["edit_generation"]
-                        state["pending_paths"] = []
-
-            if classification_failed:
-                # The authority could not decide what really ran.  Advance the
-                # epoch so no older proof can be reused optimistically.
-                if mutation_detection != "unknown":
-                    state["edit_generation"] += 1
-                    state["pending_paths"] = self._merge_proof_paths(
-                        state["pending_paths"],
-                        [str(VIRTUAL_WORKSPACE_ROOT)],
-                    )
-                    changed_paths = [str(VIRTUAL_WORKSPACE_ROOT)]
-                mutation_detection = "unknown"
 
             state["material_fingerprint"] = (
                 _material_fingerprint(post_snapshot)
@@ -3637,7 +3447,6 @@ class IsolatedWorkerServer:
                 state,
                 mutation_detection=mutation_detection,
                 changed_paths=changed_paths,
-                verification=verification,
             )
         with execution.lock:
             execution.proof_receipt = dict(receipt)

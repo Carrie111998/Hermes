@@ -464,10 +464,9 @@ def _transform(raw: bytes) -> bytes:
         raise ConfigGateError("config_background_review_source_drifted")
     if agent.get("tool_use_enforcement") != "auto":
         raise ConfigGateError("config_tool_use_source_drifted")
-    if agent.get("verify_on_stop") is not None:
-        raise ConfigGateError("config_verify_on_stop_source_drifted")
-    if agent.get("verification_ledger_enabled") is not None:
-        raise ConfigGateError("config_verification_ledger_source_drifted")
+    # This retirement migration is intentionally idempotent: it accepts the
+    # legacy enabled state, an already-disabled state, or absent keys. Type
+    # validation remains in ``_target_mapping`` and output is always false.
     if _STALE_MODEL_SENTENCE not in str(agent.get("environment_hint") or ""):
         raise ConfigGateError("config_environment_hint_source_drifted")
     kanban = _required_mapping(source, "kanban")

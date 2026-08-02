@@ -330,35 +330,32 @@ def test_target_accepts_already_migrated_medium_reasoning_baseline():
     assert effective["agent"]["reasoning_effort"] == "medium"
 
 
-@pytest.mark.parametrize(
-    ("line", "code"),
-    [
-        (
-            b"  verify_on_stop: false\n",
-            "verify_on_stop_source_drifted",
-        ),
-        (
-            b"  verification_ledger_enabled: false\n",
-            "verification_ledger_source_drifted",
-        ),
-    ],
-)
-def test_plan_rejects_unreviewed_proof_gate_source_state(
-    tmp_path, monkeypatch, line, code
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_plan_idempotently_retires_legacy_proof_gate_source_state(
+    tmp_path, monkeypatch, value
 ):
     module, path = _prepare(tmp_path, monkeypatch)
     raw = path.read_bytes()
     path.write_bytes(
         raw.replace(
             b"  reasoning_effort: high\n",
-            b"  reasoning_effort: high\n" + line,
+            (
+                "  reasoning_effort: high\n"
+                f"  verify_on_stop: {value}\n"
+                f"  verification_ledger_enabled: {value}\n"
+            ).encode(),
         )
     )
 
-    with pytest.raises(module.ConfigGateError, match=code):
-        module.build_plan(
-            expected_before_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
-        )
+    target = module._transform(path.read_bytes())
+    plan = module.build_plan(
+        expected_before_sha256=hashlib.sha256(path.read_bytes()).hexdigest()
+    )
+    effective = yaml.safe_load(target)
+
+    assert plan["after_sha256"] == hashlib.sha256(target).hexdigest()
+    assert effective["agent"]["verify_on_stop"] is False
+    assert effective["agent"]["verification_ledger_enabled"] is False
 
 
 def test_apply_rechecks_source_after_backup_publish(tmp_path, monkeypatch):

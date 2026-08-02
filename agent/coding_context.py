@@ -38,21 +38,18 @@ session (deferred), the same contract as ``/skills install`` vs ``--now``.
 
 Activation (config ``agent.coding_context``):
 
-  * ``auto`` (default) — posture (brief + snapshot) on an interactive coding
-    surface sitting in a code workspace (git repo or recognised project root).
-    Prompt-only; toolsets and the skill index untouched.
-  * ``focus`` — like ``auto``, but additionally collapses the toolset to the
-    ``coding`` set + enabled MCP servers and demotes non-coding skill
-    categories to names-only in the prompt's skill index (no skill is ever
-    hidden). Explicit opt-in for a lean schema.
+  * ``auto`` (default) — no host-side posture decision. The model interprets
+    the user's task with the normal prompt and tool surface.
+  * ``focus`` — explicit operator selection of the coding posture and coding
+    toolset + enabled MCP servers.
   * ``on`` — force the posture anywhere (incl. non-workspaces). Prompt-only.
   * ``off`` — disable entirely.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import json
 import os
 import re
 import tempfile
@@ -66,13 +63,9 @@ logger = logging.getLogger("hermes.coding_context")
 
 CODING_TOOLSET = "coding"
 
-# Surfaces where a coding posture makes sense under ``auto``. Messaging
-# platforms (telegram, discord, slack, …) are intentionally absent — a chat bot
-# in a group is not pair-programming.
-INTERACTIVE_CODING_PLATFORMS = {"cli", "tui", "acp", "desktop", ""}
-
-# Project-root signals that mark a directory as a code workspace even when it
-# isn't (yet) a git repo. Cheap filename checks — no parsing.
+# Compatibility-only project facts consumed by explicit UI/ledger surfaces.
+# These observations never select a runtime posture, system prompt, toolset,
+# or skill index; only explicit ``agent.coding_context`` configuration does.
 _PROJECT_MARKERS = (
     "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
     "package.json", "tsconfig.json", "deno.json",
@@ -81,134 +74,26 @@ _PROJECT_MARKERS = (
     "CMakeLists.txt", "Makefile", "Dockerfile",
     "AGENTS.md", "CLAUDE.md", ".cursorrules",
 )
-
-# Agent-instruction files surfaced separately from manifests in the snapshot.
 _CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md", ".cursorrules")
-
-# Source-file extensions that make a git repo a *code* workspace even with no
-# manifest. Without this, `git init` on a notes/writing/research folder (a huge
-# non-coding use case) would flip the whole session into the coding posture just
-# for having a `.git`. A manifest still wins on its own (see `_PROJECT_MARKERS`).
-_CODE_EXTENSIONS = frozenset({
-    ".py", ".pyi", ".ipynb", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".rb", ".php", ".c", ".h",
-    ".cc", ".cpp", ".hpp", ".cs", ".swift", ".m", ".mm", ".dart", ".ex", ".exs",
-    ".lua", ".sh", ".bash", ".zsh", ".sql", ".vue", ".svelte", ".r", ".jl",
-    ".hs", ".clj", ".erl", ".pl",
-})
-
-# Dirs never worth scanning for the code check (deps/build/vcs/venv noise).
-_CODE_SCAN_SKIP_DIRS = frozenset({
-    ".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build",
-    "target", ".next", ".turbo", "vendor",
-})
-
-# Bounded sweep: a code workspace reveals itself in the first handful of entries.
-_CODE_SCAN_MAX_ENTRIES = 500
-
-
-def _has_code_files(root: Path) -> bool:
-    """Cheap, bounded check for source files in a repo's top two levels.
-
-    Lets a git repo of loose scripts (no manifest) still read as a code
-    workspace while a bare notes/writing repo does not. Scans the root and its
-    immediate subdirectories only, capped at ``_CODE_SCAN_MAX_ENTRIES`` stats —
-    a handful of readdirs at session start, not a full walk.
-    """
-    seen = 0
-    stack = [(root, True)]
-    while stack:
-        directory, is_root = stack.pop()
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    seen += 1
-                    if seen > _CODE_SCAN_MAX_ENTRIES:
-                        return False
-                    name = entry.name
-                    try:
-                        if entry.is_file():
-                            if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
-                                return True
-                        elif is_root and entry.is_dir() and name not in _CODE_SCAN_SKIP_DIRS and not name.startswith("."):
-                            stack.append((Path(entry.path), False))
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-    return False
-
-# Lockfile → package manager, checked in priority order.
-_PY_LOCKFILES = (("uv.lock", "uv"), ("poetry.lock", "poetry"), ("Pipfile.lock", "pipenv"))
-_JS_LOCKFILES = (
-    ("pnpm-lock.yaml", "pnpm"), ("bun.lockb", "bun"), ("bun.lock", "bun"),
-    ("yarn.lock", "yarn"), ("package-lock.json", "npm"),
+_PY_LOCKFILES = (
+    ("uv.lock", "uv"),
+    ("poetry.lock", "poetry"),
+    ("Pipfile.lock", "pipenv"),
 )
-
-# package.json scripts / Makefile targets worth surfacing as verify commands.
-_VERIFY_TARGETS = ("test", "tests", "lint", "typecheck", "check", "build", "fmt", "format")
+_JS_LOCKFILES = (
+    ("pnpm-lock.yaml", "pnpm"),
+    ("bun.lockb", "bun"),
+    ("bun.lock", "bun"),
+    ("yarn.lock", "yarn"),
+    ("package-lock.json", "npm"),
+)
+_VERIFY_TARGETS = (
+    "test", "tests", "lint", "typecheck", "check", "build", "fmt", "format"
+)
 _MAX_VERIFY_COMMANDS = 8
 _MAX_FACT_FILE_BYTES = 256 * 1024
 
 _GIT_TIMEOUT = 2.5
-
-
-# Per-model edit-format steering. Matching the edit tool format to how a model
-# was trained reduces mistakes and wasted reasoning (OpenAI/Codex handle
-# patch-style diffs best; Anthropic models — and most open-weight coding
-# models, whose RL scaffolds use str_replace-style editors — do best with
-# string-replacement). Our `patch` tool exposes both: mode="patch" (V4A
-# multi-file) and mode="replace" (find-and-swap). We nudge each family toward
-# its native format. Unknown families get nothing (the brief's neutral wording
-# stands). Substrings match the model id; aligned with TOOL_USE_ENFORCEMENT_MODELS.
-#
-# GPT/Codex get V4A for ALL edits, single-file included: in codex-rs,
-# apply_patch (V4A — apply_patch.lark) is the ONLY file editor, no
-# str_replace-style tool exists, and the shipped model prompts say to use
-# apply_patch even "for single file edits" — so a replace-mode nudge would
-# steer those models toward a format their first-party harness never taught
-# them.
-_EDIT_FORMAT_GUIDANCE: dict[str, tuple[tuple[str, ...], str]] = {
-    "patch": (
-        ("gpt", "codex"),
-        "- Edit format: author new files with `write_file`; for edits to "
-        "existing code use `patch` with `mode='patch'` (V4A diff) — including "
-        "single-file edits. It's the edit format you handle most reliably.",
-    ),
-    "replace": (
-        ("claude", "sonnet", "opus", "haiku",
-         "gemini", "gemma", "deepseek", "qwen", "kimi", "glm", "grok",
-         "hermes", "llama", "mistral", "devstral", "minimax"),
-        "- Edit format: author new files with `write_file`; for edits to "
-        "existing code prefer `patch` in `mode='replace'` — match a unique "
-        "snippet and swap it. Reach for `mode='patch'` (V4A) only when an edit "
-        "genuinely spans several files at once.",
-    ),
-}
-
-
-def _model_family(model: Optional[str]) -> Optional[str]:
-    """Classify a model id into an edit-format family key, or ``None``.
-
-    Used to steer the coding posture toward the edit tool format a model was
-    trained on. Family-agnostic by design: an unrecognised model gets ``None``
-    and the operating brief's neutral edit wording applies.
-    """
-    if not model:
-        return None
-    lowered = model.lower()
-    for family, (needles, _line) in _EDIT_FORMAT_GUIDANCE.items():
-        if any(n in lowered for n in needles):
-            return family
-    return None
-
-
-def _edit_format_line(model: Optional[str]) -> str:
-    """The edit-format guidance line for this model's family (``""`` if none)."""
-    family = _model_family(model)
-    if family is None:
-        return ""
-    return _EDIT_FORMAT_GUIDANCE[family][1]
 
 
 # Operating brief for the coding posture. Tool names referenced here (read_file,
@@ -299,27 +184,14 @@ class ContextProfile:
     compact_skill_categories: tuple[str, ...] = ()
 
 
-# Skill categories that are clearly not part of a coding workflow. Demoted to
-# names-only in the prompt's skill index under the opt-in ``focus`` mode only
-# (deny-list — anything not listed here, incl. custom user categories, keeps
-# full entries). Coding-adjacent categories (devops, github, mcp,
-# data-science, diagramming, research, security, …) are intentionally absent.
-_NON_CODING_SKILL_CATEGORIES = (
-    "apple", "communication", "cooking", "creative", "email", "finance",
-    "gaming", "gifs", "health", "media", "music", "note-taking",
-    "productivity", "shopping", "smart-home", "social-media", "travel",
-    "yuanbao",
-)
-
-
 GENERAL_PROFILE = ContextProfile(name="general")
 CODING_PROFILE = ContextProfile(
     name="coding",
     toolset=CODING_TOOLSET,
     guidance=CODING_AGENT_GUIDANCE,
-    model_hint="coding",
+    model_hint=None,
     memory_policy="project",
-    compact_skill_categories=_NON_CODING_SKILL_CATEGORIES,
+    compact_skill_categories=(),
 )
 
 _PROFILES: dict[str, ContextProfile] = {
@@ -406,19 +278,10 @@ def _home() -> Optional[Path]:
 
 
 def _marker_root(cwd: Path) -> Optional[Path]:
-    """Nearest ancestor that looks like a project root, or ``None``.
+    """Nearest compatibility-facts root without selecting a runtime mode."""
 
-    Walks up at most a few levels so a manifest in the workspace root counts
-    even when the user is in a subdirectory. ``$HOME`` itself is skipped — a
-    Makefile or AGENTS.md sitting in the home directory is global user config,
-    not a project-root signal.
-    """
     current = cwd.resolve()
     home = _home()
-    # Shared world-writable temp roots are never project roots: a stray
-    # manifest in /tmp (left by any process) must not flip every session
-    # whose cwd lives under the temp dir into the coding posture. Same
-    # reasoning as the $HOME skip below.
     try:
         temp_root = Path(tempfile.gettempdir()).resolve()
     except Exception:
@@ -428,45 +291,20 @@ def _marker_root(cwd: Path) -> Optional[Path]:
             break
         if parent == home or (temp_root is not None and parent == temp_root):
             continue
-        for marker in _PROJECT_MARKERS:
-            if (parent / marker).exists():
-                return parent
+        if any((parent / marker).exists() for marker in _PROJECT_MARKERS):
+            return parent
     return None
 
 
 def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
-    """Resolve which profile applies.
+    """Resolve posture from explicit operator configuration only.
 
-    ``auto``/``focus``: coding when the surface is interactive AND the cwd is a
-    code workspace (a git repo or a recognised project root). ``on``: always
-    coding. ``off``: always general.
-
-    A git repo rooted at ``$HOME`` (the dotfiles pattern) is NOT a workspace
-    signal — without the guard, every session anywhere under a dotfiles-managed
-    home directory would silently flip to the coding posture.
-
-    Detection is intentionally not memoized: it's a handful of ``stat`` calls,
-    and callers resolve the mode once per session anyway. Caching here would
-    risk a stale posture if a long-lived process (gateway/TUI) serves sessions
-    from different working directories.
+    Platform, path, filenames, extensions, manifests, and model identifiers are
+    opaque here.  They must never select a system prompt or tool surface.
     """
-    if mode == "off":
-        return GENERAL_PROFILE.name
-    if mode == "on":
-        return CODING_PROFILE.name
-    if platform and platform.strip().lower() not in INTERACTIVE_CODING_PLATFORMS:
-        return GENERAL_PROFILE.name
-    cwd = Path(cwd_str)
-    # A recognized project root (manifest / AGENTS.md / .cursorrules) is a code
-    # workspace on its own — cheap stat checks, no scan.
-    if _marker_root(cwd) is not None:
-        return CODING_PROFILE.name
-    git_root = _git_root(cwd)
-    if git_root is not None and git_root == _home():
-        git_root = None  # dotfiles repo at $HOME — not a code workspace
-    # A bare git repo only counts when it actually holds code, so `git init` on a
-    # notes/writing/research folder stays in the general posture.
-    if git_root is not None and _has_code_files(git_root):
+
+    del platform, cwd_str
+    if mode in {"on", "focus"}:
         return CODING_PROFILE.name
     return GENERAL_PROFILE.name
 
@@ -489,9 +327,8 @@ class RuntimeMode:
     # The normalized ``agent.coding_context`` mode this posture was resolved
     # under (auto/focus/on/off). Toolset collapse is gated on ``focus``.
     config_mode: str = "auto"
-    # The model id this session runs (e.g. "anthropic/claude-opus-4.8"). Used
-    # only to steer edit-format guidance toward the model's family — see
-    # ``_edit_format_line``. Fixed for the session, so cache-safe.
+    # Opaque model id retained for API compatibility and diagnostics only.
+    # It never changes prompt bytes or tool selection.
     model: Optional[str] = None
     # Standing operator instructions (``agent.coding_instructions``), appended
     # as an extra stable system block. Empty unless the user configures it.
@@ -526,10 +363,6 @@ class RuntimeMode:
     def system_prompt_parts(self) -> tuple[list[str], list[str], list[str]]:
         """Return prefix, workspace, and trailing posture blocks separately.
 
-        The operating brief carries a model-family edit-format nudge appended
-        to it (one cached string, not a separate block) so the model is steered
-        toward the `patch` mode it handles best — see ``_edit_format_line``.
-
         The three lists preserve the historical flat prompt order: the brief,
         the live workspace snapshot, then configured operator instructions.
         Prompt assembly can therefore put a cache boundary before the snapshot
@@ -541,11 +374,7 @@ class RuntimeMode:
         workspace_parts: list[str] = []
         trailing: list[str] = []
         if self.profile.guidance:
-            brief = self.profile.guidance
-            edit_line = _edit_format_line(self.model)
-            if edit_line:
-                brief = f"{brief}\n{edit_line}"
-            prefix.append(brief)
+            prefix.append(self.profile.guidance)
         workspace = build_coding_workspace_block(self.cwd)
         if workspace:
             workspace_parts.append(workspace)
@@ -582,9 +411,7 @@ class RuntimeMode:
         rediscover what the index stopped showing them. Names-only keeps every
         skill loadable on recall while still cutting the description noise.
         """
-        if not self.is_coding or self.config_mode != "focus":
-            return frozenset()
-        return frozenset(self.profile.compact_skill_categories)
+        return frozenset()
 
 
 def resolve_runtime_mode(
@@ -594,14 +421,12 @@ def resolve_runtime_mode(
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
 ) -> RuntimeMode:
-    """Resolve the operating posture once. Cheap — a handful of ``stat`` calls.
+    """Resolve the operating posture once from explicit configuration.
 
     This is the single entry point every domain should call. The returned
-    object is immutable and safe to cache for the session. Detection itself is
-    intentionally *not* memoized (see ``_detect_profile_name``) so a long-lived
-    process can't pin a stale posture; callers resolve once per session and
-    hold the result. ``model`` is recorded only to steer edit-format guidance;
-    it never affects detection.
+    object is immutable and safe to cache for the session. ``platform``,
+    ``cwd``, and ``model`` are retained as opaque context but never classify the
+    task or alter the prompt/tool surface.
     """
     resolved_cwd = _resolve_cwd(cwd)
     mode = _coding_mode(config)
@@ -654,10 +479,7 @@ def coding_system_blocks(
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
 ) -> list[str]:
-    """Stable system-prompt blocks for the current posture (empty when general).
-
-    ``model`` steers the brief's edit-format nudge toward the model's family.
-    """
+    """Stable system-prompt blocks for the explicitly selected posture."""
     return resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config, model=model
     ).system_blocks()
@@ -682,13 +504,9 @@ def coding_compact_skill_categories(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
 ) -> frozenset[str]:
-    """Skill categories the active posture demotes to names-only in the index.
+    """Return no semantic category filtering.
 
-    Empty outside the coding posture and outside the opt-in ``focus`` mode —
-    the default posture never touches the skill index. Under ``focus``,
-    demoted — never hidden: every skill name stays in the index and remains
-    loadable via ``skill_view`` / ``skills_list``; only descriptions are
-    dropped.
+    Skill category labels are model-facing data, not host routing authority.
     """
     return resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
@@ -756,7 +574,8 @@ def _parse_status(porcelain: str) -> tuple[dict[str, str], dict[str, int]]:
 
 
 def _read_small(path: Path) -> str:
-    """Read a small text file, or ``""`` — never raises, never reads huge files."""
+    """Read a bounded text fact source, returning an empty string on failure."""
+
     try:
         if not path.is_file() or path.stat().st_size > _MAX_FACT_FILE_BYTES:
             return ""
@@ -767,12 +586,7 @@ def _read_small(path: Path) -> str:
 
 @dataclass(frozen=True)
 class ProjectFacts:
-    """Structured project facts — the model's verify loop, detected once.
-
-    The same data that feeds the workspace snapshot, exposed structurally so
-    non-prompt consumers (e.g. the desktop verify UI) read it instead of
-    re-detecting and drifting from the prompt.
-    """
+    """Compatibility facts that never control prompt or tool selection."""
 
     manifests: list[str]
     package_managers: list[str]
@@ -781,33 +595,50 @@ class ProjectFacts:
 
 
 def detect_project_facts(root: Path) -> ProjectFacts:
-    """Detect manifests, package manager(s), verify commands, and context files.
+    """Observe explicit project metadata for compatibility-only consumers."""
 
-    Cheap: stat calls plus reads of a couple of small files. The single source
-    of truth for both the prompt snapshot (:func:`_project_facts`) and the
-    gateway's ``project.facts`` — so the UI never re-sniffs verify commands.
-    """
-    manifests = [m for m in _PROJECT_MARKERS if m not in _CONTEXT_FILES and (root / m).is_file()]
+    manifests = [
+        marker
+        for marker in _PROJECT_MARKERS
+        if marker not in _CONTEXT_FILES and (root / marker).is_file()
+    ]
     package_managers = list(
-        dict.fromkeys(pm for lock, pm in (*_PY_LOCKFILES, *_JS_LOCKFILES) if (root / lock).is_file())
+        dict.fromkeys(
+            manager
+            for lockfile, manager in (*_PY_LOCKFILES, *_JS_LOCKFILES)
+            if (root / lockfile).is_file()
+        )
     )
-
     verify: list[str] = []
     if (root / "scripts" / "run_tests.sh").is_file():
         verify.append("scripts/run_tests.sh")
     if (root / "package.json").is_file():
         try:
-            scripts = json.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
+            scripts = json.loads(
+                _read_small(root / "package.json") or "{}"
+            ).get("scripts") or {}
         except (json.JSONDecodeError, AttributeError):
             scripts = {}
-        js_pm = next((pm for lock, pm in _JS_LOCKFILES if (root / lock).is_file()), "npm")
-        verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
-    if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(root / "pyproject.toml"):
+        js_manager = next(
+            (
+                manager
+                for lockfile, manager in _JS_LOCKFILES
+                if (root / lockfile).is_file()
+            ),
+            "npm",
+        )
+        verify.extend(
+            f"{js_manager} run {name}" for name in _VERIFY_TARGETS if name in scripts
+        )
+    if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(
+        root / "pyproject.toml"
+    ):
         verify.append("pytest")
     makefile = _read_small(root / "Makefile")
     if makefile:
         verify.extend(
-            f"make {name}" for name in _VERIFY_TARGETS
+            f"make {name}"
+            for name in _VERIFY_TARGETS
             if re.search(rf"^{re.escape(name)}\s*:", makefile, re.MULTILINE)
         )
 
@@ -815,41 +646,12 @@ def detect_project_facts(root: Path) -> ProjectFacts:
         manifests=manifests,
         package_managers=package_managers,
         verify_commands=list(dict.fromkeys(verify))[:_MAX_VERIFY_COMMANDS],
-        context_files=[c for c in _CONTEXT_FILES if (root / c).is_file()],
+        context_files=[name for name in _CONTEXT_FILES if (root / name).is_file()],
     )
 
 
-def _project_facts(root: Path) -> list[str]:
-    """Render :func:`detect_project_facts` as workspace-snapshot lines.
-
-    Hands the model its *verify loop* up front — which manifest, which package
-    manager, and the exact test/lint/build commands — instead of making it
-    rediscover them every session. Built once at prompt-build time; the string
-    output must stay byte-stable to preserve the prompt cache.
-    """
-    f = detect_project_facts(root)
-    facts: list[str] = []
-
-    if f.manifests:
-        line = f"- Project: {', '.join(f.manifests[:6])}"
-        if f.package_managers:
-            line += f" ({'/'.join(f.package_managers)})"
-        facts.append(line)
-    if f.verify_commands:
-        facts.append(f"- Verify: {'; '.join(f.verify_commands)}")
-    if f.context_files:
-        facts.append(f"- Context files: {', '.join(f.context_files)}")
-
-    return facts
-
-
 def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, Any]]:
-    """Structured project facts for ``cwd`` — ``None`` outside a workspace.
-
-    Same detection the system-prompt snapshot uses (git root, else marker root),
-    exposed for non-prompt consumers (the desktop verify UI) so they never
-    re-derive "are we coding?" or duplicate the verify-command sniffing.
-    """
+    """Return compatibility facts without selecting prompt or tool posture."""
     resolved = _resolve_cwd(cwd)
     root = _git_root(resolved) or _marker_root(resolved)
     if root is None:
@@ -866,17 +668,12 @@ def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, An
 
 
 def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
-    """Workspace snapshot for the system prompt (empty outside a workspace).
-
-    Git state (branch/status/commits) when the cwd is in a repo, plus detected
-    project facts (manifest, package manager, verify commands, context files)
-    — so marker-only (non-git) projects still get a snapshot.
-    """
+    """Structural git snapshot for an explicitly selected coding posture."""
     resolved = _resolve_cwd(cwd)
     git_root = _git_root(resolved)
-    root = git_root or _marker_root(resolved)
-    if root is None:
+    if git_root is None:
         return ""
+    root = git_root
 
     lines = ["Workspace (snapshot at session start — re-check with `git` before acting on it):"]
     lines.append(f"- Root: {root}")
@@ -915,5 +712,4 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
             lines.append("- Recent commits:")
             lines.extend(f"    {c}" for c in recent.splitlines())
 
-    lines.extend(_project_facts(root))
     return "\n".join(lines)

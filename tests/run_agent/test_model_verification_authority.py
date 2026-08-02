@@ -367,6 +367,111 @@ def test_runtime_effect_generation_delta_seeds_current_turn_paths():
     assert agent._turn_file_mutation_paths == {target}
 
 
+def test_runtime_effect_equal_generation_is_structurally_read_only():
+    authority = "runtime-effect-equal-root"
+    agent = SimpleNamespace(
+        _workspace_lease_authority=authority,
+        _turn_file_mutation_paths=set(),
+        _turn_isolated_worker_proof_error=None,
+    )
+    receipt = _worker_receipt(authority, edit_generation=4)
+
+    with patch(
+        "tools.terminal_tool.isolated_worker_proof_status_for_authority",
+        return_value=receipt,
+    ):
+        _apply_runtime_effect(
+            agent,
+            _runtime_effect(authority, 4),
+            isolated_worker_selected=True,
+        )
+
+    assert agent._turn_isolated_worker_baseline_generation == 4
+    assert agent._turn_file_mutation_paths == set()
+    assert agent._turn_isolated_worker_proof_error is None
+
+
+def test_runtime_effect_missing_baseline_records_structural_uncertainty():
+    authority = "runtime-effect-missing-baseline-root"
+    agent = SimpleNamespace(
+        _workspace_lease_authority=authority,
+        _turn_file_mutation_paths=set(),
+        _turn_isolated_worker_proof_error=None,
+    )
+    receipt = _worker_receipt(authority, edit_generation=5)
+
+    with patch(
+        "tools.terminal_tool.isolated_worker_proof_status_for_authority",
+        return_value=receipt,
+    ):
+        _apply_runtime_effect(
+            agent,
+            _runtime_effect(authority, None),
+            isolated_worker_selected=True,
+        )
+
+    assert agent._turn_isolated_worker_baseline_generation == 5
+    assert agent._turn_isolated_worker_proof_error == (
+        "runtime_effect_baseline_unavailable"
+    )
+    assert agent._turn_file_mutation_paths == {"/workspace"}
+
+
+def test_runtime_effect_generation_rollback_is_never_accepted():
+    authority = "runtime-effect-rollback-root"
+    agent = SimpleNamespace(
+        _workspace_lease_authority=authority,
+        _turn_file_mutation_paths=set(),
+        _turn_isolated_worker_proof_error=None,
+    )
+    receipt = _worker_receipt(authority, edit_generation=5)
+
+    with patch(
+        "tools.terminal_tool.isolated_worker_proof_status_for_authority",
+        return_value=receipt,
+    ):
+        _apply_runtime_effect(
+            agent,
+            _runtime_effect(authority, 6),
+            isolated_worker_selected=True,
+        )
+
+    assert agent._turn_isolated_worker_baseline_generation == 5
+    assert agent._turn_isolated_worker_proof_error == (
+        "runtime_effect_generation_rollback"
+    )
+    assert agent._turn_file_mutation_paths == {"/workspace"}
+
+
+def test_lazy_baseline_capture_keeps_only_exact_structural_generation():
+    authority = "lazy-baseline-root"
+    agent = SimpleNamespace(
+        _isolated_worker_backend_selected=True,
+        _turn_isolated_worker_baseline_attempted=False,
+        _turn_isolated_worker_baseline_generation=None,
+        _turn_isolated_worker_proof_error=None,
+        _workspace_lease_authority=authority,
+        session_id=authority,
+        _turn_file_mutation_paths=set(),
+    )
+    receipt = _worker_receipt(
+        authority,
+        edit_generation=7,
+        status="passed",
+    )
+
+    with patch(
+        "tools.terminal_tool.isolated_worker_proof_status_for_authority",
+        return_value=receipt,
+    ):
+        _capture_isolated_worker_baseline(agent)
+
+    assert agent._turn_isolated_worker_baseline_attempted is True
+    assert agent._turn_isolated_worker_baseline_generation == 7
+    assert agent._turn_isolated_worker_proof_error is None
+    assert agent._turn_file_mutation_paths == set()
+
+
 def test_runtime_effect_authority_mismatch_is_hard_failure():
     agent = SimpleNamespace(
         _workspace_lease_authority="actual-conversation-root",

@@ -92,13 +92,26 @@ def _init_code_repo(path):
 
 
 class TestCodingContextBlock:
-    def test_injected_when_active(self, monkeypatch, tmp_path):
+    def test_injected_only_when_explicitly_active(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        parts = _prompt_parts(agent)
+        with patch("agent.coding_context._coding_mode", return_value="on"):
+            parts = _prompt_parts(agent)
         assert "coding agent" in parts["stable"]
         assert "Workspace" in parts["context"]
+
+    def test_auto_does_not_route_from_repository_contents(
+        self, monkeypatch, tmp_path
+    ):
+        _init_code_repo(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
+
+        parts = _prompt_parts(agent)
+
+        assert "coding agent" not in parts["stable"]
+        assert "Workspace" not in parts["context"]
 
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
