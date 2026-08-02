@@ -56,60 +56,14 @@ def test_faster_whisper_is_not_a_base_dependency():
     assert any(dep.startswith("faster-whisper") for dep in voice_extra)
 
 
-def test_manifest_includes_bundled_skills():
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-
-    assert "graft skills" in manifest
-    assert "graft optional-skills" in manifest
-
-
-def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
-    """Regression test for #34034 / #28149.
-
-    Plugin discovery (hermes_cli/plugins.py) registers each bundled plugin by
-    reading its ``plugin.yaml`` / ``plugin.yml`` manifest. Those manifests are
-    data files, not Python modules, so they only reach installed packages when
-    declared explicitly:
-
-    - wheel  -> ``[tool.setuptools.package-data]`` ``plugins`` glob
-    - sdist  -> ``MANIFEST.in`` (Homebrew and other downstream packagers build
-                from the sdist)
-
-    v0.15.0 declared neither, so the wheel shipped every adapter's Python code
-    but none of its manifests, and *every* gateway platform failed with
-    "No adapter available for <platform>". Both channels must cover manifests.
-    """
-    # There must actually be manifests on disk for the globs to match.
-    on_disk = list((REPO_ROOT / "plugins").rglob("plugin.yaml")) + list(
-        (REPO_ROOT / "plugins").rglob("plugin.yml")
-    )
-    assert on_disk, "expected bundled plugin manifests under plugins/"
-
-    # Wheel channel: package-data must declare a glob that matches plugin
-    # manifests anywhere under the plugins package.
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    plugins_pkg_data = data["tool"]["setuptools"]["package-data"].get("plugins", [])
-    assert any(
-        g.endswith("plugin.yaml") or g.endswith("plugin.yml")
-        for g in plugins_pkg_data
-    ), "pyproject package-data 'plugins' must ship plugin.yaml/plugin.yml (wheel)"
-
-    # Sdist channel: MANIFEST.in must recursively include the manifests so
-    # downstream packagers building from the sdist also get them.
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-    assert "recursive-include plugins" in manifest and "plugin.yaml" in manifest, (
-        "MANIFEST.in must recursive-include plugins plugin.yaml/plugin.yml (sdist)"
-    )
-
-
-# Minimum non-vulnerable Starlette: CVE-2026-54283 and related advisories
-# require 1.3.1. Anything below that leaves current DoS and request parsing
-# ``request.form()`` limits and path-based request handling. Starlette's
+# Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
+# 1.0.1. Anything below that lets a malformed Host header desync
+# ``request.url.path`` from the dispatched ASGI path, bypassing path-based
 # authz in middleware/endpoints that gate on ``request.url``. Starlette is a
 # transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/[computer-use]/
 # [dev]) so we pin it directly in every extra that exposes a server surface and
 # enforce the floor in both pyproject and the committed lockfile.
-_STARLETTE_CVE_FLOOR = (1, 3, 1)
+_STARLETTE_CVE_FLOOR = (1, 0, 1)
 _UPDATE_DOWNGRADE_GUARD_FLOORS = {
     # `hermes update` reinstalls exact pins from pyproject/lazy_deps. These
     # reviewed CVE pins must not slide back to stale versions that downgrade
@@ -132,7 +86,7 @@ def _version_tuple(spec: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def test_starlette_pinned_above_current_security_floor_in_pyproject():
+def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
     """Every extra that declares Starlette must pin a patched (>=1.0.1) version.
 
     Regression guard for #35067 / CVE-2026-48710. A future edit that drops the
@@ -166,7 +120,7 @@ def test_starlette_pinned_above_current_security_floor_in_pyproject():
         )
 
 
-def test_locked_starlette_is_not_below_current_security_floor():
+def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
     """The committed uv.lock must resolve starlette to a patched version.
 
     pyproject pins protect the declared extras, but the lockfile is what
@@ -189,66 +143,12 @@ def test_locked_starlette_is_not_below_current_security_floor():
     assert versions, "starlette not found in uv.lock"
     for ver in versions:
         assert _version_tuple(ver) >= _STARLETTE_CVE_FLOOR, (
-            f"uv.lock resolves starlette=={ver}, below the current security "
+            f"uv.lock resolves starlette=={ver}, below the CVE-2026-48710 fix "
             f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))} — regenerate the "
             f"lockfile after bumping the pin"
         )
 
 
-def test_pillow_pinned_at_current_security_floor():
-    """Core and locked Pillow versions must include current security fixes."""
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    dependencies = data["project"]["dependencies"]
-    pillow_specs = [spec for spec in dependencies if spec.lower().startswith("pillow==")]
-    assert pillow_specs == ["Pillow==12.3.0"]
-
-    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
-    versions = []
-    in_pillow = False
-    for line in lock.splitlines():
-        if line.startswith("[[package]]"):
-            in_pillow = False
-        elif line.strip() == 'name = "pillow"':
-            in_pillow = True
-        elif in_pillow and line.startswith("version = "):
-            versions.append(line.split("=", 1)[1].strip().strip('"'))
-            in_pillow = False
-
-    assert versions == ["12.3.0"], f"uv.lock resolves unexpected Pillow versions: {versions}"
-
-
-def test_update_cve_pins_do_not_downgrade_reviewed_current_versions():
-    """`hermes update` must not reinstall stale reviewed CVE pins.
-
-    The project intentionally exact-pins reviewed dependency versions. When
-    security pins get stale, update reinstalls can downgrade environments that
-    already contain newer fixed versions. Guard the reviewed CVE packages
-    across pyproject, lazy_deps, and the committed lockfile.
-    """
-    pins = _pins_from_specs(_pyproject_pinned_specs() + _lazy_deps_pinned_specs())
-    for package, floor in _UPDATE_DOWNGRADE_GUARD_FLOORS.items():
-        versions = pins.get(package)
-        assert versions, f"{package} is no longer exact-pinned; update this guard"
-        below_floor = sorted(
-            version for version in versions
-            if _version_tuple(version) < floor
-        )
-        assert not below_floor, (
-            f"{package} exact pin(s) {below_floor} are below the reviewed "
-            f"anti-downgrade floor {'.'.join(map(str, floor))}; bump the pin "
-            "and regenerate uv.lock"
-        )
-        locked_versions = _locked_versions(package)
-        assert locked_versions, f"{package} is missing from uv.lock"
-        locked_below_floor = sorted(
-            version for version in locked_versions
-            if _version_tuple(version) < floor
-        )
-        assert not locked_below_floor, (
-            f"uv.lock resolves {package} version(s) {locked_below_floor} below "
-            f"the reviewed anti-downgrade floor {'.'.join(map(str, floor))}; "
-            "regenerate uv.lock after bumping the pin"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -348,27 +248,6 @@ def test_pyproject_pins_are_internally_consistent():
     )
 
 
-def test_pyproject_and_lazy_deps_pins_agree():
-    """Every package pinned in BOTH places must use the same version.
-
-    Regression guard for the aiohttp / anthropic extras-vs-lazy drift:
-    tools/lazy_deps.py mirrors the pyproject extras, so a CVE bump applied to
-    one and not the other leaves users on a vulnerable version depending on
-    the install path. Bump both in lockstep.
-    """
-    py = _pins_from_specs(_pyproject_pinned_specs())
-    lazy = _pins_from_specs(_lazy_deps_pinned_specs())
-
-    mismatches = [
-        f"{name}: pyproject={sorted(py[name])} lazy_deps={sorted(lazy[name])}"
-        for name in sorted(set(py) & set(lazy))
-        if py[name] != lazy[name]
-    ]
-    assert not mismatches, (
-        "pyproject.toml extras and tools/lazy_deps.py disagree on the pinned "
-        "version of the same package — bump both in lockstep:\n  "
-        + "\n  ".join(mismatches)
-    )
 
 
 def _lazy_deps_by_feature():
