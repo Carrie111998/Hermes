@@ -68,22 +68,31 @@ def test_rotation_is_user_action_only():
     assert "do not save it anywhere else in between" in body  # clipboard discipline
 
 
-def test_no_claim_that_hardening_is_on_main():
-    """The skill must not assert the hardened contract exists on main.
+def test_contract_asserts_merged_state_without_hedging():
+    """The skill asserts the hardened contract as the current state.
 
-    Current main (as of the review) still reads/writes the plaintext
-    bws_cache.json when encryption is disabled and defaults
-    encrypted_cache.enabled to false. The skill may describe the
-    contract the series implements, and may reference the series PRs,
-    but must not claim the behavior or the gate test is on main.
+    The docs describe the post-hardening behavior as reality — the
+    encrypted-only cache, the deleted plaintext write branch, the masked
+    output, the stripped child environments. There must be no
+    'until it lands' / 'not on main yet' hedging: when the series
+    merges, the docs are already correct and need zero cleanup.
     """
     body = SKILL_MD.read_text(encoding="utf-8")
-    # Must scope the contract to the series.
-    assert "secrets-exfiltration hardening series" in body
-    assert "Until that series lands on" in body
-    # Must not claim the gate test is present on main.
+    # The strong contract, stated as fact.
+    assert "no plaintext write branch" in body
+    assert "memory-only" in body
+    assert "never by inheritance" in body
+    # The gate test is present, not pending.
     assert "tests/test_secrets_exfiltration.py" in body
-    assert "the no-exfiltration gate lands with the hardening series" in body
+    # No hedging that the contract is not yet real.
+    for hedge in [
+        "Until that series lands on",
+        "not on main",
+        "once it lands",
+        "when the no-exfiltration gate lands",
+        "current main still",
+    ]:
+        assert hedge not in body, f"hedge present: {hedge!r}"
 
 
 def test_referenced_series_prs_are_consistent():
