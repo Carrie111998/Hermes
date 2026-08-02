@@ -673,3 +673,62 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_char_from_boundary_cut_not_flagged(self, tmp_path):
+        """#76886: `head -c 1000` can slice a multibyte char, and
+        errors="replace" turns the dangling tail into a single U+FFFD at the
+        *end* of the sample. That lone trailing artifact must not condemn a
+        valid UTF-8 file as binary."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # 999 ASCII bytes + the first byte of 'ç' (0xC3) -> one trailing U+FFFD.
+        boundary_sample = ("a" * 999) + "�"
+        assert ops._is_likely_binary("notes.md", boundary_sample) is False
+
+    def test_interior_replacement_char_still_flagged(self, tmp_path):
+        """A trailing-only exemption must not weaken detection of genuinely
+        non-UTF-8 content, whose replacement chars land in the interior."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # U+FFFD before the end (even with a trailing one too) => still binary.
+        assert ops._is_likely_binary("notes.txt", "ab�cd�") is True
+
+    def test_read_file_valid_utf8_across_1000_byte_boundary(self, tmp_path):
+        """End-to-end repro of #76886: a valid UTF-8 file whose non-ASCII
+        character straddles byte 1000 must read as text, not be rejected as
+        binary. Exercises the real `head -c 1000` sample path.
+
+        The env decodes stdout with errors="replace" (as the production
+        terminal backend does, tools/environments/local.py), so the sliced
+        multibyte tail surfaces as a single trailing U+FFFD — the artifact
+        this fix must tolerate."""
+        # 'ç' (0xC3 0xA7) starts at byte 1000: byte 1000 is 0xC3, so the
+        # `head -c 1000` sample ends mid-character.
+        fails = tmp_path / "fails.md"
+        fails.write_bytes(b"a" * 999 + "ç\nx\n".encode("utf-8"))
+
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+
+        def execute(command, **kwargs):
+            completed = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                input=kwargs.get("stdin_data"),
+            )
+            # Mirror the production backend: decode bytes with
+            # errors="replace" so a boundary-sliced multibyte char does not
+            # raise, exactly as tools/environments/local.py does.
+            return {
+                "output": completed.stdout.decode("utf-8", errors="replace"),
+                "returncode": completed.returncode,
+            }
+
+        env.execute = execute
+
+        ops = ShellFileOperations(env)
+        result = ops.read_file(str(fails))
+
+        assert result.is_binary is False, "boundary-cut UTF-8 wrongly flagged binary"
+        assert result.error is None
+        assert "ç" in (result.content or "")
+

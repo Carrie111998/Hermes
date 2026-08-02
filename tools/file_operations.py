@@ -893,7 +893,19 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # Exception (#76886): the sample is taken with `head -c 1000`, so a
+            # file longer than the sample can be sliced in the middle of a
+            # multibyte character. Python's errors="replace" collapses that
+            # dangling, incomplete-but-valid trailing sequence into exactly one
+            # U+FFFD at the very end of the string \u2014 an artifact of the cut, not
+            # of the file's bytes. Ignore a single *trailing* U+FFFD so valid
+            # UTF-8 (Turkish, CJK, emoji \u2026) still reads when a non-ASCII char
+            # straddles the 1000-byte boundary; any U+FFFD in the interior
+            # still marks genuinely non-UTF-8 content.
+            sample = content_sample[:1000]
+            interior = sample[:-1] if sample.endswith("\ufffd") else sample
+            if "\ufffd" in interior:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
