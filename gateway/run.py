@@ -2737,6 +2737,11 @@ def _reap_gateway_turn_processes(
     process. The newer turn snapshots its own baseline independently, so
     skipping here does not leave anything permanently unreaped.
     """
+    if not task_id:
+        # ProcessSession.task_id defaults to "" for sessionless callers, so a
+        # blank id would match (and kill) every unrelated empty-task process
+        # instead of this turn's own. Nothing session-scoped to reap.
+        return 0
     if is_still_current is not None:
         try:
             if not is_still_current():
@@ -24987,9 +24992,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     done, _ = await asyncio.wait(
                         {_executor_task}, timeout=_POLL_INTERVAL
                     )
-                    if _turn_timeout_fired.is_set():
-                        _inactivity_timeout = True
-                        break
                     if done:
                         # Prefer the real result when the worker finished,
                         # even if the watchdog fired in the same window: the
