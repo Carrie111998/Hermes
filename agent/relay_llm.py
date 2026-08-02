@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
-import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
@@ -14,14 +11,6 @@ from typing import Any
 from agent import relay_runtime
 
 logger = logging.getLogger(__name__)
-
-
-_PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
-    {"reasoning_content", "reasoning_details"}
-)
-_RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
-    {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
-)
 
 
 def execute(
@@ -34,79 +23,19 @@ def execute(
     metadata: dict[str, Any] | None = None,
     defer_logical_completion: bool = False,
 ) -> Any:
-    """Run one non-streaming physical provider attempt through Relay."""
-    runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
-    if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return callback(request)
-    logical = _logical_parent(runtime, session, parent, metadata)
-    parent = logical[1] if logical is not None else parent
-
-    relay_request_body = _relay_request_body(request, metadata)
-    relay_request = runtime.relay.LLMRequest({}, relay_request_body)
-    codec_baseline_body = _codec_round_trip_request_body(
-        runtime.relay,
-        relay_request,
-        relay_request_body=relay_request_body,
-        metadata=metadata,
+    """Run one direct, model-authoritative non-streaming provider attempt."""
+    logical = _begin_logical_notification(
+        _execution_notification_metadata(metadata, name=name, model_name=model_name),
+        session_id=session_id,
     )
-    raw_response: dict[str, Any] = {}
-    callback_error: BaseException | None = None
-    callback_context = contextvars.copy_context()
-
-    def invoke(next_request: Any) -> Any:
-        nonlocal callback_error
-        try:
-            final_request = _provider_request(
-                request,
-                next_request,
-                relay_request_body=relay_request_body,
-                codec_baseline_body=codec_baseline_body,
-                metadata=metadata,
-            )
-            raw = callback_context.copy().run(callback, final_request)
-        except BaseException as exc:
-            callback_error = exc
-            raise
-        raw_response["value"] = raw
-        raw_response["json"] = _jsonable(raw)
-        return raw_response["json"]
-
     try:
-        managed = _run_awaitable(
-            runtime.run_in_session_async(
-                session,
-                runtime.relay.llm.execute,
-                name,
-                relay_request,
-                invoke,
-                handle=parent,
-                metadata=_jsonable(metadata or {}),
-                model_name=model_name,
-                codec=_codec(runtime.relay, metadata),
-                response_codec=_codec(runtime.relay, metadata),
-            )
-        )
-    except BaseException as exc:
-        if (
-            callback_error is not None
-            and relay_runtime._is_relay_wrapped_callback_error(exc, callback_error)
-        ):
-            raise callback_error
-        if _recover_successful_callback(
-            raw_response,
-            relay_error=exc,
-            callback_error=callback_error,
-            logical=logical,
-            defer_logical_completion=defer_logical_completion,
-        ):
-            return raw_response["value"]
+        response = callback(request)
+    except BaseException:
+        _complete_logical(logical, outcome="failed")
         raise
-
     if not defer_logical_completion:
         _complete_logical(logical, outcome="success")
-    if "value" in raw_response and _json_equal(managed, raw_response["json"]):
-        return raw_response["value"]
-    return _namespace(managed)
+    return response
 
 
 async def execute_async(
@@ -119,84 +48,19 @@ async def execute_async(
     metadata: dict[str, Any] | None = None,
     defer_logical_completion: bool = False,
 ) -> Any:
-    """Run one asynchronous physical provider attempt through Relay."""
-    runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
-    if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return await callback(request)
-    logical = _logical_parent(runtime, session, parent, metadata)
-    parent = logical[1] if logical is not None else parent
-
-    relay_request_body = _relay_request_body(request, metadata)
-    relay_request = runtime.relay.LLMRequest({}, relay_request_body)
-    codec_baseline_body = _codec_round_trip_request_body(
-        runtime.relay,
-        relay_request,
-        relay_request_body=relay_request_body,
-        metadata=metadata,
+    """Run one direct, model-authoritative async provider attempt."""
+    logical = _begin_logical_notification(
+        _execution_notification_metadata(metadata, name=name, model_name=model_name),
+        session_id=session_id,
     )
-    raw_response: dict[str, Any] = {}
-    callback_error: BaseException | None = None
-    callback_context = contextvars.copy_context()
-
-    async def invoke(next_request: Any) -> Any:
-        nonlocal callback_error
-        try:
-            final_request = _provider_request(
-                request,
-                next_request,
-                relay_request_body=relay_request_body,
-                codec_baseline_body=codec_baseline_body,
-                metadata=metadata,
-            )
-            async def call_provider() -> Any:
-                return await callback(final_request)
-
-            task = callback_context.copy().run(
-                asyncio.create_task,
-                call_provider(),
-            )
-            raw = await task
-        except BaseException as exc:
-            callback_error = exc
-            raise
-        raw_response["value"] = raw
-        raw_response["json"] = _jsonable(raw)
-        return raw_response["json"]
-
     try:
-        managed = await runtime.run_in_session_async(
-            session,
-            runtime.relay.llm.execute,
-            name,
-            relay_request,
-            invoke,
-            handle=parent,
-            metadata=_jsonable(metadata or {}),
-            model_name=model_name,
-            codec=_codec(runtime.relay, metadata),
-            response_codec=_codec(runtime.relay, metadata),
-        )
-    except BaseException as exc:
-        if (
-            callback_error is not None
-            and relay_runtime._is_relay_wrapped_callback_error(exc, callback_error)
-        ):
-            raise callback_error
-        if _recover_successful_callback(
-            raw_response,
-            relay_error=exc,
-            callback_error=callback_error,
-            logical=logical,
-            defer_logical_completion=defer_logical_completion,
-        ):
-            return raw_response["value"]
+        response = await callback(request)
+    except BaseException:
+        _complete_logical(logical, outcome="failed")
         raise
-
     if not defer_logical_completion:
         _complete_logical(logical, outcome="success")
-    if "value" in raw_response and _json_equal(managed, raw_response["json"]):
-        return raw_response["value"]
-    return _namespace(managed)
+    return response
 
 
 def execute_current(
@@ -305,9 +169,26 @@ def provider_stream(
     observer: Callable[[Any], None] | None = None,
     accept_chunk: Callable[[Any], bool] | None = None,
     on_terminal: Callable[[str], None] | None = None,
+    lifecycle_metadata: dict[str, Any] | None = None,
+    lifecycle_session_id: str | None = None,
     completed_response_predicate: Callable[[Any], bool] | None = None,
 ) -> "ProviderLlmStream":
-    """Open one direct, model-authoritative provider stream."""
+    """Open one direct, model-authoritative provider stream.
+
+    Lifecycle observation receives detached structural metadata and a terminal
+    outcome only.  It never receives the request, provider callback, chunks,
+    or final response and therefore cannot alter model execution.
+    """
+    logical = _begin_logical_notification(
+        lifecycle_metadata,
+        session_id=lifecycle_session_id,
+    )
+
+    def notify_terminal(outcome: str) -> None:
+        _complete_logical(logical, outcome=outcome)
+        if on_terminal is not None:
+            on_terminal(outcome)
+
     return ProviderLlmStream(
         request,
         stream_factory,
@@ -315,7 +196,7 @@ def provider_stream(
         on_provider_chunk=on_provider_chunk,
         observer=observer,
         accept_chunk=accept_chunk,
-        on_terminal=on_terminal,
+        on_terminal=(notify_terminal if logical is not None or on_terminal else None),
         completed_response_predicate=completed_response_predicate,
     )
 
@@ -640,14 +521,42 @@ def _logical_parent(
                         "hermes.call_role": str(
                             (metadata or {}).get("call_role") or "primary"
                         ),
+                        "hermes.provider": str(
+                            (metadata or {}).get("provider") or "unknown"
+                        ),
+                        "hermes.model": str(
+                            (metadata or {}).get("model") or "unknown"
+                        ),
+                        "hermes.api_mode": str(
+                            (metadata or {}).get("api_mode") or "unknown"
+                        ),
                     },
                 )
                 turn.logical_llm_calls[request_id] = handle
     return turn, handle, request_id
 
 
+def _execution_notification_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    name: str,
+    model_name: str,
+) -> dict[str, Any]:
+    """Return a detached scalar-only lifecycle description."""
+    source = metadata or {}
+    return {
+        "api_request_id": str(source.get("api_request_id") or ""),
+        "call_role": str(source.get("call_role") or "primary"),
+        "api_mode": str(source.get("api_mode") or "unknown"),
+        "provider": str(name or source.get("provider") or "unknown"),
+        "model": str(model_name or source.get("model") or "unknown"),
+    }
+
+
 def _begin_logical_notification(
     metadata: dict[str, Any] | None,
+    *,
+    session_id: str | None = None,
 ) -> tuple[relay_runtime.RelayTurnContext, Any, str] | None:
     """Open an optional Relay lifecycle scope without mediating execution.
 
@@ -656,7 +565,7 @@ def _begin_logical_notification(
     missing runtime, disabled observer, or notification failure therefore
     falls back to the provider's raw stream contract.
     """
-    turn = relay_runtime.active_turn()
+    turn = relay_runtime.active_turn(session_id)
     request_id = str((metadata or {}).get("api_request_id") or "")
     if turn is None or not request_id:
         return None
@@ -726,37 +635,6 @@ def _complete_logical(
                 turn.logical_llm_calls.pop(request_id, None)
 
 
-def _recover_successful_callback(
-    raw_response: dict[str, Any],
-    *,
-    relay_error: BaseException,
-    callback_error: BaseException | None,
-    logical: tuple[relay_runtime.RelayTurnContext, Any, str] | None,
-    defer_logical_completion: bool,
-) -> bool:
-    if (
-        not isinstance(relay_error, Exception)
-        or callback_error is not None
-        or "value" not in raw_response
-    ):
-        return False
-    logger.warning(
-        "NeMo Relay LLM post-processing failed after provider success; "
-        "returning the provider response",
-        exc_info=True,
-    )
-    if not defer_logical_completion:
-        _complete_logical(logical, outcome="success")
-    return True
-
-
-def _is_cancellation(error: BaseException) -> bool:
-    return isinstance(
-        error,
-        (asyncio.CancelledError, InterruptedError, KeyboardInterrupt),
-    )
-
-
 def complete_logical_call(api_request_id: str, *, outcome: str) -> None:
     """Complete the active turn's logical LLM call after caller validation."""
     turn = relay_runtime.active_turn()
@@ -766,225 +644,6 @@ def complete_logical_call(api_request_id: str, *, outcome: str) -> None:
         handle = turn.logical_llm_calls.get(api_request_id)
     if handle is not None:
         _complete_logical((turn, handle, api_request_id), outcome=outcome)
-
-
-def _provider_request(
-    original: dict[str, Any],
-    request: Any,
-    *,
-    relay_request_body: dict[str, Any],
-    codec_baseline_body: dict[str, Any] | None,
-    metadata: dict[str, Any] | None,
-) -> dict[str, Any]:
-    content = getattr(request, "content", request)
-    if not isinstance(content, dict):
-        content = relay_request_body
-    if codec_baseline_body is None or _json_equal(content, relay_request_body):
-        final = dict(original)
-    else:
-        baseline = codec_baseline_body
-        intercepted = _provider_request_body(content, metadata)
-        final = dict(original)
-        # Typed codecs may not represent provider-specific fields. Overlay only
-        # values that changed from the codec-facing baseline so unrelated
-        # intercepts cannot delete or normalize unknown provider arguments.
-        for key in baseline.keys() | intercepted.keys():
-            if key not in intercepted:
-                final.pop(key, None)
-            elif key not in baseline or not _json_equal(
-                intercepted[key],
-                baseline[key],
-            ):
-                final[key] = intercepted[key]
-        _restore_provider_message_extensions(
-            original,
-            final,
-            baseline=baseline,
-            intercepted=intercepted,
-        )
-    headers = getattr(request, "headers", None)
-    if isinstance(headers, dict):
-        headers = {
-            key: value
-            for key, value in headers.items()
-            if str(key).lower() not in _RELAY_INTERNAL_PROVIDER_HEADERS
-        }
-    if headers:
-        final["extra_headers"] = {
-            **dict(final.get("extra_headers") or {}),
-            **headers,
-        }
-    return final
-
-
-def _relay_request_body(
-    request: dict[str, Any], metadata: dict[str, Any] | None
-) -> dict[str, Any]:
-    body = _jsonable(request)
-    if not isinstance(body, dict):
-        return {}
-    # The Responses SDK accepts ``tools=None`` as "no tools", while Relay's
-    # typed Responses codec correctly expects either an array or an absent
-    # field. Normalize only the codec-facing copy; the original provider
-    # request is restored when no interceptor changes it.
-    if str((metadata or {}).get("api_mode") or "") == "codex_responses":
-        body = dict(body)
-        if body.get("tools") is None:
-            body.pop("tools", None)
-        elif isinstance(body.get("tools"), list):
-            body["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        key: value
-                        for key, value in tool.items()
-                        if key != "type"
-                    },
-                }
-                if isinstance(tool, dict)
-                and tool.get("type") == "function"
-                and "function" not in tool
-                else tool
-                for tool in body["tools"]
-            ]
-    elif str((metadata or {}).get("api_mode") or "") == "chat_completions":
-        tools = body.get("tools")
-        if isinstance(tools, list):
-            body = dict(body)
-            body["tools"] = [
-                {"type": "function", **tool}
-                if isinstance(tool, dict)
-                and "function" in tool
-                and "type" not in tool
-                else tool
-                for tool in tools
-            ]
-    return body
-
-
-def _restore_provider_message_extensions(
-    original: dict[str, Any],
-    final: dict[str, Any],
-    *,
-    baseline: dict[str, Any],
-    intercepted: dict[str, Any],
-) -> None:
-    """Restore provider wire fields that Relay's typed codec cannot represent."""
-    original_messages = original.get("messages")
-    final_messages = final.get("messages")
-    baseline_messages = baseline.get("messages")
-    intercepted_messages = intercepted.get("messages")
-    if not all(
-        isinstance(messages, list)
-        for messages in (
-            original_messages,
-            final_messages,
-            baseline_messages,
-            intercepted_messages,
-        )
-    ):
-        return
-    if not (
-        len(original_messages)
-        == len(final_messages)
-        == len(baseline_messages)
-        == len(intercepted_messages)
-    ):
-        return
-    for original_message, final_message, baseline_message, intercepted_message in zip(
-        original_messages,
-        final_messages,
-        baseline_messages,
-        intercepted_messages,
-        strict=True,
-    ):
-        if not all(
-            isinstance(message, dict)
-            for message in (
-                original_message,
-                final_message,
-                baseline_message,
-                intercepted_message,
-            )
-        ):
-            continue
-        for key in _PROVIDER_MESSAGE_EXTENSION_KEYS:
-            if (
-                key in original_message
-                and key not in baseline_message
-                and key not in intercepted_message
-                and key not in final_message
-            ):
-                final_message[key] = original_message[key]
-
-
-def _codec_round_trip_request_body(
-    relay: Any,
-    relay_request: Any,
-    *,
-    relay_request_body: dict[str, Any],
-    metadata: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    """Return the codec-only request shape used to identify real rewrites."""
-    codec = _codec(relay, metadata)
-    if codec is None:
-        return _provider_request_body(relay_request_body, metadata)
-    try:
-        annotated = codec.decode(relay_request)
-        encoded = codec.encode(annotated, relay_request)
-        content = getattr(encoded, "content", encoded)
-        if isinstance(content, dict):
-            return _provider_request_body(content, metadata)
-    except Exception:
-        logger.warning(
-            "NeMo Relay request codec baseline failed; ignoring request rewrites",
-            exc_info=True,
-        )
-        return None
-    logger.warning(
-        "NeMo Relay request codec returned an unsupported baseline; "
-        "ignoring request rewrites"
-    )
-    return None
-
-
-def _provider_request_body(
-    content: dict[str, Any], metadata: dict[str, Any] | None
-) -> dict[str, Any]:
-    body = dict(content)
-    if str((metadata or {}).get("api_mode") or "") != "codex_responses":
-        return body
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return body
-    body["tools"] = [
-        {
-            "type": "function",
-            **dict(tool["function"]),
-        }
-        if isinstance(tool, dict)
-        and tool.get("type") == "function"
-        and isinstance(tool.get("function"), dict)
-        else tool
-        for tool in tools
-    ]
-    return body
-
-
-def _codec(relay: Any, metadata: dict[str, Any] | None) -> Any:
-    api_mode = str((metadata or {}).get("api_mode") or "")
-    codecs = getattr(relay, "codecs", None)
-    if codecs is None:
-        return None
-    if api_mode == "chat_completions":
-        codec = getattr(codecs, "OpenAIChatCodec", None)
-    elif api_mode == "anthropic_messages":
-        codec = getattr(codecs, "AnthropicMessagesCodec", None)
-    elif api_mode == "codex_responses":
-        codec = getattr(codecs, "OpenAIResponsesCodec", None)
-    else:
-        codec = None
-    return codec() if callable(codec) else None
 
 
 def _jsonable(value: Any) -> Any:
@@ -1019,24 +678,3 @@ def _namespace(value: Any) -> Any:
     if isinstance(value, list):
         return [_namespace(item) for item in value]
     return value
-
-
-def _json_equal(left: Any, right: Any) -> bool:
-    try:
-        return json.dumps(
-            _jsonable(left), sort_keys=True, separators=(",", ":")
-        ) == json.dumps(_jsonable(right), sort_keys=True, separators=(",", ":"))
-    except (TypeError, ValueError):
-        return False
-
-
-def _run_awaitable(value: Any) -> Any:
-    if not inspect.isawaitable(value):
-        return value
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(value)
-    raise RuntimeError(
-        "Synchronous Relay LLM execution cannot run on an event-loop thread"
-    )

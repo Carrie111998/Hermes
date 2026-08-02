@@ -87,8 +87,15 @@ class TestStreamingAccumulator:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        agent._current_api_request_id = "chat-primary-1"
 
-        response = agent._interruptible_streaming_api_call({})
+        from agent import relay_llm
+
+        with patch(
+            "agent.relay_llm.provider_stream",
+            wraps=relay_llm.provider_stream,
+        ) as provider_stream_call:
+            response = agent._interruptible_streaming_api_call({})
 
         assert response.choices[0].message.content == "Hello world!"
         assert response.choices[0].message.tool_calls is None
@@ -96,6 +103,13 @@ class TestStreamingAccumulator:
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
         mock_client.chat.completions.create.assert_called_once()
+        assert provider_stream_call.call_args.kwargs["lifecycle_metadata"] == {
+            "api_request_id": "chat-primary-1",
+            "call_role": "primary",
+            "provider": "provider",
+            "model": agent.model,
+            "api_mode": "chat_completions",
+        }
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")

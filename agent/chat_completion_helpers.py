@@ -2323,6 +2323,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _open_bedrock_stream,
                     on_stream_created=_bedrock_stream_created,
                     accept_chunk=_accept_bedrock_event,
+                    lifecycle_metadata={
+                        "api_request_id": getattr(
+                            agent, "_current_api_request_id", None
+                        ),
+                        "call_role": (
+                            "delegated"
+                            if getattr(agent, "is_subagent", False)
+                            else "fallback"
+                            if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                            else "primary"
+                        ),
+                        "provider": str(
+                            getattr(agent, "provider", "") or "bedrock"
+                        ),
+                        "model": str(getattr(agent, "model", "") or ""),
+                        "api_mode": "custom",
+                    },
+                    lifecycle_session_id=str(
+                        getattr(agent, "session_id", "") or ""
+                    ),
                     completed_response_predicate=lambda response: bool(
                         getattr(response, "choices", None)
                     ),
@@ -2779,6 +2799,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _open_stream,
                 on_stream_created=_stream_created,
                 accept_chunk=_accept_stream_chunk,
+                lifecycle_metadata={
+                    "api_request_id": getattr(
+                        agent, "_current_api_request_id", None
+                    ),
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "provider": str(
+                        getattr(agent, "provider", "") or "provider"
+                    ),
+                    "model": str(getattr(agent, "model", "") or ""),
+                    "api_mode": "chat_completions",
+                },
+                lifecycle_session_id=str(
+                    getattr(agent, "session_id", "") or ""
+                ),
                 completed_response_predicate=lambda value: hasattr(value, "choices"),
             )
         )
@@ -3217,6 +3257,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 on_stream_created=_anthropic_stream_created,
                 on_provider_chunk=accumulator.observe,
                 accept_chunk=_accept_anthropic_event,
+                lifecycle_metadata={
+                    "api_request_id": getattr(
+                        agent, "_current_api_request_id", None
+                    ),
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "provider": str(
+                        getattr(agent, "provider", "") or "anthropic"
+                    ),
+                    "model": str(getattr(agent, "model", "") or ""),
+                    "api_mode": "anthropic_messages",
+                },
+                lifecycle_session_id=str(
+                    getattr(agent, "session_id", "") or ""
+                ),
             )
         )
         try:

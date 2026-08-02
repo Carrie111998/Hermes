@@ -55,14 +55,6 @@ def test_relay_streaming_attacks_never_enter_provider_boundary(
         "resolve_execution_context",
         resolve_execution_context,
     )
-    monkeypatch.setattr(
-        relay_llm,
-        "_provider_request",
-        lambda *_args, **_kwargs: pytest.fail(
-            f"Relay request rewrite invoked: {attack}"
-        ),
-    )
-
     request = {
         "model": "trusted-model",
         "messages": [{"role": "user", "content": "exact input"}],
@@ -240,6 +232,7 @@ def _make_agent(*, api_mode: str):
 
 def test_anthropic_final_response_is_exact_provider_message() -> None:
     agent = _make_agent(api_mode="anthropic_messages")
+    agent._current_api_request_id = "anthropic-primary-1"
     usage = SimpleNamespace(
         input_tokens=17,
         output_tokens=9,
@@ -294,11 +287,22 @@ def test_anthropic_final_response_is_exact_provider_message() -> None:
     request_client.messages.stream.return_value = manager
     agent._create_request_anthropic_client = lambda *args, **kwargs: request_client
 
-    response = agent._interruptible_streaming_api_call(
-        {"model": "claude-exact", "messages": []}
-    )
+    with patch(
+        "agent.relay_llm.provider_stream",
+        wraps=relay_llm.provider_stream,
+    ) as provider_stream_call:
+        response = agent._interruptible_streaming_api_call(
+            {"model": "claude-exact", "messages": []}
+        )
 
     request_client.messages.stream.assert_called_once()
+    assert provider_stream_call.call_args.kwargs["lifecycle_metadata"] == {
+        "api_request_id": "anthropic-primary-1",
+        "call_role": "primary",
+        "provider": "anthropic",
+        "model": agent.model,
+        "api_mode": "anthropic_messages",
+    }
     assert response is final_message
     assert response.content[0].thinking == "trusted reasoning"
     assert response.content[1].text == "trusted text"
@@ -312,6 +316,7 @@ def test_anthropic_final_response_is_exact_provider_message() -> None:
 def test_bedrock_final_response_preserves_reasoning_tool_usage_and_finish() -> None:
     pytest.importorskip("botocore", reason="botocore required for Bedrock parity")
     agent = _make_agent(api_mode="bedrock_converse")
+    agent._current_api_request_id = "bedrock-primary-1"
     events = [
         {"messageStart": {"role": "assistant"}},
         {
@@ -368,15 +373,28 @@ def test_bedrock_final_response_preserves_reasoning_tool_usage_and_finish() -> N
     client = MagicMock()
     client.converse_stream.return_value = {"stream": iter(events)}
 
-    with patch(
-        "agent.bedrock_adapter._get_bedrock_runtime_client",
-        return_value=client,
+    with (
+        patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=client,
+        ),
+        patch(
+            "agent.relay_llm.provider_stream",
+            wraps=relay_llm.provider_stream,
+        ) as provider_stream_call,
     ):
         response = agent._interruptible_streaming_api_call(
             {"modelId": "bedrock-exact", "messages": []}
         )
 
     client.converse_stream.assert_called_once()
+    assert provider_stream_call.call_args.kwargs["lifecycle_metadata"] == {
+        "api_request_id": "bedrock-primary-1",
+        "call_role": "primary",
+        "provider": "bedrock",
+        "model": agent.model,
+        "api_mode": "custom",
+    }
     message = response.choices[0].message
     assert message.reasoning_content == "trusted reasoning"
     assert message.content == "trusted text"
@@ -392,6 +410,7 @@ def test_bedrock_final_response_preserves_reasoning_tool_usage_and_finish() -> N
 
 def test_codex_final_response_preserves_items_reasoning_usage_and_status() -> None:
     agent = _make_agent(api_mode="codex_responses")
+    agent._current_api_request_id = "codex-primary-1"
     reasoning_deltas: list[str] = []
     agent.reasoning_callback = reasoning_deltas.append
     reasoning_item = SimpleNamespace(
@@ -446,12 +465,23 @@ def test_codex_final_response_preserves_items_reasoning_usage_and_status() -> No
     request_client = MagicMock()
     request_client.responses.create.return_value = raw_stream
 
-    response = agent._run_codex_stream(
-        {"model": "codex-exact", "instructions": "exact", "input": []},
-        client=request_client,
-    )
+    with patch(
+        "agent.relay_llm.provider_stream",
+        wraps=relay_llm.provider_stream,
+    ) as provider_stream_call:
+        response = agent._run_codex_stream(
+            {"model": "codex-exact", "instructions": "exact", "input": []},
+            client=request_client,
+        )
 
     request_client.responses.create.assert_called_once()
+    assert provider_stream_call.call_args.kwargs["lifecycle_metadata"] == {
+        "api_request_id": "codex-primary-1",
+        "call_role": "primary",
+        "provider": "codex",
+        "model": "codex-exact",
+        "api_mode": "codex_responses",
+    }
     assert raw_stream.closed is True
     assert response.output == [reasoning_item, tool_item]
     assert response.output[0] is reasoning_item

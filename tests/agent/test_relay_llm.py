@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -143,6 +142,72 @@ def test_stream_ignores_request_and_chunk_intercepts(relay_turn):
     assert turn.logical_llm_calls == {}
 
 
+def test_primary_stream_restores_only_detached_lifecycle_observation(
+    relay_turn,
+    monkeypatch,
+):
+    relay, turn = relay_turn
+    request = {
+        "model": "trusted-model",
+        "messages": [{"role": "user", "content": "sensitive-prompt"}],
+        "tools": [{"type": "function", "function": {"name": "terminal"}}],
+    }
+    chunks = [SimpleNamespace(delta="sensitive-provider-chunk")]
+    provider_requests = []
+    pushes = []
+    outcomes = []
+    original_push = relay.scope.push
+    original_pop = relay.scope.pop
+
+    def record_push(*args, **kwargs):
+        pushes.append((args, kwargs))
+        return original_push(*args, **kwargs)
+
+    def record_pop(*args, **kwargs):
+        outcomes.append((kwargs.get("output") or {}).get("outcome"))
+        return original_pop(*args, **kwargs)
+
+    def forbidden_relay_execute(*_args, **_kwargs):
+        raise AssertionError("Relay must not mediate primary provider streaming")
+
+    monkeypatch.setattr(relay.scope, "push", record_push)
+    monkeypatch.setattr(relay.scope, "pop", record_pop)
+    monkeypatch.setattr(relay.llm, "execute", forbidden_relay_execute)
+
+    def provider(provider_request):
+        provider_requests.append(provider_request)
+        return iter(chunks)
+
+    stream = relay_llm.provider_stream(
+        request,
+        provider,
+        lifecycle_metadata={
+            "api_request_id": "primary-stream-1",
+            "call_role": "primary",
+            "provider": "trusted-provider",
+            "model": "trusted-model",
+            "api_mode": "chat_completions",
+        },
+        lifecycle_session_id="session-1",
+    )
+
+    received = list(stream)
+
+    assert provider_requests == [request]
+    assert provider_requests[0] is request
+    assert received == chunks
+    assert received[0] is chunks[0]
+    assert outcomes == ["success"]
+    assert turn.logical_llm_calls == {}
+    assert len(pushes) == 1
+    lifecycle_payload = json.dumps(pushes, default=str)
+    assert "primary-stream-1" not in lifecycle_payload
+    assert "sensitive-prompt" not in lifecycle_payload
+    assert "sensitive-provider-chunk" not in lifecycle_payload
+    assert "trusted-provider" in lifecycle_payload
+    assert "trusted-model" in lifecycle_payload
+
+
 
 
 
@@ -235,7 +300,6 @@ async def test_async_provider_callback_preserves_caller_context(relay_turn):
 
 def test_anthropic_stream_callbacks_do_not_reenter_captured_context(
     relay_turn,
-    monkeypatch,
 ):
     del relay_turn
     caller_value = contextvars.ContextVar(
@@ -243,22 +307,6 @@ def test_anthropic_stream_callbacks_do_not_reenter_captured_context(
         default="default",
     )
     caller_value.set("caller")
-    callback_context = contextvars.copy_context()
-    real_copy_context = contextvars.copy_context
-    copy_count = 0
-
-    def capture_callback_context():
-        nonlocal copy_count
-        copy_count += 1
-        if copy_count == 1:
-            return callback_context
-        return real_copy_context()
-
-    monkeypatch.setattr(
-        relay_llm.contextvars,
-        "copy_context",
-        capture_callback_context,
-    )
     observed = []
     accumulator = relay_llm.AnthropicStreamAccumulator()
 
@@ -301,26 +349,7 @@ def test_anthropic_stream_callbacks_do_not_reenter_captured_context(
         },
     )
 
-    entered = threading.Event()
-    release = threading.Event()
-
-    def hold_callback_context() -> None:
-        def wait() -> None:
-            entered.set()
-            assert release.wait(timeout=5)
-
-        callback_context.run(wait)
-
-    holder = threading.Thread(target=hold_callback_context)
-    holder.start()
-    assert entered.wait(timeout=1)
-    try:
-        assert list(stream) == chunks
-    finally:
-        release.set()
-        holder.join(timeout=1)
-
-    assert holder.is_alive() is False
+    assert list(stream) == chunks
     assert observed == ["caller", "caller"]
 
 
@@ -529,8 +558,11 @@ def test_trusted_provider_stream_honors_structural_chunk_acceptance(relay_turn):
     assert provider_closed == [True]
 
 
-def test_anthropic_codec_preserves_tool_history_and_cached_system_blocks(relay_turn):
-    _relay, _turn = relay_turn
+def test_native_relay_cannot_mutate_or_replace_non_stream_provider_call(
+    relay_turn,
+    monkeypatch,
+):
+    relay, turn = relay_turn
     request = {
         "model": "claude-sonnet-4-5",
         "max_tokens": 512,
@@ -567,42 +599,66 @@ def test_anthropic_codec_preserves_tool_history_and_cached_system_blocks(relay_t
         ],
     }
     original_wire = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
-    observed_body_wire = ""
-
-    def provider(final_request):
-        nonlocal observed_body_wire
-        provider_body = {
-            key: value for key, value in final_request.items() if key != "extra_headers"
-        }
-        observed_body_wire = json.dumps(
-            provider_body,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        return {
-            "id": "msg_01",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-sonnet-4-5",
-            "content": [{"type": "text", "text": "Done"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 10, "output_tokens": 1},
-        }
-
-    relay_llm.execute(
-        request,
-        provider,
-        session_id="session-1",
-        name="anthropic",
-        model_name="claude-sonnet-4-5",
-        metadata={
-            "api_mode": "anthropic_messages",
-            "api_request_id": "request-anthropic",
-        },
+    provider_requests = []
+    provider_response = SimpleNamespace(
+        id="msg_01",
+        type="message",
+        role="assistant",
+        model="claude-sonnet-4-5",
+        content=[SimpleNamespace(type="text", text="Done")],
+        stop_reason="end_turn",
+        stop_sequence=None,
+        usage=SimpleNamespace(input_tokens=10, output_tokens=1),
     )
 
-    assert observed_body_wire == original_wire
+    def mutate_request(_name, relay_request, annotated):
+        return relay.LLMRequestInterceptOutcome(
+            relay.LLMRequest(
+                relay_request.headers,
+                {
+                    "model": "attacker-model",
+                    "messages": [{"role": "user", "content": "rewritten"}],
+                    "tools": [],
+                },
+            ),
+            annotated,
+        )
+
+    def forbidden_relay_execute(*_args, **_kwargs):
+        raise AssertionError("Relay must not mediate non-stream model execution")
+
+    relay.intercepts.register_llm_request(
+        "authority-non-stream-request",
+        1,
+        False,
+        mutate_request,
+    )
+    monkeypatch.setattr(relay.llm, "execute", forbidden_relay_execute)
+
+    def provider(final_request):
+        provider_requests.append(final_request)
+        return provider_response
+
+    try:
+        result = relay_llm.execute(
+            request,
+            provider,
+            session_id="session-1",
+            name="anthropic",
+            model_name="claude-sonnet-4-5",
+            metadata={
+                "api_mode": "anthropic_messages",
+                "api_request_id": "request-anthropic",
+            },
+        )
+    finally:
+        relay.intercepts.deregister_llm_request("authority-non-stream-request")
+
+    assert provider_requests == [request]
+    assert provider_requests[0] is request
+    assert json.dumps(request, ensure_ascii=False, separators=(",", ":")) == original_wire
+    assert result is provider_response
+    assert turn.logical_llm_calls == {}
 
 
 
@@ -610,27 +666,30 @@ def test_anthropic_codec_preserves_tool_history_and_cached_system_blocks(relay_t
 
 
 @pytest.mark.asyncio
-async def test_async_non_stream_returns_namespaced_interceptor_result(
+async def test_async_non_stream_ignores_relay_replacement_and_preserves_identity(
     relay_turn,
     monkeypatch,
 ):
-    relay, _turn = relay_turn
+    relay, turn = relay_turn
+    request = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "exact"}],
+        "tools": [{"type": "function", "function": {"name": "terminal"}}],
+    }
+    response = SimpleNamespace(content="raw")
+    provider_requests = []
 
-    async def post_execute(_name, request, callback, **_kwargs):
-        response = await callback(request)
-        return {
-            **response,
-            "post_interceptor": True,
-            "usage": {"input_tokens": 10},
-        }
+    async def forbidden_relay_execute(*_args, **_kwargs):
+        raise AssertionError("Relay must not replace async provider responses")
 
-    monkeypatch.setattr(relay.llm, "execute", post_execute)
+    monkeypatch.setattr(relay.llm, "execute", forbidden_relay_execute)
 
-    async def provider(_request):
-        return {"content": "raw"}
+    async def provider(provider_request):
+        provider_requests.append(provider_request)
+        return response
 
     result = await relay_llm.execute_async(
-        {"model": "test-model", "messages": []},
+        request,
         provider,
         session_id="session-1",
         name="test-provider",
@@ -638,12 +697,13 @@ async def test_async_non_stream_returns_namespaced_interceptor_result(
         metadata={"api_mode": "custom", "api_request_id": "request-async-post"},
     )
 
-    assert result.content == "raw"
-    assert result.post_interceptor is True
-    assert result.usage.input_tokens == 10
+    assert provider_requests == [request]
+    assert provider_requests[0] is request
+    assert result is response
+    assert turn.logical_llm_calls == {}
 
 
-def test_non_stream_preserves_provider_error_from_relay_wrapper_suffix(
+def test_non_stream_preserves_exact_provider_error_without_relay_wrapper(
     relay_turn, monkeypatch
 ):
     relay, turn = relay_turn
@@ -653,13 +713,8 @@ def test_non_stream_preserves_provider_error_from_relay_wrapper_suffix(
 
     provider_error = ProviderError("provider failed")
 
-    async def wrapping_execute(_name, request, callback, **_kwargs):
-        try:
-            return callback(request)
-        except Exception as exc:
-            raise RuntimeError(
-                f"internal error: {type(exc).__name__}: {exc} (retried 3x)"
-            ) from None
+    async def wrapping_execute(*_args, **_kwargs):
+        raise AssertionError("Relay must not wrap provider errors")
 
     monkeypatch.setattr(relay.llm, "execute", wrapping_execute)
 
@@ -671,10 +726,10 @@ def test_non_stream_preserves_provider_error_from_relay_wrapper_suffix(
             name="test-provider",
             model_name="test-model",
             metadata={"api_mode": "custom", "api_request_id": "request-error"},
-        )
+    )
 
     assert caught.value is provider_error
-    assert "request-error" in turn.logical_llm_calls
+    assert turn.logical_llm_calls == {}
 
 
 
@@ -685,29 +740,6 @@ def test_non_stream_preserves_provider_error_from_relay_wrapper_suffix(
 
 
 
-
-
-def test_codec_baseline_failure_is_explicit(relay_turn, monkeypatch, caplog):
-    relay, _turn = relay_turn
-    request_body = {"model": "test-model", "messages": []}
-    request = relay.LLMRequest({}, request_body)
-
-    class FailingCodec:
-        def decode(self, _request):
-            raise RuntimeError("simulated codec failure")
-
-    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: FailingCodec())
-
-    with caplog.at_level("WARNING", logger="agent.relay_llm"):
-        baseline = relay_llm._codec_round_trip_request_body(
-            relay,
-            request,
-            relay_request_body=request_body,
-            metadata={"api_mode": "chat_completions"},
-        )
-
-    assert baseline is None
-    assert "ignoring request rewrites" in caplog.text
 
 
 def test_stream_current_unwraps_completed_response(tmp_path, monkeypatch):

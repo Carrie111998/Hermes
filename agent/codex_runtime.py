@@ -1313,6 +1313,24 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 _open_codex_stream,
                 on_stream_created=_codex_stream_created,
                 accept_chunk=_accept_codex_chunk,
+                lifecycle_metadata={
+                    "api_request_id": getattr(
+                        agent, "_current_api_request_id", None
+                    ),
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "provider": str(getattr(agent, "provider", "") or "codex"),
+                    "model": str(api_kwargs.get("model") or ""),
+                    "api_mode": "codex_responses",
+                },
+                lifecycle_session_id=str(
+                    getattr(agent, "session_id", "") or ""
+                ),
                 completed_response_predicate=lambda response: bool(
                     hasattr(response, "output") and not hasattr(response, "__iter__")
                 ),
