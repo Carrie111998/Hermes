@@ -144,11 +144,16 @@ class _patch_discord_sender:
         self._entry = None
         self._original = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None, caption=None):
+    async def _adapter(
+        self, pconfig, chat_id, message, *, thread_id=None, media_files=None,
+        caption=None, on_provider_contact=None,
+    ):
         token = getattr(pconfig, "token", None)
         # Only forward caption= when set, so mocks written against the
         # pre-caption signature (no caption kwarg) keep working.
         extra = {"caption": caption} if caption is not None else {}
+        if on_provider_contact:
+            on_provider_contact()
         return await self._mock(
             token, chat_id, message,
             thread_id=thread_id, media_files=media_files, **extra,
@@ -204,7 +209,10 @@ class _patch_slack_standalone_sender:
         self._entry = None
         self._original = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, **_kw):
+    async def _adapter(
+        self, pconfig, chat_id, message, *, thread_id=None,
+        on_provider_contact=None, **_kw,
+    ):
         from plugins.platforms.slack.adapter import SlackAdapter
         formatted = message
         if message:
@@ -213,6 +221,8 @@ class _patch_slack_standalone_sender:
             except Exception:
                 pass
         token = getattr(pconfig, "token", None)
+        if on_provider_contact:
+            on_provider_contact()
         return await self._mock(token, chat_id, formatted, thread_ts=thread_id)
 
     def __enter__(self):

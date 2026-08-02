@@ -1729,6 +1729,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process DingTalk delivery via a static robot webhook URL.
 
@@ -1748,6 +1749,8 @@ async def _standalone_send(
         if not webhook_url:
             return {"error": "DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config."}
         async with httpx.AsyncClient(timeout=30.0) as client:
+            if on_provider_contact:
+                on_provider_contact()
             resp = await client.post(
                 webhook_url,
                 json={"msgtype": "text", "text": {"content": message}},

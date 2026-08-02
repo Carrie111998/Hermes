@@ -584,7 +584,7 @@ class TestDeliverResultErrorReturns:
         assert result.receipts[0]["status"] == "failed"
         assert result.receipts[0]["transport"] == "none"
 
-    def test_standalone_exception_after_contact_is_ambiguous_without_retry(self):
+    def test_partial_multi_call_standalone_failure_is_ambiguous_without_retry(self):
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
         config = GatewayConfig(
@@ -594,6 +594,8 @@ class TestDeliverResultErrorReturns:
         contacts = {}
 
         async def fail_after_contact(*_args, on_provider_contact=None, **_kwargs):
+            # First effect was accepted; a later effect lost confirmation.
+            on_provider_contact()
             on_provider_contact()
             raise ConnectionError("first chunk accepted; second confirmation lost")
 

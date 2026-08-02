@@ -1235,6 +1235,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Open an ephemeral WebSocket to the daemon, send, and close.
 
@@ -1279,6 +1280,8 @@ async def _standalone_send(
         async with _wsclient.connect(
             ws_url, open_timeout=10, close_timeout=5
         ) as ws:
+            if on_provider_contact:
+                on_provider_contact()
             await ws.send(json.dumps(payload))
             # Give the daemon a moment to process the command before closing.
             await asyncio.sleep(0.5)

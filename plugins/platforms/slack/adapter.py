@@ -8570,6 +8570,7 @@ async def _standalone_upload_file(
     *,
     initial_comment: str = "",
     thread_id: Optional[str] = None,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Upload one local file via ``files_upload_v2`` (same API as the live adapter)."""
     kwargs: Dict[str, Any] = {
@@ -8580,7 +8581,33 @@ async def _standalone_upload_file(
     }
     if thread_id:
         kwargs["thread_ts"] = thread_id
-    result = await client.files_upload_v2(**kwargs)
+
+    # files_upload_v2 is a three-request convenience method: obtain an upload
+    # URL, upload bytes, then complete the upload. Wrap those deepest SDK
+    # boundaries so its local path read/validation happens before contact and
+    # each actual Slack/files.slack.com request is recorded independently.
+    wrapped_methods = []
+    if on_provider_contact:
+        for method_name in (
+            "files_getUploadURLExternal",
+            "_upload_file",
+            "files_completeUploadExternal",
+        ):
+            original = getattr(client, method_name, None)
+            if not callable(original):
+                continue
+
+            async def _contacting_call(*args, _original=original, **call_kwargs):
+                on_provider_contact()
+                return await _original(*args, **call_kwargs)
+
+            setattr(client, method_name, _contacting_call)
+            wrapped_methods.append((method_name, original))
+    try:
+        result = await client.files_upload_v2(**kwargs)
+    finally:
+        for method_name, original in wrapped_methods:
+            setattr(client, method_name, original)
     if isinstance(result, dict) and result.get("ok") is False:
         return {"error": f"Slack API error: {result.get('error', 'unknown')}"}
     # files_upload_v2 responses vary by sdk version; prefer file timestamp when present.
@@ -8609,6 +8636,7 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
     caption=None,
+    on_provider_contact=None,
 ):
     """Out-of-process Slack delivery via the Web API.
 
@@ -8728,6 +8756,8 @@ async def _standalone_send(
             if thread_id:
                 post_kwargs["thread_ts"] = thread_id
             try:
+                if on_provider_contact:
+                    on_provider_contact()
                 post_resp = await client.chat_postMessage(**post_kwargs)
                 if isinstance(post_resp, dict) and not post_resp.get("ok", True):
                     return {
@@ -8756,6 +8786,8 @@ async def _standalone_send(
                         }
                         if thread_id:
                             fallback_kwargs["thread_ts"] = thread_id
+                        if on_provider_contact:
+                            on_provider_contact()
                         fb = await client.chat_postMessage(**fallback_kwargs)
                         if isinstance(fb, dict) and fb.get("ok", True):
                             last_message_id = fb.get("ts") or last_message_id
@@ -8773,6 +8805,7 @@ async def _standalone_send(
                     media_path,
                     initial_comment=formatted_caption if caption_pending else "",
                     thread_id=thread_id,
+                    on_provider_contact=on_provider_contact,
                 )
                 if upload_result.get("error"):
                     warnings.append(
@@ -8845,6 +8878,8 @@ async def _standalone_send(
                     "Authorization": f"Bearer {tok}",
                     "Content-Type": "application/json",
                 }
+                if on_provider_contact:
+                    on_provider_contact()
                 async with session.post(
                     url, headers=headers, json=payload, **_req_kw
                 ) as resp:

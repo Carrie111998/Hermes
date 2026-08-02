@@ -1691,6 +1691,7 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
     caption=None,
+    on_provider_contact=None,
 ):
     """Out-of-process WhatsApp delivery via the local bridge HTTP API.
 
@@ -1721,6 +1722,8 @@ async def _standalone_send(
             # 1) Text first (skip the /send call when this chunk is media-only
             #    or when the text is delivered as the media caption instead).
             if text.strip() and not media_caption:
+                if on_provider_contact:
+                    on_provider_contact()
                 async with session.post(
                     f"http://localhost:{bridge_port}/send",
                     json={"chatId": normalized_chat_id, "message": text},
@@ -1744,6 +1747,8 @@ async def _standalone_send(
                     # so nothing silently disappears.
                     if media_caption:
                         try:
+                            if on_provider_contact:
+                                on_provider_contact()
                             async with session.post(
                                 f"http://localhost:{bridge_port}/send",
                                 json={"chatId": normalized_chat_id, "message": media_caption},
@@ -1764,6 +1769,8 @@ async def _standalone_send(
                     payload["fileName"] = os.path.basename(media_path)
                 if media_caption:
                     payload["caption"] = media_caption
+                if on_provider_contact:
+                    on_provider_contact()
                 async with session.post(
                     f"http://localhost:{bridge_port}/send-media",
                     json=payload,

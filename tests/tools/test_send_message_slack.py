@@ -8,7 +8,7 @@ _standalone_send`` and text sends now route through ``_send_via_adapter``
 
 import asyncio
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +19,14 @@ from tools.send_message_tool import _send_to_platform, _send_via_adapter
 
 def _ensure_slack_mock(monkeypatch):
     """Install lightweight Slack modules when optional Slack deps are absent."""
+    try:
+        import aiohttp  # noqa: F401
+    except ImportError:
+        aiohttp = ModuleType("aiohttp")
+        aiohttp.ClientSession = MagicMock()
+        aiohttp.ClientTimeout = MagicMock()
+        monkeypatch.setitem(sys.modules, "aiohttp", aiohttp)
+
     if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
         return
 
@@ -72,7 +80,8 @@ def test_registry_fallback_marks_each_chunk_only_at_sender_boundary(monkeypatch)
 
     events = []
 
-    async def sender(*_args, **_kwargs):
+    async def sender(*_args, on_provider_contact=None, **_kwargs):
+        on_provider_contact()
         events.append("send")
         if events.count("send") == 2:
             raise ConnectionError("second chunk confirmation lost")

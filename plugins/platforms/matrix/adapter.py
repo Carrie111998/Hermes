@@ -5171,6 +5171,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process Matrix delivery via the Client-Server API.
 
@@ -5214,6 +5215,8 @@ async def _standalone_send(
         # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
         async with aiohttp.ClientSession() as session:
             async def _do_send():
+                if on_provider_contact:
+                    on_provider_contact()
                 async with session.put(url, headers=headers, json=payload) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()

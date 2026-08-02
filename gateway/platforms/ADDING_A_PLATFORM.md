@@ -36,7 +36,10 @@ status display, gateway setup, and more.
   for cron jobs that run separately from the gateway.  Without this, a
   `deliver=<name>` job fires correctly but the actual send returns
   `No live adapter for platform '<name>'`.  Pair with `cron_deliver_env_var`
-  for end-to-end cron support.  See the docsite for the signature.
+  for end-to-end cron support. The sender must accept optional
+  `on_provider_contact=None` and invoke it immediately before every external
+  provider send/upload/request, after local validation and setup. See the
+  docsite for the full signature.
 - `plugin.yaml` `requires_env` / `optional_env` rich-dict entries —
   auto-populate `OPTIONAL_ENV_VARS` in `hermes_cli/config.py` so the setup
   wizard surfaces proper descriptions, prompts, password flags, and URLs.

@@ -9550,6 +9550,7 @@ async def _standalone_send(
     media_files: Optional[list] = None,
     force_document: bool = False,
     caption: Optional[str] = None,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Send via Discord REST API without a live gateway adapter.
 
@@ -9671,6 +9672,8 @@ async def _standalone_send(
                                         fh.read(),
                                         filename=os.path.basename(media_path),
                                     )
+                            if on_provider_contact:
+                                on_provider_contact()
                             async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
                                 if resp.status not in {200, 201}:
                                     body = await _standalone_read_text_limited(
@@ -9687,6 +9690,8 @@ async def _standalone_send(
                     else:
                         # No media — simple JSON POST creates the thread with
                         # just the text starter.
+                        if on_provider_contact:
+                            on_provider_contact()
                         async with session.post(
                             thread_url,
                             headers=json_headers,
@@ -9725,6 +9730,8 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
+                if on_provider_contact:
+                    on_provider_contact()
                 async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await _standalone_read_text_limited(
@@ -9751,6 +9758,8 @@ async def _standalone_send(
                     warnings.append(warning)
                     if caption_pending:
                         try:
+                            if on_provider_contact:
+                                on_provider_contact()
                             async with session.post(
                                 url, headers=json_headers,
                                 json={"content": caption}, **_req_kw,
@@ -9774,7 +9783,10 @@ async def _standalone_send(
                         )
                         caption_pending = False
                     with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
+                        file_bytes = f.read()
+                        form.add_field("files[0]", file_bytes, filename=filename)
+                        if on_provider_contact:
+                            on_provider_contact()
                         async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
                             if resp.status not in {200, 201}:
                                 body = await _standalone_read_text_limited(

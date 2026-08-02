@@ -10078,6 +10078,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process Telegram delivery. Delegates to the standalone
     ``_send_telegram`` REST sender in tools/send_message_tool.py (which already
@@ -10104,6 +10105,7 @@ async def _standalone_send(
         thread_id=thread_id,
         disable_link_previews=disable_link_previews,
         force_document=force_document,
+        on_provider_contact=on_provider_contact,
     )
 
 

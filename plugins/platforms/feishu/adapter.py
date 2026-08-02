@@ -5617,6 +5617,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
@@ -5634,6 +5635,17 @@ async def _standalone_send(
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
+        _run_blocking = adapter._run_blocking
+
+        async def _contacting_run_blocking(func, *args, **kwargs):
+            if on_provider_contact:
+                on_provider_contact()
+            return await _run_blocking(func, *args, **kwargs)
+
+        # Feishu media helpers perform separate upload and message-create SDK
+        # calls. Instrument their common blocking bridge so each provider
+        # effect is marked only after local file reads/body construction.
+        adapter._run_blocking = _contacting_run_blocking
         metadata = {"thread_id": thread_id} if thread_id else None
 
         last_result = None

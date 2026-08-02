@@ -519,6 +519,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Out-of-process publish for cron / send_message_tool fallbacks.
 
@@ -563,6 +564,8 @@ async def _standalone_send(
     url = f"{server}/{publish_topic}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            if on_provider_contact:
+                on_provider_contact()
             resp = await client.post(url, content=body, headers=headers)
         if resp.status_code >= 300:
             return {"error": f"ntfy HTTP {resp.status_code}: {resp.text[:200]}"}

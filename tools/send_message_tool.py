@@ -766,15 +766,14 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
-            result = await _call_provider(
-                on_provider_contact,
-                entry.standalone_sender_fn,
+            result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                on_provider_contact=on_provider_contact,
             )
         except asyncio.CancelledError:
             raise
@@ -912,15 +911,14 @@ async def _send_to_platform(
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _dc_caption is not None:
-            result = await _call_provider(
-                on_provider_contact,
-                entry.standalone_sender_fn,
+            result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 "",
                 thread_id=thread_id,
                 media_files=media_files,
                 caption=_dc_caption,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -928,14 +926,13 @@ async def _send_to_platform(
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _call_provider(
-                on_provider_contact,
-                entry.standalone_sender_fn,
+            result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1009,14 +1006,13 @@ async def _send_to_platform(
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _call_provider(
-                on_provider_contact,
-                _feishu_entry.standalone_sender_fn,
+            result = await _feishu_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else None,
                 thread_id=thread_id,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1039,15 +1035,14 @@ async def _send_to_platform(
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _sl_caption is not None:
-            result = await _call_provider(
-                on_provider_contact,
-                _slack_entry.standalone_sender_fn,
+            result = await _slack_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 "",
                 thread_id=thread_id,
                 media_files=media_files,
                 caption=_sl_caption,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1055,14 +1050,13 @@ async def _send_to_platform(
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _call_provider(
-                on_provider_contact,
-                _slack_entry.standalone_sender_fn,
+            result = await _slack_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1092,9 +1086,7 @@ async def _send_to_platform(
         if _wa_caption is not None:
             # Single-file captioned send: no separate text chunk, caption on
             # the media itself.
-            result = await _call_provider(
-                on_provider_contact,
-                _wa_entry.standalone_sender_fn,
+            result = await _wa_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 "",
@@ -1102,15 +1094,14 @@ async def _send_to_platform(
                 thread_id=thread_id,
                 force_document=force_document,
                 caption=_wa_caption,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _call_provider(
-                on_provider_contact,
-                _wa_entry.standalone_sender_fn,
+            result = await _wa_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
@@ -1622,13 +1613,12 @@ async def _registry_standalone_send(
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
-    return await _call_provider(
-        on_provider_contact,
-        entry.standalone_sender_fn,
+    return await entry.standalone_sender_fn(
         pconfig,
         chat_id,
         message,
         thread_id=thread_id,
+        on_provider_contact=on_provider_contact,
     )
 
 

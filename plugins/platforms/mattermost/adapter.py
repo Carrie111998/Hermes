@@ -1017,6 +1017,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[list] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Send via the Mattermost v4 REST API without a live gateway adapter.
 
@@ -1090,6 +1091,8 @@ async def _standalone_send(
                         fh.read(),
                         filename=os.path.basename(file_path),
                     )
+                if on_provider_contact:
+                    on_provider_contact()
                 async with session.post(
                     f"{base_url}/api/v4/files",
                     data=form,
@@ -1118,6 +1121,8 @@ async def _standalone_send(
                 payload["root_id"] = thread_id
             if file_ids:
                 payload["file_ids"] = file_ids
+            if on_provider_contact:
+                on_provider_contact()
             async with session.post(
                 f"{base_url}/api/v4/posts",
                 headers=headers,

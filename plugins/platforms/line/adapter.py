@@ -1644,6 +1644,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Out-of-process push delivery for cron jobs running detached from the gateway.
 
@@ -1675,6 +1676,8 @@ async def _standalone_send(
 
     client = _LineClient(token)
     try:
+        if on_provider_contact:
+            on_provider_contact()
         await client.push(chat_id, messages)
         return {"success": True, "message_id": None}
     except Exception as exc:
