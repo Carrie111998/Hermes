@@ -58,6 +58,7 @@ let
           "alibabacloud-gateway-dingtalk"
           "alibabacloud-gateway-spi"
           "alibabacloud-tea"
+          "evdev"
         ] (_: null)
       );
 

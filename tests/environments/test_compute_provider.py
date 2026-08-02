@@ -411,3 +411,10 @@ def test_cua_fleet_provider_uses_public_sandbox_facade() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
     assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.20",)
+
+
+def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:
+    from pathlib import Path
+
+    python_nix = Path(__file__).parents[2] / "nix" / "python.nix"
+    assert '"evdev"' in python_nix.read_text()
