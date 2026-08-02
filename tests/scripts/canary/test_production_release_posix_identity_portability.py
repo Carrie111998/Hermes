@@ -11,6 +11,7 @@ from scripts.canary import production_release_candidate_promoter as promoter
 from scripts.canary import production_release_rotation_stager_input_author as author
 from scripts.canary import production_release_rotation_stager_installer as installer
 from scripts.canary import production_release_rotation_stager_launcher as launcher
+from scripts.canary import production_successor_rebind_owner_runtime as successor
 
 
 @pytest.mark.parametrize(
@@ -46,6 +47,11 @@ from scripts.canary import production_release_rotation_stager_launcher as launch
             launcher.RotationStagerLauncherError,
             "rotation_stager_launcher_posix_identity_unavailable",
         ),
+        (
+            successor,
+            successor.SuccessorRebindOwnerRuntimeError,
+            "successor_rebind_owner_runtime_identity_unavailable",
+        ),
     ),
 )
 def test_posix_identity_reader_fails_closed_when_api_is_missing(
@@ -63,7 +69,7 @@ def test_posix_identity_reader_fails_closed_when_api_is_missing(
 
 @pytest.mark.parametrize(
     "module",
-    (phase, runtime, promoter, author, installer, launcher),
+    (phase, runtime, promoter, author, installer, launcher, successor),
 )
 def test_posix_identity_reader_preserves_native_values(
     monkeypatch: pytest.MonkeyPatch,

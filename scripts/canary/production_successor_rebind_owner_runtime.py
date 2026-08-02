@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Mapping, Never
+from typing import Any, Callable, Literal, Mapping, Never
 
 from gateway import production_owner_runtime as runtime
 from scripts.canary import package_production_owner_runtime as package
@@ -61,6 +61,19 @@ class SuccessorRebindOwnerRuntimeError(RuntimeError):
 
 def _fail(code: str, _cause: BaseException | None = None) -> Never:
     raise SuccessorRebindOwnerRuntimeError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _fail("successor_rebind_owner_runtime_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("successor_rebind_owner_runtime_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _fail("successor_rebind_owner_runtime_identity_unavailable")
+    return value
 
 
 def _canonical(value: Any) -> bytes:
@@ -1874,11 +1887,8 @@ def validate_active_installation(
 
 
 def _require_os_identity(*, uid: int, gid: int) -> None:
-    try:
-        observed_uid = os.geteuid()
-        observed_gid = os.getegid()
-    except (AttributeError, OSError) as exc:
-        _fail("successor_rebind_owner_runtime_identity_unavailable", exc)
+    observed_uid = _read_posix_identity("geteuid")
+    observed_gid = _read_posix_identity("getegid")
     if observed_uid != uid or observed_gid != gid or (uid == 0) != (gid == 0):
         _fail("successor_rebind_owner_runtime_identity_invalid")
 
@@ -2014,8 +2024,8 @@ def build_runtime_as_dedicated_builder(
         release_base=RELEASE_BASE,
         builder_uid=BUILDER_UID,
         builder_gid=BUILDER_GID,
-        effective_uid=os.geteuid(),
-        effective_gid=os.getegid(),
+        effective_uid=_read_posix_identity("geteuid"),
+        effective_gid=_read_posix_identity("getegid"),
         source_tree_oid=source_tree_oid,
         stage_c_builder_terminal_receipt_sha256=(
             stage_c_builder_terminal_receipt_sha256
