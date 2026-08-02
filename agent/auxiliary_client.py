@@ -9933,6 +9933,7 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    route_callback: Optional[Callable[[str, Optional[str], str], None]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -9987,6 +9988,7 @@ def call_llm(
                 stream=stream,
                 stream_options=stream_options,
                 route_info=route_info,
+                route_callback=route_callback,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -10037,6 +10039,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    route_callback: Optional[Callable[[str, Optional[str], str], None]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -10195,6 +10198,23 @@ def _call_llm_impl(
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    # Report the route ACTUALLY used on the wire (after auto-detection,
+    # fallback chains, and client construction) so callers that need to
+    # attribute a failure point at the real endpoint, not the pre-resolution
+    # guess from _resolve_task_provider_model (#72636). The base_url is
+    # query-stripped so credentials some proxies carry as ?key=... are not
+    # leaked into user-facing diagnostics; the callback also re-strips
+    # defensively in case a future caller bypasses this path.
+    if route_callback is not None:
+        try:
+            _clean_base, _dropped_q = _extract_url_query_params(_base_info)
+            route_callback(
+                resolved_provider or "auto",
+                final_model,
+                _clean_base,
+            )
+        except Exception:
+            logger.debug("route_callback error in call_llm", exc_info=True)
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, request_provider or "auto", final_model or "default",
