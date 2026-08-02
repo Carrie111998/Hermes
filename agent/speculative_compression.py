@@ -630,6 +630,8 @@ def build_candidate(
     worker_messages[snapshot.cut_index][_TAIL_MARKER] = marker
     if cancel_event is not None and cancel_event.is_set():
         raise CancelledError()
+    # The claim in _run_job already linearized past the kill switch, but a
+    # cancel set before this point must still abort before any provider cost.
     try:
         compressed = worker.compress(
             worker_messages,
@@ -911,7 +913,6 @@ def schedule_tool_wait_candidate(
                     memory_context = sanitize_memory_context(_maybe_ctx)
                 except Exception:
                     memory_context = _maybe_ctx
-                memory_context = _maybe_ctx
         except Exception:
             pass
     try:
@@ -1222,14 +1223,6 @@ class SpeculativeCompressionManager:
         start_event: threading.Event,
     ) -> SpeculativeCandidate:
         start_event.wait()
-        with self._lock:
-            current = self._entries.get(str(session_id))
-            if (
-                current is None
-                or current.generation is not generation
-                or cancel_event.is_set()
-            ):
-                raise CancelledError()
         worker = compressor_factory()
         with self._lock:
             current = self._entries.get(str(session_id))
@@ -1239,6 +1232,14 @@ class SpeculativeCompressionManager:
                 or cancel_event.is_set()
             ):
                 raise CancelledError()
+            # Linearization point for the kill switch: from here the job is
+            # committed to run to completion. invalidate_session() serializes
+            # on the same lock — an invalidation that returns after this check
+            # has already popped the entry, so the candidate can never be
+            # published; an invalidation that ran before it has set
+            # cancel_event, which build_candidate() observes again immediately
+            # before provider egress. No provider work begins after
+            # invalidate_session() returns.
         candidate = build_candidate(
             snapshot,
             lambda: worker,
