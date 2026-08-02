@@ -68,6 +68,20 @@ def _exact_command_sha256(value: object) -> str:
 
     return hashlib.sha256(str(value or "").strip().encode("utf-8")).hexdigest()
 
+
+def _exact_execute_code_sha256(value: object) -> str:
+    """Return a domain-separated digest for one exact execute_code script.
+
+    Terminal commands and Python scripts intentionally occupy different
+    capability namespaces.  A plan grant for terminal text that happens to be
+    valid Python must not authorize executing that text through ``execute_code``
+    (or vice versa).  Script bytes are otherwise opaque: no parser, keyword
+    matcher, or semantic classifier participates in this digest.
+    """
+
+    subject = b"hermes.execute_code.v1\0" + str(value or "").encode("utf-8")
+    return hashlib.sha256(subject).hexdigest()
+
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
 # instantly bypass all approval checks — a prompt-injection escalation path.
@@ -3206,16 +3220,17 @@ def grant_plan_capability(
     plan_revision: int | None = None,
     exact_commands: list[str],
     approved_by_user_id: str,
+    exact_code_scripts: Optional[list[str]] = None,
     ttl_seconds: int = 3600,
     max_uses_per_command: int = 3,
     canonical_case_id: str = "",
     source_refs: Optional[dict] = None,
 ) -> dict:
-    """Grant an expiring exact-command capability for an owner-approved plan.
+    """Grant expiring exact terminal/code capabilities for an approved plan.
 
     Hermes/GPT decides that the authenticated owner's current message approves
     the plan. This function only verifies identity/config and hashes exact
-    commands; it performs no semantic approval classification.
+    terminal/code subjects; it performs no semantic approval classification.
     """
     if is_delegated_exact_plan_consumer():
         raise PermissionError(
@@ -3318,8 +3333,17 @@ def grant_plan_capability(
             "Canonical Brain case does not contain the exact active plan_id/revision"
         )
     effective_plan_revision = plan_revision or 1
-    if not isinstance(exact_commands, list) or not 1 <= len(exact_commands) <= 64:
-        raise ValueError("exact_commands must contain 1..64 commands")
+    if not isinstance(exact_commands, list):
+        raise ValueError("exact_commands must be an array")
+    if exact_code_scripts is None:
+        exact_code_scripts = []
+    if not isinstance(exact_code_scripts, list):
+        raise ValueError("exact_code_scripts must be an array")
+    exact_subject_count = len(exact_commands) + len(exact_code_scripts)
+    if not 1 <= exact_subject_count <= 64:
+        raise ValueError(
+            "exact_commands and exact_code_scripts must contain 1..64 items total"
+        )
     ttl_seconds = max(60, min(int(ttl_seconds), 8 * 3600))
     max_uses_per_command = max(1, min(int(max_uses_per_command), 10))
     command_uses: dict[str, int] = {}
@@ -3327,8 +3351,12 @@ def grant_plan_capability(
         normalized = str(command or "").strip()
         if not normalized:
             raise ValueError("exact_commands cannot contain empty commands")
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        digest = _exact_command_sha256(normalized)
         command_uses[digest] = max_uses_per_command
+    for code in exact_code_scripts:
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("exact_code_scripts cannot contain empty scripts")
+        command_uses[_exact_execute_code_sha256(code)] = max_uses_per_command
     now = time.time()
     authority_source_refs = (
         _runtime_observed_approval_source_refs()
@@ -3592,9 +3620,33 @@ def grant_plan_capability(
 
 
 def consume_plan_capability(session_key: str, command: str) -> str | None:
-    """Consume one exact-command use and return the authorizing plan id."""
+    """Consume one exact terminal-command use and return its plan id."""
+
+    return _consume_plan_capability_digest(
+        session_key,
+        _exact_command_sha256(command),
+    )
+
+
+def consume_execute_code_plan_capability(
+    session_key: str,
+    code: str,
+) -> str | None:
+    """Consume one exact, domain-separated execute_code script use."""
+
+    return _consume_plan_capability_digest(
+        session_key,
+        _exact_execute_code_sha256(code),
+    )
+
+
+def _consume_plan_capability_digest(
+    session_key: str,
+    digest: str,
+) -> str | None:
+    """Consume one mechanically identified execution-subject digest."""
+
     session_key = str(session_key or "")
-    digest = hashlib.sha256(str(command or "").strip().encode("utf-8")).hexdigest()
     observed_user_id = _observed_session_user_id()
     observed_platform = _observed_session_platform()
     try:
@@ -4524,7 +4576,34 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     """
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
+    return env_type in (
+        "singularity",
+        "modal",
+        "daytona",
+        "isolated_worker",
+        "vercel_sandbox",
+    )
+
+
+def _delegated_exact_capability_required(execution_kind: str) -> dict:
+    """Return the stable fail-closed contract for a delegated host execution.
+
+    ``execution_kind`` is an exact tool identifier supplied by the caller, not
+    a classification of command or code content.
+    """
+
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: delegated {execution_kind} execution outside a "
+            "mechanically isolated backend requires an unexpired exact "
+            "owner-approved plan capability for this exact input."
+        ),
+        "status": "blocked",
+        "outcome": "exact_plan_capability_required",
+        "error_code": "delegated_exact_plan_capability_required",
+        "user_consent": False,
+    }
 
 
 def check_dangerous_command(command: str, env_type: str,
@@ -4922,6 +5001,23 @@ def check_all_command_guards(command: str, env_type: str,
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    # Delegated workers have exactly two authority shapes:
+    #   1. a mechanically isolated backend, handled above without approval; or
+    #   2. an owner-approved capability for this normalized terminal input.
+    # A capability miss must stop here.  Falling through to Tirith, regex
+    # patterns, command allowlists, YOLO, or an auto-approval callback would
+    # reintroduce a non-model semantic authority (and let a child broaden its
+    # commissioning authority through configuration).
+    if is_delegated_exact_plan_consumer():
+        plan_id = consume_plan_capability(get_current_session_key(), command)
+        if plan_id:
+            return {
+                "approved": True,
+                "message": None,
+                "plan_capability": plan_id,
+            }
+        return _delegated_exact_capability_required("terminal")
 
     # Hardline floor: unconditional block for catastrophic commands
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
@@ -5398,6 +5494,23 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    # As with delegated terminal execution, a non-isolated child may execute
+    # only a script whose exact, domain-separated bytes were commissioned by
+    # an owner-approved model-authored plan.  Do not downgrade an exact miss
+    # into the legacy broad execute_code approval class.
+    if is_delegated_exact_plan_consumer():
+        plan_id = consume_execute_code_plan_capability(
+            get_current_session_key(),
+            code,
+        )
+        if plan_id:
+            return {
+                "approved": True,
+                "message": None,
+                "plan_capability": plan_id,
+            }
+        return _delegated_exact_capability_required("execute_code")
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     # Cron is intentionally evaluated first for mode=off so cron_mode=deny
