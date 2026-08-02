@@ -130,6 +130,102 @@ class TestExtractAttachments(unittest.TestCase):
 class TestEmailResponseDelivery(unittest.TestCase):
     """Test approval-first response routing for inbound email."""
 
+    def test_profile_scoped_delivery_settings_override_process_global_channel(self):
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        process_values = {
+            "EMAIL_RESPONSE_DELIVERY": "email",
+            "EMAIL_APPROVAL_DISCORD_CHANNEL": "ACTIVE_PROFILE_CHANNEL",
+            "DISCORD_HOME_CHANNEL": "ACTIVE_PROFILE_HOME",
+        }
+        scoped_values = {
+            "EMAIL_ADDRESS": "secondary@test.com",
+            "EMAIL_PASSWORD": "secondary-secret",
+            "EMAIL_IMAP_HOST": "imap.secondary.test",
+            "EMAIL_SMTP_HOST": "smtp.secondary.test",
+            "EMAIL_RESPONSE_DELIVERY": "discord",
+            "EMAIL_APPROVAL_DISCORD_CHANNEL": "SECONDARY_PROFILE_CHANNEL",
+        }
+
+        with patch.dict(os.environ, process_values, clear=False):
+            set_multiplex_active(True)
+            token = set_secret_scope(scoped_values)
+            try:
+                config = GatewayConfig()
+                _apply_env_overrides(config)
+                adapter = EmailAdapter(config.platforms[Platform.EMAIL])
+            finally:
+                reset_secret_scope(token)
+                set_multiplex_active(False)
+
+        self.assertEqual(adapter._response_delivery, "discord")
+        self.assertEqual(
+            adapter._approval_discord_channel,
+            "SECONDARY_PROFILE_CHANNEL",
+        )
+
+    def test_profile_scope_without_redirect_does_not_inherit_global_redirect(self):
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        process_values = {
+            "EMAIL_RESPONSE_DELIVERY": "discord",
+            "EMAIL_APPROVAL_DISCORD_CHANNEL": "ACTIVE_PROFILE_CHANNEL",
+            "DISCORD_HOME_CHANNEL": "ACTIVE_PROFILE_HOME",
+        }
+        scoped_values = {
+            "EMAIL_ADDRESS": "secondary@test.com",
+            "EMAIL_PASSWORD": "secondary-secret",
+            "EMAIL_IMAP_HOST": "imap.secondary.test",
+            "EMAIL_SMTP_HOST": "smtp.secondary.test",
+        }
+
+        with patch.dict(os.environ, process_values, clear=False):
+            set_multiplex_active(True)
+            token = set_secret_scope(scoped_values)
+            try:
+                config = GatewayConfig()
+                _apply_env_overrides(config)
+                adapter = EmailAdapter(config.platforms[Platform.EMAIL])
+            finally:
+                reset_secret_scope(token)
+                set_multiplex_active(False)
+
+        self.assertEqual(adapter._response_delivery, "email")
+        self.assertEqual(adapter._approval_discord_channel, "")
+
+    def test_multiplex_adapter_without_materialized_routing_fails_closed(self):
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        process_values = {
+            "EMAIL_RESPONSE_DELIVERY": "discord",
+            "EMAIL_APPROVAL_DISCORD_CHANNEL": "ACTIVE_PROFILE_CHANNEL",
+            "DISCORD_HOME_CHANNEL": "ACTIVE_PROFILE_HOME",
+        }
+        with patch.dict(os.environ, process_values, clear=False):
+            set_multiplex_active(True)
+            try:
+                adapter = EmailAdapter(PlatformConfig(enabled=True))
+            finally:
+                set_multiplex_active(False)
+
+        self.assertEqual(adapter._response_delivery, "email")
+        self.assertEqual(adapter._approval_discord_channel, "")
+        self.assertEqual(adapter._approval_discord_thread, "")
+
     def test_yaml_platform_keys_are_bridged_into_email_extra(self):
         from pathlib import Path
         import tempfile
@@ -201,6 +297,85 @@ class TestEmailResponseDelivery(unittest.TestCase):
             base_delay=2.0,
         )
         adapter._send_email.assert_not_called()
+
+    def test_discord_response_delivery_resolves_same_multiplex_profile(self):
+        from gateway.config import Platform, PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+            discord_adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        resolver = MagicMock(return_value=discord_adapter)
+        setattr(
+            adapter,
+            "gateway_runner",
+            SimpleNamespace(
+                _authorization_adapter=resolver,
+                adapters={Platform.DISCORD: object()},
+            ),
+        )
+
+        self.assertIs(adapter._discord_delivery_adapter("reviewer"), discord_adapter)
+        resolver.assert_called_once_with(Platform.DISCORD, "reviewer")
+
+    def test_discord_response_delivery_does_not_fallback_across_profiles(self):
+        from gateway.config import Platform, PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+            active_discord_adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        resolver = MagicMock(return_value=None)
+        setattr(
+            adapter,
+            "gateway_runner",
+            SimpleNamespace(
+                _authorization_adapter=resolver,
+                adapters={Platform.DISCORD: active_discord_adapter},
+            ),
+        )
+
+        self.assertIsNone(adapter._discord_delivery_adapter("reviewer"))
+        resolver.assert_called_once_with(Platform.DISCORD, "reviewer")
+
+    def test_stamped_discord_delivery_rejects_legacy_unscoped_resolver(self):
+        from gateway.config import Platform, PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+            active_discord_adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        legacy_resolver = MagicMock(return_value=active_discord_adapter)
+        legacy_resolver.side_effect = lambda platform: active_discord_adapter
+        setattr(
+            adapter,
+            "gateway_runner",
+            SimpleNamespace(
+                _authorization_adapter=legacy_resolver,
+                adapters={Platform.DISCORD: active_discord_adapter},
+            ),
+        )
+
+        self.assertIsNone(adapter._discord_delivery_adapter("reviewer"))
+        legacy_resolver.assert_called_once_with(Platform.DISCORD, "reviewer")
 
     def test_discord_response_delivery_leaves_non_final_notices_on_email_path(self):
         import asyncio
