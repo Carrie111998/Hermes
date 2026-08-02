@@ -78,6 +78,7 @@ incoming `MessageEvent` and used for routing, isolation, and context injection.
 | `estimated_cost_usd` | `float` | `0.0` | Estimated cumulative USD cost. |
 | `cost_status` | `str` | `"unknown"` | Cost tracking status label. |
 | `last_prompt_tokens` | `int` | `0` | Last API-reported prompt token count. Used for accurate compression pre-check. |
+| `last_input_budget_tokens` | `int` | `0` | Last resolved model input budget after output reservation. Used by model-aware context rollover. |
 
 ### Boolean Flags (State Machine)
 
@@ -86,8 +87,8 @@ behavior on the next access.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `was_auto_reset` | `bool` | `False` | Set when a session was auto-reset due to policy expiry (idle/daily). Consumed once to inject a context notice. |
-| `auto_reset_reason` | `Optional[str]` | `None` | `"idle"` or `"daily"` — why the previous session was auto-reset. |
+| `was_auto_reset` | `bool` | `False` | Set when a new row was created at an automatic boundary. Consumed once to inject internal boundary context. |
+| `auto_reset_reason` | `Optional[str]` | `None` | Boundary reason such as `"idle"`, `"daily"` or `"context_rollover"`. |
 | `reset_had_activity` | `bool` | `False` | Whether the expired session had any messages (`total_tokens > 0`). |
 | `is_fresh_reset` | `bool` | `False` | Set by explicit `/new` or `/reset`. Triggers topic/channel skill re-injection on first message. Distinguished from `was_auto_reset` to avoid misleading "session expired" notices. |
 | `expiry_finalized` | `bool` | `False` | Set by background expiry watcher after invoking `on_session_finalize` hooks, cleaning tool resources, and evicting the cached agent. Prevents redundant finalization across restarts. |
@@ -163,7 +164,7 @@ SessionStore(sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=
 | Method | Description |
 |---|---|
 | `get_or_create_session(source, force_new=False)` | Core entry point. Returns existing or creates new `SessionEntry`. Evaluates `suspended`, `resume_pending`, and reset policy. Creates/ends SQLite records. |
-| `update_session(session_key, last_prompt_tokens=None)` | Lightweight metadata update after an interaction. Bumps `updated_at`, optionally records `last_prompt_tokens`. |
+| `update_session(session_key, last_prompt_tokens=None, last_input_budget_tokens=None)` | Lightweight metadata update after an interaction. Bumps `updated_at` and optionally records model-context measurements. |
 | `reset_session(session_key, display_name=None)` | Explicit reset (from `/new` or `/reset`). Creates new `session_id`, sets `is_fresh_reset=True`. Ends old SQLite session, creates new one. |
 | `switch_session(session_key, target_session_id)` | Switch to a different existing session ID (from `/resume`). Ends current SQLite session, reopens target. |
 | `suspend_session(session_key)` | Mark session as `suspended=True` (from `/stop`). Forces auto-reset on next access. |
@@ -626,12 +627,35 @@ When a session expires:
 
 ### Reset Policy (per-platform/type, in config.yaml)
 
+Context pressure is handled separately from conversation reset:
+
+```yaml
+context_rollover:
+  enabled: false             # opt in, off by default
+  threshold_ratio: 0.70      # share of the measured usable input budget
+  max_prompt_tokens: 0       # optional absolute cap, 0 disables the cap
+  notify: false              # invisible by default
+  exclude_platforms:
+    - api_server
+    - webhook
+```
+
+When enabled, Hermes records the active model's resolved context window and
+output reservation after each completed turn. At the next inbound boundary,
+the lower of the ratio threshold and optional absolute cap creates a linked
+context-segment child. The logical conversation continues, recent real
+dialogue is carried through a deterministic extract and the full parent
+transcript remains searchable through `session_search`. No LLM summary is
+created. Active background work defers rollover.
+
+Timed resets remain a separate policy:
+
 ```yaml
 session_reset:
-  mode: none            # none (default) | idle | daily | both
-  at_hour: 4            # daily reset hour (local time)
-  idle_minutes: 1440    # idle timeout (24h)
-  notify: true          # notify user on auto-reset
+  mode: none                 # none (default) | idle | daily | both
+  at_hour: 4                 # daily reset hour (local time)
+  idle_minutes: 1440         # idle timeout (24h)
+  notify: true               # notify user on reset
 ```
 
 Platform-specific overrides can be set under `platforms.<name>.session_reset`.

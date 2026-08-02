@@ -2205,10 +2205,20 @@ class GatewaySlashCommandsMixin:
             if _sess_db is not None:
                 try:
                     _sess_entry = await self.async_session_store.get_or_create_session(source)
-                    # If this session was auto-reset, consume the flag so the
-                    # next regular message's cleanup does not wipe the model
-                    # override just stored below (Closes #48031).
-                    if getattr(_sess_entry, "was_auto_reset", False):
+                    # True conversation resets consume the flag so the next
+                    # regular message does not wipe the model override just
+                    # stored below (#48031). A context rollover is the same
+                    # logical conversation, so preserve its pending
+                    # deterministic checkpoint for that next regular turn.
+                    if (
+                        getattr(_sess_entry, "was_auto_reset", False)
+                        and getattr(
+                            _sess_entry,
+                            "auto_reset_reason",
+                            None,
+                        )
+                        != "context_rollover"
+                    ):
                         _sess_entry.was_auto_reset = False
                     await _sess_db.update_session_model(
                         _sess_entry.session_id, result.new_model

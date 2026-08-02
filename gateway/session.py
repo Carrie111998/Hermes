@@ -87,6 +87,7 @@ def _hash_chat_id(value: str) -> str:
 from .config import (
     Platform,
     GatewayConfig,
+    ContextRolloverPolicy,  # noqa: F401 - re-exported via gateway/__init__.py
     SessionResetPolicy,  # noqa: F401 — re-exported via gateway/__init__.py
     HomeChannel,
 )
@@ -794,12 +795,16 @@ class SessionEntry:
     
     # Last API-reported prompt tokens (for accurate compression pre-check)
     last_prompt_tokens: int = 0
+    # Last resolved model runtime's usable input budget. This is the context
+    # window after any explicit output-token reservation.
+    last_input_budget_tokens: int = 0
     
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
     was_auto_reset: bool = False
-    auto_reset_reason: Optional[str] = None  # "idle" or "daily"
+    auto_reset_reason: Optional[str] = None
     reset_had_activity: bool = False  # whether the expired session had any messages
+    reset_prompt_tokens: int = 0  # prior prompt size at an automatic boundary
 
     # When this session was created by an auto-reset, the session_id of the
     # session it replaced.  Used to give Slack/Discord channels/threads a
@@ -865,6 +870,7 @@ class SessionEntry:
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
+            "last_input_budget_tokens": self.last_input_budget_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "expiry_finalized": self.expiry_finalized,
@@ -880,6 +886,7 @@ class SessionEntry:
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
+            "reset_prompt_tokens": self.reset_prompt_tokens,
             "prev_session_id": self.prev_session_id,
         }
         if self.model_override:
@@ -946,6 +953,7 @@ class SessionEntry:
             cache_write_tokens=data.get("cache_write_tokens", 0),
             total_tokens=data.get("total_tokens", 0),
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
+            last_input_budget_tokens=data.get("last_input_budget_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             expiry_finalized=data.get("expiry_finalized", data.get("memory_flushed", False)),
@@ -957,6 +965,7 @@ class SessionEntry:
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
+            reset_prompt_tokens=data.get("reset_prompt_tokens", 0),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
@@ -965,25 +974,20 @@ class SessionEntry:
 def build_channel_continuity_note(
     entry: "SessionEntry",
     source: SessionSource,
+    *,
+    continuity_checkpoint: Optional[str] = None,
 ) -> Optional[str]:
-    """Build a lightweight session-continuity hint for Slack/Discord channels.
+    """Build the existing reset pointer or a context-rollover checkpoint.
 
-    Slack and Discord channels/threads are long-lived: when the daily/idle
-    reset policy starts a fresh session, the agent loses the thread's prior
-    context and can mistakenly bind a new request to an unrelated recent
-    session.  This deterministic one-line hint points the agent at the
-    specific prior session in *this* channel/thread so it recalls that
-    context via ``session_search`` before acting.
-
-    Returns ``None`` (and the caller adds nothing) unless **all** hold:
-      - the source platform is Slack or Discord,
-      - this session was created by an auto-reset that had real activity,
-      - the previous session_id was recorded on the entry.
-
-    No LLM calls, no extra API/DB lookups — the previous session id is
-    already known from :meth:`SessionStore.get_or_create_session`.
+    Timed reset behaviour remains scoped to Slack and Discord. Context
+    rollover is a continuation of the same logical conversation, so every
+    platform allowed by its policy receives the deterministic checkpoint.
     """
-    if source.platform not in (Platform.SLACK, Platform.DISCORD):
+    is_context_rollover = entry.auto_reset_reason == "context_rollover"
+    if (
+        not is_context_rollover
+        and source.platform not in (Platform.SLACK, Platform.DISCORD)
+    ):
         return None
     if not getattr(entry, "reset_had_activity", False):
         return None
@@ -992,14 +996,27 @@ def build_channel_continuity_note(
         return None
 
     where = "thread" if source.thread_id else "channel"
-    return (
-        f"[System note: This {where} had an earlier Hermes session "
-        f"(session_id: {prev}) that was auto-reset. If the user refers to "
-        f"earlier work here, or the request depends on this {where}'s history, "
-        f"use the session_search tool to recall that prior session before "
-        f"acting — do not assume an unrelated recent session is the right "
-        f"context.]"
-    )
+    if is_context_rollover:
+        if source.chat_type == "dm":
+            where = "conversation"
+        note = (
+            f"[System note: This {where} is continuing from its previous "
+            f"context segment (session_id: {prev}) inside the same logical "
+            f"conversation. If the request depends on earlier exact detail, "
+            f"use session_search with that session id before acting.]"
+        )
+    else:
+        note = (
+            f"[System note: This {where} had an earlier Hermes session "
+            f"(session_id: {prev}) that was auto-reset. If the user refers to "
+            f"earlier work here, or the request depends on this {where}'s "
+            f"history, use the session_search tool to recall that prior "
+            f"session before acting — do not assume an unrelated recent "
+            f"session is the right context.]"
+        )
+    if is_context_rollover and continuity_checkpoint:
+        note = note + "\n\n" + continuity_checkpoint
+    return note
 
 
 def is_shared_multi_user_session(
@@ -2057,8 +2074,8 @@ class SessionStore:
         """
         Check if a session should be reset based on policy.
         
-        Returns the reset reason ("idle" or "daily") if a reset is needed,
-        or None if the session is still valid.
+        Returns the boundary reason if a new session row is needed, or None if
+        the current row is still valid.
         
         Sessions with active background processes are never reset.
         """
@@ -2074,7 +2091,22 @@ class SessionStore:
             platform=source.platform,
             session_type=source.chat_type
         )
-        
+
+        # Context rollover is a model-pressure boundary, not the end of the
+        # logical conversation. Resolve it from the last runtime's measured
+        # usable input budget and defer until a real measurement exists.
+        context_policy = self.config.context_rollover
+        platform_name = source.platform.value if source.platform else ""
+        if platform_name not in context_policy.exclude_platforms:
+            context_threshold = context_policy.resolve_threshold(
+                entry.last_input_budget_tokens
+            )
+            if (
+                context_threshold > 0
+                and entry.last_prompt_tokens >= context_threshold
+            ):
+                return "context_rollover"
+
         if policy.mode == "none":
             return None
         
@@ -2339,7 +2371,10 @@ class SessionStore:
         was_auto_reset = False
         auto_reset_reason = None
         reset_had_activity = False
+        reset_prompt_tokens = 0
         prev_session_id: Optional[str] = None
+        rollover_metadata: Dict[str, Any] = {}
+        rollover_model_override: Optional[Dict[str, str]] = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2373,8 +2408,14 @@ class SessionStore:
                         was_auto_reset = True
                         auto_reset_reason = _reset_reason
                         reset_had_activity = entry.last_prompt_tokens > 0
+                        reset_prompt_tokens = entry.last_prompt_tokens
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        if _reset_reason == "context_rollover":
+                            rollover_metadata = dict(entry.metadata)
+                            rollover_model_override = sanitize_model_override(
+                                entry.model_override
+                            )
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2388,8 +2429,14 @@ class SessionStore:
                         was_auto_reset = True
                         auto_reset_reason = _reset_reason
                         reset_had_activity = entry.last_prompt_tokens > 0
+                        reset_prompt_tokens = entry.last_prompt_tokens
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        if _reset_reason == "context_rollover":
+                            rollover_metadata = dict(entry.metadata)
+                            rollover_model_override = sanitize_model_override(
+                                entry.model_override
+                            )
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2431,10 +2478,13 @@ class SessionStore:
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
+                metadata=rollover_metadata,
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                reset_prompt_tokens=reset_prompt_tokens,
                 prev_session_id=prev_session_id,
+                model_override=rollover_model_override,
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -2460,6 +2510,8 @@ class SessionStore:
                     "thread_id": source.thread_id,
                     "profile_name": source.profile,
                 }
+                if auto_reset_reason == "context_rollover" and prev_session_id:
+                    db_create_kwargs["parent_session_id"] = prev_session_id
 
         if _needs_save:
             self._save_entries()
@@ -2501,7 +2553,8 @@ class SessionStore:
     def update_session(
         self,
         session_key: str,
-        last_prompt_tokens: int = None,
+        last_prompt_tokens: Optional[int] = None,
+        last_input_budget_tokens: Optional[int] = None,
     ) -> None:
         """Update lightweight session metadata after an interaction."""
         with self._lock:
@@ -2512,6 +2565,8 @@ class SessionStore:
                 entry.updated_at = _now()
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
+                if last_input_budget_tokens is not None:
+                    entry.last_input_budget_tokens = last_input_budget_tokens
                 self._save()
                 self._record_gateway_session_peer(
                     entry.session_id,
@@ -3251,6 +3306,47 @@ class SessionStore:
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
             return []
+
+    def load_recent_transcript_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 16,
+    ) -> List[Dict[str, Any]]:
+        """Load a bounded dialogue tail without replaying the whole session."""
+        if not self._db:
+            return []
+        try:
+            return self._db.get_recent_messages(
+                session_id,
+                roles=("user", "assistant"),
+                limit=limit,
+            )
+        except Exception as e:
+            logger.debug("Could not load recent messages from DB: %s", e)
+            return []
+
+    def build_continuity_checkpoint(
+        self,
+        entry: SessionEntry,
+    ) -> Optional[str]:
+        """Build the bounded checkpoint for a context-created session entry."""
+        if (
+            entry.auto_reset_reason != "context_rollover"
+            or not entry.prev_session_id
+        ):
+            return None
+        from gateway.session_continuity import build_context_rollover_checkpoint
+
+        recent_messages = self.load_recent_transcript_messages(
+            entry.prev_session_id,
+            limit=16,
+        )
+        return build_context_rollover_checkpoint(
+            previous_session_id=entry.prev_session_id,
+            prompt_tokens=entry.reset_prompt_tokens,
+            messages=recent_messages,
+        )
 
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.

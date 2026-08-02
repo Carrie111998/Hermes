@@ -65,6 +65,13 @@ _COMPACTION_PREFIXES = (
     "[CONTEXT SUMMARY]:",
 )
 
+# Parent segments whose content has intentionally left the current live
+# context. Compression and context rollover differ in how they hand off, but
+# both make the parent transcript eligible for recall from the child.
+_ARCHIVED_CONTINUATION_REASONS = frozenset(
+    {"compression", "context_rollover"}
+)
+
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
@@ -102,12 +109,11 @@ def _is_compaction_summary(content: str) -> bool:
 def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
     """Walk parent_session_id chain to the lineage root.
 
-    Returns ``(root_id, has_compression_hop)`` where ``has_compression_hop`` is
-    True if any session along the chain ended with ``end_reason = 'compression'``
-    — i.e. at least one parent/ancestor was compression-rotated into this
-    lineage. That flag lets callers distinguish a compression-split lineage
-    (parent content summarised away, no longer in live context) from a
-    delegation lineage (child content still visible to the parent agent).
+    Returns ``(root_id, has_archived_hop)``. The flag is true if any session
+    along the chain ended through compression or context rollover, meaning
+    its content is no longer in the child's live context. This distinguishes
+    a continuation lineage from delegation, whose child content remains
+    visible to the parent agent.
 
     Falls back to ``(session_id, False)`` on errors.
     """
@@ -115,15 +121,15 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
         return session_id, False
     visited: set[str] = set()
     cur = session_id
-    has_compression = False
+    has_archived_hop = False
     while cur and cur not in visited:
         visited.add(cur)
         try:
             s = db.get_session(cur)
             if not s:
                 break
-            if s.get("end_reason") == "compression":
-                has_compression = True
+            if s.get("end_reason") in _ARCHIVED_CONTINUATION_REASONS:
+                has_archived_hop = True
             parent = s.get("parent_session_id")
             if not parent:
                 break
@@ -131,7 +137,7 @@ def _resolve_to_parent(db, session_id: str) -> tuple[str, bool]:
         except Exception as e:
             logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
             break
-    return cur, has_compression
+    return cur, has_archived_hop
 
 
 def _resolve_lineage(db, session_id: str) -> str:
@@ -140,14 +146,12 @@ def _resolve_lineage(db, session_id: str) -> str:
 
 
 def _is_compression_ended(db, session_id: str) -> bool:
-    """Return True if *session_id* itself ended with ``end_reason='compression'``.
+    """Return True if *session_id* is an archived continuation parent.
 
-    Unlike the ``has_compression_hop`` flag from :func:`_resolve_to_parent`
-    (which is True for any descendant of a compression-ended ancestor), this
-    checks only the session's own ``end_reason``. A delegation child created
-    under a compression continuation has ``parent_session_id`` set but its own
-    ``end_reason`` is ``None`` — its content is still live to the parent agent,
-    so it must stay excluded from discovery.
+    The historical function name is retained for compatibility. Both
+    ``compression`` and ``context_rollover`` mean this session's content is
+    outside the current child's live context. A delegation child has no such
+    end reason and must stay excluded from discovery.
     """
     if not session_id:
         return False
@@ -155,7 +159,7 @@ def _is_compression_ended(db, session_id: str) -> bool:
         s = db.get_session(session_id)
         if not s:
             return False
-        return s.get("end_reason") == "compression"
+        return s.get("end_reason") in _ARCHIVED_CONTINUATION_REASONS
     except Exception:
         return False
 
@@ -737,12 +741,11 @@ def _discover(
         # compression-summarised out of the live context (memory black hole
         # after compression). Two sub-cases:
         #
-        # Legacy rotation: the FTS hit lives in a session that itself ended
-        # with end_reason='compression'. That session's content has been
-        # replaced by a summary in the continuation child, so it must stay
-        # discoverable. A delegation child living under a compression
-        # continuation does NOT have end_reason='compression' itself, so it
-        # stays excluded.
+        # Continuation rotation: the FTS hit lives in a session that itself
+        # ended through compression or context rollover. Its content is
+        # outside the child's live context, so it must stay discoverable. A
+        # delegation child has no archived-continuation end reason and stays
+        # excluded.
         #
         # In-place compaction: the FTS hit lives on the SAME session_id as the
         # current session, but the matched message row is an archived

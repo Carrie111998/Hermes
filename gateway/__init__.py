@@ -11,6 +11,7 @@ to various messaging platforms (Telegram, Discord, WhatsApp, Weixin, and more) w
 
 from .config import GatewayConfig, PlatformConfig, HomeChannel, load_gateway_config
 from .session import (
+    ContextRolloverPolicy,
     SessionContext,
     SessionStore,
     SessionResetPolicy,
@@ -27,6 +28,7 @@ __all__ = [
     # Session
     "SessionContext",
     "SessionStore",
+    "ContextRolloverPolicy",
     "SessionResetPolicy",
     "build_session_context_prompt",
     # Delivery

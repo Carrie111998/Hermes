@@ -41,6 +41,7 @@ class _CompressionThenFailureAgent:
             last_prompt_tokens=4321,
             context_length=200000,
         )
+        self.max_tokens = 32000
         self.session_prompt_tokens = 4321
         self.session_completion_tokens = 0
 
@@ -181,6 +182,24 @@ def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
     )
 
 
+def test_runtime_budget_reserves_the_active_agents_output_limit(monkeypatch):
+    _install_compression_failure_agent(monkeypatch)
+
+    session_store = _SessionStore()
+    runner = _runner(session_store)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = _run_compression_failure_turn(runner, source)
+
+    assert result["context_length"] == 200000
+    assert result["last_input_budget_tokens"] == 168000
+
+
 class _RateLimitFailureAgent(_CompressionThenFailureAgent):
     def run_conversation(self, user_message, conversation_history=None, task_id=None, **_kwargs):
         return {
@@ -281,5 +300,4 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-
 

@@ -251,6 +251,32 @@ Semantics are honest at-least-once:
 Disable with `gateway.delivery_ledger: false` in `config.yaml` (restores the
 old behavior: in-flight responses are lost on crash).
 
+### Invisible Context Rollover
+
+Long conversations can silently replace their physical model context before
+context pressure causes drift. The user stays in one logical conversation:
+
+```yaml
+context_rollover:
+  enabled: true
+  threshold_ratio: 0.70
+  max_prompt_tokens: 0
+  notify: false
+  exclude_platforms:
+    - api_server
+    - webhook
+```
+
+Hermes measures the active model's usable input budget after each completed
+turn. At the next inbound boundary, it creates a linked context segment when
+the prompt reaches the configured share of that budget. A lower optional
+`max_prompt_tokens` cap wins. Recent real dialogue is carried forward through
+a deterministic extract, while exact earlier detail remains available through
+`session_search`. No extra LLM summarisation call is made.
+
+Rollover is invisible by default and is deferred while background work is
+active. Set `notify: true` only when you want an operator diagnostic.
+
 ### Reset Policies
 
 **By default sessions never auto-reset** — context lives until you `/reset`

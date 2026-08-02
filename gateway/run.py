@@ -2281,6 +2281,26 @@ _OWN_POLICY_OPEN_ENV = {
 }
 
 
+def _usable_input_budget(context_length: Any, max_output_tokens: Any) -> int:
+    """Return the measured input budget after reserving model output tokens."""
+    try:
+        context_tokens = max(0, int(context_length or 0))
+        output_reserve = max(0, int(max_output_tokens or 0))
+    except (TypeError, ValueError):
+        return 0
+    if context_tokens <= 0:
+        return 0
+    usable = context_tokens - output_reserve
+    if usable <= 0:
+        logger.debug(
+            "Model output reservation (%s tokens) consumes the context window "
+            "(%s tokens); using the full context window as the input budget",
+            output_reserve,
+            context_tokens,
+        )
+    return usable if usable > 0 else context_tokens
+
+
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
     for platform, platform_config in getattr(config, "platforms", {}).items():
@@ -5291,12 +5311,18 @@ class TurnRunner:
         _input_toks = 0
         _output_toks = 0
         _context_length = 0
+        _last_input_budget_toks = 0
         _agent = ctx.agent_holder[0]
         if _agent and hasattr(_agent, "context_compressor"):
-            _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
+            _compressor = _agent.context_compressor
+            _last_prompt_toks = getattr(_compressor, "last_prompt_tokens", 0)
             _input_toks = getattr(_agent, "session_prompt_tokens", 0)
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
-            _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+            _context_length = getattr(_compressor, "context_length", 0) or 0
+            _last_input_budget_toks = _usable_input_budget(
+                _context_length,
+                getattr(_agent, "max_tokens", 0) or 0,
+            )
         _resolved_model = getattr(_agent, "model", None) if _agent else None
 
         # Sync session_id immediately after run_conversation(). Compression
@@ -5434,6 +5460,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "last_input_budget_tokens": _last_input_budget_toks,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5572,6 +5599,7 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "model": _resolved_model,
             "context_length": _context_length,
+            "last_input_budget_tokens": _last_input_budget_toks,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -15755,7 +15783,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
                 binding = None
             if binding:
-                bound_session_id = str(binding.get("session_id") or "")
+                stored_binding_session_id = str(binding.get("session_id") or "")
+                bound_session_id = stored_binding_session_id
                 # Heal bindings that point at a pre-compression parent: walk
                 # the compression-continuation chain forward to its tip so the
                 # next message resumes the compressed child instead of
@@ -15778,7 +15807,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and canonical_session_id != bound_session_id
                     ):
                         bound_session_id = canonical_session_id
-                if bound_session_id and bound_session_id != session_entry.session_id:
+                reset_replaces_bound_session = bool(
+                    getattr(session_entry, "was_auto_reset", False)
+                    and getattr(
+                        session_entry,
+                        "auto_reset_reason",
+                        None,
+                    )
+                    == "context_rollover"
+                    and getattr(session_entry, "prev_session_id", None)
+                    == bound_session_id
+                )
+                if reset_replaces_bound_session:
+                    # The reset decision has already replaced the session that
+                    # this topic binding points at. Advance the binding to the
+                    # new child instead of switching back to the oversized or
+                    # oversized parent and silently undoing the rollover.
+                    await asyncio.to_thread(
+                        self._sync_telegram_topic_binding,
+                        source,
+                        session_entry,
+                        reason=f"auto-reset:{session_entry.auto_reset_reason}",
+                    )
+                elif bound_session_id and bound_session_id != session_entry.session_id:
                     # Route the override through SessionStore so the session_key
                     # → session_id mapping is persisted to disk and the previous
                     # lane session is ended cleanly. Mutating session_entry in
@@ -15790,8 +15841,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # If the stored binding pointed at a parent, rewrite it to the
                 # canonical descendant now that we've followed the chain.
                 if (
-                    bound_session_id
-                    and bound_session_id != str(binding.get("session_id") or "")
+                    not reset_replaces_bound_session
+                    and bound_session_id
+                    and bound_session_id != stored_binding_session_id
                 ):
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
@@ -15807,13 +15859,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # wiping model/reasoning overrides set between turns (Closes #48031).
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
-            # Treat auto-reset as a full conversation boundary — clear every
-            # conversation-scoped per-session dict in one funnel call so the
-            # fresh session does not inherit the previous conversation's
-            # model/reasoning overrides, a queued "/model switched" note, or
-            # a stale resolved-model cache (#48031, #58403). See
-            # _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
+            _auto_reset_reason = (
+                getattr(session_entry, "auto_reset_reason", None) or "idle"
+            )
+            if _auto_reset_reason == "context_rollover":
+                # This is a new physical context segment inside the same
+                # logical conversation. Keep model, reasoning and routing
+                # state, but clear boundary security state and any stale
+                # turn-only sidecar before the deterministic checkpoint lands.
+                self._clear_context_segment_scope(session_key)
+            else:
+                # Timed, suspended and failed-resume resets are true
+                # conversation boundaries. Clear every conversation-scoped
+                # per-session dict through the single funnel.
+                self._clear_conversation_scope(
+                    session_key,
+                    reason="auto_reset",
+                )
             # Evict the cached agent so the fresh session does not inherit the
             # previous conversation's context_compressor._previous_summary —
             # the cache is keyed on the stable session_key, so an auto-reset
@@ -15882,6 +15944,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
+            elif reset_reason == "context_rollover":
+                context_note = (
+                    "[System note: This is a new context segment inside the "
+                    "same logical conversation. The previous segment crossed "
+                    "its model-aware context threshold. A deterministic "
+                    "recent-dialogue checkpoint follows when available, and "
+                    "earlier exact detail remains searchable.]"
+                )
             elif reset_reason == "resume_pending_expired":
                 context_note = "[System note: The previous gateway session could not be recovered after a restart (API recovery timed out). This is a fresh conversation — use /resume to restore history if needed.]"
             else:
@@ -15890,9 +15960,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the specific prior same-channel session so it recalls that context
             # via session_search instead of an unrelated recent session.  Returns
             # None (appends nothing) for other platforms or when there's no prior
-            # activity to recall.  Deterministic — no extra API/DB calls (#36220).
+            # activity to recall. Context rollover adds a bounded deterministic
+            # dialogue tail from state.db. Other reasons remain pointer-only.
+            continuity_checkpoint = None
+            if (
+                reset_reason == "context_rollover"
+                and session_entry.prev_session_id
+            ):
+                try:
+                    continuity_checkpoint = (
+                        await self.async_session_store.build_continuity_checkpoint(
+                            session_entry,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "Context rollover checkpoint build failed",
+                        exc_info=True,
+                    )
             try:
-                continuity_note = build_channel_continuity_note(session_entry, source)
+                continuity_note = build_channel_continuity_note(
+                    session_entry,
+                    source,
+                    continuity_checkpoint=continuity_checkpoint,
+                )
             except Exception:
                 continuity_note = None
             if continuity_note:
@@ -15904,21 +15995,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # - the platform is excluded (e.g. api_server, webhook)
             # - the expired session had no activity (nothing was cleared)
             try:
-                policy = self.session_store.config.get_reset_policy(
+                platform_name = source.platform.value if source.platform else ""
+                had_activity = getattr(session_entry, 'reset_had_activity', False)
+                reset_policy = self.session_store.config.get_reset_policy(
                     platform=source.platform,
                     session_type=getattr(source, 'chat_type', 'dm'),
                 )
-                platform_name = source.platform.value if source.platform else ""
-                had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended and restart-recovery-expired sessions always notify
-                # regardless of policy.notify — the user had an active session
-                # that was silently replaced, so they need to know they can
-                # /resume it.  Idle/daily resets respect the policy flag.
-                should_notify = reset_reason in {"suspended", "resume_pending_expired"} or (
-                    policy.notify
-                    and had_activity
-                    and platform_name not in policy.notify_exclude_platforms
-                )
+                if reset_reason == "context_rollover":
+                    rollover_policy = self.session_store.config.context_rollover
+                    should_notify = rollover_policy.should_notify(
+                        platform_name,
+                        had_activity,
+                    )
+                else:
+                    # Suspended and failed restart recovery always notify. The
+                    # user had an active conversation silently replaced and
+                    # needs to know that /resume remains available.
+                    should_notify = reset_reason in {
+                        "suspended",
+                        "resume_pending_expired",
+                    } or (
+                        reset_policy.notify
+                        and had_activity
+                        and platform_name
+                        not in reset_policy.notify_exclude_platforms
+                    )
                 if should_notify:
                     adapter = self._adapter_for_source(source)
                     if adapter:
@@ -15927,18 +16028,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         elif reset_reason == "resume_pending_expired":
                             reason_text = "gateway restart recovery timed out"
                         elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
+                            reason_text = (
+                                f"daily schedule at {reset_policy.at_hour}:00"
+                            )
+                        elif reset_reason == "context_rollover":
+                            observed_tokens = getattr(
+                                session_entry,
+                                "reset_prompt_tokens",
+                                0,
+                            )
+                            reason_text = (
+                                f"context reached {observed_tokens:,} tokens"
+                                if observed_tokens
+                                else "model-aware context threshold reached"
+                            )
                         else:
-                            hours = policy.idle_minutes // 60
-                            mins = policy.idle_minutes % 60
+                            hours = reset_policy.idle_minutes // 60
+                            mins = reset_policy.idle_minutes % 60
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
-                        )
+                        if reset_reason == "context_rollover":
+                            notice = (
+                                f"◐ Context segment rolled over ({reason_text}). "
+                                "The conversation is continuing with recent "
+                                "working context carried forward. Earlier "
+                                "detail remains searchable.\n"
+                                "Adjust this in config.yaml under "
+                                "context_rollover."
+                            )
+                        else:
+                            notice = (
+                                f"◐ Session automatically reset ({reason_text}). "
+                                f"Conversation history cleared.\n"
+                                f"Use /resume to browse and restore a previous session.\n"
+                                f"Adjust reset timing in config.yaml under session_reset."
+                            )
                         try:
                             session_info = await asyncio.to_thread(
                                 self._reset_notice_session_info, source
@@ -17406,11 +17530,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             
             # Token counts and model are now persisted by the agent directly.
-            # Keep only last_prompt_tokens here for context-window tracking and
-            # compression decisions.
+            # Keep the last prompt use and resolved usable input budget here
+            # for context-window decisions at the next inbound boundary.
             await self.async_session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                last_input_budget_tokens=agent_result.get(
+                    "last_input_budget_tokens",
+                    0,
+                ),
             )
 
             # Re-baseline the cached agent's message_count snapshot now that
@@ -22173,6 +22301,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
         )
+
+    def _clear_context_segment_scope(self, session_key: str) -> None:
+        """Clear boundary-only state while preserving logical conversation state."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        if state is not None:
+            state.conversation.sidecar_notes = []
+        self._clear_session_boundary_security_state(session_key)
+        logger.debug("Cleared context-segment boundary state for %s", session_key)
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear per-session control state that must not survive a boundary switch."""

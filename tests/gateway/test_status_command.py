@@ -211,6 +211,50 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_message_persists_agent_token_counts(monkeypatch):
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.session_store.load_transcript.return_value = [{"role": "user", "content": "earlier"}]
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 80,
+            "last_input_budget_tokens": 68_000,
+            "input_tokens": 120,
+            "output_tokens": 45,
+            "model": "openai/test-model",
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("hello"))
+
+    assert result == "ok"
+    runner.session_store.update_session.assert_called_once_with(
+        session_entry.session_key,
+        last_prompt_tokens=80,
+        last_input_budget_tokens=68_000,
+    )
+
+
+@pytest.mark.asyncio
 async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monkeypatch):
     import gateway.run as gateway_run
 
@@ -486,5 +530,4 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-
 

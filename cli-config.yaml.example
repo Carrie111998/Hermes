@@ -703,6 +703,19 @@ memory:
 #   "daily" - Reset at a fixed hour each day
 #   "both"  - Reset on EITHER inactivity timeout or daily boundary
 #
+# Context rollover is a separate, invisible model-pressure boundary. It keeps
+# one logical conversation while replacing only the physical model context.
+# The ratio uses the active model's measured input budget after output
+# reservation. A non-zero max_prompt_tokens is an optional absolute cap.
+context_rollover:
+  enabled: false
+  threshold_ratio: 0.70
+  max_prompt_tokens: 0
+  notify: false
+  exclude_platforms:
+    - api_server
+    - webhook
+
 session_reset:
   mode: none           # "none", "idle", "daily", or "both"
   idle_minutes: 1440   # Inactivity timeout in minutes (used by "idle"/"both")

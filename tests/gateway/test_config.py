@@ -15,6 +15,7 @@ from agent.secret_scope import (
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from gateway.config import (
     ChannelOverride,
+    ContextRolloverPolicy,
     GatewayConfig,
     HomeChannel,
     Platform,
@@ -25,6 +26,51 @@ from gateway.config import (
     load_gateway_config,
     persist_home_channel,
 )
+
+
+class TestContextRolloverPolicy:
+    def test_roundtrip_preserves_enabled_ratio_cap_notify_and_exclusions(self):
+        policy = ContextRolloverPolicy(
+            enabled=True,
+            threshold_ratio=0.72,
+            max_prompt_tokens=300_000,
+            notify=True,
+            exclude_platforms=("webhook",),
+        )
+
+        restored = ContextRolloverPolicy.from_dict(policy.to_dict())
+
+        assert restored == policy
+
+    def test_resolves_model_ratio_and_lower_absolute_cap(self):
+        ratio_only = ContextRolloverPolicy(enabled=True, threshold_ratio=0.70)
+        capped = ContextRolloverPolicy(
+            enabled=True,
+            threshold_ratio=0.70,
+            max_prompt_tokens=300_000,
+        )
+
+        assert ratio_only.resolve_threshold(500_000) == 350_000
+        assert capped.resolve_threshold(500_000) == 300_000
+
+    def test_ratio_only_waits_for_measured_budget(self):
+        policy = ContextRolloverPolicy(enabled=True, threshold_ratio=0.70)
+
+        assert policy.resolve_threshold(0) == 0
+
+    def test_policy_is_off_by_default(self):
+        policy = ContextRolloverPolicy()
+
+        assert policy.resolve_threshold(500_000) == 0
+        assert policy.notify is False
+        assert policy.should_notify("telegram", had_activity=True) is False
+
+    def test_optional_diagnostic_respects_activity_and_exclusions(self):
+        policy = ContextRolloverPolicy(enabled=True, notify=True)
+
+        assert policy.should_notify("telegram", had_activity=True) is True
+        assert policy.should_notify("telegram", had_activity=False) is False
+        assert policy.should_notify("webhook", had_activity=True) is False
 
 
 class TestHomeChannelRoundtrip:
@@ -278,6 +324,48 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_context_rollover_from_top_level_config(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "context_rollover:\n"
+            "  enabled: true\n"
+            "  threshold_ratio: 0.72\n"
+            "  max_prompt_tokens: 300000\n"
+            "  notify: true\n"
+            "  exclude_platforms:\n"
+            "    - webhook\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.context_rollover.enabled is True
+        assert config.context_rollover.threshold_ratio == 0.72
+        assert config.context_rollover.max_prompt_tokens == 300_000
+        assert config.context_rollover.notify is True
+        assert config.context_rollover.exclude_platforms == ("webhook",)
+
+    def test_context_rollover_from_nested_gateway_config(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  context_rollover:\n"
+            "    enabled: true\n"
+            "    threshold_ratio: 0.75\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.context_rollover.enabled is True
+        assert config.context_rollover.threshold_ratio == 0.75
+
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
         """A fresh install seeded from cli-config.yaml.example must not
         auto-reset sessions.
@@ -304,6 +392,7 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.default_reset_policy.mode == "none"
+        assert config.context_rollover.enabled is False
 
     def test_no_config_yaml_means_no_auto_reset(self, tmp_path, monkeypatch):
         """With no config.yaml at all, sessions must never auto-reset."""

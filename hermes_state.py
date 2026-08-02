@@ -41,7 +41,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -6321,6 +6321,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
+        return result
+
+    def get_recent_messages(
+        self,
+        session_id: str,
+        *,
+        roles: Optional[Sequence[str]] = None,
+        limit: int = 20,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load the newest messages, returned in chronological order.
+
+        This is the bounded tail counterpart to :meth:`get_messages`. It is
+        intended for continuity and preview surfaces that must not load a
+        multi-hundred-thousand-token transcript just to inspect its ending.
+        """
+        limit = max(1, int(limit))
+        active_clause = "" if include_inactive else " AND active = 1"
+        params: list = [session_id]
+        role_clause = ""
+        if roles:
+            normalized_roles = tuple(str(role) for role in roles)
+            placeholders = ", ".join("?" for _ in normalized_roles)
+            role_clause = f" AND role IN ({placeholders})"
+            params.extend(normalized_roles)
+        params.append(limit)
+        sql = (
+            "SELECT * FROM messages WHERE session_id = ?"
+            f"{active_clause}{role_clause} ORDER BY id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = list(reversed(self._conn.execute(sql, params).fetchall()))
+
+        result = []
+        for row in rows:
+            message = dict(row)
+            if "content" in message:
+                message["content"] = self._decode_content(message["content"])
+            result.append(message)
         return result
 
     def get_messages_around(
