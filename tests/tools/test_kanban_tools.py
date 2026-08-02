@@ -446,6 +446,38 @@ def test_create_review_status_enters_review_and_is_claimable(worker_env):
         conn.close()
 
 
+def test_review_tool_schema_and_runtime_handoff(worker_env, monkeypatch):
+    from hermes_cli import profiles
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    schema = kt.KANBAN_SUBMIT_REVIEW_SCHEMA
+    assert schema["parameters"]["required"] == ["summary", "metadata"]
+    assert schema["parameters"]["properties"]["reviewer"]["default"] == "orion"
+
+    out = json.loads(kt._handle_submit_review({
+        "summary": "ready for review",
+        "metadata": {
+            "pr_url": "https://github.com/acme/repo/pull/7",
+            "repo": "acme/repo",
+            "number": 7,
+            "head_sha": "a" * 40,
+            "verification_evidence": {"tests": ["pytest -q"]},
+        },
+    }))
+    assert out["ok"] is True
+    assert out["status"] == "review"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.assignee == "orion"
+        assert task.status == "review"
+    finally:
+        conn.close()
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -619,6 +651,30 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, other).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_worker_review_changes_rejects_foreign_task_id(worker_env):
+    """A worker cannot request review changes on a sibling task."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(
+            conn, title="review sibling", assignee="reviewer", initial_status="review",
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_review_changes({"task_id": other, "summary": "HIJACK"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "review"
     finally:
         conn.close()
 
