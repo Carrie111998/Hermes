@@ -351,6 +351,48 @@ def _surface_generations(manager: PluginManager) -> dict[str, int]:
     }
 
 
+def _assert_lock_acquirable_from_other_thread(label: str, lock: Any) -> None:
+    acquired = threading.Event()
+    release = threading.Event()
+    failures: list[BaseException] = []
+
+    def acquire_lock() -> None:
+        try:
+            lock.acquire()
+            acquired.set()
+            assert release.wait(timeout=5), f"{label} release gate timed out"
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            if acquired.is_set():
+                lock.release()
+
+    thread = threading.Thread(
+        target=acquire_lock,
+        name=f"h1-assert-lock-free-{label}",
+        daemon=True,
+    )
+    thread.start()
+    assert acquired.wait(timeout=5), f"{label} lock was leaked"
+    release.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive(), f"{label} lock holder did not exit"
+    assert failures == []
+
+
+def _assert_all_registration_locks_acquirable_from_other_threads(
+    manager: PluginManager,
+    *,
+    context_locks: list[Any] | None = None,
+) -> None:
+    _assert_lock_acquirable_from_other_thread("manager", manager._lock)
+    _assert_lock_acquirable_from_other_thread("tool", registry._lock)
+    for surface, transaction in plugins_module._external_registry_transactions().items():
+        _assert_lock_acquirable_from_other_thread(surface, transaction.lock)
+    for index, lock in enumerate(context_locks or []):
+        _assert_lock_acquirable_from_other_thread(f"context[{index}]", lock)
+
+
 def _register_external_direct(
     surface: str,
     value: Any,
@@ -663,6 +705,252 @@ def test_force_reload_baseexception_after_external_install_rolls_back_all_surfac
     assert registry.get_entry(_TOOL_NAME) is old_tool
     assert _read_external_generation(old_values, isolated_registries) == old_values
     assert _read_external_generation(new_values, isolated_registries) == old_values
+
+
+def test_force_reload_baseexception_after_activation_keeps_published_generation(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "activation-interrupt")
+    _support(old_values, "generation-a", released=True, register_generation_state=True)
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    new_values = _external_values("generation-b", "activation-interrupt")
+    _support(new_values, "generation-b", released=True, register_generation_state=True)
+    original_activate = plugins_module._PluginPublicationCapability._activate
+    rollback_attempted = threading.Event()
+    original_restore = registry._restore_transaction_snapshot_exact_locked
+
+    def activate_then_interrupt(self):
+        original_activate(self)
+        raise _InjectedBaseException("injected after publication activation")
+
+    def observe_rollback(snapshot):
+        rollback_attempted.set()
+        original_restore(snapshot)
+
+    monkeypatch.setattr(
+        plugins_module._PluginPublicationCapability,
+        "_activate",
+        activate_then_interrupt,
+    )
+    monkeypatch.setattr(
+        registry,
+        "_restore_transaction_snapshot_exact_locked",
+        observe_rollback,
+    )
+
+    with pytest.raises(
+        _InjectedBaseException,
+        match="injected after publication activation",
+    ):
+        manager.discover_and_load(force=True)
+
+    assert not rollback_attempted.is_set()
+    assert manager._live_context_revoking == set()
+    assert manager.invoke_hook("post_tool_call") == ["generation-b"]
+    assert registry.get_entry(_TOOL_NAME).handler({}) == "generation-b"
+    assert _read_external_generation(new_values, isolated_registries) == new_values
+
+
+def test_force_reload_mid_cleanup_release_failure_preserves_primary_and_cancels_revocation(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "cleanup-release")
+    support = _support(
+        old_values,
+        "generation-a",
+        released=True,
+        register_generation_state=True,
+    )
+    support.saved_contexts = []
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_contexts.append(ctx)\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    new_values = _external_values("generation-b", "cleanup-release")
+    support = _support(
+        new_values,
+        "generation-b",
+        released=True,
+        register_generation_state=True,
+    )
+    support.saved_contexts = []
+    primary = _InjectedBaseException("injected after all publication locks")
+    release_failure = _InjectedBaseException("injected mid cleanup release failure")
+    original_tool_validate = registry._validate_prepared_transaction_locked
+    original_tool_lock = registry._lock
+    fail_release = threading.Event()
+    revocation_observed = threading.Event()
+
+    class _FailingReleaseLock:
+        def acquire(self, *args, **kwargs):
+            return original_tool_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            original_tool_lock.release()
+            if fail_release.is_set():
+                raise release_failure
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.release()
+
+    def validate_then_interrupt(snapshot, prepared) -> None:
+        original_tool_validate(snapshot, prepared)
+        assert manager._live_context_revoking == {manager._live_context_generation}
+        revocation_observed.set()
+        fail_release.set()
+        raise primary
+
+    monkeypatch.setattr(registry, "_validate_prepared_transaction_locked", validate_then_interrupt)
+    monkeypatch.setattr(registry, "_lock", _FailingReleaseLock())
+
+    with pytest.raises(_InjectedBaseException) as exc_info:
+        manager.discover_and_load(force=True)
+
+    assert exc_info.value is primary
+    assert revocation_observed.is_set()
+    assert any("cleanup" in note.lower() for note in primary.__notes__)
+    assert any("mid cleanup release failure" in note for note in primary.__notes__)
+    assert manager._live_context_revoking == set()
+    monkeypatch.setattr(registry, "_lock", original_tool_lock)
+    _assert_all_registration_locks_acquirable_from_other_threads(
+        manager,
+        context_locks=[
+            manager._context_registration_lock,
+            *(context._registration_lock for context in support.saved_contexts),
+        ],
+    )
+    assert manager.invoke_hook("post_tool_call") == ["generation-a"]
+    assert registry.get_entry(_TOOL_NAME).handler({}) == "generation-a"
+    assert _read_external_generation(old_values, isolated_registries) == old_values
+
+
+def test_registration_transaction_constructor_attempts_all_lock_cleanup(monkeypatch):
+    manager = PluginManager()
+    original_manager_lock = manager._lock
+    original_tool_lock = registry._lock
+    external_transactions = plugins_module._external_registry_transactions()
+    external_lock_slots: dict[str, tuple[Any, str, Any]] = {}
+    external_surfaces = list(external_transactions)
+    for surface, transaction in external_transactions.items():
+        if surface == "platform":
+            owner = transaction
+        elif surface == "secret":
+            from agent.secret_sources import registry as secret_registry
+
+            owner = secret_registry._registry_state
+        else:
+            owner = transaction._state
+        external_lock_slots[surface] = (owner, "_lock", owner._lock)
+    first_failure = _InjectedBaseException("injected constructor release failure 0")
+    second_failure = _InjectedBaseException("injected constructor release failure 1")
+    first_cleanup_index = 2 + external_surfaces.index("web")
+    later_cleanup_index = 2 + external_surfaces.index("stt")
+    failures = {first_cleanup_index: first_failure, later_cleanup_index: second_failure}
+
+    class _ReleaseWrapper:
+        def __init__(self, lock, index: int) -> None:
+            self._lock = lock
+            self._index = index
+            self._release_count = 0
+
+        def acquire(self, *args, **kwargs):
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            self._lock.release()
+            self._release_count += 1
+            if self._index in failures and self._release_count > 1:
+                raise failures[self._index]
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.release()
+
+    monkeypatch.setattr(manager, "_lock", _ReleaseWrapper(original_manager_lock, 0))
+    monkeypatch.setattr(registry, "_lock", _ReleaseWrapper(original_tool_lock, 1))
+    for index, (surface, (owner, attr, original_lock)) in enumerate(
+        external_lock_slots.items(),
+        start=2,
+    ):
+        monkeypatch.setattr(owner, attr, _ReleaseWrapper(original_lock, index))
+
+    with pytest.raises(_InjectedBaseException) as exc_info:
+        plugins_module._RegistrationTransaction(manager)
+
+    monkeypatch.setattr(manager, "_lock", original_manager_lock)
+    monkeypatch.setattr(registry, "_lock", original_tool_lock)
+    for owner, attr, original_lock in external_lock_slots.values():
+        monkeypatch.setattr(owner, attr, original_lock)
+
+    assert exc_info.value is first_failure
+    assert first_failure.__notes__ == [
+        "Additional cleanup failure: constructor lock[3]: "
+        "_InjectedBaseException: injected constructor release failure 1",
+        "Plugin registration cleanup failed; attempted all cleanup actions. "
+        "First failure at constructor lock[0].",
+    ]
+    _assert_all_registration_locks_acquirable_from_other_threads(manager)
+
+
+def test_force_reload_candidate_callback_worker_registration_does_not_deadlock(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("generation-a", "worker-callback")
+    support = _support(values, "generation-a", released=True)
+    support.worker_started = threading.Event()
+    support.worker_done = threading.Event()
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        f'''import threading
+import {_SUPPORT_MODULE} as support
+
+def register(ctx):
+    def worker():
+        support.worker_started.set()
+        ctx.register_hook("h1_worker_callback_hook", lambda **kwargs: support.marker)
+        support.worker_done.set()
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    if not support.worker_started.wait(timeout=5):
+        raise RuntimeError("worker did not start")
+    if not support.worker_done.wait(timeout=5):
+        raise RuntimeError("worker registration deadlocked")
+    thread.join(timeout=1)
+''',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+
+    manager.discover_and_load(force=True)
+
+    assert support.worker_done.is_set()
+    assert manager.invoke_hook("h1_worker_callback_hook") == ["generation-a"]
 
 
 def test_force_reload_removes_registrations_absent_from_new_generation(

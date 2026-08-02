@@ -45,7 +45,7 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -541,6 +541,44 @@ class _PluginPublicationCapability:
         object.__setattr__(self, "_published", True)
 
 
+def _run_cleanup_actions(
+    actions: Iterable[tuple[str, Callable[[], None]]],
+    *,
+    primary: Optional[BaseException] = None,
+    note: str = "Plugin registration cleanup failed",
+) -> None:
+    """Run every cleanup action, preserving an active primary exception."""
+    failures: List[tuple[str, BaseException]] = []
+    for label, action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            logger.error("%s for %s", note, label, exc_info=True)
+            failures.append((label, exc))
+    if not failures:
+        return
+    if primary is not None:
+        primary.add_note(
+            f"{note}; attempted all cleanup actions. First failure: "
+            f"{failures[0][0]}: {type(failures[0][1]).__name__}: {failures[0][1]}"
+        )
+        for label, exc in failures[1:]:
+            primary.add_note(
+                f"Additional cleanup failure: {label}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        return
+    first_label, first_failure = failures[0]
+    for label, exc in failures[1:]:
+        first_failure.add_note(
+            f"Additional cleanup failure: {label}: {type(exc).__name__}: {exc}"
+        )
+    first_failure.add_note(
+        f"{note}; attempted all cleanup actions. First failure at {first_label}."
+    )
+    raise first_failure
+
+
 @dataclass(frozen=True)
 class _PluginContextBinding:
     """One coherent authority target captured by a registration mutation."""
@@ -566,6 +604,7 @@ class _RegistrationTransaction:
         self.manager = manager
         self.replace_owned = replace_owned
         self.tool_registry = tool_registry
+        self.registration_lock = threading.RLock()
         self.external_transactions = _external_registry_transactions()
         locks = [
             manager._lock,
@@ -587,8 +626,13 @@ class _RegistrationTransaction:
                 for surface in _EXTERNAL_COMMIT_SURFACES
             }
         finally:
-            for lock in reversed(acquired_locks):
-                lock.release()
+            _run_cleanup_actions(
+                [
+                    (f"constructor lock[{index}]", lock.release)
+                    for index, lock in enumerate(reversed(acquired_locks))
+                ],
+                primary=sys.exc_info()[1],
+            )
 
         self.manager_view = _PluginRegistrationView(
             self.manager_before,
@@ -677,6 +721,9 @@ class _RegistrationTransaction:
             else None
         )
         context_locks = [self.manager._context_registration_lock]
+        context_locks.extend(
+            dict.fromkeys(context._registration_lock for context in self.contexts)
+        )
         live_registry_locks = [
             self.manager._lock,
             self.tool_registry._lock,
@@ -688,11 +735,11 @@ class _RegistrationTransaction:
         acquired_locks: List[Any] = []
         revocation_started = False
         publication_started = False
-        publication_committed = False
         publication_capability = _PluginPublicationCapability()
         context_bindings_before: List[
             tuple[PluginContext, _PluginContextBinding]
         ] = []
+        active_primary: Optional[BaseException] = None
 
         try:
             # Binding locks always precede every live manager/tool/external
@@ -758,9 +805,9 @@ class _RegistrationTransaction:
                 )
             self.manager._install_owned_state_locked(next_manager)
             publication_capability._activate()
-            publication_committed = True
         except BaseException as primary:
-            if publication_started and not publication_committed:
+            active_primary = primary
+            if publication_started and not publication_capability._published:
                 rollback_errors: List[BaseException] = []
                 rollback_steps = [
                     (
@@ -815,10 +862,23 @@ class _RegistrationTransaction:
                     ]
             raise
         finally:
-            for lock in reversed(acquired_locks):
-                lock.release()
+            cleanup_actions: List[tuple[str, Callable[[], None]]] = [
+                (f"commit lock[{index}]", lock.release)
+                for index, lock in enumerate(reversed(acquired_locks))
+            ]
             if revocation_started:
-                self.manager._cancel_live_context_revocation(revoke_generation)
+                cleanup_actions.append(
+                    (
+                        "live context revocation",
+                        lambda: self.manager._cancel_live_context_revocation(
+                            revoke_generation
+                        ),
+                    )
+                )
+            _run_cleanup_actions(
+                cleanup_actions,
+                primary=sys.exc_info()[1] or active_primary,
+            )
 
 
 class _ForceSweepAbort(RuntimeError):
@@ -841,14 +901,13 @@ class PluginContext:
         registration_manager: Any = None,
         registration_registry: Any = None,
         registration_external_registries: Any = None,
+        registration_lock: Any = None,
     ):
         self.manifest = manifest
         self._manager = manager
-        # Every context owned by this manager, including staged transaction
-        # contexts, shares the live manager's reentrant registration lock.
-        # Cross-context callback nesting is therefore same-thread re-entry,
-        # never independent-lock acquisition in an opposing order.
-        self._registration_lock = manager._context_registration_lock
+        # Live contexts share the manager lock; staged transaction contexts use
+        # a transaction-local lock and join the live ordering only at commit.
+        self._registration_lock = registration_lock or manager._context_registration_lock
         # Managed discovery supplies isolated registry transaction views.
         # Direct/runtime contexts leave them unset and target live registries.
         self._registration_binding = _PluginContextBinding(
@@ -2211,46 +2270,38 @@ class PluginManager:
                 raise
 
     def _force_discover_and_load(self) -> None:
-        """Stage and publish a force generation while owning shared authority."""
-        # Acquire before discovery invokes any candidate callback. If a live
-        # registration owns the lock, fail closed without waiting back on a
-        # callback that may itself be waiting for this reload.
-        if not self._context_registration_lock.acquire(blocking=False):
-            return
-        try:
-            with self._discovery_lock:
-                if env_var_enabled("HERMES_SAFE_MODE"):
-                    logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
-                    with self._lock:
-                        self._discovered = True
-                        self._generation += 1
-                    return
+        """Stage and publish a force generation under discovery serialization."""
+        with self._discovery_lock:
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
+                with self._lock:
+                    self._discovered = True
+                    self._generation += 1
+                return
 
-                transaction = _RegistrationTransaction(
-                    self,
-                    replace_owned=True,
-                )
-                module_snapshot = _snapshot_module_namespace(_NS_PARENT)
-                try:
-                    self._discover_and_load_inner(transaction)
-                    transaction.commit()
-                except (_ForceSweepAbort, RegistryTransactionConflict) as exc:
-                    _restore_module_namespace(_NS_PARENT, module_snapshot)
-                    if isinstance(exc, RegistryTransactionConflict):
-                        logger.warning(
-                            "Plugin force-reload commit conflict: "
-                            "surface=%s expected_generation=%d "
-                            "actual_generation=%d; retaining prior generation",
-                            exc.surface,
-                            exc.expected_generation,
-                            exc.actual_generation,
-                        )
-                    return
-                except BaseException:
-                    _restore_module_namespace(_NS_PARENT, module_snapshot)
-                    raise
-        finally:
-            self._context_registration_lock.release()
+            transaction = _RegistrationTransaction(
+                self,
+                replace_owned=True,
+            )
+            module_snapshot = _snapshot_module_namespace(_NS_PARENT)
+            try:
+                self._discover_and_load_inner(transaction)
+                transaction.commit()
+            except (_ForceSweepAbort, RegistryTransactionConflict) as exc:
+                _restore_module_namespace(_NS_PARENT, module_snapshot)
+                if isinstance(exc, RegistryTransactionConflict):
+                    logger.warning(
+                        "Plugin force-reload commit conflict: "
+                        "surface=%s expected_generation=%d "
+                        "actual_generation=%d; retaining prior generation",
+                        exc.surface,
+                        exc.expected_generation,
+                        exc.actual_generation,
+                    )
+                return
+            except BaseException:
+                _restore_module_namespace(_NS_PARENT, module_snapshot)
+                raise
 
     def _discover_and_load_inner(
         self,
@@ -2734,6 +2785,7 @@ class PluginManager:
             registration_manager=transaction.manager_view,
             registration_registry=transaction.tool_view,
             registration_external_registries=transaction.context_targets(),
+            registration_lock=transaction.registration_lock,
         )
         try:
             transaction.tool_view.register_plugin_override_policy(
