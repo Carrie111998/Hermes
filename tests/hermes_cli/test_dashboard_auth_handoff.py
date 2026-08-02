@@ -101,6 +101,27 @@ def _phone_consume(ticket: str, *, extra_qs: str = "") -> TestClient:
     return phone
 
 
+def _fragment_consume(
+    ticket: str,
+    *,
+    origin: str = "https://fly-app.fly.dev",
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[TestClient, object]:
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    headers = {
+        "Origin": origin,
+        "Sec-Fetch-Site": "same-origin",
+        "X-Hermes-Handoff": "1",
+    }
+    headers.update(extra_headers or {})
+    response = phone.post(
+        "/api/auth/handoff-consume",
+        json={"ticket": ticket},
+        headers=headers,
+    )
+    return phone, response
+
+
 # ---------------------------------------------------------------------------
 # Mint endpoint auth
 # ---------------------------------------------------------------------------
@@ -157,6 +178,136 @@ def test_mint_handoff_rejects_unknown_profile(gated_app):
         json={"session_id": "sess-p", "profile": "nope-profile-xyz"},
     )
     assert r.status_code in (400, 404), r.text
+
+
+# ---------------------------------------------------------------------------
+# Fragment bootstrap transport
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_bootstrap_is_public_and_hardened(gated_app):
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+
+    response = phone.get("/handoff#ticket=hnd_never-sent-to-server")
+
+    assert response.status_code == 200
+    assert "hnd_never-sent-to-server" not in response.text
+    assert "/api/auth/handoff-consume" in response.text
+    assert "history.replaceState" in response.text
+    assert response.headers["referrer-policy"] == "no-referrer"
+    csp = response.headers["content-security-policy"]
+    assert "default-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+    lookalike = phone.get("/handoff-extra", follow_redirects=False)
+    assert lookalike.status_code == 302
+    assert "/login" in lookalike.headers["location"]
+
+
+def test_fragment_bootstrap_preserves_proxy_prefix(gated_app):
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    page = phone.get(
+        "/handoff",
+        headers={"X-Forwarded-Prefix": "/hermes"},
+    )
+
+    assert page.status_code == 200
+    assert 'fetch("/hermes/api/auth/handoff-consume"' in page.text
+
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "prefixed-fragment")
+    _phone, response = _fragment_consume(
+        ticket,
+        extra_headers={"X-Forwarded-Prefix": "/hermes"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "location": "/hermes/chat?resume=prefixed-fragment",
+    }
+    assert "Path=/hermes" in response.headers["set-cookie"]
+
+
+def test_fragment_consume_sets_scoped_cookie_and_uses_bound_target(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "fragment-session")
+
+    phone, response = _fragment_consume(ticket)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"location": "/chat?resume=fragment-session"}
+    assert response.headers["cache-control"] == "no-store"
+    bare = _bare_cookie_names(phone)
+    assert SESSION_AT_COOKIE in bare
+    assert SESSION_RT_COOKIE not in bare
+
+    me = phone.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["scopes"] == ["resume"]
+    assert me.json()["bound_session_id"] == "fragment-session"
+
+
+def test_fragment_consume_is_single_use(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "single-use-fragment")
+
+    _phone, first = _fragment_consume(ticket)
+    _replay_phone, replay = _fragment_consume(ticket)
+
+    assert first.status_code == 200
+    assert replay.status_code == 401
+    assert replay.json() == {"detail": "Invalid or expired handoff"}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Origin": "https://attacker.example"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"X-Hermes-Handoff": "0"},
+    ],
+)
+def test_rejected_fragment_request_does_not_burn_ticket(gated_app, headers):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "origin-guard")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    rejected_headers = {
+        "Origin": "https://fly-app.fly.dev",
+        "Sec-Fetch-Site": "same-origin",
+        "X-Hermes-Handoff": "1",
+        **headers,
+    }
+    rejected = phone.post(
+        "/api/auth/handoff-consume",
+        json={"ticket": ticket},
+        headers=rejected_headers,
+    )
+    _valid_phone, valid = _fragment_consume(ticket)
+
+    assert rejected.status_code == 403
+    assert valid.status_code == 200
+
+
+def test_fragment_consume_requires_json_without_burning_ticket(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "content-type-guard")
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+
+    rejected = phone.post(
+        "/api/auth/handoff-consume",
+        content=f'{{"ticket":"{ticket}"}}',
+        headers={
+            "Content-Type": "text/plain",
+            "Origin": "https://fly-app.fly.dev",
+            "Sec-Fetch-Site": "same-origin",
+            "X-Hermes-Handoff": "1",
+        },
+    )
+    _valid_phone, valid = _fragment_consume(ticket)
+
+    assert rejected.status_code == 403
+    assert valid.status_code == 200
 
 
 # ---------------------------------------------------------------------------

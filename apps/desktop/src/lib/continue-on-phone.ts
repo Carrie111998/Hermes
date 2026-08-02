@@ -57,17 +57,24 @@ export function buildDashboardSessionUrl(
     return null
   }
 
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/chat`
+  const basePath = url.pathname.replace(/\/+$/, '')
   url.search = ''
   url.hash = ''
+
+  if (cleanHandoff) {
+    // Fragments are not sent in HTTP request lines or Referer headers. The
+    // public handoff bootstrap exchanges this one-time ticket in a same-origin
+    // POST body, then removes it from browser history before opening chat.
+    url.pathname = `${basePath}/handoff`
+    url.hash = new URLSearchParams({ ticket: cleanHandoff }).toString()
+    return url.toString()
+  }
+
+  url.pathname = `${basePath}/chat`
   url.searchParams.set('resume', cleanSessionId)
 
   if (profile?.trim()) {
     url.searchParams.set('profile', profile.trim())
-  }
-
-  if (cleanHandoff) {
-    url.searchParams.set('handoff', cleanHandoff)
   }
 
   return url.toString()

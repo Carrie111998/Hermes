@@ -544,7 +544,8 @@ same auth gate as the rest of `/api/`.
 | `POST /api/ops/hooks` · `DELETE /api/ops/hooks` | Create / remove a shell hook (consent-gated) |
 | `GET /api/system/stats` | Host stats — OS, CPU, memory, disk, uptime |
 | `GET /api/dashboard/remote-access` | The configured dashboard public URL (for [Continue on phone](#continue-a-session-on-your-phone)); empty when unset |
-| `POST /api/auth/handoff-ticket` | Mint a single-use phone handoff ticket `{session_id, profile?}` (full desk only; resume-scoped consume on GET `/chat?handoff=`) |
+| `POST /api/auth/handoff-ticket` | Mint a single-use phone handoff ticket `{session_id, profile?}` (full desk only) |
+| `POST /api/auth/handoff-consume` | Same-origin fragment bootstrap exchange for a resume-scoped phone cookie |
 | `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git/pip installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 6h cache |
 | `GET /api/curator` · `PUT .../paused` · `POST .../run` | Skill-curator status + pause/resume + run |
 | `GET /api/portal` | Nous Portal auth + Tool Gateway routing (read-only) |
@@ -1113,10 +1114,10 @@ Hermes Desktop can hand the conversation you're looking at to your phone: **sess
 The QR encodes a **single-use handoff URL**:
 
 ```
-https://<public-host>/<prefix>/chat?resume=<session-id>&handoff=<ticket>[&profile=<name>]
+https://<public-host>/<prefix>/handoff#ticket=<ticket>
 ```
 
-On first load the dashboard consumes `handoff` (GET `/chat` only), sets a **resume-scoped** browser session cookie bound to that session/profile, and strips the ticket from the URL. The phone then opens chat PTY against the bound session — client query params cannot pivot to another session. If the handoff ticket is missing/expired/already used, the phone falls through to normal gated sign-in.
+The fragment is never sent in the HTTP request line or `Referer` header. A small server-rendered `/handoff` page removes the fragment from browser history, exchanges the ticket through a same-origin JSON POST, receives a **resume-scoped** browser session cookie bound to the ticket's session/profile, and replaces the page with the bound Chat route. Client parameters cannot pivot to another session. Missing, expired, replayed, or cross-origin handoffs fail closed.
 
 Prerequisites — Desktop checks all of these and won't render a QR code until they pass:
 
@@ -1130,7 +1131,7 @@ Desktop:
 
 1. Resolves the public base via `GET /api/dashboard/remote-access` (`{"public_url": "…"}`, empty when unset).
 2. Mints `POST /api/auth/handoff-ticket` with `{session_id, profile}` against the local/authenticated desk backend.
-3. Builds the QR URL with `resume` + `handoff` (+ `profile` when needed).
+3. Builds the QR URL with the ticket in the URL fragment. Session and profile stay server-side on the ticket.
 
 ### Handoff URL lifetime, scope, and logs
 
@@ -1142,15 +1143,7 @@ Desktop:
 | Scope after consume | **`resume` only** | Denies `/api/env`, `/api/config`, session list, admin WS (`/api/ws`, `/api/console`, `/api/pub`) |
 | Logout | `/auth/logout` clears cookies and best-effort revokes provider refresh tokens | Phone end of session |
 
-**Tunnel / reverse-proxy access logs (read this before public exposure).**
-
-The first phone hit is `GET /chat?resume=…&handoff=<ticket>`. The app **strips** `handoff` on the 302 redirect, but anything sitting **in front of** the app can still log the original request line:
-
-- **cloudflared**: at `--loglevel debug` it logs the request URL and headers and **warns that this can expose sensitive information**. Keep production tunnels at `info` or higher unless you are actively debugging, and treat debug logs as secret material.
-- **nginx / Caddy / other reverse proxies**: default access logs often include the full request URI (path **and** query). Prefer logging `$uri` / path-only, or redact `handoff` / `ticket` query parameters before shipping logs to a third party.
-- **Hermes app audit logs** already redact handoff/ticket secrets; do not assume the tunnel does.
-
-Mitigations already in the product: short TTL, single-use tickets, resume-only scope, no long-lived token in the SPA bundle. Mitigations on the operator side: avoid debug tunnel logging, redact query strings in proxy access logs, and rotate/re-mint if a ticket URL was captured before consume.
+The one-time ticket stays in the fragment until the bootstrap script moves it into a same-origin POST body. Reverse proxies and tunnels therefore see only `GET /handoff`, not the secret. The bootstrap response uses a nonce-scoped content security policy, `Referrer-Policy: no-referrer`, no external assets, and no caching. The consume endpoint also requires JSON, the bootstrap request header, and a matching browser `Origin` before it touches the ticket.
 
 ## CORS
 

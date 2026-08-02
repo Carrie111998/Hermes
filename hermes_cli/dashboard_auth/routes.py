@@ -15,7 +15,9 @@ The routes:
 """
 from __future__ import annotations
 
+import json
 import logging
+import secrets
 import threading
 import time
 from collections import defaultdict, deque
@@ -861,6 +863,181 @@ async def api_auth_ws_ticket(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Public: phone-handoff fragment bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _canonical_origin(raw: str, *, require_origin_shape: bool = False) -> str:
+    """Return a normalised scheme + authority or ``""`` for invalid input."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit((raw or "").strip())
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    if require_origin_shape and parsed.path not in {"", "/"}:
+        return ""
+
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme == "https" else 80
+    authority = host if port in {None, default_port} else f"{host}:{port}"
+    return f"{parsed.scheme}://{authority}"
+
+
+def _expected_handoff_origin(request: Request) -> str:
+    """Resolve the browser origin from trusted config, then proxy-aware URL."""
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    public_url = resolve_public_url()
+    return _canonical_origin(public_url or str(request.url))
+
+
+def _render_handoff_bootstrap(prefix: str, nonce: str) -> str:
+    """Render a dependency-free page that exchanges a fragment ticket."""
+    api_path = json.dumps(f"{prefix}/api/auth/handoff-consume")
+    script = """
+(() => {
+  const status = document.getElementById('status');
+  const fail = () => {
+    status.textContent = 'This handoff link is invalid or has expired. Create a new QR code from Hermes Desktop.';
+    document.title = 'Handoff expired | Hermes';
+  };
+
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  let ticket = params.get('ticket') || '';
+  history.replaceState(null, '', window.location.pathname + window.location.search);
+  if (!ticket) {
+    fail();
+    return;
+  }
+
+  const body = JSON.stringify({ ticket });
+  ticket = '';
+  fetch(__API_PATH__, {
+    method: 'POST',
+    credentials: 'include',
+    cache: 'no-store',
+    redirect: 'error',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Hermes-Handoff': '1'
+    },
+    body
+  }).then(async response => {
+    if (!response.ok) throw new Error('handoff rejected');
+    const payload = await response.json();
+    const next = new URL(payload.location || '', window.location.origin);
+    if (next.origin !== window.location.origin) throw new Error('invalid destination');
+    window.location.replace(next.pathname + next.search);
+  }).catch(fail);
+})();
+""".replace("__API_PATH__", api_path)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Opening Hermes</title>
+  <style nonce="{nonce}">
+    :root {{ color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }}
+    body {{ align-items: center; background: #071411; color: #e9fff7; display: flex; justify-content: center; margin: 0; min-height: 100vh; }}
+    main {{ max-width: 32rem; padding: 2rem; text-align: center; }}
+    h1 {{ font-size: 1.5rem; margin: 0 0 .75rem; }}
+    p {{ color: #a9c7bd; line-height: 1.55; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Opening Hermes</h1>
+    <p id="status">Securing this session on your phone...</p>
+  </main>
+  <script nonce="{nonce}">{script}</script>
+</body>
+</html>"""
+
+
+@router.get("/handoff", name="handoff_bootstrap")
+async def handoff_bootstrap(request: Request) -> HTMLResponse:
+    """Load the fragment-only handoff exchange without exposing the SPA."""
+    nonce = secrets.token_urlsafe(18)
+    prefix = _prefix(request)
+    return HTMLResponse(
+        _render_handoff_bootstrap(prefix, nonce),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Content-Security-Policy": (
+                "default-src 'none'; base-uri 'none'; connect-src 'self'; "
+                f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                "form-action 'none'; frame-ancestors 'none'"
+            ),
+            "Cross-Origin-Opener-Policy": "same-origin",
+            "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.post("/api/auth/handoff-consume", name="auth_handoff_consume")
+async def api_auth_handoff_consume(request: Request):
+    """Exchange a same-origin fragment ticket for a resume-scoped cookie."""
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    origin = _canonical_origin(
+        request.headers.get("origin", ""),
+        require_origin_shape=True,
+    )
+    expected_origin = _expected_handoff_origin(request)
+    fetch_site = request.headers.get("sec-fetch-site", "")
+    if (
+        content_type != "application/json"
+        or request.headers.get("x-hermes-handoff") != "1"
+        or not origin
+        or origin != expected_origin
+        or (fetch_site and fetch_site != "same-origin")
+    ):
+        return JSONResponse(
+            {"detail": "Handoff request rejected"},
+            status_code=403,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict) or not isinstance(payload.get("ticket"), str):
+        return JSONResponse(
+            {"detail": "Invalid handoff request"},
+            status_code=400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    from hermes_cli.dashboard_auth.middleware import consume_handoff_response
+
+    response = consume_handoff_response(
+        request,
+        payload["ticket"].strip(),
+        require_legacy_chat_request=False,
+        json_response=True,
+    )
+    if response is None:
+        return JSONResponse(
+            {"detail": "Invalid or expired handoff"},
+            status_code=401,
+            headers={"Cache-Control": "no-store"},
+        )
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Auth-required: phone-handoff ticket (QR path)
 # ---------------------------------------------------------------------------
 
@@ -878,8 +1055,8 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
     (``auth_required`` False) Hermes Desktop authenticates with the legacy
     session token and has no OAuth cookie — mint as a synthetic local-desk
     identity so Continue-on-phone can issue QR handoff tickets. The ticket
-    binds ``session_id`` + optional ``profile`` and, on consume via
-    ``?handoff=``, mints a resume-scoped browser session cookie — never
+    binds ``session_id`` + optional ``profile`` and, on fragment-bootstrap
+    consume, mints a resume-scoped browser session cookie — never
     ``API_SERVER_KEY`` / superuser / ``*`` scope.
     """
     import time as _time

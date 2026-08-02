@@ -30,7 +30,7 @@ describe('buildDashboardSessionUrl', () => {
     )
   })
 
-  it('appends a handoff ticket when provided', () => {
+  it('keeps the handoff ticket out of the HTTP request URL', () => {
     expect(
       buildDashboardSessionUrl(
         'https://hermes.example.com/agent',
@@ -39,7 +39,7 @@ describe('buildDashboardSessionUrl', () => {
         'ticket/with spaces'
       )
     ).toBe(
-      'https://hermes.example.com/agent/chat?resume=session-42&profile=work&handoff=ticket%2Fwith+spaces'
+      'https://hermes.example.com/agent/handoff#ticket=ticket%2Fwith+spaces'
     )
   })
 
@@ -70,12 +70,13 @@ describe('resolveContinueOnPhoneUrl', () => {
 
     expect(result).toEqual({
       ok: true,
-      url: 'https://hermes.example.com/agent/chat?resume=session-42&profile=work&handoff=handoff-ticket-abc'
+      url: 'https://hermes.example.com/agent/handoff#ticket=handoff-ticket-abc'
     })
     expect(deps.getRemoteAccess).toHaveBeenCalledWith('work')
     expect(deps.probe).toHaveBeenCalledWith('https://hermes.example.com/agent')
     expect(deps.mintHandoffTicket).toHaveBeenCalledWith('session-42', 'work')
     expect(result.ok && result.url).not.toContain('token=')
+    expect(result.ok && result.url.split('#')[0]).not.toContain('handoff-ticket-abc')
   })
 
   it('refuses a dashboard without a configured public URL', async () => {

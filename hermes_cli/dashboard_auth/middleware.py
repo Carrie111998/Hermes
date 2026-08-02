@@ -67,6 +67,13 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/fonts-terminal/",
 )
 
+# Exact public browser pages. These are kept separate from the prefix list so
+# ``/handoff-anything`` cannot accidentally inherit the handoff bootstrap's
+# unauthenticated status.
+_GATE_PUBLIC_PATHS: frozenset[str] = frozenset({
+    "/handoff",
+})
+
 
 def _path_is_public(path: str) -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
@@ -82,6 +89,8 @@ def _path_is_public(path: str) -> bool:
       ``/assets/``.
     """
     if path in PUBLIC_API_PATHS:
+        return True
+    if path in _GATE_PUBLIC_PATHS:
         return True
     return any(
         path == prefix or path.startswith(prefix)
@@ -390,7 +399,11 @@ async def gated_auth_middleware(
         # (no error leak about handoff state).
         handoff = (request.query_params.get("handoff") or "").strip()
         if handoff:
-            handoff_resp = _handoff_consume_response(request, handoff)
+            handoff_resp = consume_handoff_response(
+                request,
+                handoff,
+                require_legacy_chat_request=True,
+            )
             if handoff_resp is not None:
                 return handoff_resp
         # Silently bounce the user through the portal OAuth flow when
@@ -576,11 +589,18 @@ def _scope_denial_response(request: Request, session) -> Response | None:
     )
 
 
-def _handoff_consume_response(request: Request, handoff: str) -> Response | None:
+def consume_handoff_response(
+    request: Request,
+    handoff: str,
+    *,
+    require_legacy_chat_request: bool = True,
+    json_response: bool = False,
+) -> Response | None:
     """Consume a single-use handoff ticket and mint resume-scoped cookies.
 
-    F-03: only GET …/chat may consume. Other paths ignore the param (return
-    None → normal unauth) without burning the ticket.
+    By default, only exact GET ``/chat`` may consume. The fragment bootstrap
+    opts out only after its route has enforced exact path, same-origin fetch
+    metadata and JSON content type.
 
     On success returns a 302 to ``/chat?resume=&profile=`` built from the
     **ticket-bound** session_id/profile only (F-02 ticket wins) plus
@@ -603,10 +623,10 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
         consume_handoff_ticket,
     )
 
-    # F-03 / M2 / F-01: exact ASGI GET /chat only (no client prefix authz).
-    # Ticket stays usable on rejected placement. Prefix is used only below
-    # for redirect Location + cookie Path after a successful consume.
-    if not is_handoff_consume_request(request):
+    # Compatibility for the original query-string transport: only exact ASGI
+    # GET /chat may consume. The fragment bootstrap calls this helper after
+    # its own exact-route, content-type and same-origin checks.
+    if require_legacy_chat_request and not is_handoff_consume_request(request):
         return None
 
     try:
@@ -644,7 +664,14 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
         info,
         prefix=prefix_from_request(request) or "",
     )
-    resp = RedirectResponse(url=location, status_code=302)
+    resp: Response
+    if json_response:
+        resp = JSONResponse(
+            {"location": location},
+            headers={"Cache-Control": "no-store"},
+        )
+    else:
+        resp = RedirectResponse(url=location, status_code=302)
     # Never issue a refresh token via handoff — resume-scoped AT only.
     set_session_cookies(
         resp,

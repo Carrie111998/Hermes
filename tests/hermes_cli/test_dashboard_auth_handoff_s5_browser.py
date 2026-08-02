@@ -1,10 +1,10 @@
 """S5 exposure-prep proofs that stay on localhost.
 
 1. TTL / revocation contract (constants + runtime expiry + logout clears cookie)
-2. Real browser execution of gated ``buildWsUrl`` after handoff consume
+2. Real browser execution of fragment bootstrap + gated ``buildWsUrl``
 
-No public tunnel, no external origin. Tunnel access-log guidance lives in
-website docs (cloudflared debug logs full request URL including query).
+No public tunnel and no external origin. The browser proof still verifies that
+the handoff capability never reaches the HTTP URL.
 """
 from __future__ import annotations
 
@@ -121,6 +121,18 @@ def _desk_login(client: httpx.Client) -> None:
     assert r2.status_code in (302, 200), r2.text
 
 
+def _consume_fragment(client: httpx.Client, base: str, ticket: str):
+    return client.post(
+        "/api/auth/handoff-consume",
+        json={"ticket": ticket},
+        headers={
+            "Origin": base,
+            "Sec-Fetch-Site": "same-origin",
+            "X-Hermes-Handoff": "1",
+        },
+    )
+
+
 def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
     """F-04 + logout: short handoff TTL, 45m resume session, logout clears cookie."""
     assert HANDOFF_TTL_SECONDS == 120
@@ -147,16 +159,12 @@ def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
 
     phone = httpx.Client(base_url=base, timeout=10.0, follow_redirects=False)
     try:
-        expired = phone.get(
-            "/chat",
-            params={"resume": sid, "profile": "default", "handoff": ticket},
-        )
+        expired = _consume_fragment(phone, base, ticket)
         # Expired: must not establish a resume session cookie.
         assert not any("hermes_session_at" in k for k in phone.cookies.keys()), (
             f"expired handoff must not set session cookies: {list(phone.cookies.keys())}"
         )
-        # Status can be 302 to login or 200 shell without cookie; never "success mint".
-        assert expired.status_code in (200, 302, 401, 403)
+        assert expired.status_code == 401
     finally:
         phone.close()
 
@@ -170,11 +178,9 @@ def test_s5_ttl_and_revocation_contract(runtime_server, monkeypatch):
 
     phone2 = httpx.Client(base_url=base, timeout=10.0, follow_redirects=False)
     try:
-        c = phone2.get(
-            "/chat",
-            params={"resume": sid, "profile": "default", "handoff": ticket2},
-        )
-        assert c.status_code == 302, c.text
+        c = _consume_fragment(phone2, base, ticket2)
+        assert c.status_code == 200, c.text
+        assert c.json()["location"] == f"/chat?resume={sid}&profile=default"
         assert any("hermes_session_at" in k for k in phone2.cookies.keys())
         me = phone2.get("/api/auth/me")
         assert me.status_code == 200, me.text
@@ -212,9 +218,7 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
         pytest.skip("agent-browser not installed")
 
     # Browser is the first consumer of the handoff URL (Set-Cookie on 302).
-    handoff_url = (
-        f"{base}/chat?resume={sid}&profile=default&handoff={ticket}"
-    )
+    handoff_url = f"{base}/handoff#ticket={ticket}"
 
     # Keep JS free of nested quotes so agent-browser eval shell-wrapping is safe.
     # Mirrors web/src/lib/api.ts buildWsUrl gated branch:
@@ -262,6 +266,7 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
   return {
     authRequired: authRequired,
     hasToken: hasToken,
+    viewport: { width: window.innerWidth, height: window.innerHeight },
     meStatus: meStatus,
     wsTicketStatus: wsTicketStatus,
     eventChannel: eventChannel,
@@ -286,6 +291,8 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
         )
 
     try:
+        r_device = _ab("set", "device", "iPhone 12")
+        assert r_device.returncode == 0, r_device.stderr or r_device.stdout
         r_open = _ab("open", handoff_url, "--headless")
         assert r_open.returncode == 0, r_open.stderr or r_open.stdout
         r_wait = _ab("wait", "--load", "networkidle")
@@ -302,6 +309,7 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
         )
         if isinstance(url_payload, dict) and "data" in url_payload:
             final_url = url_payload["data"].get("url") or url_payload.get("url")
+        assert "#ticket=" not in str(final_url).lower(), final_url
         assert "handoff=" not in str(final_url).lower(), final_url
         assert "resume=" in str(final_url), final_url
 
@@ -323,6 +331,9 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
         assert isinstance(found, dict), found
         assert found.get("authRequired") is True, found
         assert found.get("hasToken") is False, found
+        viewport = found.get("viewport") or {}
+        assert 320 <= int(viewport.get("width") or 0) <= 430, viewport
+        assert int(viewport.get("height") or 0) >= 600, viewport
         assert found.get("meStatus") == 200, found
         assert found.get("wsTicketStatus") == 200, found
         assert found.get("eventChannel"), found
@@ -331,5 +342,6 @@ def test_s5_browser_build_ws_url_after_handoff(runtime_server, tmp_path):
         assert built.get("channel") == found.get("eventChannel"), built
         assert str(built.get("href", "")).startswith("ws://"), built
         assert "handoff=" not in (found.get("href") or ""), found
+        assert "#ticket=" not in (found.get("href") or ""), found
     finally:
         _ab("close")
