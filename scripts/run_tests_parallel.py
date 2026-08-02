@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -298,6 +299,21 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _isolated_basetemp_arg(pytest_args: List[str], temp_root: str) -> List[str]:
+    """Give each pytest subprocess a private temp root unless explicitly set.
+
+    Without this, parallel pytest processes race while maintaining the shared
+    ``pytest-current`` symlink and can fail during session cleanup even when
+    every test passed.
+    """
+    if any(
+        arg == "--basetemp" or arg.startswith("--basetemp=")
+        for arg in pytest_args
+    ):
+        return []
+    return [f"--basetemp={Path(temp_root) / 'run'}"]
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
@@ -305,7 +321,15 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    pytest_temp = tempfile.TemporaryDirectory(prefix="hermes-pytest-")
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        str(file),
+        *_isolated_basetemp_arg(pytest_args, pytest_temp.name),
+        *pytest_args,
+    ]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -352,6 +376,7 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        pytest_temp.cleanup()
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -370,6 +395,7 @@ def _run_one_file_once(
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
+    pytest_temp.cleanup()
     return file, rc, output, summary, subproc_wall
 
 

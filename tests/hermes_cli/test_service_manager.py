@@ -192,22 +192,37 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+def test_seed_supervise_skeleton_creates_expected_layout(tmp_path, monkeypatch) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
+    from pathlib import Path
 
     from hermes_cli.service_manager import _seed_supervise_skeleton
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
 
+    chmod_calls: list[tuple[Path, int]] = []
+    original_chmod = Path.chmod
+
+    def recording_chmod(path: Path, mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((path, mode))
+        original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", recording_chmod)
+
     _seed_supervise_skeleton(svc_dir)
 
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    assert stat.S_IMODE(event.stat().st_mode) == 0o3730, (
-        f"event/ mode = {oct(event.stat().st_mode)}, want 03730"
+    # Some non-container hosts clear setgid when the caller cannot chown the
+    # directory to the target group. The chmod spy below fixes the requested
+    # 03730 invariant, while the Docker integration test validates live s6
+    # behavior; this portable stat assertion requires every functional bit.
+    event_mode = stat.S_IMODE(event.stat().st_mode)
+    assert event_mode in {0o1730, 0o3730}, (
+        f"event/ mode = {oct(event.stat().st_mode)}, want 01730 or 03730"
     )
 
     # supervise/ dir.
@@ -218,7 +233,9 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    assert stat.S_IMODE(supervise_event.stat().st_mode) == 0o3730
+    assert stat.S_IMODE(supervise_event.stat().st_mode) in {0o1730, 0o3730}
+    assert (event, 0o3730) in chmod_calls
+    assert (supervise_event, 0o3730) in chmod_calls
 
     # supervise/control FIFO.
     control = supervise / "control"
@@ -487,5 +504,3 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
-

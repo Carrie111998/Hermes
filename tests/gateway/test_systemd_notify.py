@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 
 import pytest
 
 
 @pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets are unavailable"
+    not hasattr(socket, "AF_UNIX") or sys.platform != "linux",
+    reason="Linux abstract Unix datagram sockets are unavailable",
 )
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
@@ -77,5 +79,4 @@ async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     assert "WATCHDOG=1" in calls
     assert calls[-1] == "STOPPING=1"
     assert watchdog.unhealthy is False
-
 

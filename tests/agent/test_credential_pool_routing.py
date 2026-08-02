@@ -371,6 +371,14 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # This fixture is exercising only the explicit entries below. Keep a
+        # developer's real Claude Code credentials from being auto-seeded into
+        # the temporary pool, which would turn a singleton into a multi-entry
+        # pool and make the rotation assertions depend on host state.
+        monkeypatch.setattr(
+            "hermes_cli.auth.is_provider_explicitly_configured",
+            lambda _provider: False,
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
@@ -491,4 +499,3 @@ class TestFailureAttribution:
         assert recovered is False
         assert self._statuses(pool)["cred-0"] != "exhausted"
         agent._swap_credential.assert_not_called()
-

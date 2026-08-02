@@ -67,3 +67,17 @@ def test_glyph_safe_stdio_noop_without_reconfigure(monkeypatch) -> None:
     print("✓ still fine")
 
     assert "✓ still fine" in plain.getvalue()
+
+
+def test_parallel_runner_uses_private_pytest_basetemp_by_default(tmp_path) -> None:
+    mod = _load_runner()
+
+    assert mod._isolated_basetemp_arg([], str(tmp_path)) == [
+        f"--basetemp={tmp_path / 'run'}"
+    ]
+    assert mod._isolated_basetemp_arg(
+        ["--basetemp=/explicit/root"], str(tmp_path)
+    ) == []
+    assert mod._isolated_basetemp_arg(
+        ["--basetemp", "/explicit/root"], str(tmp_path)
+    ) == []
