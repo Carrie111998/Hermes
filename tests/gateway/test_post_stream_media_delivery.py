@@ -12,7 +12,7 @@ and can strip the path from the visible reply, so auto-attach is intentional
 there. This file pins the asymmetry.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -36,6 +36,37 @@ def _event():
         source=source,
         message_id="171.000001",
     )
+
+
+def _feishu_topic_event():
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_parent_chat",
+        chat_type="group",
+        thread_id="omt_topic_abc",
+    )
+    return MessageEvent(
+        text="hi",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="om_trigger_42",
+    )
+
+
+def _real_thread_metadata_runner():
+    runner = SimpleNamespace(
+        _is_telegram_dm_topic_target=lambda *args, **kwargs: False,
+        _reply_anchor_for_event=lambda event: event.message_id,
+    )
+    runner._thread_metadata_for_target = MethodType(
+        GatewayRunner._thread_metadata_for_target,
+        runner,
+    )
+    runner._thread_metadata_for_source = MethodType(
+        GatewayRunner._thread_metadata_for_source,
+        runner,
+    )
+    return runner
 
 
 def _fake_runner(thread_meta):
@@ -111,3 +142,22 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
+@pytest.mark.asyncio
+async def test_feishu_topic_post_stream_media_carries_trigger_anchor(tmp_path, monkeypatch):
+    """Post-stream media must use ReplyMessage's real message anchor so an
+    attachment stays in the triggering Feishu topic."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "topic-chart.png")
+    adapter = _adapter()
+
+    await GatewayRunner._deliver_media_from_response(
+        _real_thread_metadata_runner(),
+        f"Here is the chart.\nMEDIA:{media_file}",
+        _feishu_topic_event(),
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once()
+    assert adapter.send_multiple_images.await_args.kwargs["metadata"] == {
+        "thread_id": "omt_topic_abc",
+        "reply_to_message_id": "om_trigger_42",
+    }

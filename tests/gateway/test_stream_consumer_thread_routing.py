@@ -107,22 +107,21 @@ class TestOverflowFirstMessage:
 
 
 class TestFeishuFallbackThreadRouting:
-    """Verify FeishuAdapter._send_raw_message degrades safely without a reply anchor.
+    """Verify FeishuAdapter._send_raw_message fails closed without a reply anchor.
 
     Regression for #39526: ``thread_id`` is NOT a valid ``receive_id_type`` for
     Feishu CreateMessage (the API only accepts
     open_id/user_id/union_id/email/chat_id). Sending with
     receive_id_type="thread_id" fails with [99992402] field validation failed,
     silently dropping media/file attachments in topic groups. When no reply
-    anchor is available the adapter must degrade to chat_id delivery so the
-    message still reaches the conversation, never emit receive_id_type="thread_id".
+    anchor is available the adapter must not send the topic-scoped attachment
+    to the parent chat and must never emit receive_id_type="thread_id".
     """
 
     @pytest.mark.asyncio
-    async def test_create_degrades_to_chat_id_when_no_reply_anchor(self):
+    async def test_topic_without_reply_anchor_fails_closed(self):
         """When reply_to=None and metadata has only thread_id (no reply anchor),
-        message.create must use receive_id_type='chat_id' — never the invalid
-        'thread_id' receive_id_type that triggers 99992402."""
+        neither ReplyMessage nor parent-chat CreateMessage may be called."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         # We test the _send_raw_message method directly by mocking the client
@@ -153,37 +152,19 @@ class TestFeishuFallbackThreadRouting:
         # Call _send_raw_message with reply_to=None and only thread_id in
         # metadata (no reply_to_message_id anchor).
         import json
-        result = await FeishuAdapter._send_raw_message(
-            adapter,
-            chat_id="oc_main_chat",
-            msg_type="text",
-            payload=json.dumps({"text": "hello"}),
-            reply_to=None,
-            metadata={"thread_id": "omt_topic_abc"},
-        )
+        with pytest.raises(ValueError, match="reply anchor"):
+            await FeishuAdapter._send_raw_message(
+                adapter,
+                chat_id="oc_main_chat",
+                msg_type="text",
+                payload=json.dumps({"text": "hello"}),
+                reply_to=None,
+                metadata={"thread_id": "omt_topic_abc"},
+            )
 
-        # Without a reply anchor we must NOT call reply; we degrade to create.
+        # Failing closed means the attachment cannot escape into the parent chat.
         mock_client.im.v1.message.reply.assert_not_called()
-        mock_client.im.v1.message.create.assert_called_once()
-
-        call_args = mock_client.im.v1.message.create.call_args[0][0]
-        # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
-        body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
-        assert body is not None, "request has neither .body nor .request_body"
-        # receive_id must be the chat_id, NOT the thread_id.
-        receive_id = getattr(body, "receive_id", None)
-        if receive_id is None and isinstance(body, str):
-            import json as _json
-            receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "oc_main_chat", (
-            f"Expected receive_id='oc_main_chat' (degraded), got '{receive_id}'"
-        )
-        # And receive_id_type must be 'chat_id', never the invalid 'thread_id'.
-        receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type == "chat_id", (
-            f"Expected receive_id_type='chat_id', got '{receive_id_type}' "
-            "(thread_id is not a valid receive_id_type and causes 99992402)"
-        )
+        mock_client.im.v1.message.create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_thread_with_reply_anchor_uses_reply_in_thread(self):
@@ -236,4 +217,3 @@ class TestFeishuFallbackThreadRouting:
         assert reply_in_thread is True, (
             f"Expected reply_in_thread=True so media lands in topic, got '{reply_in_thread}'"
         )
-

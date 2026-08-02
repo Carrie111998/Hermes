@@ -4786,6 +4786,9 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
+        if (metadata or {}).get("thread_id"):
+            raise ValueError("Feishu topic delivery requires a reply anchor")
+
         # No reply anchor available. ``thread_id`` is NOT a valid
         # ``receive_id_type`` for CreateMessage — the Feishu API only accepts
         # open_id/user_id/union_id/email/chat_id, and sending with
@@ -4983,6 +4986,9 @@ class FeishuAdapter(BasePlatformAdapter):
                             metadata=metadata,
                         )
                 return response
+            except ValueError:
+                # Invalid routing or payload cannot become valid on retry.
+                raise
             except Exception as exc:
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):

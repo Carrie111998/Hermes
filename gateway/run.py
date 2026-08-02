@@ -19787,6 +19787,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Slack's reply_in_thread=false path uses message_id to distinguish
             # real existing threads from synthetic top-level session keys.
             metadata["message_id"] = str(reply_to_message_id)
+        if platform == Platform.FEISHU and reply_to_message_id is not None:
+            # Feishu topics only accept ReplyMessage with a real message
+            # anchor; CreateMessage has no valid thread_id receive type.
+            metadata["reply_to_message_id"] = str(reply_to_message_id)
         return metadata
 
     @staticmethod
