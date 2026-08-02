@@ -15,10 +15,10 @@ dedicated regression test in the PR that introduced it:
 - child-process env scrub                     -> #77027
 
 This test pins the end-to-end property: real env-load path, real public
-entrypoint (load_hermes_dotenv), real log formatter, and asserts neither
-the applied secret names nor their values reach the process's output
-surfaces.  If a future change reintroduces a leak anywhere in the chain,
-this test is the tripwire.
+entrypoint (load_hermes_dotenv), real log formatter, with the capture
+handler installed AROUND the load so it observes records emitted during
+external-secret loading.  If a future change reintroduces a leak anywhere
+in the chain, this test is the tripwire.
 """
 
 from __future__ import annotations
@@ -41,10 +41,11 @@ from hermes_cli import env_loader  # noqa: E402
 # The secret-shaped names and values the mocked Bitwarden source returns.
 # These must NEVER appear in stdout / stderr / formatted log output.
 _LEAK_NAMES = ("LEAK_THIS_API_KEY", "LEAK_THIS_TOKEN")
-# Prefix-shaped (sk- + >=10 token chars) so main's shape-based redactor
-# recognizes them — the assertion is that the redactor catches them, not
-# that they happen to be short enough to slip past.
-_LEAK_VALUES = ("sk-leak-1234567890", "tok-leak-5678")
+# Both prefix-shaped (vendor prefix + >=10 token chars) so main's shape-based
+# redactor recognizes them — the assertion is that the redactor catches them,
+# not that they happen to be short enough to slip past.  Opaque values with NO
+# vendor prefix are pinned by #77020's own regression tests, not here.
+_LEAK_VALUES = ("sk-leak-1234567890", "ghp_leak5678abcde")
 
 
 @pytest.fixture(autouse=True)
@@ -58,37 +59,20 @@ def _reset_sources():
     env_loader.reset_secret_source_cache()
 
 
-def _capture_log_output() -> list[str]:
-    """Format records through the real RedactingFormatter and collect them.
+class _FormattingCapture(logging.Handler):
+    """Capture records formatted through the real RedactingFormatter.
 
-    This asserts on what is actually written to log files (post-redaction),
-    not on the raw LogRecord.msg which the handler-level masker never sees.
+    Asserts on what is actually written to log files (post-redaction), not
+    on the raw LogRecord.msg which the handler-level masker never sees.
     """
 
-    class _Capture(logging.Handler):
-        def __init__(self):
-            super().__init__()
-            self.lines: list[str] = []
-            self.setFormatter(RedactingFormatter("%(message)s"))
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+        self.setFormatter(RedactingFormatter("%(message)s"))
 
-        def emit(self, record: logging.LogRecord) -> None:
-            self.lines.append(self.format(record))
-
-    capture = _Capture()
-    root = logging.getLogger()
-    root.addHandler(capture)
-    try:
-        root.setLevel(logging.DEBUG)
-        logger = logging.getLogger("test_no_exfil_gate")
-        # Prefix-shaped value: masked by main's shape-based regex.  The
-        # opaque-value pass (values with NO vendor prefix) is pinned by
-        # #77020's own regression tests, not here — this gate asserts the
-        # end-to-end property on the surfaces current main already covers.
-        logger.info("status: applied secret value %s", _LEAK_VALUES[0])
-        logger.warning("bws returned value %s in payload", _LEAK_VALUES[0])
-    finally:
-        root.removeHandler(capture)
-    return capture.lines
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(self.format(record))
 
 
 def test_e2e_env_load_no_secret_exfil(tmp_path, monkeypatch, capsys):
@@ -111,20 +95,36 @@ def test_e2e_env_load_no_secret_exfil(tmp_path, monkeypatch, capsys):
     import agent.secret_sources.bitwarden as bw_module
 
     monkeypatch.setattr(bw_module, "find_bws", lambda **_kw: Path("/fake/bws"))
-    monkeypatch.setattr(
-        bw_module,
-        "fetch_bitwarden_secrets",
-        lambda **_kw: (dict(zip(_LEAK_NAMES, _LEAK_VALUES)), []),
-    )
+
+    # The mocked load path emits a log record containing EVERY value the test
+    # claims to cover — the realistic backend-echo case.  Without this, the
+    # log assertions below would be vacuous (no record ever carried the
+    # values, so their absence proves nothing).
+    def _mocked_fetch(**_kw):
+        logger = logging.getLogger("agent.secret_sources.bitwarden")
+        for value in _LEAK_VALUES:
+            logger.warning("bws returned value %s in payload", value)
+        return dict(zip(_LEAK_NAMES, _LEAK_VALUES)), []
+
+    monkeypatch.setattr(bw_module, "fetch_bitwarden_secrets", _mocked_fetch)
 
     from agent.secret_sources import registry as reg_module
 
     reg_module._reset_registry_for_tests()
 
-    # Exercise the real public entrypoint (user env load path).  This
-    # triggers _apply_external_secret_sources internally (env_loader.py:512),
-    # so the applied env assertions below prove the full chain ran.
-    env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+    # Install the capture handler BEFORE the load so it observes records
+    # emitted during external-secret loading (not after the fact).
+    capture = _FormattingCapture()
+    root = logging.getLogger()
+    root.addHandler(capture)
+    try:
+        root.setLevel(logging.DEBUG)
+        # Exercise the real public entrypoint (user env load path).  This
+        # triggers _apply_external_secret_sources internally (env_loader.py:512)
+        # and the mocked fetch's warning records above.
+        env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+    finally:
+        root.removeHandler(capture)
 
     # 1. The load actually happened and applied the secrets (non-vacuous).
     assert os.environ.get(_LEAK_NAMES[0]) == _LEAK_VALUES[0]
@@ -142,10 +142,12 @@ def test_e2e_env_load_no_secret_exfil(tmp_path, monkeypatch, capsys):
         assert value not in err, f"secret value {value} leaked to stderr"
         assert value not in out, f"secret value {value} leaked to stdout"
 
-    # 4. Formatted log output masks the values (shape-based regex on main,
-    #    opaque-value pass added in #77020).
-    log_lines = _capture_log_output()
+    # 4. The load path emitted records carrying every value (non-vacuous) and
+    #    the formatted output — what actually reaches log files — masks them.
+    assert len(capture.lines) >= 2, (
+        "expected the mocked load path to emit a record per leaked value"
+    )
     for value in _LEAK_VALUES:
         assert all(
-            value not in line for line in log_lines
+            value not in line for line in capture.lines
         ), f"secret value {value} reached formatted log output"
