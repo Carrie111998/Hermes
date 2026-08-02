@@ -405,10 +405,34 @@ function GridBody({ visible, rglLayout, preview, onPersist, onHide, onRemove }: 
   visible: Component[]; rglLayout: LayoutItem[]; preview?: string;
   onPersist: (l: LayoutItem[]) => void; onHide: (id: string) => void; onRemove: (id: string) => void;
 }) {
+  // Auto-grow overrides (grow-only, local, never persisted): a card whose
+  // content is clipped bumps its row-count here so prose is readable. Cleared
+  // for a card the moment the user drag-resizes it (their size wins).
+  const [grown, setGrown] = useState<Record<string, number>>({});
+  const layout = rglLayout.map((it) =>
+    grown[it.i] && grown[it.i] > it.h ? { ...it, h: grown[it.i] } : it);
+  const autoGrow = (id: string, rows: number) =>
+    setGrown((g) => {
+      const base = rglLayout.find((x) => x.i === id)?.h ?? 1;
+      const target = Math.max(base, rows);
+      return g[id] === target ? g : { ...g, [id]: target };
+    });
+  const persist = (l: LayoutItem[]) => {
+    // a manual resize clears that card's auto-grow override
+    setGrown((g) => {
+      const next = { ...g };
+      for (const it of l) {
+        const auto = g[it.i];
+        if (auto != null && it.h !== auto) delete next[it.i];
+      }
+      return next;
+    });
+    onPersist(l);
+  };
   return (
     <RGL
       className="layout"
-      layout={rglLayout as any}
+      layout={layout as any}
       cols={12}
       rowHeight={96}
       margin={[10, 10]}
@@ -417,12 +441,12 @@ function GridBody({ visible, rglLayout, preview, onPersist, onHide, onRemove }: 
       isDraggable={!preview}
       isResizable={!preview}
       compactType="vertical"
-      onDragStop={(l: any) => onPersist([...l])}
-      onResizeStop={(l: any) => onPersist([...l])}
+      onDragStop={(l: any) => persist([...l])}
+      onResizeStop={(l: any) => persist([...l])}
     >
       {visible.map((c) => (
         <div key={c.id}>
-          <Card c={c} preview={preview} onHide={onHide} onRemove={onRemove} />
+          <Card c={c} preview={preview} onHide={onHide} onRemove={onRemove} onAutoGrow={autoGrow} />
         </div>
       ))}
     </RGL>

@@ -482,8 +482,8 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
         )}
       </div>
       {(result || running) && (
-        <div className="mt-3 flex-1 min-h-0 flex flex-col rounded-xl border border-line bg-[#0b1424] overflow-hidden">
-          <div className="flex items-center gap-2 px-3.5 h-8 border-b border-line/70 shrink-0 bg-white/[0.015]">
+        <div className="mt-3 rounded-xl border border-line bg-[#0b1424] overflow-hidden">
+          <div className="flex items-center gap-2 px-3.5 h-8 border-b border-line/70 bg-white/[0.015]">
             <span className={`w-1.5 h-1.5 rounded-full ${running ? "bg-blue animate-pulse" : "bg-green shadow-[0_0_6px] shadow-green"}`} />
             <span className="text-[10.5px] w590 uppercase tracking-[0.08em] text-ink-4">
               {running ? "Hermes working" : "Result"}
@@ -492,7 +492,7 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
               <span className="text-[10.5px] text-ink-4 ml-auto tabular-nums">{when(data.runs[0].ts)}</span>
             ) : null}
           </div>
-          <div className="flex-1 min-h-0 overflow-auto px-3.5 py-3">
+          <div className="px-3.5 py-3 overflow-auto" style={{ minHeight: 132, maxHeight: 340 }}>
             {running && !result
               ? <div className="flex items-center gap-2 text-[12.5px] text-ink-3"><LoaderCircle size={13} className="spin" /> running the full agent — may take a minute…</div>
               : <Prose>{result}</Prose>}

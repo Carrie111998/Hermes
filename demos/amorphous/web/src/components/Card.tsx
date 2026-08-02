@@ -19,9 +19,10 @@ interface Props {
   preview?: string; // proposal id when previewing
   onHide: (id: string) => void;
   onRemove: (id: string) => void;
+  onAutoGrow?: (id: string, rows: number) => void;
 }
 
-export default function Card({ c, preview, onHide, onRemove }: Props) {
+export default function Card({ c, preview, onHide, onRemove, onAutoGrow }: Props) {
   const { data, err, refresh, flash } = useComponentData(c, preview);
   const [chatOpen, setChatOpen] = useState(false);
   const [maxOpen, setMaxOpen] = useState(false);
@@ -83,7 +84,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
               </div>
             )}
           </div>
-          <CardBody c={c} data={data} err={err} onPopOut={() => { setMaxOpen(true); track("maximize", c.id); }} />
+          <CardBody c={c} data={data} err={err} onAutoGrow={preview ? undefined : onAutoGrow} onPopOut={() => { setMaxOpen(true); track("maximize", c.id); }} />
           {chatOpen && <ComponentChat c={c} onClose={() => setChatOpen(false)} onChanged={refresh} />}
         </div>
       </ContextMenu.Trigger>
@@ -134,20 +135,31 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
   );
 }
 
-function CardBody({ c, data, err, onPopOut }: { c: Component; data: any; err: string; onPopOut: () => void }) {
+function CardBody({ c, data, err, onPopOut, onAutoGrow }: { c: Component; data: any; err: string; onPopOut: () => void; onAutoGrow?: (id: string, rows: number) => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const [overflow, setOverflow] = useState(0);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const check = () => setOverflow(Math.max(0, el.scrollHeight - el.clientHeight));
-    check();
-    const ro = new ResizeObserver(check);
+    const measure = () => {
+      const over = el.scrollHeight - el.clientHeight;
+      setOverflow(over);
+      // Auto-grow: if content is clipped, ask the grid for enough rows to show
+      // it — capped so a huge result can't eat the board (overflow chip covers
+      // the rest). Grow-only; never shrinks the user's chosen size.
+      if (onAutoGrow && over > 20) {
+        const PER_ROW = 106; // rowHeight 96 + margin 10
+        const needed = Math.ceil((el.scrollHeight + 46) / PER_ROW);
+        onAutoGrow(c.id, Math.min(needed, 5));
+      }
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
-    const mo = new MutationObserver(check);
-    mo.observe(el, { childList: true, subtree: true });
+    const mo = new MutationObserver(measure);
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
     return () => { ro.disconnect(); mo.disconnect(); };
-  }, [c.id]);
+  }, [c.id, JSON.stringify(data)]);
   return (
     <div className="relative flex-1 min-h-0 flex flex-col">
       <div ref={ref} className="body-fade flex-1 overflow-auto px-3.5 py-3 min-h-0">
