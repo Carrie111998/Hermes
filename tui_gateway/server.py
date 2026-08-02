@@ -5001,7 +5001,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
     )
-    cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
+    display_cfg = _load_cfg().get("display") or {}
+    cfg_personality = display_cfg.get("personality") or ""
     personality = (session or {}).get("personality", cfg_personality)
     reasoning_config = getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
@@ -5072,6 +5073,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         )
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
+        "tui_startup_panel": bool(display_cfg.get("tui_startup_panel", True)),
     }
     try:
         from hermes_cli import __version__, __release_date__

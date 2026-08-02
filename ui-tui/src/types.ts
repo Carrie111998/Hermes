@@ -176,6 +176,8 @@ export interface SessionInfo {
   skills: Record<string, string[]>
   system_prompt?: string
   tools: Record<string, string[]>
+  /** Whether the initial TUI banner and session summary should render. */
+  tui_startup_panel?: boolean
   update_behind?: number | null
   update_command?: string
   usage?: Usage

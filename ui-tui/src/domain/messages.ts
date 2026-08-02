@@ -4,6 +4,9 @@ import type { Msg, SessionInfo } from '../types.js'
 
 export const introMsg = (info: SessionInfo): Msg => ({ info, kind: 'intro', role: 'system', text: '' })
 
+/** Older gateways omit this field, which preserves the historical visible panel. */
+export const showStartupPanel = (info?: SessionInfo): boolean => info?.tui_startup_panel !== false
+
 export const userDisplay = (text: string) => {
   if (text.length <= LONG_MSG) {
     return text
