@@ -7,6 +7,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { artifactDownloadName, type ArtifactKind } from '@/lib/artifact-detect'
 import { downloadTextFile } from '@/lib/download-text'
+import { composeHtmlDocument } from '@/lib/html-shell'
 import { ChevronLeft, ChevronRight, Download, ExternalLink } from '@/lib/icons'
 import { $artifactRegistry, $artifactVersionSelection, findArtifact, selectArtifactVersion } from '@/store/artifacts'
 import { notifyError } from '@/store/notifications'
@@ -26,22 +27,6 @@ const SOURCE_LANGUAGE_BY_KIND: Record<ArtifactKind, string | undefined> = {
 const HEADER_BUTTON_CLASS =
   'flex items-center gap-1 rounded-md px-1.5 text-[0.625rem] font-bold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40'
 
-/** Wrap an HTML fragment in a minimal document shell; full documents pass
- *  through untouched. Keeps generated fragments (no <html>/<body>) rendering
- *  with sane defaults instead of quirks-mode soup. */
-function composeArtifactHtml(content: string): string {
-  if (/<html[\s>]|<!doctype\s+html/i.test(content)) {
-    return content
-  }
-
-  return [
-    '<!doctype html>',
-    '<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">',
-    '<style>body{margin:0;font-family:system-ui,sans-serif}</style></head><body>',
-    content,
-    '</body></html>'
-  ].join('\n')
-}
 
 /** Write the composed document to a real temp file through the existing
  *  buffer-save IPC, then hand it to the OS browser. A blob/data URL can't
@@ -53,7 +38,7 @@ async function openHtmlInBrowser(content: string): Promise<void> {
     throw new Error('Desktop bridge unavailable')
   }
 
-  const bytes = new TextEncoder().encode(composeArtifactHtml(content))
+  const bytes = new TextEncoder().encode(composeHtmlDocument(content))
   const path = await bridge.saveImageBuffer(bytes, '.html')
 
   if (!path) {
@@ -97,7 +82,7 @@ function ArtifactLiveView({ content, kind, title }: { content: string; kind: Art
     <iframe
       className="block size-full border-0 bg-white"
       sandbox="allow-scripts"
-      srcDoc={composeArtifactHtml(content)}
+      srcDoc={composeHtmlDocument(content)}
       // Deliberately raw white + forced light scheme: the frame hosts foreign
       // generated HTML that assumes a light canvas, so it renders deterministically
       // light in both app themes instead of inheriting theme tokens it can't see.

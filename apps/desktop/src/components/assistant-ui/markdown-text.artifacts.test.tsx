@@ -23,11 +23,12 @@ function fenced(language: string, body: string): string {
   return `Here you go:\n\n\`\`\`${language}\n${body}\n\`\`\`\n`
 }
 
-// End-to-end for the artifact path: a substantial ```html fence in assistant
-// markdown must come out of preprocessMarkdown -> Streamdown -> SyntaxHighlighter
-// as an artifact card (registered in the store), while small fences keep the
-// plain code-card path.
-describe('MarkdownTextContent artifacts', () => {
+// End-to-end for the html fence path: a ```html fence in assistant markdown
+// must come out of preprocessMarkdown -> Streamdown -> SyntaxHighlighter as an
+// inline sandboxed iframe in the message itself — not an artifact card, not a
+// plain code block. Non-html fences keep their existing paths (code card for
+// small snippets, artifact card for substantial code).
+describe('MarkdownTextContent html fences', () => {
   beforeEach(() => {
     $activeSessionId.set('session-artifacts')
     $selectedStoredSessionId.set(null)
@@ -43,33 +44,51 @@ describe('MarkdownTextContent artifacts', () => {
     window.localStorage.clear()
   })
 
-  it('renders a substantial html fence as an artifact card and registers it', async () => {
-    render(<MarkdownTextContent isRunning={false} text={fenced('html', HTML_DOC)} />)
+  it('renders a substantial html fence as an inline sandboxed iframe (not a card)', async () => {
+    const { container } = render(<MarkdownTextContent isRunning={false} text={fenced('html', HTML_DOC)} />)
 
-    const card = await screen.findByText('Pomodoro Timer')
+    const frame = await screen.findByTitle('Pomodoro Timer')
 
-    expect(card.closest('button')?.dataset.slot).toBe('aui_artifact-card')
-    expect(artifactsForSession('session-artifacts')).toHaveLength(1)
-    expect(artifactsForSession('session-artifacts')[0]?.kind).toBe('html')
-    // Registration alone must not open the rail (offer, don't hijack).
+    expect(frame.tagName).toBe('IFRAME')
+    expect(frame.getAttribute('sandbox')).toContain('allow-scripts')
+    expect(frame.getAttribute('srcdoc')).toContain('<h1>Pomodoro</h1>')
+    expect(container.querySelector('[data-slot="aui_artifact-card"]')).toBeNull()
+    expect(container.querySelector('[data-slot="code-card"]')).toBeNull()
+    expect(artifactsForSession('session-artifacts')).toHaveLength(0)
+    // Inline rendering must not open the right rail (offer, don't hijack).
     expect($previewTabs.get()).toHaveLength(0)
   })
 
-  it('keeps a small fence as a plain code block', async () => {
+  it('wraps an html fragment in a document shell with the height-sync shim', async () => {
+    const { container } = render(
+      <MarkdownTextContent isRunning={false} text={fenced('html', '<h1>Frag</h1><p>no shell here</p>')} />
+    )
+
+    const frame = await screen.findByTitle('Frag')
+    const srcDoc = frame.getAttribute('srcdoc') ?? ''
+
+    expect(srcDoc).toMatch(/<!doctype html>/i)
+    expect(srcDoc).toContain('__inlineHeight')
+    expect(container.querySelector('[data-slot="aui_artifact-card"]')).toBeNull()
+  })
+
+  it('keeps a small non-html fence as a plain code block', async () => {
     const { container } = render(<MarkdownTextContent isRunning={false} text={fenced('js', SMALL_SNIPPET)} />)
 
     // The code card mounts synchronously; Shiki may split tokens into spans,
     // so assert on the card slots rather than text content.
     expect(container.querySelector('[data-slot="code-card"]')).not.toBeNull()
     expect(container.querySelector('[data-slot="aui_artifact-card"]')).toBeNull()
+    expect(container.querySelector('iframe')).toBeNull()
     expect(artifactsForSession('session-artifacts')).toHaveLength(0)
   })
 
-  it('does not register while the message is still streaming', async () => {
-    render(<MarkdownTextContent isRunning text={fenced('html', HTML_DOC)} />)
+  it('shows a placeholder while the message is streaming, then no registration', async () => {
+    const { container } = render(<MarkdownTextContent isRunning text={fenced('html', HTML_DOC)} />)
 
-    await screen.findByText('Pomodoro Timer')
-
+    // Streaming fences defer the iframe; only the shimmer placeholder exists.
+    expect(container.querySelector('[data-slot="inline-html-placeholder"]')).not.toBeNull()
+    expect(container.querySelector('iframe')).toBeNull()
     expect(artifactsForSession('session-artifacts')).toHaveLength(0)
   })
 })

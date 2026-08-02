@@ -36,7 +36,7 @@ import { cn } from '@/lib/utils'
 
 import { ArtifactCard } from './artifact-card'
 import { SessionRefLink } from './directive-text'
-import { detectEmbed, extractAlert, MarkdownAlert, RichCodeBlock, UrlEmbed } from './embeds'
+import { detectEmbed, extractAlert, HTML_INLINE_FENCE_LANGUAGES, InlineHtmlEmbed, MarkdownAlert, RichCodeBlock, UrlEmbed } from './embeds'
 
 // Math rendering plugin (KaTeX). Configured once at module scope — the
 // plugin is stateless beyond its internal cache so re-creating per-render
@@ -572,6 +572,17 @@ function MarkdownTextSurface({
         // right rail; every other language falls back to the Shiki-highlighted
         // code block.
         SyntaxHighlighter: (props: SyntaxHighlighterProps) => {
+          // html-family fences render inline as a sandboxed iframe in the
+          // message itself, before artifact-card promotion (which would
+          // relegate them to the right rail). Reasoning text keeps plain
+          // code blocks via disableArtifacts.
+          if (
+            !disableArtifacts &&
+            HTML_INLINE_FENCE_LANGUAGES.has((props.language ?? '').toLowerCase())
+          ) {
+            return <InlineHtmlEmbed code={props.code} streaming={isStreaming} />
+          }
+
           const artifact = disableArtifacts ? null : detectArtifact(props.language, props.code)
 
           if (artifact) {
