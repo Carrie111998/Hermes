@@ -478,14 +478,21 @@ class CLICommandsMixin:
         ``text.split()`` keeps the session alive but lets malformed input run,
         because ``/cron add 30m "partial`` still splits into a well-formed
         ``add`` whose schedule (``30m``) validates.
+
+        The hint goes through ``_cli_visible_print`` because ``patch_stdout``
+        swallows bare ``print`` while the prompt_toolkit Application owns the
+        terminal — which is precisely the situation this guard exists for, so a
+        bare ``print`` would leave the refusal silent.
         """
         import shlex
+
+        from cli import _cli_visible_print
 
         try:
             return shlex.split(text)
         except ValueError as exc:
-            print(f"(._.) {label}: {exc}. Nothing was run.")
-            print(f"      Close the quote, e.g. {example}")
+            _cli_visible_print(f"(._.) {label}: {exc}. Nothing was run.")
+            _cli_visible_print(f"      Close the quote, e.g. {example}")
             return None
 
     def _handle_journey_command(self, cmd_original: str) -> None:

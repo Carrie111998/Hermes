@@ -125,6 +125,22 @@ def test_journey_balanced_quotes_still_group_tokens():
 # --------------------------------------------------------------------------
 
 
+def test_refusal_hint_uses_the_prompt_toolkit_safe_printer():
+    """The hint must survive ``patch_stdout``.
+
+    A bare ``print`` is swallowed while the prompt_toolkit Application owns the
+    terminal — exactly the situation this guard exists for — so the refusal has
+    to go through ``cli._cli_visible_print`` or it is silent where it matters.
+    """
+    cli_obj = _make_cli()
+    with patch("cli._cli_visible_print") as mock_print, \
+            patch("hermes_cli.curator.cli_main"):
+        cli_obj._handle_curator_command('/curator "unterminated')
+    printed = " ".join(str(call[0][0]) for call in mock_print.call_args_list)
+    assert "No closing quotation" in printed
+    assert "/curator" in printed
+
+
 @pytest.mark.parametrize(
     "handler_name, line",
     [
