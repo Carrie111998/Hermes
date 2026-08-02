@@ -101,9 +101,9 @@ import {
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
-  sessionPinId,
   setCurrentCwd
 } from '@/store/session'
+import { sessionMatchesPinKey, sessionPinKey, sessionScopedId } from '@/store/session-pin-key'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 
 import {
@@ -144,7 +144,8 @@ import {
   SidebarPinnedEmptyState,
   SidebarSessionSkeletons
 } from './section-states'
-import { buildSessionByAnyId } from './session-index'
+import { buildSessionByPinKey } from './session-index'
+import { shouldShowSessionSections } from './session-visibility'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
@@ -410,10 +411,10 @@ export function ChatSidebar({
 
   const workingSessionIdSet = useMemo(() => new Set(workingSessionIds), [workingSessionIds])
 
-  // Index sessions by every id a pin might be stored under — recents, cron,
+  // Index sessions by every scoped key a pin might be stored under — recents, cron,
   // AND messaging, since all three can be pinned (see session-index.ts).
-  const sessionByAnyId = useMemo(
-    () => buildSessionByAnyId(visibleSessions, cronSessions, messagingSessions),
+  const sessionByPinKey = useMemo(
+    () => buildSessionByPinKey(visibleSessions, cronSessions, messagingSessions),
     [visibleSessions, cronSessions, messagingSessions]
   )
 
@@ -421,29 +422,29 @@ export function ChatSidebar({
     const seen = new Set<string>()
     const out: SessionInfo[] = []
 
-    for (const pinId of pinnedSessionIds) {
-      const session = sessionByAnyId.get(pinId)
+    for (const pinKey of pinnedSessionIds) {
+      const session = sessionByPinKey.get(pinKey)
+      const scopedId = session ? sessionScopedId(session) : null
 
-      if (session && !seen.has(session.id)) {
-        seen.add(session.id)
+      if (session && scopedId && !seen.has(scopedId)) {
+        seen.add(scopedId)
         out.push(session)
       }
     }
 
     return out
-  }, [pinnedSessionIds, sessionByAnyId])
-
-  const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(s => s.id)), [pinnedSessions])
-  const pinnedIdSet = useMemo(() => new Set(pinnedSessionIds), [pinnedSessionIds])
+  }, [pinnedSessionIds, sessionByPinKey])
 
   // A pinned session belongs to the Pinned section and nowhere else, so every
-  // other list filters it out (the flat recents already did). Match on the live
-  // id AND the durable pin id — a backend snapshot can surface either side of a
-  // compression tip rotation.
+  // other list filters it out (the flat recents already did). Match modern
+  // profile-qualified keys and id-only legacy entries awaiting migration.
   const isPinnedSession = useCallback(
-    (session: SessionInfo) => pinnedRealIdSet.has(session.id) || pinnedIdSet.has(sessionPinId(session)),
-    [pinnedRealIdSet, pinnedIdSet]
+    (session: SessionInfo) => pinnedSessionIds.some(key => sessionMatchesPinKey(session, key)),
+    [pinnedSessionIds]
   )
+
+  const pinRow = useCallback((session: SessionInfo) => pinSession(sessionPinKey(session)), [])
+  const unpinRow = useCallback((session: SessionInfo) => unpinSession(sessionPinKey(session)), [])
 
   // Full-text search across *all* sessions (not just the loaded page) so 699
   // sessions stay findable. Debounced; loaded sessions are matched instantly
@@ -499,12 +500,12 @@ export function ChatSidebar({
         continue
       }
 
-      const loaded = sessionByAnyId.get(match.session_id)
+      const loaded = sessionByPinKey.get(match.session_id)
       out.set(match.session_id, loaded ?? searchResultToSession(match))
     }
 
     return [...out.values()]
-  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
+  }, [trimmedQuery, sortedSessions, serverMatches, sessionByPinKey])
 
   const unpinnedAgentSessions = useMemo(
     () => sortedSessions.filter(s => !isPinnedSession(s)),
@@ -1102,7 +1103,12 @@ export function ChatSidebar({
 
   const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
 
-  const showSessionSections = showSessionSkeletons || sortedSessions.length > 0 || projectModel.length > 0
+  const showSessionSections = shouldShowSessionSections({
+    hiddenPinnedSessionCount: crossProfilePinCount,
+    projectCount: projectModel.length,
+    sessionCount: sortedSessions.length,
+    sessionsLoading: showSessionSkeletons
+  })
 
   // Each reorderable list reports its OWN new id order; persisting is a direct,
   // typed write — no id-prefix sniffing to figure out which level moved.
@@ -1115,16 +1121,7 @@ export function ChatSidebar({
   // it over the default sort, so stale/new ids reconcile on the next render.
   const reorderProjects = (ids: string[]) => setSidebarProjectOrderIds(ids)
 
-  // Sortable rows carry live session ids; the pinned store is keyed by durable
-  // (lineage-root) ids, so translate before persisting the new order.
-  const reorderPinned = (ids: string[]) =>
-    setPinnedSessionOrder(
-      ids.map(id => {
-        const session = sessionByAnyId.get(id)
-
-        return session ? sessionPinId(session) : id
-      })
-    )
+  const reorderPinned = (keys: string[]) => setPinnedSessionOrder(keys)
 
   return (
     <Sidebar
@@ -1269,7 +1266,7 @@ export function ChatSidebar({
                 onDeleteSession={onDeleteSession}
                 onResumeSession={onResumeSession}
                 onToggle={() => undefined}
-                onTogglePin={pinSession}
+                onTogglePin={pinRow}
                 open
                 pinned={false}
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
@@ -1301,7 +1298,7 @@ export function ChatSidebar({
                 onReorderSessions={reorderPinned}
                 onResumeSession={onResumeSession}
                 onToggle={() => setSidebarPinsOpen(!pinsOpen)}
-                onTogglePin={unpinSession}
+                onTogglePin={unpinRow}
                 open={pinsOpen}
                 pinned
                 rootClassName="shrink-0 p-0 pb-1"
@@ -1453,7 +1450,7 @@ export function ChatSidebar({
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}
                 onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
-                onTogglePin={pinSession}
+                onTogglePin={pinRow}
                 open={agentsOpen}
                 pinned={false}
                 projectBackRow={
@@ -1511,7 +1508,7 @@ export function ChatSidebar({
                     onDeleteSession={onDeleteSession}
                     onResumeSession={onResumeSession}
                     onToggle={() => toggleSidebarMessagingOpen(group.sourceId)}
-                    onTogglePin={pinSession}
+                    onTogglePin={pinRow}
                     open={messagingOpenIds.includes(group.sourceId)}
                     pinned={false}
                     rootClassName="shrink-0 p-0"

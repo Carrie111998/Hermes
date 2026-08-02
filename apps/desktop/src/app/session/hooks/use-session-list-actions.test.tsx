@@ -2,6 +2,7 @@ import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import { $pinnedSessionIds } from '@/store/layout'
 import {
   $cronSessions,
   $hiddenPinnedSessionCount,
@@ -14,6 +15,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { createSessionPinKey } from '@/store/session-pin-key'
 
 import { useSessionListActions } from './use-session-list-actions'
 
@@ -88,6 +90,7 @@ beforeEach(() => {
   setCronSessions([])
   setHiddenPinnedSessionCount(0)
   setMessagingSessions([])
+  $pinnedSessionIds.set([])
   setSessionsLoading(false)
 })
 
@@ -96,10 +99,24 @@ afterEach(() => {
   setCronSessions([])
   setHiddenPinnedSessionCount(0)
   setMessagingSessions([])
+  $pinnedSessionIds.set([])
   setSessionsLoading(false)
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
+  it('preserves only scoped pinned rows when a concrete-profile page omits them', async () => {
+    setSessions([row('kept', { profile: 'work' }), row('sibling-only', { profile: 'default' })])
+    $pinnedSessionIds.set([createSessionPinKey('work', 'kept'), createSessionPinKey('default', 'sibling-only')])
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(session => session.id)).toEqual(['kept'])
+  })
+
   it('keeps the previous $sessions array when the refresh is content-identical', async () => {
     const rows = [row('a'), row('b')]
     listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows }))

@@ -1,7 +1,8 @@
+import { createSessionPinKey } from '@/store/session-pin-key'
 import type { SessionInfo } from '@/types/hermes'
 
 /**
- * Index sessions by every id a pin might be stored under.
+ * Index sessions by every profile-qualified key a pin might be stored under.
  *
  * The sidebar fetches three independent slices — recents, cron, and messaging
  * — and renders the latter two in self-managed sections. Any of them can be
@@ -12,20 +13,49 @@ import type { SessionInfo } from '@/types/hermes'
  *
  * Each session is keyed under both its live id and its lineage root, so a pin
  * stored before an auto-compression still resolves to the live continuation
- * tip. Recents are indexed last and win a direct id collision.
+ * tip. Recents are indexed last and win a direct collision inside one profile.
+ * A legacy unqualified id is exposed only when it resolves to exactly one
+ * scoped identity; cloned ids stay deliberately ambiguous until migration.
  */
-export function buildSessionByAnyId(
+export function buildSessionByPinKey(
   visibleSessions: SessionInfo[],
   cronSessions: SessionInfo[],
   messagingSessions: SessionInfo[]
 ): Map<string, SessionInfo> {
   const map = new Map<string, SessionInfo>()
+  const legacyCandidates = new Map<string, Set<string>>()
+
+  const recordLegacyCandidate = (legacyId: string, qualifiedKey: string) => {
+    const candidates = legacyCandidates.get(legacyId) ?? new Set<string>()
+
+    candidates.add(qualifiedKey)
+    legacyCandidates.set(legacyId, candidates)
+  }
 
   for (const session of [...cronSessions, ...messagingSessions, ...visibleSessions]) {
-    map.set(session.id, session)
+    const directKey = createSessionPinKey(session.profile, session.id)
 
-    if (session._lineage_root_id && !map.has(session._lineage_root_id)) {
-      map.set(session._lineage_root_id, session)
+    map.set(directKey, session)
+    recordLegacyCandidate(session.id, directKey)
+
+    if (session._lineage_root_id) {
+      const rootKey = createSessionPinKey(session.profile, session._lineage_root_id)
+
+      if (!map.has(rootKey)) {
+        map.set(rootKey, session)
+      }
+
+      recordLegacyCandidate(session._lineage_root_id, rootKey)
+    }
+  }
+
+  for (const [legacyId, candidates] of legacyCandidates) {
+    if (candidates.size === 1) {
+      const row = map.get([...candidates][0])
+
+      if (row) {
+        map.set(legacyId, row)
+      }
     }
   }
 

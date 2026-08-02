@@ -46,6 +46,7 @@ import {
   sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
+import { createSessionPinKey } from '@/store/session-pin-key'
 import {
   $sessionStates,
   $sessionTiles,
@@ -428,16 +429,18 @@ export function stackSessionTilesIntoMain(): void {
  *  updates in other sessions) — for a context menu that's almost never open.
  *  Same class as the TreeGroup fix (#72245): derive narrowly, bail out unless
  *  the derived values change. */
-function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: string; title: string } {
-  const cache = useRef<{ key: string; value: { pinId: string; profile?: string; title: string } } | null>(null)
+function useTileMenuRow(storedSessionId: string): { pinKey: string; profile?: string; title: string } {
+  const cache = useRef<{ key: string; value: { pinKey: string; profile?: string; title: string } } | null>(null)
 
   const subscribe = useCallback((onChange: () => void) => {
     const offSessions = $sessions.listen(onChange)
     const offTree = $projectTree.listen(onChange)
+    const offProfile = $activeGatewayProfile.listen(onChange)
 
     return () => {
       offSessions()
       offTree()
+      offProfile()
     }
   }, [])
 
@@ -446,10 +449,11 @@ function useTileMenuRow(storedSessionId: string): { pinId: string; profile?: str
     const pinId = stored ? sessionPinId(stored) : storedSessionId
     const title = tileTitle(storedSessionId)
     const profile = stored?.profile
-    const key = `${pinId}\u0000${title}\u0000${profile ?? ''}`
+    const pinKey = createSessionPinKey(profile ?? $activeGatewayProfile.get(), pinId)
+    const key = `${pinKey}\u0000${title}`
 
     if (cache.current?.key !== key) {
-      cache.current = { key, value: { pinId, profile, title } }
+      cache.current = { key, value: { pinKey, profile, title } }
     }
 
     return cache.current.value
@@ -477,9 +481,9 @@ export function SessionTabMenu({
   /** Layout-tree pane id — powers the Close-others/right/all verbs. */
   tabPaneId: string
 }) {
-  const { pinId, profile, title } = useTileMenuRow(storedSessionId)
+  const { pinKey, profile, title } = useTileMenuRow(storedSessionId)
   const pinnedSessionIds = useStore($pinnedSessionIds)
-  const pinned = pinnedSessionIds.includes(pinId)
+  const pinned = pinnedSessionIds.includes(pinKey)
 
   return (
     <span className="contents" onContextMenu={event => event.stopPropagation()}>
@@ -489,7 +493,7 @@ export function SessionTabMenu({
         onClose={onClose}
         onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
         onHideTabBar={onHideTabBar}
-        onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+        onPin={() => (pinned ? unpinSession(pinKey) : pinSession(pinKey))}
         pinned={pinned}
         profile={profile}
         sessionId={storedSessionId}

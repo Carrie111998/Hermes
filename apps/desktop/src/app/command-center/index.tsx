@@ -29,7 +29,8 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
-import { $sessions, sessionPinId } from '@/store/session'
+import { $sessions } from '@/store/session'
+import { sessionPinKey, sessionScopedId } from '@/store/session-pin-key'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -363,11 +364,11 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
               ) : (
                 <ul>
                   {filteredSessions.map(session => {
-                    const pinId = sessionPinId(session)
-                    const pinned = pinnedSessionIds.includes(pinId)
+                    const pinKey = sessionPinKey(session)
+                    const pinned = pinnedSessionIds.includes(pinKey)
 
                     return (
-                      <li className="group flex items-center gap-2 py-2" key={session.id}>
+                      <li className="group flex items-center gap-2 py-2" key={sessionScopedId(session)}>
                         <button
                           className="min-w-0 flex-1 text-left"
                           onClick={() => onOpenSession(session.id)}
@@ -382,7 +383,7 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
                         </button>
                         <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
                           <RowIconButton
-                            onClick={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+                            onClick={() => (pinned ? unpinSession(pinKey) : pinSession(pinKey))}
                             title={pinned ? cc.unpinSession : cc.pinSession}
                           >
                             {pinned ? <BookmarkFilled className="size-3.5" /> : <Bookmark className="size-3.5" />}

@@ -28,6 +28,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { sessionPinIdsForScope } from '@/store/session-pin-key'
 import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 // The recents list is local-only: cron rows have their own section, kanban
@@ -50,7 +51,7 @@ const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
 function sessionsToKeep(scope?: string): Set<string> {
   const keep = new Set<string>([
     ...$workingSessionIds.get(),
-    ...$pinnedSessionIds.get(),
+    ...sessionPinIdsForScope($pinnedSessionIds.get(), scope),
     ...getRecentlySettledSessionIds()
   ])
 
@@ -199,7 +200,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         // identity, or every sidebar memo keyed on $sessions recomputes and the
         // whole list re-renders once per turn/broadcast for nothing.
         setSessions(prev => {
-          const next = mergeSessionPage(prev, incoming, sessionsToKeep())
+          const keepScope = profileScope === ALL_PROFILES ? undefined : profileScope
+          const next = mergeSessionPage(prev, incoming, sessionsToKeep(keepScope))
 
           return sameCronSignature(prev, next) ? prev : next
         })

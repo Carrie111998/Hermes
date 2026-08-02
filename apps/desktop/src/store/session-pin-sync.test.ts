@@ -13,6 +13,7 @@ vi.mock('@/hermes', () => ({
 import { $pinnedSessionIds } from '@/store/layout'
 import { $sessions } from '@/store/session'
 
+import { createSessionPinKey } from './session-pin-key'
 import { watchSessionPins } from './session-pin-sync'
 
 const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
@@ -41,7 +42,7 @@ afterEach(() => {
 describe('watchSessionPins', () => {
   it('mirrors a new pin as pinned=true with the row profile', async () => {
     $sessions.set([row('a', { profile: 'work' })])
-    $pinnedSessionIds.set(['a'])
+    $pinnedSessionIds.set([createSessionPinKey('work', 'a')])
     await flush()
 
     expect(patch).toHaveBeenCalledWith('a', true, 'work')
@@ -49,23 +50,18 @@ describe('watchSessionPins', () => {
 
   it('mirrors an unpin as pinned=false', async () => {
     $sessions.set([row('b')])
-    $pinnedSessionIds.set(['b'])
+    $pinnedSessionIds.set([createSessionPinKey('default', 'b')])
     await flush()
     patch.mockClear()
 
     $pinnedSessionIds.set([])
     await flush()
 
-    expect(patch).toHaveBeenCalledWith('b', false, undefined)
+    expect(patch).toHaveBeenCalledWith('b', false, 'default')
   })
 
-  it('defers a pin whose row is not loaded, then flushes once it appears', async () => {
-    $pinnedSessionIds.set(['c'])
-    await flush()
-    // No row yet -> nothing sent.
-    expect(patch).not.toHaveBeenCalled()
-
-    $sessions.set([row('c', { profile: 'p2' })])
+  it('mirrors a qualified pin before its row is loaded', async () => {
+    $pinnedSessionIds.set([createSessionPinKey('p2', 'c')])
     await flush()
 
     expect(patch).toHaveBeenCalledWith('c', true, 'p2')
@@ -74,15 +70,15 @@ describe('watchSessionPins', () => {
   it('matches a pin id against the lineage root', async () => {
     // pin id is the lineage root; the live row carries it as _lineage_root_id.
     $sessions.set([row('tip', { _lineage_root_id: 'root' })])
-    $pinnedSessionIds.set(['root'])
+    $pinnedSessionIds.set([createSessionPinKey('default', 'root')])
     await flush()
 
-    expect(patch).toHaveBeenCalledWith('root', true, undefined)
+    expect(patch).toHaveBeenCalledWith('root', true, 'default')
   })
 
   it('does not re-PATCH an already-mirrored pin on unrelated session updates', async () => {
     $sessions.set([row('d')])
-    $pinnedSessionIds.set(['d'])
+    $pinnedSessionIds.set([createSessionPinKey('default', 'd')])
     await flush()
     patch.mockClear()
 
@@ -95,18 +91,30 @@ describe('watchSessionPins', () => {
 })
 
 describe('watchSessionPins remote pull', () => {
+  it('migrates an ambiguous legacy id to the cloned profile whose durable row is pinned', async () => {
+    $pinnedSessionIds.set(['shared'])
+    $sessions.set([
+      row('shared', { pinned: false, profile: 'default' }),
+      row('shared', { pinned: true, profile: 'work' })
+    ])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual([createSessionPinKey('work', 'shared')])
+    expect(patch).not.toHaveBeenCalledWith('shared', true, 'default')
+  })
+
   it('adopts a pin another app made', async () => {
     $sessions.set([row('remote', { pinned: true })])
     await flush()
 
-    expect($pinnedSessionIds.get()).toContain('remote')
+    expect($pinnedSessionIds.get()).toContain(createSessionPinKey('default', 'remote'))
   })
 
   it('adopts a remote pin on the durable lineage root, not the live tip', async () => {
     $sessions.set([row('tip', { _lineage_root_id: 'root', pinned: true })])
     await flush()
 
-    expect($pinnedSessionIds.get()).toEqual(['root'])
+    expect($pinnedSessionIds.get()).toEqual([createSessionPinKey('default', 'root')])
   })
 
   it('does not echo an adopted pin back as a redundant write', async () => {
@@ -126,16 +134,18 @@ describe('watchSessionPins remote pull', () => {
     $sessions.set([row('gone', { pinned: false })])
     await flush()
 
-    expect($pinnedSessionIds.get()).not.toContain('gone')
+    expect($pinnedSessionIds.get()).not.toContain(createSessionPinKey('default', 'gone'))
   })
 
   it('leaves the local set alone when the backend omits the flag', async () => {
-    $pinnedSessionIds.set(['legacy'])
+    const pinKey = createSessionPinKey('default', 'legacy')
+
+    $pinnedSessionIds.set([pinKey])
     // No `pinned` key at all — a runtime predating the column.
     $sessions.set([row('legacy')])
     await flush()
 
-    expect($pinnedSessionIds.get()).toContain('legacy')
+    expect($pinnedSessionIds.get()).toContain(pinKey)
   })
 
   it('does not revert a fresh local pin while the loaded row is still stale (#74570)', async () => {
@@ -146,18 +156,20 @@ describe('watchSessionPins remote pull', () => {
     await flush()
     patch.mockClear()
 
-    $pinnedSessionIds.set(['fresh'])
+    const pinKey = createSessionPinKey('default', 'fresh')
+
+    $pinnedSessionIds.set([pinKey])
     await flush()
 
-    expect($pinnedSessionIds.get()).toContain('fresh')
-    expect(patch).toHaveBeenCalledWith('fresh', true, undefined)
+    expect($pinnedSessionIds.get()).toContain(pinKey)
+    expect(patch).toHaveBeenCalledWith('fresh', true, 'default')
   })
 
   it('does not revert a fresh local unpin while the loaded row still says pinned (#74570)', async () => {
     // Adopt a server-side pin first, so it's held locally and mirrored.
     $sessions.set([row('sticky', { pinned: true })])
     await flush()
-    expect($pinnedSessionIds.get()).toContain('sticky')
+    expect($pinnedSessionIds.get()).toContain(createSessionPinKey('default', 'sticky'))
     patch.mockClear()
 
     // User unpins while the loaded row still says pinned=true.
@@ -165,10 +177,10 @@ describe('watchSessionPins remote pull', () => {
     await flush()
 
     expect($pinnedSessionIds.get()).not.toContain('sticky')
-    expect(patch).toHaveBeenCalledWith('sticky', false, undefined)
+    expect(patch).toHaveBeenCalledWith('sticky', false, 'default')
   })
 
-  it('keeps a deferred pin (row not yet loaded) when a stale page finally arrives', async () => {
+  it('migrates a unique legacy pin when its row finally appears', async () => {
     $pinnedSessionIds.set(['deferred'])
     await flush()
     expect(patch).not.toHaveBeenCalled()
@@ -177,8 +189,8 @@ describe('watchSessionPins remote pull', () => {
     $sessions.set([row('deferred', { pinned: false })])
     await flush()
 
-    expect($pinnedSessionIds.get()).toContain('deferred')
-    expect(patch).toHaveBeenCalledWith('deferred', true, undefined)
+    expect($pinnedSessionIds.get()).toContain(createSessionPinKey('default', 'deferred'))
+    expect(patch).toHaveBeenCalledWith('deferred', true, 'default')
   })
 
   it('ignores a stale page that contradicts a write still in flight', async () => {
@@ -187,16 +199,18 @@ describe('watchSessionPins remote pull', () => {
     patch.mockImplementationOnce(() => new Promise(resolve => (settle = resolve)))
 
     $sessions.set([row('race')])
-    $pinnedSessionIds.set(['race'])
+    const pinKey = createSessionPinKey('default', 'race')
+
+    $pinnedSessionIds.set([pinKey])
     await flush()
-    expect(patch).toHaveBeenCalledWith('race', true, undefined)
+    expect(patch).toHaveBeenCalledWith('race', true, 'default')
 
     // A list request issued before the PATCH lands still says pinned=false.
     // Honouring it would silently undo the pin the user just made.
     $sessions.set([row('race', { pinned: false })])
     await flush()
 
-    expect($pinnedSessionIds.get()).toContain('race')
+    expect($pinnedSessionIds.get()).toContain(pinKey)
 
     // Once the write is acked, later server truth is honoured again.
     settle({ ok: true })
@@ -206,6 +220,6 @@ describe('watchSessionPins remote pull', () => {
     $sessions.set([row('race', { pinned: false }), row('other')])
     await flush()
 
-    expect($pinnedSessionIds.get()).not.toContain('race')
+    expect($pinnedSessionIds.get()).not.toContain(pinKey)
   })
 })

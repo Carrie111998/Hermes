@@ -12,7 +12,7 @@ import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import { groupEntriesByRecency, type SidebarListRow, toSessionRows } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { sessionPinId } from '@/store/session'
+import { sessionPinKey, sessionScopedId } from '@/store/session-pin-key'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import {
@@ -95,7 +95,7 @@ interface SidebarSessionsSectionProps {
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
-  onTogglePin: (sessionId: string) => void
+  onTogglePin: (session: SessionInfo) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
   rootClassName?: string
@@ -226,6 +226,9 @@ export function SidebarSessionsSection({
   )
 
   const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+    const rowKey = sessionScopedId(session)
+    const sortableId = pinned ? sessionPinKey(session) : session.id
+
     const rowProps = {
       branchStem,
       isPinned: pinned,
@@ -234,7 +237,7 @@ export function SidebarSessionsSection({
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
+      onPin: () => onTogglePin(session),
       onResume: () => onResumeSession(session.id),
       reorderable: draggable && !branchStem,
       session,
@@ -242,9 +245,9 @@ export function SidebarSessionsSection({
     }
 
     return draggable && !branchStem ? (
-      <SortableSidebarSessionRow key={session.id} {...rowProps} />
+      <SortableSidebarSessionRow key={rowKey} sortableId={sortableId} {...rowProps} />
     ) : (
-      <SidebarSessionRow key={session.id} {...rowProps} />
+      <SidebarSessionRow key={rowKey} {...rowProps} />
     )
   }
 
@@ -383,7 +386,11 @@ export function SidebarSessionsSection({
 
     inner =
       sessionsDraggable && onReorderSessions ? (
-        <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
+        <ReorderableList
+          ids={sessions.map(session => (pinned ? sessionPinKey(session) : session.id))}
+          onReorder={onReorderSessions}
+          sensors={dndSensors}
+        >
           {virtual}
         </ReorderableList>
       ) : (
@@ -391,7 +398,11 @@ export function SidebarSessionsSection({
       )
   } else if (sessionsDraggable && onReorderSessions) {
     inner = (
-      <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
+      <ReorderableList
+        ids={sessions.map(session => (pinned ? sessionPinKey(session) : session.id))}
+        onReorder={onReorderSessions}
+        sensors={dndSensors}
+      >
         {flatRows.map(row => renderListRow(row, true))}
       </ReorderableList>
     )
@@ -433,10 +444,11 @@ interface SortableSessionRowProps {
   onDelete: () => void
   onPin: () => void
   onResume: () => void
+  sortableId: string
 }
 
-function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
+function SortableSidebarSessionRow({ sortableId, ...props }: SortableSessionRowProps) {
+  return <SidebarSessionRow {...props} {...useSortableBindings(sortableId)} />
 }
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {
