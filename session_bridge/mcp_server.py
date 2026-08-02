@@ -28,6 +28,7 @@ from .claude_visibility_codes import (
 from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig, is_canonical_sidebar_string
 from .coordinator import ContinueRequest, ContinueResult
+from .health import build_session_health_evidence
 from .mirror import MirrorPolicy, enqueue_mirror_job
 from .models import (
     BridgeMarkerPayload,
@@ -382,15 +383,19 @@ def create_app(
     async def session_status() -> dict[str, Any]:
         """Return sanitized indexing, queue, and catalog health."""
 
+        observation_started_at = time.time()
         health_method = getattr(coordinator, "health", None)
         health = health_method() if callable(health_method) else {"running": False}
+        health_observed_at = time.time()
         catalog_status = await asyncio.to_thread(catalog.status)
+        catalog_observed_at = time.time()
         sidebar_status = await asyncio.to_thread(
             store.sidebar_delivery_status,
             inbox_cwd=config.sidebar.inbox_cwd,
             placement_generation=config.sidebar.placement_generation,
         )
         status_time = time.time()
+        sidebar_observed_at = status_time
         heartbeat_at = _finite_status_number(sidebar_status.get("last_heartbeat_at"))
         heartbeat_age = (
             max(0.0, status_time - heartbeat_at) if heartbeat_at is not None else None
@@ -435,42 +440,56 @@ def create_app(
             store.sidebar_hydration_status,
             time.time(),
         )
+        hydration_observed_at = time.time()
+        visibility = config.claude_visibility
+        if visibility.enabled:
+            visibility_status = await asyncio.to_thread(
+                store.claude_visibility_status,
+                time.time(),
+            )
+        else:
+            visibility_status = _disabled_claude_visibility_status()
+        claude_visibility_observed_at = time.time()
         sidebar_status["last_visible_task_id"] = redact_codex_thread_id(
             sidebar_status.get("last_visible_task_id")
         )
-        return _status_payload(
+        payload = _status_payload(
             health,
             catalog_status,
             sidebar_status,
             hydration_status,
             hydration_enabled=config.sidebar.legacy_hydration_enabled,
         )
+        observation_completed_at = time.time()
+        payload["evidence_v1"] = build_session_health_evidence(
+            observation_started_at=observation_started_at,
+            observation_completed_at=observation_completed_at,
+            health_observed_at=health_observed_at,
+            catalog_observed_at=catalog_observed_at,
+            sidebar_observed_at=sidebar_observed_at,
+            hydration_observed_at=hydration_observed_at,
+            claude_visibility_observed_at=claude_visibility_observed_at,
+            coordinator_health=health,
+            catalog_status=catalog_status,
+            sidebar_status=sidebar_status,
+            hydration_status=hydration_status,
+            claude_visibility_status=visibility_status,
+            catalog_scan_seconds=config.service.catalog_scan_seconds,
+            hydration_enabled=config.sidebar.legacy_hydration_enabled,
+            claude_visibility_enabled=visibility.enabled,
+        )
+        return payload
 
     @mcp.tool()
     async def session_claude_visibility_status() -> dict[str, Any]:
         """Return read-only Claude native-visibility health and cost gates."""
 
         visibility = config.claude_visibility
-        if not visibility.enabled:
-            raw: Mapping[str, Any] = {
-                "counts": {
-                    "claude_pending": 0,
-                    "claude_leased": 0,
-                    "claude_retry": 0,
-                    "claude_visible": 0,
-                    "claude_failed": 0,
-                },
-                "retry_codes": {},
-                "failed_codes": {},
-                "fatal": [],
-                "usage": {
-                    "local_day": None,
-                    "attempts": 0,
-                    "reserved_cost_usd": "0",
-                },
-            }
-        else:
-            raw = await asyncio.to_thread(store.claude_visibility_status, time.time())
+        raw = (
+            _disabled_claude_visibility_status()
+            if not visibility.enabled
+            else await asyncio.to_thread(store.claude_visibility_status, time.time())
+        )
         return _claude_visibility_status_payload(raw, visibility)
 
     @mcp.tool()
@@ -920,6 +939,26 @@ class _BearerMcpAuth:
             headers={"WWW-Authenticate": "Bearer"},
         )
         await response(scope, receive, send)
+
+
+def _disabled_claude_visibility_status() -> Mapping[str, Any]:
+    return {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_visible": 0,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "fatal": [],
+        "usage": {
+            "local_day": None,
+            "attempts": 0,
+            "reserved_cost_usd": "0",
+        },
+    }
 
 
 def _claude_visibility_status_payload(
