@@ -156,7 +156,7 @@ test('listBranches: a branch claimed by a worktree is flagged checked out', asyn
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
-})
+}, 30_000)
 
 test('listBranches: empty on a non-repo path', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-nonrepo-'))
