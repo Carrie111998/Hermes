@@ -358,15 +358,17 @@ def test_sanitize_drops_empty_tool_calls_array():
 
 
 def test_sanitize_preserves_reused_tool_call_ids_across_turns():
-    """Dedup must be scoped per assistant message, not conversation-wide.
+    """Reused ids survive: dedup keys off OUTSTANDING calls, not seen-forever.
 
     Hermes reuses local tool_call id counters on every turn
     (``image_generate:0..N`` in successive image rounds), so the same ids
-    legitimately appear in MULTIPLE assistant messages. A conversation-wide
-    seen-set misclassifies later turns' calls as duplicates, strips them and
-    re-writes ``tool_calls: []`` — which DeepSeek rejects with HTTP 400
+    legitimately appear in MULTIPLE assistant messages. A seen-once-drop-
+    forever rule misclassifies later turns' calls as duplicates, strips them
+    and re-writes ``tool_calls: []`` — which DeepSeek rejects with HTTP 400
     (the #58755 follow-up: the dedup pass ran after the empty-array drop
-    and re-introduced `[]`). Each assistant message opens a fresh id scope.
+    and re-introduced `[]`). Each assistant call ARMS its id and each tool
+    result CONSUMES it, so a fresh call re-arms the id; only a result that
+    answers nothing outstanding is dropped.
     """
     from agent.agent_runtime_helpers import sanitize_api_messages
 
@@ -397,6 +399,35 @@ def test_sanitize_preserves_reused_tool_call_ids_across_turns():
     tool_ids = sorted(m["tool_call_id"] for m in out if m.get("role") == "tool")
     assert tool_ids == ["image_generate:0", "image_generate:0",
                         "image_generate:1", "image_generate:1"]
+
+
+def test_sanitize_still_drops_replayed_result_for_retired_call():
+    """The #58327 protection holds under outstanding-call semantics: a second
+    result replaying an already-answered call id answers nothing outstanding
+    and is still dropped, even after a later assistant message re-armed it."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        # call id:0 armed by turn 1
+        {"role": "assistant", "content": "one",
+         "tool_calls": [{"id": "local:0", "call_id": "local:0", "type": "function",
+                         "function": {"name": "image_generate", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "local:0", "content": "imgA"},
+        # a replay of the SAME result after the call was answered — must drop
+        {"role": "tool", "tool_call_id": "local:0", "content": "imgA (replayed)"},
+        # turn 2 re-arms local:0 legitimately
+        {"role": "assistant", "content": "two",
+         "tool_calls": [{"id": "local:0", "call_id": "local:0", "type": "function",
+                         "function": {"name": "image_generate", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "local:0", "content": "imgB"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    tool_msgs = [m for m in out if m.get("role") == "tool"]
+    # replay dropped; both legitimate answers survive
+    assert [m["content"] for m in tool_msgs] == ["imgA", "imgB"]
+    assistants = [m for m in out if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert len(assistants) == 2
 
 
 # ── Self-recovery: heal empty-content non-final messages ──────────────────
