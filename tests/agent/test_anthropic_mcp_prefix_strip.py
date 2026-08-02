@@ -1,4 +1,4 @@
-"""Tests for GH-25255: Anthropic OAuth ``mcp__`` tool-name round-trip.
+"""Tests for Anthropic OAuth tool-name normalization and round-trips.
 
 Anthropic's subscription/OAuth billing classifier treats a **single-underscore**
 ``mcp_`` tool name as a third-party-app fingerprint and rejects the request with
@@ -11,6 +11,9 @@ the OAuth wire NOTHING may carry a single-underscore ``mcp_`` prefix:
 ``normalize_response`` reverses the ``mcp__`` wire name back to whatever the tool
 registry knows (the single-underscore ``mcp_<server>_<tool>`` form for MCP server
 tools, or the bare name for native tools) so the dispatcher is unaffected.
+
+The deterministic prompt trigger includes ``session_search`` guidance, so its
+OAuth wire alias must round-trip to the registry name.
 """
 
 from __future__ import annotations
@@ -93,6 +96,19 @@ class TestAnthropicMcpPrefixStrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "mcp__read_file"
 
+    def test_oauth_session_search_alias_round_trips_to_registry_name(self):
+        """``mcp__chat_history_lookup`` dispatches as ``session_search``."""
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp__chat_history_lookup")
+        response = _make_response(block)
+
+        registry = _FakeRegistry({"session_search"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=True)
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "session_search"
+
 
 
 
@@ -106,11 +122,11 @@ class TestAnthropicOAuthOutgoingPrefix:
     """build_anthropic_kwargs must emit ZERO single-underscore ``mcp_`` names on
     the OAuth wire — bare names and MCP server names both land on ``mcp__``."""
 
-    def _build(self, tools, is_oauth=True):
+    def _build(self, tools, is_oauth=True, messages=None):
         from agent.anthropic_adapter import build_anthropic_kwargs
         return build_anthropic_kwargs(
             model="claude-sonnet-4-6",
-            messages=[{"role": "user", "content": "Hi"}],
+            messages=messages or [{"role": "user", "content": "Hi"}],
             tools=tools,
             max_tokens=4096,
             reasoning_config=None,
@@ -155,3 +171,47 @@ class TestAnthropicOAuthOutgoingPrefix:
         for n in names:
             assert not (n.startswith("mcp_") and not n.startswith("mcp__"))
 
+    def test_oauth_aliases_session_search_in_request_shape(self):
+        """OAuth aliases the classifier trigger in name, description, and prompt."""
+        kwargs = self._build(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "session_search",
+                    "description": "Use session_search to recall prior chats.",
+                    "parameters": {},
+                },
+            }],
+            messages=[
+                {"role": "system", "content": "Use session_search before asking again."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        assert kwargs["tools"][0]["name"] == "mcp__chat_history_lookup"
+        assert "session_search" not in kwargs["tools"][0]["description"]
+        system_text = " ".join(block["text"] for block in kwargs["system"])
+        assert "session_search" not in system_text
+        assert "chat_history_lookup" in system_text
+
+    def test_non_oauth_keeps_session_search_request_shape(self):
+        """API-key requests retain the public tool name and prompt vocabulary."""
+        kwargs = self._build(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "session_search",
+                    "description": "Use session_search to recall prior chats.",
+                    "parameters": {},
+                },
+            }],
+            is_oauth=False,
+            messages=[
+                {"role": "system", "content": "Use session_search before asking again."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        assert kwargs["tools"][0]["name"] == "session_search"
+        assert "session_search" in kwargs["tools"][0]["description"]
+        assert kwargs["system"] == "Use session_search before asking again."

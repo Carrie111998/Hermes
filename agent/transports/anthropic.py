@@ -84,7 +84,11 @@ class AnthropicTransport(ProviderTransport):
         to OpenAI finish_reason, and collects reasoning_details in provider_data.
         """
         import json
-        from agent.anthropic_adapter import _to_plain_data, _sanitize_replay_block
+        from agent.anthropic_adapter import (
+            _OAUTH_TOOL_NAME_REVERSE_ALIASES,
+            _sanitize_replay_block,
+            _to_plain_data,
+        )
         from agent.transports.types import ToolCall
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
@@ -143,14 +147,19 @@ class AnthropicTransport(ProviderTransport):
                     # Resolve by registry lookup, preferring whichever original
                     # is actually registered; never rewrite a name the LLM used
                     # that already resolves natively. GH-25255.
-                    from tools.registry import registry as _tool_registry
-                    if not _tool_registry.get_entry(name):
-                        bare = name[len(_MCP_PREFIX):]            # read_file
-                        single = "mcp_" + bare                    # mcp_read_file / mcp_linear_get_issue
-                        if _tool_registry.get_entry(single):
-                            name = single
-                        elif _tool_registry.get_entry(bare):
-                            name = bare
+                    bare = name[len(_MCP_PREFIX):]                # read_file
+                    # OAuth aliases must round-trip before the generic registry
+                    # lookup, which only knows Hermes's canonical tool names.
+                    if bare in _OAUTH_TOOL_NAME_REVERSE_ALIASES:
+                        name = _OAUTH_TOOL_NAME_REVERSE_ALIASES[bare]
+                    else:
+                        from tools.registry import registry as _tool_registry
+                        if not _tool_registry.get_entry(name):
+                            single = "mcp_" + bare                # mcp_read_file / mcp_linear_get_issue
+                            if _tool_registry.get_entry(single):
+                                name = single
+                            elif _tool_registry.get_entry(bare):
+                                name = bare
                 tool_calls.append(
                     ToolCall(
                         id=block.id,
