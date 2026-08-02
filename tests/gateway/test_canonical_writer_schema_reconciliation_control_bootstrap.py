@@ -801,6 +801,133 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
     assert session.closed is False
 
 
+@pytest.mark.parametrize(
+    ("replacement", "expected_code"),
+    (
+        (
+            {"control_admin_role_exact": "false"},
+            "schema_reconciliation_control_admin_session_boundary_drifted",
+        ),
+        (
+            {"foreign_client_session_count": "1"},
+            "schema_reconciliation_control_foreign_client_sessions_present",
+        ),
+        (
+            {"max_prepared_transactions": "1"},
+            "schema_reconciliation_control_prepared_transactions_drifted",
+        ),
+        (
+            {"non_template_database_inventory_exact": "false"},
+            "schema_reconciliation_control_database_inventory_drifted",
+        ),
+        (
+            {"latent_provider_exception_exact": "false"},
+            "schema_reconciliation_control_cloudsqladmin_contract_drifted",
+        ),
+        (
+            {"executor_database_effective_privileges_exact": "false"},
+            "schema_reconciliation_control_executor_privileges_drifted",
+        ),
+        (
+            {"migration_owner_role_exact": "false"},
+            "schema_reconciliation_control_migration_owner_role_drifted",
+        ),
+        (
+            {"current_database_owner_exact": "false"},
+            "schema_reconciliation_control_database_owner_drifted",
+        ),
+        (
+            {"helper_absent": "false", "helper_same_name_count": "1"},
+            "schema_reconciliation_control_routeback_helper_present",
+        ),
+        (
+            {},
+            "schema_reconciliation_control_foundation_objects_drifted",
+        ),
+    ),
+)
+def test_fixed_observation_reports_secret_free_structural_drift_code(
+    replacement: Mapping[str, str],
+    expected_code: str,
+) -> None:
+    assert bootstrap._STABLE_ERROR.fullmatch(expected_code)
+    username = "muncho_canary_control_" + "a" * 16
+    values = {
+        "database_name": bootstrap.foundation.SQL_DATABASE,
+        "version_num": "180002",
+        "session_user_name": username,
+        "control_admin_count": "1",
+        "control_admin_role_exact": "true",
+        "control_admin_forward_role_count": "1",
+        "control_admin_owned_object_count": "0",
+        "control_admin_shared_dependency_count": "0",
+        "foreign_client_session_count": "0",
+        "max_prepared_transactions": "0",
+        "cluster_prepared_xact_count": "0",
+        "non_template_database_inventory_exact": "true",
+        "all_connectable_database_inventory_exact": "true",
+        "latent_provider_exception_exact": "true",
+        "executor_database_effective_privileges_exact": "true",
+        "migration_owner_role_exact": "true",
+        "current_database_owner_exact": "true",
+        "executor_membership_count": "0",
+        "executor_owned_object_count": "0",
+        "executor_acl_dependency_count": "0",
+        "observer_prosrc_sha256": None,
+        "observer_definition_sha256": None,
+        "apply_prosrc_sha256": None,
+        "apply_definition_sha256": None,
+        "foundation_state": "drift",
+        "foundation_exact": "false",
+        "helper_absent": "true",
+        "helper_same_name_count": "0",
+    }
+    values.update(replacement)
+    result = QueryResult(
+        bootstrap._FOUNDATION_OBSERVATION_COLUMNS,
+        (
+            tuple(
+                values[name]
+                for name in bootstrap._FOUNDATION_OBSERVATION_COLUMNS
+            ),
+        ),
+        "COMMIT",
+    )
+
+    with pytest.raises(bootstrap.ControlBootstrapError, match=expected_code):
+        bootstrap._parse_foundation_observation_result(
+            type("Session", (), {"username": username})(),
+            result,
+            phase="before_install",
+            observed_at_unix=NOW,
+        )
+
+
+def test_fixed_observation_does_not_classify_malformed_drift_value() -> None:
+    row = {
+        name: "0" for name in bootstrap._FOUNDATION_OBSERVATION_COLUMNS
+    }
+    row.update(
+        {
+            "control_admin_role_exact": "true",
+            "non_template_database_inventory_exact": "true",
+            "all_connectable_database_inventory_exact": "true",
+            "latent_provider_exception_exact": "true",
+            "executor_database_effective_privileges_exact": "true",
+            "migration_owner_role_exact": "true",
+            "current_database_owner_exact": "true",
+            "helper_absent": "true",
+            "foreign_client_session_count": "not-a-decimal",
+        }
+    )
+
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match="schema_reconciliation_control_database_observation_invalid",
+    ):
+        bootstrap._foundation_drift_error_code(row)
+
+
 def test_fixed_observation_rolls_back_and_unlocks_on_query_failure() -> None:
     class Session:
         username = bootstrap.foundation.SQL_USER
@@ -1162,6 +1289,32 @@ def test_install_failure_receipt_binds_accepted_install_claim() -> None:
     assert records[-1]["transcript_head_sha256"] == install[
         "install_claim_sha256"
     ]
+
+
+def test_structural_drift_code_survives_secret_free_failure_envelope() -> None:
+    _key, gate, install, _intermediate_value, _cleanup, _terminal_value = (
+        _protocol_fixture()
+    )
+    expected = "schema_reconciliation_control_database_inventory_drifted"
+    output = io.BytesIO()
+
+    with pytest.raises(bootstrap.ControlBootstrapError, match=expected):
+        bootstrap.run_protocol(
+            gate,
+            install_callback=lambda *_args: (_ for _ in ()).throw(
+                bootstrap.ControlBootstrapError(expected)
+            ),
+            post_cleanup_callback=lambda *_args: {},
+            input_stream=io.BytesIO(
+                _frame(bootstrap.INSTALL_MAGIC, install) + CREDENTIAL
+            ),
+            output_stream=output,
+            now=lambda: NOW,
+        )
+
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert records[-1]["error_code"] == expected
+    assert records[-1]["secret_material_recorded"] is False
 
 
 class _PartialSecondWrite:
