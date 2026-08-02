@@ -722,7 +722,7 @@ class TestInstallerNoShell:
     on disk instead of curling them from the cua.ai vanity CDN, whose public
     DNS is NXDOMAIN."""
 
-    def _run(self, download_rc=0):
+    def _run(self, download_rc=0, fail_names=None, installer_rc=0):
         import subprocess
         from unittest.mock import MagicMock
         from hermes_cli import tools_config
@@ -730,14 +730,16 @@ class TestInstallerNoShell:
         calls = []
         fake_proc = MagicMock()
         fake_proc.pid = 1
-        fake_proc.returncode = 0
+        fake_proc.returncode = installer_rc
         fake_proc.communicate.return_value = ("", None)
 
         def fake_run(cmd, **kw):
             calls.append(("run", cmd, kw))
             m = MagicMock()
-            m.returncode = download_rc
-            m.stderr = "curl: (6) could not resolve" if download_rc else ""
+            name = cmd[-1].rsplit("/", 1)[-1]
+            rc = 6 if fail_names and name in fail_names else download_rc
+            m.returncode = rc
+            m.stderr = "curl: (6) could not resolve" if rc else ""
             return m
 
         def fake_popen(cmd, **kw):
@@ -747,7 +749,9 @@ class TestInstallerNoShell:
         with patch("platform.system", return_value="Linux"), \
              patch("subprocess.run", side_effect=fake_run), \
              patch("subprocess.Popen", side_effect=fake_popen), \
-             patch.object(tools_config.shutil, "which", return_value="/usr/local/bin/cua-driver"), \
+             patch.object(tools_config.shutil, "which",
+                          return_value=None if installer_rc
+                          else "/usr/local/bin/cua-driver"), \
              patch.object(tools_config, "_clear_stale_cua_install_lock"), \
              patch.object(tools_config, "_print_warning"), \
              patch.object(tools_config, "_print_info"), \
@@ -806,6 +810,37 @@ class TestInstallerNoShell:
         ok, calls = self._run(download_rc=6)
         assert ok is False
         assert not [c for c in calls if c[0] == "popen"]
+
+    def test_required_rust_sibling_failure_returns_false_without_exec(self):
+        """_install-rust.sh is load-bearing — no stubs exist for it."""
+        ok, calls = self._run(fail_names={"_install-rust.sh"})
+        assert ok is False
+        assert not [c for c in calls if c[0] == "popen"]
+        # Aborted before the optional sibling was even attempted.
+        assert [c[1][-1].rsplit("/", 1)[-1] for c in calls if c[0] == "run"] == [
+            "install.sh", "_install-rust.sh",
+        ]
+
+    def test_optional_common_sibling_failure_still_execs_installer(self):
+        """_install-common.sh is optional upstream: _install-rust.sh defines
+        no-op stubs when it cannot load that sibling, so a failed fetch must
+        not abort an otherwise-working install (review on #76861)."""
+        ok, calls = self._run(fail_names={"_install-common.sh"})
+        assert ok is True
+        popen_calls = [c for c in calls if c[0] == "popen"]
+        assert len(popen_calls) == 1
+        assert popen_calls[0][1][1].endswith("/install.sh")
+        # All three still attempted, in order.
+        assert [c[1][-1].rsplit("/", 1)[-1] for c in calls if c[0] == "run"] == [
+            "install.sh", "_install-rust.sh", "_install-common.sh",
+        ]
+
+    def test_optional_sibling_failure_still_defers_to_installer_result(self):
+        """Warn-and-continue, not warn-and-succeed: the installer's own
+        outcome still decides the return value."""
+        ok, calls = self._run(fail_names={"_install-common.sh"}, installer_rc=1)
+        assert ok is False
+        assert len([c for c in calls if c[0] == "popen"]) == 1
 
     def test_posix_manual_hint_materializes_three_github_siblings(self):
         """Failure/timeout recovery must not re-teach the broken lone curl|bash.
@@ -882,6 +917,36 @@ class TestInstallerNoShell:
         # The whole temp dir goes, not just install.sh.
         assert not os.path.exists(os.path.dirname(captured["script"]))
         assert not os.path.exists(captured["script"])
+
+    def test_temp_script_dir_removed_on_required_download_failure(self):
+        """The fail-fast return happens before the try/finally, so that path
+        has to clean the mkdtemp directory itself."""
+        import os
+        import tempfile
+        from unittest.mock import MagicMock
+        from hermes_cli import tools_config
+
+        made = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def fake_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            made.append(path)
+            return path
+
+        with patch("platform.system", return_value="Linux"), \
+             patch("tempfile.mkdtemp", side_effect=fake_mkdtemp), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=6, stderr="curl: (6)")), \
+             patch("subprocess.Popen") as popen, \
+             patch.object(tools_config, "_clear_stale_cua_install_lock"), \
+             patch.object(tools_config, "_print_warning"), \
+             patch.object(tools_config, "_print_info"):
+            ok = tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
+
+        assert ok is False
+        popen.assert_not_called()
+        assert made and not os.path.exists(made[0])
 
 
 class TestConfirmedVersionPinning:

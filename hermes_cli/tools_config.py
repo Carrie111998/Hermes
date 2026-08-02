@@ -1377,7 +1377,9 @@ def _run_cua_driver_installer(
       GitHub raw into a temp dir and exec ``/bin/bash <dir>/install.sh``.
       ``install.sh`` prefers on-disk siblings over fetching them from the
       ``cua.ai`` vanity CDN, so shipping all three keeps the install working
-      even when that host does not resolve.
+      even when that host does not resolve. Only ``install.sh`` and
+      ``_install-rust.sh`` are required; ``_install-common.sh`` is optional
+      upstream and its download failure only warns.
     * Windows       → ``powershell -NoProfile -ExecutionPolicy Bypass -Command
       "irm …/install.ps1 | iex"``.
 
@@ -1431,7 +1433,13 @@ def _run_cua_driver_installer(
             "https://raw.githubusercontent.com/trycua/cua/main/"
             "libs/cua-driver/scripts/"
         )
-        script_names = ("install.sh", "_install-rust.sh", "_install-common.sh")
+        # install.sh and _install-rust.sh are load-bearing — without them there
+        # is nothing to exec. _install-common.sh is optional by upstream's own
+        # contract: _install-rust.sh defines no-op stubs when it cannot load
+        # that sibling, so a failed fetch there is a warning, not an abort
+        # (review on #76861).
+        required_scripts = ("install.sh", "_install-rust.sh")
+        optional_scripts = ("_install-common.sh",)
         # One pasteable line: mktemp + three GitHub raw curls + bash install.sh.
         # Keep as a single logical command so failure/timeout print sites stay
         # one _print_info each.
@@ -1445,11 +1453,8 @@ def _run_cua_driver_installer(
         )
         script_dir = _tempfile.mkdtemp(prefix="cua-driver-install-")
 
-        def _download_failed(detail: str) -> None:
-            _print_warning(f"    cua-driver installer download failed: {detail}")
-            shutil.rmtree(script_dir, ignore_errors=True)
-
-        for name in script_names:
+        def _download(name: str) -> Optional[str]:
+            """Fetch one script; None on success, else a failure detail."""
             try:
                 dl = subprocess.run(
                     ["curl", "-fsSL", "-o", os.path.join(script_dir, name),
@@ -1457,11 +1462,33 @@ def _run_cua_driver_installer(
                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
                 )
             except (subprocess.TimeoutExpired, OSError) as e:
-                _download_failed(f"{name}: {e}")
-                return False
+                return f"{name}: {e}"
             if dl.returncode != 0:
-                _download_failed(f"{name}: {(dl.stderr or '').strip()[:200]}")
+                return f"{name}: {(dl.stderr or '').strip()[:200]}"
+            return None
+
+        for name in required_scripts:
+            detail = _download(name)
+            if detail:
+                _print_warning(f"    cua-driver installer download failed: {detail}")
+                shutil.rmtree(script_dir, ignore_errors=True)
                 return False
+        for name in optional_scripts:
+            detail = _download(name)
+            if detail:
+                # Drop any truncated/empty artifact: an unreadable sibling that
+                # still exists would source cleanly and skip the stubs.
+                try:
+                    os.remove(os.path.join(script_dir, name))
+                except OSError:
+                    pass
+                _print_warning(
+                    f"    cua-driver installer optional download failed: {detail}"
+                )
+                _print_info(
+                    "    Continuing — upstream defines no-op stubs when "
+                    f"{name} is absent."
+                )
         install_cmd = ["/bin/bash", os.path.join(script_dir, "install.sh")]
     use_shell = False
 
