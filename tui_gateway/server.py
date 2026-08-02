@@ -5083,7 +5083,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         )
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
-        "tui_startup_panel": bool(display_cfg.get("tui_startup_panel", True)),
+
         # Speculative compression observability for the TUI status bar:
         # None = feature off; "enabled" = armed; "installed" = a speculative
         # candidate was committed during this session.

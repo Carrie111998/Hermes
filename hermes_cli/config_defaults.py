@@ -569,8 +569,8 @@ DEFAULT_CONFIG = {
             "max_age_seconds": 180,
             "hard_wait_seconds": 2,
             "during_tool_wait": True,
-            # Reserved for a later idle scheduler; v1 deliberately ignores it.
-            "during_idle": False,
+            # Speculation currently overlaps only tool execution.
+
         },
         "progress_notices": False,    # opt-in (#52995): when True, routine compression
                                       # progress statuses (compacting/preflight/pre-API/
@@ -896,7 +896,7 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
-            "fallback_chain": [],  # ordered task-specific provider/model fallbacks
+
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
@@ -1115,9 +1115,7 @@ DEFAULT_CONFIG = {
         # Mirrors `hermes -c` muscle memory.  Default off so existing
         # users aren't surprised.  HERMES_TUI_RESUME=<id> always wins.
         "tui_auto_resume_recent": False,
-        # Show the TUI's startup banner and session/tool/skill summary panel.
-        # Set false for a clean transcript that starts directly at the composer.
-        "tui_startup_panel": True,
+
         # When true (default), `hermes --tui` drops a one-time hint
         # ("subagents working · /agents to watch live") the first time a turn
         # starts delegating, nudging the user toward the live spawn-tree

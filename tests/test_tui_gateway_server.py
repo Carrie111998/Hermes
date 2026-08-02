@@ -119,12 +119,7 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
-def test_session_info_respects_tui_startup_panel_config(monkeypatch):
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {"tui_startup_panel": False}})
-    assert server._session_info(None)["tui_startup_panel"] is False
 
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {}})
-    assert server._session_info(None)["tui_startup_panel"] is True
 
 
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
