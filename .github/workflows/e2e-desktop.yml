@@ -44,7 +44,7 @@ jobs:
 
       - name: grab npm 12
         run: |
-          npm i -g npm@12
+          npm i -g npm@12.0.2
 
       # Full npm ci (not --ignore-scripts): electron's postinstall
       # downloads the binary we launch, and node-pty's native build is

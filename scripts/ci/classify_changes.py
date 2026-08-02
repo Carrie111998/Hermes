@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Mapping
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
@@ -58,6 +59,7 @@ _PY_SKIP = ("docs/", "website/") + _FRONTEND
 # can't get push access — it runs on an ephemeral runner with zero write perms.
 _CI_REVIEW_FILES = {
     ".prettierrc",
+    "scripts/ci/classify_changes.py",
 }
 _CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
 
@@ -127,6 +129,34 @@ def ci_review_files(files: list[str]) -> list[str]:
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
 
 
+def compare_changed_paths(payload: object) -> list[str]:
+    """Extract exact current and renamed predecessor paths from GitHub compare JSON."""
+
+    pages = payload if isinstance(payload, list) else [payload]
+    paths: list[str] = []
+    for page in pages:
+        if not isinstance(page, Mapping):
+            raise ValueError("compare_file_payload_invalid")
+        files = page.get("files")
+        if files is None:
+            continue
+        if not isinstance(files, list):
+            raise ValueError("compare_file_payload_invalid")
+        for item in files:
+            if not isinstance(item, Mapping):
+                raise ValueError("compare_file_payload_invalid")
+            filename = item.get("filename")
+            if not isinstance(filename, str) or not filename:
+                raise ValueError("compare_file_payload_invalid")
+            paths.append(filename)
+            if item.get("status") == "renamed":
+                previous = item.get("previous_filename")
+                if not isinstance(previous, str) or not previous:
+                    raise ValueError("compare_file_payload_invalid")
+                paths.append(previous)
+    return paths
+
+
 def _is_owner_gate(p: str) -> bool:
     return p in _OWNER_GATE_FILES or p.startswith(_OWNER_GATE_PATHS)
 
@@ -165,6 +195,17 @@ def classify(files: list[str]) -> dict[str, bool]:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--extract-compare-paths"]:
+        try:
+            paths = compare_changed_paths(json.load(sys.stdin))
+        except (json.JSONDecodeError, ValueError):
+            print("compare_file_payload_invalid", file=sys.stderr)
+            return 2
+        print("\n".join(paths))
+        return 0
+    if sys.argv[1:]:
+        print("classify_changes_arguments_invalid", file=sys.stderr)
+        return 2
     files = sys.stdin.read().splitlines()
     lanes = classify(files)
     out = "\n".join([
