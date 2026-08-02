@@ -1,20 +1,20 @@
 ---
 name: workflow-engine
-description: "Use when running multi-agent DAG pipelines via workflow_start — fire-and-forget orchestration across agents."
-version: 4.0.0
-author: Hermes Agent
+description: "Use when running multi-agent DAG pipelines via workflow_start — fire-and-forget orchestration across agents. Covers review loops, template substitution, delivery routing, and workspace inheritance."
+version: 5.0.0
+author: Newton
 license: MIT
 metadata:
   hermes:
     tags: [workflow, pipeline, dag, kanban, orchestration, multi-agent]
-    related_skills: [kanban-notification-system, plan]
+    related_skills: [kanban-notification-system]
 ---
 
 # Workflow Engine
 
 ## Overview
 
-The workflow engine runs DAG-based pipelines — multi-step processes where nodes depend on each other and execute in parallel where possible. You call `workflow_start`, it creates kanban cards, and returns immediately. The kanban dispatcher picks up ready cards and spawns workers. When the workflow finishes, you get a notification with a summary.
+Run DAG-based pipelines via `workflow_start`. The engine creates kanban cards, returns immediately, and the kanban dispatcher handles execution. When the workflow finishes, you get a notification with a summary.
 
 Fire-and-forget. No monitoring loop. The engine does not block.
 
@@ -22,285 +22,114 @@ Fire-and-forget. No monitoring loop. The engine does not block.
 
 - Multi-step pipeline: research → spec → build → review → deliver
 - Parallel work across multiple agents with dependency ordering
-- Workflow that pauses for user input and resumes when unblocked
 - Sealed-envelope testing (implementer and tester work blind)
+- Review loops with fail → enrich → re-work cycles
 
 **Don't use for:** single tool calls, simple sequential tasks one agent can handle, or real-time mid-workflow interaction.
 
-## Quick Reference
+## How to Use
 
-| Action | Call |
-|--------|------|
-| List available pipelines | `workflow_list()` |
-| Show pipeline structure | `workflow_show(workflow="name")` |
-| Validate before running | `workflow_validate(workflow="name")` |
-| Start a pipeline | `workflow_start(workflow="name", context={...})` |
-| Check running status | `workflow_status(workflow="name")` |
+### Starting a Workflow
 
-## Starting a Workflow
-
-```python
+```
 workflow_start(
-    workflow="my-pipeline",
-    context={"topic": "Should we adopt X?"},
-    inputs={"detail_level": "deep"},
-    board="my-board",  # optional board override
+    workflow="implementation",
+    board="agent-service",
+    inputs={"issue_number": "346", "repo": "agent-service"},
     attachments={"grill_artifact": "/path/to/file.md"},
 )
 ```
 
-Returns immediately with `{"status": "dispatched"}`.
+**Parameters:**
+- `workflow` — pipeline name (matches YAML filename without .yaml)
+- `board` — kanban board name (optional, overrides YAML)
+- `inputs` — key-value dict available as `{inputs.key}` in node tasks
+- `attachments` — named file dict attached to cards (keys must match YAML declarations)
+- `delivery_target` — optional object for cron-triggered workflows (see below)
 
-The engine:
-1. Injects your session info (platform, chat_id, thread_id)
-2. Creates kanban cards for every node across all layers
-3. Subscribes the final-layer card(s) for notification
-4. Returns — the kanban dispatcher handles execution
+### Progressive Disclosure
 
-## User-Feedback Nodes
+1. `workflow_list()` — names + descriptions
+2. `workflow_show(workflow="ideation")` — structure, inputs, attachments, node descriptions
+3. `workflow_start(...)` — trigger
 
-When a node needs user input, the worker blocks the card. You get a notification:
+### Cron Delivery Routing
 
-> Kanban t_abc123 blocked: Needs user feedback — which option?
+Cron-triggered workflows have no Discord session context. Always pass `delivery_target`:
 
-Then:
-1. Surface the options to the user
-2. Get their input
-3. Call `kanban_unblock(card_id="t_abc123")`
-
-The workflow resumes from where it paused.
-
-## YAML Authoring
-
-### Structure
-
-```yaml
-name: my-workflow
-description: "Multi-step pipeline"
-
-trigger_events:
-  - workflow_dispatch
-
-roles:
-  researcher: agent-a
-  reviewer: agent-b
-
-nodes:
-  setup:
-    agent: "{researcher}"
-    task: >
-      Analyze the topic: "{topic}".
-    outputs:
-      - findings
-
-  review:
-    agent: "{reviewer}"
-    task: >
-      Read {setup.findings}. Synthesize a recommendation.
-    depends_on:
-      - setup
-    outputs:
-      - recommendation
 ```
-
-### Inputs
-
-Declare expected inputs for progressive disclosure:
-
-```yaml
-inputs:
-  - name: grill_artifact
-    required: true
-    description: "Path to the grill artifact file"
-  - name: topic
-    required: false
-    description: "Research topic"
-```
-
-`workflow_show` returns the inputs list so agents discover what parameters are needed before triggering.
-
-### Attachment Selection
-
-Workflows declare expected attachments with names. Nodes reference them by name:
-
-```yaml
-attachments:
-  - name: grill_artifact
-    required: true
-    description: "The enriched README"
-  - name: source_video
-    required: true
-    description: "Base video for splicing"
-
-nodes:
-  enrich-artifact:
-    attachment: grill_artifact
-  splice-video:
-    attachment: source_video
-```
-
-The caller passes named file paths:
-
-```python
 workflow_start(
-    workflow="my-workflow",
-    attachments={"grill_artifact": "/path/to/file.md", "source_video": "/path/to/video.mp4"}
+    workflow="implementation",
+    board="agent-service",
+    inputs={"issue_number": "346"},
+    delivery_target={
+        "platform": "discord",
+        "channel": "1500949529443303594",
+        "profile": "nikola"
+    },
 )
 ```
 
-If `attachment` is set, only that named file is attached. If omitted, all attachments are attached (first layer) or none (other layers).
+Without this, notifications go to Sherlock (default profile).
 
-### Node Fields
+### Review Nodes
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `agent` | Yes | Which agent executes this node. Supports `{role}` template. |
-| `task` | Yes | Instruction body. Supports `{upstream.output}` template variables. |
-| `depends_on` | No | Node IDs that must complete before this one starts. |
-| `outputs` | No | Named outputs — available as `{node-id.output-name}` downstream. |
-| `timeout_minutes` | No | Max runtime per node. Default: 10. |
-| `fallback_on_timeout` | No | `skip` \| `degraded` \| `fail` (default). |
-| `goal_max_turns` | No | Max agent turns. Default: 20. |
-| `when` | No | Conditional — node only runs when expression is true. |
-| `reviews` | No | Sequential review pipeline (see below). |
-
-### Template Variables
-
-Resolve from:
-1. Engine-injected: `{run_id}`, `{run_short_id}`, `{date}`
-2. Inputs: `{inputs.topic}`, `{inputs.pr_link}`
-3. Upstream outputs: `{setup.findings}`
-4. Node metadata: `{nodes.node-id.name}` (disambiguated name), `{nodes.node-id.card_id}` (kanban task ID)
-
-### Roles
-
-Map role names to agent profiles. Swap agents by editing one line:
-
-```yaml
-roles:
-  architect: agent-a
-  executor: agent-b
-nodes:
-  design:
-    agent: "{architect}"
-    task: "Analyze the proposal"
-```
-
-### DAG Patterns
-
-- **Linear chain:** A → B → C (each depends on the previous)
-- **Parallel layer:** Multiple nodes with the same `depends_on` run concurrently
-- **Diamond:** Two nodes depend on the same prior node, then converge
-- **Failure routing:** `fallback_on_timeout: skip` lets downstream proceed
-
-## Review Pipeline
-
-Nodes can declare a `reviews` attribute — a list of node IDs that review their output.
-
-```yaml
-nodes:
-  implement:
-    agent: "{coder}"
-    task: >
-      Implement the feature. Commit to your worktree branch.
-      Do NOT open a PR. When done, block this card with
-      reason "pending review".
-    reviews:
-      - verify
-```
-
-### How it works
-
-1. Creator blocks card with `"pending review"` when done
-2. Supervisor detects the block → dispatches the first reviewer
-3. Reviewer always completes (marks done) — pass or fail is in the result
-4. Engine reads the result to determine pass vs fail
-5. Pass → marks creator done → workflow advances
-6. Fail → enriches creator with feedback → resets to ready → creator re-works
-
-### Reviewer instructions
-
-Reviewers always complete the card — never block for pass/fail:
+Reviewers always complete the card — never block. Pass/fail is in the result summary:
 
 ```yaml
 qa-verify:
   agent: "{qa}"
   task: >
-    Run the tests. If all pass, complete this card with a summary
-    that includes the results. If any fail, complete this card
-    with a summary that includes the failure details.
+    Run the tests. Complete this card with a summary.
+    - If pass → include test results
+    - If fail → include failure details
 
-    Do NOT block this card. Always complete it with pass/fail
-    in the summary.
+    Do NOT block this card. Always complete it with pass/fail.
 ```
 
-The engine detects pass/fail from the result content (checks for markers like "fail", "failure", "error", "blocked").
+The engine auto-injects a context header telling the reviewer which node it's reviewing and the card ID. YAML doesn't need to explain how to find the work.
 
-### Block reason convention
+### Review Workspace Inheritance
+
+Default: reviewer runs in scratch (blind review). Set `inherit_workspace: true` to start in the same project directory:
+
+```yaml
+  qa-review:
+    inherit_workspace: true  # reviewer sees the spec author's files
+```
+
+Use `true` for read-only reviews where the reviewer needs the actual files.
+
+### Block Reason Convention
 
 - `"pending review"` — triggers the review pipeline
-- Any other block reason — treated as an unrelated failure (credential issue, push failure, etc.)
+- Any other block reason — treated as unrelated failure
 
-### Sequential reviews
+Workers default to `kanban_block`. YAML must explicitly say "call kanban_complete with a summary" when the worker should complete.
 
-Multiple reviewers run in order:
+## Template Variables
 
-```yaml
-reviews:
-  - qa-review
-  - security-review
-```
-
-When qa-review passes, security-review is dispatched. If any reviewer fails, the creator is enriched with feedback and reset to ready.
-
-### Retry limits
-
-Reviews have configurable retry limits with precedence (highest to lowest):
-
-1. **Per-review**: `{review: "qa-review", max_retries: 5}`
-2. **Node-level**: `max_retries: 3` on the node under review
-3. **Workflow-level**: `max_retries: 5` in YAML
-4. **Env var**: `HERMES_WORKFLOW_MAX_RETRIES`
-5. **Engine default**: 3
-
-```yaml
-nodes:
-  spec-author:
-    max_retries: 5
-    reviews:
-      - qa-review
-      - {review: security-review, max_retries: 2}
-```
-
-When the limit is hit, the reviewer is not dispatched and the node stays blocked.
-
-## Dry-Run Mode
-
-```python
-workflow_start(workflow="name", dry_run=True)
-```
-
-Shows the execution plan without creating any cards.
-
-## Resume from Saved State
-
-```python
-workflow_start(workflow="name", resume=True, node="specific-node")
-```
-
-Reuses saved state. Skips completed nodes.
+| Template | Resolves to |
+|---|---|
+| `{inputs.key}` | Input value |
+| `{nodes.node-id.card_id}` | Kanban task ID (for cross-referencing) |
+| `{nodes.node-id.name}` | Node ID + short run ID |
+| `{run_id}` | Full run ID |
+| `{run_short_id}` | Time-only portion |
+| `{date}` | Current date |
 
 ## Common Pitfalls
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "workflow not found" error | Pipeline YAML missing or `HERMES_FLEET_PIPELINES` not set | Check `workflow_list()` shows it |
-| No notification arrives | Session info not injected (CLI/cron path) | Call from a gateway session |
-| Node stuck "running" | Kanban dispatcher polls wrong board | Verify card is on expected board |
-| Template substitution failure | Missing key in context dict | Ensure all `{placeholders}` are in context |
-| Card auto-blocked "heartbeat stale" | Handled automatically in fire-and-forget mode | No action needed |
-| Review not triggered | Block reason doesn't start with "pending review" | Use exact phrase "pending review" |
-| Review loops hit triage | Reviewer blocked instead of completing | Reviewers must always complete (done), not block |
+| No notification arrives | Cron without `delivery_target` | Pass `delivery_target` with explicit `profile` |
+| Notification goes to Sherlock | `profile` is None | Pass `delivery_target` with `profile` |
+| Unknown input rejected | Input not declared in YAML | Add to YAML `inputs:` or use top-level param |
+| Review not triggered | Block reason ≠ "pending review" | Use exact phrase "pending review" |
+| Review loops hit triage | Reviewer blocked instead of completing | Reviewers must always complete (done) |
+| Cards default to scratch | Board has no `default_workdir` | Set `default_workdir` in `board.json` |
+| Body prefix not injected | Gateway running stale bytecode | Delete `.pyc` files, restart gateway |
+| Template unresolved | Missing key in context/inputs | Ensure all `{placeholders}` are declared |
 
 ## Verification Checklist
 
@@ -308,4 +137,6 @@ Reuses saved state. Skips completed nodes.
 - [ ] Pipeline validates: `workflow_validate(workflow="name")` returns valid
 - [ ] All required inputs provided
 - [ ] `workflow_start` returns `{"status": "dispatched"}`
+- [ ] Cron workflows have `delivery_target` with explicit `profile`
+- [ ] Review nodes say "call kanban_complete" (not kanban_block)
 - [ ] Final node completion triggers notification in your session
