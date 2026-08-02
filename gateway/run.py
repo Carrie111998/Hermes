@@ -1675,18 +1675,6 @@ def _clear_planned_restart_notification() -> None:
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
 
-# A gateway is never a delegate_task child, even when the process that
-# spawned it was one (e.g. a desktop session launched from a subagent, or
-# a terminal session that inherited the marker from a delegated context).
-# HERMES_DELEGATED_CHILD_CONTEXT is a lineage marker for subagent
-# subprocesses; inherited here it makes the kanban dispatcher's own
-# connect()/migration write_txn fail with "delegate_task child contexts
-# cannot mutate Kanban tasks or boards" on every tick. The gateway IS the
-# trusted dispatcher host, so strip the stale marker. The in-process
-# ContextVar guard still protects real delegated children (that signal is
-# per-execution-context and never survives a process boundary).
-os.environ.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
-
 _ensure_ssl_certs()
 
 # Add parent directory to path
