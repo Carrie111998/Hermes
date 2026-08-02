@@ -840,6 +840,7 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    _profile_db_resolved: bool = False,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -855,11 +856,27 @@ def session_search(
     if db is None:
         try:
             from hermes_state import SessionDB
-            db = SessionDB()
+            owned_db = SessionDB()
         except Exception:
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
+        try:
+            return session_search(
+                query=query,
+                role_filter=role_filter,
+                limit=limit,
+                db=owned_db,
+                current_session_id=current_session_id,
+                session_id=session_id,
+                around_message_id=around_message_id,
+                window=window,
+                sort=sort,
+                profile=profile,
+                _profile_db_resolved=_profile_db_resolved,
+            )
+        finally:
+            owned_db.close()
 
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
@@ -876,14 +893,28 @@ def session_search(
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
-    if profile is not None and str(profile).strip():
+    if profile is not None and str(profile).strip() and not _profile_db_resolved:
         try:
             profile_db = _resolve_profile_db(profile)
         except Exception as e:
             return tool_error(f"profile '{profile}': {e}", success=False)
         if profile_db is not None:
-            db = profile_db
-            current_session_id = None
+            try:
+                return session_search(
+                    query=query,
+                    role_filter=role_filter,
+                    limit=limit,
+                    db=profile_db,
+                    current_session_id="",
+                    session_id=session_id,
+                    around_message_id=around_message_id,
+                    window=window,
+                    sort=sort,
+                    profile=profile,
+                    _profile_db_resolved=True,
+                )
+            finally:
+                profile_db.close()
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:

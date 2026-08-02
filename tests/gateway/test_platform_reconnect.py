@@ -215,7 +215,10 @@ class TestPlatformReconnectWatcher:
         )
 
     @pytest.mark.asyncio
-    async def test_reconnect_retries_resume_pending_for_platform(self):
+    @pytest.mark.parametrize("redelivery_disconnects", [False, True])
+    async def test_reconnect_retries_resume_pending_for_platform(
+        self, redelivery_disconnects
+    ):
         """A successful reconnect retries the startup auto-resume scoped to
         that platform.
 
@@ -227,6 +230,12 @@ class TestPlatformReconnectWatcher:
         """
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
+        async def redeliver(**_kwargs):
+            if redelivery_disconnects:
+                runner.adapters.pop(Platform.TELEGRAM, None)
+            return 1
+
+        runner._redeliver_pending_obligations = AsyncMock(side_effect=redeliver)
         runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
 
         platform_config = PlatformConfig(enabled=True, token="test")
@@ -257,10 +266,17 @@ class TestPlatformReconnectWatcher:
 
                 await run_one_iteration()
 
-        assert Platform.TELEGRAM in runner.adapters
-        runner._schedule_resume_pending_sessions.assert_called_once_with(
-            platform=Platform.TELEGRAM
+        runner._redeliver_pending_obligations.assert_awaited_once_with(
+            platform=Platform.TELEGRAM,
         )
+        if redelivery_disconnects:
+            assert Platform.TELEGRAM not in runner.adapters
+            runner._schedule_resume_pending_sessions.assert_not_called()
+        else:
+            assert Platform.TELEGRAM in runner.adapters
+            runner._schedule_resume_pending_sessions.assert_called_once_with(
+                platform=Platform.TELEGRAM,
+            )
 
 
     @pytest.mark.asyncio

@@ -96,6 +96,50 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "failed"
 
+    @pytest.mark.asyncio
+    async def test_dns_send_failure_promotes_adapter_to_reconnect(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error=(
+                    "ClientConnectorDNSError: Cannot connect to host discord.com:443 "
+                    "[nodename nor servname provided, or not known]"
+                ),
+            )
+        )
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await _run(adapter, _event())
+
+        assert adapter.has_fatal_error
+        assert adapter.fatal_error_retryable
+        fatal_handler.assert_awaited_once_with(adapter)
+        claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
+        assert len(claimed) == 1
+
+    @pytest.mark.asyncio
+    async def test_retryable_rate_limit_does_not_reconnect(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="rate_limited",
+                retryable=True,
+            )
+        )
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await _run(adapter, _event())
+
+        assert not adapter.has_fatal_error
+        fatal_handler.assert_not_awaited()
+        assert dl.sweep_recoverable(deliverable_platforms={"slack"}) == []
+
 
     @pytest.mark.asyncio
     async def test_crash_between_attempting_and_ack_is_recoverable(self):

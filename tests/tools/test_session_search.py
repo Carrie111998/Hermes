@@ -29,6 +29,45 @@ def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
 
 
+class TestOwnedDbCleanup:
+    @staticmethod
+    def _track_close(monkeypatch, db):
+        closed = []
+        close = db.close
+
+        def tracked_close():
+            closed.append(True)
+            close()
+
+        monkeypatch.setattr(db, "close", tracked_close)
+        return closed
+
+    def test_closes_default_db_it_opens(self, tmp_path, monkeypatch):
+        owned = SessionDB(tmp_path / "owned.db")
+        owned.create_session("owned", source="cli")
+        closed = self._track_close(monkeypatch, owned)
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: owned)
+
+        result = json.loads(session_search())
+
+        assert result["success"] is True
+        assert closed == [True]
+
+    def test_closes_profile_db_but_not_injected_db(self, db, tmp_path, monkeypatch):
+        owned = SessionDB(tmp_path / "profile.db", read_only=False)
+        owned.create_session("profile", source="cli")
+        closed = self._track_close(monkeypatch, owned)
+        monkeypatch.setattr(
+            "tools.session_search_tool._resolve_profile_db", lambda _profile: owned
+        )
+
+        result = json.loads(session_search(db=db, profile="other"))
+
+        assert result["success"] is True
+        assert closed == [True]
+        assert db._conn.execute("SELECT 1").fetchone()[0] == 1
+
+
 def _seed_modpack_sessions(db):
     """Create three sessions about a modpack so FTS5 has hits to dedupe."""
     now = int(time.time())

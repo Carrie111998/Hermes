@@ -2509,6 +2509,11 @@ _RETRYABLE_ERROR_PATTERNS = (
     "connectionreset",
     "connectionrefused",
     "connecttimeout",
+    "cannot connect to host",
+    "nodename nor servname",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "getaddrinfo failed",
     "network",
     "broken pipe",
     "remotedisconnected",
@@ -4959,6 +4964,20 @@ class BasePlatformAdapter(ABC):
         return any(pat in lowered for pat in _RETRYABLE_ERROR_PATTERNS)
 
     @staticmethod
+    def _is_reconnectable_delivery_failure(result: "SendResult") -> bool:
+        """Return True only for transport failures a reconnect can repair."""
+        error = str(getattr(result, "error", "") or "")
+        return BasePlatformAdapter._is_retryable_error(error)
+
+    async def _promote_retryable_delivery_failure(self, result: "SendResult") -> None:
+        """Move an exhausted network send onto the existing reconnect path."""
+        error = str(getattr(result, "error", "") or "")
+        if not self._is_reconnectable_delivery_failure(result):
+            return
+        self._set_fatal_error("outbound_network_error", error, retryable=True)
+        await self._notify_fatal_error()
+
+    @staticmethod
     def _is_timeout_error(error: Optional[str]) -> bool:
         """Return True if the error string indicates a read/write timeout.
 
@@ -6088,11 +6107,17 @@ class BasePlatformAdapter(ABC):
                                 mark_failed(
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
+                                    recoverable=(
+                                        delivery_adapter
+                                        ._is_reconnectable_delivery_failure(result)
+                                    ),
                                 )
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
                             )
+                    if not getattr(result, "success", False):
+                        await delivery_adapter._promote_retryable_delivery_failure(result)
 
                     # Schedule auto-deletion on the adapter that owns the new
                     # message ID, which may be the reconnect replacement.

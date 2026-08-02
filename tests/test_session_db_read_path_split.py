@@ -44,6 +44,37 @@ def test_read_conn_reused_within_thread(db):
 
 
 @pytest.mark.requires_wal
+def test_dead_thread_read_connections_are_reused(db):
+    conns = []
+    ready = threading.Barrier(7)
+    release = threading.Event()
+
+    def grab():
+        conns.append(db._get_read_conn())
+        ready.wait()
+        release.wait()
+
+    threads = [threading.Thread(target=grab) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    try:
+        ready.wait(timeout=5)
+        assert all(conn is not None for conn in conns)
+        assert len(db._read_conns) == 6
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join()
+
+    assert db.get_session("s1")["id"] == "s1"
+
+    assert len(db._read_conns) == 6
+    assert db._get_read_conn() in conns
+    for conn in conns:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+@pytest.mark.requires_wal
 def test_reads_do_not_take_writer_lock(db):
     """Reads must complete while another thread holds self._lock."""
     acquired = db._lock.acquire()
