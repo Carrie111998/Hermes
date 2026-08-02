@@ -6,7 +6,7 @@ Based on PR #1085 by ismoilh (salvaged).
 import json
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -512,6 +512,137 @@ class TestCheckSensitivePathWindowsHostSemantics:
         assert "error" in result
         assert "sensitive" in result["error"].lower()
         mock_get.assert_not_called()
+
+    _WIN_HERMES_CONFIG = r"C:\Users\test\.hermes\config.yaml"
+    _WIN_HERMES_CONFIG_MIXED = r"C:\Users\test\.HERMES\CONFIG.YAML"
+    _WIN_HERMES_CONFIG_TRAILING = r"C:\Users\test\.hermes\config.yaml."
+    _WIN_HERMES_NEARBY_SAFE = r"C:\Users\test\.hermes\notes.yaml"
+
+    def _patch_windows_hermes_config(self, monkeypatch, mod, config_path=None):
+        config_path = config_path or self._WIN_HERMES_CONFIG
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+        monkeypatch.setattr(mod, "_hermes_config_resolved", config_path)
+        monkeypatch.setattr(mod, "_hermes_config_resolved_loaded", True)
+
+    def test_hermes_config_canonical_blocked_on_windows_local(self, monkeypatch):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        assert mod._check_sensitive_path(self._WIN_HERMES_CONFIG) is not None
+
+    def test_hermes_config_mixed_case_alias_blocked_on_windows_local(self, monkeypatch):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        err = mod._check_sensitive_path(self._WIN_HERMES_CONFIG_MIXED)
+        assert err is not None
+        assert "Hermes config" in err
+
+    def test_hermes_config_trailing_dot_alias_blocked_on_windows_local(self, monkeypatch):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        err = mod._check_sensitive_path(self._WIN_HERMES_CONFIG_TRAILING)
+        assert err is not None
+        assert "Hermes config" in err
+
+    def test_hermes_config_nearby_safe_path_still_allowed(self, monkeypatch):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        assert mod._check_sensitive_path(self._WIN_HERMES_NEARBY_SAFE) is None
+
+    def test_hermes_config_aliases_not_blocked_on_posix_or_container(self, monkeypatch):
+        """POSIX/container sinks stay case-sensitive for the config identity check."""
+        from tools import file_tools as mod
+
+        hermes = "/home/user/.hermes/config.yaml"
+        monkeypatch.setattr(mod, "_hermes_config_resolved", hermes)
+        monkeypatch.setattr(mod, "_hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            mod,
+            "_resolve_path_for_task",
+            lambda filepath, task_id="default": Path(filepath),
+        )
+        monkeypatch.setattr(mod.os.path, "normpath", lambda path: path)
+
+        monkeypatch.setattr(mod.sys, "platform", "linux")
+        monkeypatch.setattr(
+            mod, "_terminal_env_type_for_task", lambda task_id="default": "docker"
+        )
+        assert mod._check_sensitive_path(hermes) is not None
+        assert mod._check_sensitive_path("/home/user/.HERMES/config.yaml") is None
+        assert mod._check_sensitive_path("/home/user/.hermes/config.yaml.") is None
+
+        monkeypatch.setattr(mod.sys, "platform", "win32")
+        monkeypatch.setattr(
+            mod, "_terminal_env_type_for_task", lambda task_id="default": "docker"
+        )
+        assert mod._check_sensitive_path("/home/user/.HERMES/config.yaml") is None
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_blocks_hermes_config_alias_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        result = json.loads(
+            mod.write_file_tool(self._WIN_HERMES_CONFIG_MIXED, "approvals:\n  mode: off\n")
+        )
+        assert "error" in result
+        assert "Hermes config" in result["error"]
+        mock_get.assert_not_called()
+
+        result = json.loads(
+            mod.write_file_tool(self._WIN_HERMES_CONFIG_TRAILING, "approvals:\n  mode: off\n")
+        )
+        assert "error" in result
+        assert "Hermes config" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_allows_nearby_safe_path_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "status": "ok",
+            "path": self._WIN_HERMES_NEARBY_SAFE,
+            "bytes": 5,
+        }
+        mock_ops.write_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        result = json.loads(mod.write_file_tool(self._WIN_HERMES_NEARBY_SAFE, "hello"))
+        assert result["status"] == "ok"
+        mock_get.assert_called_once()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_patch_blocks_hermes_config_alias_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_hermes_config(monkeypatch, mod)
+        for path in (self._WIN_HERMES_CONFIG_MIXED, self._WIN_HERMES_CONFIG_TRAILING):
+            patch_text = (
+                "*** Begin Patch\n"
+                f"*** Update File: {path}\n"
+                "@@ @@\n"
+                "-old\n"
+                "+approvals:\n"
+                "+  mode: off\n"
+                "*** End Patch\n"
+            )
+            result = json.loads(mod.patch_tool(mode="patch", patch=patch_text))
+            assert "error" in result
+            assert "hermes config" in result["error"].lower()
+            mock_get.assert_not_called()
 
 
 class TestAtomicWrite:

@@ -742,14 +742,17 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
+    # this file. Reuse the same Windows-local alias canonicalization as the
+    # POSIX denylist so mixed-case / trailing-dot spellings cannot bypass.
     hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
+    if hermes_config:
+        hermes_key = _posix_form_for_sensitive_check(hermes_config, casefold=casefold)
+        if resolved_posix == hermes_key or normalized_posix == hermes_key:
+            return (
+                f"Refusing to write to Hermes config file: {filepath}\n"
+                "Agent cannot modify security-sensitive configuration. "
+                "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+            )
     return None
 
 
