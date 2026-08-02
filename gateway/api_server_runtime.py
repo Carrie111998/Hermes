@@ -94,6 +94,31 @@ _UNBOUNDED_TOOL_WAIT_CAP_SECONDS = 3600.0
 _SESSION_SWEEP_INTERVAL_SECONDS = 60.0
 _FINISHED_SESSION_TTL_SECONDS = 120.0
 
+_FAILURE_REASON_CODES = {
+    "content_policy_blocked": "content_policy_blocked",
+    "timeout": "provider_timeout",
+    "overloaded": "provider_unavailable",
+    "rate_limit": "provider_unavailable",
+    "server_error": "provider_unavailable",
+}
+
+
+def _runtime_failure_code(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "runtime_unavailable"
+    if result.get("turn_exit_reason") in {
+        "empty_response_exhausted",
+        "all_retries_exhausted_no_response",
+    }:
+        return "provider_empty_stream"
+    reason = str(result.get("failure_reason") or "").strip().lower()
+    if reason in _FAILURE_REASON_CODES:
+        return _FAILURE_REASON_CODES[reason]
+    error = str(result.get("error") or "").strip().lower()
+    if error.startswith("content_policy_blocked:"):
+        return "content_policy_blocked"
+    return "runtime_unavailable"
+
 _RUNTIME_GATE_LOCK = threading.Lock()
 _RUNTIME_EXECUTOR: ThreadPoolExecutor | None = None
 _ACTIVE_RUN_COUNT = 0
@@ -1484,7 +1509,19 @@ class APIServerRuntimeMixin:
             )
             text = str((result or {}).get("final_response") or "")
             session.emit("usage", usage or {})
-            session.emit("completed", {"finish_reason": "stop", "text": text})
+            failed = isinstance(result, dict) and (
+                bool(result.get("failed")) or result.get("completed") is False
+            )
+            if failed:
+                session.emit(
+                    "error",
+                    runtime_error_envelope(
+                        _runtime_failure_code(result),
+                        support_id=run_id,
+                    ),
+                )
+            else:
+                session.emit("completed", {"finish_reason": "stop", "text": text})
         except asyncio.CancelledError:
             # aiohttp cancels the handler when the orchestrator disconnects;
             # the agent may keep running on its executor thread unless told

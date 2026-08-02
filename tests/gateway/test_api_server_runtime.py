@@ -27,6 +27,7 @@ from gateway.api_server_runtime import (
     _pin_run_model,
     _resume_runtime_history,
     _runtime_attachment_parts,
+    _runtime_failure_code,
     _runtime_allowed_skill_digests,
     _runtime_image_paths,
     _runtime_allowed_skill_names,
@@ -2093,6 +2094,60 @@ async def test_runtime_run_pins_one_hour_prompt_cache_ttl():
         events = [json.loads(line) async for line in response.content]
         assert events[-1]["type"] == "completed"
         assert events[-1]["payload"]["text"] == "done"
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"failed": True, "failure_reason": "timeout"}, "provider_timeout"),
+        ({"failed": True, "turn_exit_reason": "empty_response_exhausted"}, "provider_empty_stream"),
+        ({"failed": True, "error": "content_policy_blocked: rejected"}, "content_policy_blocked"),
+        ({"failed": True, "error": "private downstream detail"}, "runtime_unavailable"),
+    ],
+)
+def test_runtime_failure_code_projects_only_stable_safe_codes(result, expected):
+    assert _runtime_failure_code(result) == expected
+
+
+@pytest.mark.asyncio
+async def test_runtime_failed_agent_result_emits_error_without_completed():
+    class FailedAdapter(APIServerRuntimeMixin):
+        def _check_auth(self, _request):
+            return None
+
+        async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(tools=[], valid_tool_names=set(), model="configured-model")
+            kwargs["agent_configurator"](agent)
+            return {
+                "final_response": "must not be delivered as success",
+                "completed": False,
+                "failed": True,
+                "turn_exit_reason": "empty_response_exhausted",
+                "error": "private provider response",
+            }, {"total_tokens": 3}
+
+    adapter = FailedAdapter()
+    app = web.Application()
+    app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/runtime/runs", json=_run_body("run_failed_result"))
+        assert response.status == 200
+        events = [json.loads(line) async for line in response.content]
+        assert [event["type"] for event in events][-2:] == ["usage", "error"]
+        assert not any(event["type"] == "completed" for event in events)
+        assert events[-1]["payload"] == {
+            "code": "provider_empty_stream",
+            "message": "The creation service returned no output.",
+            "retryable": True,
+            "reason": "provider_empty_stream",
+            "source": "runtime",
+            "support_id": "run_failed_result",
+        }
+        assert "private provider response" not in json.dumps(events)
     finally:
         await client.close()
 
