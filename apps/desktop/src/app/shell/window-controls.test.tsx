@@ -2,9 +2,9 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { act } from 'react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
+import type { HermesConnection } from '@/global'
 import { I18nProvider } from '@/i18n'
 import { setConnection } from '@/store/session'
-import type { HermesConnection } from '@/global'
 
 import { WindowControls } from './window-controls'
 
@@ -123,6 +123,7 @@ describe('WindowControls (app-drawn window chrome)', () => {
       windowControls: { minimize: vi.fn(), toggleMaximize: vi.fn(), close: vi.fn() },
       onWindowStateChanged: (callback: (state: { isMaximized?: boolean }) => void) => {
         onState = callback
+
         return () => undefined
       }
     })

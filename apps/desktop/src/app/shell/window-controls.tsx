@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { cn } from '@/lib/utils'
 import { $connection } from '@/store/session'
 
 import { titlebarButtonClass } from './titlebar'
@@ -85,6 +86,17 @@ export function WindowControls() {
 
   const controls = window.hermesDesktop?.windowControls
 
+  // Chrome-band button styling: icons follow --titlebar-foreground, hovers
+  // follow the chrome hover tokens (falling back to the default palette via
+  // context.tsx). Close keeps a destructive hover so it reads as dangerous
+  // even on a busy band.
+  const controlButtonClass = cn(
+    titlebarButtonClass,
+    'text-(--titlebar-foreground) hover:text-(--titlebar-foreground) hover:bg-(--titlebar-control-hover)'
+  )
+
+  const closeButtonClass = cn(controlButtonClass, 'hover:bg-(--titlebar-control-close-hover) hover:text-white')
+
   return (
     <div
       aria-label={t.shell.windowControls}
@@ -93,7 +105,7 @@ export function WindowControls() {
       <Tip label={t.shell.windowButtons.minimize}>
         <Button
           aria-label={t.shell.windowButtons.minimize}
-          className={titlebarButtonClass}
+          className={controlButtonClass}
           onClick={() => controls?.minimize()}
           onPointerDown={event => event.stopPropagation()}
           size="icon-titlebar"
@@ -106,7 +118,7 @@ export function WindowControls() {
       <Tip label={isMaximized ? t.shell.windowButtons.restore : t.shell.windowButtons.maximize}>
         <Button
           aria-label={isMaximized ? t.shell.windowButtons.restore : t.shell.windowButtons.maximize}
-          className={titlebarButtonClass}
+          className={controlButtonClass}
           onClick={() => controls?.toggleMaximize()}
           onPointerDown={event => event.stopPropagation()}
           size="icon-titlebar"
@@ -119,7 +131,7 @@ export function WindowControls() {
       <Tip label={t.shell.windowButtons.close}>
         <Button
           aria-label={t.shell.windowButtons.close}
-          className={titlebarButtonClass}
+          className={closeButtonClass}
           onClick={() => controls?.close()}
           onPointerDown={event => event.stopPropagation()}
           size="icon-titlebar"
