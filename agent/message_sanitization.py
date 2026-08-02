@@ -280,6 +280,25 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+def parse_tool_arguments(raw_arguments: Any) -> tuple[dict, str | None]:
+    """Parse model-emitted arguments as the JSON object tools require."""
+    try:
+        arguments = json.loads(raw_arguments)
+    except (json.JSONDecodeError, TypeError):
+        arguments = None
+    if isinstance(arguments, dict):
+        return arguments, None
+    return {}, json.dumps(
+        {
+            "error": "Invalid tool arguments",
+            "message": (
+                "Tool arguments must be a valid JSON object; tool was not executed."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
     """Append a synthetic assistant turn when an interrupted tail is a tool result.
 
@@ -470,6 +489,7 @@ __all__ = [
     "_sanitize_messages_surrogates",
     "_escape_invalid_chars_in_json_strings",
     "_repair_tool_call_arguments",
+    "parse_tool_arguments",
     "_strip_non_ascii",
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",

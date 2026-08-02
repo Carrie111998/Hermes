@@ -2792,6 +2792,90 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '{"name":"hindsight_recall","arguments":{"query":"unfinished',
+            '{"name":"hindsight_recall","arguments":{"query":"say "hello""}}',
+        ],
+        ids=["truncated-deferred-call", "unescaped-quotes"],
+    )
+    def test_malformed_tool_call_emits_one_error_result_without_dispatch(
+        self, agent, arguments,
+    ):
+        """Malformed calls become one model-visible parse error immediately."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("tool_call")
+        tc = _mock_tool_call(name="tool_call", arguments=arguments, call_id="bad-call")
+        malformed = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        recovered = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [malformed, recovered]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="must not run") as dispatch,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("recall something")
+
+        assert result["final_response"] == "Recovered"
+        assert result["api_calls"] == 2
+        dispatch.assert_not_called()
+        second_request = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        error_results = [
+            message for message in second_request
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == "bad-call"
+        ]
+        assert len(error_results) == 1
+        assert "Invalid JSON arguments" in error_results[0]["content"]
+        assert "Please retry with valid JSON" in error_results[0]["content"]
+
+    def test_second_consecutive_malformed_tool_call_returns_closed_partial(
+        self, agent,
+    ):
+        """Only one regeneration opportunity is allowed per malformed streak."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("tool_call")
+        first = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(
+                name="tool_call", arguments='{"name":"one"', call_id="bad-1",
+            )],
+        )
+        second = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(
+                name="tool_call", arguments='{"name":"two"', call_id="bad-2",
+            )],
+        )
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="must not run") as dispatch,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("recall something")
+
+        assert result["partial"] is True
+        assert result["completed"] is False
+        assert result["api_calls"] == 2
+        dispatch.assert_not_called()
+        assert result["messages"][-1]["role"] == "assistant"
+        assert "invalid json" in result["messages"][-1]["content"].lower()
+        assert [
+            message["tool_call_id"]
+            for message in result["messages"]
+            if message.get("role") == "tool"
+        ] == ["bad-1", "bad-2"]
+
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
@@ -3811,8 +3895,8 @@ class TestRunConversation:
         assert result["final_response"] == "Done!"
 
 
-    def test_truncated_tool_json_after_tool_batch_closes_tool_tail(self, agent):
-        """finish_reason=tool_calls + truncated args after a real tool must close tool→user."""
+    def test_truncated_tool_json_after_tool_batch_requests_regeneration(self, agent):
+        """A malformed call after a real tool receives one paired parse error."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         good_tc = _mock_tool_call(
@@ -3831,21 +3915,34 @@ class TestRunConversation:
         bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.side_effect = [good_resp, bad_resp]
+        recovered_resp = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            good_resp, bad_resp, recovered_resp,
+        ]
 
         with (
-            patch("run_agent.handle_function_call", return_value='{"success":true}'),
+            patch(
+                "run_agent.handle_function_call",
+                return_value='{"success":true}',
+            ) as dispatch,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("write then truncate")
 
-        assert result.get("partial") is True
+        assert result["final_response"] == "Recovered"
+        assert dispatch.call_count == 1
         msgs = result.get("messages") or []
         assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
-        assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
+        malformed_results = [
+            message for message in msgs
+            if isinstance(message, dict)
+            and message.get("role") == "tool"
+            and message.get("tool_call_id") == "c_bad"
+        ]
+        assert len(malformed_results) == 1
+        assert "tool was not executed" in malformed_results[0]["content"].lower()
 
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
@@ -5804,5 +5901,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
-

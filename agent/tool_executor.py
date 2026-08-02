@@ -32,6 +32,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.message_sanitization import parse_tool_arguments
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -96,25 +97,6 @@ _MAX_TOOL_WORKERS = 8
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
-
-
-def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
-    try:
-        arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
-        arguments = None
-    if isinstance(arguments, dict):
-        return arguments, None
-    return {}, json.dumps(
-        {
-            "error": "Invalid tool arguments",
-            "message": (
-                "Tool arguments must be a valid JSON object; tool was not executed."
-            ),
-        },
-        ensure_ascii=False,
-    )
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -667,7 +649,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
-        function_args, malformed_args_result = _parse_tool_arguments(
+        function_args, malformed_args_result = parse_tool_arguments(
             tool_call.function.arguments
         )
 
@@ -1369,7 +1351,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         function_name = tool_call.function.name
 
-        function_args, malformed_args_result = _parse_tool_arguments(
+        function_args, malformed_args_result = parse_tool_arguments(
             tool_call.function.arguments
         )
         if malformed_args_result is not None:

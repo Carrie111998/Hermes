@@ -49,6 +49,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
+    parse_tool_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
     _sanitize_structure_non_ascii,
@@ -2457,7 +2458,7 @@ def run_conversation(
                     else:
                         interrupted = True
                     break
-                
+
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool
@@ -5996,9 +5997,8 @@ def run_conversation(
                     if not args or not args.strip():
                         tc.function.arguments = "{}"
                         continue
-                    try:
-                        json.loads(args)
-                    except json.JSONDecodeError as e:
+                    _parsed_args, parse_error = parse_tool_arguments(args)
+                    if parse_error is not None:
                         if (
                             _mixed_invalid_batch
                             and tc.function.name not in agent.valid_tool_names
@@ -6007,83 +6007,63 @@ def run_conversation(
                             # invalid-name error result below. Don't let its
                             # broken args trigger the whole-turn JSON retry.
                             continue
-                        invalid_json_args.append((tc.function.name, str(e)))
+                        invalid_json_args.append((tc, parse_error))
                 
                 if invalid_json_args:
-                    # Check if the invalid JSON is due to truncation rather
-                    # than a model formatting mistake.  Routers sometimes
-                    # rewrite finish_reason from "length" to "tool_calls",
-                    # hiding the truncation from the length handler above.
-                    # Detect truncation: args that don't end with } or ]
-                    # (after stripping whitespace) are cut off mid-stream.
-                    _truncated = any(
-                        not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
-                        for tc in assistant_message.tool_calls
-                        if tc.function.name in {n for n, _ in invalid_json_args}
+                    # Preserve the assistant/tool-call pairing and give the
+                    # model one deterministic, model-visible parse error per
+                    # call ID. Retrying the same response without feedback
+                    # just replays deterministic providers; coercing malformed
+                    # arguments to {} risks invoking a tool with invented
+                    # intent. No malformed call reaches the executor here.
+                    invalid_by_id = {
+                        tc.id: error for tc, error in invalid_json_args
+                    }
+                    first_tc, error_msg = invalid_json_args[0]
+                    tool_name = first_tc.function.name
+                    agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
+                    agent._buffer_vprint("⚠️  Injecting recovery tool results for invalid JSON...")
+                    agent._invalid_json_retries += 1
+
+                    recovery_assistant = agent._build_assistant_message(
+                        assistant_message, finish_reason,
                     )
-                    if _truncated:
-                        agent._vprint(
-                            f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
-                            f"(finish_reason={finish_reason!r}) — refusing to execute.",
-                            force=True,
+                    messages.append(recovery_assistant)
+
+                    for tc in assistant_message.tool_calls:
+                        if tc.id in invalid_by_id:
+                            err = invalid_by_id[tc.id]
+                            tool_result = (
+                                f"Error: Invalid JSON arguments. {err}. "
+                                "The tool was not executed. Please retry with valid JSON."
+                            )
+                        else:
+                            tool_result = (
+                                "Skipped: another tool call in this response had invalid JSON."
+                            )
+                        messages.append({
+                            "role": "tool",
+                            "name": tc.function.name,
+                            "tool_call_id": tc.id,
+                            "content": tool_result,
+                        })
+                    if agent._invalid_json_retries > 1:
+                        final_response = (
+                            "Invalid JSON tool call arguments after regeneration attempt"
                         )
-                        agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
-                        _final_response = "Response truncated due to output length limit"
-                        # Same tool-tail close as interrupt / invalid-tool
-                        # exhaustion — this path never reaches finalize_turn.
-                        close_interrupted_tool_sequence(messages, _final_response)
+                        close_interrupted_tool_sequence(messages, final_response)
                         agent._persist_session(messages, conversation_history)
                         return {
-                            "final_response": _final_response,
+                            "final_response": final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": _final_response,
+                            "error": final_response,
                         }
+                    continue
 
-                    # Track retries for invalid JSON arguments
-                    agent._invalid_json_retries += 1
-
-                    tool_name, error_msg = invalid_json_args[0]
-                    agent._buffer_vprint(f"⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
-
-                    if agent._invalid_json_retries < 3:
-                        agent._buffer_vprint(f"🔄 Retrying API call ({agent._invalid_json_retries}/3)...")
-                        # Don't add anything to messages, just retry the API call
-                        continue
-                    else:
-                        # Instead of returning partial, inject tool error results so the model can recover.
-                        # Using tool results (not user messages) preserves role alternation.
-                        agent._buffer_vprint("⚠️  Injecting recovery tool results for invalid JSON...")
-                        agent._invalid_json_retries = 0  # Reset for next attempt
-                        
-                        # Append the assistant message with its (broken) tool_calls
-                        recovery_assistant = agent._build_assistant_message(assistant_message, finish_reason)
-                        messages.append(recovery_assistant)
-                        
-                        # Respond with tool error results for each tool call
-                        invalid_names = {name for name, _ in invalid_json_args}
-                        for tc in assistant_message.tool_calls:
-                            if tc.function.name in invalid_names:
-                                err = next(e for n, e in invalid_json_args if n == tc.function.name)
-                                tool_result = (
-                                    f"Error: Invalid JSON arguments. {err}. "
-                                    f"For tools with no required parameters, use an empty object: {{}}. "
-                                    f"Please retry with valid JSON."
-                                )
-                            else:
-                                tool_result = "Skipped: other tool call in this response had invalid JSON."
-                            messages.append({
-                                "role": "tool",
-                                "name": tc.function.name,
-                                "tool_call_id": tc.id,
-                                "content": tool_result,
-                            })
-                        continue
-                
-                # Reset retry counter on successful JSON validation
                 agent._invalid_json_retries = 0
 
                 # ── Post-call guardrails ──────────────────────────

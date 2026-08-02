@@ -175,6 +175,7 @@ def start_container(
     name: str,
     *env: str,
     cmd: str = "sleep infinity",
+    user: str | None = None,
     timeout: int = 60,
 ) -> str:
     """Start a detached container and wait for cont-init to finish.
@@ -185,12 +186,15 @@ def start_container(
             typically handled by the ``container_name`` fixture).
         env: Env vars as ``KEY=VALUE`` strings, each passed via ``-e``.
         cmd: Container CMD (default ``sleep infinity``).
+        user: Optional Docker ``--user`` value for non-root startup tests.
         timeout: ``docker run`` subprocess timeout.
 
     Returns the container name. Raises on ``docker run`` failure or if
     the container never finishes cont-init within 30s.
     """
     args = ["docker", "run", "-d", "--name", name]
+    if user is not None:
+        args.extend(["--user", user])
     for e in env:
         args.extend(["-e", e])
     args.extend([image, *cmd.split()])

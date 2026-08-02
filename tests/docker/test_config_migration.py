@@ -6,6 +6,8 @@ user.
 """
 from __future__ import annotations
 
+import subprocess
+
 from tests.docker.conftest import docker_exec, docker_exec_sh, start_container
 
 
@@ -50,3 +52,19 @@ def test_config_migration_runs_on_boot(
     )
 
 
+def test_config_migration_runs_when_container_starts_as_hermes(
+    built_image: str, container_name: str,
+) -> None:
+    """The migration must not attempt a second privilege drop at UID 10000."""
+    start_container(built_image, container_name, user="10000:10000")
+
+    logs = subprocess.run(
+        ["docker", "logs", container_name],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert logs.returncode == 0
+    combined_logs = logs.stdout + logs.stderr
+    assert "docker_config_migrate.py failed" not in combined_logs
+    assert "unable to set supplementary group list" not in combined_logs
