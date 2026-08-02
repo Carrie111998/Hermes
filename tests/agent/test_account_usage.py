@@ -113,6 +113,21 @@ def test_account_usage_snapshot_to_dict_serializes_complete_snapshot():
     json.dumps(result, allow_nan=False)
 
 
+@pytest.mark.parametrize("used_percent", [float("nan"), float("inf"), float("-inf")])
+def test_account_usage_snapshot_to_dict_sanitizes_non_finite_percentages(used_percent):
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage-api",
+        fetched_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        windows=(account_usage.AccountUsageWindow(label="Session", used_percent=used_percent),),
+    )
+
+    result = account_usage.account_usage_snapshot_to_dict(snapshot)
+
+    assert result["windows"][0]["used_percent"] is None
+    json.dumps(result, allow_nan=False)
+
+
 def test_account_usage_snapshot_to_dict_serializes_unavailable_snapshot():
     snapshot = account_usage.AccountUsageSnapshot(
         provider="anthropic",

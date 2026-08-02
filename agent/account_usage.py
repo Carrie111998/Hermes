@@ -70,7 +70,7 @@ def account_usage_snapshot_to_dict(
         "windows": [
             {
                 "label": window.label,
-                "used_percent": window.used_percent,
+                "used_percent": float(window.used_percent) if _is_finite_num(window.used_percent) else None,
                 "reset_at": _datetime_to_utc_iso(window.reset_at),
                 "detail": window.detail,
             }
