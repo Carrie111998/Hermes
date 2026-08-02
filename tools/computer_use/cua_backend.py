@@ -151,8 +151,12 @@ _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport (fallback when the
                             # `_resolve_mcp_invocation` below)
 # The lifecycle owner times out its own MCP startup so the same asyncio task
 # that entered stdio_client/ClientSession also unwinds them and reaps the child.
-# Keep this below the synchronous 30s ready guard to leave cleanup headroom.
 _CUA_MCP_STARTUP_TIMEOUT_SECONDS = 25.0
+# The synchronous caller must wait beyond the startup deadline while the
+# lifecycle owner joins a blocking daemon-start worker and reaps owned children.
+# Embedded status probes can consume 2s and stop escalation roughly 10s, so 15s
+# preserves a bounded outer guard without exposing failure before cleanup ends.
+_CUA_MCP_STARTUP_CLEANUP_GRACE_SECONDS = 15.0
 
 # Whole-screen / desktop capture. cua-driver is a window-oriented driver —
 # its `get_window_state` / `screenshot` tools capture a single window (by
@@ -436,16 +440,30 @@ class _EmbeddedCuaDaemon:
         except Exception:
             pass
 
-    def start(self) -> None:
+    def start(
+        self,
+        driver_cmd: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
         if self._process is not None and self._process.poll() is None:
             return
         from tools.environments.local import _sanitize_subprocess_env
 
+        def _raise_if_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("embedded cua-driver startup cancelled")
+
+        _raise_if_cancelled()
+        if driver_cmd:
+            self._driver_cmd = driver_cmd
         if not self._driver_cmd:
             self._driver_cmd = resolve_cua_driver_cmd() or ""
         if not self._driver_cmd:
             raise RuntimeError(cua_driver_install_hint())
         self._command, self._mcp_args = _resolve_mcp_invocation(self._driver_cmd)
+        # Manifest discovery is blocking. A lifecycle timeout may arrive while
+        # it runs, so re-check before crossing the process-spawn boundary.
+        _raise_if_cancelled()
         env = _sanitize_subprocess_env(self.child_env())
         command = [
             self._command,
@@ -469,6 +487,11 @@ class _EmbeddedCuaDaemon:
             text=True,
             env=env,
         )
+        # Close the narrow check→Popen race: if cancellation landed between
+        # those operations, reap the process before the worker can return.
+        if cancel_event is not None and cancel_event.is_set():
+            self.stop()
+            raise RuntimeError("embedded cua-driver startup cancelled")
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr,
             args=(self._process,),
@@ -479,6 +502,9 @@ class _EmbeddedCuaDaemon:
 
         deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                self.stop()
+                raise RuntimeError("embedded cua-driver startup cancelled")
             if self._process.poll() is not None:
                 detail = "; ".join(self._stderr_tail) or "no diagnostic output"
                 raise RuntimeError(
@@ -1187,6 +1213,25 @@ class _CuaDriverSession:
         # when startup wedges, the caller reports HOW FAR it got instead of
         # an opaque "never reached ready".
         self._startup_phase = "binary-check"
+        embedded_start_task: Optional[asyncio.Task[Any]] = None
+        embedded_cancel_event = (
+            threading.Event() if self._embedded_daemon is not None else None
+        )
+
+        async def _cleanup_embedded_startup() -> None:
+            """Cancel, join, then reap the exact private-daemon startup."""
+            if self._embedded_daemon is None:
+                return
+            if embedded_cancel_event is not None:
+                embedded_cancel_event.set()
+            # Join before the final stop so a worker blocked before Popen cannot
+            # spawn after stop() has already observed an empty process slot.
+            if embedded_start_task is not None:
+                try:
+                    await asyncio.shield(embedded_start_task)
+                except BaseException:
+                    pass
+            await asyncio.to_thread(self._embedded_daemon.stop)
 
         try:
             # Own the complete startup budget here, including synchronous
@@ -1197,6 +1242,21 @@ class _CuaDriverSession:
                 driver_cmd = await asyncio.to_thread(resolve_cua_driver_cmd)
                 if not driver_cmd:
                     raise RuntimeError(cua_driver_install_hint())
+
+                if self._embedded_daemon is not None:
+                    self._startup_phase = "embedded-daemon"
+                    embedded_start_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._embedded_daemon.start,
+                            driver_cmd,
+                            embedded_cancel_event,
+                        )
+                    )
+                    # Keep ownership of the worker when the absolute startup
+                    # timeout cancels this lifecycle task. The timeout handler
+                    # stops the daemon and joins this exact worker before
+                    # exposing failure to the synchronous caller.
+                    await asyncio.shield(embedded_start_task)
 
                 # Surface 8: ask cua-driver itself which subcommand spawns
                 # the MCP server, instead of hardcoding ["mcp"]. Falls back
@@ -1257,6 +1317,7 @@ class _CuaDriverSession:
                         await self._shutdown_event.wait()
         except asyncio.TimeoutError as e:
             phase = getattr(self, "_startup_phase", "unknown")
+            await _cleanup_embedded_startup()
             timeout_error = asyncio.TimeoutError(
                 "cua-driver MCP startup timed out after "
                 f"{_CUA_MCP_STARTUP_TIMEOUT_SECONDS:g}s "
@@ -1269,6 +1330,7 @@ class _CuaDriverSession:
             # Capture ordinary errors and anyio CancelledError.
             # The caller (start()) inspects this to surface setup
             # failures to the synchronous world.
+            await _cleanup_embedded_startup()
             self._setup_error = e
             self._ready_event.set()
             raise
@@ -1359,7 +1421,11 @@ class _CuaDriverSession:
         self._lifecycle_future = asyncio.run_coroutine_threadsafe(
             self._lifecycle_coro(), loop
         )
-        if not self._ready_event.wait(timeout=30.0):
+        ready_guard_seconds = (
+            _CUA_MCP_STARTUP_TIMEOUT_SECONDS
+            + _CUA_MCP_STARTUP_CLEANUP_GRACE_SECONDS
+        )
+        if not self._ready_event.wait(timeout=ready_guard_seconds):
             # Best-effort: signal shutdown if the future is still alive.
             self._signal_shutdown_locked()
             # Surface which startup phase wedged (issue #57025) — "doctor
@@ -1368,7 +1434,8 @@ class _CuaDriverSession:
             phase = getattr(self, "_startup_phase", "unknown")
             from hermes_constants import display_hermes_home
             raise RuntimeError(
-                "cua-driver session never reached ready (timeout 30s; "
+                "cua-driver session never reached ready "
+                f"(timeout {ready_guard_seconds:g}s including cleanup; "
                 f"stuck in phase: {phase}). "
                 "Run `hermes computer-use doctor` and check "
                 f"{display_hermes_home()}/logs/agent.log for the phase timings."
@@ -1986,7 +2053,7 @@ class CuaDriverBackend(ComputerUseBackend):
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
         self._embedded_daemon = (
-            _EmbeddedCuaDaemon(resolve_cua_driver_cmd() or "", permission_mode)
+            _EmbeddedCuaDaemon("", permission_mode)
             if permission_mode == "unrestricted"
             else None
         )
@@ -2061,8 +2128,6 @@ class CuaDriverBackend(ComputerUseBackend):
         import importlib
         importlib.invalidate_caches()
         try:
-            if self._embedded_daemon is not None:
-                self._embedded_daemon.start()
             self._session.start()
         except Exception:
             if self._embedded_daemon is not None:

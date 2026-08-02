@@ -1561,6 +1561,242 @@ class TestCuaMcpStartupCleanup:
         assert not stdio_entered
         assert "manifest-discovery" in str(session._setup_error)
 
+    def test_unrestricted_embedded_daemon_is_inside_startup_deadline(self, monkeypatch):
+        """A wedged private daemon must be stopped before timeout reaches the caller."""
+        import asyncio
+        import threading
+        import time
+
+        from tools.computer_use import cua_backend
+
+        class HangingEmbeddedDaemon:
+            def __init__(self):
+                self.started = threading.Event()
+                self.stop_requested = threading.Event()
+                self.worker_finished = threading.Event()
+
+            def start(self, _driver_cmd=None, cancel_event=None):
+                self.started.set()
+                while not self.stop_requested.wait(timeout=0.01):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                self.worker_finished.set()
+
+            def stop(self):
+                self.stop_requested.set()
+
+            def proxy_invocation(self):
+                raise AssertionError("MCP proxy must not start before daemon readiness")
+
+            def child_env(self):
+                return {}
+
+        daemon = HangingEmbeddedDaemon()
+        session = cua_backend._CuaDriverSession(
+            cua_backend._AsyncBridge(), cast(Any, daemon)
+        )
+        # _lifecycle_coro imports the optional MCP SDK before entering its
+        # startup timeout. Warm that import so elapsed time below measures the
+        # bounded daemon phase rather than one-time module import cost.
+        __import__("mcp.client.stdio")
+        monkeypatch.setattr(
+            cua_backend, "_CUA_MCP_STARTUP_TIMEOUT_SECONDS", 0.05
+        )
+        monkeypatch.setattr(
+            cua_backend, "resolve_cua_driver_cmd", lambda: "cua-driver"
+        )
+
+        async def drive():
+            started = time.monotonic()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session._lifecycle_coro(), timeout=0.5)
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(drive())
+        assert elapsed < 0.25
+        assert daemon.started.is_set()
+        assert daemon.stop_requested.is_set()
+        assert daemon.worker_finished.is_set(), (
+            "embedded daemon startup worker must finish before failure returns"
+        )
+        assert "embedded-daemon" in str(session._setup_error)
+
+    def test_unrestricted_timeout_cannot_spawn_after_cleanup_begins(
+        self, monkeypatch
+    ):
+        """Cancellation during manifest probing must prevent a later daemon spawn."""
+        import asyncio
+        import time
+
+        from tools.computer_use import cua_backend
+
+        daemon = cua_backend._EmbeddedCuaDaemon("", "unrestricted")
+        session = cua_backend._CuaDriverSession(
+            cua_backend._AsyncBridge(), daemon
+        )
+        spawned = False
+
+        def slow_manifest(_driver_cmd):
+            time.sleep(0.12)
+            return "cua-driver", ["mcp"]
+
+        def forbidden_spawn(*_args, **_kwargs):
+            nonlocal spawned
+            spawned = True
+            raise AssertionError("daemon spawned after startup timeout")
+
+        monkeypatch.setattr(
+            cua_backend, "_CUA_MCP_STARTUP_TIMEOUT_SECONDS", 0.05
+        )
+        monkeypatch.setattr(
+            cua_backend, "resolve_cua_driver_cmd", lambda: "cua-driver"
+        )
+        monkeypatch.setattr(cua_backend, "_resolve_mcp_invocation", slow_manifest)
+        __import__("mcp.client.stdio")
+        monkeypatch.setattr(cua_backend.subprocess, "Popen", forbidden_spawn)
+
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(
+                asyncio.wait_for(session._lifecycle_coro(), timeout=0.5)
+            )
+
+        assert not spawned
+        assert "embedded-daemon" in str(session._setup_error)
+
+    def test_external_cancellation_joins_embedded_startup_worker(self, monkeypatch):
+        """Lifecycle cancellation must not detach an unrestricted startup thread."""
+        import asyncio
+        import threading
+
+        from tools.computer_use import cua_backend
+
+        class HangingEmbeddedDaemon:
+            def __init__(self):
+                self.started = threading.Event()
+                self.stop_requested = threading.Event()
+                self.worker_finished = threading.Event()
+
+            def start(self, _driver_cmd=None, cancel_event=None):
+                import time
+
+                self.started.set()
+                rescue_deadline = time.monotonic() + 0.3
+                while (
+                    not self.stop_requested.wait(timeout=0.01)
+                    and time.monotonic() < rescue_deadline
+                ):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                self.worker_finished.set()
+
+            def stop(self):
+                self.stop_requested.set()
+
+            def proxy_invocation(self):
+                raise AssertionError("MCP proxy must not start before daemon readiness")
+
+            def child_env(self):
+                return {}
+
+        daemon = HangingEmbeddedDaemon()
+        session = cua_backend._CuaDriverSession(
+            cua_backend._AsyncBridge(), cast(Any, daemon)
+        )
+        monkeypatch.setattr(
+            cua_backend, "resolve_cua_driver_cmd", lambda: "cua-driver"
+        )
+        __import__("mcp.client.stdio")
+
+        async def drive():
+            task = asyncio.create_task(session._lifecycle_coro())
+            started = await asyncio.to_thread(daemon.started.wait, 0.2)
+            assert started
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+        assert daemon.stop_requested.is_set()
+        assert daemon.worker_finished.is_set(), (
+            "embedded daemon startup worker must finish before cancellation returns"
+        )
+
+    def test_synchronous_start_guard_waits_for_timeout_cleanup(self, monkeypatch):
+        """The outer ready guard must leave the lifecycle enough cleanup headroom."""
+        import asyncio
+        import threading
+        import time
+
+        from tools.computer_use import cua_backend
+
+        native_event = threading.Event
+
+        class SlowCleanupDaemon:
+            def __init__(self):
+                self.stop_finished = native_event()
+
+            def start(self, _driver_cmd=None, cancel_event=None):
+                while cancel_event is None or not cancel_event.wait(timeout=0.01):
+                    pass
+
+            def stop(self):
+                time.sleep(0.12)
+                self.stop_finished.set()
+
+            def proxy_invocation(self):
+                raise AssertionError("MCP proxy must not start before daemon readiness")
+
+            def child_env(self):
+                return {}
+
+        class ScaledReadyEvent:
+            """Compress the old fixed 30s guard so this regression stays fast."""
+
+            def __init__(self):
+                self._event = native_event()
+
+            def set(self):
+                self._event.set()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def wait(self, timeout=None):
+                # Old code asks for 30s and is simulated as 0.10s. Revised
+                # code asks for startup + cleanup grace and gets that budget.
+                if timeout == 30.0:
+                    timeout = 0.10
+                return self._event.wait(timeout)
+
+        daemon = SlowCleanupDaemon()
+        session = cua_backend._CuaDriverSession(
+            cua_backend._AsyncBridge(), cast(Any, daemon)
+        )
+        monkeypatch.setattr(
+            cua_backend, "_CUA_MCP_STARTUP_TIMEOUT_SECONDS", 0.05
+        )
+        monkeypatch.setattr(
+            cua_backend,
+            "_CUA_MCP_STARTUP_CLEANUP_GRACE_SECONDS",
+            0.20,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            cua_backend, "resolve_cua_driver_cmd", lambda: "cua-driver"
+        )
+        __import__("mcp.client.stdio")
+        monkeypatch.setattr(cua_backend.threading, "Event", ScaledReadyEvent)
+
+        try:
+            with pytest.raises(RuntimeError):
+                session.start()
+            assert daemon.stop_finished.is_set(), (
+                "synchronous startup failure returned before daemon cleanup finished"
+            )
+        finally:
+            daemon.stop_finished.wait(timeout=0.5)
+            session._bridge.stop()
+
     @pytest.mark.skipif(os.name != "posix", reason="process watchdog is POSIX-only")
     def test_real_wedged_mcp_child_is_reaped_before_timeout_returns(
         self, tmp_path, monkeypatch
