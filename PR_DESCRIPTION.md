@@ -54,7 +54,7 @@ Verified with the Hermes runtime virtualenv:
 ```text
 tests/plugins/test_team_memory_plugin.py
 tests/experiments/test_team_memory_ab_test.py
-9 passed
+10 passed
 experiments/team_memory_ab_test/scripts/quick_test.sh
 passed in a temporary HERMES_HOME; no model call performed
 ```
