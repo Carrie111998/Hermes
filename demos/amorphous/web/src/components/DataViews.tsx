@@ -591,8 +591,38 @@ function HeatmapView({ data }: { data: any }) {
 
 /* ---------- live log tail ---------- */
 function LogsView({ data }: { data: any }) {
-  const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ block: "end" }); }, [data.lines]);
+  /* Autoscroll rules:
+     - NEVER scrollIntoView (it drags every ancestor scroller — hijacks the page).
+     - Scroll ONLY this box via scrollTop.
+     - Stick to bottom only while the user is already at the bottom; if they
+       scrolled up to read, stay put and show a "jump to latest" chip. */
+  const boxRef = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  const [behind, setBehind] = useState(false);
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    if (stick.current) {
+      el.scrollTop = el.scrollHeight;
+      setBehind(false);
+    } else {
+      setBehind(true);
+    }
+  }, [data.lines]);
+  const onScroll = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    stick.current = atBottom;
+    if (atBottom) setBehind(false);
+  };
+  const jump = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    stick.current = true;
+    el.scrollTop = el.scrollHeight;
+    setBehind(false);
+  };
   const color = (l: string) =>
     /error|fail|critical|traceback/i.test(l) ? "text-red"
       : /warn/i.test(l) ? "text-amber"
@@ -600,11 +630,19 @@ function LogsView({ data }: { data: any }) {
   return (
     <div className="h-full flex flex-col font-mono text-[11.5px] leading-[1.6]">
       <div className="text-[10.5px] text-ink-4 pb-1.5 truncate shrink-0">{data.path}</div>
-      <div className="flex-1 overflow-auto min-h-0 bg-[#0a1322] rounded-lg border border-line px-3 py-2">
-        {(data.lines || []).map((l: string, i: number) => (
-          <div key={i} className={`whitespace-pre-wrap break-all ${color(l)}`}>{l || " "}</div>
-        ))}
-        <div ref={endRef} />
+      <div className="relative flex-1 min-h-0">
+        <div ref={boxRef} onScroll={onScroll}
+             className="absolute inset-0 overflow-auto bg-[#0a1322] rounded-lg border border-line px-3 py-2 overscroll-contain">
+          {(data.lines || []).map((l: string, i: number) => (
+            <div key={i} className={`whitespace-pre-wrap break-all ${color(l)}`}>{l || " "}</div>
+          ))}
+        </div>
+        {behind && (
+          <button onClick={jump}
+                  className="absolute bottom-2 right-2 inline-flex items-center gap-1 h-[22px] px-2.5 rounded-full bg-surface-2/95 border border-line-2 text-[10.5px] text-ink-2 hover:text-ink cursor-pointer backdrop-blur-sm">
+            ↓ latest
+          </button>
+        )}
       </div>
     </div>
   );
