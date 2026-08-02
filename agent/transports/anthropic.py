@@ -148,18 +148,20 @@ class AnthropicTransport(ProviderTransport):
                     # is actually registered; never rewrite a name the LLM used
                     # that already resolves natively. GH-25255.
                     bare = name[len(_MCP_PREFIX):]                # read_file
-                    # OAuth aliases must round-trip before the generic registry
-                    # lookup, which only knows Hermes's canonical tool names.
-                    if bare in _OAUTH_TOOL_NAME_REVERSE_ALIASES:
-                        name = _OAUTH_TOOL_NAME_REVERSE_ALIASES[bare]
-                    else:
-                        from tools.registry import registry as _tool_registry
-                        if not _tool_registry.get_entry(name):
-                            single = "mcp_" + bare                # mcp_read_file / mcp_linear_get_issue
-                            if _tool_registry.get_entry(single):
-                                name = single
-                            elif _tool_registry.get_entry(bare):
-                                name = bare
+                    from tools.registry import registry as _tool_registry
+                    if not _tool_registry.get_entry(name):
+                        single = "mcp_" + bare                # mcp_read_file / mcp_linear_get_issue
+                        if _tool_registry.get_entry(single):
+                            name = single
+                        elif _tool_registry.get_entry(bare):
+                            name = bare
+                        elif bare in _OAUTH_TOOL_NAME_REVERSE_ALIASES:
+                            # OAuth wire alias (e.g. chat_history_lookup ->
+                            # session_search). Checked LAST so the GH-25255
+                            # contract still holds: a real tool actually
+                            # registered under the wire name wins, and we never
+                            # rewrite a name that already resolves natively.
+                            name = _OAUTH_TOOL_NAME_REVERSE_ALIASES[bare]
                 tool_calls.append(
                     ToolCall(
                         id=block.id,

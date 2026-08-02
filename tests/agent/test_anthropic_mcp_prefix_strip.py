@@ -109,6 +109,38 @@ class TestAnthropicMcpPrefixStrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "session_search"
 
+    def test_oauth_memory_alias_round_trips_to_registry_name(self):
+        """``mcp__context_notes`` dispatches as ``memory`` (#65365 second trigger)."""
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp__context_notes")
+        response = _make_response(block)
+
+        registry = _FakeRegistry({"memory"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=True)
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "memory"
+
+    def test_registered_tool_wins_over_oauth_alias(self):
+        """A real tool registered under the wire name keeps GH-25255 precedence.
+
+        An MCP server tool named ``mcp_chat_history_lookup`` goes out as
+        ``mcp__chat_history_lookup`` too. The alias must NOT hijack it — the
+        registry lookup runs first, so the genuinely registered tool wins and
+        the dispatcher doesn't silently run ``session_search`` instead.
+        """
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp__chat_history_lookup")
+        response = _make_response(block)
+
+        registry = _FakeRegistry({"mcp_chat_history_lookup", "session_search"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=True)
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "mcp_chat_history_lookup"
+
 
 
 
@@ -215,3 +247,59 @@ class TestAnthropicOAuthOutgoingPrefix:
         assert kwargs["tools"][0]["name"] == "session_search"
         assert "session_search" in kwargs["tools"][0]["description"]
         assert kwargs["system"] == "Use session_search before asking again."
+
+    def test_oauth_aliases_memory_tool_name_but_not_its_prose(self):
+        """#65365's second trigger: the ``memory`` schema name is aliased.
+
+        The name is what the classifier keys on, so it must not reach the wire.
+        Its description and the system prompt keep the word "memory" — it is
+        ordinary English there ("persistent memory across sessions"), and
+        rewriting prose would hand the model mangled instructions.
+        """
+        kwargs = self._build(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "memory",
+                    "description": "Save durable facts to persistent memory.",
+                    "parameters": {},
+                },
+            }],
+            messages=[
+                {"role": "system", "content": "You have persistent memory across sessions."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        assert kwargs["tools"][0]["name"] == "mcp__context_notes"
+        # Prose is untouched — the tool still describes itself accurately.
+        assert "persistent memory" in kwargs["tools"][0]["description"]
+        system_text = " ".join(block["text"] for block in kwargs["system"])
+        assert "persistent memory across sessions" in system_text
+
+    def test_oauth_prose_alias_respects_word_boundaries(self):
+        """A longer identifier containing the token must not be rewritten.
+
+        System blocks carry user-supplied text (project AGENTS.md, memory
+        snapshots). Rewriting ``session_search_tool.py`` would produce a path
+        that doesn't exist and has no reverse mapping.
+        """
+        kwargs = self._build(
+            [],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Use session_search to recall. "
+                        "Implementation lives in tools/session_search_tool.py."
+                    ),
+                },
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+
+        system_text = " ".join(block["text"] for block in kwargs["system"])
+        # Bare token aliased...
+        assert "Use chat_history_lookup to recall." in system_text
+        # ...but the longer identifier survives intact.
+        assert "tools/session_search_tool.py" in system_text

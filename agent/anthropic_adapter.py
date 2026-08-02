@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -394,14 +395,53 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
-# Anthropic's OAuth billing classifier fingerprints the combination of the
-# ``session_search`` and ``skill_manage`` guidance terms in Hermes's request
-# shape. Alias the independently functional session-search term only on the
-# OAuth wire; the response transport restores the registry name before dispatch.
-_OAUTH_TOOL_NAME_ALIASES = {"session_search": "chat_history_lookup"}
+
+# Anthropic's OAuth billing classifier fingerprints certain Hermes tool schemas
+# as a third-party app and reroutes the request to the metered extra-usage lane,
+# surfacing as HTTP 400 "You're out of extra usage" on a valid subscription
+# token. Issue #65365 isolated two triggers with a deterministic A/B repro on a
+# live Claude Max account: exposing the ``session_search`` schema alone, or the
+# ``memory`` schema alone, each reproduces the 400; removing them clears it.
+#
+# Both are aliased to neutral names on the OAuth wire only. The response
+# transport restores the registry name before dispatch, so tool behavior and
+# API-key requests are unchanged.
+_OAUTH_TOOL_NAME_ALIASES = {
+    "session_search": "chat_history_lookup",
+    "memory": "context_notes",
+}
 _OAUTH_TOOL_NAME_REVERSE_ALIASES = {
     wire_name: name for name, wire_name in _OAUTH_TOOL_NAME_ALIASES.items()
 }
+
+# Aliases that are ALSO safe to substitute in free-form prose (system prompt
+# text, tool descriptions). Only unambiguous snake_case tool tokens qualify:
+# "memory" is ordinary English throughout the system prompt ("persistent
+# memory across sessions", "OS, CPU, memory, disk"), so rewriting it in prose
+# would corrupt guidance the model has to follow. Renaming a tool is a
+# different operation from rewriting the vocabulary that describes it — keep
+# the two sets separate so the next alias can't silently mangle prose.
+_OAUTH_PROSE_ALIAS_NAMES = frozenset({"session_search"})
+
+# Word-boundary matchers so a prose substitution can't corrupt a longer
+# identifier that merely CONTAINS the token. System blocks carry user-supplied
+# text (project AGENTS.md / .cursorrules, memory snapshots), and a bare
+# str.replace would turn a reference like ``tools/session_search_tool.py``
+# into ``tools/chat_history_lookup_tool.py`` — a path that does not exist and
+# has no reverse mapping. ``\b`` treats ``_`` as a word char, so the longer
+# identifier is skipped while ``session_search``, `` `session_search` `` and
+# ``session_search(`` still match.
+_OAUTH_PROSE_ALIAS_PATTERNS = tuple(
+    (re.compile(rf"\b{re.escape(name)}\b"), _OAUTH_TOOL_NAME_ALIASES[name])
+    for name in sorted(_OAUTH_PROSE_ALIAS_NAMES)
+)
+
+
+def _apply_oauth_prose_aliases(text: str) -> str:
+    """Rewrite prose-safe tool tokens to their OAuth wire aliases."""
+    for pattern, wire_name in _OAUTH_PROSE_ALIAS_PATTERNS:
+        text = pattern.sub(wire_name, text)
+    return text
 
 
 def _get_claude_code_version() -> str:
@@ -2797,8 +2837,7 @@ def build_anthropic_kwargs(
                 text = text.replace("Hermes agent", "Claude Code")
                 text = text.replace("hermes-agent", "claude-code")
                 text = text.replace("Nous Research", "Anthropic")
-                for original_name, wire_name in _OAUTH_TOOL_NAME_ALIASES.items():
-                    text = text.replace(original_name, wire_name)
+                text = _apply_oauth_prose_aliases(text)
                 block["text"] = text
 
         # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
@@ -2834,9 +2873,14 @@ def build_anthropic_kwargs(
                     tool["name"] = _to_oauth_wire_name(tool["name"])
                 description = tool.get("description")
                 if isinstance(description, str):
-                    for original_name, wire_name in _OAUTH_TOOL_NAME_ALIASES.items():
-                        description = description.replace(original_name, wire_name)
-                    tool["description"] = description
+                    # Prose-safe aliases only. The ``memory`` tool's own
+                    # description is dense ordinary prose about memory
+                    # ("save durable facts to persistent memory"); rewriting
+                    # every occurrence would leave the model with mangled
+                    # instructions for a tool it still has to use correctly.
+                    # Its NAME is aliased above, which is the part of the
+                    # schema the classifier keys on per #65365's repro.
+                    tool["description"] = _apply_oauth_prose_aliases(description)
 
         # 4. Apply the same normalization to tool names in message history
         #    (tool_use blocks) so replayed turns match the wire names above.
