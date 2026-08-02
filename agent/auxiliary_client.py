@@ -8672,6 +8672,19 @@ def call_llm(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    if (
+        not _allow_fallback(resolved_execution_mode)
+        and resolved_provider == "custom"
+        and not resolved_base_url
+    ):
+        custom_base, custom_key, custom_mode = _resolve_custom_runtime()
+        if not custom_base or not custom_key:
+            raise StrictExecutionConfigurationError(
+                "Strict custom provider has no explicit configured endpoint"
+            )
+        resolved_base_url = custom_base
+        resolved_api_key = custom_key
+        resolved_api_mode = resolved_api_mode or custom_mode
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -8787,13 +8800,22 @@ def call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     if not _allow_retry(resolved_execution_mode):
+        strict_provider_label = resolved_provider
+        requested_provider = str(provider or "").strip().lower()
+        direct_base = _AUX_DIRECT_API_BASE_URLS.get(requested_provider, "")
+        if (
+            resolved_provider == "custom"
+            and direct_base
+            and str(resolved_base_url or "").rstrip("/") == direct_base.rstrip("/")
+        ):
+            strict_provider_label = str(provider).strip()
         return _strict_sync_completion(
             client,
             kwargs,
             task=task,
             requested_provider=str(provider),
             requested_model=str(model),
-            dispatched_provider=resolved_provider,
+            dispatched_provider=strict_provider_label,
             dispatched_model=str(final_model or ""),
             resolved_base_url=resolved_base_url,
             audit=execution_audit,
@@ -9430,6 +9452,19 @@ async def async_call_llm(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    if (
+        not _allow_fallback(resolved_execution_mode)
+        and resolved_provider == "custom"
+        and not resolved_base_url
+    ):
+        custom_base, custom_key, custom_mode = _resolve_custom_runtime()
+        if not custom_base or not custom_key:
+            raise StrictExecutionConfigurationError(
+                "Strict custom provider has no explicit configured endpoint"
+            )
+        resolved_base_url = custom_base
+        resolved_api_key = custom_key
+        resolved_api_mode = resolved_api_mode or custom_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -9527,13 +9562,22 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     if not _allow_retry(resolved_execution_mode):
+        strict_provider_label = resolved_provider
+        requested_provider = str(provider or "").strip().lower()
+        direct_base = _AUX_DIRECT_API_BASE_URLS.get(requested_provider, "")
+        if (
+            resolved_provider == "custom"
+            and direct_base
+            and str(resolved_base_url or "").rstrip("/") == direct_base.rstrip("/")
+        ):
+            strict_provider_label = str(provider).strip()
         return await _strict_async_completion(
             client,
             kwargs,
             task=task,
             requested_provider=str(provider),
             requested_model=str(model),
-            dispatched_provider=resolved_provider,
+            dispatched_provider=strict_provider_label,
             dispatched_model=str(final_model or ""),
             resolved_base_url=resolved_base_url,
             audit=execution_audit,

@@ -292,6 +292,13 @@ class TestPluginLlmFacade:
                 provider="test-provider",
                 execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
             )
+        with pytest.raises(StrictExecutionConfigurationError, match="explicit model"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                provider="test-provider",
+                model="auto",
+                execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+            )
 
     @pytest.mark.parametrize("provider", ["auto", "main", " AUTO "])
     def test_strict_mode_rejects_implicit_provider_names(self, provider):

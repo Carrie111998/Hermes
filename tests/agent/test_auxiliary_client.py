@@ -4413,6 +4413,14 @@ def _strict_response(model="test-model"):
 
 def _install_strict_client(monkeypatch, client):
     monkeypatch.setattr(
+        "agent.auxiliary_client._resolve_custom_runtime",
+        lambda: (
+            "https://strict.invalid/v1",
+            "test-only-placeholder",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
         "agent.auxiliary_client._get_cached_client",
         lambda *_args, **_kwargs: (client, "test-model"),
     )
@@ -4540,7 +4548,9 @@ class TestStrictSingleAttemptExecution:
         assert completions.calls == 1
         assert audit.delivery_ambiguous is True
 
-    @pytest.mark.parametrize("provider", ["custom", "qwen-oauth", "xai-oauth"])
+    @pytest.mark.parametrize(
+        "provider", ["openai", "custom", "qwen-oauth", "xai-oauth"]
+    )
     def test_strict_openai_compatible_and_oauth_routes_use_one_call(
         self, monkeypatch, provider
     ):

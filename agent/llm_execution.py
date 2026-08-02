@@ -67,6 +67,16 @@ class LlmExecutionAudit:
         self.execution_mode = resolved_mode.value
         self.requested_provider = str(provider or "").strip()
         self.requested_model = str(model or "").strip()
+        self.dispatched_provider = ""
+        self.dispatched_model = ""
+        self.response_provider = ""
+        self.response_model = ""
+        self.attempt_count = 0
+        self.fallback_used = False
+        self.credential_rotation_used = False
+        self.route_changed = False
+        self.delivery_ambiguous = False
+        self.strict_contract_satisfied = False
 
     def record_dispatch(self, provider: str | None, model: str | None) -> None:
         self.dispatched_provider = str(provider or "").strip()
@@ -154,9 +164,10 @@ def validate_strict_request(
             "strict_single_attempt requires an explicit provider other than "
             "'auto' or 'main'"
         )
-    if not model_text:
+    if not model_text or model_text.lower() in {"auto", "main"}:
         raise StrictExecutionConfigurationError(
-            "strict_single_attempt requires an explicit model"
+            "strict_single_attempt requires an explicit model other than "
+            "'auto' or 'main'"
         )
     return resolved_mode
 
