@@ -836,11 +836,15 @@ def strip_think_blocks(agent, content: str) -> str:
     #     a literal <tool_call> in prose is already vanishingly rare.
     for _tc_name in ("tool_call", "tool_calls", "tool_result",
                       "function_call", "function_calls"):
+        # NOTE: intentionally does NOT use re.IGNORECASE — models emit
+        # these tags in lower case only, and case-insensitive matching
+        # corrupts data content (e.g. JS/HTML that contains `<TOOL_CALL>`
+        # literal strings). See #72797.
         content = re.sub(
             rf'<{_tc_name}\b[^>]*>.*?</{_tc_name}>',
             '',
             content,
-            flags=re.DOTALL | re.IGNORECASE,
+            flags=re.DOTALL,
         )
     # 1c. <function name="...">...</function> — Gemma-style standalone
     #     tool call. Only strip when the tag sits at a block boundary
@@ -876,11 +880,12 @@ def strip_think_blocks(agent, content: str) -> str:
     #     unterminated <function name="..."> because a truncated tail
     #     during streaming may still be valuable to the user; matches
     #     OpenClaw's intentional asymmetry.)
+    # NOTE: intentionally does NOT use re.IGNORECASE — same rationale
+    # as the block patterns above (#72797).
     content = re.sub(
         r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*',
         '',
         content,
-        flags=re.IGNORECASE,
     )
     return content
 
