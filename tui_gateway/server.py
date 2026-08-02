@@ -1607,6 +1607,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if "enabled_toolsets" in current:
+                    kw["enabled_toolsets_override"] = current["enabled_toolsets"]
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3076,6 +3078,9 @@ def _load_enabled_toolsets() -> list[str] | None:
                 flush=True,
             )
         return None
+
+
+_SESSION_TOOLSETS_UNSET = object()
 
 
 def _session_tool_progress_mode(sid: str) -> str:
@@ -4580,6 +4585,13 @@ def _agent_fallback_model(agent):
     return _load_fallback_model()
 
 
+def _agent_enabled_toolsets(agent):
+    """Preserve explicit empty authority instead of rehydrating profile defaults."""
+    if hasattr(agent, "enabled_toolsets"):
+        return getattr(agent, "enabled_toolsets")
+    return _load_enabled_toolsets()
+
+
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
 
@@ -4592,8 +4604,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
-        "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        "enabled_toolsets": _agent_enabled_toolsets(agent),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -4620,9 +4631,13 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
 
 def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     kwargs = _background_agent_kwargs(agent, task_id)
+    parent_toolsets = kwargs["enabled_toolsets"]
+    preview_toolsets = ["terminal", "file"]
+    if parent_toolsets is not None:
+        preview_toolsets = [name for name in preview_toolsets if name in parent_toolsets]
     kwargs.update(
         {
-            "enabled_toolsets": ["terminal", "file"],
+            "enabled_toolsets": preview_toolsets,
             "session_db": None,
             "skip_memory": True,
         }
@@ -4753,6 +4768,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # another session set). See the cross-session-contamination note in
         # _apply_model_switch.
         reset_kw = {"model_override": session.get("model_override")}
+        if "enabled_toolsets" in session:
+            reset_kw["enabled_toolsets_override"] = session["enabled_toolsets"]
         old_reasoning = getattr(session.get("agent"), "reasoning_config", None)
         if old_reasoning is None:
             old_reasoning = session.get("create_reasoning_override")
@@ -4931,6 +4948,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    enabled_toolsets_override=_SESSION_TOOLSETS_UNSET,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5057,6 +5075,11 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    enabled_toolsets = (
+        _load_enabled_toolsets()
+        if enabled_toolsets_override is _SESSION_TOOLSETS_UNSET
+        else enabled_toolsets_override
+    )
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
@@ -5083,7 +5106,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=enabled_toolsets,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -5763,6 +5786,20 @@ def _(rid, params: dict) -> dict:
     # fall back to the profile default service tier rather than forcing normal.
     create_service_tier_override = "priority" if params.get("fast") else None
 
+    enabled_toolsets = _SESSION_TOOLSETS_UNSET
+    if "enabled_toolsets" in params:
+        raw_enabled_toolsets = params.get("enabled_toolsets")
+        if not isinstance(raw_enabled_toolsets, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_enabled_toolsets
+        ):
+            return _err(
+                rid,
+                4002,
+                "enabled_toolsets must be a list of non-empty strings",
+            )
+        enabled_toolsets = list(dict.fromkeys(item.strip() for item in raw_enabled_toolsets))
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
@@ -5782,6 +5819,11 @@ def _(rid, params: dict) -> dict:
             "cols": cols,
             "created_at": now,
             "edit_snapshots": {},
+            **(
+                {"enabled_toolsets": enabled_toolsets}
+                if enabled_toolsets is not _SESSION_TOOLSETS_UNSET
+                else {}
+            ),
             "explicit_cwd": explicit_cwd,
             "history": history,
             "history_lock": threading.Lock(),

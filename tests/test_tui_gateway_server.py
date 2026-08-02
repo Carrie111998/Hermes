@@ -81,6 +81,95 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         reset_hermes_home_override(token)
 
 
+def test_session_create_preserves_explicit_enabled_toolsets(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        server._sessions.clear()
+        monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *args, **kwargs: None)
+
+        response = server._methods["session.create"](
+            "toolset-rid",
+            {"cols": 80, "enabled_toolsets": []},
+        )
+
+        assert "result" in response
+        sid = response["result"]["session_id"]
+        assert server._sessions[sid]["enabled_toolsets"] == []
+    finally:
+        server._sessions.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+def test_session_create_keeps_toolset_selection_session_isolated(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        server._sessions.clear()
+        monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *args, **kwargs: None)
+
+        restricted = server._methods["session.create"](
+            "restricted-rid",
+            {"cols": 80, "enabled_toolsets": []},
+        )
+        inherited = server._methods["session.create"](
+            "inherited-rid",
+            {"cols": 80},
+        )
+
+        restricted_session = server._sessions[restricted["result"]["session_id"]]
+        inherited_session = server._sessions[inherited["result"]["session_id"]]
+        assert restricted_session["enabled_toolsets"] == []
+        assert "enabled_toolsets" not in inherited_session
+    finally:
+        server._sessions.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+def test_session_create_rejects_malformed_enabled_toolsets(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        server._sessions.clear()
+        monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *args, **kwargs: None)
+
+        response = server._methods["session.create"](
+            "bad-toolset-rid",
+            {"cols": 80, "enabled_toolsets": "terminal"},
+        )
+
+        assert response["error"]["code"] == 4002
+        assert "enabled_toolsets" in response["error"]["message"]
+        assert server._sessions == {}
+    finally:
+        server._sessions.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 
@@ -2191,6 +2280,69 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     kwargs = server._background_agent_kwargs(agent, "task-id")
 
     assert kwargs["fallback_model"] == chain
+
+
+def test_background_agent_kwargs_preserves_explicit_zero_tool_authority(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.5",
+        provider="openai-codex",
+        enabled_toolsets=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["terminal", "file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+
+    assert kwargs["enabled_toolsets"] == []
+
+
+def test_preview_agent_kwargs_cannot_widen_explicit_zero_tool_authority(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.5",
+        provider="openai-codex",
+        enabled_toolsets=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["terminal", "file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._ephemeral_preview_agent_kwargs(agent, "task-id")
+
+    assert kwargs["enabled_toolsets"] == []
+
+
+def test_reset_session_agent_preserves_explicit_zero_tool_authority(monkeypatch):
+    captured = {}
+    old_agent = types.SimpleNamespace(reasoning_config=None)
+    new_agent = types.SimpleNamespace()
+    session = {
+        "session_key": "session-key",
+        "agent": old_agent,
+        "enabled_toolsets": [],
+        "model_override": None,
+        "history": [],
+        "history_lock": threading.RLock(),
+    }
+
+    monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(server, "_clear_session_context", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **kwargs: captured.update(kwargs) or new_agent,
+    )
+    monkeypatch.setattr(server, "_config_model_target", lambda: "model")
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "compact")
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args, **_kwargs: None)
+
+    server._reset_session_agent("sid", session)
+
+    assert captured["enabled_toolsets_override"] == []
+    assert session["agent"] is new_agent
 
 
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
