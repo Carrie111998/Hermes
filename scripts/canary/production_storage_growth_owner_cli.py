@@ -262,6 +262,7 @@ def _emit(value: Mapping[str, Any]) -> None:
 def _install_owner_state_privileged(
     release_sha: str,
     binding: Mapping[str, Any],
+    authority_key_attestation: Mapping[str, Any],
     *,
     runner: Any = subprocess.run,
 ) -> Mapping[str, Any]:
@@ -284,6 +285,7 @@ def _install_owner_state_privileged(
             command,
             input=installer.canonical_json_bytes({
                 "sealed_artifact_binding": binding,
+                "authority_key_attestation": authority_key_attestation,
             }),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -354,12 +356,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _revalidate_runtime(runtime, release_sha)
         elif operation == "install-owner-state":
-            runtime, artifacts = _runtime_artifacts(release_sha)
+            route, runtime = _build_route(release_sha)
+            artifacts = owner.observe_exact_production_storage_runtime_artifacts(
+                release_sha=release_sha,
+                trusted_runtime=runtime,
+            )
             binding = installer.build_owner_artifact_binding(
                 release_sha,
                 artifacts,
             )
-            result = _install_owner_state_privileged(release_sha, binding)
+            authority_key_attestation = route.attest_authority_key()
+            result = _install_owner_state_privileged(
+                release_sha,
+                binding,
+                authority_key_attestation,
+            )
             _revalidate_runtime(runtime, release_sha)
         else:
             route, runtime = _build_route(release_sha)

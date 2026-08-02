@@ -670,6 +670,7 @@ class ProductionStoragePasskeyBoundary:
 
     def _invoke(self, operation: str, document: Mapping[str, Any]) -> Mapping[str, Any]:
         if operation not in {
+            "attest_production_storage_authority",
             "request_production_storage_growth",
             "consume_production_storage_growth",
         }:
@@ -718,6 +719,56 @@ class ProductionStoragePasskeyBoundary:
                 "production_storage_owner_gate_response_invalid"
             )
         return copy.deepcopy(dict(response["document"]))
+
+    def attest_authority(self) -> Mapping[str, Any]:
+        value = self._invoke("attest_production_storage_authority", {})
+        unsigned = {
+            name: item
+            for name, item in value.items()
+            if name != "attestation_sha256"
+        } if isinstance(value, Mapping) else {}
+        if (
+            not isinstance(value, Mapping)
+            or set(value)
+            != {
+                "schema", "release_sha", "receipt_public_key_ed25519_hex",
+                "receipt_public_key_id", "portable_trust_bundle_sha256",
+                "portable_trust_bundle",
+                "authority_manifest_sha256", "authority_host_receipt_sha256",
+                "root_owned_trust_bundle_validated",
+                "rotation_requires_new_release_and_owner_install",
+                "attestation_sha256",
+            }
+            or value.get("schema")
+            != "muncho-production-storage-authority-key-attestation.v1"
+            or value.get("release_sha") != self.release_revision
+            or not _is_sha(value.get("receipt_public_key_ed25519_hex"))
+            or not _is_sha(value.get("receipt_public_key_id"))
+            or value.get("receipt_public_key_id")
+            != hashlib.sha256(bytes.fromhex(
+                value["receipt_public_key_ed25519_hex"]
+            )).hexdigest()
+            or any(
+                not _is_sha(value.get(name))
+                for name in (
+                    "portable_trust_bundle_sha256",
+                    "authority_manifest_sha256",
+                    "authority_host_receipt_sha256",
+                )
+            )
+            or not isinstance(value.get("portable_trust_bundle"), Mapping)
+            or value["portable_trust_bundle"].get("trust_bundle_sha256")
+            != value.get("portable_trust_bundle_sha256")
+            or value.get("root_owned_trust_bundle_validated") is not True
+            or value.get("rotation_requires_new_release_and_owner_install")
+            is not True
+            or value.get("attestation_sha256")
+            != protocol.sha256_json(unsigned)
+        ):
+            raise ProductionStoragePasskeyError(
+                "production_storage_authority_key_attestation_invalid"
+            )
+        return copy.deepcopy(dict(value))
 
     def request(
         self,

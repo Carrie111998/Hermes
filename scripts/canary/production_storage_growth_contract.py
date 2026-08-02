@@ -143,6 +143,7 @@ _PLAN_FIELDS = frozenset({
     "owner_route_sha256",
     "production_cutover_transport_sha256",
     "installer_sha256",
+    "state_helper_sha256",
     "runtime_artifact_attestation",
     "runtime_artifact_attestation_sha256",
     "maximum_provider_resize_operations",
@@ -173,6 +174,9 @@ RUNTIME_ARTIFACT_RELATIVES = {
     ),
     "guest": "scripts/canary/production_storage_growth_guest.py",
     "installer": "scripts/canary/production_storage_growth_installer.py",
+    "state_helper": (
+        "scripts/canary/production_storage_growth_state_helper.py"
+    ),
 }
 _RUNTIME_ARTIFACT_ENTRY_FIELDS = frozenset({
     "release_relative",
@@ -597,6 +601,7 @@ def build_plan(
         "production_cutover_transport_sha256": artifacts["artifacts"]
         ["production_cutover"]["sha256"],
         "installer_sha256": artifacts["artifacts"]["installer"]["sha256"],
+        "state_helper_sha256": artifacts["artifacts"]["state_helper"]["sha256"],
         "runtime_artifact_attestation": artifacts,
         "runtime_artifact_attestation_sha256": artifacts[
             "attestation_sha256"
@@ -652,6 +657,7 @@ def validate_plan(value: Any) -> Mapping[str, Any]:
         "owner_route_sha256",
         "production_cutover_transport_sha256",
         "installer_sha256",
+        "state_helper_sha256",
         "runtime_artifact_attestation_sha256",
         "idempotency_key_sha256",
     )
@@ -721,6 +727,8 @@ def validate_plan(value: Any) -> Mapping[str, Any]:
         != artifacts["artifacts"]["production_cutover"]["sha256"]
         or plan.get("installer_sha256")
         != artifacts["artifacts"]["installer"]["sha256"]
+        or plan.get("state_helper_sha256")
+        != artifacts["artifacts"]["state_helper"]["sha256"]
         or plan.get("source_preflight_sha256") != checked_source["observation_sha256"]
         or plan.get("boot_device_name")
         != checked_source["boot_attachment"]["device_name"]

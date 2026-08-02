@@ -245,6 +245,7 @@ _FULL_IAM_INTAKE_REQUEST_OPERATIONS = frozenset({
 })
 _FULL_IAM_INTAKE_RESPONSE_OPERATIONS = frozenset({
     "attest_cloud_observation",
+    "attest_production_storage_authority",
 })
 COMPUTE_POLL_ATTEMPTS = 90
 
@@ -1005,6 +1006,46 @@ def _local_production_storage_authority_binding(
         host_receipt_sha256,
         receipt_public_key,
     )
+
+
+def _local_production_storage_authority_key_attestation(
+    release_revision: str,
+) -> Mapping[str, Any]:
+    """Attest the receipt key through root-owned portable signed trust."""
+
+    (
+        _runtime,
+        manifest_sha256,
+        host_receipt_sha256,
+        trust_bundle,
+    ) = _local_cutover_authority_binding(
+        release_revision,
+        protocol.GENESIS_JOURNAL_HEAD_SHA256,
+    )
+    try:
+        checked_trust, receipt_public_key = (
+            production_cutover.validate_trust_bundle(trust_bundle)
+        )
+    except production_cutover.ProductionCutoverPasskeyError:
+        raise PasskeyV2ServiceError(
+            "passkey_v2_production_storage_trust_invalid"
+        ) from None
+    raw = receipt_public_key.public_bytes_raw()
+    unsigned = {
+        "schema": "muncho-production-storage-authority-key-attestation.v1",
+        "release_sha": release_revision,
+        "receipt_public_key_ed25519_hex": raw.hex(),
+        "receipt_public_key_id": hashlib.sha256(raw).hexdigest(),
+        "portable_trust_bundle_sha256": checked_trust[
+            "trust_bundle_sha256"
+        ],
+        "portable_trust_bundle": checked_trust,
+        "authority_manifest_sha256": manifest_sha256,
+        "authority_host_receipt_sha256": host_receipt_sha256,
+        "root_owned_trust_bundle_validated": True,
+        "rotation_requires_new_release_and_owner_install": True,
+    }
+    return {**unsigned, "attestation_sha256": protocol.sha256_json(unsigned)}
 
 
 def build_service_frame(
@@ -4643,6 +4684,9 @@ def handle_intake_frame(
             Ed25519PublicKey,
         ],
     ] = _local_production_storage_authority_binding,
+    production_storage_authority_attestor: Callable[
+        [str], Mapping[str, Any]
+    ] = _local_production_storage_authority_key_attestation,
 ) -> Mapping[str, Any]:
     frame = _validate_intake_frame(
         value,
@@ -4650,7 +4694,13 @@ def handle_intake_frame(
     )
     operation = frame["operation"]
     document = dict(frame["document"])
-    if operation == "preflight":
+    if operation == "attest_production_storage_authority":
+        if document:
+            raise PasskeyV2ServiceError("passkey_v2_service_document_invalid")
+        result = production_storage_authority_attestor(
+            release_revision
+        )
+    elif operation == "preflight":
         if document:
             raise PasskeyV2ServiceError("passkey_v2_service_document_invalid")
         authority = authority_client.call("health", {})
