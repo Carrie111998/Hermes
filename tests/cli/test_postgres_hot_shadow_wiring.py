@@ -59,9 +59,10 @@ def test_preload_observes_only_after_sqlite_history_is_authoritative() -> None:
     db = MagicMock()
     db.get_session.return_value = {"id": "session-1", "title": "demo"}
     db.resolve_resume_session_id.return_value = "session-1"
-    db.get_messages_as_conversation.return_value = [
-        {"role": "user", "content": "authoritative"}
-    ]
+    db.get_resume_conversations.return_value = (
+        [{"role": "user", "content": "authoritative"}],
+        [{"role": "user", "content": "authoritative"}],
+    )
     shell = HermesCLI.__new__(HermesCLI)
     shell._resumed = True
     shell._session_db = db

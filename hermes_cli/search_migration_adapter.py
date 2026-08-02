@@ -336,9 +336,26 @@ class SearchMigrationAdapter:
         """Render snippets in an isolated in-memory database after cache snapshot release."""
         page = sqlite3.connect(":memory:"); page.row_factory = sqlite3.Row
         try:
-            page.execute(f"CREATE VIRTUAL TABLE adapter_page USING fts5(indexed, tokenize='{tokenizer}')")
-            page.executemany("INSERT INTO adapter_page(rowid,indexed) VALUES (?,?)", [(r.id, r.indexed_text) for r in hydrated.values()])
-            return {r["rowid"]: r["snippet"] for r in page.execute("SELECT rowid,snippet(adapter_page,0,'>>>','<<<','...',40) snippet FROM adapter_page WHERE adapter_page MATCH ?", (match,))}
+            page.execute(
+                f"CREATE VIRTUAL TABLE adapter_page USING fts5("
+                f"content, tool_name, tool_calls, tokenize='{tokenizer}')"
+            )
+            page.executemany(
+                "INSERT INTO adapter_page(rowid,content,tool_name,tool_calls) "
+                "VALUES (?,?,?,?)",
+                [
+                    (r.id, r.content or "", r.tool_name or "", r.tool_calls or "")
+                    for r in hydrated.values()
+                ],
+            )
+            return {
+                r["rowid"]: r["snippet"]
+                for r in page.execute(
+                    "SELECT rowid,snippet(adapter_page,-1,'>>>','<<<','...',40) "
+                    "snippet FROM adapter_page WHERE adapter_page MATCH ?",
+                    (match,),
+                )
+            }
         finally:
             page.close()
 
