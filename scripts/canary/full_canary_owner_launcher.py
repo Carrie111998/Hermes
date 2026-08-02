@@ -14178,10 +14178,13 @@ def bootstrap_schema_reconciliation_control(
             )
 
         session = transport.open_bootstrap(release_sha)
+        # The remote process issues the gate while ``read_gate`` blocks.  A
+        # timestamp captured before the read can therefore predate the gate.
+        gate_raw = session.read_gate()
         current = now()
         try:
             gate = bootstrap.validate_gate_for_owner(
-                session.read_gate(),
+                gate_raw,
                 expected_release_revision=release_sha,
                 expected_owner_subject_sha256=expected_owner_subject,
                 owner_public_key_ed25519_hex=(
