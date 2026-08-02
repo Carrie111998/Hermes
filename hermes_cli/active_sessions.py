@@ -21,6 +21,10 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
+class ActiveSessionRegistryError(RuntimeError):
+    """The on-disk active-session registry cannot be trusted."""
+
+
 def coerce_max_concurrent_sessions(value: Any, key: str = "max_concurrent_sessions") -> Optional[int]:
     """Return a positive integer cap, or None when disabled/invalid."""
     if value is None:
@@ -185,13 +189,28 @@ def _read_entries(path: Path) -> list[dict[str, Any]]:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except Exception:
-        logger.warning("Ignoring corrupt active session registry at %s", path)
-        return []
-    entries = data.get("entries") if isinstance(data, dict) else data
+    except Exception as exc:
+        logger.error("Unreadable active session registry at %s", path)
+        raise ActiveSessionRegistryError(
+            f"unreadable active session registry: {path}"
+        ) from exc
+    if isinstance(data, dict):
+        if "entries" not in data:
+            raise ActiveSessionRegistryError(
+                f"malformed active session registry: {path}"
+            )
+        entries = data.get("entries")
+    else:
+        entries = data
     if not isinstance(entries, list):
-        return []
-    return [entry for entry in entries if isinstance(entry, dict)]
+        raise ActiveSessionRegistryError(
+            f"malformed active session registry: {path}"
+        )
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise ActiveSessionRegistryError(
+            f"malformed active session registry entries: {path}"
+        )
+    return entries
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
@@ -392,18 +411,19 @@ def try_reserve_active_session_transition(
 
 def release_active_session(lease: ActiveSessionLease) -> None:
     state_path = lease.registry_state_path()
-    try:
-        with _FileLock(lease.registry_lock_path()):
-            entries = _prune_dead(_read_entries(state_path))
-            kept = [
-                entry
-                for entry in entries
-                if str(entry.get("lease_id") or "") != lease.lease_id
-            ]
-            if len(kept) != len(entries):
-                _write_entries(state_path, kept)
-    finally:
-        lease.released = True
+    with _FileLock(lease.registry_lock_path()):
+        entries = _prune_dead(_read_entries(state_path))
+        kept = [
+            entry
+            for entry in entries
+            if str(entry.get("lease_id") or "") != lease.lease_id
+        ]
+        if len(kept) != len(entries):
+            _write_entries(state_path, kept)
+    # Publish release only after the registry transaction succeeds.  A
+    # transient lock/write failure must leave the lease retryable instead of
+    # permanently suppressing every later ``release()`` call.
+    lease.released = True
 
 
 def transfer_active_session(
@@ -443,7 +463,12 @@ def transfer_active_session(
         return updated
 
 
-def release_orphaned_leases(live_lease_ids: set[str]) -> int:
+def release_orphaned_leases(
+    live_lease_ids: set[str],
+    *,
+    state_path: str | Path | None = None,
+    lock_path: str | Path | None = None,
+) -> int:
     """Drop this process's registry entries that no live session owns.
 
     ``_prune_dead`` only reclaims leases whose owning process died. A server
@@ -454,13 +479,16 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
     turn path and no staleness threshold to tune.
     """
     pid = os.getpid()
-    state_path = _state_path()
+    resolved_state_path = (
+        Path(state_path) if state_path is not None else _state_path()
+    )
+    resolved_lock_path = Path(lock_path) if lock_path is not None else _lock_path()
     # With the cap disabled the registry is never written, so don't take a lock
     # (or create its file) on the idle-reaper tick for the majority of installs.
-    if not state_path.exists():
+    if not resolved_state_path.exists():
         return 0
-    with _FileLock(_lock_path()):
-        entries = _prune_dead(_read_entries(state_path))
+    with _FileLock(resolved_lock_path):
+        entries = _prune_dead(_read_entries(resolved_state_path))
         kept = [
             entry
             for entry in entries
@@ -469,7 +497,7 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
         ]
         dropped = len(entries) - len(kept)
         if dropped:
-            _write_entries(state_path, kept)
+            _write_entries(resolved_state_path, kept)
     return dropped
 
 

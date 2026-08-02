@@ -524,6 +524,14 @@ class ComputeHost:
         with session.lock:
             history = list(session.agent.history)
         session.agent.clear_interrupt()
+        self.emit(
+            {
+                "type": "turn.accepted",
+                "sid": session.sid,
+                "request_id": request_id,
+                "accepted_ns": now_ns(),
+            }
+        )
         self.emit({"type": "turn.started", "sid": session.sid, "request_id": request_id, "started_ns": now_ns()})
 
         def stream(delta: str) -> None:
@@ -571,6 +579,121 @@ class ComputeHost:
 
     # ── Real dashboard turn path ───────────────────────────────────────
 
+    def _wait_for_real_turn_admission(
+        self,
+        session: dict[str, Any],
+        *,
+        sid: str,
+        admission_token: str,
+        admission_kind: str,
+    ) -> None:
+        """Validate a request-owned reservation without consuming it.
+
+        First-turn persistence can block on SQLite.  Keep the protocol-time
+        reservation live across that write, then validate it again when the
+        worker claims ``running``.  An interrupt that lands during the write
+        removes the token, so the post-write claim fails instead of starting
+        cancelled model work.
+        """
+        while True:
+            if admission_kind == "initial":
+                with self._real_turn_admissions_lock:
+                    with session["history_lock"]:
+                        if (
+                            self._real_turn_admissions.get(sid)
+                            != admission_token
+                            or session.get("_compute_host_turn_admission")
+                            != admission_token
+                        ):
+                            raise RuntimeError("turn admission expired")
+                return
+
+            if admission_kind in {"idle", "terminal-successor"}:
+                admission_field = (
+                    "_compute_host_terminal_successor_pending"
+                    if admission_kind == "terminal-successor"
+                    else "_compute_host_turn_admission"
+                )
+                with session["history_lock"]:
+                    if session.get(admission_field) != admission_token:
+                        raise RuntimeError("turn admission expired")
+                    wait_for_terminal = bool(
+                        admission_kind == "terminal-successor"
+                        and session.get("_compute_host_terminal_pending")
+                    )
+                    if not wait_for_terminal:
+                        if (
+                            session.get("running")
+                            or session.get("_compute_host_control_pending")
+                        ):
+                            raise RuntimeError("session busy")
+                        return
+            else:
+                # Direct unit-level callers predate protocol-time admission.
+                with session["history_lock"]:
+                    wait_for_terminal = bool(
+                        session.get("_compute_host_terminal_pending")
+                    )
+                    if not wait_for_terminal:
+                        if session.get("running"):
+                            raise RuntimeError("session busy")
+                        return
+
+            if self._closed.wait(0.005):
+                raise RuntimeError("compute host shutting down")
+
+    def _claim_real_turn_admission(
+        self,
+        server: Any,
+        session: dict[str, Any],
+        frame: dict[str, Any],
+        *,
+        sid: str,
+        admission_token: str,
+        admission_kind: str,
+    ) -> int:
+        """Consume a still-valid reservation and publish ``running``."""
+        if admission_kind == "initial":
+            with self._real_turn_admissions_lock:
+                with session["history_lock"]:
+                    if (
+                        self._real_turn_admissions.get(sid) != admission_token
+                        or session.get("_compute_host_turn_admission")
+                        != admission_token
+                    ):
+                        raise RuntimeError("turn admission expired")
+                    self._real_turn_admissions.pop(sid, None)
+                    session.pop("_compute_host_turn_admission", None)
+                    return self._mark_real_turn_running(server, session, frame)
+
+        if admission_kind in {"idle", "terminal-successor"}:
+            admission_field = (
+                "_compute_host_terminal_successor_pending"
+                if admission_kind == "terminal-successor"
+                else "_compute_host_turn_admission"
+            )
+            with session["history_lock"]:
+                if session.get(admission_field) != admission_token:
+                    raise RuntimeError("turn admission expired")
+                if (
+                    session.get("running")
+                    or session.get("_compute_host_control_pending")
+                    or (
+                        admission_kind == "terminal-successor"
+                        and session.get("_compute_host_terminal_pending")
+                    )
+                ):
+                    raise RuntimeError("session busy")
+                session.pop(admission_field, None)
+                return self._mark_real_turn_running(server, session, frame)
+
+        with session["history_lock"]:
+            if session.get("running") or session.get(
+                "_compute_host_terminal_pending"
+            ):
+                raise RuntimeError("session busy")
+            return self._mark_real_turn_running(server, session, frame)
+
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
@@ -593,96 +716,73 @@ class ComputeHost:
                 ):
                     self.emit(
                         {
-                            "type": "turn.end",
+                            "type": "turn.error",
                             "sid": sid,
                             "request_id": request_id,
-                            "interrupted": True,
-                            "ended_ns": now_ns(),
+                            "reason": "cancelled_before_accept",
+                            "message": "queued prompt was cancelled before acceptance",
                         }
                     )
                     return
             admission_token = str(frame.get("_compute_host_admission_token") or "")
             admission_kind = str(frame.get("_compute_host_admission_kind") or "")
-            if admission_kind == "initial":
-                # Keep the host-level reservation and the freshly initialized
-                # session reservation under one lock order until running=True.
-                with self._real_turn_admissions_lock:
-                    with session["history_lock"]:
-                        if (
-                            self._real_turn_admissions.get(sid) != admission_token
-                            or session.get("_compute_host_turn_admission")
-                            != admission_token
-                        ):
-                            raise RuntimeError("turn admission expired")
-                        self._real_turn_admissions.pop(sid, None)
-                        session.pop("_compute_host_turn_admission", None)
-                        base_history_version = self._mark_real_turn_running(
-                            server, session, frame
-                        )
-                        turn_claimed = True
-            elif admission_kind in {"idle", "terminal-successor"}:
-                admission_field = (
-                    "_compute_host_terminal_successor_pending"
-                    if admission_kind == "terminal-successor"
-                    else "_compute_host_turn_admission"
-                )
-                while True:
-                    wait_for_terminal = False
-                    with session["history_lock"]:
-                        if session.get(admission_field) != admission_token:
-                            raise RuntimeError("turn admission expired")
-                        if (
-                            admission_kind == "terminal-successor"
-                            and session.get("_compute_host_terminal_pending")
-                        ):
-                            wait_for_terminal = True
-                        else:
-                            if (
-                                session.get("running")
-                                or session.get("_compute_host_control_pending")
-                            ):
-                                raise RuntimeError("session busy")
-                            session.pop(admission_field, None)
-                            base_history_version = self._mark_real_turn_running(
-                                server, session, frame
-                            )
-                            turn_claimed = True
-                            break
-                    if wait_for_terminal and self._closed.wait(0.005):
-                        raise RuntimeError("compute host shutting down")
-            else:
-                # Direct unit-level callers predate protocol-time admission.
-                # Production turn.start frames always carry one of the kinds
-                # above; preserve the narrow test seam without weakening wire
-                # ordering semantics.
-                while True:
-                    with session["history_lock"]:
-                        terminal_pending = bool(
-                            session.get("_compute_host_terminal_pending")
-                        )
-                        if not terminal_pending:
-                            if session.get("running"):
-                                raise RuntimeError("session busy")
-                            base_history_version = self._mark_real_turn_running(
-                                server, session, frame
-                            )
-                            turn_claimed = True
-                            break
-                    if self._closed.wait(0.005):
-                        raise RuntimeError("compute host shutting down")
-            self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
+
+            self._wait_for_real_turn_admission(
+                session,
+                sid=sid,
+                admission_token=admission_token,
+                admission_kind=admission_kind,
+            )
             try:
-                server._ensure_session_db_row(session)
-            except Exception:
-                pass
+                server._ensure_session_db_row(session, raise_on_error=True)
+                server._persist_branch_seed(session, raise_on_error=True)
+            except Exception as exc:
+                from hermes_state import is_disk_full_error
+
+                code = 5070 if is_disk_full_error(exc) else 5071
+                message = (
+                    "disk full: session storage could not be written — free "
+                    "some disk space and try again"
+                    if code == 5070
+                    else f"session storage could not be written: {exc}"
+                )
+                self.emit(
+                    {
+                        "type": "turn.error",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "reason": "persistence_failed",
+                        "rpc_error": {"code": code, "message": message},
+                        "message": message,
+                    }
+                )
+                return
+
+            base_history_version = self._claim_real_turn_admission(
+                server,
+                session,
+                frame,
+                sid=sid,
+                admission_token=admission_token,
+                admission_kind=admission_kind,
+            )
+            turn_claimed = True
+            # Acceptance is the durability boundary. The supervisor does not
+            # return prompt.submit success until this frame arrives; no model
+            # work or user-visible message.start is allowed before it.
+            self.emit(
+                {
+                    "type": "turn.accepted",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "accepted_ns": now_ns(),
+                }
+            )
+            self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
             try:
                 import hermes_undo
 
                 hermes_undo.on_user_message_appended(session["session_key"])
-            except Exception:
-                pass
-            try:
-                server._persist_branch_seed(session)
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
@@ -902,6 +1002,10 @@ class ComputeHost:
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
+            if frame.get("parent_lease_id"):
+                session["_compute_host_parent_lease_id"] = str(
+                    frame.get("parent_lease_id")
+                )
             incoming_history = frame.get("history")
             try:
                 incoming_version = int(frame.get("history_version") or 0)
@@ -932,6 +1036,10 @@ class ComputeHost:
                     frame.get("_compute_host_admission_token") or ""
                 )
             }
+            if frame.get("parent_lease_id"):
+                initial_session_state["_compute_host_parent_lease_id"] = str(
+                    frame.get("parent_lease_id")
+                )
         session_db = None
         home_token = None
         secret_token = None

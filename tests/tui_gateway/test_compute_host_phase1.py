@@ -68,6 +68,7 @@ def test_compute_host_frame_protocol_round_trip():
         assert end["history_version"] == 1
         frames = _json_lines(out)
         assert [f["type"] for f in frames if f.get("request_id") == "turn-1"] == [
+            "turn.accepted",
             "turn.started",
             "delta",
             "delta",
@@ -1559,6 +1560,11 @@ for raw in sys.stdin:
         break
     if frame.get('type') == 'turn.start':
         turn = frame
+        print(json.dumps({
+            'type':'turn.accepted',
+            'sid':turn.get('sid'),
+            'request_id':turn.get('request_id'),
+        }), flush=True)
         print(json.dumps({
             'type':'interactive.request',
             'sid':frame.get('sid'),

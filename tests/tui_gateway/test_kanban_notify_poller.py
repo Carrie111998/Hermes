@@ -11,7 +11,10 @@ These tests cover the delivery half that now lives in tui_gateway/server.py:
 unsubscribe) and ``_format_kanban_event_text``.
 """
 
+import threading
 from types import SimpleNamespace
+
+import pytest
 
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
@@ -23,7 +26,11 @@ SESSION_KEY = "tui-session-key-1"
 
 
 def _session(key: str = SESSION_KEY) -> dict:
-    return {"session_key": key}
+    return {
+        "session_key": key,
+        "history_lock": threading.Lock(),
+        "_kanban_pending": [],
+    }
 
 
 def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
@@ -150,6 +157,58 @@ class TestCollectKanbanNotifications:
         assert "cross-profile delivery" in texts[0]
         assert _sub_rows(tid) == []
 
+    @pytest.mark.parametrize("failure_stage", ["lookup", "format"])
+    def test_failure_before_pending_ownership_retries_terminal_once(
+        self, monkeypatch, failure_stage
+    ):
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        before_cursor = int(_sub_rows(tid)[0]["last_event_id"])
+        _complete(tid, summary="retry exactly once")
+        session = _session()
+        failed = False
+
+        if failure_stage == "lookup":
+            original = kb.get_task
+
+            def fail_once(*args, **kwargs):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise RuntimeError("lookup failed")
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(kb, "get_task", fail_once)
+        else:
+            original = server._format_kanban_event_text
+
+            def fail_once(*args, **kwargs):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise RuntimeError("format failed")
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(server, "_format_kanban_event_text", fail_once)
+
+        with pytest.raises(RuntimeError, match="failed"):
+            server._collect_kanban_notifications(session)
+
+        rows = _sub_rows(tid)
+        assert len(rows) == 1
+        assert int(rows[0]["last_event_id"]) == before_cursor
+        assert session["_kanban_pending"] == []
+
+        retry = server._collect_kanban_notifications(session)
+        assert len(retry) == 1
+        assert tid in retry[0]
+        assert session["_kanban_pending"] == retry
+        assert _sub_rows(tid) == []
+
+        assert server._collect_kanban_notifications(session) == []
+        assert session["_kanban_pending"] == retry
+
 
 class TestFormatKanbanEventText:
     SUB = {"task_id": "t_abc123"}
@@ -205,6 +264,7 @@ class TestNotificationPollerLoopKanbanWiring:
             "_run_prompt_submit",
             lambda rid, sid, sess, text: submits.append(text),
         )
+        server._sessions["sid-poller-test"] = session
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -235,6 +295,8 @@ class TestNotificationPollerLoopKanbanWiring:
         }
 
     def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):
+        import tui_gateway.server as server
+
         tid = _create_subscribed_task()
         _complete(tid, summary="poller e2e done")
         session = self._poller_session(running=False)
@@ -245,6 +307,8 @@ class TestNotificationPollerLoopKanbanWiring:
         finally:
             stop.set()
             thread.join(timeout=5)
+            server._sessions.pop("sid-poller-test", None)
+            server._release_active_session_slot(session)
 
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
         assert any(tid in t for t in status_texts), status_texts
@@ -275,6 +339,10 @@ class TestNotificationPollerLoopKanbanWiring:
         finally:
             stop.set()
             thread.join(timeout=5)
+            import tui_gateway.server as server
+
+            server._sessions.pop("sid-poller-test", None)
+            server._release_active_session_slot(session)
 
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []

@@ -2796,12 +2796,32 @@ def _(rid, params: dict) -> dict:
 @method("session.close")
 def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
-    # Serialize only the ownership claim against session.resume / the orphan
-    # reaper. Finalization may run arbitrary plugin/agent cleanup and must not
-    # keep every unrelated session.resume waiting behind it.
+    # Mark child-owned work for close while it is still published in
+    # _sessions. Its inherited child admission relies on the parent's sole
+    # lease, so popping/releasing first would let another process exceed cap
+    # while the child kept computing.
     with _session_resume_lock:
-        session = _pop_session_by_id(sid)
-    closed = _teardown_popped_session(session, end_reason="tui_close")
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            child_running = _compute_host_handoff_live(session)
+            if child_running:
+                session["_closing"] = True
+                session["_compute_host_close_requested"] = "tui_close"
+                popped = None
+            else:
+                popped = _pop_session_by_id(sid)
+    if child_running:
+        settled = _request_compute_host_close(
+            sid, session, end_reason="tui_close"
+        )
+        if settled:
+            with _session_resume_lock:
+                popped = _pop_session_by_id(sid)
+            # The terminal callback may have won the same idempotent pop.
+            closed = _teardown_popped_session(popped, end_reason="tui_close")
+            return _ok(rid, {"closed": closed or sid not in _sessions})
+        return _ok(rid, {"closed": False, "closing": True})
+    closed = _teardown_popped_session(popped, end_reason="tui_close")
     return _ok(rid, {"closed": closed})
 
 

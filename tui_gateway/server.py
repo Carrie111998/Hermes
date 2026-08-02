@@ -172,6 +172,12 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+# Leases being released after their session has left ``_sessions`` still need
+# a process-local owner.  Keep them keyed by their pinned registry + lease id
+# until the registry transaction succeeds; orphan reconciliation treats these
+# entries as live and also supplies the retry clock.
+_pending_lease_releases_lock = threading.RLock()
+_pending_lease_releases: dict[tuple[str, str, str], Any] = {}
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -560,17 +566,12 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     contract _ensure_session_db_row already uses for the row itself, and keeps
     the invariant that anything holding a slot is something the user can see.
     """
-    if session.get("active_session_lease") is not None:
-        return None
-    lease, limit_message = _claim_active_session_slot(
-        str(session.get("session_key") or ""),
-        live_session_id=sid,
-        surface=_session_source(session),
-    )
-    if limit_message is not None:
-        return limit_message
-    session["active_session_lease"] = lease
-    return None
+    with _session_work_admission_lock(session):
+        with _sessions_lock:
+            if _sessions.get(sid) is not session or session.get("_finalized"):
+                return "session is no longer active"
+            with session["history_lock"]:
+                return _ensure_active_session_slot_locked(sid, session)
 
 
 def _claim_active_session_slot_for_profile(
@@ -598,6 +599,163 @@ def _claim_active_session_slot_for_profile(
             reset_hermes_home_override(token)
 
 
+_SESSION_WORK_ADMITTED = "admitted"
+_SESSION_WORK_DEFERRED = "deferred"
+_SESSION_WORK_DENIED = "denied"
+_SESSION_WORK_CLOSED = "closed"
+_SESSION_CAPACITY_ERROR = (
+    "Hermes could not verify active session capacity. Try again shortly."
+)
+_SESSION_STATE_ABSENT = object()
+_PROMPT_ADMISSION_STATE_FIELDS = (
+    "running",
+    "turn_settled",
+    "last_active",
+    "detached_turn_task_id",
+    "_turn_cancel_requested",
+    "inflight_turn",
+)
+
+
+def _session_work_admission_lock(session: dict) -> threading.RLock:
+    """Return the lock serializing all attempts to start work in a session."""
+    with _sessions_lock:
+        lock = session.get("_work_admission_lock")
+        if lock is None:
+            lock = threading.RLock()
+            session["_work_admission_lock"] = lock
+        return lock
+
+
+def _ensure_active_session_slot_locked(sid: str, session: dict) -> str | None:
+    """Claim and publish a lease while lifecycle + history locks are held."""
+    if session.get("active_session_lease") is not None:
+        return None
+    if _inside_compute_host_child() and session.get(
+        "_compute_host_parent_lease_id"
+    ):
+        # The serving parent already owns the one profile-local lease for this
+        # logical session. Child-side continuations, notifications and Kanban
+        # turns share that ownership marker instead of acquiring a second slot.
+        # Only a parent turn.start frame can install the marker, so unrelated
+        # sessions created inside the child still go through normal admission.
+        return None
+    lease, limit_message = _claim_active_session_slot_for_profile(
+        str(session.get("session_key") or ""),
+        live_session_id=sid,
+        surface=_session_source(session),
+        profile_home=session.get("profile_home"),
+    )
+    if limit_message is not None:
+        return limit_message
+    if lease is None:
+        # Registry/config/locking failures are not proof that capacity exists.
+        # Starting unleased work would silently bypass the configured cap.
+        return _SESSION_CAPACITY_ERROR
+    session["active_session_lease"] = lease
+    return None
+
+
+def _admit_session_work(
+    sid: str,
+    session: dict,
+    *,
+    blocked_if=None,
+) -> tuple[str, str | None]:
+    """Atomically claim capacity and mark one idle session as running.
+
+    Lock order is admission -> lifecycle -> history -> profile registry file.
+    The orphan reconciler holds the lifecycle lock while reconciling registry
+    snapshots, so it can neither miss a just-published lease nor delete a lease
+    between its registry claim and publication on the live session.
+    """
+    with _session_work_admission_lock(session):
+        with _sessions_lock:
+            if (
+                _sessions.get(sid) is not session
+                or session.get("_finalized")
+                or session.get("_closing")
+            ):
+                return _SESSION_WORK_CLOSED, "session is no longer active"
+            with session["history_lock"]:
+                if session.get("running") or _interrupt_call_pending(session):
+                    return _SESSION_WORK_DEFERRED, None
+                if blocked_if is not None and blocked_if(session):
+                    return _SESSION_WORK_DEFERRED, None
+                if limit_message := _ensure_active_session_slot_locked(sid, session):
+                    return _SESSION_WORK_DENIED, limit_message
+                session["running"] = True
+                session["turn_settled"] = False
+                session["last_active"] = time.time()
+                return _SESSION_WORK_ADMITTED, None
+
+
+def _snapshot_prompt_admission_state(session: dict) -> dict[str, Any]:
+    """Capture fields mutated between prompt admission and dispatch."""
+    return {
+        field: session.get(field, _SESSION_STATE_ABSENT)
+        for field in _PROMPT_ADMISSION_STATE_FIELDS
+    }
+
+
+def _rollback_prompt_admission(
+    session: dict,
+    state: dict[str, Any],
+    *,
+    lease_before: Any = None,
+    rewind_candidate: dict[str, Any] | None = None,
+) -> None:
+    """Restore a prompt rejected after admission and undo its first lease.
+
+    A persisted-session lease predating this prompt belongs to the idle
+    conversation and must survive a failed write.  Only a lease installed by
+    this admission is released, returning an otherwise-idle first-turn draft
+    to the same lease-free state it had before the RPC.
+    """
+    # A rewind is durably truncated before dispatch. If the child rejects the
+    # turn before acceptance, compensate that candidate before restoring its
+    # in-memory projection; otherwise a persistence rejection would silently
+    # commit the user's rewind even though the edited turn never ran.
+    if rewind_candidate and rewind_candidate.get("persisted"):
+        original_history = list(rewind_candidate.get("history") or [])
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    raise RuntimeError("session store unavailable")
+                db.replace_messages(session["session_key"], original_history)
+        except Exception:
+            # Keep memory aligned with the durable truncated state if the
+            # compensating write itself cannot commit. The original RPC error
+            # remains primary, and this exceptional recovery failure is loud.
+            logger.exception(
+                "failed to restore durable rewind candidate for session %s",
+                session.get("session_key"),
+            )
+            rewind_candidate = None
+
+    acquired_lease = None
+    with _session_work_admission_lock(session):
+        with session["history_lock"]:
+            for field, value in state.items():
+                if value is _SESSION_STATE_ABSENT:
+                    session.pop(field, None)
+                else:
+                    session[field] = value
+            if rewind_candidate and rewind_candidate.get("persisted"):
+                session["history"] = list(
+                    rewind_candidate.get("history") or []
+                )
+                session["history_version"] = int(
+                    rewind_candidate.get("history_version") or 0
+                )
+            current_lease = session.get("active_session_lease")
+            if lease_before is None and current_lease is not None:
+                acquired_lease = current_lease
+                session.pop("active_session_lease", None)
+    if acquired_lease is not None:
+        _release_lease_durably(acquired_lease)
+
+
 def _reserve_detach_capacity(
     source_sid: str,
     source: dict,
@@ -619,7 +777,10 @@ def _reserve_detach_capacity(
             )
     except Exception as exc:
         logger.warning("Failed to reserve detach capacity: %s", exc)
-        return None, None
+        return None, (
+            "Hermes could not reserve capacity for detaching this turn. "
+            "The foreground turn is still running unchanged; try again."
+        )
 
 
 def _release_detach_capacity_reservation(
@@ -631,26 +792,70 @@ def _release_detach_capacity_reservation(
         current = source.get("detach_capacity_reservation")
         if reservation is None:
             reservation = current
-        if current is reservation:
-            source.pop("detach_capacity_reservation", None)
     if reservation is None:
         return
+    released = _release_lease_durably(reservation)
+    if source is not None and source.get("detach_capacity_reservation") is reservation:
+        # On failure the process-owned retry registry is now the live owner.
+        source.pop("detach_capacity_reservation", None)
+    if not released:
+        logger.debug("Retained failed detach capacity release for retry")
+
+
+def _lease_release_key(lease: Any) -> tuple[str, str, str]:
+    """Stable process-owned identity for one pinned registry lease."""
     try:
-        reservation.release()
+        state_path = str(lease.registry_state_path())
     except Exception:
-        logger.debug("Failed to release detach capacity reservation", exc_info=True)
+        state_path = str(getattr(lease, "state_path", "") or "")
+    try:
+        lock_path = str(lease.registry_lock_path())
+    except Exception:
+        lock_path = str(getattr(lease, "lock_path", "") or "")
+    lease_id = str(getattr(lease, "lease_id", "") or id(lease))
+    return state_path, lock_path, lease_id
+
+
+def _retain_lease_for_release(lease: Any) -> tuple[str, str, str]:
+    key = _lease_release_key(lease)
+    with _pending_lease_releases_lock:
+        _pending_lease_releases[key] = lease
+    return key
+
+
+def _release_lease_durably(lease: Any) -> bool:
+    """Release a lease, retaining process ownership across any failure."""
+    key = _retain_lease_for_release(lease)
+    try:
+        lease.release()
+    except Exception:
+        logger.debug("Failed to release active-session lease", exc_info=True)
+        return False
+    with _pending_lease_releases_lock:
+        if _pending_lease_releases.get(key) is lease:
+            _pending_lease_releases.pop(key, None)
+    return True
+
+
+def _retain_session_leases_for_release(session: dict | None) -> None:
+    """Transfer teardown-bound lease ownership before removing a session."""
+    if not session:
+        return
+    for field in ("active_session_lease", "detach_capacity_reservation"):
+        lease = session.get(field)
+        if lease is not None:
+            _retain_lease_for_release(lease)
 
 
 def _release_active_session_slot(session: dict | None) -> None:
     if not session:
         return
-    lease = session.pop("active_session_lease", None)
+    lease = session.get("active_session_lease")
     if lease is None:
         return
-    try:
-        lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+    _release_lease_durably(lease)
+    if session.get("active_session_lease") is lease:
+        session.pop("active_session_lease", None)
 
 
 def _transfer_active_session_slot(
@@ -694,10 +899,7 @@ def _transfer_active_session_slot(
     if new_lease is not None:
         old_lease = session.pop("active_session_lease", None)
         if old_lease is not None:
-            try:
-                old_lease.release()
-            except Exception:
-                logger.debug("Failed to release stale active session slot", exc_info=True)
+            _release_lease_durably(old_lease)
         session["active_session_lease"] = new_lease
         return True
     # Reserve failed — retain the existing lease rather than dropping it.
@@ -1095,6 +1297,10 @@ def _pop_session_by_id(
             and not allow_running_detached
         ):
             return None
+        # Transfer ownership before the session disappears. Reconciliation
+        # holds this same lifecycle lock, so it cannot snapshot the registry in
+        # the gap between pop and a failed teardown release.
+        _retain_session_leases_for_release(session)
         session = _sessions.pop(sid, None)
     if session is None:
         return None
@@ -1134,6 +1340,61 @@ def _close_session_by_id(
         ),
         end_reason=end_reason,
     )
+
+
+def _request_compute_host_close(
+    sid: str,
+    session: dict,
+    *,
+    end_reason: str,
+    timeout: float = 10.0,
+) -> bool:
+    """Cancel one child-owned turn without dropping its parent's lease.
+
+    The parent stays in ``_sessions`` while waiting, so normal lease
+    reconciliation continues to see its registry ownership.  A timeout keeps
+    the close request latched; the eventual child terminal callback completes
+    teardown and releases the lease.  Thus a non-interruptible tool can delay
+    close, but can never make capacity available while it still computes.
+    """
+    with _sessions_lock:
+        if _sessions.get(sid) is not session:
+            return True
+        with session["history_lock"]:
+            child_running = _compute_host_handoff_live(session)
+            if not child_running:
+                return True
+            session["_closing"] = True
+            session["_compute_host_close_requested"] = end_reason
+            session["_turn_cancel_requested"] = True
+            session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
+
+    _clear_pending(sid)
+    _cancel_compute_host_interactions(sid)
+    supervisor = _compute_host_supervisor
+    if supervisor is None:
+        # No verified terminal owner: keep the session and lease until the
+        # existing completion path proves settlement.
+        return False
+    try:
+        interrupt_and_wait = getattr(supervisor, "interrupt_and_wait", None)
+        if callable(interrupt_and_wait):
+            settled = bool(interrupt_and_wait(sid, timeout=timeout))
+        else:
+            supervisor.interrupt(sid, request_id=f"close-{uuid.uuid4().hex}")
+            settled = False
+    except Exception:
+        logger.debug("compute-host close interrupt failed", exc_info=True)
+        is_running = getattr(supervisor, "is_running", None)
+        # A stopped host is verified terminal even if the pipe write raced its
+        # exit. A live host retains ownership and its eventual callback closes.
+        settled = bool(callable(is_running) and not is_running())
+
+    if settled:
+        with session["history_lock"]:
+            settled = not _compute_host_handoff_live(session)
+    return settled
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
@@ -1228,6 +1489,7 @@ def _close_sessions_for_transport(
             if session.get("close_on_disconnect") and not _detached_dispatch_is_protected(
                 session
             ):
+                _retain_session_leases_for_release(session)
                 popped = _sessions.pop(sid, None)
                 if popped is session:
                     session["_sid"] = sid
@@ -1328,22 +1590,71 @@ def _reap_idle_sessions() -> None:
 
 
 def _reclaim_orphaned_leases() -> None:
-    """Hand the registry the lease ids we still own so it can drop the rest."""
+    """Reconcile each profile registry against the leases it still owns."""
     try:
         from hermes_cli.active_sessions import release_orphaned_leases
 
         with _sessions_lock:
-            live = set()
+            # Retry teardown releases before reconciling. Failures remain in
+            # the process-owned registry below and therefore remain live; a
+            # successful retry removes the on-disk entry itself.
+            with _pending_lease_releases_lock:
+                pending_releases = list(_pending_lease_releases.values())
+            for lease in pending_releases:
+                _release_lease_durably(lease)
+
+            launch_runtime = Path(_hermes_home) / "runtime"
+            registries: dict[tuple[Path, Path], set[str]] = {
+                (
+                    launch_runtime / "active_sessions.json",
+                    launch_runtime / "active_sessions.lock",
+                ): set()
+            }
             for session in _sessions.values():
+                session_runtime = _session_home(session) / "runtime"
+                registries.setdefault(
+                    (
+                        session_runtime / "active_sessions.json",
+                        session_runtime / "active_sessions.lock",
+                    ),
+                    set(),
+                )
                 for field in (
                     "active_session_lease",
                     "detach_capacity_reservation",
                 ):
                     lease = session.get(field)
                     if lease is not None:
-                        live.add(lease.lease_id)
-        if dropped := release_orphaned_leases(live):
-            logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
+                        state_path = lease.registry_state_path()
+                        lock_path = lease.registry_lock_path()
+                        registries.setdefault((state_path, lock_path), set()).add(
+                            lease.lease_id
+                        )
+
+            with _pending_lease_releases_lock:
+                retained_releases = list(_pending_lease_releases.values())
+            for lease in retained_releases:
+                state_path = lease.registry_state_path()
+                lock_path = lease.registry_lock_path()
+                registries.setdefault((state_path, lock_path), set()).add(
+                    lease.lease_id
+                )
+
+            # Keep the lifecycle lock through every file transaction. Admission
+            # uses the same lifecycle -> history -> file order, so a new lease
+            # cannot be claimed after this snapshot and then mistaken for an
+            # orphan before it is published on its session.
+            dropped_total = 0
+            for (state_path, lock_path), live_ids in registries.items():
+                dropped_total += release_orphaned_leases(
+                    live_ids,
+                    state_path=state_path,
+                    lock_path=lock_path,
+                )
+        if dropped_total:
+            logger.info(
+                "Reclaimed %d orphaned active-session lease(s)", dropped_total
+            )
     except Exception:
         logger.debug("orphaned lease reclaim failed", exc_info=True)
 
@@ -2153,6 +2464,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
+    lease = session.get("active_session_lease")
     return {
         "type": "turn.start",
         "sid": sid,
@@ -2170,6 +2482,7 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        "parent_lease_id": str(getattr(lease, "lease_id", "") or ""),
     }
 
 
@@ -2233,6 +2546,27 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
+def _compute_host_handoff_live(session: dict | None) -> bool:
+    """Whether parent capacity is still handed to a compute-host turn.
+
+    ``_compute_host_request_id`` is published under ``history_lock`` before
+    the turn.start pipe write and is cleared only by synchronous dispatch
+    rollback or the matching child terminal callback.  It therefore covers
+    the admission/accept/start window where ``_compute_host_active`` has not
+    been published yet.  The active+running fallback keeps compatibility with
+    sessions created by older hosts that did not retain a request generation.
+    """
+    if not session:
+        return False
+    return bool(
+        session.get("_compute_host_request_id")
+        or (
+            session.get("_compute_host_active")
+            and session.get("running")
+        )
+    )
+
+
 def _on_compute_host_turn_done(
     rid: str,
     sid: str,
@@ -2262,6 +2596,12 @@ def _on_compute_host_turn_done(
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
     _retire_compute_host_interactions(sid)
+    close_reason = str(session.get("_compute_host_close_requested") or "")
+    if close_reason:
+        # turn.end/turn.error is the proof that inherited child work no longer
+        # owns the parent's slot. Only now may teardown release that lease.
+        _close_session_by_id(sid, end_reason=close_reason)
+        return
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         status = "error"
@@ -2347,16 +2687,69 @@ def _submit_prompt_to_compute_host(
             # and busy-input interrupts use the same lock, so either turn.start
             # is written first and stop follows, or cancellation wins and this
             # submission never reaches the child.
-            _get_compute_host_supervisor(cfg).submit_turn(
+            acceptance = _get_compute_host_supervisor(cfg).submit_turn(
                 frame, on_complete=_complete
             )
         except Exception as exc:
+            close_reason = ""
             with session["history_lock"]:
                 if session.get("_compute_host_request_id") == host_request_id:
                     session.pop("_compute_host_request_id", None)
+                close_reason = str(
+                    session.get("_compute_host_close_requested") or ""
+                )
+                if close_reason:
+                    # No child terminal will follow a synchronous dispatch
+                    # rollback. Publish the verified idle state here so the
+                    # deferred session.close can finish instead of waiting on
+                    # a callback that cannot exist.
+                    session["running"] = False
+                    session["turn_settled"] = True
+                    _clear_inflight_turn(session)
+            if close_reason:
+                _close_session_by_id(sid, end_reason=close_reason)
             return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        if (
+            isinstance(acceptance, dict)
+            and acceptance.get("type") == "turn.error"
+        ):
+            close_reason = ""
+            with session["history_lock"]:
+                if session.get("_compute_host_request_id") == host_request_id:
+                    session.pop("_compute_host_request_id", None)
+                close_reason = str(
+                    session.get("_compute_host_close_requested") or ""
+                )
+                if close_reason:
+                    session["running"] = False
+                    session["turn_settled"] = True
+                    _clear_inflight_turn(session)
+            if close_reason:
+                _close_session_by_id(sid, end_reason=close_reason)
+            rpc_error = acceptance.get("rpc_error")
+            if not isinstance(rpc_error, dict):
+                rpc_error = {}
+            try:
+                code = int(rpc_error.get("code") or 5019)
+            except (TypeError, ValueError):
+                code = 5019
+            message = str(
+                rpc_error.get("message")
+                or acceptance.get("message")
+                or "compute host rejected turn"
+            )
+            response = _err(rid, code, message)
+            response["error"]["data"] = {
+                "reason": str(acceptance.get("reason") or "rejected"),
+                "turn_isolation": True,
+            }
+            return response
         with session["history_lock"]:
-            session["_compute_host_active"] = True
+            # A very short turn can terminally settle before submit_turn's
+            # waiter is scheduled. Do not republish active ownership after the
+            # matching callback already cleared this generation.
+            if session.get("_compute_host_request_id") == host_request_id:
+                session["_compute_host_active"] = True
             # Explicit paths came from a captured/queued prompt. Do not erase
             # attachments added concurrently while the pipe write was in
             # flight; only consume the live attachment buffer when it supplied
@@ -3015,7 +3408,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
-    return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+    return (
+        (s, None)
+        if s and not s.get("_closing")
+        else (None, _err(rid, 4001, "session not found"))
+    )
 
 
 def _sess(params, rid):
@@ -3339,7 +3736,9 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
+def _ensure_session_db_row(
+    session: dict, *, raise_on_error: bool = False
+) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
     Called from prompt.submit so a row only exists once the user actually sends
@@ -3374,6 +3773,8 @@ def _ensure_session_db_row(session: dict) -> None:
         try:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
         except Exception:
+            if raise_on_error:
+                raise
             logger.debug("failed to open profile db for session row", exc_info=True)
             return
         close_db = True
@@ -3381,6 +3782,8 @@ def _ensure_session_db_row(session: dict) -> None:
         db = _get_db()
         close_db = False
     if db is None:
+        if raise_on_error:
+            raise RuntimeError("session store unavailable")
         return
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
@@ -3460,7 +3863,7 @@ def _ensure_session_db_row(session: dict) -> None:
         # no toast. Re-raise so the submit handler can return a real RPC error.
         from hermes_state import is_disk_full_error
 
-        if is_disk_full_error(exc):
+        if raise_on_error or is_disk_full_error(exc):
             raise
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -3471,7 +3874,9 @@ def _ensure_session_db_row(session: dict) -> None:
                 pass
 
 
-def _persist_branch_seed(session: dict) -> None:
+def _persist_branch_seed(
+    session: dict, *, raise_on_error: bool = False
+) -> None:
     """First-turn persist of a branch's copied transcript.
 
     A branch is a draft until its first submit: the parent's messages live only
@@ -3491,23 +3896,21 @@ def _persist_branch_seed(session: dict) -> None:
         return
     with _session_db(session) as db:
         if db is None:
+            if raise_on_error:
+                raise RuntimeError("session store unavailable")
             return
         try:
-            for msg in seed:
-                db.append_message(
-                    session_id=key,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    # Preserve the parent's original message timestamps —
-                    # append_message would otherwise stamp time.time() and the
-                    # branch's copied history would all appear authored "now".
-                    timestamp=msg.get("timestamp"),
-                )
+            # The branch row is still empty at first admission. Replace the
+            # whole seed in SessionDB's single write transaction so a failure
+            # cannot leave a half-copied parent transcript that a retry would
+            # then duplicate. ``replace_messages`` preserves message
+            # timestamps and the richer persisted fields carried by history.
+            db.replace_messages(key, seed)
             session["_branch_seed_persisted"] = True
         except Exception as exc:
             from hermes_state import is_disk_full_error
 
-            if is_disk_full_error(exc):
+            if raise_on_error or is_disk_full_error(exc):
                 raise
             logger.debug("branch seed persist failed", exc_info=True)
 
@@ -7417,6 +7820,7 @@ def _init_session(
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
+            "_work_admission_lock": threading.RLock(),
         }
         if initial_session_state:
             # Compute-host admission must be visible before any poller or
@@ -8179,14 +8583,20 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # Leave the marker: the next resume retries (bounded by attempts).
             session["_auto_continue_scheduled"] = False
             return
+        admission, limit_message = _admit_session_work(
+            sid,
+            session,
+            blocked_if=lambda current: bool(current.get("_turn_cancel_requested")),
+        )
+        if admission != _SESSION_WORK_ADMITTED:
+            # A user turn wins races; capacity/build failures leave the durable
+            # crash marker intact so a later resume can retry without nesting
+            # or losing the interrupted request.
+            session["_auto_continue_scheduled"] = False
+            if admission == _SESSION_WORK_DENIED and limit_message:
+                logger.info("Deferred auto-continue for %s: %s", sid, limit_message)
+            return
         with session["history_lock"]:
-            if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
-                # A real user prompt beat us to it — their turn wins, and its
-                # own conclusion clears the marker.
-                session["_auto_continue_scheduled"] = False
-                return
-            session["running"] = True
-            session["last_active"] = time.time()
             # Hand this turn its own marker inputs (read back by
             # _run_prompt_submit): count the attempt so a crash during the
             # continuation trips the breaker, and re-record the ORIGINAL
@@ -8444,18 +8854,27 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """
     with session["history_lock"]:
         queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if not queued:
             return False
-        if _interrupt_call_pending(session):
-            # A delayed interrupt must settle before a successor starts.
-            return True
+    admission, limit_message = _admit_session_work(sid, session)
+    if admission != _SESSION_WORK_ADMITTED:
+        # Keep the accepted prompt in-place. Interrupt settlement or the next
+        # turn/poller pass retries it; capacity denial must never consume it.
+        if admission == _SESSION_WORK_DENIED and limit_message:
+            logger.info("Deferred queued prompt for %s: %s", sid, limit_message)
+        return True
+    with session["history_lock"]:
+        queued = session.get("queued_prompt")
+        if not queued:
+            # Defensive: no current writer should be able to consume this while
+            # ``running`` is true, but do not leave a phantom running session.
+            session["running"] = False
+            return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
-        session["running"] = True
-        session["turn_settled"] = False
         # Stop deliberately clears every prompt that predates it. Therefore a
         # queued prompt that still exists here was accepted afterwards and owns
         # a fresh turn; do not let the old turn's cancellation discard it.
@@ -8691,6 +9110,7 @@ def _deferred_session_record(
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
+        "_work_admission_lock": threading.RLock(),
     }
 
 
@@ -8775,7 +9195,7 @@ def _claim_or_reuse_live(
         live = _find_live_session_by_key(session_key)
         if live is not None:
             if lease is not None:
-                lease.release()
+                _release_lease_durably(lease)
             return live
         with _sessions_lock:
             _sessions[sid] = record
@@ -10048,16 +10468,20 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
 
 
 def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this TUI session's subscriptions.
+    """Transfer unseen kanban events into this session's pending buffer.
 
     ``kanban_create`` auto-subscribes TUI/desktop sessions with
     ``platform="tui"`` and ``chat_id=HERMES_SESSION_KEY`` (see
     tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
     can't deliver those — there is no "tui" messaging adapter — so this
-    poller is the delivery path for them (issue #59890). Uses the same
-    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
+    poller is the delivery path for them (issue #59890).
+
+    SQLite's IMMEDIATE transaction serializes this poller with gateway
+    notifiers. The cursor (and terminal subscription deletion) commits only
+    after formatted text has been copied into ``_kanban_pending``. If SQLite
+    commit fails, the exact appended slice is removed while ``history_lock``
+    is still held, leaving the durable cursor retryable. This closes the
+    claim-before-lookup/format/buffer loss window.
 
     Returns the list of formatted notification texts (may be empty).
     """
@@ -10107,39 +10531,135 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
-                )
-                if not events:
-                    continue
-                task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
-                    if text:
-                        texts.append(text)
-                # Unsubscribe only at a truly final status (done/archived);
-                # blocked/crashed subs stay live so a respawned task's next
-                # terminal event still reaches the user (same rule as the
-                # gateway notifier).
-                if task and getattr(task, "status", "") in {"done", "archived"}:
+                formatted: list[str] = []
+                pending_start = 0
+                appended = False
+                history_lock = session.get("history_lock")
+                with (
+                    history_lock
+                    if history_lock is not None
+                    else contextlib.nullcontext()
+                ):
+                    pending = session.setdefault("_kanban_pending", [])
+                    pending_start = len(pending)
                     try:
-                        _kb.remove_notify_sub(
-                            conn,
-                            task_id=sub["task_id"],
-                            platform=sub["platform"],
-                            chat_id=sub["chat_id"],
-                            thread_id=sub.get("thread_id") or "",
-                        )
+                        with _kb.write_txn(conn):
+                            cursor_row = conn.execute(
+                                "SELECT last_event_id FROM kanban_notify_subs "
+                                "WHERE task_id = ? AND platform = ? "
+                                "AND chat_id = ? AND thread_id = ?",
+                                (
+                                    sub["task_id"],
+                                    sub["platform"],
+                                    sub["chat_id"],
+                                    sub.get("thread_id") or "",
+                                ),
+                            ).fetchone()
+                            if cursor_row is None:
+                                continue
+                            old_cursor = int(cursor_row["last_event_id"])
+                            new_cursor, events = _kb.unseen_events_for_sub(
+                                conn,
+                                task_id=sub["task_id"],
+                                platform=sub["platform"],
+                                chat_id=sub["chat_id"],
+                                thread_id=sub.get("thread_id") or "",
+                                kinds=_KANBAN_NOTIFY_KINDS,
+                            )
+                            if not events:
+                                continue
+                            task = _kb.get_task(conn, sub["task_id"])
+                            for ev in events:
+                                text = _format_kanban_event_text(
+                                    sub, task, ev, slug
+                                )
+                                if text:
+                                    formatted.append(text)
+                            if formatted:
+                                pending.extend(formatted)
+                                appended = True
+                            advanced = conn.execute(
+                                "UPDATE kanban_notify_subs SET last_event_id = ? "
+                                "WHERE task_id = ? AND platform = ? "
+                                "AND chat_id = ? AND thread_id = ? "
+                                "AND last_event_id = ?",
+                                (
+                                    int(new_cursor),
+                                    sub["task_id"],
+                                    sub["platform"],
+                                    sub["chat_id"],
+                                    sub.get("thread_id") or "",
+                                    old_cursor,
+                                ),
+                            )
+                            if advanced.rowcount != 1:
+                                raise RuntimeError(
+                                    "kanban notification cursor ownership changed"
+                                )
+                            # Terminal subscriptions transfer ownership to the
+                            # pending buffer before deletion, in this same DB
+                            # transaction. A commit failure restores both.
+                            if task and getattr(task, "status", "") in {
+                                "done",
+                                "archived",
+                            }:
+                                conn.execute(
+                                    "DELETE FROM kanban_notify_subs "
+                                    "WHERE task_id = ? AND platform = ? "
+                                    "AND chat_id = ? AND thread_id = ?",
+                                    (
+                                        sub["task_id"],
+                                        sub["platform"],
+                                        sub["chat_id"],
+                                        sub.get("thread_id") or "",
+                                    ),
+                                )
                     except Exception:
-                        pass
+                        if appended:
+                            del pending[pending_start : pending_start + len(formatted)]
+                        raise
+                texts.extend(formatted)
         finally:
             conn.close()
     return texts
+
+
+def _clear_autonomous_running(session: dict) -> None:
+    with session["history_lock"]:
+        session["running"] = False
+
+
+def _requeue_failed_notification(
+    process_registry: Any,
+    session: dict,
+    evt: dict,
+    *,
+    claim_acquired: bool = False,
+    claim_id: str | None = None,
+) -> bool:
+    """Rollback one removed notification after claim/dispatch failure.
+
+    Durable async deliveries must relinquish their SQLite claim before their
+    in-memory event becomes visible again. Ordinary process notifications use
+    an empty claim id, so the same path preserves them without special cases.
+    """
+    requeued = False
+    try:
+        if claim_acquired:
+            from tools.async_delegation import release_event_delivery
+
+            release_event_delivery(evt, claim_id or "")
+        process_registry.completion_queue.put(evt)
+        requeued = True
+    except Exception:
+        logger.warning(
+            "Failed to roll back notification delivery; durable state remains "
+            "retryable",
+            exc_info=True,
+        )
+    finally:
+        _clear_autonomous_running(session)
+    return requeued
 
 
 def _notification_poller_loop(
@@ -10162,6 +10682,15 @@ def _notification_poller_loop(
     """
     from tools.process_registry import process_registry, format_process_notification
 
+    def notification_work_blocked(current: dict) -> bool:
+        return bool(
+            current.get("queued_prompt")
+            or current.get("_compute_host_terminal_pending")
+            or current.get("_compute_host_terminal_successor_pending")
+            or current.get("_compute_host_turn_admission")
+            or current.get("_compute_host_control_pending")
+        )
+
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
@@ -10180,16 +10709,31 @@ def _notification_poller_loop(
             if _kanban_texts:
                 for _kb_text in _kanban_texts:
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
-            _pending = session.get("_kanban_pending") or []
+                # _collect_kanban_notifications transactionally transferred
+                # these texts into _kanban_pending before advancing its cursor.
+            with session["history_lock"]:
+                _pending = list(session.get("_kanban_pending") or [])
             if _pending:
                 _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
-                        _batch = list(_pending)
+                try:
+                    admission, _limit_message = _admit_session_work(
+                        sid,
+                        session,
+                        blocked_if=lambda current: not bool(
+                            current.get("_kanban_pending")
+                        ),
+                    )
+                except Exception as exc:
+                    _clear_autonomous_running(session)
+                    print(
+                        f"[tui_gateway] kanban notification claim failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    admission = _SESSION_WORK_DEFERRED
+                if admission == _SESSION_WORK_ADMITTED:
+                    with session["history_lock"]:
+                        _batch = list(session.get("_kanban_pending") or [])
                         session["_kanban_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
@@ -10203,7 +10747,13 @@ def _notification_poller_loop(
                             file=sys.stderr,
                         )
                         with session["history_lock"]:
+                            current_pending = list(
+                                session.get("_kanban_pending") or []
+                            )
+                            session["_kanban_pending"] = _batch + current_pending
                             session["running"] = False
+                elif admission == _SESSION_WORK_ADMITTED:
+                    _clear_autonomous_running(session)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -10258,43 +10808,45 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _requeued = False
-        with session["history_lock"]:
-            # A compute-host child raises a terminal barrier after its final
-            # quiescent snapshot and clears it only after turn.end is on the
-            # wire. Treat that window as busy so this autonomous poller cannot
-            # install a successor behind the parent's terminal state.
-            if (
-                session.get("running")
-                or _interrupt_call_pending(session)
-                or session.get("queued_prompt")
-                or session.get("_compute_host_terminal_pending")
-                or session.get("_compute_host_terminal_successor_pending")
-                or session.get("_compute_host_turn_admission")
-                or session.get("_compute_host_control_pending")
-            ):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-                # Completion events arrive after the Stop that may have
-                # cancelled the originating turn. This is fresh work, so it
-                # must not inherit that turn's cancellation state.
-                session["_turn_cancel_requested"] = False
-                session["turn_settled"] = False
-        if _requeued:
+        # A compute-host child raises a terminal barrier after its final
+        # quiescent snapshot and clears it only after turn.end is on the wire.
+        # Admission also claims the profile-local capacity lease before it
+        # publishes ``running``.
+        admission, _limit_message = _admit_session_work(
+            sid,
+            session,
+            blocked_if=notification_work_blocked,
+        )
+        if admission != _SESSION_WORK_ADMITTED:
+            process_registry.completion_queue.put(evt)
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
             time.sleep(0.25)
             continue
 
+        with session["history_lock"]:
+            # Completion events arrive after the Stop that may have cancelled
+            # the originating turn. This is fresh work, so it must not inherit
+            # that turn's cancellation state.
+            session["_turn_cancel_requested"] = False
+
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery, complete_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        try:
+            _claim = claim_event_delivery(evt, "tui-poller")
+        except Exception as exc:
+            _requeue_failed_notification(process_registry, session, evt)
+            print(
+                f"[tui_gateway] notification poller claim failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
         if _claim is None:
+            _clear_autonomous_running(session)
             continue
         try:
             _emit("message.start", sid)
@@ -10311,14 +10863,18 @@ def _notification_poller_loop(
                 _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _requeue_failed_notification(
+                process_registry,
+                session,
+                evt,
+                claim_acquired=True,
+                claim_id=_claim,
+            )
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -10361,30 +10917,35 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        admission, _limit_message = _admit_session_work(
+            sid,
+            session,
+            blocked_if=notification_work_blocked,
+        )
+        if admission != _SESSION_WORK_ADMITTED:
+            process_registry.completion_queue.put(evt)
+            break
         with session["history_lock"]:
-            if (
-                session.get("running")
-                or _interrupt_call_pending(session)
-                or session.get("queued_prompt")
-                or session.get("_compute_host_terminal_pending")
-                or session.get("_compute_host_terminal_successor_pending")
-                or session.get("_compute_host_turn_admission")
-                or session.get("_compute_host_control_pending")
-            ):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
             # Mirror the live-loop claim: shutdown draining also starts fresh
             # work that must not inherit a prior turn's Stop flag.
             session["_turn_cancel_requested"] = False
-            session["turn_settled"] = False
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery, complete_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        try:
+            _claim = claim_event_delivery(evt, "tui-poller")
+        except Exception as exc:
+            _requeue_failed_notification(process_registry, session, evt)
+            print(
+                f"[tui_gateway] notification poller claim failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            break
         if _claim is None:
+            _clear_autonomous_running(session)
             continue
         try:
             _emit("message.start", sid)
@@ -10401,14 +10962,19 @@ def _notification_poller_loop(
                 _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _requeue_failed_notification(
+                process_registry,
+                session,
+                evt,
+                claim_acquired=True,
+                claim_id=_claim,
+            )
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            break
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -11288,12 +11854,11 @@ def _run_prompt_submit(
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
-                    return
-                session["running"] = True
+            admission, _limit_message = _admit_session_work(sid, session)
+            if admission != _SESSION_WORK_ADMITTED:
+                # User already sent something — their turn wins, and the judge
+                # will re-run on the next turn anyway.
+                return
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
@@ -11328,37 +11893,66 @@ def _run_prompt_submit(
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
+                try:
+                    admission, _limit_message = _admit_session_work(sid, session)
+                except Exception as _claim_exc:
+                    _clear_autonomous_running(session)
+                    for pending_evt, _pending_synth in drained[index:]:
+                        process_registry.completion_queue.put(pending_evt)
+                    print(
+                        f"[tui_gateway] completion notification claim failed: "
+                        f"{type(_claim_exc).__name__}: {_claim_exc}",
+                        file=sys.stderr,
+                    )
+                    break
+                if admission != _SESSION_WORK_ADMITTED:
+                    for pending_evt, _pending_synth in drained[index:]:
+                        process_registry.completion_queue.put(pending_evt)
+                    break
                 with session["history_lock"]:
-                    if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
-                            process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
                     # Mirror the poller claims: this notification is fresh work
                     # and must not inherit the finished turn's Stop flag, or
                     # _run_prompt_submit would drop the event as
                     # cancelled-before-start after message.start was emitted.
                     session["_turn_cancel_requested"] = False
-                    session["turn_settled"] = False
                 from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                    claim_event_delivery, complete_event_delivery,
                 )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
+                try:
+                    _claim = claim_event_delivery(_evt, "tui-post-turn")
+                except Exception as _claim_exc:
+                    _requeue_failed_notification(process_registry, session, _evt)
+                    for pending_evt, _pending_synth in drained[index + 1 :]:
+                        process_registry.completion_queue.put(pending_evt)
+                    print(
+                        f"[tui_gateway] completion notification claim failed: "
+                        f"{type(_claim_exc).__name__}: {_claim_exc}",
+                        file=sys.stderr,
+                    )
+                    break
                 if _claim is None:
+                    _clear_autonomous_running(session)
                     continue
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
+                    _requeue_failed_notification(
+                        process_registry,
+                        session,
+                        _evt,
+                        claim_acquired=True,
+                        claim_id=_claim,
+                    )
+                    for pending_evt, _pending_synth in drained[index + 1 :]:
+                        process_registry.completion_queue.put(pending_evt)
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",
                         file=sys.stderr,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
+                    break
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

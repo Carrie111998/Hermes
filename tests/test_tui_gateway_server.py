@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -87,6 +88,436 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
         server._cfg_mtime = None
         server._cfg_path = None
         reset_hermes_home_override(token)
+
+
+def test_remote_profile_first_prompt_uses_remote_cap_and_registry(monkeypatch, tmp_path):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    launch_home = tmp_path / "launch"
+    remote_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir()
+    remote_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text(
+        "max_concurrent_sessions: 5\n", encoding="utf-8"
+    )
+    (remote_home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(server, "_hermes_home", str(launch_home))
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+
+    remote_token = set_hermes_home_override(remote_home)
+    try:
+        blocker, message = try_acquire_active_session(
+            session_id="remote-blocker",
+            surface="cli",
+            config={"max_concurrent_sessions": 1},
+        )
+    finally:
+        reset_hermes_home_override(remote_token)
+    assert message is None and blocker is not None
+
+    session = _session(
+        active_session_lease=None,
+        profile_home=str(remote_home),
+        session_key="remote-first-turn",
+    )
+    server._sessions["remote-sid"] = session
+    try:
+        response = server._methods["prompt.submit"](
+            "prompt", {"session_id": "remote-sid", "text": "hello"}
+        )
+
+        assert response["error"]["code"] == 4090
+        assert "active session limit (1/1)" in response["error"]["message"]
+        assert session["running"] is False
+        assert session.get("active_session_lease") is None
+        assert not (launch_home / "runtime" / "active_sessions.json").exists()
+        remote_entries = json.loads(
+            (remote_home / "runtime" / "active_sessions.json").read_text()
+        )["entries"]
+        assert [entry["session_id"] for entry in remote_entries] == [
+            "remote-blocker"
+        ]
+    finally:
+        server._sessions.pop("remote-sid", None)
+        blocker.release()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+
+
+def test_rewind_capacity_denial_leaves_db_and_memory_byte_identical(monkeypatch):
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+    persisted = json.dumps(history, sort_keys=True, separators=(",", ":"))
+
+    class DB:
+        def replace_messages(self, *_args):
+            raise AssertionError("capacity denial mutated the durable transcript")
+
+    session = _session(
+        active_session_lease=None,
+        history=json.loads(persisted),
+        _work_admission_lock=threading.RLock(),
+    )
+    before_session = json.dumps(
+        {
+            "history": session["history"],
+            "history_version": session["history_version"],
+            "running": session["running"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    server._sessions["rewind-cap-sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: DB())
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (
+            None,
+            "Hermes is at the active session limit (1/1).",
+        ),
+    )
+    try:
+        response = server._methods["prompt.submit"](
+            "rewind-cap",
+            {
+                "session_id": "rewind-cap-sid",
+                "text": "edited second",
+                "truncate_before_user_ordinal": 1,
+            },
+        )
+
+        assert response["error"]["code"] == 4090
+        after_session = json.dumps(
+            {
+                "history": session["history"],
+                "history_version": session["history_version"],
+                "running": session["running"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        assert after_session == before_session
+        assert json.dumps(history, sort_keys=True, separators=(",", ":")) == persisted
+        assert session.get("active_session_lease") is None
+    finally:
+        server._sessions.pop("rewind-cap-sid", None)
+
+
+@pytest.mark.parametrize("preexisting_lease", [False, True])
+def test_rewind_db_failure_rolls_back_admission_and_only_new_lease(
+    monkeypatch, preexisting_lease
+):
+    class Lease:
+        lease_id = "rewind-db-lease"
+
+        def __init__(self):
+            self.release_count = 0
+
+        def release(self):
+            self.release_count += 1
+
+    class FailingDB:
+        def replace_messages(self, *_args):
+            raise OSError("replace failed")
+
+    lease = Lease()
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+    session = _session(
+        active_session_lease=lease if preexisting_lease else None,
+        history=list(history),
+        last_active=123.0,
+        turn_settled=True,
+    )
+    server._sessions["rewind-db-sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: FailingDB())
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (lease, None),
+    )
+    try:
+        response = server._methods["prompt.submit"](
+            "rewind-db",
+            {
+                "session_id": "rewind-db-sid",
+                "text": "edited second",
+                "truncate_before_user_ordinal": 1,
+            },
+        )
+
+        assert response["error"]["code"] == 5008
+        assert session["history"] == history
+        assert session["history_version"] == 0
+        assert session["running"] is False
+        assert session["turn_settled"] is True
+        assert session["last_active"] == 123.0
+        assert session.get("inflight_turn") is None
+        if preexisting_lease:
+            assert session["active_session_lease"] is lease
+            assert lease.release_count == 0
+        else:
+            assert session.get("active_session_lease") is None
+            assert lease.release_count == 1
+    finally:
+        server._sessions.pop("rewind-db-sid", None)
+
+
+def test_first_prompt_row_failure_releases_new_lease_and_restores_idle_state(
+    monkeypatch,
+):
+    class Lease:
+        lease_id = "first-row-failure-lease"
+
+        def __init__(self):
+            self.release_count = 0
+
+        def release(self):
+            self.release_count += 1
+
+    lease = Lease()
+    session = _session(
+        active_session_lease=None,
+        last_active=456.0,
+        turn_settled=True,
+    )
+    server._sessions["first-row-failure-sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (lease, None),
+    )
+    monkeypatch.setattr(
+        server,
+        "_ensure_session_db_row",
+        lambda _session: (_ for _ in ()).throw(OSError("row write failed")),
+    )
+    try:
+        response = server._methods["prompt.submit"](
+            "first-row-failure",
+            {"session_id": "first-row-failure-sid", "text": "hello"},
+        )
+
+        assert response["error"]["code"] == 5071
+        assert session["running"] is False
+        assert session["turn_settled"] is True
+        assert session.get("inflight_turn") is None
+        assert session.get("active_session_lease") is None
+        assert lease.release_count == 1
+    finally:
+        server._sessions.pop("first-row-failure-sid", None)
+
+
+def test_remote_rewind_success_changes_only_profile_db(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    launch_home = tmp_path / "launch"
+    remote_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir()
+    remote_home.mkdir(parents=True)
+    session_key = "remote-rewind-key"
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+
+    def seed(path):
+        db = SessionDB(db_path=path)
+        db.create_session(session_key, source="tui", model="test")
+        for message in history:
+            db.append_message(
+                session_id=session_key,
+                role=message["role"],
+                content=message["content"],
+            )
+        return db
+
+    launch_db = seed(launch_home / "state.db")
+    remote_db = seed(remote_home / "state.db")
+
+    class Lease:
+        lease_id = "remote-rewind-lease"
+
+        def release(self):
+            return None
+
+    class NeverThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    session = _session(
+        active_session_lease=None,
+        history=list(history),
+        profile_home=str(remote_home),
+        session_key=session_key,
+    )
+    server._sessions["remote-rewind-sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: launch_db)
+    monkeypatch.setattr(server.threading, "Thread", NeverThread)
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (Lease(), None),
+    )
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    try:
+        response = server._methods["prompt.submit"](
+            "remote-rewind",
+            {
+                "session_id": "remote-rewind-sid",
+                "text": "edited second",
+                "truncate_before_user_ordinal": 1,
+            },
+        )
+
+        assert response["result"]["status"] == "streaming"
+        def without_timestamps(messages):
+            return [
+                {key: value for key, value in message.items() if key != "timestamp"}
+                for message in messages
+            ]
+
+        assert without_timestamps(
+            launch_db.get_messages_as_conversation(session_key)
+        ) == history
+        assert without_timestamps(
+            remote_db.get_messages_as_conversation(session_key)
+        ) == history[:2]
+        assert session["history"] == history[:2]
+    finally:
+        server._sessions.pop("remote-rewind-sid", None)
+        launch_db.close()
+        remote_db.close()
+
+
+def test_corrupt_registry_blocks_first_prompt_without_mutating_session(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "profile"
+    runtime = home / "runtime"
+    runtime.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    corrupt = b'{"entries": ["not-an-entry"]}'
+    registry = runtime / "active_sessions.json"
+    registry.write_bytes(corrupt)
+    monkeypatch.setattr(server, "_hermes_home", str(home))
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    session = _session(
+        active_session_lease=None,
+        profile_home=str(home),
+        session_key="corrupt-first-work",
+        _work_admission_lock=threading.RLock(),
+    )
+    before = dict(session)
+    server._sessions["corrupt-first-sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("corrupt registry admitted work"),
+    )
+    try:
+        response = server._methods["prompt.submit"](
+            "prompt", {"session_id": "corrupt-first-sid", "text": "hello"}
+        )
+
+        assert response["error"]["code"] == 4090
+        assert "could not verify active session capacity" in response["error"][
+            "message"
+        ]
+        assert session == before
+        assert registry.read_bytes() == corrupt
+    finally:
+        server._sessions.pop("corrupt-first-sid", None)
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+
+
+def test_concurrent_first_submits_share_one_claim_and_queue_second(monkeypatch):
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    ready = threading.Event()
+    ready.set()
+    responses = {}
+    claim_count = 0
+
+    class Lease:
+        lease_id = "one-lease"
+
+        def release(self):
+            return None
+
+    def delayed_claim(*_args, **_kwargs):
+        nonlocal claim_count
+        claim_count += 1
+        claim_entered.set()
+        assert release_claim.wait(5)
+        return Lease(), None
+
+    session = _session(
+        active_session_lease=None,
+        agent_ready=ready,
+        session_key="concurrent-first",
+    )
+    server._sessions["concurrent-sid"] = session
+    monkeypatch.setattr(server, "_claim_active_session_slot_for_profile", delayed_claim)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: None)
+
+    def submit(name, text):
+        responses[name] = server._methods["prompt.submit"](
+            name, {"session_id": "concurrent-sid", "text": text}
+        )
+
+    first = threading.Thread(target=submit, args=("first", "alpha"), daemon=True)
+    second = threading.Thread(target=submit, args=("second", "beta"), daemon=True)
+    try:
+        first.start()
+        assert claim_entered.wait(5)
+        second.start()
+        release_claim.set()
+        first.join(5)
+        second.join(5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert claim_count == 1
+        statuses = sorted(response["result"]["status"] for response in responses.values())
+        assert statuses == ["queued", "streaming"]
+        assert session["active_session_lease"].lease_id == "one-lease"
+        assert session["running"] is True
+        assert session["queued_prompt"]["text"] in {"alpha", "beta"}
+    finally:
+        release_claim.set()
+        first.join(5)
+        second.join(5)
+        server._sessions.pop("concurrent-sid", None)
 
 
 def test_detach_replacement_is_idle_without_holding_shared_slot(
@@ -585,6 +1016,485 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         assert server._sessions["iso-sid"]["history_version"] == 1
     finally:
         server._sessions.pop("iso-sid", None)
+
+
+@pytest.mark.parametrize("failure_site", ["session_row", "branch_seed"])
+def test_compute_host_first_turn_persistence_failure_is_synchronous_and_releases_slot(
+    monkeypatch, tmp_path, failure_site
+):
+    """A child persistence rejection never becomes model work or a live lease."""
+    from tui_gateway.compute_host import ComputeHost
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n"
+        "dashboard:\n"
+        "  turn_isolation: true\n",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(home)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    sid = f"compute-persist-{failure_site}"
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+    parent = _session(
+        active_session_lease=None,
+        agent_ready=threading.Event(),
+        profile_home=str(home),
+        session_key=f"parent-{failure_site}",
+        history=list(original_history),
+        history_version=9,
+        last_active=123.0,
+        turn_settled=True,
+    )
+    parent["agent"] = None
+    child = _session(
+        parent_session_id=("parent-key" if failure_site == "branch_seed" else None),
+        session_key=f"child-{failure_site}",
+        turn_settled=True,
+    )
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    child_runs = []
+    rewind_writes = []
+
+    class RewindDB:
+        def replace_messages(self, _key, messages):
+            rewind_writes.append(list(messages))
+
+    class RewindDBContext:
+        def __enter__(self):
+            return RewindDB()
+
+        def __exit__(self, *_exc):
+            return False
+
+    def ensure_row(_session, *, raise_on_error=False):
+        assert raise_on_error is True
+        if failure_site == "session_row":
+            raise OSError("forced session-row failure")
+
+    def persist_seed(_session, *, raise_on_error=False):
+        assert raise_on_error is True
+        if failure_site == "branch_seed":
+            raise OSError("forced branch-seed failure")
+
+    class Supervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            before = len(out.getvalue().splitlines())
+            host._run_real_turn(frame)
+            frames = [
+                json.loads(line)
+                for line in out.getvalue().splitlines()[before:]
+                if line.strip()
+            ]
+            assert not any(
+                item.get("type") in {"turn.accepted", "turn.started"}
+                for item in frames
+            )
+            return next(
+                item
+                for item in frames
+                if item.get("type") == "turn.error"
+                and item.get("request_id") == frame["request_id"]
+            )
+
+    server._sessions[sid] = parent
+    monkeypatch.setattr(host, "_ensure_server_session", lambda *_args: child)
+    monkeypatch.setattr(server, "_ensure_session_db_row", ensure_row)
+    monkeypatch.setattr(server, "_persist_branch_seed", persist_seed)
+    monkeypatch.setattr(server, "_session_db", lambda _session: RewindDBContext())
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: child_runs.append("ran"),
+    )
+    monkeypatch.setattr(
+        server, "_get_compute_host_supervisor", lambda _cfg=None: Supervisor()
+    )
+    try:
+        response = server._methods["prompt.submit"](
+            "persist-failure",
+            {
+                "session_id": sid,
+                "text": "edited second",
+                "truncate_before_user_ordinal": 1,
+            },
+        )
+
+        assert response["error"]["code"] == 5071
+        assert response["error"]["data"]["reason"] == "persistence_failed"
+        assert child_runs == []
+        assert child["running"] is False
+        assert parent["running"] is False
+        assert parent["turn_settled"] is True
+        assert parent["history"] == original_history
+        assert parent["history_version"] == 9
+        assert rewind_writes == [original_history[:2], original_history]
+        assert parent.get("active_session_lease") is None
+        assert active_session_registry_snapshot() == []
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+def test_compute_host_child_autonomous_work_inherits_exactly_one_parent_lease(
+    monkeypatch, tmp_path
+):
+    """A cap=1 isolated turn and its child successors share one registry row."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    parent = _session(
+        active_session_lease=None,
+        profile_home=str(home),
+        session_key="isolated-logical-session",
+    )
+    sid = "isolated-logical-sid"
+    server._sessions[sid] = parent
+    try:
+        admission, message = server._admit_session_work(sid, parent)
+        assert (admission, message) == (server._SESSION_WORK_ADMITTED, None)
+        frame = server._compute_host_turn_frame("turn", sid, parent, "first")
+        assert frame["parent_lease_id"] == parent["active_session_lease"].lease_id
+        assert len(active_session_registry_snapshot()) == 1
+
+        # Model the child-owned live record created from that turn.start frame.
+        # Its notification/Kanban/continuation work must be admitted without a
+        # second profile claim, while a different child session remains capped.
+        child = _session(
+            active_session_lease=None,
+            profile_home=str(home),
+            session_key="isolated-logical-session",
+            _compute_host_parent_lease_id=frame["parent_lease_id"],
+        )
+        server._sessions[sid] = child
+        monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
+        successor, successor_message = server._admit_session_work(sid, child)
+        assert (successor, successor_message) == (
+            server._SESSION_WORK_ADMITTED,
+            None,
+        )
+        assert len(active_session_registry_snapshot()) == 1
+
+        unrelated = _session(
+            active_session_lease=None,
+            profile_home=str(home),
+            session_key="unrelated-child",
+        )
+        server._sessions["unrelated-child-sid"] = unrelated
+        denied, denied_message = server._admit_session_work(
+            "unrelated-child-sid", unrelated
+        )
+        assert denied == server._SESSION_WORK_DENIED
+        assert "active session limit (1/1)" in denied_message
+        assert len(active_session_registry_snapshot()) == 1
+    finally:
+        server._sessions.pop(sid, None)
+        server._sessions.pop("unrelated-child-sid", None)
+        parent["active_session_lease"].release()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("terminal_type", ["turn.end", "turn.error"])
+def test_running_compute_host_close_holds_lease_until_terminal(
+    monkeypatch, tmp_path, terminal_type
+):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    parent_lease = competitor = None
+    old_supervisor = server._compute_host_supervisor
+    interrupted = threading.Event()
+    terminal = threading.Event()
+    close_response = {}
+
+    class Supervisor:
+        def interrupt_and_wait(self, sid, *, timeout):
+            assert sid == "compute-close-sid"
+            assert timeout > 0
+            interrupted.set()
+            assert terminal.wait(2)
+            return True
+
+        def is_running(self):
+            return True
+
+    try:
+        parent_lease, message = try_acquire_active_session(
+            session_id="compute-close-parent",
+            surface="desktop",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert message is None and parent_lease is not None
+        session = _session(
+            active_session_lease=parent_lease,
+            _compute_host_active=True,
+            _compute_host_request_id="host-turn",
+            running=True,
+            session_key="compute-close-parent",
+            turn_settled=False,
+        )
+        server._sessions["compute-close-sid"] = session
+        server._compute_host_supervisor = Supervisor()
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+
+        close_thread = threading.Thread(
+            target=lambda: close_response.update(
+                server._methods["session.close"](
+                    "close-compute", {"session_id": "compute-close-sid"}
+                )
+            )
+        )
+        close_thread.start()
+        assert interrupted.wait(2)
+
+        competitor, denied = try_acquire_active_session(
+            session_id="competitor",
+            surface="cli",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert competitor is None
+        assert "active session limit (1/1)" in denied
+        assert "compute-close-sid" in server._sessions
+        assert parent_lease.released is False
+
+        server._on_compute_host_turn_done(
+            "turn",
+            "compute-close-sid",
+            session,
+            {
+                "type": terminal_type,
+                "request_id": "host-turn",
+                "history": [],
+                "history_version": 0,
+                "base_history_version": 0,
+                **(
+                    {"message": "compute host failed during shutdown"}
+                    if terminal_type == "turn.error"
+                    else {}
+                ),
+            },
+            host_request_id="host-turn",
+        )
+        terminal.set()
+        close_thread.join(2)
+
+        assert not close_thread.is_alive()
+        assert close_response["result"]["closed"] is True
+        assert "compute-close-sid" not in server._sessions
+        assert parent_lease.released is True
+        competitor, message = try_acquire_active_session(
+            session_id="competitor",
+            surface="cli",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert message is None and competitor is not None
+    finally:
+        terminal.set()
+        server._compute_host_supervisor = old_supervisor
+        server._close_session_by_id(
+            "compute-close-sid", allow_running_detached=True
+        )
+        if competitor is not None:
+            competitor.release()
+        if parent_lease is not None and not parent_lease.released:
+            parent_lease.release()
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+def test_compute_host_close_during_turn_start_handoff_retains_sole_lease(
+    monkeypatch, tmp_path, dispatch_fails
+):
+    """Close cannot reclaim capacity between turn.start write and activation."""
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    parent_lease = competitor = None
+    old_supervisor = server._compute_host_supervisor
+    frame_written = threading.Event()
+    release_dispatch = threading.Event()
+    interrupt_requested = threading.Event()
+    child_terminal = threading.Event()
+    submit_response = {}
+    close_response = {}
+
+    class Supervisor:
+        callback = None
+        frame = None
+
+        def submit_turn(self, frame, *, on_complete=None):
+            self.frame = dict(frame)
+            self.callback = on_complete
+            # This barrier represents a flushed turn.start pipe write. The
+            # parent has not yet returned from submit_turn, so active is still
+            # unpublished while the request generation must own liveness.
+            frame_written.set()
+            assert release_dispatch.wait(5)
+            if dispatch_fails:
+                raise BrokenPipeError("forced handoff dispatch failure")
+            return {
+                "type": "turn.accepted",
+                "sid": frame["sid"],
+                "request_id": frame["request_id"],
+            }
+
+        def interrupt_and_wait(self, sid, *, timeout):
+            assert sid == "handoff-close-sid"
+            interrupt_requested.set()
+            deadline = time.monotonic() + timeout
+            if not dispatch_fails:
+                return child_terminal.wait(timeout)
+            while time.monotonic() < deadline:
+                if not server._compute_host_handoff_live(session):
+                    return True
+                time.sleep(0.005)
+            return False
+
+        def is_running(self):
+            return True
+
+    supervisor = Supervisor()
+    try:
+        parent_lease, message = try_acquire_active_session(
+            session_id="handoff-close-parent",
+            surface="desktop",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert message is None and parent_lease is not None
+        session = _session(
+            active_session_lease=parent_lease,
+            agent=None,
+            agent_ready=threading.Event(),
+            running=True,
+            turn_settled=False,
+            session_key="handoff-close-parent",
+        )
+        session["agent"] = None
+        server._sessions["handoff-close-sid"] = session
+        server._compute_host_supervisor = supervisor
+        monkeypatch.setattr(
+            server, "_get_compute_host_supervisor", lambda _cfg=None: supervisor
+        )
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(
+            server, "_notify_session_boundary", lambda *a, **k: None
+        )
+
+        submit_thread = threading.Thread(
+            target=lambda: submit_response.update(
+                server._submit_prompt_to_compute_host(
+                    "submit", "handoff-close-sid", session, "hello"
+                )
+            ),
+            daemon=True,
+        )
+        submit_thread.start()
+        assert frame_written.wait(5)
+        assert session.get("_compute_host_request_id")
+        assert session.get("_compute_host_active") is not True
+        assert server._compute_host_handoff_live(session) is True
+
+        close_thread = threading.Thread(
+            target=lambda: close_response.update(
+                server._methods["session.close"](
+                    "close", {"session_id": "handoff-close-sid"}
+                )
+            ),
+            daemon=True,
+        )
+        close_thread.start()
+        assert interrupt_requested.wait(5)
+
+        competitor, denied = try_acquire_active_session(
+            session_id="handoff-competitor",
+            surface="cli",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert competitor is None
+        assert "active session limit (1/1)" in denied
+        assert server._sessions.get("handoff-close-sid") is session
+        assert session["_closing"] is True
+        assert parent_lease.released is False
+
+        release_dispatch.set()
+        submit_thread.join(5)
+        assert not submit_thread.is_alive()
+        if dispatch_fails:
+            assert submit_response["error"]["code"] == 5019
+        else:
+            assert submit_response["result"]["status"] == "streaming"
+            assert supervisor.callback is not None
+            supervisor.callback(
+                {
+                    "type": "turn.end",
+                    "sid": "handoff-close-sid",
+                    "request_id": supervisor.frame["request_id"],
+                    "history": [],
+                    "history_version": 0,
+                    "base_history_version": 0,
+                }
+            )
+            child_terminal.set()
+
+        close_thread.join(5)
+        assert not close_thread.is_alive()
+        assert close_response["result"]["closed"] is True
+        assert "handoff-close-sid" not in server._sessions
+        assert parent_lease.released is True
+
+        competitor, message = try_acquire_active_session(
+            session_id="handoff-competitor",
+            surface="cli",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert message is None and competitor is not None
+    finally:
+        release_dispatch.set()
+        child_terminal.set()
+        server._compute_host_supervisor = old_supervisor
+        server._close_session_by_id(
+            "handoff-close-sid", allow_running_detached=True
+        )
+        if competitor is not None:
+            competitor.release()
+        if parent_lease is not None and not parent_lease.released:
+            parent_lease.release()
+        reset_hermes_home_override(token)
 
 
 def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch):
@@ -5494,7 +6404,9 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
         {"role": "user", "content": "second"},
         {"role": "assistant", "content": "done"},
     ]
-    server._sessions["trunc-sid"] = _session(history=list(history))
+    server._sessions["trunc-sid"] = _session(
+        history=list(history), active_session_lease=None
+    )
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     # If the guard ever lets a negative ordinal through, these would run and the
     # session would be marked busy; failing here makes that regression loud.
@@ -5503,6 +6415,13 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
     )
     monkeypatch.setattr(
         server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: pytest.fail(
+            "validation failure must not claim a session lease"
+        ),
     )
 
     try:
@@ -5521,6 +6440,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
         # History and the DB are left exactly as they were — no silent loss.
         assert server._sessions["trunc-sid"]["history"] == history
         assert server._sessions["trunc-sid"]["running"] is False
+        assert server._sessions["trunc-sid"]["active_session_lease"] is None
         assert replaced == []
     finally:
         server._sessions.pop("trunc-sid", None)
@@ -5672,6 +6592,324 @@ class _StopAfterOneNotificationPoll:
     def is_set(self):
         self._checks += 1
         return self._checks > 1
+
+
+def test_crash_auto_continue_defers_at_capacity_without_consuming_marker(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "profile"
+    home.mkdir()
+    ready = threading.Event()
+    ready.set()
+    session = _session(
+        active_session_lease=None,
+        agent_ready=ready,
+        profile_home=str(home),
+        session_key="crash-key",
+    )
+    server.record_turn_start(home, "crash-key", "finish this", attempts=0)
+    server._sessions["crash-sid"] = session
+    dispatched = []
+
+    class ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 3600.0, 3))
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (
+            None,
+            "Hermes is at the active session limit (1/1).",
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+    try:
+        scheduled = server._maybe_schedule_auto_continue(
+            "crash-sid", session, "crash-key"
+        )
+
+        assert scheduled is not None
+        assert dispatched == []
+        assert session["running"] is False
+        assert session.get("active_session_lease") is None
+        assert session.get("_auto_continue_scheduled") is False
+        marker = server.read_turn_marker(home, "crash-key")
+        assert marker is not None
+        assert marker["prompt"] == "finish this"
+        assert marker["attempts"] == 0
+    finally:
+        server._sessions.pop("crash-sid", None)
+        server.clear_turn_marker(home, "crash-key")
+
+
+def test_kanban_pending_work_defers_at_capacity_without_losing_events(
+    monkeypatch
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    session = _session(active_session_lease=None, session_key="kanban-key")
+    server._sessions["kanban-sid"] = session
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    def collect(session):
+        session.setdefault("_kanban_pending", []).append("task done")
+        return ["task done"]
+
+    monkeypatch.setattr(server, "_collect_kanban_notifications", collect)
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (
+            None,
+            "Hermes is at the active session limit (1/1).",
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("capacity-denied kanban work was dispatched")
+        ),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "kanban-sid", session
+        )
+
+        assert session["running"] is False
+        assert session.get("active_session_lease") is None
+        assert session["_kanban_pending"] == ["task done"]
+    finally:
+        server._sessions.pop("kanban-sid", None)
+
+
+def test_process_notification_defers_at_capacity_without_losing_event(
+    monkeypatch
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": "proc-capacity",
+        "session_key": "notify-key",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.discard(event["session_id"])
+    session = _session(active_session_lease=None, session_key="notify-key")
+    server._sessions["notify-sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot_for_profile",
+        lambda *_args, **_kwargs: (
+            None,
+            "Hermes is at the active session limit (1/1).",
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("capacity-denied notification was dispatched")
+        ),
+    )
+    stop = threading.Event()
+    stop.set()
+    try:
+        server._notification_poller_loop(stop, "notify-sid", session)
+
+        assert session["running"] is False
+        assert session.get("active_session_lease") is None
+        assert isolated_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("notify-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
+def test_live_notification_claim_exception_requeues_once_and_clears_running(
+    monkeypatch
+):
+    import queue as _queue_mod
+    import tools.async_delegation as async_delivery
+
+    from tools.process_registry import process_registry
+
+    class LiveOnlyQueue(_queue_mod.Queue):
+        # Keep the post-stop shutdown drain from consuming the event restored
+        # by the live-loop failure; this test isolates that one rollback.
+        def empty(self):
+            return True
+
+    event = {
+        "type": "completion",
+        "session_id": "claim-exception-process",
+        "session_key": "claim-exception-key",
+        "command": "echo claim",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue = LiveOnlyQueue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _s: [])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        async_delivery,
+        "claim_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(OSError("claim unavailable")),
+    )
+    session = _session(session_key="claim-exception-key")
+    server._sessions["claim-exception-sid"] = session
+    process_registry._completion_consumed.discard(event["session_id"])
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "claim-exception-sid", session
+        )
+
+        assert session["running"] is False
+        assert isolated_queue.qsize() == 1
+        assert isolated_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("claim-exception-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+
+
+def test_live_notification_dispatch_failure_releases_claim_before_requeue(
+    monkeypatch
+):
+    import queue as _queue_mod
+    import tools.async_delegation as async_delivery
+
+    from tools.process_registry import process_registry
+
+    trace = []
+
+    class LiveOnlyQueue(_queue_mod.Queue):
+        def empty(self):
+            return True
+
+        def put(self, item, *args, **kwargs):
+            trace.append(("put", item))
+            return super().put(item, *args, **kwargs)
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "dispatch-failure-delegation",
+        "session_key": "dispatch-failure-key",
+        "origin_ui_session_id": "dispatch-failure-sid",
+    }
+    isolated_queue = LiveOnlyQueue()
+    isolated_queue.put(event)
+    trace.clear()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _s: [])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification", lambda _evt: "done"
+    )
+    monkeypatch.setattr(
+        async_delivery, "claim_event_delivery", lambda *_args: "durable-claim"
+    )
+    monkeypatch.setattr(
+        async_delivery,
+        "release_event_delivery",
+        lambda evt, claim: trace.append(("release", evt, claim)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synchronous dispatch failure")
+        ),
+    )
+    session = _session(session_key="dispatch-failure-key")
+    server._sessions["dispatch-failure-sid"] = session
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "dispatch-failure-sid", session
+        )
+
+        assert session["running"] is False
+        assert [entry[0] for entry in trace] == ["release", "put"]
+        assert isolated_queue.qsize() == 1
+        assert isolated_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("dispatch-failure-sid", None)
+
+
+@pytest.mark.parametrize("failure_stage", ["claim", "dispatch"])
+def test_kanban_delivery_failure_restores_batch_in_original_order(
+    monkeypatch, failure_stage
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _s: [])
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    session = _session(
+        session_key="kanban-rollback-key",
+        _kanban_pending=["first", "second"],
+    )
+    server._sessions["kanban-rollback-sid"] = session
+    if failure_stage == "claim":
+        monkeypatch.setattr(
+            server,
+            "_admit_session_work",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("registry claim failed")
+            ),
+        )
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *_args, **_kwargs: pytest.fail("claim failure dispatched"),
+        )
+    else:
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("kanban dispatch failed")
+            ),
+        )
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "kanban-rollback-sid", session
+        )
+
+        assert session["running"] is False
+        assert session["_kanban_pending"] == ["first", "second"]
+    finally:
+        server._sessions.pop("kanban-rollback-sid", None)
 
 
 def test_notification_poller_requeues_while_compute_host_terminal_frame_pending(
@@ -6320,6 +7558,70 @@ def test_post_turn_drain_clears_stale_stop_before_notification_turn(
         process_registry._completion_consumed.discard(event["session_id"])
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
+
+
+@pytest.mark.parametrize("failure_stage", ["claim", "dispatch"])
+def test_post_turn_delivery_failure_restores_removed_notification_once(
+    monkeypatch, tmp_path, failure_stage
+):
+    import queue as _queue_mod
+    import tools.async_delegation as async_delivery
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    event = {
+        "type": "completion",
+        "session_id": f"post-turn-{failure_stage}",
+        "session_key": "post-turn-rollback-key",
+        "command": "echo rollback",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.discard(event["session_id"])
+    session = _session(
+        session_key="post-turn-rollback-key",
+        agent=_RecordingAgent([]),
+        running=True,
+    )
+    server._sessions["post-turn-rollback-sid"] = session
+    original_run = server._run_prompt_submit
+    if failure_stage == "claim":
+        monkeypatch.setattr(
+            async_delivery,
+            "claim_event_delivery",
+            lambda *_args: (_ for _ in ()).throw(OSError("claim unavailable")),
+        )
+        invoke = original_run
+    else:
+        monkeypatch.setattr(
+            async_delivery, "claim_event_delivery", lambda *_args: ""
+        )
+
+        def fail_nested(rid, sid, target, text, **kwargs):
+            if text == "primary turn":
+                return original_run(rid, sid, target, text, **kwargs)
+            raise RuntimeError("nested dispatch failed synchronously")
+
+        monkeypatch.setattr(server, "_run_prompt_submit", fail_nested)
+        invoke = fail_nested
+    try:
+        invoke(
+            "post-turn-rollback",
+            "post-turn-rollback-sid",
+            session,
+            "primary turn",
+        )
+
+        assert session["running"] is False
+        assert isolated_queue.qsize() == 1
+        assert isolated_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("post-turn-rollback-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
 
 
 def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
@@ -11344,15 +12646,18 @@ def test_queued_prompt_claim_clears_stale_cancel_before_inline_start(monkeypatch
         queued_prompt={"text": "post-stop", "transport": None},
         _turn_cancel_requested=True,
     )
+    server._sessions["post-stop-sid"] = session
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
     monkeypatch.setattr(server.threading, "Thread", DeferredThread)
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
-
-    assert server._drain_queued_prompt("next", "post-stop-sid", session) is True
-    assert session["_turn_cancel_requested"] is False
-    assert session["running"] is True
-    assert clear_calls == [True]
-    assert len(created_threads) == 1
+    try:
+        assert server._drain_queued_prompt("next", "post-stop-sid", session) is True
+        assert session["_turn_cancel_requested"] is False
+        assert session["running"] is True
+        assert clear_calls == [True]
+        assert len(created_threads) == 1
+    finally:
+        server._sessions.pop("post-stop-sid", None)
 
 
 def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
@@ -11666,6 +12971,7 @@ def test_queued_prompt_waits_for_busy_interrupt_completion(monkeypatch):
         _busy_interrupt_pending=True,
         _interrupt_call_count=1,
     )
+    server._sessions["busy-order"] = session
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
     monkeypatch.setattr(
         server,
@@ -11675,15 +12981,18 @@ def test_queued_prompt_waits_for_busy_interrupt_completion(monkeypatch):
         ),
     )
 
-    assert server._drain_queued_prompt("turn", "busy-order", session) is True
-    assert dispatched == []
-    assert session["running"] is False
-    assert session["queued_prompt"]["text"] == "successor"
+    try:
+        assert server._drain_queued_prompt("turn", "busy-order", session) is True
+        assert dispatched == []
+        assert session["running"] is False
+        assert session["queued_prompt"]["text"] == "successor"
 
-    session["_busy_interrupt_pending"] = False
-    session.pop("_interrupt_call_count")
-    assert server._drain_queued_prompt("turn", "busy-order", session) is True
-    assert dispatched == [("turn", "busy-order", session, "successor")]
+        session["_busy_interrupt_pending"] = False
+        session.pop("_interrupt_call_count")
+        assert server._drain_queued_prompt("turn", "busy-order", session) is True
+        assert dispatched == [("turn", "busy-order", session, "successor")]
+    finally:
+        server._sessions.pop("busy-order", None)
 
 
 def test_clear_pending_without_sid_clears_all():
@@ -15498,6 +16807,92 @@ def test_detach_capacity_failure_rolls_back_marker_without_replacement(
         server._sessions.pop("source-sid", None)
 
 
+def test_detach_reservation_exception_fails_closed_without_mutation(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.active_sessions as active_sessions
+
+    prior_session_ids = set(server._sessions)
+    source = _session(
+        running=True,
+        turn_settled=False,
+        profile_home=str(tmp_path / "profiles" / "worker"),
+        session_key="source-key",
+    )
+    server._sessions["source-sid"] = source
+    before_keys = set(source)
+    before_tasks = dict(server._detached_turns)
+    create_calls = []
+
+    monkeypatch.setattr(
+        active_sessions,
+        "try_reserve_active_session_transition",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("registry lock failed")),
+    )
+    monkeypatch.setattr(
+        server,
+        "_create_detached_replacement",
+        lambda *_args: create_calls.append(True),
+    )
+    try:
+        response = server._methods["session.detach_turn"](
+            "detach", {"session_id": "source-sid"}
+        )
+
+        assert response["error"]["code"] == 4090
+        assert "could not reserve capacity" in response["error"]["message"]
+        assert create_calls == []
+        assert set(server._sessions) == prior_session_ids | {"source-sid"}
+        assert server._sessions["source-sid"] is source
+        assert source["running"] is True
+        assert set(source) == before_keys
+        assert "detaching_turn" not in source
+        assert "detach_capacity_reservation" not in source
+        assert "detached_turn_task_id" not in source
+        assert server._detached_turns == before_tasks
+    finally:
+        server._sessions.pop("source-sid", None)
+
+
+def test_corrupt_registry_blocks_detach_without_mutation(monkeypatch, tmp_path):
+    home = tmp_path / "profile"
+    runtime = home / "runtime"
+    runtime.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 2\n", encoding="utf-8"
+    )
+    corrupt = b'{"entries": "not-a-list"}'
+    registry = runtime / "active_sessions.json"
+    registry.write_bytes(corrupt)
+    source = _session(
+        running=True,
+        turn_settled=False,
+        profile_home=str(home),
+        session_key="corrupt-detach-source",
+    )
+    before = dict(source)
+    before_tasks = dict(server._detached_turns)
+    server._sessions["corrupt-detach-sid"] = source
+    monkeypatch.setattr(
+        server,
+        "_create_detached_replacement",
+        lambda *_args: pytest.fail("corrupt registry published replacement"),
+    )
+    try:
+        response = server._methods["session.detach_turn"](
+            "detach", {"session_id": "corrupt-detach-sid"}
+        )
+
+        assert response["error"]["code"] == 4090
+        assert "could not reserve capacity" in response["error"]["message"]
+        assert source == before
+        assert server._sessions["corrupt-detach-sid"] is source
+        assert server._detached_turns == before_tasks
+        assert registry.read_bytes() == corrupt
+    finally:
+        server._sessions.pop("corrupt-detach-sid", None)
+
+
 def test_detached_owner_survives_disconnect_and_recovers_on_activation(monkeypatch):
     task_id = "task-reconnect"
     transport = object()
@@ -17805,6 +19200,185 @@ def test_reap_idle_sessions_calls_periodic_trim(monkeypatch):
         server._sessions.clear()
 
 
+def test_orphan_reconcile_isolated_per_profile_registry(monkeypatch, tmp_path):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    launch_home = tmp_path / "launch"
+    remote_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir()
+    remote_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_hermes_home", str(launch_home))
+    cfg = {"max_concurrent_sessions": 5}
+
+    launch_token = set_hermes_home_override(launch_home)
+    try:
+        launch_live, _ = try_acquire_active_session(
+            session_id="launch-live", surface="desktop", config=cfg
+        )
+        launch_orphan, _ = try_acquire_active_session(
+            session_id="launch-orphan", surface="desktop", config=cfg
+        )
+    finally:
+        reset_hermes_home_override(launch_token)
+
+    remote_token = set_hermes_home_override(remote_home)
+    try:
+        remote_live, _ = try_acquire_active_session(
+            session_id="remote-live", surface="desktop", config=cfg
+        )
+        remote_orphan, _ = try_acquire_active_session(
+            session_id="remote-orphan", surface="desktop", config=cfg
+        )
+    finally:
+        reset_hermes_home_override(remote_token)
+
+    assert all(
+        lease is not None
+        for lease in (launch_live, launch_orphan, remote_live, remote_orphan)
+    )
+    server._sessions["launch-sid"] = _session(
+        active_session_lease=launch_live,
+        profile_home=None,
+        session_key="launch-live",
+    )
+    server._sessions["remote-sid"] = _session(
+        active_session_lease=remote_live,
+        profile_home=str(remote_home),
+        session_key="remote-live",
+    )
+    try:
+        server._reclaim_orphaned_leases()
+
+        launch_entries = json.loads(
+            (launch_home / "runtime" / "active_sessions.json").read_text()
+        )["entries"]
+        remote_entries = json.loads(
+            (remote_home / "runtime" / "active_sessions.json").read_text()
+        )["entries"]
+        assert [entry["session_id"] for entry in launch_entries] == ["launch-live"]
+        assert [entry["session_id"] for entry in remote_entries] == ["remote-live"]
+    finally:
+        server._sessions.pop("launch-sid", None)
+        server._sessions.pop("remote-sid", None)
+        launch_live.release()
+        remote_live.release()
+
+
+def test_popped_remote_session_failed_release_is_retried_by_process_owner(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.active_sessions as active_sessions
+
+    launch_home = tmp_path / "launch"
+    remote_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir()
+    remote_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_hermes_home", str(launch_home))
+    token = set_hermes_home_override(remote_home)
+    try:
+        lease, message = active_sessions.try_acquire_active_session(
+            session_id="remote-popped",
+            surface="desktop",
+            config={"max_concurrent_sessions": 1},
+        )
+    finally:
+        reset_hermes_home_override(token)
+    assert message is None and lease is not None
+    session = _session(
+        active_session_lease=lease,
+        profile_home=str(remote_home),
+        session_key="remote-popped",
+    )
+    server._sessions["remote-popped-sid"] = session
+    real_write = active_sessions._write_entries
+    failed = False
+
+    def fail_release_once(path, entries):
+        nonlocal failed
+        if not failed and not entries:
+            failed = True
+            raise OSError("remote release unavailable")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_release_once)
+    try:
+        assert server._close_session_by_id("remote-popped-sid") is True
+        assert "remote-popped-sid" not in server._sessions
+        assert lease.released is False
+        assert lease in server._pending_lease_releases.values()
+        assert len(
+            active_sessions._read_entries(lease.registry_state_path())
+        ) == 1
+
+        server._reclaim_orphaned_leases()
+
+        assert lease.released is True
+        assert lease not in server._pending_lease_releases.values()
+        assert active_sessions._read_entries(lease.registry_state_path()) == []
+    finally:
+        monkeypatch.setattr(active_sessions, "_write_entries", real_write)
+        server._sessions.pop("remote-popped-sid", None)
+        if not lease.released:
+            server._reclaim_orphaned_leases()
+
+
+def test_failed_detach_reservation_release_is_retained_and_retried(
+    monkeypatch, tmp_path
+):
+    import hermes_cli.active_sessions as active_sessions
+
+    home = tmp_path / "profile"
+    token = set_hermes_home_override(home)
+    try:
+        reservation, message = active_sessions.try_reserve_active_session_transition(
+            transition="detach_turn",
+            session_id="detach:source-key",
+            surface="desktop",
+            config={"max_concurrent_sessions": 1},
+        )
+    finally:
+        reset_hermes_home_override(token)
+    assert message is None and reservation is not None
+    source = _session(
+        detach_capacity_reservation=reservation,
+        profile_home=str(home),
+        session_key="source-key",
+    )
+    server._sessions["detach-release-source"] = source
+    real_write = active_sessions._write_entries
+    failed = False
+
+    def fail_release_once(path, entries):
+        nonlocal failed
+        if not failed and not entries:
+            failed = True
+            raise OSError("detach release unavailable")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_release_once)
+    try:
+        server._release_detach_capacity_reservation(source)
+        assert source.get("detach_capacity_reservation") is None
+        assert reservation.released is False
+        assert reservation in server._pending_lease_releases.values()
+        assert len(
+            active_sessions._read_entries(reservation.registry_state_path())
+        ) == 1
+
+        server._reclaim_orphaned_leases()
+
+        assert reservation.released is True
+        assert reservation not in server._pending_lease_releases.values()
+        assert active_sessions._read_entries(
+            reservation.registry_state_path()
+        ) == []
+    finally:
+        monkeypatch.setattr(active_sessions, "_write_entries", real_write)
+        server._sessions.pop("detach-release-source", None)
+        if not reservation.released:
+            server._reclaim_orphaned_leases()
+
+
 def test_reap_idle_sessions_logs_trim_failure(monkeypatch, caplog):
     monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
     monkeypatch.setattr(server, "_close_session_by_id", lambda *a, **k: None)
@@ -19278,6 +20852,8 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert resp is not None and resp.get("result")
         assert not observed["history"]
         assert not observed["run_kwargs"]
-        assert cleanup_order == ["trim", "reset_home"]
+        # Capacity admission first binds the session profile to read its cap
+        # and claim its registry, then the turn binds it again for execution.
+        assert cleanup_order == ["reset_home", "trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)

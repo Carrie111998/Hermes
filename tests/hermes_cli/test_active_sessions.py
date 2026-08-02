@@ -6,6 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import active_sessions
 
 
@@ -242,6 +244,69 @@ def test_lease_release_uses_claim_time_registry_under_home_override(tmp_path, mo
     assert _registry_entries_for(claim_home) == []
     # Profile B's registry was never created/touched by the release.
     assert not (other_home / "runtime" / "active_sessions.json").exists()
+
+
+def test_failed_lease_release_remains_retryable(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="retry-release",
+        surface="tui",
+        config={"max_concurrent_sessions": 1},
+    )
+    assert message is None and lease is not None
+
+    real_write = active_sessions._write_entries
+    attempts = 0
+
+    def fail_once(path, entries):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("transient registry write failure")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_once)
+    try:
+        lease.release()
+    except OSError as exc:
+        assert "transient registry write failure" in str(exc)
+    else:  # pragma: no cover - the injected failure must propagate
+        raise AssertionError("release unexpectedly succeeded")
+
+    assert lease.released is False
+    lease.release()
+    assert lease.released is True
+    assert attempts == 2
+    assert _registry_entries_for(home) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{not-json",
+        b'"not-a-registry"',
+        b'{"entries": {}}',
+        b'{"entries": [1]}',
+    ],
+)
+def test_corrupt_registry_fails_closed_without_overwrite(
+    tmp_path, monkeypatch, payload
+):
+    home = tmp_path / ".hermes"
+    registry = home / "runtime" / "active_sessions.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_bytes(payload)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(active_sessions.ActiveSessionRegistryError):
+        active_sessions.try_acquire_active_session(
+            session_id="must-not-admit",
+            surface="tui",
+            config={"max_concurrent_sessions": 1},
+        )
+
+    assert registry.read_bytes() == payload
 
 
 def test_lease_transfer_uses_claim_time_registry_under_home_override(tmp_path, monkeypatch):
