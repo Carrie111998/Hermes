@@ -6960,6 +6960,52 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 }
 
 
+def _builtin_provider_present(name: str) -> bool:
+    """Look up *name* in the built-in provider registry, returning False
+    (not raising) when the catalog fails to load.
+
+    Used by ``_preserve_provider_with_base_url`` so a built-in lookup
+    exception cannot suppress the parallel user-defined provider lookup
+    (#76602).
+    """
+    try:
+        from hermes_cli.providers import get_provider
+
+        return get_provider(name) is not None
+    except Exception:
+        # Keep the high-risk provider-backed routes safe even if provider
+        # catalog loading is unavailable during early import/test paths.
+        return name in {
+            "anthropic",
+            "copilot",
+            "copilot-acp",
+            "minimax-oauth",
+            "nous",
+            "openai-codex",
+            "qwen-oauth",
+            "xai-oauth",
+        }
+
+
+def _named_custom_provider_present(name: str) -> bool:
+    """Look up *name* in the user-defined ``providers:`` section of
+    config.yaml, returning False when the config is unavailable or
+    fails to load.
+
+    Used by ``_preserve_provider_with_base_url`` so a user-defined
+    provider remains preserved even when the built-in registry raises
+    (parallel lookup; each side fails independently — #76602).
+    """
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        return _get_named_custom_provider(name) is not None
+    except Exception:
+        # Config not loaded yet (early import paths, tests) — fail closed:
+        # never widen True just because the import / load failed.
+        return False
+
+
 def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
@@ -7077,45 +7123,18 @@ def _resolve_task_provider_model(
         normalized = str(prov or "").strip().lower()
         if normalized in {"", "auto", "custom"} or normalized.startswith("custom:"):
             return False
-        try:
-            from hermes_cli.providers import get_provider
-
-            if get_provider(normalized) is not None:
-                return True
-            # #76602 — also preserve when *normalized* names a user-defined
-            # provider from the ``providers:`` section of config.yaml.
-            # Without this, an explicit provider + base_url (the shape the
-            # auxiliary vision path passes after resolving the task config)
-            # falls through to the anonymous ``"custom"`` downgrade, the
-            # downstream ``resolve_provider_client`` named-custom-provider
-            # branch never runs, and the call lands with ``no-key-required``
-            # → 401 from any auth-required provider (e.g. agnes-ai.cn,
-            # nvidia-nim with key_env, etc.). Mirrors the keep-naming
-            # behavior ``call_llm`` uses for main-runtime resolution.
-            try:
-                from hermes_cli.runtime_provider import _get_named_custom_provider
-
-                if _get_named_custom_provider(normalized) is not None:
-                    return True
-            except Exception:
-                # Config not loaded yet (early import paths, tests) — fall
-                # back to the hardcoded allowlist below; never widen a True
-                # just because the import failed.
-                pass
-            return False
-        except Exception:
-            # Keep the high-risk provider-backed routes safe even if provider
-            # catalog loading is unavailable during early import/test paths.
-            return normalized in {
-                "anthropic",
-                "copilot",
-                "copilot-acp",
-                "minimax-oauth",
-                "nous",
-                "openai-codex",
-                "qwen-oauth",
-                "xai-oauth",
-            }
+        # #76602 — two independent lookups, each guarded by its own
+        # try/except so a partial catalog-load failure in either path
+        # doesn't suppress the other. The previous shape nested the
+        # named-custom lookup inside the built-in try-block, so an
+        # exception from get_provider() jumped straight to the outer
+        # allowlist fallback and never consulted the user's configured
+        # named provider (the very bug this PR exists to fix).
+        if _builtin_provider_present(normalized):
+            return True
+        if _named_custom_provider_present(normalized):
+            return True
+        return False
 
     if provider:
         provider, base_url = _expand_direct_api_alias(provider, base_url)
