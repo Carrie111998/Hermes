@@ -13117,6 +13117,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # of a bot token. Including its secret keeps multiplexed profiles
             # from spawning competing sidecars for the same account and port.
             "_project_secret",
+            # App-id / client-id auth (no single bot token). Prefer stable
+            # non-secret identities so multiplexed profiles cannot spawn
+            # competing clients for the same exclusive connection.
+            # Feishu/Lark + QQ Bot: one active WS (or gateway session) per app.
+            "_app_id",
+            # DingTalk + Teams: client_id identifies the exclusive app.
+            "_client_id",
+            # WeCom: bot_id identifies the exclusive bot.
+            "_bot_id",
+            # WhatsApp Cloud: phone_number_id is the exclusive Graph identity.
+            "_phone_number_id",
         ):
             val = getattr(adapter, attr, None)
             if isinstance(val, str) and val.strip():

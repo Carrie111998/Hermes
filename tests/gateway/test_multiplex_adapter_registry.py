@@ -39,6 +39,57 @@ class TestCredentialFingerprint:
         assert fp1 is not None
         assert "shared-project-secret" not in fp1
 
+    def test_reads_feishu_app_id(self):
+        """Feishu/Lark store app_id (not a bot token); multiplex must see it.
+
+        Without this, every cloned profile with the same FEISHU_APP_ID returns
+        None here, the same-credential conflict check is skipped, and N
+        WebSocket clients fight for the single allowed connection per app.
+        """
+        class _FeishuAdapter:
+            def __init__(self, app_id):
+                self._app_id = app_id
+
+        fp1 = GatewayRunner._adapter_credential_fingerprint(
+            _FeishuAdapter("cli_a1b2c3d4e5f6g7h8")
+        )
+        fp2 = GatewayRunner._adapter_credential_fingerprint(
+            _FeishuAdapter("cli_a1b2c3d4e5f6g7h8")
+        )
+
+        assert fp1 == fp2
+        assert fp1 is not None
+        assert "cli_a1b2c3d4e5f6g7h8" not in fp1
+
+    def test_distinct_app_ids_distinct_fp(self):
+        class _FeishuAdapter:
+            def __init__(self, app_id):
+                self._app_id = app_id
+
+        a = GatewayRunner._adapter_credential_fingerprint(
+            _FeishuAdapter("cli_aaaaaaaaaaaaaaaa")
+        )
+        b = GatewayRunner._adapter_credential_fingerprint(
+            _FeishuAdapter("cli_bbbbbbbbbbbbbbbb")
+        )
+        assert a is not None and b is not None
+        assert a != b
+
+    def test_reads_client_id_and_bot_id(self):
+        class _ClientIdAdapter:
+            def __init__(self, client_id):
+                self._client_id = client_id
+
+        class _BotIdAdapter:
+            def __init__(self, bot_id):
+                self._bot_id = bot_id
+
+        assert GatewayRunner._adapter_credential_fingerprint(
+            _ClientIdAdapter("ding-client-id")
+        ) is not None
+        assert GatewayRunner._adapter_credential_fingerprint(
+            _BotIdAdapter("wecom-bot-id")
+        ) is not None
 
     def test_reads_config_token(self):
         """Adapters like Discord store token on `config`, not on self.
