@@ -9018,6 +9018,7 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_KANBAN_SAFE_ROOT_ACTIVE"] = "1"
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -9035,11 +9036,21 @@ def _default_spawn(
     # build_context_files_prompt (#34619 — workers loaded the dispatching
     # gateway's AGENTS.md instead of the task's). Setting it to the workspace
     # fixes both: the workspace is where the task's work actually happens.
-    # Only pin a real, absolute directory — file_tools rejects relative /
-    # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
-    # here (leave the inherited value rather than write a meaningless one).
+    accepted_workspace = None
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
-        env["TERMINAL_CWD"] = workspace
+        try:
+            normalized_workspace = os.path.realpath(workspace)
+            if (
+                os.path.dirname(normalized_workspace) != normalized_workspace
+                and os.pathsep not in normalized_workspace
+            ):
+                accepted_workspace = normalized_workspace
+        except (OSError, ValueError):
+            pass
+    if accepted_workspace is not None:
+        # Scope native file-tool writes to this task root; terminal and OS access remain outside it.
+        env["TERMINAL_CWD"] = accepted_workspace
+        env["HERMES_WRITE_SAFE_ROOT"] = accepted_workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:

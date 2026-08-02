@@ -316,6 +316,8 @@ Do not ask the agent to `patch` `~/.hermes/cron/jobs.json` directly. Use the `cr
 Write guards apply to `write_file` and `patch` only. The `terminal` tool runs as the same OS user and can still `cat` or overwrite denied paths via shell commands. The denylist reduces accidental damage and gives models a clear stop signal; it does not sandbox a hostile or compromised agent.
 :::
 
+Kanban workers receive a task-scoped `HERMES_WRITE_SAFE_ROOT` and `TERMINAL_CWD`. The file-tool root limits native `write_file` and `patch` mutations to that task workspace; terminal commands and child processes retain the worker's OS privileges and are outside this boundary.
+
 ## User Authorization (Gateway)
 
 When running the messaging gateway, Hermes controls who can interact with the bot through a layered authorization system.
