@@ -23,6 +23,7 @@ Header schema (12 headers total):
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -128,11 +129,27 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
+_DURATION_MULTIPLIERS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _parse_reset_seconds(value: Any, *, now: float) -> float:
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0.0
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        numeric = float(text)
+    except ValueError:
+        parts = list(_DURATION_PART_RE.finditer(text))
+        if not parts or "".join(part.group(0) for part in parts) != text:
+            return 0.0
+        return sum(float(part.group(1)) * _DURATION_MULTIPLIERS[part.group(2)] for part in parts)
+    if not math.isfinite(numeric):
+        return 0.0
+    # Providers use both relative seconds and Unix timestamps on the wire.
+    if numeric >= 1_000_000_000:
+        return max(0.0, numeric - now)
+    return max(0.0, numeric)
 
 
 def parse_rate_limit_headers(
@@ -161,7 +178,7 @@ def parse_rate_limit_headers(
         return RateLimitBucket(
             limit=_safe_int(lowered.get(f"x-ratelimit-limit-{tag}")),
             remaining=_safe_int(lowered.get(f"x-ratelimit-remaining-{tag}")),
-            reset_seconds=_safe_float(lowered.get(f"x-ratelimit-reset-{tag}")),
+            reset_seconds=_parse_reset_seconds(lowered.get(f"x-ratelimit-reset-{tag}"), now=now),
             captured_at=now,
         )
 

@@ -59,8 +59,42 @@ class TestParseHeaders:
         state = parse_rate_limit_headers({})
         assert state is None
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("1s", 1.0), ("250ms", 0.25), ("1m30s", 90.0), ("2h5m", 7_500.0)],
+    )
+    def test_parses_openai_wire_reset_durations(self, raw, expected):
+        state = parse_rate_limit_headers(
+            {
+                "x-ratelimit-limit-requests": "10",
+                "x-ratelimit-remaining-requests": "9",
+                "x-ratelimit-reset-requests": raw,
+            },
+            provider="xai-oauth",
+        )
+        assert state.requests_min.reset_seconds == pytest.approx(expected)
 
+    def test_parses_epoch_reset_timestamp_as_remaining_seconds(self, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: 1_700_000_000.0)
+        state = parse_rate_limit_headers(
+            {
+                "x-ratelimit-limit-requests": "10",
+                "x-ratelimit-remaining-requests": "9",
+                "x-ratelimit-reset-requests": "1700000045",
+            },
+            provider="xai-oauth",
+        )
+        assert state.requests_min.reset_seconds == pytest.approx(45.0)
 
+    def test_invalid_reset_value_degrades_to_zero(self):
+        state = parse_rate_limit_headers(
+            {
+                "x-ratelimit-limit-requests": "10",
+                "x-ratelimit-remaining-requests": "9",
+                "x-ratelimit-reset-requests": "not-a-duration",
+            }
+        )
+        assert state.requests_min.reset_seconds == 0.0
 
 
 class TestBucket:
