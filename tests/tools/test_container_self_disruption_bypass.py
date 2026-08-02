@@ -20,6 +20,7 @@ import tools.approval as approval_module
 from tools.approval import (
     check_all_command_guards,
     check_dangerous_command,
+    check_execute_code_guard,
     set_current_session_key,
     clear_session,
 )
@@ -167,6 +168,61 @@ def test_check_all_guards_host_destructive_bypassed_in_docker(interactive_sessio
         "rm -rf /workspace", "docker", approval_callback=_deny_cb_recording(calls),
     )
     assert not calls
+    assert result["approved"] is True
+
+
+# ---------------------------------------------------------------------------
+# check_execute_code_guard (the equivalent bypass surface)
+# ---------------------------------------------------------------------------
+# execute_code runs arbitrary local Python and shares the container skip, so it
+# is a parallel bypass: a script can subprocess/os.system its way to a
+# self-termination command. The carve-out matches self-disruption *shell*
+# commands in the script text so they still route through approval, while
+# ordinary scripts stay waived by the container boundary. The whole-script
+# approval only fires in a gateway/ask surface, so these run under ask-mode.
+
+@pytest.fixture
+def ask_session(interactive_session, monkeypatch):
+    """interactive_session plus ask-mode, so execute_code reaches the
+    whole-script approval site instead of the local-non-gateway auto-approve."""
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    return interactive_session
+
+
+@pytest.mark.parametrize("backend", CONTAINER_BACKENDS)
+def test_execute_code_self_disruption_gated_in_container(ask_session, backend):
+    """A script that shells out to self-termination is NOT waived by the
+    container bypass — it routes through approval (pending, not auto-approved)."""
+    code = 'import os\nos.system("pkill hermes")\n'
+    result = check_execute_code_guard(code, backend)
+    assert result["approved"] is False, (
+        f"execute_code self-termination auto-approved under {backend}"
+    )
+
+
+@pytest.mark.parametrize("backend", CONTAINER_BACKENDS)
+def test_execute_code_ordinary_still_bypassed_in_container(ask_session, backend):
+    """A script with no self-disruption command is still waived by the
+    container boundary — unchanged behavior."""
+    code = 'import subprocess\nsubprocess.run(["rm", "-rf", "/workspace"])\n'
+    result = check_execute_code_guard(code, backend)
+    assert result["approved"] is True, (
+        f"ordinary execute_code was gated under {backend}"
+    )
+
+
+def test_execute_code_gateway_stop_gated_in_docker(ask_session):
+    code = 'import subprocess\nsubprocess.run("hermes gateway stop", shell=True)\n'
+    result = check_execute_code_guard(code, "docker")
+    assert result["approved"] is False
+
+
+def test_execute_code_vercel_sandbox_still_waived(ask_session):
+    """vercel_sandbox has no local gateway to self-terminate and is handled by a
+    separate always-skip outside _should_skip_container_guards; the carve-out
+    intentionally leaves it unchanged."""
+    code = 'import os\nos.system("pkill hermes")\n'
+    result = check_execute_code_guard(code, "vercel_sandbox")
     assert result["approved"] is True
 
 

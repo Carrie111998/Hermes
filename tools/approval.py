@@ -3934,7 +3934,20 @@ def check_execute_code_guard(code: str, env_type: str,
     if env_type == "vercel_sandbox":
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
+        # Self-disruption carve-out, mirroring check_dangerous_command /
+        # check_all_command_guards: the container host-safety boundary justifies
+        # waiving host-destructive commands, but NOT the agent killing its own
+        # gateway/service — that is a self-inflicted DoS regardless of the
+        # sandbox. execute_code is an equivalent bypass surface (a script can
+        # subprocess/os.system its way to `hermes gateway stop`, `pkill hermes`,
+        # etc.), so a script whose text carries a self-disruption *shell*
+        # command still routes through approval. Matching runs over the script
+        # text, so embedded shell self-termination is caught; a raw in-process
+        # kill (e.g. os.kill on a discovered PID) remains out of scope for
+        # string-pattern detection, as the docstring already notes for the
+        # process APIs execute_code exposes generally.
+        if not _matches_self_disruption_pattern(code):
+            return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
