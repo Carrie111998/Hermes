@@ -268,19 +268,18 @@ def test_root_pinned_python_accepts_standard_root_owned_0755(
 
 
 def _installer_source(tmp_path: Path) -> tuple[Path, str]:
-    source_paths = set(installer._SOURCE_ASSETS) | set(
-        installer._REVISION_STATIC_ASSETS
-    ) | set(
-        installer._LATCHED_REVISION_STATIC_ASSETS
-    ) | set(
-        installer._SUCCESSOR_REBIND_STATIC_ASSETS
+    source_paths = (
+        set(installer._SOURCE_ASSETS)
+        | set(installer._REVISION_STATIC_ASSETS)
+        | set(installer._LATCHED_REVISION_STATIC_ASSETS)
+        | set(installer._SUCCESSOR_REBIND_STATIC_ASSETS)
     )
-    files = {
-        relative: (ROOT / relative).read_bytes()
-        for relative in source_paths
-    }
+    files = {relative: (ROOT / relative).read_bytes() for relative in source_paths}
     files["scripts/canary/production_cutover_unit_input_rotation.py"] = (
         ROOT / "scripts/canary/production_cutover_unit_input_rotation.py"
+    ).read_bytes()
+    files["scripts/canary/upstream_sync_rail_successor_rebind.py"] = (
+        ROOT / "scripts/canary/upstream_sync_rail_successor_rebind.py"
     ).read_bytes()
     return _commit_source(tmp_path, files)
 
@@ -294,9 +293,7 @@ def _installer_roots(tmp_path: Path) -> installer.InstallerRoots:
         libexec=tmp_path / "usr/libexec",
         job_root=tmp_path / "var/lib/muncho-release-updates",
         promotion_lock=(tmp_path / "run/lock/muncho-release-builder-promotion.lock"),
-        library_releases=(
-            tmp_path / "usr/lib/muncho-release-updater-releases"
-        ),
+        library_releases=(tmp_path / "usr/lib/muncho-release-updater-releases"),
     )
 
 
@@ -426,9 +423,7 @@ def test_revision_qualified_foundation_is_create_only_and_inert(
         "release_revision": revision,
         "roots": roots,
         "production": False,
-        "command_runner": lambda argv: _fake_foundation_command(
-            roots, calls, argv
-        ),
+        "command_runner": lambda argv: _fake_foundation_command(roots, calls, argv),
         "identity_validator": lambda: None,
         "foundation_validator": _validate_test_foundation,
         "revision_qualified": True,
@@ -443,16 +438,15 @@ def test_revision_qualified_foundation_is_create_only_and_inert(
     )
     assert first["schema"] == installer.REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
     assert first["foundation_layout"] == "revision-qualified-v2"
-    assert first["foundation_asset_manifest_sha256"] == second[
-        "foundation_asset_manifest_sha256"
-    ]
+    assert (
+        first["foundation_asset_manifest_sha256"]
+        == second["foundation_asset_manifest_sha256"]
+    )
     assert first["created_asset_count"] == expected_assets
     assert second["created_asset_count"] == 0
     assert (roots.library_releases.stat().st_mode & 0o777) == 0o755
     assert (library.stat().st_mode & 0o777) == 0o555
-    assert (
-        library / "scripts/canary/production_release_builder_phase.py"
-    ).is_file()
+    assert (library / "scripts/canary/production_release_builder_phase.py").is_file()
     assert (
         roots.systemd / "muncho-release-builder-v2@.service"
     ).stat().st_mode & 0o777 == 0o444
@@ -478,9 +472,7 @@ def test_latched_revision_foundation_is_create_only_and_inert(
         "release_revision": revision,
         "roots": roots,
         "production": False,
-        "command_runner": lambda argv: _fake_foundation_command(
-            roots, calls, argv
-        ),
+        "command_runner": lambda argv: _fake_foundation_command(roots, calls, argv),
         "identity_validator": lambda: None,
         "foundation_validator": _validate_test_foundation,
         "revision_qualified_v3": True,
@@ -493,8 +485,7 @@ def test_latched_revision_foundation_is_create_only_and_inert(
         installer._LATCHED_REVISION_STATIC_ASSETS
     )
     assert (
-        first["schema"]
-        == installer.LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+        first["schema"] == installer.LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
     )
     assert first["foundation_layout"] == "latched-revision-qualified-v3"
     assert first["created_asset_count"] == expected_assets
@@ -502,9 +493,9 @@ def test_latched_revision_foundation_is_create_only_and_inert(
     assert (
         roots.systemd / "muncho-release-builder-v3@.service"
     ).stat().st_mode & 0o777 == 0o444
-    unit = (
-        roots.systemd / "muncho-release-builder-v3@.service"
-    ).read_text(encoding="utf-8")
+    unit = (roots.systemd / "muncho-release-builder-v3@.service").read_text(
+        encoding="utf-8"
+    )
     assert "RemainAfterExit=yes" in unit
     assert (
         roots.libexec / "muncho-release-foundation-exec-v3"
@@ -527,9 +518,7 @@ def test_successor_rebind_v4_foundation_is_create_only_and_inert(
         "release_revision": revision,
         "roots": roots,
         "production": False,
-        "command_runner": lambda argv: _fake_foundation_command(
-            roots, calls, argv
-        ),
+        "command_runner": lambda argv: _fake_foundation_command(roots, calls, argv),
         "identity_validator": lambda: None,
         "foundation_validator": _validate_test_foundation,
         "revision_qualified_v4": True,
@@ -542,12 +531,9 @@ def test_successor_rebind_v4_foundation_is_create_only_and_inert(
         installer._SUCCESSOR_REBIND_STATIC_ASSETS
     )
     assert (
-        first["schema"]
-        == installer.SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA
+        first["schema"] == installer.SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA
     )
-    assert first["foundation_layout"] == (
-        "successor-rebind-revision-qualified-v4"
-    )
+    assert first["foundation_layout"] == ("successor-rebind-revision-qualified-v4")
     assert first["created_asset_count"] == expected_assets
     assert second["created_asset_count"] == 0
     wrapper = roots.libexec / "muncho-release-foundation-exec-v4"
@@ -560,18 +546,60 @@ def test_successor_rebind_v4_foundation_is_create_only_and_inert(
     assert first["activation_performed"] is False
 
 
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "ops/muncho/release-updater/muncho-release-foundation-exec-v4",
+        "scripts/canary/production_successor_rebind_owner_runtime_preexec.py",
+    ),
+)
+def test_successor_rebind_v4_installer_rejects_stale_bound_digests(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    source, _revision = _installer_source(tmp_path)
+    selected = source / relative
+    selected.write_bytes(selected.read_bytes() + b"\n# stale digest fixture\n")
+    _run("git", "add", relative, cwd=source)
+    _run("git", "commit", "-qm", "stale bound digest", cwd=source)
+    revision = _run("git", "rev-parse", "HEAD", cwd=source)
+    roots = _installer_roots(tmp_path)
+
+    with pytest.raises(
+        installer.RotationStagerInstallerError,
+        match="asset_binding_invalid",
+    ):
+        installer._install_for_test(
+            source_root=source,
+            source_remote="fork",
+            repository_url=REMOTE_URL,
+            release_revision=revision,
+            roots=roots,
+            production=False,
+            command_runner=lambda _argv: None,
+            identity_validator=lambda: None,
+            foundation_validator=lambda _roots: None,
+            revision_qualified_v4=True,
+        )
+
+
 def test_successor_rebind_v4_wrapper_has_only_one_fixed_action() -> None:
     raw = (
-        ROOT
-        / "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
+        ROOT / "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
+    ).read_text(encoding="utf-8")
+    verifier = (
+        ROOT / "scripts/canary/production_successor_rebind_owner_runtime_preexec.py"
     ).read_text(encoding="utf-8")
 
     assert "successor-rebind-owner-apply" in raw
-    assert "upstream-sync-successor-owner-apply" in raw
+    assert "upstream-sync-successor-owner-apply" in verifier
     assert "owner-apply-fixed" not in raw
-    assert 'if [ "$#" -ne 3 ]' in raw
+    assert 'if [ "$#" -ne 8 ]' in raw
     assert 'if [ "$operation" != successor-rebind-owner-apply ]' in raw
-    assert 'runtime_base=/usr/lib/muncho-successor-rebind-runtime' in raw
+    assert "runtime_base=/usr/lib/muncho-successor-rebind-runtime" in raw
+    assert "production_successor_rebind_owner_runtime_preexec" in raw
+    assert "exec /usr/bin/python3 -I -S -B" in raw
+    assert "expected_preexec_sha256" in raw
     assert "hermes-agent-releases" not in raw
     assert '"$@"' not in raw
     assert "systemctl" not in raw
@@ -597,9 +625,7 @@ def test_revision_qualified_foundation_keeps_two_revisions_side_by_side(
         "repository_url": REMOTE_URL,
         "roots": roots,
         "production": False,
-        "command_runner": lambda argv: _fake_foundation_command(
-            roots, calls, argv
-        ),
+        "command_runner": lambda argv: _fake_foundation_command(roots, calls, argv),
         "identity_validator": lambda: None,
         "foundation_validator": _validate_test_foundation,
         "revision_qualified": True,
@@ -618,9 +644,10 @@ def test_revision_qualified_foundation_keeps_two_revisions_side_by_side(
     assert first_library.is_dir()
     assert second_library.is_dir()
     assert first_library != second_library
-    assert first["foundation_asset_manifest_sha256"] != second[
-        "foundation_asset_manifest_sha256"
-    ]
+    assert (
+        first["foundation_asset_manifest_sha256"]
+        != second["foundation_asset_manifest_sha256"]
+    )
     for library in (first_library, second_library):
         assert (library.stat().st_mode & 0o777) == 0o555
         assert (
@@ -683,10 +710,9 @@ def test_revision_foundation_wrapper_preserves_python_argv_contract(
         "import json,sys\nprint(json.dumps(sys.argv))\n",
         encoding="utf-8",
     )
-    source = (
-        ROOT
-        / f"ops/muncho/release-updater/{wrapper_name}"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / f"ops/muncho/release-updater/{wrapper_name}").read_text(
+        encoding="utf-8"
+    )
     source = source.replace(
         "/usr/lib/muncho-release-updater-releases",
         str(library_base),

@@ -49,16 +49,10 @@ PREFLIGHT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-preflight.v1"
 STARTED_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-started.v1"
 ARCHIVE_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-archive.v1"
 TERMINAL_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-terminal.v1"
-OWNER_REQUEST_SCHEMA = (
-    "muncho-dual-upstream-sync-successor-rebind-owner-request.v1"
-)
-OWNER_RESULT_SCHEMA = (
-    "muncho-dual-upstream-sync-successor-rebind-owner-result.v1"
-)
+OWNER_REQUEST_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-owner-request.v3"
+OWNER_RESULT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-owner-result.v3"
 ROLLBACK_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-rollback.v1"
-ROLLBACK_INTENT_SCHEMA = (
-    "muncho-dual-upstream-sync-successor-rebind-rollback-intent.v1"
-)
+ROLLBACK_INTENT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-rollback-intent.v1"
 OPERATION = "dual-upstream-sync-successor-rebind"
 
 UNIT_NAMES = activation.UNIT_NAMES
@@ -70,35 +64,60 @@ STAGED_ROOT = rail.PACKAGE_ROOT
 AUTHORITY_PATH = STAGED_ROOT / "successor-rebind-authority.json"
 PREFLIGHT_PATH = STAGED_ROOT / "successor-rebind-preflight.json"
 EVIDENCE_ROOT = Path(
-    "/var/lib/muncho-production-legacy-cutover/"
-    "dual-upstream-sync-successor-rebind"
+    "/var/lib/muncho-production-legacy-cutover/dual-upstream-sync-successor-rebind"
 )
-RUNTIME_RELATIVE = Path(
-    "scripts/canary/upstream_sync_rail_successor_rebind.py"
+RUNTIME_RELATIVE = Path("scripts/canary/upstream_sync_rail_successor_rebind.py")
+FOUNDATION_V4_WRAPPER = Path("/usr/libexec/muncho-release-foundation-exec-v4")
+FOUNDATION_V4_WRAPPER_SHA256 = (
+    "ec692b7f7edef34c86f329de51fedc8487ec6999853586fefbe9fd68d5c1d658"
+)
+PREEXEC_VERIFIER_SHA256 = (
+    "4cb6d6924a86393776a723597a5110c19fbf6d71f7f5bd37550b29dc407030aa"
 )
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_OWNER_FRAME_MAGIC = b"MSR1"
+_OWNER_FRAME_MAGIC = b"MSR2"
 _OWNER_FRAME_MAX_BYTES = 16 * 1024
 _UNIT_DIGEST_FIELDS = frozenset(UNIT_NAMES)
-_ENABLED_STATES = frozenset(
-    {
-        "alias",
-        "bad",
-        "disabled",
-        "enabled",
-        "enabled-runtime",
-        "generated",
-        "indirect",
-        "linked",
-        "linked-runtime",
-        "masked",
-        "masked-runtime",
-        "static",
-        "transient",
-    }
+_OWNER_RUNTIME_IDENTITY_FIELDS = (
+    "source_tree_oid",
+    "stage_c_builder_terminal_receipt_sha256",
+    "foundation_wrapper_sha256",
+    "preexec_verifier_sha256",
+    "controller_owner_runtime_manifest_sha256",
+    "controller_owner_runtime_attestation_sha256",
+    "controller_owner_runtime_tree_sha256",
+    "controller_owner_runtime_interpreter_sha256",
+    "remote_owner_runtime_publication_sha256",
+    "remote_owner_runtime_manifest_sha256",
+    "remote_owner_runtime_attestation_sha256",
+    "remote_owner_runtime_tree_sha256",
+    "remote_owner_runtime_interpreter_sha256",
+    "remote_owner_runtime_staging_publication_sha256",
+    "remote_owner_runtime_staging_manifest_sha256",
+    "remote_owner_runtime_staging_attestation_sha256",
+    "remote_owner_runtime_staging_tree_sha256",
+    "remote_owner_runtime_staging_interpreter_sha256",
+    "remote_owner_runtime_staging_pyvenv_cfg_sha256",
+    "remote_owner_runtime_builder_receipt_sha256",
+    "remote_owner_runtime_wheel_sha256",
 )
+_ENABLED_STATES = frozenset({
+    "alias",
+    "bad",
+    "disabled",
+    "enabled",
+    "enabled-runtime",
+    "generated",
+    "indirect",
+    "linked",
+    "linked-runtime",
+    "masked",
+    "masked-runtime",
+    "static",
+    "transient",
+})
 
 
 class UpstreamSyncRailSuccessorRebindError(RuntimeError):
@@ -165,7 +184,28 @@ def build_owner_request(
     predecessor_activation_receipt_sha256: str,
     stage_c_host_artifact_manifest_sha256: str,
     stage_c_release_update_publication_sha256: str,
+    source_tree_oid: str,
+    stage_c_builder_terminal_receipt_sha256: str,
     rebind_runtime_sha256: str,
+    foundation_wrapper_sha256: str,
+    controller_owner_runtime_manifest_sha256: str,
+    controller_owner_runtime_attestation_sha256: str,
+    controller_owner_runtime_tree_sha256: str,
+    controller_owner_runtime_interpreter_sha256: str,
+    remote_owner_runtime_publication_sha256: str,
+    remote_owner_runtime_manifest_sha256: str,
+    remote_owner_runtime_attestation_sha256: str,
+    remote_owner_runtime_tree_sha256: str,
+    remote_owner_runtime_interpreter_sha256: str,
+    remote_owner_runtime_staging_publication_sha256: str,
+    remote_owner_runtime_staging_manifest_sha256: str,
+    remote_owner_runtime_staging_attestation_sha256: str,
+    remote_owner_runtime_staging_tree_sha256: str,
+    remote_owner_runtime_staging_interpreter_sha256: str,
+    remote_owner_runtime_staging_pyvenv_cfg_sha256: str,
+    remote_owner_runtime_builder_receipt_sha256: str,
+    remote_owner_runtime_wheel_sha256: str,
+    preexec_verifier_sha256: str,
 ) -> dict[str, Any]:
     """Build the sole public owner input from exact reviewed identities."""
 
@@ -184,7 +224,56 @@ def build_owner_request(
         "stage_c_release_update_publication_sha256": (
             stage_c_release_update_publication_sha256
         ),
+        "source_tree_oid": source_tree_oid,
+        "stage_c_builder_terminal_receipt_sha256": (
+            stage_c_builder_terminal_receipt_sha256
+        ),
         "rebind_runtime_sha256": rebind_runtime_sha256,
+        "foundation_wrapper_sha256": foundation_wrapper_sha256,
+        "controller_owner_runtime_manifest_sha256": (
+            controller_owner_runtime_manifest_sha256
+        ),
+        "controller_owner_runtime_attestation_sha256": (
+            controller_owner_runtime_attestation_sha256
+        ),
+        "controller_owner_runtime_tree_sha256": (controller_owner_runtime_tree_sha256),
+        "controller_owner_runtime_interpreter_sha256": (
+            controller_owner_runtime_interpreter_sha256
+        ),
+        "remote_owner_runtime_publication_sha256": (
+            remote_owner_runtime_publication_sha256
+        ),
+        "remote_owner_runtime_manifest_sha256": remote_owner_runtime_manifest_sha256,
+        "remote_owner_runtime_attestation_sha256": (
+            remote_owner_runtime_attestation_sha256
+        ),
+        "remote_owner_runtime_tree_sha256": remote_owner_runtime_tree_sha256,
+        "remote_owner_runtime_interpreter_sha256": (
+            remote_owner_runtime_interpreter_sha256
+        ),
+        "remote_owner_runtime_staging_publication_sha256": (
+            remote_owner_runtime_staging_publication_sha256
+        ),
+        "remote_owner_runtime_staging_manifest_sha256": (
+            remote_owner_runtime_staging_manifest_sha256
+        ),
+        "remote_owner_runtime_staging_attestation_sha256": (
+            remote_owner_runtime_staging_attestation_sha256
+        ),
+        "remote_owner_runtime_staging_tree_sha256": (
+            remote_owner_runtime_staging_tree_sha256
+        ),
+        "remote_owner_runtime_staging_interpreter_sha256": (
+            remote_owner_runtime_staging_interpreter_sha256
+        ),
+        "remote_owner_runtime_staging_pyvenv_cfg_sha256": (
+            remote_owner_runtime_staging_pyvenv_cfg_sha256
+        ),
+        "remote_owner_runtime_builder_receipt_sha256": (
+            remote_owner_runtime_builder_receipt_sha256
+        ),
+        "remote_owner_runtime_wheel_sha256": remote_owner_runtime_wheel_sha256,
+        "preexec_verifier_sha256": preexec_verifier_sha256,
         "caller_selected_paths_allowed": False,
         "caller_selected_commands_allowed": False,
         "caller_selected_targets_allowed": False,
@@ -212,7 +301,28 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
         "predecessor_activation_receipt_sha256",
         "stage_c_host_artifact_manifest_sha256",
         "stage_c_release_update_publication_sha256",
+        "source_tree_oid",
+        "stage_c_builder_terminal_receipt_sha256",
         "rebind_runtime_sha256",
+        "foundation_wrapper_sha256",
+        "controller_owner_runtime_manifest_sha256",
+        "controller_owner_runtime_attestation_sha256",
+        "controller_owner_runtime_tree_sha256",
+        "controller_owner_runtime_interpreter_sha256",
+        "remote_owner_runtime_publication_sha256",
+        "remote_owner_runtime_manifest_sha256",
+        "remote_owner_runtime_attestation_sha256",
+        "remote_owner_runtime_tree_sha256",
+        "remote_owner_runtime_interpreter_sha256",
+        "remote_owner_runtime_staging_publication_sha256",
+        "remote_owner_runtime_staging_manifest_sha256",
+        "remote_owner_runtime_staging_attestation_sha256",
+        "remote_owner_runtime_staging_tree_sha256",
+        "remote_owner_runtime_staging_interpreter_sha256",
+        "remote_owner_runtime_staging_pyvenv_cfg_sha256",
+        "remote_owner_runtime_builder_receipt_sha256",
+        "remote_owner_runtime_wheel_sha256",
+        "preexec_verifier_sha256",
         "caller_selected_paths_allowed",
         "caller_selected_commands_allowed",
         "caller_selected_targets_allowed",
@@ -233,9 +343,12 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
             for name in (
                 "target_revision",
                 "predecessor_revision",
+                "source_tree_oid",
             )
         )
         or request["target_revision"] == request["predecessor_revision"]
+        or request["foundation_wrapper_sha256"] != FOUNDATION_V4_WRAPPER_SHA256
+        or request["preexec_verifier_sha256"] != PREEXEC_VERIFIER_SHA256
         or any(
             _SHA256.fullmatch(str(request.get(name, ""))) is None
             for name in (
@@ -243,7 +356,27 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
                 "predecessor_activation_receipt_sha256",
                 "stage_c_host_artifact_manifest_sha256",
                 "stage_c_release_update_publication_sha256",
+                "stage_c_builder_terminal_receipt_sha256",
                 "rebind_runtime_sha256",
+                "foundation_wrapper_sha256",
+                "controller_owner_runtime_manifest_sha256",
+                "controller_owner_runtime_attestation_sha256",
+                "controller_owner_runtime_tree_sha256",
+                "controller_owner_runtime_interpreter_sha256",
+                "remote_owner_runtime_publication_sha256",
+                "remote_owner_runtime_manifest_sha256",
+                "remote_owner_runtime_attestation_sha256",
+                "remote_owner_runtime_tree_sha256",
+                "remote_owner_runtime_interpreter_sha256",
+                "remote_owner_runtime_staging_publication_sha256",
+                "remote_owner_runtime_staging_manifest_sha256",
+                "remote_owner_runtime_staging_attestation_sha256",
+                "remote_owner_runtime_staging_tree_sha256",
+                "remote_owner_runtime_staging_interpreter_sha256",
+                "remote_owner_runtime_staging_pyvenv_cfg_sha256",
+                "remote_owner_runtime_builder_receipt_sha256",
+                "remote_owner_runtime_wheel_sha256",
+                "preexec_verifier_sha256",
                 "request_sha256",
             )
         )
@@ -341,9 +474,7 @@ def _expected_missing_roots(
     )
     if valid_roots != frozenset({predecessor_sender_release_root}):
         _fail("upstream_sync_successor_revision_invalid")
-    return tuple(
-        sorted({predecessor_root, predecessor_sender_release_root})
-    )
+    return tuple(sorted({predecessor_root, predecessor_sender_release_root}))
 
 
 def _derive_predecessor_sender_release_root(
@@ -412,8 +543,7 @@ def build_authority(
         not isinstance(package, activation.PackageContext)
         or package.manifest.get("release_revision")
         != package.manifest.get("sender_revision")
-        or _SHA40.fullmatch(str(package.manifest.get("release_revision", "")))
-        is None
+        or _SHA40.fullmatch(str(package.manifest.get("release_revision", ""))) is None
         or any(
             _SHA256.fullmatch(value or "") is None
             for value in (
@@ -424,7 +554,9 @@ def build_authority(
         )
         or not isinstance(predecessor_units, Mapping)
         or set(predecessor_units) != _UNIT_DIGEST_FIELDS
-        or any(not isinstance(raw, bytes) or not raw for raw in predecessor_units.values())
+        or any(
+            not isinstance(raw, bytes) or not raw for raw in predecessor_units.values()
+        )
     ):
         _fail("upstream_sync_successor_authority_invalid")
     predecessor_sender_release_root = _derive_predecessor_sender_release_root(
@@ -959,10 +1091,7 @@ class _GuardedHost:
 
 
 def _observe_all(host: RebindHost, *, systemd_root: Path) -> dict[str, UnitState]:
-    return {
-        name: host.observe(name, systemd_root=systemd_root)
-        for name in UNIT_NAMES
-    }
+    return {name: host.observe(name, systemd_root=systemd_root) for name in UNIT_NAMES}
 
 
 def _validate_loaded_digests(
@@ -990,7 +1119,10 @@ def _timer_state_map(
     result: dict[str, dict[str, str]] = {}
     for name in TIMER_NAMES:
         item = observed[name]
-        if item.enabled_state not in {"enabled", "disabled"} or item.active_state not in {
+        if item.enabled_state not in {
+            "enabled",
+            "disabled",
+        } or item.active_state not in {
             "active",
             "inactive",
         }:
@@ -1042,30 +1174,24 @@ def _build_preflight_receipt(
     if any(observed[name].active_state != "inactive" for name in SERVICE_NAMES):
         _fail("upstream_sync_successor_service_busy")
     timer_prestates = _timer_state_map(observed)
-    return _receipt(
-        {
-            "schema": PREFLIGHT_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "target_package_manifest_sha256": package.manifest[
-                "manifest_sha256"
-            ],
-            "predecessor_unit_digests": dict(
-                authority["predecessor_unit_digests"]
-            ),
-            "predecessor_missing_release_roots": list(
-                authority["predecessor_missing_release_roots"]
-            ),
-            "target_revision": authority["target_revision"],
-            "target_unit_digests": dict(authority["target_unit_digests"]),
-            "timer_prestates": timer_prestates,
-            "service_units_inactive": True,
-            "missing_release_refs_proven": True,
-            "unit_files_exact": True,
-            "runtime_mutation_performed": False,
-            "secret_material_recorded": False,
-            "secret_digest_recorded": False,
-        }
-    )
+    return _receipt({
+        "schema": PREFLIGHT_SCHEMA,
+        "authority_sha256": authority["authority_sha256"],
+        "target_package_manifest_sha256": package.manifest["manifest_sha256"],
+        "predecessor_unit_digests": dict(authority["predecessor_unit_digests"]),
+        "predecessor_missing_release_roots": list(
+            authority["predecessor_missing_release_roots"]
+        ),
+        "target_revision": authority["target_revision"],
+        "target_unit_digests": dict(authority["target_unit_digests"]),
+        "timer_prestates": timer_prestates,
+        "service_units_inactive": True,
+        "missing_release_refs_proven": True,
+        "unit_files_exact": True,
+        "runtime_mutation_performed": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    })
 
 
 def preflight(
@@ -1189,9 +1315,7 @@ def _validate_stage0_bundle(
         bundle.assert_stable()
         publication = bundle.publication
         plan = publication["plan"]
-        host_manifest = bundle.input_documents[
-            "host_artifact_manifest_sha256"
-        ]
+        host_manifest = bundle.input_documents["host_artifact_manifest_sha256"]
         host_identity = bundle.input_internal_identities[
             "host_artifact_manifest_sha256"
         ]
@@ -1199,8 +1323,7 @@ def _validate_stage0_bundle(
             f"hermes-agent-{request['target_revision'][:12]}"
         )
         if (
-            publication.get("release_revision")
-            != request["target_revision"]
+            publication.get("release_revision") != request["target_revision"]
             or plan.get("release_revision") != request["target_revision"]
             or publication.get("publication_sha256")
             != request["stage_c_release_update_publication_sha256"]
@@ -1208,18 +1331,23 @@ def _validate_stage0_bundle(
             != request["stage_c_host_artifact_manifest_sha256"]
             or host_manifest.get("manifest_sha256")
             != request["stage_c_host_artifact_manifest_sha256"]
-            or host_identity
-            != request["stage_c_host_artifact_manifest_sha256"]
+            or host_identity != request["stage_c_host_artifact_manifest_sha256"]
             or bundle.predecessor_trust.get("activation_receipt_sha256")
             != request["predecessor_activation_receipt_sha256"]
             or bundle.predecessor_trust.get("release_revision")
             != request["predecessor_revision"]
             or publication.get("predecessor_revision")
             != request["predecessor_revision"]
-            or plan.get("predecessor_revision")
-            != request["predecessor_revision"]
+            or plan.get("predecessor_revision") != request["predecessor_revision"]
             or plan.get("predecessor_activation_receipt_sha256")
             != request["predecessor_activation_receipt_sha256"]
+            or plan.get("source_tree_oid") != request["source_tree_oid"]
+            or plan.get("builder_terminal_receipt_sha256")
+            != request["stage_c_builder_terminal_receipt_sha256"]
+            or bundle.builder_receipt.get("source_tree_oid")
+            != request["source_tree_oid"]
+            or bundle.builder_receipt.get("receipt_sha256")
+            != request["stage_c_builder_terminal_receipt_sha256"]
             or bundle.release_root != expected_release_root
             or bundle.builder_manifest.get("release_revision")
             != request["target_revision"]
@@ -1229,7 +1357,11 @@ def _validate_stage0_bundle(
             _fail("upstream_sync_successor_stage0_binding_invalid")
     except UpstreamSyncRailSuccessorRebindError:
         raise
-    except (KeyError, TypeError, release_stage0.ProductionReleaseUpdateStage0Error) as exc:
+    except (
+        KeyError,
+        TypeError,
+        release_stage0.ProductionReleaseUpdateStage0Error,
+    ) as exc:
         raise UpstreamSyncRailSuccessorRebindError(
             "upstream_sync_successor_stage0_binding_invalid"
         ) from exc
@@ -1276,11 +1408,7 @@ def _read_pending_transaction_inode(
     try:
         target_before = target.lstat()
         pending_before = pending.lstat()
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(pending, flags)
         opened = os.fstat(descriptor)
         chunks: list[bytes] = []
@@ -1330,9 +1458,7 @@ def _fsync_directory(path: Path) -> None:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_DIRECTORY", 0),
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
         )
         os.fsync(descriptor)
     except OSError as exc:
@@ -1493,9 +1619,7 @@ def _remove_just_created_stage(
                 modes=frozenset({0o444}),
                 root_owned=root_owned,
             )
-            moved_identity = release_builder.FileIdentity.from_stat(
-                moved_metadata
-            )
+            moved_identity = release_builder.FileIdentity.from_stat(moved_metadata)
             moved_is_exact = (
                 moved_identity.device == identity.device
                 and moved_identity.inode == identity.inode
@@ -1654,22 +1778,20 @@ def _started_receipt(
     authority: Mapping[str, Any],
     preflight_sha256: str,
 ) -> dict[str, Any]:
-    return _receipt(
-        {
-            "schema": STARTED_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "preflight_receipt_sha256": preflight_sha256,
-            "predecessor_unit_digests": dict(authority["predecessor_unit_digests"]),
-            "target_unit_digests": dict(authority["target_unit_digests"]),
-            "timer_units": list(TIMER_NAMES),
-            "service_units": list(SERVICE_NAMES),
-            "stop_scope": list(TIMER_NAMES),
-            "archive_before_replace": True,
-            "forward_recovery_only_after_start": True,
-            "runtime_mutation_performed": False,
-            "secret_material_recorded": False,
-        }
-    )
+    return _receipt({
+        "schema": STARTED_SCHEMA,
+        "authority_sha256": authority["authority_sha256"],
+        "preflight_receipt_sha256": preflight_sha256,
+        "predecessor_unit_digests": dict(authority["predecessor_unit_digests"]),
+        "target_unit_digests": dict(authority["target_unit_digests"]),
+        "timer_units": list(TIMER_NAMES),
+        "service_units": list(SERVICE_NAMES),
+        "stop_scope": list(TIMER_NAMES),
+        "archive_before_replace": True,
+        "forward_recovery_only_after_start": True,
+        "runtime_mutation_performed": False,
+        "secret_material_recorded": False,
+    })
 
 
 def _validate_started(
@@ -1695,19 +1817,17 @@ def _rollback_intent_receipt(
 ) -> dict[str, Any]:
     if not isinstance(cause, str) or re.fullmatch(r"[a-z0-9_]{1,120}", cause) is None:
         _fail("upstream_sync_successor_rollback_intent_invalid")
-    return _receipt(
-        {
-            "schema": ROLLBACK_INTENT_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "preflight_receipt_sha256": preflight_sha256,
-            "cause": cause,
-            "stop_scope": list(TIMER_NAMES),
-            "rollback_must_resume_before_forward_recovery": True,
-            "forward_mutation_may_have_occurred": True,
-            "rollback_mutation_performed": False,
-            "secret_material_recorded": False,
-        }
-    )
+    return _receipt({
+        "schema": ROLLBACK_INTENT_SCHEMA,
+        "authority_sha256": authority["authority_sha256"],
+        "preflight_receipt_sha256": preflight_sha256,
+        "cause": cause,
+        "stop_scope": list(TIMER_NAMES),
+        "rollback_must_resume_before_forward_recovery": True,
+        "forward_mutation_may_have_occurred": True,
+        "rollback_mutation_performed": False,
+        "secret_material_recorded": False,
+    })
 
 
 def _ensure_rollback_intent(
@@ -1790,17 +1910,15 @@ def _archive_units(
             gid=0 if root_owned else activation._effective_gid(),  # noqa: SLF001
         )
         stability_guard()
-    receipt = _receipt(
-        {
-            "schema": ARCHIVE_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "preflight_receipt_sha256": preflight_sha256,
-            "archived_unit_digests": dict(authority["predecessor_unit_digests"]),
-            "archived_unit_names": list(UNIT_NAMES),
-            "archive_complete_before_replace": True,
-            "secret_material_recorded": False,
-        }
-    )
+    receipt = _receipt({
+        "schema": ARCHIVE_SCHEMA,
+        "authority_sha256": authority["authority_sha256"],
+        "preflight_receipt_sha256": preflight_sha256,
+        "archived_unit_digests": dict(authority["predecessor_unit_digests"]),
+        "archived_unit_names": list(UNIT_NAMES),
+        "archive_complete_before_replace": True,
+        "secret_material_recorded": False,
+    })
     stability_guard()
     published = _publish(
         receipt,
@@ -1827,17 +1945,15 @@ def _validate_archive(
         "archive.json",
         evidence_root=evidence_root,
     )
-    expected = _receipt(
-        {
-            "schema": ARCHIVE_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "preflight_receipt_sha256": preflight_sha256,
-            "archived_unit_digests": dict(authority["predecessor_unit_digests"]),
-            "archived_unit_names": list(UNIT_NAMES),
-            "archive_complete_before_replace": True,
-            "secret_material_recorded": False,
-        }
-    )
+    expected = _receipt({
+        "schema": ARCHIVE_SCHEMA,
+        "authority_sha256": authority["authority_sha256"],
+        "preflight_receipt_sha256": preflight_sha256,
+        "archived_unit_digests": dict(authority["predecessor_unit_digests"]),
+        "archived_unit_names": list(UNIT_NAMES),
+        "archive_complete_before_replace": True,
+        "secret_material_recorded": False,
+    })
     observed_receipt = activation._read_canonical_json(  # noqa: SLF001
         receipt_path,
         root_owned=root_owned,
@@ -2035,22 +2151,20 @@ def _restore_predecessor(
             _fail("upstream_sync_successor_rollback_unconfirmed")
     if any(observed[name].active_state != "inactive" for name in SERVICE_NAMES):
         _fail("upstream_sync_successor_rollback_unconfirmed")
-    rollback = _receipt(
-        {
-            "schema": ROLLBACK_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "preflight_receipt_sha256": preflight_sha256,
-            "rollback_intent_receipt_sha256": rollback_intent["receipt_sha256"],
-            "restored_unit_digests": dict(authority["predecessor_unit_digests"]),
-            "restored_timer_prestates": copy.deepcopy(dict(prestates)),
-            "stopped_units": list(TIMER_NAMES),
-            "archive_used": archive_used,
-            "cause": cause,
-            "rollback_complete": True,
-            "target_active": False,
-            "secret_material_recorded": False,
-        }
-    )
+    rollback = _receipt({
+        "schema": ROLLBACK_SCHEMA,
+        "authority_sha256": authority["authority_sha256"],
+        "preflight_receipt_sha256": preflight_sha256,
+        "rollback_intent_receipt_sha256": rollback_intent["receipt_sha256"],
+        "restored_unit_digests": dict(authority["predecessor_unit_digests"]),
+        "restored_timer_prestates": copy.deepcopy(dict(prestates)),
+        "stopped_units": list(TIMER_NAMES),
+        "archive_used": archive_used,
+        "cause": cause,
+        "rollback_complete": True,
+        "target_active": False,
+        "secret_material_recorded": False,
+    })
     stability_guard()
     published = _publish(
         rollback,
@@ -2110,6 +2224,7 @@ def _rebind(
         preflight=checked_preflight,
         root_owned=root_owned,
     ) as held:
+
         def assert_rollback_authority() -> None:
             held.assert_stable()
 
@@ -2329,6 +2444,7 @@ def _rebind_unheld(
                 expected_digests=current_digests,
                 root_owned=root_owned,
             ) as held_current:
+
                 def assert_current_stable() -> None:
                     stability_guard()
                     held_current.assert_stable()
@@ -2339,10 +2455,7 @@ def _rebind_unheld(
                     current_host,
                     systemd_root=systemd_root,
                 )
-                if any(
-                    stopped[name].active_state != "inactive"
-                    for name in UNIT_NAMES
-                ):
+                if any(stopped[name].active_state != "inactive" for name in UNIT_NAMES):
                     _fail("upstream_sync_successor_quiescence_unconfirmed")
                 if archive_path.exists() or archive_path.is_symlink():
                     _validate_archive(
@@ -2379,6 +2492,7 @@ def _rebind_unheld(
                 expected_digests=authority["target_unit_digests"],
                 root_owned=root_owned,
             ) as held_target:
+
                 def assert_target_stable() -> None:
                     stability_guard()
                     held_target.assert_stable()
@@ -2395,8 +2509,7 @@ def _rebind_unheld(
                     systemd_root=systemd_root,
                 )
                 if any(
-                    reloaded[name].active_state != "inactive"
-                    for name in UNIT_NAMES
+                    reloaded[name].active_state != "inactive" for name in UNIT_NAMES
                 ):
                     _fail("upstream_sync_successor_reload_quiescence_invalid")
                 target_host.mutate("enable", *TIMER_NAMES)
@@ -2409,37 +2522,37 @@ def _rebind_unheld(
                     systemd_root=systemd_root,
                 )
                 assert_target_stable()
-            terminal = _receipt(
-                {
-                    "schema": TERMINAL_SCHEMA,
-                    "authority_sha256": authority["authority_sha256"],
-                    "preflight_receipt_sha256": expected_preflight_sha256,
-                    "archive_receipt_sha256": activation._read_canonical_json(  # noqa: SLF001
-                        archive_path,
-                        root_owned=root_owned,
-                        modes=frozenset({0o600}),
-                    )["receipt_sha256"],
-                    "target_revision": authority["target_revision"],
-                    "target_unit_digests": dict(authority["target_unit_digests"]),
-                    "timer_units": list(TIMER_NAMES),
-                    "service_units": list(SERVICE_NAMES),
-                    "timers_enabled": True,
-                    "timers_active": True,
-                    "assert_result": {name: observed[name].assert_result for name in UNIT_NAMES},
-                    "catch_up_result": {
-                        name: {
-                            "result": observed[name].result,
-                            "exec_main_status": observed[name].exec_main_status,
-                        }
-                        for name in SERVICE_NAMES
-                    },
-                    "forward_recovery_performed": forward_recovery,
-                    "rollback_performed": False,
-                    "stopped_units": list(TIMER_NAMES),
-                    "auto_merge_or_deploy_enabled": False,
-                    "secret_material_recorded": False,
-                }
-            )
+            terminal = _receipt({
+                "schema": TERMINAL_SCHEMA,
+                "authority_sha256": authority["authority_sha256"],
+                "preflight_receipt_sha256": expected_preflight_sha256,
+                "archive_receipt_sha256": activation._read_canonical_json(  # noqa: SLF001
+                    archive_path,
+                    root_owned=root_owned,
+                    modes=frozenset({0o600}),
+                )["receipt_sha256"],
+                "target_revision": authority["target_revision"],
+                "target_unit_digests": dict(authority["target_unit_digests"]),
+                "timer_units": list(TIMER_NAMES),
+                "service_units": list(SERVICE_NAMES),
+                "timers_enabled": True,
+                "timers_active": True,
+                "assert_result": {
+                    name: observed[name].assert_result for name in UNIT_NAMES
+                },
+                "catch_up_result": {
+                    name: {
+                        "result": observed[name].result,
+                        "exec_main_status": observed[name].exec_main_status,
+                    }
+                    for name in SERVICE_NAMES
+                },
+                "forward_recovery_performed": forward_recovery,
+                "rollback_performed": False,
+                "stopped_units": list(TIMER_NAMES),
+                "auto_merge_or_deploy_enabled": False,
+                "secret_material_recorded": False,
+            })
             stability_guard()
             published = _publish(
                 terminal,
@@ -2544,8 +2657,7 @@ def _authority_matches_owner_request(
     request: Mapping[str, Any],
 ) -> None:
     if (
-        authority.get("predecessor_revision")
-        != request["predecessor_revision"]
+        authority.get("predecessor_revision") != request["predecessor_revision"]
         or authority.get("target_revision") != request["target_revision"]
         or authority.get("target_package_manifest_sha256")
         != request["target_package_manifest_sha256"]
@@ -2553,8 +2665,7 @@ def _authority_matches_owner_request(
         != request["stage_c_host_artifact_manifest_sha256"]
         or authority.get("stage_c_release_update_publication_sha256")
         != request["stage_c_release_update_publication_sha256"]
-        or authority.get("rebind_runtime_sha256")
-        != request["rebind_runtime_sha256"]
+        or authority.get("rebind_runtime_sha256") != request["rebind_runtime_sha256"]
     ):
         _fail("upstream_sync_successor_owner_authority_binding_invalid")
 
@@ -2571,6 +2682,7 @@ def _owner_result(
         "operation": OPERATION,
         "request_sha256": request["request_sha256"],
         "target_revision": request["target_revision"],
+        **{name: request[name] for name in _OWNER_RUNTIME_IDENTITY_FIELDS},
         "authority_sha256": authority["authority_sha256"],
         "preflight_receipt_sha256": preflight_value["receipt_sha256"],
         "terminal_receipt_sha256": terminal["receipt_sha256"],
@@ -2599,6 +2711,7 @@ def validate_owner_result(
         "operation",
         "request_sha256",
         "target_revision",
+        *_OWNER_RUNTIME_IDENTITY_FIELDS,
         "authority_sha256",
         "preflight_receipt_sha256",
         "terminal_receipt_sha256",
@@ -2622,6 +2735,10 @@ def validate_owner_result(
         or result.get("operation") != OPERATION
         or result.get("request_sha256") != expected_request["request_sha256"]
         or result.get("target_revision") != expected_request["target_revision"]
+        or any(
+            result.get(name) != expected_request[name]
+            for name in _OWNER_RUNTIME_IDENTITY_FIELDS
+        )
         or any(
             _SHA256.fullmatch(str(result.get(name, ""))) is None
             for name in (
@@ -2809,9 +2926,7 @@ def _owner_apply_verified(
                 root_owned=root_owned,
                 modes=frozenset({0o444}),
             )
-            preflight_digest = str(
-                provisional_preflight.get("receipt_sha256", "")
-            )
+            preflight_digest = str(provisional_preflight.get("receipt_sha256", ""))
             preflight_value = _validate_preflight(
                 provisional_preflight,
                 authority=authority,
@@ -2875,9 +2990,7 @@ def _owner_apply_verified(
         )
         # No staged or runtime mutation is permitted until the complete exact
         # predecessor preflight above has passed in memory.
-        created: list[
-            tuple[Mapping[str, Any], Path, release_builder.FileIdentity]
-        ] = []
+        created: list[tuple[Mapping[str, Any], Path, release_builder.FileIdentity]] = []
         try:
             authority_identity = _stage_create_only_guarded(
                 authority,
@@ -2970,7 +3083,46 @@ def owner_apply_framed_stdin() -> dict[str, Any]:
     if sys.stdin.isatty():
         _fail("upstream_sync_successor_owner_cli_invalid")
     frame = sys.stdin.buffer.read(_OWNER_FRAME_MAX_BYTES + 9)
-    return owner_apply(decode_owner_request(frame))
+    request = decode_owner_request(frame)
+    from scripts.canary import production_successor_rebind_owner_runtime
+
+    production_successor_rebind_owner_runtime.validate_active_installation(
+        revision=request["target_revision"],
+        expected_publication_sha256=request["remote_owner_runtime_publication_sha256"],
+        expected_manifest_sha256=request["remote_owner_runtime_manifest_sha256"],
+        expected_attestation_sha256=request["remote_owner_runtime_attestation_sha256"],
+        expected_tree_sha256=request["remote_owner_runtime_tree_sha256"],
+        expected_interpreter_sha256=request["remote_owner_runtime_interpreter_sha256"],
+        expected_staging_publication_sha256=request[
+            "remote_owner_runtime_staging_publication_sha256"
+        ],
+        expected_source_tree_oid=request["source_tree_oid"],
+        expected_stage_c_builder_terminal_receipt_sha256=request[
+            "stage_c_builder_terminal_receipt_sha256"
+        ],
+        expected_owner_runtime_builder_receipt_sha256=request[
+            "remote_owner_runtime_builder_receipt_sha256"
+        ],
+        expected_owner_runtime_wheel_sha256=request[
+            "remote_owner_runtime_wheel_sha256"
+        ],
+        expected_staging_manifest_sha256=request[
+            "remote_owner_runtime_staging_manifest_sha256"
+        ],
+        expected_staging_attestation_sha256=request[
+            "remote_owner_runtime_staging_attestation_sha256"
+        ],
+        expected_staging_tree_sha256=request[
+            "remote_owner_runtime_staging_tree_sha256"
+        ],
+        expected_staging_interpreter_sha256=request[
+            "remote_owner_runtime_staging_interpreter_sha256"
+        ],
+        expected_staging_pyvenv_cfg_sha256=request[
+            "remote_owner_runtime_staging_pyvenv_cfg_sha256"
+        ],
+    )
+    return owner_apply(request)
 
 
 class OwnerRebindTransport(Protocol):
@@ -2985,13 +3137,52 @@ class OwnerRebindTransport(Protocol):
 
 
 class _ProductionOwnerRebindTransport:
-    def __init__(self, target_revision: str) -> None:
+    def __init__(self, request_value: Mapping[str, Any]) -> None:
+        from gateway import production_owner_runtime
         from scripts.canary import production_cutover_owner_launcher as owner
 
+        request = validate_owner_request(request_value)
+        target_revision = request["target_revision"]
+        try:
+            attestation = production_owner_runtime.require_active_owner_runtime(
+                target_revision
+            )
+        except production_owner_runtime.ProductionOwnerRuntimeError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_owner_runtime_not_active"
+            ) from exc
+        if any(
+            attestation[name] != request[request_name]
+            for name, request_name in (
+                (
+                    "manifest_sha256",
+                    "controller_owner_runtime_manifest_sha256",
+                ),
+                (
+                    "attestation_sha256",
+                    "controller_owner_runtime_attestation_sha256",
+                ),
+                ("tree_sha256", "controller_owner_runtime_tree_sha256"),
+                (
+                    "interpreter_sha256",
+                    "controller_owner_runtime_interpreter_sha256",
+                ),
+            )
+        ):
+            _fail("upstream_sync_successor_owner_runtime_identity_invalid")
         identity, trusted, configuration = (
             owner.build_production_cutover_owner_identity(target_revision)
         )
         self._target_revision = target_revision
+        self._request_sha256 = request["request_sha256"]
+        self._runtime_identities = (
+            request["foundation_wrapper_sha256"],
+            request["remote_owner_runtime_manifest_sha256"],
+            request["remote_owner_runtime_tree_sha256"],
+            request["remote_owner_runtime_interpreter_sha256"],
+            request["remote_owner_runtime_attestation_sha256"],
+            request["preexec_verifier_sha256"],
+        )
         self._identity = identity
         self._transport = owner.ProductionCutoverTransport(
             identity,
@@ -3007,19 +3198,16 @@ class _ProductionOwnerRebindTransport:
     ) -> bytes:
         if target_revision != self._target_revision:
             _fail("upstream_sync_successor_owner_target_changed")
+        request = decode_owner_request(request_frame)
+        if request["request_sha256"] != self._request_sha256:
+            _fail("upstream_sync_successor_owner_request_changed")
         account = self._identity.account_for_read_only_preflight()
-        release = rail.release_root(target_revision)
-        python = release / ".venv/bin/python"
         completed = self._transport._run_remote_input(  # noqa: SLF001
             (
-                *self._transport._fixed_remote_environment(  # noqa: SLF001
-                    chdir=str(release)
-                ),
-                str(python),
-                "-B",
-                "-m",
-                "scripts.canary.upstream_sync_rail_successor_rebind",
-                "owner-apply-fixed",
+                str(FOUNDATION_V4_WRAPPER),
+                target_revision,
+                "successor-rebind-owner-apply",
+                *self._runtime_identities,
             ),
             account=account,
             input_bytes=request_frame,
@@ -3036,9 +3224,7 @@ def owner_run(
     transport: OwnerRebindTransport | None = None,
 ) -> dict[str, Any]:
     request = validate_owner_request(request_value)
-    selected = transport or _ProductionOwnerRebindTransport(
-        request["target_revision"]
-    )
+    selected = transport or _ProductionOwnerRebindTransport(request)
     try:
         raw = selected.invoke_successor_rebind(
             target_revision=request["target_revision"],
@@ -3050,11 +3236,7 @@ def owner_run(
         raise UpstreamSyncRailSuccessorRebindError(
             "upstream_sync_successor_owner_transport_failed"
         ) from exc
-    if (
-        not isinstance(raw, bytes)
-        or not raw.endswith(b"\n")
-        or len(raw) > 64 * 1024
-    ):
+    if not isinstance(raw, bytes) or not raw.endswith(b"\n") or len(raw) > 64 * 1024:
         _fail("upstream_sync_successor_owner_transport_failed")
     try:
         value = activation._decode(raw[:-1])  # noqa: SLF001
@@ -3104,6 +3286,7 @@ def _verify(
         preflight=preflight,
         root_owned=root_owned,
     ) as held:
+
         def assert_stable() -> None:
             held.assert_stable()
             if stability_guard is not None:
@@ -3323,7 +3506,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--predecessor-activation-receipt-sha256")
     parser.add_argument("--stage-c-host-artifact-manifest-sha256")
     parser.add_argument("--stage-c-release-update-publication-sha256")
+    parser.add_argument("--source-tree-oid")
+    parser.add_argument("--stage-c-builder-terminal-receipt-sha256")
     parser.add_argument("--rebind-runtime-sha256")
+    parser.add_argument("--foundation-wrapper-sha256")
+    parser.add_argument("--controller-owner-runtime-manifest-sha256")
+    parser.add_argument("--controller-owner-runtime-attestation-sha256")
+    parser.add_argument("--controller-owner-runtime-tree-sha256")
+    parser.add_argument("--controller-owner-runtime-interpreter-sha256")
+    parser.add_argument("--remote-owner-runtime-publication-sha256")
+    parser.add_argument("--remote-owner-runtime-manifest-sha256")
+    parser.add_argument("--remote-owner-runtime-attestation-sha256")
+    parser.add_argument("--remote-owner-runtime-tree-sha256")
+    parser.add_argument("--remote-owner-runtime-interpreter-sha256")
+    parser.add_argument("--remote-owner-runtime-staging-publication-sha256")
+    parser.add_argument("--remote-owner-runtime-staging-manifest-sha256")
+    parser.add_argument("--remote-owner-runtime-staging-attestation-sha256")
+    parser.add_argument("--remote-owner-runtime-staging-tree-sha256")
+    parser.add_argument("--remote-owner-runtime-staging-interpreter-sha256")
+    parser.add_argument("--remote-owner-runtime-staging-pyvenv-cfg-sha256")
+    parser.add_argument("--remote-owner-runtime-builder-receipt-sha256")
+    parser.add_argument("--remote-owner-runtime-wheel-sha256")
+    parser.add_argument("--preexec-verifier-sha256")
     return parser
 
 
@@ -3336,7 +3540,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.predecessor_activation_receipt_sha256,
         arguments.stage_c_host_artifact_manifest_sha256,
         arguments.stage_c_release_update_publication_sha256,
+        arguments.source_tree_oid,
+        arguments.stage_c_builder_terminal_receipt_sha256,
         arguments.rebind_runtime_sha256,
+        arguments.foundation_wrapper_sha256,
+        arguments.controller_owner_runtime_manifest_sha256,
+        arguments.controller_owner_runtime_attestation_sha256,
+        arguments.controller_owner_runtime_tree_sha256,
+        arguments.controller_owner_runtime_interpreter_sha256,
+        arguments.remote_owner_runtime_publication_sha256,
+        arguments.remote_owner_runtime_manifest_sha256,
+        arguments.remote_owner_runtime_attestation_sha256,
+        arguments.remote_owner_runtime_tree_sha256,
+        arguments.remote_owner_runtime_interpreter_sha256,
+        arguments.remote_owner_runtime_staging_publication_sha256,
+        arguments.remote_owner_runtime_staging_manifest_sha256,
+        arguments.remote_owner_runtime_staging_attestation_sha256,
+        arguments.remote_owner_runtime_staging_tree_sha256,
+        arguments.remote_owner_runtime_staging_interpreter_sha256,
+        arguments.remote_owner_runtime_staging_pyvenv_cfg_sha256,
+        arguments.remote_owner_runtime_builder_receipt_sha256,
+        arguments.remote_owner_runtime_wheel_sha256,
+        arguments.preexec_verifier_sha256,
     )
     if arguments.operation == "owner-run":
         if (
@@ -3362,7 +3587,64 @@ def main(argv: Sequence[str] | None = None) -> int:
                     stage_c_release_update_publication_sha256=(
                         arguments.stage_c_release_update_publication_sha256
                     ),
+                    source_tree_oid=arguments.source_tree_oid,
+                    stage_c_builder_terminal_receipt_sha256=(
+                        arguments.stage_c_builder_terminal_receipt_sha256
+                    ),
                     rebind_runtime_sha256=arguments.rebind_runtime_sha256,
+                    foundation_wrapper_sha256=(arguments.foundation_wrapper_sha256),
+                    controller_owner_runtime_manifest_sha256=(
+                        arguments.controller_owner_runtime_manifest_sha256
+                    ),
+                    controller_owner_runtime_attestation_sha256=(
+                        arguments.controller_owner_runtime_attestation_sha256
+                    ),
+                    controller_owner_runtime_tree_sha256=(
+                        arguments.controller_owner_runtime_tree_sha256
+                    ),
+                    controller_owner_runtime_interpreter_sha256=(
+                        arguments.controller_owner_runtime_interpreter_sha256
+                    ),
+                    remote_owner_runtime_publication_sha256=(
+                        arguments.remote_owner_runtime_publication_sha256
+                    ),
+                    remote_owner_runtime_manifest_sha256=(
+                        arguments.remote_owner_runtime_manifest_sha256
+                    ),
+                    remote_owner_runtime_attestation_sha256=(
+                        arguments.remote_owner_runtime_attestation_sha256
+                    ),
+                    remote_owner_runtime_tree_sha256=(
+                        arguments.remote_owner_runtime_tree_sha256
+                    ),
+                    remote_owner_runtime_interpreter_sha256=(
+                        arguments.remote_owner_runtime_interpreter_sha256
+                    ),
+                    remote_owner_runtime_staging_publication_sha256=(
+                        arguments.remote_owner_runtime_staging_publication_sha256
+                    ),
+                    remote_owner_runtime_staging_manifest_sha256=(
+                        arguments.remote_owner_runtime_staging_manifest_sha256
+                    ),
+                    remote_owner_runtime_staging_attestation_sha256=(
+                        arguments.remote_owner_runtime_staging_attestation_sha256
+                    ),
+                    remote_owner_runtime_staging_tree_sha256=(
+                        arguments.remote_owner_runtime_staging_tree_sha256
+                    ),
+                    remote_owner_runtime_staging_interpreter_sha256=(
+                        arguments.remote_owner_runtime_staging_interpreter_sha256
+                    ),
+                    remote_owner_runtime_staging_pyvenv_cfg_sha256=(
+                        arguments.remote_owner_runtime_staging_pyvenv_cfg_sha256
+                    ),
+                    remote_owner_runtime_builder_receipt_sha256=(
+                        arguments.remote_owner_runtime_builder_receipt_sha256
+                    ),
+                    remote_owner_runtime_wheel_sha256=(
+                        arguments.remote_owner_runtime_wheel_sha256
+                    ),
+                    preexec_verifier_sha256=(arguments.preexec_verifier_sha256),
                 )
             )
         )

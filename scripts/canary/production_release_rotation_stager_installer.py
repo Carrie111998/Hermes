@@ -73,6 +73,10 @@ _SOURCE_ASSETS: Mapping[str, tuple[str, int]] = {
         "library/scripts/canary/production_release_rotation_stager_promoter.py",
         0o444,
     ),
+    "scripts/canary/production_successor_rebind_owner_runtime_preexec.py": (
+        "library/scripts/canary/production_successor_rebind_owner_runtime_preexec.py",
+        0o444,
+    ),
     "ops/muncho/release-updater/muncho-release-builder.sysusers": (
         "sysusers/muncho-release-builder.conf",
         0o444,
@@ -424,9 +428,7 @@ def _install_for_test(
     revision_qualified_v3: bool = False,
     revision_qualified_v4: bool = False,
 ) -> Mapping[str, Any]:
-    revisioned = (
-        revision_qualified or revision_qualified_v3 or revision_qualified_v4
-    )
+    revisioned = revision_qualified or revision_qualified_v3 or revision_qualified_v4
     if (
         not isinstance(roots, InstallerRoots)
         or _REVISION.fullmatch(release_revision or "") is None
@@ -447,7 +449,8 @@ def _install_for_test(
                 revision_qualified_v3,
                 revision_qualified_v4,
             )
-        ) > 1
+        )
+        > 1
         or (
             production
             and (
@@ -543,10 +546,46 @@ def _install_for_test(
         "blob",
         f"{release_revision}:{builder_wrapper_source}",
     )
+    successor_raw = b""
+    preexec_raw = b""
+    successor_wrapper_raw = b""
+    if revision_qualified_v4:
+        successor_raw = _git(
+            source_root,
+            "cat-file",
+            "blob",
+            (
+                f"{release_revision}:"
+                "scripts/canary/upstream_sync_rail_successor_rebind.py"
+            ),
+        )
+        preexec_raw = _git(
+            source_root,
+            "cat-file",
+            "blob",
+            (
+                f"{release_revision}:"
+                "scripts/canary/production_successor_rebind_owner_runtime_preexec.py"
+            ),
+        )
+        successor_wrapper_raw = _git(
+            source_root,
+            "cat-file",
+            "blob",
+            (
+                f"{release_revision}:"
+                "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
+            ),
+        )
     try:
         rotation_tree = ast.parse(rotation_raw.decode("utf-8", errors="strict"))
         launcher_tree = ast.parse(launcher_raw.decode("utf-8", errors="strict"))
         promoter_tree = ast.parse(promoter_raw.decode("utf-8", errors="strict"))
+        successor_tree = (
+            ast.parse(successor_raw.decode("utf-8", errors="strict"))
+            if revision_qualified_v4
+            else None
+        )
 
         def literal_set(tree: ast.AST, name: str) -> frozenset[str]:
             for node in getattr(tree, "body", ()):
@@ -607,13 +646,25 @@ def _install_for_test(
             wrapper_hash_name,
         ) != _sha256(builder_wrapper_raw):
             _fail("rotation_stager_installer_asset_binding_invalid")
+        if revision_qualified_v4 and (
+            successor_tree is None
+            or literal_string(
+                successor_tree,
+                "FOUNDATION_V4_WRAPPER_SHA256",
+            )
+            != _sha256(successor_wrapper_raw)
+            or literal_string(
+                successor_tree,
+                "PREEXEC_VERIFIER_SHA256",
+            )
+            != _sha256(preexec_raw)
+        ):
+            _fail("rotation_stager_installer_asset_binding_invalid")
     except (SyntaxError, UnicodeError, ValueError, TypeError) as exc:
         _fail("rotation_stager_installer_protocol_drift", exc)
 
     library_root = (
-        roots.library_releases / release_revision
-        if revisioned
-        else roots.library
+        roots.library_releases / release_revision if revisioned else roots.library
     )
     for root in (
         roots.library_releases if revisioned else roots.library,
@@ -625,8 +676,7 @@ def _install_for_test(
         _ensure_directory(
             root,
             create=(
-                root
-                == (roots.library_releases if revisioned else roots.library)
+                root == (roots.library_releases if revisioned else roots.library)
                 or not production
             ),
             production=production,
@@ -704,7 +754,10 @@ def _install_for_test(
         foundation_validator(roots)
 
     deterministic_assets = [
-        {name: item[name] for name in ("source_relative_path", "target_path", "mode", "sha256")}
+        {
+            name: item[name]
+            for name in ("source_relative_path", "target_path", "mode", "sha256")
+        }
         for item in installed
     ]
     unsigned = {

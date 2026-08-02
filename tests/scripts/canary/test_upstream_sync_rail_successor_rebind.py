@@ -10,10 +10,12 @@ from typing import Any, Callable
 
 import pytest
 
+from gateway import production_owner_runtime
 from ops.muncho.runtime import upstream_sync_job_rail as rail
 from scripts.canary import package_production_cutover_artifacts as host_package
 from scripts.canary import production_release_update_contract as release_contract
 from scripts.canary import production_release_consumer_inventory as inventory
+from scripts.canary import production_cutover_owner_launcher as owner_launcher
 from scripts.canary import upstream_sync_rail_cutover as activation
 from scripts.canary import upstream_sync_rail_successor_rebind as successor
 
@@ -23,6 +25,34 @@ PREDECESSOR = "9d4a56cb069c096a2db6e452c19ffc1b7dc2d4f6"
 PREDECESSOR_SENDER = "f8733e2f44dae583ac30b2c4f4e85afd7890a1a5"
 TARGET = "a094bc4c2ecf1e4deb9b5b353491f9a0690211b3"
 PREDECESSOR_RECEIPT = "6" * 64
+SOURCE_TREE = "8" * 40
+STAGE_C_BUILDER_RECEIPT = "9" * 64
+
+
+def _owner_runtime_kwargs() -> dict[str, str]:
+    return {
+        "source_tree_oid": SOURCE_TREE,
+        "stage_c_builder_terminal_receipt_sha256": STAGE_C_BUILDER_RECEIPT,
+        "foundation_wrapper_sha256": successor.FOUNDATION_V4_WRAPPER_SHA256,
+        "controller_owner_runtime_manifest_sha256": "a" * 64,
+        "controller_owner_runtime_attestation_sha256": "b" * 64,
+        "controller_owner_runtime_tree_sha256": "c" * 64,
+        "controller_owner_runtime_interpreter_sha256": "d" * 64,
+        "remote_owner_runtime_publication_sha256": "e" * 64,
+        "remote_owner_runtime_manifest_sha256": "f" * 64,
+        "remote_owner_runtime_attestation_sha256": "0" * 64,
+        "remote_owner_runtime_tree_sha256": "1" * 64,
+        "remote_owner_runtime_interpreter_sha256": "2" * 64,
+        "remote_owner_runtime_staging_publication_sha256": "3" * 64,
+        "remote_owner_runtime_staging_manifest_sha256": "4" * 64,
+        "remote_owner_runtime_staging_attestation_sha256": "5" * 64,
+        "remote_owner_runtime_staging_tree_sha256": "6" * 64,
+        "remote_owner_runtime_staging_interpreter_sha256": "7" * 64,
+        "remote_owner_runtime_staging_pyvenv_cfg_sha256": "8" * 64,
+        "remote_owner_runtime_builder_receipt_sha256": "9" * 64,
+        "remote_owner_runtime_wheel_sha256": "a" * 64,
+        "preexec_verifier_sha256": successor.PREEXEC_VERIFIER_SHA256,
+    }
 
 
 def test_stage_c_contract_inventories_both_exact_timer_service_pairs() -> None:
@@ -39,18 +69,10 @@ def test_stage_c_contract_inventories_both_exact_timer_service_pairs() -> None:
         assert binding == "owner_runtime_rendered"
         assert catalog[unit].fragment_path == target
         assert catalog[unit].source == "host"
-    assert catalog[rail.SYNC_SERVICE_UNIT].triggered_by == (
-        rail.SYNC_TIMER_UNIT,
-    )
-    assert catalog[rail.SYNC_TIMER_UNIT].triggers == (
-        rail.SYNC_SERVICE_UNIT,
-    )
-    assert catalog[rail.REPORT_SERVICE_UNIT].triggered_by == (
-        rail.REPORT_TIMER_UNIT,
-    )
-    assert catalog[rail.REPORT_TIMER_UNIT].triggers == (
-        rail.REPORT_SERVICE_UNIT,
-    )
+    assert catalog[rail.SYNC_SERVICE_UNIT].triggered_by == (rail.SYNC_TIMER_UNIT,)
+    assert catalog[rail.SYNC_TIMER_UNIT].triggers == (rail.SYNC_SERVICE_UNIT,)
+    assert catalog[rail.REPORT_SERVICE_UNIT].triggered_by == (rail.REPORT_TIMER_UNIT,)
+    assert catalog[rail.REPORT_TIMER_UNIT].triggers == (rail.REPORT_SERVICE_UNIT,)
 
 
 def _write(path: Path, raw: bytes, *, mode: int) -> None:
@@ -86,14 +108,10 @@ class FakeSystemd:
                 fragment_path=str(systemd_root / name),
                 fragment_sha256=predecessor_digests[name],
                 enabled_state=(
-                    timer_enabled_state
-                    if name in successor.TIMER_NAMES
-                    else "static"
+                    timer_enabled_state if name in successor.TIMER_NAMES else "static"
                 ),
                 active_state=(
-                    timer_active_state
-                    if name in successor.TIMER_NAMES
-                    else "inactive"
+                    timer_active_state if name in successor.TIMER_NAMES else "inactive"
                 ),
                 assert_result="no",
                 result=("success" if name in successor.SERVICE_NAMES else ""),
@@ -116,9 +134,7 @@ class FakeSystemd:
 
     def _reload(self) -> None:
         for name in successor.UNIT_NAMES:
-            digest = hashlib.sha256(
-                (self.systemd_root / name).read_bytes()
-            ).hexdigest()
+            digest = hashlib.sha256((self.systemd_root / name).read_bytes()).hexdigest()
             self._set(
                 name,
                 fragment_sha256=digest,
@@ -193,6 +209,8 @@ class FakeStage0Bundle:
                 "release_revision": TARGET,
                 "host_artifact_manifest_sha256": self.host_manifest_sha256,
                 "predecessor_activation_receipt_sha256": PREDECESSOR_RECEIPT,
+                "source_tree_oid": SOURCE_TREE,
+                "builder_terminal_receipt_sha256": STAGE_C_BUILDER_RECEIPT,
             },
         }
 
@@ -214,7 +232,11 @@ class FakeStage0Bundle:
 
     @property
     def builder_receipt(self) -> dict[str, str]:
-        return {"release_revision": TARGET}
+        return {
+            "release_revision": TARGET,
+            "source_tree_oid": SOURCE_TREE,
+            "receipt_sha256": STAGE_C_BUILDER_RECEIPT,
+        }
 
     def assert_stable(self) -> None:
         self.stable_assertions += 1
@@ -280,14 +302,12 @@ class OwnerHarness:
         stage0_verifier: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         item = self.harness
+
         def valid_stage0(
             *,
             expected_predecessor_activation_receipt_sha256: str,
         ) -> FakeStage0Bundle:
-            assert (
-                expected_predecessor_activation_receipt_sha256
-                == PREDECESSOR_RECEIPT
-            )
+            assert expected_predecessor_activation_receipt_sha256 == PREDECESSOR_RECEIPT
             return self.stage0_bundle
 
         selected_verifier = stage0_verifier or valid_stage0
@@ -347,9 +367,7 @@ def _build_owner_harness(
             "release_revision": TARGET,
             "plan": {
                 "release_revision": TARGET,
-                "host_artifact_manifest_sha256": host_manifest[
-                    "manifest_sha256"
-                ],
+                "host_artifact_manifest_sha256": host_manifest["manifest_sha256"],
             },
             "secret_material_recorded": False,
             "secret_digest_recorded": False,
@@ -363,20 +381,15 @@ def _build_owner_harness(
     _write_canonical(publication_path, publication)
     request = successor.build_owner_request(
         target_revision=TARGET,
-        target_package_manifest_sha256=harness.package.manifest[
-            "manifest_sha256"
-        ],
+        target_package_manifest_sha256=harness.package.manifest["manifest_sha256"],
         predecessor_revision=PREDECESSOR,
         predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
-        stage_c_host_artifact_manifest_sha256=host_manifest[
-            "manifest_sha256"
-        ],
-        stage_c_release_update_publication_sha256=publication[
-            "publication_sha256"
-        ],
+        stage_c_host_artifact_manifest_sha256=host_manifest["manifest_sha256"],
+        stage_c_release_update_publication_sha256=publication["publication_sha256"],
         rebind_runtime_sha256=hashlib.sha256(
             harness.runtime_path.read_bytes()
         ).hexdigest(),
+        **_owner_runtime_kwargs(),
     )
     return OwnerHarness(
         harness=harness,
@@ -519,14 +532,14 @@ def test_exact_9d4_f873_successor_rebind_proves_target_and_catch_up(
 
     assert terminal["target_revision"] == TARGET
     assert terminal["forward_recovery_performed"] is False
-    assert terminal["assert_result"] == {
-        name: "yes" for name in successor.UNIT_NAMES
-    }
+    assert terminal["assert_result"] == {name: "yes" for name in successor.UNIT_NAMES}
     assert harness.host.calls.count(("stop", *successor.TIMER_NAMES)) == 1
     assert ("start", *successor.SERVICE_NAMES) in harness.host.calls
     assert ("start", *successor.TIMER_NAMES) in harness.host.calls
     for name in successor.UNIT_NAMES:
-        assert (harness.systemd_root / name).read_bytes() == harness.package.artifacts[name]
+        assert (harness.systemd_root / name).read_bytes() == harness.package.artifacts[
+            name
+        ]
 
 
 def test_foreign_predecessor_tamper_fails_before_any_mutation(
@@ -564,19 +577,13 @@ def test_rebind_rejects_0600_staged_inputs_before_mutation(
     artifact: str,
 ) -> None:
     harness = _build_harness(tmp_path, monkeypatch)
-    path = (
-        harness.authority_path
-        if artifact == "authority"
-        else harness.preflight_path
-    )
+    path = harness.authority_path if artifact == "authority" else harness.preflight_path
     path.chmod(0o600)
 
-    with pytest.raises(
-        (
-            successor.UpstreamSyncRailSuccessorRebindError,
-            activation.UpstreamSyncRailCutoverError,
-        )
-    ):
+    with pytest.raises((
+        successor.UpstreamSyncRailSuccessorRebindError,
+        activation.UpstreamSyncRailCutoverError,
+    )):
         harness.rebind()
 
     assert harness.host.calls == []
@@ -746,9 +753,7 @@ def test_stage0_drift_after_first_target_write_uses_held_rollback_authority(
 
     def drift_after_first_target_write() -> None:
         target_count = sum(
-            hashlib.sha256(
-                (owner.harness.systemd_root / name).read_bytes()
-            ).hexdigest()
+            hashlib.sha256((owner.harness.systemd_root / name).read_bytes()).hexdigest()
             == owner.harness.package.manifest["artifacts"][name]
             for name in changed_units
         )
@@ -761,10 +766,7 @@ def test_stage0_drift_after_first_target_write_uses_held_rollback_authority(
 
     with pytest.raises(
         successor.UpstreamSyncRailSuccessorRebindError,
-        match=(
-            "failed_rolled_back:"
-            "upstream_sync_successor_stage0_drifted"
-        ),
+        match=("failed_rolled_back:upstream_sync_successor_stage0_drifted"),
     ):
         owner.apply()
 
@@ -924,7 +926,9 @@ def test_crash_mid_replace_recovers_forward_from_exact_digest_mix(
 
     assert terminal["forward_recovery_performed"] is True
     for name in successor.UNIT_NAMES:
-        assert (harness.systemd_root / name).read_bytes() == harness.package.artifacts[name]
+        assert (harness.systemd_root / name).read_bytes() == harness.package.artifacts[
+            name
+        ]
 
 
 def test_foreign_tamper_after_crash_rolls_back_instead_of_recovering(
@@ -975,9 +979,11 @@ def test_systemd_observer_normalizes_known_omitted_optional_properties(
     monkeypatch.setattr(
         activation,
         "_systemctl_capture",
-        lambda *args: (1, b"disabled\n")
-        if args == ("is-enabled", unit)
-        else (_ for _ in ()).throw(AssertionError(args)),
+        lambda *args: (
+            (1, b"disabled\n")
+            if args == ("is-enabled", unit)
+            else (_ for _ in ()).throw(AssertionError(args))
+        ),
     )
 
     observed = successor._SystemdHost(root_owned=False).observe(  # noqa: SLF001
@@ -1012,9 +1018,11 @@ def test_systemd_observer_rejects_duplicate_property_output(
     monkeypatch.setattr(
         activation,
         "_systemctl_capture",
-        lambda *args: (0, b"static\n")
-        if args == ("is-enabled", unit)
-        else (_ for _ in ()).throw(AssertionError(args)),
+        lambda *args: (
+            (0, b"static\n")
+            if args == ("is-enabled", unit)
+            else (_ for _ in ()).throw(AssertionError(args))
+        ),
     )
 
     with pytest.raises(
@@ -1235,9 +1243,7 @@ def test_owner_path_rejects_noncanonical_stage0_before_staging(
     owner = _build_owner_harness(tmp_path, monkeypatch)
 
     def rejected_stage0(**_kwargs: Any) -> Any:
-        raise successor.release_stage0.ProductionReleaseUpdateStage0Error(
-            failure
-        )
+        raise successor.release_stage0.ProductionReleaseUpdateStage0Error(failure)
 
     with pytest.raises(
         successor.UpstreamSyncRailSuccessorRebindError,
@@ -1441,10 +1447,12 @@ def test_owner_request_frame_and_transport_are_closed_to_manual_fields() -> None
         stage_c_host_artifact_manifest_sha256="2" * 64,
         stage_c_release_update_publication_sha256="3" * 64,
         rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
     )
-    assert successor.decode_owner_request(
-        successor.encode_owner_request(request)
-    ) == request
+    assert (
+        successor.decode_owner_request(successor.encode_owner_request(request))
+        == request
+    )
     foreign = dict(request)
     foreign["command"] = "systemctl restart anything"
     with pytest.raises(
@@ -1480,6 +1488,125 @@ def test_owner_request_frame_and_transport_are_closed_to_manual_fields() -> None
     result = successor.owner_run(request, transport=FakeTransport())
     assert result["request_sha256"] == request["request_sha256"]
     assert result["caller_selected_commands_allowed"] is False
+
+
+def test_production_transport_keeps_controller_and_remote_runtime_proofs_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
+    )
+    local = {
+        name: request[f"controller_owner_runtime_{name}"]
+        for name in (
+            "manifest_sha256",
+            "attestation_sha256",
+            "tree_sha256",
+            "interpreter_sha256",
+        )
+    }
+    monkeypatch.setattr(
+        production_owner_runtime,
+        "require_active_owner_runtime",
+        lambda revision: local if revision == TARGET else pytest.fail(revision),
+    )
+
+    class Identity:
+        def account_for_read_only_preflight(self) -> str:
+            return "owner@example.invalid"
+
+    calls: list[tuple[str, ...]] = []
+
+    class Transport:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def _run_remote_input(
+            self,
+            argv: tuple[str, ...],
+            **_kwargs: Any,
+        ) -> Any:
+            calls.append(argv)
+            return type("Completed", (), {"stdout": b"exact\n"})()
+
+    monkeypatch.setattr(
+        owner_launcher,
+        "build_production_cutover_owner_identity",
+        lambda revision: (
+            (
+                Identity(),
+                Path("/usr/bin/gcloud"),
+                "production-owner",
+            )
+            if revision == TARGET
+            else pytest.fail(revision)
+        ),
+    )
+    monkeypatch.setattr(owner_launcher, "ProductionCutoverTransport", Transport)
+
+    transport = successor._ProductionOwnerRebindTransport(request)  # noqa: SLF001
+    assert (
+        transport.invoke_successor_rebind(
+            target_revision=TARGET,
+            request_frame=successor.encode_owner_request(request),
+        )
+        == b"exact\n"
+    )
+    assert calls == [
+        (
+            str(successor.FOUNDATION_V4_WRAPPER),
+            TARGET,
+            "successor-rebind-owner-apply",
+            successor.FOUNDATION_V4_WRAPPER_SHA256,
+            request["remote_owner_runtime_manifest_sha256"],
+            request["remote_owner_runtime_tree_sha256"],
+            request["remote_owner_runtime_interpreter_sha256"],
+            request["remote_owner_runtime_attestation_sha256"],
+            successor.PREEXEC_VERIFIER_SHA256,
+        )
+    ]
+    assert request["remote_owner_runtime_manifest_sha256"] != local["manifest_sha256"]
+
+
+def test_production_transport_rejects_controller_proof_mismatch_without_using_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
+    )
+    monkeypatch.setattr(
+        production_owner_runtime,
+        "require_active_owner_runtime",
+        lambda _revision: {
+            "manifest_sha256": request["remote_owner_runtime_manifest_sha256"],
+            "attestation_sha256": request[
+                "controller_owner_runtime_attestation_sha256"
+            ],
+            "tree_sha256": request["controller_owner_runtime_tree_sha256"],
+            "interpreter_sha256": request[
+                "controller_owner_runtime_interpreter_sha256"
+            ],
+        },
+    )
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="owner_runtime_identity_invalid",
+    ):
+        successor._ProductionOwnerRebindTransport(request)  # noqa: SLF001
 
 
 def test_owner_cli_has_no_path_command_json_or_secret_input() -> None:

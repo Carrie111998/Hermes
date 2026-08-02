@@ -57,6 +57,7 @@ REQUIRED_MODULES = (
     "scripts.canary.full_canary_owner_launcher",
     "scripts.canary.owner_gate_caddy_cutover",
     "scripts.canary.package_production_cutover_artifacts",
+    "scripts.canary.package_production_owner_runtime",
     "scripts.canary.production_cutover_activation_lock",
     "scripts.canary.production_cutover_host_authority",
     "scripts.canary.production_cutover_initial_collector",
@@ -68,6 +69,8 @@ REQUIRED_MODULES = (
     "scripts.canary.production_database_recovery_probe",
     "scripts.canary.production_os_login_metadata_migration",
     "scripts.canary.production_release_update_stage0",
+    "scripts.canary.production_successor_rebind_owner_runtime",
+    "scripts.canary.production_successor_rebind_owner_runtime_preexec",
     "scripts.canary.stage_production_cron_continuity",
     "scripts.canary.upstream_sync_rail_successor_rebind",
 )
@@ -158,9 +161,7 @@ def validate_owner_runtime_attestation(
         )
     raw = copy.deepcopy(dict(value))
     unsigned = {
-        name: item
-        for name, item in raw.items()
-        if name != "attestation_sha256"
+        name: item for name, item in raw.items() if name != "attestation_sha256"
     }
     if (
         raw.get("schema") != ATTESTATION_SCHEMA
@@ -181,8 +182,7 @@ def validate_owner_runtime_attestation(
         or raw.get("ambient_python_environment_present") is not False
         or raw.get("secret_material_recorded") is not False
         or raw.get("secret_digest_recorded") is not False
-        or raw.get("attestation_sha256")
-        != _sha256_bytes(_canonical(unsigned))
+        or raw.get("attestation_sha256") != _sha256_bytes(_canonical(unsigned))
     ):
         raise ProductionOwnerRuntimeError(
             "production_owner_runtime_attestation_invalid"
@@ -274,13 +274,9 @@ def _stable_regular(path: Path, *, maximum: int) -> bytes:
     )
     raw = b"".join(chunks)
     if identity(before) != identity(opened) or identity(before) != identity(after):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_manifest_changed"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_manifest_changed")
     if len(raw) != before.st_size:
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_manifest_changed"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_manifest_changed")
     return raw
 
 
@@ -308,9 +304,7 @@ def _decode_manifest(raw: bytes) -> Mapping[str, Any]:
             "production_owner_runtime_manifest_invalid"
         ) from exc
     if not isinstance(value, Mapping) or raw != _canonical(value) + b"\n":
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_manifest_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_manifest_invalid")
     return value
 
 
@@ -323,9 +317,7 @@ def _tree_entry(path: Path, root: Path) -> tuple[dict[str, Any], int]:
         ) from exc
     relative = path.relative_to(root).as_posix()
     if not relative or _CONTROL.search(relative) is not None:
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_tree_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_tree_invalid")
     common = {
         "path": relative,
         "mode": f"{stat.S_IMODE(item.st_mode):04o}",
@@ -334,15 +326,11 @@ def _tree_entry(path: Path, root: Path) -> tuple[dict[str, Any], int]:
     }
     if stat.S_ISDIR(item.st_mode):
         if stat.S_IMODE(item.st_mode) & 0o222:
-            raise ProductionOwnerRuntimeError(
-                "production_owner_runtime_tree_writable"
-            )
+            raise ProductionOwnerRuntimeError("production_owner_runtime_tree_writable")
         return {**common, "kind": "directory"}, 0
     if stat.S_ISREG(item.st_mode):
         if item.st_nlink != 1 or stat.S_IMODE(item.st_mode) & 0o222:
-            raise ProductionOwnerRuntimeError(
-                "production_owner_runtime_tree_writable"
-            )
+            raise ProductionOwnerRuntimeError("production_owner_runtime_tree_writable")
         return {
             **common,
             "kind": "file",
@@ -362,9 +350,7 @@ def _tree_entry(path: Path, root: Path) -> tuple[dict[str, Any], int]:
             or _CONTROL.search(target) is not None
             or not _within(resolved, root)
         ):
-            raise ProductionOwnerRuntimeError(
-                "production_owner_runtime_tree_invalid"
-            )
+            raise ProductionOwnerRuntimeError("production_owner_runtime_tree_invalid")
         return {**common, "kind": "symlink", "target": target}, 0
     raise ProductionOwnerRuntimeError("production_owner_runtime_tree_invalid")
 
@@ -381,9 +367,7 @@ def collect_tree_entries(root: Path) -> tuple[list[dict[str, Any]], int]:
         or stat.S_ISLNK(root_state.st_mode)
         or stat.S_IMODE(root_state.st_mode) & 0o222
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_tree_writable"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_tree_writable")
     entries: list[dict[str, Any]] = []
     total = 0
     for current, directories, files in os.walk(
@@ -406,9 +390,7 @@ def collect_tree_entries(root: Path) -> tuple[list[dict[str, Any]], int]:
                 )
     entries.sort(key=lambda item: item["path"])
     if len({item["path"] for item in entries}) != len(entries):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_tree_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_tree_invalid")
     return entries, total
 
 
@@ -475,9 +457,7 @@ def _validate_pyvenv_cfg(path: Path, *, root: Path) -> None:
             continue
         name, item = line.split(" = ", 1)
         if name in values:
-            raise ProductionOwnerRuntimeError(
-                "production_owner_runtime_pyvenv_invalid"
-            )
+            raise ProductionOwnerRuntimeError("production_owner_runtime_pyvenv_invalid")
         values[name] = item
     try:
         home = Path(values["home"])
@@ -492,12 +472,9 @@ def _validate_pyvenv_cfg(path: Path, *, root: Path) -> None:
         or not executable.is_absolute()
         or not _within(home, python_root)
         or not _within(executable, python_root)
-        or values.get("include-system-site-packages", "").casefold()
-        != "false"
+        or values.get("include-system-site-packages", "").casefold() != "false"
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_pyvenv_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_pyvenv_invalid")
 
 
 def _validate_site_packages(path: Path, *, root: Path) -> None:
@@ -530,9 +507,7 @@ def build_manifest(revision: str) -> Mapping[str, Any]:
     """Build the canonical manifest after the staged tree has been sealed."""
 
     if _REVISION.fullmatch(revision or "") is None:
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_revision_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_revision_invalid")
     root = _runtime_root()
     interpreter, pyvenv, site_packages = _runtime_identity(root)
     try:
@@ -573,13 +548,8 @@ def build_manifest(revision: str) -> Mapping[str, Any]:
         or len(sys_path) != len(set(sys_path))
         or str(site_packages) not in sys_path
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_sys_path_invalid"
-        )
-    modules = {
-        name: importlib.import_module(name)
-        for name in REQUIRED_MODULES
-    }
+        raise ProductionOwnerRuntimeError("production_owner_runtime_sys_path_invalid")
+    modules = {name: importlib.import_module(name) for name in REQUIRED_MODULES}
     required = {
         name: _origin_record(module, root=root)
         for name, module in sorted(modules.items())
@@ -651,9 +621,7 @@ _MANIFEST_FIELDS = frozenset({
 
 
 def _validate_manifest(value: Mapping[str, Any], revision: str) -> Mapping[str, Any]:
-    unsigned = {
-        name: item for name, item in value.items() if name != "manifest_sha256"
-    }
+    unsigned = {name: item for name, item in value.items() if name != "manifest_sha256"}
     root = _runtime_root()
     interpreter, pyvenv, site_packages = _runtime_identity(root)
     entries = value.get("entries")
@@ -681,9 +649,7 @@ def _validate_manifest(value: Mapping[str, Any], revision: str) -> Mapping[str, 
         or not isinstance(required, Mapping)
         or set(required) != set(REQUIRED_MODULES)
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_manifest_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_manifest_invalid")
     try:
         root_state = os.lstat(root)
         interpreter_value = value["interpreter"]
@@ -705,9 +671,7 @@ def _validate_manifest(value: Mapping[str, Any], revision: str) -> Mapping[str, 
         or set(pyvenv_value) != {"path", "mode", "size", "sha256"}
         or pyvenv_value.get("path") != str(pyvenv)
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_manifest_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_manifest_invalid")
     _validate_pyvenv_cfg(pyvenv, root=root)
     _validate_site_packages(site_packages, root=root)
     observed_entries, observed_bytes = collect_tree_entries(root)
@@ -720,12 +684,9 @@ def _validate_manifest(value: Mapping[str, Any], revision: str) -> Mapping[str, 
         or os.lstat(pyvenv).st_size != pyvenv_value.get("size")
         or f"{stat.S_IMODE(os.lstat(interpreter).st_mode):04o}"
         != interpreter_value.get("mode")
-        or f"{stat.S_IMODE(os.lstat(pyvenv).st_mode):04o}"
-        != pyvenv_value.get("mode")
+        or f"{stat.S_IMODE(os.lstat(pyvenv).st_mode):04o}" != pyvenv_value.get("mode")
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_tree_changed"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_tree_changed")
     return copy.deepcopy(dict(value))
 
 
@@ -742,9 +703,7 @@ def _validate_invocation(manifest: Mapping[str, Any]) -> None:
         or Path(sys.executable) != Path(manifest["interpreter"]["path"])
         or Path(sys.executable).resolve(strict=True) != Path(sys.executable)
     ):
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_invocation_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_invocation_invalid")
 
 
 class _ManifestImportGuard(MetaPathFinder):
@@ -829,21 +788,14 @@ def _audit_loaded_modules(guard: _ManifestImportGuard) -> None:
 
 def verify_runtime(revision: str) -> Mapping[str, Any]:
     if _REVISION.fullmatch(revision or "") is None:
-        raise ProductionOwnerRuntimeError(
-            "production_owner_runtime_revision_invalid"
-        )
+        raise ProductionOwnerRuntimeError("production_owner_runtime_revision_invalid")
     manifest_path = _runtime_root() / MANIFEST_NAME
     manifest = _validate_manifest(
-        _decode_manifest(
-            _stable_regular(manifest_path, maximum=MAX_MANIFEST_BYTES)
-        ),
+        _decode_manifest(_stable_regular(manifest_path, maximum=MAX_MANIFEST_BYTES)),
         revision,
     )
     _validate_invocation(manifest)
-    modules = {
-        name: importlib.import_module(name)
-        for name in REQUIRED_MODULES
-    }
+    modules = {name: importlib.import_module(name) for name in REQUIRED_MODULES}
     observed_required = {
         name: _origin_record(module, root=Path(manifest["artifact_root"]))
         for name, module in sorted(modules.items())
@@ -915,17 +867,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.action == "manifest":
         if arguments.launcher_args:
-            raise ProductionOwnerRuntimeError(
-                "production_owner_runtime_argv_invalid"
-            )
+            raise ProductionOwnerRuntimeError("production_owner_runtime_argv_invalid")
         print(_canonical(build_manifest(arguments.revision)).decode("ascii"))
         return 0
     attestation = verify_runtime(arguments.revision)
     if arguments.action == "attest":
         if arguments.launcher_args:
-            raise ProductionOwnerRuntimeError(
-                "production_owner_runtime_argv_invalid"
-            )
+            raise ProductionOwnerRuntimeError("production_owner_runtime_argv_invalid")
         print(_canonical(attestation).decode("ascii"))
         return 0
     launcher_args = list(arguments.launcher_args)
