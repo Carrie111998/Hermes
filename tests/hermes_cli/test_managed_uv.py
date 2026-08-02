@@ -1100,3 +1100,61 @@ class TestVenvPythonUpdateBoundary:
             "/opt/hermes/venv/bin/python"
         )
 
+
+class TestAttemptInstallGenerationTimeouts:
+    """#76684: uv python install/find must be wall-clock bounded — an
+    unbounded subprocess wedges `hermes update` forever on flaky networks."""
+
+    def test_install_timeout_cleans_generation_and_returns_none(self, tmp_path):
+        import subprocess
+
+        from hermes_cli.managed_uv import _attempt_install_generation
+
+        python_root = tmp_path / ".hermes-runtime" / "python"
+        python_root.mkdir(parents=True)
+
+        with patch(
+            "hermes_cli.managed_uv.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="uv", timeout=300),
+        ):
+            result = _attempt_install_generation(
+                "uv",
+                "3.11",
+                project_root=tmp_path,
+                python_root=python_root,
+                current=MagicMock(),
+            )
+
+        assert result is None
+        # The half-created generation directory must be cleaned up.
+        assert list(python_root.iterdir()) == []
+
+    def test_find_timeout_cleans_generation_and_returns_none(self, tmp_path):
+        import subprocess
+        from types import SimpleNamespace
+
+        from hermes_cli.managed_uv import _attempt_install_generation
+
+        python_root = tmp_path / ".hermes-runtime" / "python"
+        python_root.mkdir(parents=True)
+        ok_result = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        calls = {"n": 0}
+
+        def fake_run(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ok_result  # install succeeds
+            raise subprocess.TimeoutExpired(cmd="uv", timeout=60)  # find hangs
+
+        with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run):
+            result = _attempt_install_generation(
+                "uv",
+                "3.11",
+                project_root=tmp_path,
+                python_root=python_root,
+                current=MagicMock(),
+            )
+
+        assert result is None
+        assert list(python_root.iterdir()) == []

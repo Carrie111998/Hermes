@@ -311,6 +311,13 @@ UV_SELF_UPDATE_INTERVAL_SECONDS = 7 * 24 * 3600
 # blackholed connection (no default timeout in uv's downloader path).
 UV_SELF_UPDATE_TIMEOUT_SECONDS = 60
 
+# Bounded wall-clock for uv subprocesses that download or resolve managed
+# Python builds. An unbounded run wedges `hermes update` forever on flaky
+# networks (zero CPU, zero network, no log output — issue #76684).
+UV_PYTHON_INSTALL_TIMEOUT_SECONDS = 300
+UV_PYTHON_FIND_TIMEOUT_SECONDS = 60
+UV_UV_INSTALL_TIMEOUT_SECONDS = 120
+
 
 def update_managed_uv(
     *,
@@ -528,23 +535,32 @@ def _attempt_install_generation(
     _make_world_traversable(generation)
 
     env = managed_python_env(project_root, install_dir=generation)
-    install = subprocess.run(
-        [
-            uv_bin,
-            "python",
-            "install",
-            request,
-            "--reinstall",
-            "--no-bin",
-            "--no-registry",
-            "--no-config",
-        ],
-        cwd=project_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        install = subprocess.run(
+            [
+                uv_bin,
+                "python",
+                "install",
+                request,
+                "--reinstall",
+                "--no-bin",
+                "--no-registry",
+                "--no-config",
+            ],
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=UV_PYTHON_INSTALL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "private Python install timed out after %ss for %s",
+            UV_PYTHON_INSTALL_TIMEOUT_SECONDS, request,
+        )
+        _remove_tree(generation, boundary=python_root)
+        return None
     if install.returncode != 0:
         logger.warning(
             "private Python install failed for %s (rc=%d): %s",
@@ -555,21 +571,30 @@ def _attempt_install_generation(
         _remove_tree(generation, boundary=python_root)
         return None
 
-    found = subprocess.run(
-        [
-            uv_bin,
-            "python",
-            "find",
-            request,
-            "--managed-python",
-            "--no-config",
-        ],
-        cwd=project_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        found = subprocess.run(
+            [
+                uv_bin,
+                "python",
+                "find",
+                request,
+                "--managed-python",
+                "--no-config",
+            ],
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=UV_PYTHON_FIND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "private Python lookup timed out after %ss for %s",
+            UV_PYTHON_FIND_TIMEOUT_SECONDS, request,
+        )
+        _remove_tree(generation, boundary=python_root)
+        return None
     if found.returncode != 0 or not found.stdout.strip():
         logger.warning(
             "private Python lookup failed for %s (rc=%d): %s",
@@ -1275,12 +1300,14 @@ def _install_uv_posix(env: dict[str, str]) -> None:
             ["curl", "-LsSf", "https://astral.sh/uv/install.sh", "-o", installer_path],
             check=True,
             capture_output=True,
+            timeout=UV_UV_INSTALL_TIMEOUT_SECONDS,
         )
         subprocess.run(
             ["sh", installer_path],
             env=env,
             check=True,
             capture_output=True,
+            timeout=UV_UV_INSTALL_TIMEOUT_SECONDS,
         )
     finally:
         try:
@@ -1297,6 +1324,7 @@ def _install_uv_windows(env: dict[str, str]) -> None:
         env=env,
         check=True,
         capture_output=True,
+        timeout=UV_UV_INSTALL_TIMEOUT_SECONDS,
     )
 
 
