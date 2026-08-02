@@ -551,7 +551,7 @@ class VoiceReceiver:
         self._playback_seen_ssrcs: Dict[int, set[int]] = {}
         self._playback_inflight: Dict[int, int] = defaultdict(int)
         self._playback_ending_tokens: set[int] = set()
-        self._playback_finished_tokens: set[int] = set()
+
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -591,7 +591,7 @@ class VoiceReceiver:
             self._playback_seen_ssrcs.clear()
             self._playback_inflight.clear()
             self._playback_ending_tokens.clear()
-            self._playback_finished_tokens.clear()
+
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -611,8 +611,6 @@ class VoiceReceiver:
         self,
         token: int,
     ) -> Optional[Tuple[Optional[Dict[str, int]], int]]:
-        if token in self._playback_finished_tokens:
-            return None
         if token not in self._playback_ending_tokens:
             return None
         if self._playback_inflight.get(token, 0) > 0:
@@ -621,7 +619,6 @@ class VoiceReceiver:
         self._playback_inflight.pop(token, None)
         stats = self._playback_transport_stats.pop(token, None)
         seen_count = len(self._playback_seen_ssrcs.pop(token, set()))
-        self._playback_finished_tokens.add(token)
         return (dict(stats) if stats is not None else None, seen_count)
 
     @staticmethod
@@ -683,7 +680,7 @@ class VoiceReceiver:
             self._playback_seen_ssrcs[token] = set()
             self._playback_inflight[token] = 0
             self._playback_ending_tokens.discard(token)
-            self._playback_finished_tokens.discard(token)
+
             self._paused = False
         logger.info("Discord voice playback capture armed (token=%s)", token)
 
@@ -765,8 +762,6 @@ class VoiceReceiver:
         """Stop new tagging; finalize after token-pinned callbacks drain."""
         newly_ending = False
         with self._lock:
-            if token in self._playback_finished_tokens:
-                return
             known = (
                 self._playback_capture_token == token
                 or token in self._playback_transport_stats
@@ -1121,10 +1116,7 @@ class VoiceReceiver:
                 if m.id != bot_id and (not allowed or str(m.id) in allowed)
             ]
             if len(candidates) == 1:
-                uid = candidates[0]
-                self._ssrc_to_user[ssrc] = uid
-                logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
-                return uid
+                return int(candidates[0])
         except Exception:
             pass
         return 0
@@ -1132,21 +1124,36 @@ class VoiceReceiver:
     def _resolve_completed_segments(
         self,
         segments: List[Tuple[int, bytes, Optional[int], int]],
-        ssrc_user_map: Dict[int, int],
         *,
         with_context: bool,
     ) -> Tuple[list, set[int]]:
         completed = []
         resolved_ssrcs: set[int] = set()
+        inferred_mappings = []
         for ssrc, pcm, playback_token, _generation in segments:
-            user_id = ssrc_user_map.get(ssrc, 0)
+            with self._lock:
+                user_id = self._ssrc_to_user.get(ssrc, 0)
             if not user_id:
-                user_id = self._infer_user_for_ssrc(ssrc)
+                candidate = self._infer_user_for_ssrc(ssrc)
+                with self._lock:
+                    authoritative = self._ssrc_to_user.get(ssrc, 0)
+                    if authoritative:
+                        user_id = authoritative
+                    elif candidate:
+                        self._ssrc_to_user[ssrc] = candidate
+                        user_id = candidate
+                        inferred_mappings.append((ssrc, candidate))
             if not user_id:
                 continue
             resolved_ssrcs.add(ssrc)
             item = (user_id, pcm, playback_token)
             completed.append(item if with_context else item[:2])
+        for ssrc, user_id in inferred_mappings:
+            logger.info(
+                "Auto-mapped ssrc=%d -> user=%d (sole allowed member)",
+                ssrc,
+                user_id,
+            )
         return completed, resolved_ssrcs
 
     def check_silence(self, *, with_context: bool = False) -> list:
@@ -1156,7 +1163,6 @@ class VoiceReceiver:
 
         with self._lock:
             segments = self._drain_boundary_locked()
-            ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc in list(self._buffers):
                 last_time = self._last_packet_time.get(ssrc, now)
                 silence_duration = now - last_time
@@ -1200,7 +1206,6 @@ class VoiceReceiver:
 
         completed, resolved_ssrcs = self._resolve_completed_segments(
             segments,
-            ssrc_user_map,
             with_context=with_context,
         )
         for ssrc, playback_token, pcm_bytes, duration_ms, silence_ms in endpoint_logs:
@@ -1222,7 +1227,6 @@ class VoiceReceiver:
 
         with self._lock:
             segments = self._drain_boundary_locked()
-            ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc, buf in list(self._buffers.items()):
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if buf_duration >= self.MIN_SPEECH_DURATION:
@@ -1253,7 +1257,6 @@ class VoiceReceiver:
 
         completed, resolved_ssrcs = self._resolve_completed_segments(
             segments,
-            ssrc_user_map,
             with_context=with_context,
         )
         for ssrc, playback_token, pcm_bytes, duration_ms in flush_logs:

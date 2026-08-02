@@ -528,6 +528,49 @@ def test_playback_boundary_defers_unknown_ssrc_resolution_until_lock_released():
     receiver._infer_user_for_ssrc.assert_called_once_with(100)
 
 
+def test_deferred_inference_cannot_overwrite_authoritative_ssrc_mapping():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc)
+    pcm = b"\x01" * 96_000
+    with receiver._lock:
+        receiver._queue_completed_segment_locked(777, pcm, None, 0)
+
+    def stale_inference(_ssrc):
+        receiver.map_ssrc(777, 222)
+        return 111
+
+    receiver._infer_user_for_ssrc = MagicMock(side_effect=stale_inference)
+
+    assert receiver.check_silence(with_context=True) == [(222, pcm, None)]
+    assert receiver._ssrc_to_user[777] == 222
+
+
+def test_completed_playbacks_leave_no_unbounded_terminal_tombstones():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc)
+
+    for token in range(1_000):
+        receiver.begin_playback_capture(token)
+        receiver.end_playback_capture(token)
+
+    assert not receiver._playback_transport_stats
+    assert not receiver._playback_inflight
+    assert not receiver._playback_ending_tokens
+    assert len(getattr(receiver, "_playback_finished_tokens", ())) <= 1
+
+
 @pytest.mark.asyncio
 async def test_ack_phrases_round_robin_deterministically_and_independently_by_kind():
     adapter = _make_adapter(
