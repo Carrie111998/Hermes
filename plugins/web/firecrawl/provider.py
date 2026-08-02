@@ -367,6 +367,27 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _credit_error_info(exc: Exception) -> Optional[Dict[str, Any]]:
+    """Classify Firecrawl account-credit failures without exposing responses."""
+    if getattr(exc, "status_code", None) != 402:
+        return None
+    return {
+        "code": "provider_credits_exhausted",
+        "provider": "firecrawl",
+        "scope": "account",
+        "retryable": False,
+    }
+
+
+def _credit_circuit_info() -> Dict[str, Any]:
+    return {
+        "code": "provider_circuit_open",
+        "provider": "firecrawl",
+        "scope": "account",
+        "retryable": False,
+    }
+
+
 class FirecrawlWebSearchProvider(WebSearchProvider):
     """Firecrawl search + extract provider with dual auth paths."""
 
@@ -418,7 +439,14 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             return {"success": True, "data": {"web": web_results}}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Firecrawl search error: %s", exc)
-            return {"success": False, "error": f"Firecrawl search failed: {exc}"}
+            result = {
+                "success": False,
+                "error": f"Firecrawl search failed: {exc}",
+            }
+            error_info = _credit_error_info(exc)
+            if error_info:
+                result["error_info"] = error_info
+            return result
 
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
@@ -454,10 +482,23 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         # cheap) so monkeypatching it in tests works as expected.
 
         results: List[Dict[str, Any]] = []
+        credit_circuit_open = False
 
         for url in urls:
             if _is_interrupted():
                 results.append({"url": url, "error": "Interrupted", "title": ""})
+                continue
+            if credit_circuit_open:
+                results.append(
+                    {
+                        "url": url,
+                        "title": "",
+                        "content": "",
+                        "raw_content": "",
+                        "error": "Firecrawl account credit circuit is open",
+                        "error_info": _credit_circuit_info(),
+                    }
+                )
                 continue
 
             # Pre-scrape website policy gate
@@ -587,15 +628,18 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 )
             except Exception as scrape_err:  # noqa: BLE001
                 logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
-                results.append(
-                    {
-                        "url": url,
-                        "title": "",
-                        "content": "",
-                        "raw_content": "",
-                        "error": str(scrape_err),
-                    }
-                )
+                result = {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": str(scrape_err),
+                }
+                error_info = _credit_error_info(scrape_err)
+                if error_info:
+                    result["error_info"] = error_info
+                    credit_circuit_open = True
+                results.append(result)
 
         return results
 

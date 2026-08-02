@@ -12,6 +12,7 @@ from tools import web_tools
 class _FakeExtractProvider(WebSearchProvider):
     def __init__(self) -> None:
         self.received_urls: list[str] = []
+        self.results: list[dict] | None = None
 
     @property
     def name(self) -> str:
@@ -29,6 +30,8 @@ class _FakeExtractProvider(WebSearchProvider):
 
     async def extract(self, urls, **kwargs):
         self.received_urls.extend(urls)
+        if self.results is not None:
+            return self.results
         return [
             {"url": url, "title": "", "content": "ok"}
             for url in urls
@@ -100,6 +103,39 @@ async def test_web_extract_reports_invalid_items_without_dispatching_them(extrac
         "Invalid URL item at index 3: expected a URL string or an object "
         "with a string 'url' or 'href' field",
     ]
+
+
+@pytest.mark.asyncio
+async def test_web_extract_preserves_allowlisted_provider_error_info(
+    extract_provider,
+):
+    extract_provider.results = [
+        {
+            "url": "https://example.com/credits",
+            "title": "",
+            "content": "",
+            "error": "Payment Required",
+            "error_info": {
+                "code": "provider_credits_exhausted",
+                "provider": "firecrawl",
+                "scope": "account",
+                "retryable": False,
+                "response": {"authorization": "must-not-leak"},
+            },
+        }
+    ]
+
+    result = json.loads(
+        await web_tools.web_extract_tool(["https://example.com/credits"])
+    )
+
+    assert result["results"][0]["error_info"] == {
+        "code": "provider_credits_exhausted",
+        "provider": "firecrawl",
+        "scope": "account",
+        "retryable": False,
+    }
+    assert "response" not in json.dumps(result)
 
 
 def test_web_extract_registry_dispatch_accepts_search_result_objects(

@@ -5,6 +5,8 @@ cron_completed / cron_failed within a threshold window, and emits a
 single cron_stale event per detection (no spam).
 """
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 
 import pytest
 
@@ -157,3 +159,47 @@ class TestCronStaleMonitor:
         mon.poll()  # must not raise
 
         assert _stale_events(bus) == []
+
+    @pytest.mark.parametrize(
+        ("job_name", "threshold"),
+        [
+            ("jobflow-tracker-cycle", 2100),
+            ("jobflow-tracker-followup", 2400),
+            ("nightly-test-gate", 3600),
+            ("postgres-sync", 1800),
+        ],
+    )
+    def test_production_threshold_boundaries(self, bus, job_name, threshold):
+        config_path = (
+            Path(__file__).resolve().parents[4]
+            / "notifications"
+            / "cron_stale_thresholds.json"
+        )
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        assert config["default_seconds"] == 1200
+        assert config["per_job"][job_name] == threshold
+
+        within = datetime.now(timezone.utc) - timedelta(seconds=threshold - 1)
+        _emit_started(bus, job_name, started_at=within)
+        mon = CronStaleMonitor(
+            bus,
+            default_threshold_seconds=config["default_seconds"],
+            per_job_thresholds=config["per_job"],
+        )
+        bus._execute(
+            "INSERT OR REPLACE INTO subscriber_cursors "
+            "(subscriber_id, last_rowid, updated_at) VALUES (?, 0, datetime('now'))",
+            (mon.subscriber_id,),
+        )
+        mon.poll()
+        assert _stale_events(bus) == []
+
+        past = datetime.now(timezone.utc) - timedelta(seconds=threshold + 1)
+        _emit_started(bus, job_name, started_at=past)
+        mon.poll()
+
+        stale = _stale_events(bus)
+        assert len(stale) == 1
+        assert stale[0].payload["job_name"] == job_name
+        assert stale[0].payload["threshold_seconds"] == threshold

@@ -1003,13 +1003,28 @@ async def web_extract_tool(
             else:
                 logger.info("%s (%d chars, whole)", url, len(clean))
 
-        # Trim output to minimal fields per entry: title, content, error
+        # Trim output to minimal fields and allowlisted provider diagnostics.
+        def _public_error_info(value: Any) -> Dict[str, Any] | None:
+            if not isinstance(value, dict):
+                return None
+            allowed = {
+                key: value[key]
+                for key in ("code", "provider", "scope", "retryable")
+                if key in value
+            }
+            return allowed or None
+
         trimmed_results = [
             {
                 "url": r.get("url", ""),
                 "title": r.get("title", ""),
                 "content": r.get("content", ""),
                 "error": r.get("error"),
+                **(
+                    {"error_info": public_error_info}
+                    if (public_error_info := _public_error_info(r.get("error_info")))
+                    else {}
+                ),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
             }
             for r in response.get("results", [])

@@ -449,6 +449,107 @@ class TestErrorResponseShapes:
         if result:  # if anything came back, it should be an error entry
             assert "error" in result[0]
 
+    def test_firecrawl_search_classifies_payment_required_preserving_envelope(
+        self,
+        monkeypatch,
+    ):
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        class PaymentRequiredError(Exception):
+            status_code = 402
+
+        class Client:
+            def search(self, **kwargs):
+                raise PaymentRequiredError(
+                    "Payment Required: Failed to search. Credits exhausted"
+                )
+
+        monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", lambda: Client())
+
+        result = firecrawl_provider.FirecrawlWebSearchProvider().search("test")
+
+        assert result["success"] is False
+        assert "Firecrawl search failed" in result["error"]
+        assert result["error_info"] == {
+            "code": "provider_credits_exhausted",
+            "provider": "firecrawl",
+            "scope": "account",
+            "retryable": False,
+        }
+
+    def test_firecrawl_search_does_not_classify_transient_error_as_credits(
+        self,
+        monkeypatch,
+    ):
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        class Client:
+            def search(self, **kwargs):
+                raise TimeoutError("temporary timeout")
+
+        monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", lambda: Client())
+
+        result = firecrawl_provider.FirecrawlWebSearchProvider().search("test")
+
+        assert result["success"] is False
+        assert "error_info" not in result
+
+    def test_firecrawl_extract_opens_invocation_circuit_after_payment_required(
+        self,
+        monkeypatch,
+    ):
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        calls = []
+
+        class PaymentRequiredError(Exception):
+            status_code = 402
+
+        class Client:
+            def scrape(self, *, url, formats):
+                calls.append(url)
+                raise PaymentRequiredError(
+                    "Payment Required: Failed to scrape. Credits exhausted"
+                )
+
+        monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", lambda: Client())
+        monkeypatch.setattr(firecrawl_provider, "check_website_access", lambda url: None)
+
+        urls = ["https://example.com/1", "https://example.com/2"]
+        result = asyncio.run(
+            firecrawl_provider.FirecrawlWebSearchProvider().extract(urls)
+        )
+
+        assert calls == [urls[0]]
+        assert [item["url"] for item in result] == urls
+        assert result[0]["error_info"]["code"] == "provider_credits_exhausted"
+        assert result[1]["error_info"]["code"] == "provider_circuit_open"
+        assert result[1]["error_info"]["scope"] == "account"
+
+    def test_firecrawl_extract_normal_url_failure_does_not_open_circuit(
+        self,
+        monkeypatch,
+    ):
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        calls = []
+
+        class Client:
+            def scrape(self, *, url, formats):
+                calls.append(url)
+                raise TimeoutError("temporary timeout")
+
+        monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", lambda: Client())
+        monkeypatch.setattr(firecrawl_provider, "check_website_access", lambda url: None)
+
+        urls = ["https://example.com/1", "https://example.com/2"]
+        result = asyncio.run(
+            firecrawl_provider.FirecrawlWebSearchProvider().extract(urls)
+        )
+
+        assert calls == urls
+        assert all("error_info" not in item for item in result)
+
     def test_firecrawl_config_error_points_paid_users_to_nous_subscription(self, monkeypatch):
         from plugins.web.firecrawl import provider as firecrawl_provider
 
