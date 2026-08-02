@@ -256,6 +256,19 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A directory can never be executed or sourced as a script
+            # (`sh /some/dir` exits 126), so it cannot carry a lifecycle
+            # command — ignore it instead of failing closed. This matters
+            # because the tokenizer is shell-shaped but the scanned text
+            # often is not: `punctuation_chars` makes `()` a segment break,
+            # so a Python line like `HOME = Path.home() / ".hermes/scripts"`
+            # (or plain `pct = len(items) / total`) leaves a bare `/` as a
+            # segment's first token, which reads as a reference to the root
+            # directory. Failing closed there blocked legitimate cron jobs
+            # with a "contains a gateway lifecycle command" error that named
+            # nothing the script actually contained.
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
