@@ -2013,6 +2013,7 @@ export interface Translations {
       xhigh: string
       max: string
       ultra: string
+      none: string
       updateFailed: string
       fastFailed: string
     }
