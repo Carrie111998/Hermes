@@ -1586,6 +1586,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    smoke: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1679,6 +1680,12 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    if smoke is not None:
+        from hermes_cli.reliability_doctor import validate_smoke_spec
+
+        normalized_smoke = validate_smoke_spec(smoke)
+    else:
+        normalized_smoke = None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -1783,6 +1790,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_smoke is not None:
+        job["smoke"] = normalized_smoke
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1857,6 +1866,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    updates = dict(updates or {})
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1865,6 +1875,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+    clear_smoke = "smoke" in updates and updates["smoke"] is None
+    if "smoke" in updates and updates["smoke"] is not None:
+        from hermes_cli.reliability_doctor import validate_smoke_spec
+
+        updates["smoke"] = validate_smoke_spec(updates["smoke"])
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1891,7 +1906,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
-
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants
             # can't be violated through the update door (e.g. flipping
@@ -1908,6 +1922,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                 )
+            if clear_smoke:
+                updated.pop("smoke", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
