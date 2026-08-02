@@ -1963,12 +1963,54 @@ class AIAgent:
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
     ):
-        """Serialize direct and turn-boundary session flushes per agent."""
+        """Serialize direct and turn-boundary session flushes per agent.
+
+        Compression owns the session for up to its lease TTL (300s); a flush
+        racing a rotation raises CompressionSessionBusyError (re-raised by the
+        unlocked flush below). Retry with bounded backoff so a transient
+        rotation doesn't drop the tail; marker-based dedup makes re-entry
+        idempotent. On final failure the deferred tail is retried by the next
+        flush — the existing crash-resilience path.
+        """
         persist_lock = getattr(self, "_session_persist_lock", None)
-        if persist_lock is None:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
-        with persist_lock:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+
+        # ponytail: fixed 3 attempts / 2s-4s backoff; upgrade path: make
+        # configurable (config.yaml session.compression_flush_retries) if a
+        # workload needs tuning.
+        for attempt in range(1, 4):
+            try:
+                if persist_lock is None:
+                    return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+                with persist_lock:
+                    return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            except Exception as e:
+                # Lazy import mirrors the existing SessionDB lazy import in
+                # _get_session_db (top-level import would pull hermes_state
+                # eagerly); isinstance is robust to subclassing.
+                from hermes_state import CompressionSessionBusyError
+                if not isinstance(e, CompressionSessionBusyError):
+                    raise
+                if attempt < 3:
+                    time.sleep(2.0 if attempt == 1 else 4.0)
+                    continue
+                self._log_db_flush_warning(
+                    f"Session DB flush deferred for {getattr(self, 'session_id', '?')} — "
+                    "compression busy after 3 attempts; unpersisted tail retries on next flush"
+                )
+                return None
+
+    def _log_db_flush_warning(self, message: str) -> None:
+        """Log a DB flush warning at most once per session per 60s window."""
+        now = time.time()
+        sid = getattr(self, "session_id", "?")
+        last_ts = getattr(self, "_last_db_flush_warn_ts", 0.0)
+        last_sid = getattr(self, "_last_db_flush_warn_sid", None)
+        if sid == last_sid and (now - last_ts) < 60:
+            logger.debug("DB flush warning suppressed (rate-limited): %s", message)
+            return
+        self._last_db_flush_warn_ts = now
+        self._last_db_flush_warn_sid = sid
+        logger.warning("%s", message)
 
     def _flush_messages_to_session_db_unlocked(
         self,
@@ -2232,7 +2274,14 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
-            logger.warning("Session DB append_message failed: %s", e)
+            # Re-raise compression-busy errors so the caller
+            # (_flush_messages_to_session_db) can retry with backoff. Any
+            # other failure is logged (rate-limited) and swallowed — the
+            # marker dedup retries unpersisted messages on the next flush.
+            from hermes_state import CompressionSessionBusyError
+            if isinstance(e, CompressionSessionBusyError):
+                raise
+            self._log_db_flush_warning(f"Session DB append_message failed: {e}")
             return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
