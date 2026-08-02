@@ -804,17 +804,12 @@ streaming:
 #   socket: /run/harness/dispatcher.sock
 #   commands: [echo, research, forge, ashare, replay, log]
 #
-# Socket resolution priority:
-#   1. dispatcher.socket (config.yaml)
-#   2. HERMES_DISPATCHER_SOCKET (env var)
-#   3. /run/harness/dispatcher.sock (compiled default)
+# Socket path: dispatcher.socket in config.yaml (required for forwarding)
+# When not set, dispatcher commands are handled locally instead of forwarded.
+# Default socket: /run/harness/dispatcher.sock (only used when configured)
 #
 # commands REPLACES the default set (not additive).  An empty list
 # disables forwarding entirely.  Omit the key to use defaults.
-#
-# Note: When dispatcher.socket is not set, the gateway falls back
-# to HERMES_DISPATCHER_SOCKET env var or the compiled default.
-# This allows deployments without config.yaml to use env vars.
 
 # =============================================================================
 # Skills Configuration

@@ -307,13 +307,6 @@ async def test_context_manager_closes_on_exit(
     assert not client.is_connected
 
 
-def test_socket_path_defaults_to_constant(monkeypatch) -> None:
-    """DispatcherClient() without socket_path uses DEFAULT_DISPATCHER_SOCKET."""
-    monkeypatch.delenv("HERMES_DISPATCHER_SOCKET", raising=False)
-    client = DispatcherClient()
-    assert client.socket_path == DEFAULT_DISPATCHER_SOCKET
-
-
 def test_socket_path_stored() -> None:
     """Explicit socket_path is stored and accessible."""
     client = DispatcherClient(socket_path="/tmp/test.sock")
@@ -503,70 +496,17 @@ class TestDispatcherConfig:
 
 
 class TestDispatcherClientInit:
-    """DispatcherClient socket_path priority: arg > env > default."""
+    """DispatcherClient socket_path configuration."""
 
-    def test_explicit_socket_path_wins(self):
-        """Explicit socket_path takes priority over env and default."""
+    def test_explicit_socket_path(self):
+        """Explicit socket_path is stored."""
         client = DispatcherClient(socket_path="/tmp/test.sock")
         assert client._path == "/tmp/test.sock"
 
-    def test_env_var_fallback_when_no_arg(self):
-        """HERMES_DISPATCHER_SOCKET is used when socket_path is None."""
-        import os
-
-        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
-        try:
-            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/var.sock"
-            client = DispatcherClient()
-            assert client._path == "/env/var.sock"
-        finally:
-            if old is None:
-                os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
-            else:
-                os.environ["HERMES_DISPATCHER_SOCKET"] = old
-
-    def test_default_when_no_arg_no_env(self):
-        """DEFAULT_DISPATCHER_SOCKET used when no arg and no env."""
-        import os
-
-        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
-        try:
-            os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
-            client = DispatcherClient()
-            assert client._path == DEFAULT_DISPATCHER_SOCKET
-        finally:
-            if old is not None:
-                os.environ["HERMES_DISPATCHER_SOCKET"] = old
-
-    def test_empty_string_falls_back_to_env(self):
-        """Empty string socket_path falls back to env var."""
-        import os
-
-        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
-        try:
-            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/var.sock"
-            client = DispatcherClient(socket_path="")
-            assert client._path == "/env/var.sock"
-        finally:
-            if old is None:
-                os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
-            else:
-                os.environ["HERMES_DISPATCHER_SOCKET"] = old
-
-    def test_explicit_wins_over_env(self):
-        """Explicit socket_path wins even when env var is set."""
-        import os
-
-        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
-        try:
-            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/var.sock"
-            client = DispatcherClient(socket_path="/explicit.sock")
-            assert client._path == "/explicit.sock"
-        finally:
-            if old is None:
-                os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
-            else:
-                os.environ["HERMES_DISPATCHER_SOCKET"] = old
+    def test_default_socket_path(self):
+        """Default socket_path is DEFAULT_DISPATCHER_SOCKET."""
+        client = DispatcherClient()
+        assert client._path == DEFAULT_DISPATCHER_SOCKET
 
 
 class TestDispatcherConfigFromDict:

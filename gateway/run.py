@@ -15722,15 +15722,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return the lazy-initialized dispatcher client. Creates
         one on first call from the configured socket path. Always
         returns the same instance for the lifetime of this
-        GatewayRunner. Falls back to HERMES_DISPATCHER_SOCKET env
-        var or compiled default when dispatcher_socket is not set."""
+        GatewayRunner. Raises DispatcherConnectionError when
+        dispatcher_socket is not set in config.yaml."""
         if self._dispatcher_client is None:
             _disp_socket = getattr(self.config, "dispatcher_socket", None)
-            # Pass socket_path to DispatcherClient. When None,
-            # DispatcherClient falls back to HERMES_DISPATCHER_SOCKET
-            # env var or DEFAULT_DISPATCHER_SOCKET.
+            if not _disp_socket:
+                raise DispatcherConnectionError(
+                    "dispatcher not configured: set dispatcher.socket "
+                    "or dispatcher_socket in config.yaml"
+                )
             self._dispatcher_client = DispatcherClient(
-                socket_path=_disp_socket or None,
+                socket_path=_disp_socket,
             )
         return self._dispatcher_client
 
@@ -15745,7 +15747,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rather than from the dispatcher. The dispatcher is a
         soft dependency: gateway stays useful even when it's
         down."""
-        client = self._get_dispatcher_client()
         source = event.source
         platform_name = (
             source.platform.value if source.platform else ""
@@ -15758,6 +15759,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content = f"{content} {args}"
         payload = {"source": platform_name, "content": content}
         try:
+            client = self._get_dispatcher_client()
             req = _make_dispatcher_request(OP_DISPATCH, payload)
             resp = await client.dispatch(req)
         except (DispatcherConnectionError, ValueError) as e:
