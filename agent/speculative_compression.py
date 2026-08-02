@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _DB_PERSISTED_MARKER = "_db_persisted"
 _TAIL_MARKER = "_speculative_tail_marker"
+_STATUS_PREFIX = "[speculative:"
 
 
 @dataclass(frozen=True)
@@ -48,9 +49,41 @@ class SpeculativeCompressionSettings:
 DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS = SpeculativeCompressionSettings()
 
 
-def _parse_bool(
-    value: Any, default: bool, log: logging.Logger, name: str
-) -> bool:
+def _format_token_budget(value: int) -> str:
+    return f"~{int(value):,}"
+
+
+def _emit_speculative_status(agent: Any, state: str, text: str) -> None:
+    """Surface speculative state without making it part of the transcript."""
+
+    try:
+        agent._vprint(f"{getattr(agent, 'log_prefix', '')}{text}", force=True)
+    except Exception:
+        pass
+    callback = getattr(agent, "status_callback", None)
+    if callback is None:
+        return
+    try:
+        callback("speculative", f"{_STATUS_PREFIX}{state}] {text}")
+    except Exception:
+        logger.debug("speculative status callback failed", exc_info=True)
+
+
+def _pressure_status(
+    settings: SpeculativeCompressionSettings,
+    request_tokens: int,
+    soft_trigger: int,
+    hard_trigger: int,
+) -> str:
+    return (
+        f"estimated {_format_token_budget(request_tokens)} tokens; "
+        f"soft trigger {settings.start_ratio:.2f} ({_format_token_budget(soft_trigger)}), "
+        f"hard trigger {settings.hard_ratio:.2f} ({_format_token_budget(hard_trigger)}); "
+        f"hard wait up to {settings.hard_wait_seconds:.1f}s, then synchronous fallback remains available"
+    )
+
+
+def _parse_bool(value: Any, default: bool, log: logging.Logger, name: str) -> bool:
     """Parse a boolean config value, warning and defaulting on garbage."""
     if isinstance(value, bool):
         return value
@@ -136,7 +169,10 @@ def normalize_speculative_compression_settings(
         max_age_seconds=max_age,
         hard_wait_seconds=max(0.0, hard_wait),
         during_tool_wait=_parse_bool(
-            values.get("during_tool_wait"), defaults.during_tool_wait, log, "during_tool_wait"
+            values.get("during_tool_wait"),
+            defaults.during_tool_wait,
+            log,
+            "during_tool_wait",
         ),
         during_idle=_parse_bool(
             values.get("during_idle"), defaults.during_idle, log, "during_idle"
@@ -166,9 +202,7 @@ def _canonical_value(value: Any, *, top_level: bool = False) -> Any:
         return {
             str(key): _canonical_value(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if not (
-                top_level and str(key) in {_DB_PERSISTED_MARKER, _TAIL_MARKER}
-            )
+            if not (top_level and str(key) in {_DB_PERSISTED_MARKER, _TAIL_MARKER})
         }
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
@@ -545,15 +579,11 @@ def compressor_settings_fingerprint(compressor: Any) -> str:
             ),
             "max_tokens": getattr(compressor, "max_tokens", None),
             "threshold_percent": getattr(compressor, "threshold_percent", None),
-            "summary_target_ratio": getattr(
-                compressor, "summary_target_ratio", None
-            ),
+            "summary_target_ratio": getattr(compressor, "summary_target_ratio", None),
             "protect_first_n": getattr(compressor, "protect_first_n", None),
             "protect_last_n": getattr(compressor, "protect_last_n", None),
             "model_thresholds": getattr(compressor, "model_thresholds", None),
-            "threshold_tokens_cap": getattr(
-                compressor, "threshold_tokens_cap", None
-            ),
+            "threshold_tokens_cap": getattr(compressor, "threshold_tokens_cap", None),
         }
     ])
 
@@ -589,9 +619,7 @@ def schedule_tool_wait_candidate(
     # would exercise the exact backend/strategy under backoff. A candidate
     # already prepared before the block stays installable (the foreground
     # install path does not re-run the summary LLM).
-    _cooldown_fn = getattr(
-        compressor, "get_active_compression_failure_cooldown", None
-    )
+    _cooldown_fn = getattr(compressor, "get_active_compression_failure_cooldown", None)
     if callable(_cooldown_fn):
         try:
             if _cooldown_fn():
@@ -618,12 +646,40 @@ def schedule_tool_wait_candidate(
             int(request_tokens),
             session_id,
         )
-        return manager.maybe_start(
+        _emit_speculative_status(
+            agent,
+            "queued",
+            "Speculative compaction queued — "
+            + _pressure_status(
+                settings, int(request_tokens), soft_trigger, _hard_trigger
+            ),
+        )
+        disposition = manager.maybe_start(
             session_id,
             snapshot,
             lambda source=compressor: clone_builtin_compressor(source),
             max_age_seconds=settings.max_age_seconds,
         )
+        if disposition in {"started", "coalesced"}:
+            _emit_speculative_status(
+                agent,
+                "preparing",
+                "Speculative compaction preparing during tool wait — "
+                + _pressure_status(
+                    settings, int(request_tokens), soft_trigger, _hard_trigger
+                ),
+            )
+        elif disposition == "ready":
+            _emit_speculative_status(
+                agent,
+                "preparing",
+                "Speculative compaction prepared — candidate is ready for the next "
+                "foreground pressure check; "
+                + _pressure_status(
+                    settings, int(request_tokens), soft_trigger, _hard_trigger
+                ),
+            )
+        return disposition
     except Exception:
         logger.debug(
             "speculative compression snapshot unavailable for session=%s",
@@ -868,17 +924,11 @@ class SpeculativeCompressionManager:
                     type(exc).__name__,
                     exc,
                 )
-            # Publish AFTER the future completes so waiters can distinguish a
-            # ready/errored result from an in-flight one (the future itself
-            # completes before this callback runs on the executor thread).
-            job.published.set()
-
             pending = job.rerun_snapshot
             factory = job.rerun_factory
             if pending is not None and factory is not None:
                 if job.candidate is not None and (
-                    pending.source_fingerprint
-                    == job.candidate.source_fingerprint
+                    pending.source_fingerprint == job.candidate.source_fingerprint
                     and pending.boundary_fingerprint
                     == job.candidate.boundary_fingerprint
                     and pending.cut_index == job.candidate.cut_index
@@ -888,11 +938,19 @@ class SpeculativeCompressionManager:
                     # even when the prefix fingerprint matches.
                     job.rerun_snapshot = None
                     job.rerun_factory = None
+                    job.published.set()
                     return
                 if not self._shutdown:
                     rerun_snapshot = pending
                     rerun_factory = factory
                     rerun_max_age = job.max_age_seconds
+            if rerun_snapshot is None:
+                # Publish AFTER the future completes so waiters can distinguish
+                # a ready/errored result from an in-flight one. If a changed
+                # snapshot is queued, the shared event is published by the
+                # replacement job instead; serving this older candidate would
+                # race the newer transcript boundary.
+                job.published.set()
             self._prune_completed_entries(self._clock())
         if rerun_snapshot is not None and rerun_factory is not None:
             cancel_event = threading.Event()
@@ -905,6 +963,7 @@ class SpeculativeCompressionManager:
                 cancel_event=cancel_event,
                 started_at=self._clock(),
                 max_age_seconds=rerun_max_age,
+                published=job.published,
             )
             replaced = False
             with self._lock:
@@ -923,6 +982,8 @@ class SpeculativeCompressionManager:
                     session_id,
                     rerun_snapshot.source_fingerprint[:12],
                 )
+            else:
+                job.published.set()
 
     def take_matching_candidate(
         self,

@@ -76,6 +76,7 @@ def _try_install_speculative_candidate(
         return messages, None, False, False
     try:
         from agent.speculative_compression import (
+            _emit_speculative_status,
             is_builtin_compression_eligible,
             speculative_thresholds,
         )
@@ -126,7 +127,21 @@ def _try_install_speculative_candidate(
         max_age_seconds=settings.max_age_seconds,
     )
     if candidate is None:
+        if force_sync:
+            _emit_speculative_status(
+                agent,
+                "fallback",
+                "Speculative compaction candidate was not ready after the "
+                f"{settings.hard_wait_seconds:.1f}s hard wait; using synchronous "
+                "compaction fallback.",
+            )
         return messages, None, False, force_sync
+    _emit_speculative_status(
+        agent,
+        "active",
+        "Speculative compaction active — installing the prepared candidate and "
+        "committing the compacted context.",
+    )
     try:
         compressed, active_system_prompt = agent._compress_context(
             messages,
@@ -141,13 +156,31 @@ def _try_install_speculative_candidate(
         # speculative path must never crash the turn.
         logger.debug("speculative candidate install failed", exc_info=True)
         _restore_speculative_candidate(agent, candidate)
+        _emit_speculative_status(
+            agent,
+            "fallback",
+            "Speculative compaction install failed; using synchronous compaction "
+            "fallback.",
+        )
         return messages, None, False, force_sync
     if getattr(agent, "_speculative_install_status", None) != "installed":
         # Deferred by lock contention (or rejected as stale by the commit
         # path). A still-valid candidate must not be lost — requeue it so a
         # later attempt can reclaim it instead of re-running the summary LLM.
         _restore_speculative_candidate(agent, candidate)
+        _emit_speculative_status(
+            agent,
+            "fallback",
+            "Speculative compaction candidate was rejected or deferred; using "
+            "synchronous compaction fallback.",
+        )
         return messages, None, False, force_sync
+    _emit_speculative_status(
+        agent,
+        "installed",
+        "Speculative compaction installed — compacted history, system prompt, and "
+        "token estimates are now active.",
+    )
     return compressed, active_system_prompt, True, force_sync
 
 

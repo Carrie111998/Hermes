@@ -1813,6 +1813,13 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     if not body:
         return
     out_kind = kind if text is not None else "status"
+    state = None
+    if out_kind == "speculative" and body.startswith("[speculative:"):
+        state_start = len("[speculative:")
+        state_end = body.find("] ", state_start)
+        if state_end > state_start:
+            state = body[state_start:state_end]
+            body = body[state_end + 2 :].strip()
     # Auto-compaction reaches us as a generic "lifecycle" status. Re-tag it so
     # drivers (desktop app) can show an explicit "Summarizing…" indicator —
     # otherwise a mid-turn compaction looks like the transcript reset itself.
@@ -1821,7 +1828,10 @@ def _status_update(sid: str, kind: str, text: str | None = None):
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
-    _emit("status.update", sid, {"kind": out_kind, "text": body})
+    payload = {"kind": out_kind, "text": body}
+    if state is not None:
+        payload["state"] = state
+    _emit("status.update", sid, payload)
 
 
 def _estimate_image_tokens(width: int, height: int) -> int:
