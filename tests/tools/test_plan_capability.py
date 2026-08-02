@@ -46,6 +46,35 @@ def test_exact_plan_capability_is_owner_bound_expiring_and_consumed(monkeypatch)
     assert approval.consume_plan_capability("session-1", "git status") is None
 
 
+def test_execute_code_capability_is_exact_and_domain_separated(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
+    )
+    approval.clear_session("session-code")
+    code = "print('exact script')\n"
+    grant = approval.grant_plan_capability(
+        session_key="session-code",
+        plan_id="plan-code",
+        exact_commands=[],
+        exact_code_scripts=[code],
+        approved_by_user_id="owner-1",
+        max_uses_per_command=1,
+    )
+
+    assert grant["command_count"] == 1
+    assert approval.consume_plan_capability("session-code", code) is None
+    assert approval.consume_execute_code_plan_capability(
+        "session-code", "print('changed script')\n"
+    ) is None
+    assert approval.consume_execute_code_plan_capability(
+        "session-code", code
+    ) == "plan-code"
+    assert approval.consume_execute_code_plan_capability(
+        "session-code", code
+    ) is None
+
+
 def test_plan_capability_rejects_non_owner(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
@@ -102,6 +131,7 @@ def test_todo_schema_and_registry_expose_plan_approval_to_model(monkeypatch):
     assert "plan_revision" in properties["plan_approval"]["required"]
     assert "ttl_seconds" in properties["plan_approval"]["required"]
     assert "max_uses_per_command" in properties["plan_approval"]["required"]
+    assert "exact_code_scripts" in properties["plan_approval"]["properties"]
     assert properties["plan_approval"]["additionalProperties"] is False
     assert {
         "user_id",
@@ -148,6 +178,29 @@ def test_todo_schema_and_registry_expose_plan_approval_to_model(monkeypatch):
     assert approval.consume_plan_capability(
         "session-registry", "git status --short"
     ) == "plan-registry"
+
+    code = "print('registry exact code')\n"
+    code_result = registry.dispatch(
+        "todo",
+        {
+            "plan_approval": {
+                "plan_id": "plan-registry-code",
+                "plan_revision": 1,
+                "exact_commands": [],
+                "exact_code_scripts": [code],
+                "ttl_seconds": 3600,
+                "max_uses_per_command": 1,
+            },
+        },
+        store=store,
+        session_key="session-registry",
+        user_id="owner-1",
+    )
+    code_data = json.loads(code_result)
+    assert code_data["plan_capability"]["plan_id"] == "plan-registry-code"
+    assert approval.consume_execute_code_plan_capability(
+        "session-registry", code
+    ) == "plan-registry-code"
 
 
 def test_todo_goal_state_uses_conversation_session_not_gateway_authority_key(
