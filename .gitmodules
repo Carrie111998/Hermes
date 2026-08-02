@@ -35,3 +35,6 @@
 [submodule "vendor/airi"]
 	path = vendor/airi
 	url = https://github.com/zapabob/airi.git
+[submodule "vendor/oh-my-hermes"]
+	path = vendor/oh-my-hermes
+	url = https://github.com/zapabob/oh-my-hermes.git
