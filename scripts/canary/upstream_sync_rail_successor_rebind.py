@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import os
 import re
 import stat
 import struct
 import sys
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, Protocol, Sequence
@@ -35,6 +37,8 @@ from scripts.canary import upstream_sync_rail_cutover as activation
 from scripts.canary.production_cutover_activation_lock import (
     authority_activation_lock,
 )
+from scripts.canary import production_release_builder_runtime as release_builder
+from scripts.canary import production_release_update_stage0 as release_stage0
 
 
 AUTHORITY_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-authority.v1"
@@ -62,14 +66,6 @@ SYSTEMD_ROOT = Path("/etc/systemd/system")
 STAGED_ROOT = rail.PACKAGE_ROOT
 AUTHORITY_PATH = STAGED_ROOT / "successor-rebind-authority.json"
 PREFLIGHT_PATH = STAGED_ROOT / "successor-rebind-preflight.json"
-STAGE_C_HOST_ARTIFACT_MANIFEST_PATH = Path(
-    "/var/lib/muncho-production-release-update/inputs/host-artifact-manifest.json"
-)
-STAGE_C_RELEASE_UPDATE_PUBLICATION_PATH = Path(
-    "/var/lib/muncho-production-release-update/authority/"
-    "release-update-publication.json"
-)
-STAGE_C_TRUST_ROOT = Path("/var/lib/muncho-production-release-update")
 EVIDENCE_ROOT = Path(
     "/var/lib/muncho-production-legacy-cutover/"
     "dual-upstream-sync-successor-rebind"
@@ -138,6 +134,16 @@ class RebindHost(Protocol):
     def mutate(self, *arguments: str) -> None: ...
 
 
+class Stage0Verifier(Protocol):
+    """Canonical fixed-root Stage-0 verifier boundary."""
+
+    def __call__(
+        self,
+        *,
+        expected_predecessor_activation_receipt_sha256: str,
+    ) -> release_stage0.VerifiedLaunchBundle: ...
+
+
 def _receipt(unsigned: Mapping[str, Any]) -> dict[str, Any]:
     payload = copy.deepcopy(dict(unsigned))
     return {
@@ -154,6 +160,7 @@ def build_owner_request(
     target_package_manifest_sha256: str,
     predecessor_revision: str,
     predecessor_sender_revision: str,
+    predecessor_activation_receipt_sha256: str,
     stage_c_host_artifact_manifest_sha256: str,
     stage_c_release_update_publication_sha256: str,
     rebind_runtime_sha256: str,
@@ -167,6 +174,9 @@ def build_owner_request(
         "target_package_manifest_sha256": target_package_manifest_sha256,
         "predecessor_revision": predecessor_revision,
         "predecessor_sender_revision": predecessor_sender_revision,
+        "predecessor_activation_receipt_sha256": (
+            predecessor_activation_receipt_sha256
+        ),
         "stage_c_host_artifact_manifest_sha256": (
             stage_c_host_artifact_manifest_sha256
         ),
@@ -199,6 +209,7 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
         "target_package_manifest_sha256",
         "predecessor_revision",
         "predecessor_sender_revision",
+        "predecessor_activation_receipt_sha256",
         "stage_c_host_artifact_manifest_sha256",
         "stage_c_release_update_publication_sha256",
         "rebind_runtime_sha256",
@@ -234,6 +245,7 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
             _SHA256.fullmatch(str(request.get(name, ""))) is None
             for name in (
                 "target_package_manifest_sha256",
+                "predecessor_activation_receipt_sha256",
                 "stage_c_host_artifact_manifest_sha256",
                 "stage_c_release_update_publication_sha256",
                 "rebind_runtime_sha256",
@@ -579,6 +591,7 @@ def _load_context(
         activation._read_canonical_json(  # noqa: SLF001
             authority_path,
             root_owned=root_owned,
+            modes=frozenset({0o444}),
         ),
         expected_sha256=expected_authority_sha256,
     )
@@ -610,6 +623,149 @@ def _load_context(
     if activation._sha256(runtime_raw) != authority["rebind_runtime_sha256"]:  # noqa: SLF001
         _fail("upstream_sync_successor_runtime_invalid")
     return authority, package
+
+
+@dataclass
+class _HeldStagedInputs(AbstractContextManager["_HeldStagedInputs"]):
+    """Exact staged authority/preflight inodes held across mutation."""
+
+    authority: release_builder.HeldRegularFile
+    preflight: release_builder.HeldRegularFile
+
+    def assert_stable(self) -> None:
+        try:
+            self.authority.assert_stable()
+            self.preflight.assert_stable()
+        except release_builder.ProductionReleaseBuilderError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_stage_identity_drifted"
+            ) from exc
+
+    def close(self) -> None:
+        self.preflight.close()
+        self.authority.close()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+
+def _hold_staged_inputs(
+    *,
+    authority_path: Path,
+    authority: Mapping[str, Any],
+    preflight_path: Path,
+    preflight: Mapping[str, Any],
+    root_owned: bool,
+) -> _HeldStagedInputs:
+    expected_uid = 0 if root_owned else activation._effective_uid()  # noqa: SLF001
+    expected_gid = 0 if root_owned else activation._effective_gid()  # noqa: SLF001
+    authority_held: release_builder.HeldRegularFile | None = None
+    try:
+        authority_held = release_builder.open_held_regular(
+            authority_path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            allowed_modes=frozenset({0o444}),
+            maximum_bytes=activation.MAX_JSON_BYTES,
+            expected_sha256=hashlib.sha256(
+                activation._canonical(authority) + b"\n"  # noqa: SLF001
+            ).hexdigest(),
+        )
+        preflight_held = release_builder.open_held_regular(
+            preflight_path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            allowed_modes=frozenset({0o444}),
+            maximum_bytes=activation.MAX_JSON_BYTES,
+            expected_sha256=hashlib.sha256(
+                activation._canonical(preflight) + b"\n"  # noqa: SLF001
+            ).hexdigest(),
+        )
+        held = _HeldStagedInputs(
+            authority=authority_held,
+            preflight=preflight_held,
+        )
+        try:
+            held.assert_stable()
+        except UpstreamSyncRailSuccessorRebindError:
+            held.close()
+            raise
+        return held
+    except release_builder.ProductionReleaseBuilderError as exc:
+        if authority_held is not None:
+            authority_held.close()
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_identity_invalid"
+        ) from exc
+
+
+@dataclass
+class _HeldUnitSet(AbstractContextManager["_HeldUnitSet"]):
+    files: Mapping[str, release_builder.HeldRegularFile]
+
+    def assert_stable(self) -> None:
+        try:
+            for name in UNIT_NAMES:
+                self.files[name].assert_stable()
+        except (KeyError, release_builder.ProductionReleaseBuilderError) as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_unit_identity_drifted"
+            ) from exc
+
+    def close(self) -> None:
+        for held in reversed(tuple(self.files.values())):
+            held.close()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+
+def _hold_unit_set(
+    *,
+    systemd_root: Path,
+    expected_digests: Mapping[str, str],
+    root_owned: bool,
+) -> _HeldUnitSet:
+    if set(expected_digests) != _UNIT_DIGEST_FIELDS:
+        _fail("upstream_sync_successor_unit_identity_invalid")
+    expected_uid = 0 if root_owned else activation._effective_uid()  # noqa: SLF001
+    expected_gid = 0 if root_owned else activation._effective_gid()  # noqa: SLF001
+    held: dict[str, release_builder.HeldRegularFile] = {}
+    try:
+        for name in UNIT_NAMES:
+            held[name] = release_builder.open_held_regular(
+                systemd_root / name,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                allowed_modes=frozenset({0o644}),
+                maximum_bytes=2 * 1024 * 1024,
+                expected_sha256=expected_digests[name],
+            )
+        result = _HeldUnitSet(files=held)
+        try:
+            result.assert_stable()
+        except UpstreamSyncRailSuccessorRebindError:
+            result.close()
+            raise
+        return result
+    except release_builder.ProductionReleaseBuilderError as exc:
+        for opened in reversed(tuple(held.values())):
+            opened.close()
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_unit_identity_invalid"
+        ) from exc
 
 
 def _unit_bytes(
@@ -667,6 +823,9 @@ def _validate_predecessor_units(
 class _SystemdHost:
     """Fixed production systemd implementation."""
 
+    def __init__(self, *, root_owned: bool = True) -> None:
+        self._root_owned = root_owned
+
     @staticmethod
     def _property(unit: str, name: str) -> str:
         try:
@@ -705,15 +864,19 @@ class _SystemdHost:
         if fragment != str(systemd_root / unit):
             _fail("upstream_sync_successor_systemd_fragment_invalid", unit)
         try:
-            raw, _metadata = activation._read_regular(  # noqa: SLF001
+            raw, metadata = activation._read_regular(  # noqa: SLF001
                 Path(fragment),
                 maximum=2 * 1024 * 1024,
+                modes=frozenset({0o644}),
+                root_owned=self._root_owned,
             )
         except activation.UpstreamSyncRailCutoverError as exc:
             raise UpstreamSyncRailSuccessorRebindError(
                 "upstream_sync_successor_systemd_fragment_invalid",
                 unit,
             ) from exc
+        if stat.S_IMODE(metadata.st_mode) != 0o644:
+            _fail("upstream_sync_successor_unit_mode_invalid", unit)
         try:
             enabled_code, enabled_raw = activation._systemctl_capture(  # noqa: SLF001
                 "is-enabled", unit
@@ -758,6 +921,23 @@ class _SystemdHost:
             raise UpstreamSyncRailSuccessorRebindError(
                 "upstream_sync_successor_systemd_mutation_failed"
             ) from exc
+
+
+@dataclass(frozen=True)
+class _GuardedHost:
+    delegate: RebindHost
+    assert_stable: Callable[[], None]
+
+    def observe(self, unit: str, *, systemd_root: Path) -> UnitState:
+        self.assert_stable()
+        observed = self.delegate.observe(unit, systemd_root=systemd_root)
+        self.assert_stable()
+        return observed
+
+    def mutate(self, *arguments: str) -> None:
+        self.assert_stable()
+        self.delegate.mutate(*arguments)
+        self.assert_stable()
 
 
 def _observe_all(host: RebindHost, *, systemd_root: Path) -> dict[str, UnitState]:
@@ -885,6 +1065,7 @@ def preflight(
         activation._read_canonical_json(  # noqa: SLF001
             authority_path,
             root_owned=root_owned,
+            modes=frozenset({0o444}),
         ),
         expected_sha256=expected_authority_sha256,
     )
@@ -899,7 +1080,7 @@ def preflight(
         root_owned=root_owned,
         release_trust_root=(release_trust_root or rail.RELEASES_ROOT),
     )
-    selected_host = host or _SystemdHost()
+    selected_host = host or _SystemdHost(root_owned=root_owned)
     return _build_preflight_receipt(
         authority=authority,
         package=package,
@@ -978,87 +1159,56 @@ def _validate_preflight(
     return copy.deepcopy(dict(value))
 
 
-def _validate_stage_c_public_artifacts(
+def _validate_stage0_bundle(
     *,
     request: Mapping[str, Any],
-    host_artifact_manifest_path: Path,
-    release_update_publication_path: Path,
-    root_owned: bool,
+    bundle: release_stage0.VerifiedLaunchBundle,
+    release_trust_root: Path,
 ) -> None:
-    """Bind the two reviewed, secret-free Stage-C public documents."""
-
-    from scripts.canary import package_production_cutover_artifacts as host_package
-    from scripts.canary import production_release_update_contract as release_contract
+    """Bind the complete predecessor-authorized Stage-C launch bundle."""
 
     try:
-        for path in (
-            host_artifact_manifest_path,
-            release_update_publication_path,
+        bundle.assert_stable()
+        publication = bundle.publication
+        plan = publication["plan"]
+        host_manifest = bundle.input_documents[
+            "host_artifact_manifest_sha256"
+        ]
+        host_identity = bundle.input_internal_identities[
+            "host_artifact_manifest_sha256"
+        ]
+        expected_release_root = release_trust_root / (
+            f"hermes-agent-{request['target_revision'][:12]}"
+        )
+        if (
+            publication.get("release_revision")
+            != request["target_revision"]
+            or plan.get("release_revision") != request["target_revision"]
+            or publication.get("publication_sha256")
+            != request["stage_c_release_update_publication_sha256"]
+            or plan.get("host_artifact_manifest_sha256")
+            != request["stage_c_host_artifact_manifest_sha256"]
+            or host_manifest.get("manifest_sha256")
+            != request["stage_c_host_artifact_manifest_sha256"]
+            or host_identity
+            != request["stage_c_host_artifact_manifest_sha256"]
+            or bundle.predecessor_trust.get("activation_receipt_sha256")
+            != request["predecessor_activation_receipt_sha256"]
+            or plan.get("predecessor_activation_receipt_sha256")
+            != request["predecessor_activation_receipt_sha256"]
+            or bundle.release_root != expected_release_root
+            or bundle.builder_manifest.get("release_revision")
+            != request["target_revision"]
+            or bundle.builder_receipt.get("release_revision")
+            != request["target_revision"]
         ):
-            activation._validate_trusted_parent_chain(  # noqa: SLF001
-                path,
-                boundary=(
-                    STAGE_C_TRUST_ROOT
-                    if root_owned
-                    else path.parent.parent
-                ),
-                root_owned=root_owned,
-            )
-        host_manifest = activation._read_canonical_json(  # noqa: SLF001
-            host_artifact_manifest_path,
-            root_owned=root_owned,
-            modes=frozenset({0o444}),
-        )
-        publication = activation._read_canonical_json(  # noqa: SLF001
-            release_update_publication_path,
-            root_owned=root_owned,
-            modes=frozenset({0o444}),
-        )
-    except activation.UpstreamSyncRailCutoverError as exc:
+            _fail("upstream_sync_successor_stage0_binding_invalid")
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except (KeyError, TypeError, release_stage0.ProductionReleaseUpdateStage0Error) as exc:
         raise UpstreamSyncRailSuccessorRebindError(
-            "upstream_sync_successor_stage_c_artifact_invalid"
+            "upstream_sync_successor_stage0_binding_invalid"
         ) from exc
-    host_digest = host_manifest.get("manifest_sha256")
-    publication_digest = publication.get("publication_sha256")
-    plan = publication.get("plan")
-    if (
-        not isinstance(plan, Mapping)
-        or host_manifest.get("schema") != host_package.MANIFEST_SCHEMA
-        or publication.get("schema") != release_contract.PUBLICATION_SCHEMA
-        or publication.get("action") != release_contract.PUBLICATION_ACTION
-        or host_manifest.get("release_revision") != request["target_revision"]
-        or publication.get("release_revision") != request["target_revision"]
-        or plan.get("release_revision") != request["target_revision"]
-        or plan.get("host_artifact_manifest_sha256")
-        != request["stage_c_host_artifact_manifest_sha256"]
-        or host_digest != request["stage_c_host_artifact_manifest_sha256"]
-        or publication_digest
-        != request["stage_c_release_update_publication_sha256"]
-        or host_digest
-        != activation._sha256(  # noqa: SLF001
-            activation._canonical(  # noqa: SLF001
-                {
-                    name: item
-                    for name, item in host_manifest.items()
-                    if name != "manifest_sha256"
-                }
-            )
-        )
-        or publication_digest
-        != activation._sha256(  # noqa: SLF001
-            activation._canonical(  # noqa: SLF001
-                {
-                    name: item
-                    for name, item in publication.items()
-                    if name != "publication_sha256"
-                }
-            )
-        )
-        or host_manifest.get("secret_material_recorded") is not False
-        or publication.get("secret_material_recorded") is not False
-        or publication.get("secret_digest_recorded") is not False
-    ):
-        _fail("upstream_sync_successor_stage_c_artifact_invalid")
 
 
 def _stage_pending_path(path: Path, digest: str) -> Path:
@@ -1406,7 +1556,9 @@ def _archive_units(
     systemd_root: Path,
     evidence_root: Path,
     root_owned: bool,
+    stability_guard: Callable[[], None],
 ) -> dict[str, Any]:
+    stability_guard()
     directory = _archive_root(
         authority["authority_sha256"],
         evidence_root=evidence_root,
@@ -1444,6 +1596,7 @@ def _archive_units(
             uid=0 if root_owned else activation._effective_uid(),  # noqa: SLF001
             gid=0 if root_owned else activation._effective_gid(),  # noqa: SLF001
         )
+        stability_guard()
     receipt = _receipt(
         {
             "schema": ARCHIVE_SCHEMA,
@@ -1531,7 +1684,9 @@ def _install_target_units(
     systemd_root: Path,
     root_owned: bool,
     progress_hook: Callable[[str, str | None], None] | None,
+    stability_guard: Callable[[], None],
 ) -> bool:
+    stability_guard()
     units = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
     digests = _digest_bytes(units)
     changed_units = tuple(
@@ -1559,6 +1714,7 @@ def _install_target_units(
             uid=0 if root_owned else activation._effective_uid(),  # noqa: SLF001
             gid=0 if root_owned else activation._effective_gid(),  # noqa: SLF001
         )
+        stability_guard()
         if progress_hook is not None:
             progress_hook("unit_replaced", name)
     final = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
@@ -1609,7 +1765,9 @@ def _restore_predecessor(
     root_owned: bool,
     cause: str,
     progress_hook: Callable[[str, str | None], None] | None,
+    stability_guard: Callable[[], None],
 ) -> dict[str, Any]:
+    stability_guard()
     rollback_intent = _ensure_rollback_intent(
         authority=authority,
         preflight_sha256=preflight_sha256,
@@ -1642,6 +1800,7 @@ def _restore_predecessor(
                 uid=0 if root_owned else activation._effective_uid(),  # noqa: SLF001
                 gid=0 if root_owned else activation._effective_gid(),  # noqa: SLF001
             )
+            stability_guard()
             if progress_hook is not None:
                 progress_hook("rollback_unit_restored", name)
     else:
@@ -1720,6 +1879,79 @@ def _rebind(
     require_root: bool,
     activation_lock_factory: Callable[[], Any] | None,
     progress_hook: Callable[[str, str | None], None] | None,
+    stability_guard: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Hold exact staged inputs for the complete mutation transaction."""
+
+    authority, _package = _load_context(
+        expected_authority_sha256=expected_authority_sha256,
+        staged_root=staged_root,
+        authority_path=authority_path,
+        runtime_path=runtime_path,
+        root_owned=root_owned,
+        release_trust_root=release_trust_root,
+    )
+    preflight_value = activation._read_canonical_json(  # noqa: SLF001
+        preflight_path,
+        root_owned=root_owned,
+        modes=frozenset({0o444}),
+    )
+    checked_preflight = _validate_preflight(
+        preflight_value,
+        authority=authority,
+        expected_sha256=expected_preflight_sha256,
+    )
+    with _hold_staged_inputs(
+        authority_path=authority_path,
+        authority=authority,
+        preflight_path=preflight_path,
+        preflight=checked_preflight,
+        root_owned=root_owned,
+    ) as held:
+        def assert_stable() -> None:
+            held.assert_stable()
+            if stability_guard is not None:
+                stability_guard()
+
+        assert_stable()
+        result = _rebind_unheld(
+            expected_authority_sha256=expected_authority_sha256,
+            expected_preflight_sha256=expected_preflight_sha256,
+            staged_root=staged_root,
+            authority_path=authority_path,
+            preflight_path=preflight_path,
+            runtime_path=runtime_path,
+            systemd_root=systemd_root,
+            evidence_root=evidence_root,
+            root_owned=root_owned,
+            release_trust_root=release_trust_root,
+            host=_GuardedHost(host, assert_stable),
+            require_root=require_root,
+            activation_lock_factory=activation_lock_factory,
+            progress_hook=progress_hook,
+            stability_guard=assert_stable,
+        )
+        assert_stable()
+        return result
+
+
+def _rebind_unheld(
+    *,
+    expected_authority_sha256: str,
+    expected_preflight_sha256: str,
+    staged_root: Path,
+    authority_path: Path,
+    preflight_path: Path,
+    runtime_path: Path,
+    systemd_root: Path,
+    evidence_root: Path,
+    root_owned: bool,
+    release_trust_root: Path,
+    host: RebindHost,
+    require_root: bool,
+    activation_lock_factory: Callable[[], Any] | None,
+    progress_hook: Callable[[str, str | None], None] | None,
+    stability_guard: Callable[[], None],
 ) -> dict[str, Any]:
     if require_root and activation._effective_uid() != 0:  # noqa: SLF001
         _fail("upstream_sync_successor_root_required")
@@ -1734,6 +1966,7 @@ def _rebind(
     preflight_value = activation._read_canonical_json(  # noqa: SLF001
         preflight_path,
         root_owned=root_owned,
+        modes=frozenset({0o444}),
     )
     checked_preflight = _validate_preflight(
         preflight_value,
@@ -1769,6 +2002,7 @@ def _rebind(
         require_root=require_root,
         lock_factory=activation_lock_factory,
     ):
+        stability_guard()
         if rollback_path.exists() or rollback_path.is_symlink():
             _fail("upstream_sync_successor_already_rolled_back")
         if terminal_path.exists() or terminal_path.is_symlink():
@@ -1786,6 +2020,7 @@ def _rebind(
                 root_owned=root_owned,
                 release_trust_root=release_trust_root,
                 host=host,
+                stability_guard=stability_guard,
             )
         started_present = started_path.exists() or started_path.is_symlink()
         if not started_present and (archive_path.exists() or archive_path.is_symlink()):
@@ -1805,6 +2040,7 @@ def _rebind(
                 preflight_sha256=expected_preflight_sha256,
             )
         else:
+            stability_guard()
             units = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
             _validate_predecessor_units(units, authority)
             _prove_missing_predecessor_refs(authority)
@@ -1823,6 +2059,7 @@ def _rebind(
                 path=started_path,
                 root_owned=root_owned,
             )
+            stability_guard()
         if rollback_intent_path.exists() or rollback_intent_path.is_symlink():
             intent = activation._read_canonical_json(  # noqa: SLF001
                 rollback_intent_path,
@@ -1850,6 +2087,7 @@ def _rebind(
                     root_owned=root_owned,
                     cause=cause,
                     progress_hook=progress_hook,
+                    stability_guard=stability_guard,
                 )
             except Exception as rollback_exc:
                 raise UpstreamSyncRailSuccessorRebindError(
@@ -1860,6 +2098,7 @@ def _rebind(
                 cause,
             )
         try:
+            stability_guard()
             current = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
             current_digests = _digest_bytes(current)
             if any(
@@ -1871,27 +2110,45 @@ def _rebind(
                 for name in UNIT_NAMES
             ):
                 _fail("upstream_sync_successor_foreign_unit_drift")
-            host.mutate("stop", *TIMER_NAMES)
-            stopped = _observe_all(host, systemd_root=systemd_root)
-            if any(stopped[name].active_state != "inactive" for name in UNIT_NAMES):
-                _fail("upstream_sync_successor_quiescence_unconfirmed")
-            if archive_path.exists() or archive_path.is_symlink():
-                _validate_archive(
-                    authority=authority,
-                    preflight_sha256=expected_preflight_sha256,
-                    evidence_root=evidence_root,
-                    root_owned=root_owned,
-                )
-                forward_recovery = True
-            else:
-                _archive_units(
-                    authority=authority,
-                    preflight_sha256=expected_preflight_sha256,
+            with _hold_unit_set(
+                systemd_root=systemd_root,
+                expected_digests=current_digests,
+                root_owned=root_owned,
+            ) as held_current:
+                def assert_current_stable() -> None:
+                    stability_guard()
+                    held_current.assert_stable()
+
+                current_host = _GuardedHost(host, assert_current_stable)
+                current_host.mutate("stop", *TIMER_NAMES)
+                stopped = _observe_all(
+                    current_host,
                     systemd_root=systemd_root,
-                    evidence_root=evidence_root,
-                    root_owned=root_owned,
                 )
-                forward_recovery = False
+                if any(
+                    stopped[name].active_state != "inactive"
+                    for name in UNIT_NAMES
+                ):
+                    _fail("upstream_sync_successor_quiescence_unconfirmed")
+                if archive_path.exists() or archive_path.is_symlink():
+                    _validate_archive(
+                        authority=authority,
+                        preflight_sha256=expected_preflight_sha256,
+                        evidence_root=evidence_root,
+                        root_owned=root_owned,
+                    )
+                    forward_recovery = True
+                else:
+                    _archive_units(
+                        authority=authority,
+                        preflight_sha256=expected_preflight_sha256,
+                        systemd_root=systemd_root,
+                        evidence_root=evidence_root,
+                        root_owned=root_owned,
+                        stability_guard=assert_current_stable,
+                    )
+                    forward_recovery = False
+                assert_current_stable()
             forward_recovery = (
                 _install_target_units(
                     package=package,
@@ -1899,28 +2156,45 @@ def _rebind(
                     systemd_root=systemd_root,
                     root_owned=root_owned,
                     progress_hook=progress_hook,
+                    stability_guard=stability_guard,
                 )
                 or forward_recovery
             )
-            host.mutate("daemon-reload")
-            reloaded = _observe_all(host, systemd_root=systemd_root)
-            _validate_loaded_digests(
-                reloaded,
+            with _hold_unit_set(
+                systemd_root=systemd_root,
                 expected_digests=authority["target_unit_digests"],
-                systemd_root=systemd_root,
-            )
-            if any(reloaded[name].active_state != "inactive" for name in UNIT_NAMES):
-                _fail("upstream_sync_successor_reload_quiescence_invalid")
-            host.mutate("enable", *TIMER_NAMES)
-            # Both oneshot services are run once before their timers are armed.
-            # This is the exact catch-up proof for the new release bytes.
-            host.mutate("start", *SERVICE_NAMES)
-            host.mutate("start", *TIMER_NAMES)
-            observed = _prove_target(
-                host=host,
-                authority=authority,
-                systemd_root=systemd_root,
-            )
+                root_owned=root_owned,
+            ) as held_target:
+                def assert_target_stable() -> None:
+                    stability_guard()
+                    held_target.assert_stable()
+
+                target_host = _GuardedHost(host, assert_target_stable)
+                target_host.mutate("daemon-reload")
+                reloaded = _observe_all(
+                    target_host,
+                    systemd_root=systemd_root,
+                )
+                _validate_loaded_digests(
+                    reloaded,
+                    expected_digests=authority["target_unit_digests"],
+                    systemd_root=systemd_root,
+                )
+                if any(
+                    reloaded[name].active_state != "inactive"
+                    for name in UNIT_NAMES
+                ):
+                    _fail("upstream_sync_successor_reload_quiescence_invalid")
+                target_host.mutate("enable", *TIMER_NAMES)
+                # Both oneshot services run once before their timers are armed.
+                target_host.mutate("start", *SERVICE_NAMES)
+                target_host.mutate("start", *TIMER_NAMES)
+                observed = _prove_target(
+                    host=target_host,
+                    authority=authority,
+                    systemd_root=systemd_root,
+                )
+                assert_target_stable()
             terminal = _receipt(
                 {
                     "schema": TERMINAL_SCHEMA,
@@ -1952,6 +2226,7 @@ def _rebind(
                     "secret_material_recorded": False,
                 }
             )
+            stability_guard()
             return _publish(terminal, path=terminal_path, root_owned=root_owned)
         except (
             UpstreamSyncRailSuccessorRebindError,
@@ -1981,6 +2256,7 @@ def _rebind(
                     root_owned=root_owned,
                     cause=cause,
                     progress_hook=progress_hook,
+                    stability_guard=stability_guard,
                 )
             except Exception as rollback_exc:
                 raise UpstreamSyncRailSuccessorRebindError(
@@ -2011,6 +2287,7 @@ def rebind(
         activation._read_canonical_json(  # noqa: SLF001
             authority_path,
             root_owned=root_owned,
+            modes=frozenset({0o444}),
         ),
         expected_sha256=expected_authority_sha256,
     )
@@ -2028,7 +2305,7 @@ def rebind(
         evidence_root=evidence_root,
         root_owned=root_owned,
         release_trust_root=release_trust_root or rail.RELEASES_ROOT,
-        host=_SystemdHost(),
+        host=_SystemdHost(root_owned=root_owned),
         require_root=require_root,
         activation_lock_factory=activation_lock_factory,
         progress_hook=None,
@@ -2174,12 +2451,67 @@ def _owner_apply(
     systemd_root: Path,
     evidence_root: Path,
     release_trust_root: Path,
-    host_artifact_manifest_path: Path,
-    release_update_publication_path: Path,
     root_owned: bool,
     host: RebindHost,
     require_root: bool,
     activation_lock_factory: Callable[[], Any] | None,
+    stage0_verifier: Stage0Verifier = release_stage0.verify_stage0,
+) -> dict[str, Any]:
+    """Apply only while canonical Stage 0 keeps every trust input open."""
+
+    request = validate_owner_request(request_value)
+    try:
+        verified = stage0_verifier(
+            expected_predecessor_activation_receipt_sha256=request[
+                "predecessor_activation_receipt_sha256"
+            ]
+        )
+        with verified as bundle:
+            _validate_stage0_bundle(
+                request=request,
+                bundle=bundle,
+                release_trust_root=release_trust_root,
+            )
+            result = _owner_apply_verified(
+                request,
+                staged_root=staged_root,
+                authority_path=authority_path,
+                preflight_path=preflight_path,
+                runtime_path=runtime_path,
+                systemd_root=systemd_root,
+                evidence_root=evidence_root,
+                release_trust_root=release_trust_root,
+                root_owned=root_owned,
+                host=host,
+                require_root=require_root,
+                activation_lock_factory=activation_lock_factory,
+                stability_guard=bundle.assert_stable,
+            )
+            bundle.assert_stable()
+            return result
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except release_stage0.ProductionReleaseUpdateStage0Error as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage0_invalid"
+        ) from exc
+
+
+def _owner_apply_verified(
+    request_value: Mapping[str, Any],
+    *,
+    staged_root: Path,
+    authority_path: Path,
+    preflight_path: Path,
+    runtime_path: Path,
+    systemd_root: Path,
+    evidence_root: Path,
+    release_trust_root: Path,
+    root_owned: bool,
+    host: RebindHost,
+    require_root: bool,
+    activation_lock_factory: Callable[[], Any] | None,
+    stability_guard: Callable[[], None],
 ) -> dict[str, Any]:
     """Author, stage, rebind, and verify one exact successor transaction."""
 
@@ -2195,13 +2527,7 @@ def _owner_apply(
     preflight_exists = os.path.lexists(preflight_path)
     if preflight_exists and not authority_exists:
         _fail("upstream_sync_successor_owner_partial_stage_invalid")
-    if not authority_exists:
-        _validate_stage_c_public_artifacts(
-            request=request,
-            host_artifact_manifest_path=host_artifact_manifest_path,
-            release_update_publication_path=release_update_publication_path,
-            root_owned=root_owned,
-        )
+    stability_guard()
     try:
         activation._validate_trusted_parent_chain(  # noqa: SLF001
             runtime_path,
@@ -2219,6 +2545,7 @@ def _owner_apply(
         ) from exc
     if activation._sha256(runtime_raw) != request["rebind_runtime_sha256"]:  # noqa: SLF001
         _fail("upstream_sync_successor_runtime_invalid")
+    stability_guard()
     package = activation._validate_package_context(  # noqa: SLF001
         staged_root=staged_root,
         release_revision=request["target_revision"],
@@ -2299,6 +2626,7 @@ def _owner_apply(
                 path=preflight_path,
                 root_owned=root_owned,
             )
+            stability_guard()
     else:
         predecessor_units = _unit_bytes(
             systemd_root=systemd_root,
@@ -2331,11 +2659,13 @@ def _owner_apply(
             path=authority_path,
             root_owned=root_owned,
         )
+        stability_guard()
         _stage_create_only(
             preflight_value,
             path=preflight_path,
             root_owned=root_owned,
         )
+        stability_guard()
 
     terminal = _rebind(
         expected_authority_sha256=authority["authority_sha256"],
@@ -2352,6 +2682,7 @@ def _owner_apply(
         require_root=require_root,
         activation_lock_factory=activation_lock_factory,
         progress_hook=None,
+        stability_guard=stability_guard,
     )
     verified = _verify(
         expected_authority_sha256=authority["authority_sha256"],
@@ -2365,9 +2696,11 @@ def _owner_apply(
         root_owned=root_owned,
         release_trust_root=release_trust_root,
         host=host,
+        stability_guard=stability_guard,
     )
     if terminal != verified:
         _fail("upstream_sync_successor_owner_terminal_drifted")
+    stability_guard()
     return _owner_result(
         request=request,
         authority=authority,
@@ -2388,10 +2721,8 @@ def owner_apply(request: Mapping[str, Any]) -> dict[str, Any]:
         systemd_root=SYSTEMD_ROOT,
         evidence_root=EVIDENCE_ROOT,
         release_trust_root=rail.RELEASES_ROOT,
-        host_artifact_manifest_path=STAGE_C_HOST_ARTIFACT_MANIFEST_PATH,
-        release_update_publication_path=STAGE_C_RELEASE_UPDATE_PUBLICATION_PATH,
         root_owned=True,
-        host=_SystemdHost(),
+        host=_SystemdHost(root_owned=True),
         require_root=True,
         activation_lock_factory=None,
     )
@@ -2511,6 +2842,68 @@ def _verify(
     root_owned: bool,
     release_trust_root: Path,
     host: RebindHost,
+    stability_guard: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    authority, _package = _load_context(
+        expected_authority_sha256=expected_authority_sha256,
+        staged_root=staged_root,
+        authority_path=authority_path,
+        runtime_path=runtime_path,
+        root_owned=root_owned,
+        release_trust_root=release_trust_root,
+    )
+    preflight = _validate_preflight(
+        activation._read_canonical_json(  # noqa: SLF001
+            preflight_path,
+            root_owned=root_owned,
+            modes=frozenset({0o444}),
+        ),
+        authority=authority,
+        expected_sha256=expected_preflight_sha256,
+    )
+    with _hold_staged_inputs(
+        authority_path=authority_path,
+        authority=authority,
+        preflight_path=preflight_path,
+        preflight=preflight,
+        root_owned=root_owned,
+    ) as held:
+        def assert_stable() -> None:
+            held.assert_stable()
+            if stability_guard is not None:
+                stability_guard()
+
+        assert_stable()
+        result = _verify_unheld(
+            expected_authority_sha256=expected_authority_sha256,
+            expected_preflight_sha256=expected_preflight_sha256,
+            staged_root=staged_root,
+            authority_path=authority_path,
+            preflight_path=preflight_path,
+            runtime_path=runtime_path,
+            systemd_root=systemd_root,
+            evidence_root=evidence_root,
+            root_owned=root_owned,
+            release_trust_root=release_trust_root,
+            host=_GuardedHost(host, assert_stable),
+        )
+        assert_stable()
+        return result
+
+
+def _verify_unheld(
+    *,
+    expected_authority_sha256: str,
+    expected_preflight_sha256: str,
+    staged_root: Path,
+    authority_path: Path,
+    preflight_path: Path,
+    runtime_path: Path,
+    systemd_root: Path,
+    evidence_root: Path,
+    root_owned: bool,
+    release_trust_root: Path,
+    host: RebindHost,
 ) -> dict[str, Any]:
     authority, _package = _load_context(
         expected_authority_sha256=expected_authority_sha256,
@@ -2524,6 +2917,7 @@ def _verify(
         activation._read_canonical_json(  # noqa: SLF001
             preflight_path,
             root_owned=root_owned,
+            modes=frozenset({0o444}),
         ),
         authority=authority,
         expected_sha256=expected_preflight_sha256,
@@ -2664,7 +3058,7 @@ def verify(
         evidence_root=evidence_root,
         root_owned=root_owned,
         release_trust_root=release_trust_root or rail.RELEASES_ROOT,
-        host=_SystemdHost(),
+        host=_SystemdHost(root_owned=root_owned),
     )
 
 
@@ -2691,6 +3085,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-package-manifest-sha256")
     parser.add_argument("--predecessor-revision")
     parser.add_argument("--predecessor-sender-revision")
+    parser.add_argument("--predecessor-activation-receipt-sha256")
     parser.add_argument("--stage-c-host-artifact-manifest-sha256")
     parser.add_argument("--stage-c-release-update-publication-sha256")
     parser.add_argument("--rebind-runtime-sha256")
@@ -2704,6 +3099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.target_package_manifest_sha256,
         arguments.predecessor_revision,
         arguments.predecessor_sender_revision,
+        arguments.predecessor_activation_receipt_sha256,
         arguments.stage_c_host_artifact_manifest_sha256,
         arguments.stage_c_release_update_publication_sha256,
         arguments.rebind_runtime_sha256,
@@ -2725,6 +3121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     predecessor_revision=arguments.predecessor_revision,
                     predecessor_sender_revision=(
                         arguments.predecessor_sender_revision
+                    ),
+                    predecessor_activation_receipt_sha256=(
+                        arguments.predecessor_activation_receipt_sha256
                     ),
                     stage_c_host_artifact_manifest_sha256=(
                         arguments.stage_c_host_artifact_manifest_sha256

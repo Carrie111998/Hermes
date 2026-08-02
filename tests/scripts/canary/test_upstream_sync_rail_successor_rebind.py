@@ -21,6 +21,7 @@ ROOT = Path(__file__).parents[3]
 PREDECESSOR = "9d4a56cb069c096a2db6e452c19ffc1b7dc2d4f6"
 PREDECESSOR_SENDER = "f8733e2f44dae583ac30b2c4f4e85afd7890a1a5"
 TARGET = "a094bc4c2ecf1e4deb9b5b353491f9a0690211b3"
+PREDECESSOR_RECEIPT = "6" * 64
 
 
 def test_stage_c_contract_inventories_both_exact_timer_service_pairs() -> None:
@@ -163,6 +164,62 @@ class FakeSystemd:
 
 
 @dataclass
+class FakeStage0Bundle:
+    release_root: Path
+    host_manifest_sha256: str
+    publication_sha256: str
+    stable_hook: Callable[[], None] | None = None
+    stable_assertions: int = 0
+
+    @property
+    def predecessor_trust(self) -> dict[str, Any]:
+        return {"activation_receipt_sha256": PREDECESSOR_RECEIPT}
+
+    @property
+    def publication(self) -> dict[str, Any]:
+        return {
+            "release_revision": TARGET,
+            "publication_sha256": self.publication_sha256,
+            "plan": {
+                "release_revision": TARGET,
+                "host_artifact_manifest_sha256": self.host_manifest_sha256,
+                "predecessor_activation_receipt_sha256": PREDECESSOR_RECEIPT,
+            },
+        }
+
+    @property
+    def input_documents(self) -> dict[str, dict[str, Any]]:
+        return {
+            "host_artifact_manifest_sha256": {
+                "manifest_sha256": self.host_manifest_sha256,
+            }
+        }
+
+    @property
+    def input_internal_identities(self) -> dict[str, str]:
+        return {"host_artifact_manifest_sha256": self.host_manifest_sha256}
+
+    @property
+    def builder_manifest(self) -> dict[str, str]:
+        return {"release_revision": TARGET}
+
+    @property
+    def builder_receipt(self) -> dict[str, str]:
+        return {"release_revision": TARGET}
+
+    def assert_stable(self) -> None:
+        self.stable_assertions += 1
+        if self.stable_hook is not None:
+            self.stable_hook()
+
+    def __enter__(self) -> FakeStage0Bundle:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+
+@dataclass
 class Harness:
     staged_root: Path
     authority_path: Path
@@ -206,9 +263,26 @@ class OwnerHarness:
     request: dict[str, Any]
     host_manifest_path: Path
     publication_path: Path
+    stage0_bundle: FakeStage0Bundle
 
-    def apply(self) -> dict[str, Any]:
+    def apply(
+        self,
+        *,
+        stage0_verifier: Callable[..., Any] | None = None,
+    ) -> dict[str, Any]:
         item = self.harness
+        def valid_stage0(
+            *,
+            expected_predecessor_activation_receipt_sha256: str,
+        ) -> FakeStage0Bundle:
+            assert (
+                expected_predecessor_activation_receipt_sha256
+                == PREDECESSOR_RECEIPT
+            )
+            return self.stage0_bundle
+
+        selected_verifier = stage0_verifier or valid_stage0
+
         return successor._owner_apply(  # noqa: SLF001
             self.request,
             staged_root=item.staged_root,
@@ -218,12 +292,11 @@ class OwnerHarness:
             systemd_root=item.systemd_root,
             evidence_root=item.evidence_root,
             release_trust_root=item.releases,
-            host_artifact_manifest_path=self.host_manifest_path,
-            release_update_publication_path=self.publication_path,
             root_owned=False,
             host=item.host,
             require_root=False,
             activation_lock_factory=lambda: nullcontext(),
+            stage0_verifier=selected_verifier,
         )
 
 
@@ -286,6 +359,7 @@ def _build_owner_harness(
         ],
         predecessor_revision=PREDECESSOR,
         predecessor_sender_revision=PREDECESSOR_SENDER,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
         stage_c_host_artifact_manifest_sha256=host_manifest[
             "manifest_sha256"
         ],
@@ -301,6 +375,11 @@ def _build_owner_harness(
         request=request,
         host_manifest_path=host_manifest_path,
         publication_path=publication_path,
+        stage0_bundle=FakeStage0Bundle(
+            release_root=harness.releases / f"hermes-agent-{TARGET[:12]}",
+            host_manifest_sha256=host_manifest["manifest_sha256"],
+            publication_sha256=publication["publication_sha256"],
+        ),
     )
 
 
@@ -465,6 +544,121 @@ def test_foreign_predecessor_tamper_fails_before_any_mutation(
             host=harness.host,
         )
     assert harness.host.calls == []
+
+
+@pytest.mark.parametrize("artifact", ("authority", "preflight"))
+def test_rebind_rejects_0600_staged_inputs_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact: str,
+) -> None:
+    harness = _build_harness(tmp_path, monkeypatch)
+    path = (
+        harness.authority_path
+        if artifact == "authority"
+        else harness.preflight_path
+    )
+    path.chmod(0o600)
+
+    with pytest.raises(
+        (
+            successor.UpstreamSyncRailSuccessorRebindError,
+            activation.UpstreamSyncRailCutoverError,
+        )
+    ):
+        harness.rebind()
+
+    assert harness.host.calls == []
+
+
+def test_rebind_rejects_wrong_unit_mode_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path, monkeypatch)
+    (harness.systemd_root / rail.SYNC_SERVICE_UNIT).chmod(0o600)
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="unit_unavailable",
+    ):
+        harness.rebind()
+
+    assert harness.host.calls == []
+
+
+def test_rebind_detects_authority_inode_swap_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path, monkeypatch)
+    original_observe = harness.host.observe
+    swapped = False
+
+    def observe_with_swap(
+        unit: str,
+        *,
+        systemd_root: Path,
+    ) -> successor.UnitState:
+        nonlocal swapped
+        observed = original_observe(unit, systemd_root=systemd_root)
+        if not swapped:
+            replacement = harness.authority_path.with_name("replacement.json")
+            _write(
+                replacement,
+                harness.authority_path.read_bytes(),
+                mode=0o444,
+            )
+            replacement.replace(harness.authority_path)
+            swapped = True
+        return observed
+
+    monkeypatch.setattr(harness.host, "observe", observe_with_swap)
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage_identity_drifted",
+    ):
+        harness.rebind()
+
+    assert harness.host.calls == []
+
+
+def test_rebind_detects_target_unit_inode_swap_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _build_harness(tmp_path, monkeypatch)
+    original_observe = harness.host.observe
+    swapped = False
+
+    def observe_with_target_swap(
+        unit: str,
+        *,
+        systemd_root: Path,
+    ) -> successor.UnitState:
+        nonlocal swapped
+        observed = original_observe(unit, systemd_root=systemd_root)
+        target = harness.systemd_root / rail.SYNC_SERVICE_UNIT
+        if (
+            not swapped
+            and hashlib.sha256(target.read_bytes()).hexdigest()
+            == harness.authority["target_unit_digests"][rail.SYNC_SERVICE_UNIT]
+        ):
+            replacement = target.with_name("replacement.service")
+            _write(replacement, target.read_bytes(), mode=0o644)
+            replacement.replace(target)
+            swapped = True
+        return observed
+
+    monkeypatch.setattr(harness.host, "observe", observe_with_target_swap)
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="failed_rolled_back:upstream_sync_successor_unit_identity_drifted",
+    ):
+        harness.rebind()
+
+    for name, raw in harness.predecessor_units.items():
+        assert (harness.systemd_root / name).read_bytes() == raw
 
 
 @pytest.mark.parametrize(
@@ -713,7 +907,7 @@ def test_systemd_observer_normalizes_known_omitted_optional_properties(
         else (_ for _ in ()).throw(AssertionError(args)),
     )
 
-    observed = successor._SystemdHost().observe(  # noqa: SLF001
+    observed = successor._SystemdHost(root_owned=False).observe(  # noqa: SLF001
         unit,
         systemd_root=systemd_root,
     )
@@ -754,7 +948,33 @@ def test_systemd_observer_rejects_duplicate_property_output(
         successor.UpstreamSyncRailSuccessorRebindError,
         match="systemd_observation_invalid",
     ):
-        successor._SystemdHost().observe(  # noqa: SLF001
+        successor._SystemdHost(root_owned=False).observe(  # noqa: SLF001
+            unit,
+            systemd_root=systemd_root,
+        )
+
+
+def test_systemd_observer_rejects_non_0644_fragment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    systemd_root = tmp_path / "systemd"
+    unit = rail.SYNC_SERVICE_UNIT
+    _write(systemd_root / unit, b"[Service]\nType=oneshot\n", mode=0o600)
+    monkeypatch.setattr(
+        activation,
+        "_systemctl_property",
+        lambda _unit, name: {
+            "LoadState": b"loaded\n",
+            "FragmentPath": f"{systemd_root / unit}\n".encode(),
+        }.get(name, b"\n"),
+    )
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="systemd_fragment_invalid",
+    ):
+        successor._SystemdHost(root_owned=False).observe(  # noqa: SLF001
             unit,
             systemd_root=systemd_root,
         )
@@ -819,6 +1039,31 @@ def test_owner_path_recovers_crash_between_exact_authority_and_preflight_stage(
     assert owner.harness.preflight_path.exists()
 
 
+def test_owner_path_holds_stage0_bundle_through_staging_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+
+    def reject_after_complete_stage() -> None:
+        if (
+            owner.harness.authority_path.exists()
+            and owner.harness.preflight_path.exists()
+        ):
+            raise successor.release_stage0.ProductionReleaseUpdateStage0Error(
+                "release_update_stage0_release_drift"
+            )
+
+    owner.stage0_bundle.stable_hook = reject_after_complete_stage
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage0_invalid",
+    ):
+        owner.apply()
+
+    assert owner.harness.host.calls == []
+
+
 def test_owner_path_foreign_unit_drift_has_no_stage_or_runtime_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -841,27 +1086,32 @@ def test_owner_path_foreign_unit_drift_has_no_stage_or_runtime_mutation(
     assert owner.harness.host.calls == []
 
 
-@pytest.mark.parametrize("kind", ("symlink", "mode"))
-def test_owner_path_rejects_stage_c_public_file_identity_before_staging(
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "release_update_inputs_document_set_invalid",
+        "release_update_contract_signature_invalid",
+        "release_update_contract_approval_expired",
+    ),
+    ids=("truncated", "unsigned", "expired"),
+)
+def test_owner_path_rejects_noncanonical_stage0_before_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    kind: str,
+    failure: str,
 ) -> None:
     owner = _build_owner_harness(tmp_path, monkeypatch)
-    if kind == "symlink":
-        raw = owner.host_manifest_path.read_bytes()
-        foreign = owner.host_manifest_path.with_name("foreign-manifest.json")
-        _write(foreign, raw, mode=0o444)
-        owner.host_manifest_path.unlink()
-        owner.host_manifest_path.symlink_to(foreign)
-    else:
-        owner.host_manifest_path.chmod(0o600)
+
+    def rejected_stage0(**_kwargs: Any) -> Any:
+        raise successor.release_stage0.ProductionReleaseUpdateStage0Error(
+            failure
+        )
 
     with pytest.raises(
         successor.UpstreamSyncRailSuccessorRebindError,
-        match="stage_c_artifact_invalid",
+        match="stage0_invalid",
     ):
-        owner.apply()
+        owner.apply(stage0_verifier=rejected_stage0)
 
     assert not owner.harness.authority_path.exists()
     assert not owner.harness.preflight_path.exists()
@@ -980,6 +1230,7 @@ def test_owner_request_frame_and_transport_are_closed_to_manual_fields() -> None
         target_package_manifest_sha256="1" * 64,
         predecessor_revision=PREDECESSOR,
         predecessor_sender_revision=PREDECESSOR_SENDER,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
         stage_c_host_artifact_manifest_sha256="2" * 64,
         stage_c_release_update_publication_sha256="3" * 64,
         rebind_runtime_sha256="4" * 64,
