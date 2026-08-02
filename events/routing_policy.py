@@ -74,6 +74,7 @@ ALERTS = "watchdog_alerts"
 SECURITY = "security_and_system"
 JOBFLOW = "jobflow_firehose"
 DEVFLOW = "devflow_firehose"
+CRITIC = "critic"
 AGENTS_MEMORY = "agents_memory"
 DAILY_BRIEF = "scribe_daily"
 OPS_TRACE = "cron_firehose"
@@ -82,7 +83,8 @@ OPS_TRACE = "cron_firehose"
 # new code, or new config with old code — both directions stay routable).
 TOPIC_ALIASES: Dict[str, str] = {
     ACTION_REQUIRED: "jobflow_decisions",   # same thread 9637
-    AGENTS_MEMORY: "critic_proposals",      # same thread 9663
+    CRITIC: "critic_proposals",             # compatibility until topic creation
+    AGENTS_MEMORY: "critic_proposals",      # temporary legacy config fallback
     OPS_TRACE: ALERTS,                      # pre-2026-07-11 degrade, kept
 }
 
@@ -177,9 +179,10 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.WATCHDOG_SELF_DEGRADED: _Spec(Attention.WARN, ALERTS),  # hook: blackout → security
     _E.WATCHDOG_DAILY: _Spec(Attention.INFO, ALERTS),
     _E.BACKEND_CONTRACT_DRIFT: _Spec(Attention.WARN, SECURITY),
+    # ----- critic domain ---------------------------------------------
+    _E.CRITIC_PROPOSAL: _Spec(Attention.INFO, CRITIC),
+    _E.CRITIC_AUTO_APPLIED: _Spec(Attention.INFO, CRITIC),
     # ----- agents & memory domain ------------------------------------
-    _E.CRITIC_PROPOSAL: _Spec(Attention.INFO, AGENTS_MEMORY),
-    _E.CRITIC_AUTO_APPLIED: _Spec(Attention.INFO, AGENTS_MEMORY),
     _E.CURATOR_DAILY: _Spec(Attention.INFO, AGENTS_MEMORY),
     _E.MEMORY_CONSOLIDATED: _Spec(Attention.INFO, AGENTS_MEMORY),
     _E.SKILL_EVOLVED: _Spec(Attention.INFO, AGENTS_MEMORY),
@@ -202,7 +205,7 @@ AGENT_TOPIC_MAP: Dict[str, str] = {
     'sentinel': JOBFLOW, 'cv-handler': JOBFLOW, 'notifier': JOBFLOW,
     'main': JOBFLOW,
     'devflow': DEVFLOW, 'devflow-standup': DEVFLOW, 'devflow-bridge': DEVFLOW,
-    'critic': AGENTS_MEMORY, 'curator': AGENTS_MEMORY,
+    'critic': CRITIC, 'curator': AGENTS_MEMORY,
     'watchdog': ALERTS, 'scribe': DAILY_BRIEF,
 }
 
@@ -344,6 +347,14 @@ def structured_human_gate(payload: dict) -> bool:
     )
 
 
+def critic_decision_gate(event_type: EventType, payload: dict) -> bool:
+    """Return whether a Critic proposal explicitly requests a user decision."""
+    return (
+        event_type is EventType.CRITIC_PROPOSAL
+        and payload.get("decision_required") is True
+    )
+
+
 def classify(
     event: Event,
     known_topic_keys: Optional[Collection[str]] = None,
@@ -432,7 +443,7 @@ def classify(
     # failed: the outstanding approval/decision still belongs to Diego.
     # Structured gates are authoritative for wrappers. Otherwise a failed or
     # degraded INFO/TRACE wrapper promotes to WARN/Alerts.
-    if structured_human_gate(payload):
+    if structured_human_gate(payload) or critic_decision_gate(et, payload):
         attention = Attention.ACT
         topic_key = ACTION_REQUIRED
     elif (

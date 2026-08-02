@@ -13,6 +13,7 @@ from events.routing_policy import (
     AGENTS_MEMORY,
     ALERTS,
     Attention,
+    CRITIC,
     DAILY_BRIEF,
     DEVFLOW,
     JOBFLOW,
@@ -482,7 +483,7 @@ class TestCronActionableOutput:
 
 def test_agent_iteration_routes_per_agent():
     assert classify(make_event(
-        EventType.AGENT_ITERATION, {"agent": "critic"})).topic_key == AGENTS_MEMORY
+        EventType.AGENT_ITERATION, {"agent": "critic"})).topic_key == CRITIC
     assert classify(make_event(
         EventType.AGENT_ITERATION, {"agent": "devflow-bridge"})).topic_key == DEVFLOW
     assert classify(make_event(
@@ -511,8 +512,39 @@ def test_curator_daily_routes_to_agents_memory():
     assert classify(make_event(EventType.CURATOR_DAILY)).topic_key == AGENTS_MEMORY
 
 
-def test_critic_proposal_no_longer_pages():
-    assert classify(make_event(EventType.CRITIC_PROPOSAL)).wa_tier is None
+def test_critic_proposal_defaults_to_critic_topic_without_paging():
+    route = classify(make_event(
+        EventType.CRITIC_PROPOSAL, {"summary": "advisory"},
+    ))
+
+    assert route.topic_key == CRITIC
+    assert route.attention is Attention.INFO
+    assert route.wa_tier is None
+
+
+def test_critic_auto_applied_routes_to_critic_topic():
+    route = classify(make_event(EventType.CRITIC_AUTO_APPLIED))
+
+    assert route.topic_key == CRITIC
+    assert route.attention is Attention.INFO
+
+
+def test_critic_agent_iteration_routes_to_critic_topic():
+    route = classify(make_event(
+        EventType.AGENT_ITERATION, {"agent": "critic", "summary": "finding"},
+    ))
+
+    assert route.topic_key == CRITIC
+
+
+def test_decision_required_critic_routes_once_to_action_required():
+    route = classify(make_event(
+        EventType.CRITIC_PROPOSAL, {"decision_required": True},
+    ))
+
+    assert route.topic_key == ACTION_REQUIRED
+    assert route.attention is Attention.ACT
+    assert route.batch is False
 
 
 def test_build_failed_pages_urgent_from_alerts():
@@ -533,6 +565,12 @@ OLD_TOPICS = {
     "critic_proposals": {"thread_id": 9663},
     "watchdog_alerts": {"thread_id": 9654},
 }
+
+
+def test_critic_alias_resolves_to_existing_pre_topic_thread():
+    assert resolve_topic_thread(OLD_TOPICS, CRITIC) == (
+        "critic_proposals", "9663",
+    )
 
 
 def test_resolve_direct():

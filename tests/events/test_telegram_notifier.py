@@ -92,7 +92,7 @@ class TestAgentIterationRouting:
             target = notifier.resolve_target(self._make_event(agent))
             assert target[2] == "101", f"{agent} expected jobflow_firehose(101), got {target[2]}"
 
-    def test_critic_routes_to_critic_proposals(
+    def test_critic_routes_to_critic_proposals_compatibility_alias(
         self, bus, topics_config, verbosity_config,
     ):
         notifier = TelegramNotifier(
@@ -100,6 +100,22 @@ class TestAgentIterationRouting:
         )
         target = notifier.resolve_target(self._make_event("critic"))
         assert target[2] == "108"
+
+    def test_decision_required_critic_has_one_action_required_target(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.CRITIC_PROPOSAL,
+            "critic.proposal_bridge",
+            {"summary": "Choose a fix", "decision_required": True},
+        )
+
+        targets = notifier.resolve_all_targets(event)
+
+        assert targets == [("telegram", "-1001234567890", "102")]
 
     def test_curator_routes_to_agents_memory(
         self, bus, topics_config, verbosity_config,

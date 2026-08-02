@@ -1066,6 +1066,7 @@ def emit_proposals_node(state: CriticState) -> dict:
                 "cluster_pattern_name": p.get("cluster_pattern_name"),
                 "v1_note": p.get("_v1_note"),
                 "replay": replay,
+                "decision_required": True,
             }
             msg = {
                 "type": "CRITIC_PROPOSAL",
