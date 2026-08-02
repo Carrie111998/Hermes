@@ -1043,4 +1043,8 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        # Shape-based regex first (vendor prefixes, headers, URLs), then the
+        # exact-value pass so opaque credential values with no recognizable
+        # prefix (e.g. MY_SERVICE_TOKEN=abc123randomstring, BWS_ACCESS_TOKEN)
+        # are masked from log output too.
+        return mask_known_secret_values(redact_sensitive_text(original))
