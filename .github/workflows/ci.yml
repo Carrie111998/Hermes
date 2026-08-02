@@ -34,7 +34,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: ubuntu-latest
+    runs-on: arc-amd64
     timeout-minutes: 10
     outputs:
       python: ${{ steps.classify.outputs.python }}
@@ -188,7 +188,7 @@ jobs:
     name: CI review comment (live)
     needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
-    runs-on: ubuntu-latest
+    runs-on: arc-amd64
     timeout-minutes: 40
     steps:
       - name: Checkout code
@@ -278,7 +278,7 @@ jobs:
       # we don't require docker to pass rn because it's so slow lol
       # - docker
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: arc-amd64
     timeout-minutes: 10
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
@@ -320,7 +320,7 @@ jobs:
     name: CI timing report
     needs: [all-checks-pass, docker]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: arc-amd64
     timeout-minutes: 10
     steps:
       - name: Checkout code
