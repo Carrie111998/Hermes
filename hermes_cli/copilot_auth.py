@@ -72,14 +72,22 @@ def validate_copilot_token(token: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def resolve_copilot_token() -> tuple[str, str]:
+def resolve_copilot_token(
+    *,
+    env_vars: tuple[str, ...] | None = None,
+    allow_gh_cli: bool = True,
+) -> tuple[str, str]:
     """Resolve a GitHub token suitable for Copilot API use.
 
     Returns (token, source) where source describes where the token came from.
+    By default this follows Copilot CLI compatibility order. Callers that are
+    enforcing a profile-pinned credential may pass ``env_vars`` and disable the
+    ``gh auth token`` fallback so generic GitHub credentials cannot be borrowed
+    silently.
     Raises ValueError if only a classic PAT is available.
     """
     # 1. Check env vars in priority order
-    for env_var in COPILOT_ENV_VARS:
+    for env_var in env_vars if env_vars is not None else COPILOT_ENV_VARS:
         val = os.getenv(env_var, "").strip()
         if val:
             valid, msg = validate_copilot_token(val)
@@ -89,6 +97,9 @@ def resolve_copilot_token() -> tuple[str, str]:
                 )
                 continue
             return val, env_var
+
+    if not allow_gh_cli:
+        return "", ""
 
     # 2. Fall back to gh auth token
     token = _try_gh_cli_token()
