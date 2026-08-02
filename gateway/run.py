@@ -2281,6 +2281,27 @@ _OWN_POLICY_OPEN_ENV = {
 }
 
 
+def _startup_guard_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Scope-aware env read for the own-policy startup guard.
+
+    The guard runs both unscoped (default profile, at gateway startup) and
+    inside ``_profile_runtime_scope`` (secondary profiles, see
+    ``_start_one_profile_adapters``). A bare ``get_secret`` would raise
+    ``UnscopedSecretError`` for the default profile's own check; catch it and
+    fall back to ``os.environ`` -- the same fallback the platform adapters
+    themselves use (e.g. ``whatsapp_common._get_wsecret``) -- so the guard and
+    the adapter it is guarding always resolve the same effective policy value
+    instead of computing it twice from different sources (#76574).
+    """
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        val = get_secret(name, default)
+    except UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
     for platform, platform_config in getattr(config, "platforms", {}).items():
@@ -2293,20 +2314,20 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (os.getenv(dm_env, "pairing") if dm_env else "pairing")
+            or (_startup_guard_secret(dm_env, "pairing") if dm_env else "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (os.getenv(group_env, "pairing") if group_env else "pairing")
+            or (_startup_guard_secret(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
+        gateway_allow_all = (_startup_guard_secret(
             "GATEWAY_ALLOW_ALL_USERS", ""
-        ).lower() in {"true", "1", "yes"}
+        ) or "").lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and os.getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and (_startup_guard_secret(allow_all_env, "") or "").lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue

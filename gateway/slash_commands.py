@@ -4963,6 +4963,25 @@ class GatewaySlashCommandsMixin:
         return t("gateway.usage.no_data")
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
+        """Profile-scoping wrapper around /insights.
+
+        Mirrors ``_handle_compress_command``: slash-command dispatch does not
+        install the per-profile secret/home scope on its own, so under
+        multiplexing the unwrapped handler opened the default profile's
+        ``state.db`` (via ``get_hermes_home()``) regardless of which profile
+        the /insights turn actually belonged to (#76574). Single-profile
+        gateways skip this -- zero behavior change.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._handle_insights_command_inner(event)
+
+        from gateway.run import _profile_runtime_scope
+
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_insights_command_inner(event)
+
+    async def _handle_insights_command_inner(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
         args = event.get_command_args().strip()
 
@@ -4996,17 +5015,16 @@ class GatewaySlashCommandsMixin:
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
 
-            loop = asyncio.get_running_loop()
-
             def _run_insights():
                 db = SessionDB()
-                engine = InsightsEngine(db)
-                report = engine.generate(days=days, source=source)
-                result = engine.format_gateway(report)
-                db.close()
-                return result
+                try:
+                    engine = InsightsEngine(db)
+                    report = engine.generate(days=days, source=source)
+                    return engine.format_gateway(report)
+                finally:
+                    db.close()
 
-            return await loop.run_in_executor(None, _run_insights)
+            return await self._run_in_executor_with_context(_run_insights)
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return t("gateway.insights.error", error=e)
