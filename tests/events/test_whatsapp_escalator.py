@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from events.bus import EventBus
+from events.routing_policy import classify
 from events.schema import Event, EventType, Priority
 from events.subscribers.whatsapp_escalator import (
     WhatsAppEscalator,
@@ -264,6 +265,63 @@ class TestQuietHours:
 
 
 class TestMessageFormat:
+    def test_handle_uses_one_computed_route_for_tier_and_verdict(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        event = Event.create(
+            EventType.INTERVIEW_SIGNAL,
+            "tracker",
+            {"company": "Acme"},
+        )
+
+        with patch.object(
+            escalator, "_is_quiet_hours", return_value=False,
+        ), patch.object(
+            escalator, "_deliver", return_value=True,
+        ), patch(
+            "events.subscribers.whatsapp_escalator.policy_classify",
+            wraps=classify,
+        ) as classify_route, patch.object(
+            escalator, "format_message", return_value="rendered",
+        ) as render:
+            escalator.handle(event)
+
+        assert classify_route.call_count == 1
+        route = render.call_args.kwargs["route"]
+        assert route.verdict == classify(event).verdict
+        assert route.wa_tier == "immediate"
+
+    def test_uses_one_computed_route_for_verdict_and_tier(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        event = Event.create(
+            EventType.AGENT_ITERATION,
+            "postgres-sync",
+            {"reason": "success", "counters": {"exit_code": 1}},
+            priority=Priority.CRITICAL,
+        )
+
+        with patch(
+            "events.subscribers.whatsapp_escalator.policy_classify",
+            wraps=classify,
+        ) as classify_route:
+            with patch(
+                "events.formatting.format_whatsapp_message",
+                return_value="rendered",
+            ) as render:
+                msg = escalator.format_message(event)
+
+        assert msg == "rendered\n\nDetails in Telegram"
+        assert classify_route.call_count == 1
+        expected_route = classify(event)
+        assert render.call_args.kwargs["verdict"] == expected_route.verdict
+
     def test_plain_text_no_markdown(self, bus, quiet_config, queue_path):
         escalator = WhatsAppEscalator(bus, quiet_config_path=quiet_config, queue_path=queue_path)
         event = Event.create(

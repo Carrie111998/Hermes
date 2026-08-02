@@ -4,6 +4,7 @@ Filters events by escalation criteria, respects quiet hours (11pm-7am ET),
 and queues non-breakthrough events for morning flush.
 """
 
+import dataclasses
 import json
 import logging
 import os
@@ -273,12 +274,15 @@ class WhatsAppEscalator(BaseSubscriber):
     def handle(self, event: Event) -> None:
         # Cycle prevention (2026-04-30): this subscriber EMITS delivery
         # events from _deliver(); consuming them would recurse. Belt-
-        # and-braces over the should_escalate() filter (which today
-        # returns False for these types via classify_tier=None).
+        # and-braces over the routing policy's current DROP behavior.
         if event.event_type in _NEVER_CONSUME:
             return
 
-        if not self.should_escalate(event):
+        route = policy_classify(event)
+        if event.event_type == EventType.AGENT_ERROR:
+            if not self._agent_error_cluster_triggered():
+                return
+        elif route.wa_tier is None:
             return
 
         # Reset daily counter at midnight
@@ -287,17 +291,17 @@ class WhatsAppEscalator(BaseSubscriber):
             self._daily_send_count = 0
             self._daily_reset_date = today
 
-        message = self.format_message(event)
+        message = self.format_message(event, route=route)
 
         # v3 P4 on the phone lane: a repeating identical escalation
         # (normalized — digits ignored) within 30 min is one page, not N.
         # IMMEDIATE tier is exempt (interview/offer/secret/credential).
-        tier = classify_tier(event)
+        tier = _TIER_BY_LABEL.get(route.wa_tier)
         if (tier != EscalationTier.IMMEDIATE
                 and self._wa_repeat_guard.is_repeat("wa", message)):
             return
 
-        if not self.should_deliver_now(event):
+        if self._is_quiet_hours() and tier != EscalationTier.IMMEDIATE:
             self._queue_message(message)
             return
 
@@ -309,7 +313,7 @@ class WhatsAppEscalator(BaseSubscriber):
         # spec §"Where to emit"). Failure paths in throttle/queue flushes
         # still log via the existing logger.warning; their reverse-signal
         # coverage is a Phase 2 follow-up.
-        if classify_tier(event) == EscalationTier.IMMEDIATE:
+        if tier == EscalationTier.IMMEDIATE:
             if not self._deliver(message, event=event):
                 # 2026-07-11: a failed breakthrough send (e.g. WhatsApp
                 # bridge 503 mid-reconnect) used to be dropped on the
@@ -334,8 +338,12 @@ class WhatsAppEscalator(BaseSubscriber):
         if now - self._throttle_start >= self.THROTTLE_WINDOW_SECONDS:
             self._flush_throttle_buffer()
 
-    def format_message(self, event: Event) -> str:
+    def format_message(self, event: Event, route=None) -> str:
         """Format event as plain-text WhatsApp message.
+
+        ``route`` is optional for direct/test callers. Delivery passes its
+        already-computed route so routing, escalation, and presentation share
+        exactly one outcome verdict.
 
         Every escalated type gets a complete plain-English sentence. The
         pre-2026-07-11 fallback (`json.dumps(payload)[:200]`) shipped
@@ -351,6 +359,11 @@ class WhatsAppEscalator(BaseSubscriber):
             silence_alert_body,
             watchdog_burst_body,
         )
+
+        if route is None:
+            route = policy_classify(event)
+        if route.priority is not event.priority:
+            event = dataclasses.replace(event, priority=route.priority)
 
         p = event.payload
         et = event.event_type
@@ -456,7 +469,9 @@ class WhatsAppEscalator(BaseSubscriber):
                 else f"{et.type_string} event — details in Telegram"
             )
 
-        formatted = format_whatsapp_message(event, text.strip())
+        formatted = format_whatsapp_message(
+            event, text.strip(), verdict=route.verdict,
+        )
         return f"{formatted}\n\nDetails in Telegram"
 
     def _flush_throttle_buffer(self) -> None:

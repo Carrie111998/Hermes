@@ -1,4 +1,7 @@
 """Tests for events.formatting emoji + header helpers."""
+
+import pytest
+
 from events.formatting import (
     PRIORITY_EMOJI, EVENT_TYPE_EMOJI, MAILBOX_INNER_EMOJI,
     SEPARATOR,
@@ -6,6 +9,7 @@ from events.formatting import (
     format_header, format_event_message, format_whatsapp_message,
     format_whatsapp_header,
 )
+from events.routing_policy import classify
 from events.schema import Event, EventType, Priority
 
 
@@ -83,6 +87,46 @@ def test_format_whatsapp_header_gateway_health_up_is_green():
     e = _make_event(EventType.GATEWAY_HEALTH, source="system",
                     payload={"platform": "whatsapp", "status": "up", "detail": ""})
     assert format_whatsapp_header(e) == "🟢 🛰️ GATEWAY HEALTH — system · 05:02 UTC"
+
+
+@pytest.mark.parametrize(
+    ("payload", "priority", "expected"),
+    [
+        ({"counters": {"exit_code": 1}, "reason": "success"}, Priority.LOW,
+         "🟠 FAILED "),
+        ({"exit_code": 1}, Priority.CRITICAL, "🔴 FAILED "),
+        ({"status": "partial"}, Priority.LOW, "🟠 DEGRADED "),
+        ({"status": "pending"}, Priority.HIGH, "🟡 PENDING "),
+        ({"reason": "success"}, Priority.NORMAL, "🟢 SUCCEEDED "),
+        ({"status": "healthy", "before": "down"}, Priority.HIGH,
+         "🟢 RECOVERED "),
+        ({"summary": "tick"}, Priority.LOW, "🟡 UNKNOWN "),
+    ],
+)
+def test_verdict_header_has_consistent_marker_and_text_label(
+    payload, priority, expected,
+):
+    e = _make_event(
+        EventType.AGENT_ITERATION,
+        priority=priority,
+        payload=payload,
+    )
+    route = classify(e)
+
+    assert format_header(e, verdict=route.verdict).startswith(expected)
+    assert format_whatsapp_header(e, verdict=route.verdict).startswith(expected)
+
+
+def test_failure_evidence_blocks_recovery_green():
+    e = _make_event(
+        EventType.GATEWAY_HEALTH,
+        priority=Priority.HIGH,
+        payload={"status": "up", "before": "down", "exit_code": 1},
+    )
+    route = classify(e)
+
+    assert format_header(e, route.verdict).startswith("🟠 FAILED ")
+    assert format_whatsapp_header(e, route.verdict).startswith("🟠 FAILED ")
 
 
 class TestRecoveryHeaderDots:

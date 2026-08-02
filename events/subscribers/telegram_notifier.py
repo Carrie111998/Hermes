@@ -442,7 +442,7 @@ class TelegramNotifier(BaseSubscriber):
         if route.priority is not event.priority:
             event = dataclasses.replace(event, priority=route.priority)
         body = self._format_payload(event)
-        return format_event_message(event, body)
+        return format_event_message(event, body, verdict=route.verdict)
 
     def _format_payload(self, event: Event) -> str:
         """Format event payload into readable text."""

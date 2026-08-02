@@ -10,6 +10,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
+from events.outcomes import OutcomeVerdict, marker_for_verdict
 from events.schema import Event, EventType, Priority
 
 # Priority -> colored dot (matches severity)
@@ -188,9 +189,15 @@ _RECOVERY_WHEN = {
 }
 
 
-def header_dot(event: Event) -> str:
-    """Header status dot, overriding the priority color where an event
-    semantically reads as a recovery rather than a problem.
+def header_dot(event: Event, verdict: OutcomeVerdict | None = None) -> str:
+    """Return a verdict-backed marker, with a legacy priority fallback.
+
+    When delivery already classified the event, the immutable verdict is the
+    presentation authority.  Callers outside the notification path may omit it
+    and retain the historical recovery overrides below.
+
+    Legacy behavior overrides the priority color where an event semantically
+    reads as a recovery rather than a problem.
 
     GATEWAY_HEALTH carries a fixed HIGH priority (so a real outage escalates),
     which means a 'down' AND a 'back-up' both inherited the amber 🟠 dot. An
@@ -206,6 +213,8 @@ def header_dot(event: Event) -> str:
     as the original: PRESENTATIONAL ONLY, priority/routing/escalation
     untouched.
     """
+    if verdict is not None:
+        return marker_for_verdict(verdict, event.priority)
     if event.event_type in _ALWAYS_RECOVERY_TYPES:
         return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
     when = _RECOVERY_WHEN.get(event.event_type)
@@ -236,13 +245,18 @@ def _short_time(iso_ts: str) -> str:
         return iso_ts
 
 
-def format_header(event: Event) -> str:
-    """Top-line header: '🟠 ⚠️ AGENT_ERROR — source · 05:02 UTC'.
+def format_header(
+    event: Event,
+    verdict: OutcomeVerdict | None = None,
+) -> str:
+    """Top-line header with an optional normalized textual outcome.
 
     For mailbox_message events, surfaces the inner message_type and includes
-    sender -> recipient: '🟡 📊 SCORE_RESULT — matcher → main · 14:37 UTC'.
+    sender -> recipient: '🟡 UNKNOWN 📊 SCORE_RESULT — matcher → main · 14:37 UTC'.
+    Legacy callers that omit ``verdict`` retain the historical unlabeled header.
     """
-    dot = header_dot(event)
+    dot = header_dot(event, verdict)
+    label = f" {verdict.state.value.upper()}" if verdict is not None else ""
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
 
@@ -251,14 +265,21 @@ def format_header(event: Event) -> str:
         inner_type = p.get("message_type", "MAILBOX_MESSAGE")
         sender = p.get("from", "?")
         recipient = p.get("to", "?")
-        return f"{dot} {icon} {inner_type} — {sender} → {recipient} · {ts}"
+        return f"{dot}{label} {icon} {inner_type} — {sender} → {recipient} · {ts}"
 
-    return f"{dot} {icon} {event.event_type.type_string.upper()} — {event.source} · {ts}"
+    return (
+        f"{dot}{label} {icon} {event.event_type.type_string.upper()} — "
+        f"{event.source} · {ts}"
+    )
 
 
-def format_event_message(event: Event, body: str) -> str:
+def format_event_message(
+    event: Event,
+    body: str,
+    verdict: OutcomeVerdict | None = None,
+) -> str:
     """Full formatted message for Telegram: header + separator + body."""
-    header = format_header(event)
+    header = format_header(event, verdict)
     if body:
         return f"{header}\n{SEPARATOR}\n{body}"
     return header
@@ -295,24 +316,32 @@ WHATSAPP_TITLE_BY_EVENT = {
 }
 
 
-def format_whatsapp_header(event: Event) -> str:
+def format_whatsapp_header(
+    event: Event,
+    verdict: OutcomeVerdict | None = None,
+) -> str:
     """WhatsApp header: like format_header but with a plain-language title."""
     title = WHATSAPP_TITLE_BY_EVENT.get(event.event_type)
     if title is None or event.event_type == EventType.MAILBOX_MESSAGE:
-        return format_header(event)
-    dot = header_dot(event)
+        return format_header(event, verdict)
+    dot = header_dot(event, verdict)
+    label = f" {verdict.state.value.upper()}" if verdict is not None else ""
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
-    return f"{dot} {icon} {title} — {event.source} · {ts}"
+    return f"{dot}{label} {icon} {title} — {event.source} · {ts}"
 
 
-def format_whatsapp_message(event: Event, body: str) -> str:
+def format_whatsapp_message(
+    event: Event,
+    body: str,
+    verdict: OutcomeVerdict | None = None,
+) -> str:
     """Compact formatted message for WhatsApp: header + body, no separator.
 
     WhatsApp is a scanning medium; body should already be concise. Caller
     decides whether to append 'Details in Telegram.'
     """
-    header = format_whatsapp_header(event)
+    header = format_whatsapp_header(event, verdict)
     if body:
         return f"{header}\n{body}"
     return header

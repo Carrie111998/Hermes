@@ -361,6 +361,27 @@ class TestTelegramNotifier:
         assert "job_discovered" in msg.lower() or "JOB_DISCOVERED" in msg
         assert "scout" in msg.lower()
 
+    def test_format_message_uses_supplied_route_verdict(self, bus, topics_config,
+                                                        verbosity_config):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.AGENT_ITERATION,
+            "postgres-sync",
+            {"reason": "success", "counters": {"exit_code": 1}},
+            priority=Priority.LOW,
+        )
+        route = classify(event, known_topic_keys=notifier.topics.keys())
+
+        with patch(
+            "events.formatting.format_event_message", return_value="rendered",
+        ) as render:
+            msg = notifier.format_message(event, route=route)
+
+        assert msg == "rendered"
+        assert render.call_args.kwargs["verdict"] is route.verdict
+
     def test_formats_resource_pressure_readably(
         self, bus, topics_config, verbosity_config,
     ):
