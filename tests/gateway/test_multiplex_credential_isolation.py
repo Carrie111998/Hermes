@@ -166,3 +166,27 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert "EXPLICIT_API_KEY" not in os.environ
 
 
+def test_homeassistant_explicit_disable_in_multiplex_config(monkeypatch, tmp_path):
+    """Secondary profiles with platforms.homeassistant.enabled: false must remain
+    disabled even when HASS_TOKEN is present in os.environ."""
+    import yaml
+    from gateway.config import load_gateway_config, Platform
+    from gateway.run import _profile_runtime_scope
+
+    monkeypatch.setenv("HASS_TOKEN", "mock_token")
+    monkeypatch.setenv("HASS_URL", "http://ha.local:8123")
+
+    p = tmp_path / "secondary_profile"
+    p.mkdir()
+    cfg_file = p / "config.yaml"
+    cfg_file.write_text(
+        yaml.dump({"platforms": {"homeassistant": {"enabled": False}}})
+    )
+
+    with _profile_runtime_scope(p):
+        cfg = load_gateway_config()
+        ha_cfg = cfg.platforms.get(Platform.HOMEASSISTANT)
+        assert ha_cfg is not None
+        assert ha_cfg.enabled is False
+
+
