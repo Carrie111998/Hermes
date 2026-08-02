@@ -190,9 +190,14 @@ class OSSBackend(Mem0Backend):
             model = embedder_config.get("model", "")
             dims = KNOWN_DIMS.get(model)
         if dims:
-            vs_config["embedding_model_dims"] = dims
+            # Only set embedding_model_dims for providers that accept it
+            # (qdrant).  Chroma's pydantic schema in mem0ai 2.0+ rejects
+            # extra fields, so adding it there causes a ValidationError.
+            provider = vector_store.get("provider", "qdrant")
+            if provider != "chroma":
+                vs_config["embedding_model_dims"] = dims
             self._recreate_collection_if_dims_changed(
-                vector_store.get("provider", "qdrant"), vs_config, dims,
+                provider, vs_config, dims,
             )
 
         vector_store["config"] = vs_config
