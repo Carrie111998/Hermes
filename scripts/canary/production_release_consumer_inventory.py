@@ -24,15 +24,16 @@ from gateway.isolated_worker_units import (
     ISOLATED_WORKER_SOCKET_UNIT,
 )
 from ops.muncho.runtime import trusted_cron_collector_rail as cron_rail
+from ops.muncho.runtime import upstream_sync_job_rail as dual_sync_rail
 from scripts.canary import package_production_cutover_artifacts as host_package
 
 
-EXPECTED_UNIT_COUNT = 75
-EXPECTED_EXECUTION_SERVICE_COUNT = 47
-EXPECTED_TRIGGER_UNIT_COUNT = 28
+EXPECTED_UNIT_COUNT = 79
+EXPECTED_EXECUTION_SERVICE_COUNT = 49
+EXPECTED_TRIGGER_UNIT_COUNT = 30
 EXPECTED_LONG_RUNNING_SERVICE_COUNT = 18
 EXPECTED_STARTUP_ONESHOT_SERVICE_COUNT = 1
-EXPECTED_TRIGGERED_ONESHOT_SERVICE_COUNT = 28
+EXPECTED_TRIGGERED_ONESHOT_SERVICE_COUNT = 30
 EXPECTED_ONESHOT_SERVICE_COUNT = (
     EXPECTED_STARTUP_ONESHOT_SERVICE_COUNT + EXPECTED_TRIGGERED_ONESHOT_SERVICE_COUNT
 )
@@ -222,6 +223,10 @@ def _unit_kind(name: str) -> str:
 
 
 def _host_consumer_specs() -> dict[str, ConsumerSpec]:
+    dual_sync_services = {
+        dual_sync_rail.SYNC_SERVICE_UNIT,
+        dual_sync_rail.REPORT_SERVICE_UNIT,
+    }
     unit_targets: dict[str, tuple[str, str]] = {}
     for artifact_name, (
         target,
@@ -239,6 +244,8 @@ def _host_consumer_specs() -> dict[str, ConsumerSpec]:
         activation_class = (
             ACTIVATION_CLASS_STARTUP_ONESHOT
             if artifact_name == "phase_b_unit"
+            else ACTIVATION_CLASS_TRIGGERED_ONESHOT
+            if path.name in dual_sync_services
             else ACTIVATION_CLASS_LONG_RUNNING
             if path.suffix == ".service"
             else ""
@@ -266,6 +273,14 @@ def _host_consumer_specs() -> dict[str, ConsumerSpec]:
             triggers = (ISOLATED_WORKER_SERVICE_UNIT,)
         elif name == ISOLATED_WORKER_SERVICE_UNIT:
             triggered_by = (ISOLATED_WORKER_SOCKET_UNIT,)
+        elif name == dual_sync_rail.SYNC_TIMER_UNIT:
+            triggers = (dual_sync_rail.SYNC_SERVICE_UNIT,)
+        elif name == dual_sync_rail.SYNC_SERVICE_UNIT:
+            triggered_by = (dual_sync_rail.SYNC_TIMER_UNIT,)
+        elif name == dual_sync_rail.REPORT_TIMER_UNIT:
+            triggers = (dual_sync_rail.REPORT_SERVICE_UNIT,)
+        elif name == dual_sync_rail.REPORT_SERVICE_UNIT:
+            triggered_by = (dual_sync_rail.REPORT_TIMER_UNIT,)
         result[name] = ConsumerSpec(
             name=name,
             source="host",
@@ -362,7 +377,7 @@ def _cron_consumer_specs() -> dict[str, ConsumerSpec]:
 
 @lru_cache(maxsize=1)
 def expected_consumer_catalog() -> Mapping[str, ConsumerSpec]:
-    """Return the exact immutable 63-unit production consumer catalog."""
+    """Return the exact immutable production consumer catalog."""
 
     combined: dict[str, ConsumerSpec] = {}
     for partition in (

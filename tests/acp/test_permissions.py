@@ -129,6 +129,25 @@ class TestApprovalBridge:
             "allow_once", "allow_session", "deny", "deny_always",
         ]
 
+    def test_exact_callback_binds_opaque_id_and_offers_only_once_or_deny(self):
+        approval_id = "b" * 32
+        result, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            allow_permanent=False,
+            legacy_callback_kwargs={
+                "allow_session": False,
+                "approval_id": approval_id,
+                "exact_execution": True,
+            },
+        )
+
+        assert result == "once"
+        assert [option.option_id for option in kwargs["options"]] == [
+            "allow_once", "deny",
+        ]
+        assert kwargs["tool_call"].raw_input["approval_id"] == approval_id
+        assert kwargs["tool_call"].raw_input["exact_execution"] is True
+
     def test_reject_always_outcome_denies_without_changing_policy(self):
         result, kwargs, _, _, _ = _invoke_callback(
             AllowedOutcome(option_id="deny_always", outcome="selected"),

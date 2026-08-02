@@ -224,6 +224,22 @@ HOST_ARTIFACT_TARGETS: Mapping[str, tuple[str, str]] = {
         str(ISOLATED_WORKER_CONFIG),
         "release_sealed_payload",
     ),
+    "dual_upstream_sync_service_unit": (
+        "/etc/systemd/system/muncho-dual-upstream-sync.service",
+        "owner_runtime_rendered",
+    ),
+    "dual_upstream_sync_timer_unit": (
+        "/etc/systemd/system/muncho-dual-upstream-sync.timer",
+        "owner_runtime_rendered",
+    ),
+    "dual_upstream_sync_report_service_unit": (
+        "/etc/systemd/system/muncho-dual-upstream-sync-report.service",
+        "owner_runtime_rendered",
+    ),
+    "dual_upstream_sync_report_timer_unit": (
+        "/etc/systemd/system/muncho-dual-upstream-sync-report.timer",
+        "owner_runtime_rendered",
+    ),
     "gateway_connector_drop_in": (
         "/etc/systemd/system/hermes-cloud-gateway.service.d/"
         "20-discord-connector.conf",

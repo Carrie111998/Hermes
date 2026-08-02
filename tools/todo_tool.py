@@ -1220,6 +1220,9 @@ def todo_tool(
                 plan_id=plan_approval.get("plan_id", ""),
                 plan_revision=plan_approval.get("plan_revision"),
                 exact_commands=plan_approval.get("exact_commands") or [],
+                exact_code_scripts=(
+                    plan_approval.get("exact_code_scripts") or []
+                ),
                 approved_by_user_id=user_id,
                 ttl_seconds=plan_approval.get("ttl_seconds", 3600),
                 max_uses_per_command=plan_approval.get("max_uses_per_command", 3),
@@ -1716,8 +1719,9 @@ TODO_SCHEMA = {
                 "description": (
                     "Use only after the authenticated owner explicitly approves this plan. "
                     "Hermes decides approval meaning and authors the lease bounds; runtime grants "
-                    "only exact expiring commands. One grant remains valid across monotonic progress "
-                    "revisions of the same active plan, but never authorizes a newly added command."
+                    "only exact expiring terminal or execute_code subjects. One grant remains valid "
+                    "across monotonic progress revisions of the same active plan, but never "
+                    "authorizes a newly added execution subject."
                 ),
                 "properties": {
                     "plan_id": {"type": "string"},
@@ -1728,7 +1732,28 @@ TODO_SCHEMA = {
                             "Exact active Canonical Task Workspace revision approved by the owner."
                         ),
                     },
-                    "exact_commands": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
+                    "exact_commands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 0,
+                        "maxItems": 64,
+                        "description": (
+                            "Exact terminal input bytes authorized by this plan. The "
+                            "runtime also binds tool kind and the current backend/resource."
+                        ),
+                    },
+                    "exact_code_scripts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 0,
+                        "maxItems": 64,
+                        "description": (
+                            "Exact Python source strings authorized for execute_code. "
+                            "The runtime binds raw bytes, tool kind, and the current "
+                            "backend/resource without interpreting content. At least one item total "
+                            "is required across exact_commands and exact_code_scripts."
+                        ),
+                    },
                     "ttl_seconds": {
                         "type": "integer",
                         "minimum": 60,

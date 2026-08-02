@@ -67,10 +67,11 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   }
 }
 
-// Approval is session-keyed on the backend (one in-flight approval per session,
-// resolved via approval.respond {choice, session_id}). It carries no request_id,
-// unlike sudo/secret which are _block()-style request/response.
+// Legacy approval is session-keyed; exact execution also carries an opaque
+// approvalId and resolves via approval.respond {approval_id, choice, session_id}.
+// This is distinct from sudo/secret's _block()-style requestId.
 export interface ApprovalRequest extends KeyedPrompt {
+  approvalId?: string
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]

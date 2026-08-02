@@ -208,7 +208,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     """Produce the scrubbed child-process env for execute_code.
 
     Rules (order matters):
-      1. Passthrough vars (skill- or config-declared) always pass.
+      1. Passthrough vars (skill- or config-declared) pass through the active
+         profile secret scope; an absent scoped value is omitted and an
+         unscoped multiplex read fails closed.
       2. Secret-substring names (KEY/TOKEN/DSN/WEBHOOK/etc.) are blocked.
       3. Names matching a safe prefix pass.
       4. Operational HERMES_* vars (_HERMES_CHILD_ALLOWED) pass by exact name.
@@ -219,12 +221,22 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     Extracted into a helper so tests can exercise the logic without
     spawning a subprocess.
     """
+    resolve_passthrough_value = None
     if is_passthrough is None:
         try:
-            from tools.env_passthrough import is_env_passthrough as _ep
+            from tools.env_passthrough import (
+                is_env_passthrough as _ep,
+                resolve_passthrough_value,
+            )
         except Exception:
             _ep = lambda _: False  # noqa: E731
+            resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
         is_passthrough = _ep
+    else:
+        try:
+            from tools.env_passthrough import resolve_passthrough_value
+        except Exception:
+            resolve_passthrough_value = lambda _name, _fallback: None  # noqa: E731
     if is_windows is None:
         is_windows = _IS_WINDOWS
 
@@ -239,7 +251,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     _dropped_hermes = []
     for k, v in source_env.items():
         if is_passthrough(k):
-            scrubbed[k] = v
+            resolved = resolve_passthrough_value(k, v)
+            if resolved is not None:
+                scrubbed[k] = resolved
             continue
         if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
             continue
@@ -1029,10 +1043,8 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
+    session_tools = set(enabled_tools) if enabled_tools is not None else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1236,7 +1248,11 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import (
+        _docker_has_host_access,
+        _get_approval_callback,
+        _get_env_config,
+    )
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
 
@@ -1246,10 +1262,13 @@ def execute_code(
     # caller (tool-executor) thread, which holds the session context (#30882).
     # A Docker sandbox with host bind mounts is no longer isolated, so its
     # script does not get the container fast-path.
-    from tools.approval import check_execute_code_guard
+    from tools.approval import check_execute_code_guard, get_current_session_key
     _guard = check_execute_code_guard(
         code, env_type,
         has_host_access=_docker_has_host_access(_env_config),
+        env_config=_env_config,
+        session_key=get_current_session_key(default="") or (task_id or ""),
+        approval_callback=_get_approval_callback(),
     )
     if not _guard.get("approved", False):
         return json.dumps({
@@ -1283,11 +1302,8 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
+    session_tools = set(enabled_tools) if enabled_tools is not None else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1326,8 +1342,8 @@ def execute_code(
         # those bytes; the child then fails to import with a SyntaxError
         # ("'utf-8' codec can't decode byte 0x97 in position ...") because
         # Python source files are decoded as UTF-8 by default (PEP 3120).
-        # sandbox_tools is already the correct set (intersection with session
-        # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
+        # sandbox_tools is the exact intersection with session tools.  An
+        # empty or non-overlapping toolset deliberately grants no RPC tools.
         tools_src = generate_hermes_tools_module(list(sandbox_tools))
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)

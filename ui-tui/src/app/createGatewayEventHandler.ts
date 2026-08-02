@@ -1173,6 +1173,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         patchOverlayState({
           approval: {
+            approvalId: ev.payload.approval_id,
             allowPermanent,
             choices: ev.payload.choices,
             command: String(ev.payload.command ?? ''),

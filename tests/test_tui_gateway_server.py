@@ -128,6 +128,56 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_exact_approval_response_requires_opaque_id(monkeypatch):
+    from tools import approval
+
+    session_key = "tui-exact-approval"
+    entry = approval._ApprovalEntry({
+        "command": "printf exact",
+        "allow_permanent": False,
+        "allow_session": False,
+        "exact_execution": True,
+    })
+    with approval._lock:
+        approval._gateway_queues[session_key] = [entry]
+    monkeypatch.setattr(
+        server,
+        "_sess",
+        lambda _params, _rid: ({"session_key": session_key}, None),
+    )
+
+    try:
+        missing = server._methods["approval.respond"](
+            "r1",
+            {"choice": "once", "session_id": "sid"},
+        )
+        broad = server._methods["approval.respond"](
+            "r2",
+            {
+                "approval_id": entry.approval_id,
+                "choice": "session",
+                "session_id": "sid",
+            },
+        )
+        accepted = server._methods["approval.respond"](
+            "r3",
+            {
+                "approval_id": entry.approval_id,
+                "choice": "once",
+                "session_id": "sid",
+            },
+        )
+
+        assert missing["result"]["resolved"] == 0
+        assert broad["result"]["resolved"] == 0
+        assert accepted["result"]["resolved"] == 1
+        assert entry.event.is_set()
+        assert entry.result == "once"
+    finally:
+        with approval._lock:
+            approval._gateway_queues.pop(session_key, None)
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -9018,6 +9068,58 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         assert stub_db.replaced == [("session-key", original_history[:2])]
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
+    """If replace_messages fails during edit/regenerate truncate, do not run the turn.
+
+    Memory-first + fail-open left session['history'] short while state.db kept
+    the old tail. The agent flush then appends the new exchange on top of the
+    'undone' turns — durable zombie history. Write first; on failure leave
+    memory and DB unchanged and return 5008.
+    """
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+    sess = _session(history=list(original_history))
+    server._sessions["trunc-fail-sid"] = sess
+
+    class _FailDb:
+        def replace_messages(self, session_id, messages):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "trunc-fail-sid",
+                    "text": "edited second",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == 5008
+        assert "truncat" in resp["error"]["message"].lower() or "persist" in resp["error"]["message"].lower()
+        # Memory left intact — same list contents as before the refused cut.
+        assert sess["history"] == original_history
+        assert sess["history_version"] == 0
+        assert sess.get("running") is not True
+    finally:
+        server._sessions.pop("trunc-fail-sid", None)
 
 
 # ---------------------------------------------------------------------------

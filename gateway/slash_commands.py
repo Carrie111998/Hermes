@@ -4119,6 +4119,28 @@ class GatewaySlashCommandsMixin:
         return t("gateway.footer.saved", state=state, example=example)
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
+        """Profile-scoping wrapper around manual /compress.
+
+        Multiplexed gateways resolve credentials through the fail-closed
+        per-profile secret scope (``agent.secret_scope``, Workstream A). The
+        agent turn installs it via ``_run_agent``'s wrapper, but slash-command
+        dispatch does not — so manual /compress reached the compressor's
+        provider resolution unscoped and died with ``UnscopedSecretError``
+        (``get_secret('OPENROUTER_BASE_URL') called with no profile secret
+        scope active``). Install the source profile's scope around the whole
+        handler, mirroring ``_run_agent``. Single-profile gateways skip this
+        — zero behavior change.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._handle_compress_command_inner(event)
+
+        from gateway.run import _profile_runtime_scope
+
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_compress_command_inner(event)
+
+    async def _handle_compress_command_inner(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.
 
         Accepts an optional focus topic: ``/compress <focus>`` guides the
@@ -4308,6 +4330,9 @@ class GatewaySlashCommandsMixin:
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
+                # Preserve the profile secret scope across the executor hop.
+                # Keep the real worker future as well so cancellation cannot
+                # let agent cleanup race a still-running compression worker.
                 _compress_future, _compress_worker_future = (
                     self._submit_in_executor_with_context(
                         lambda: tmp_agent._compress_context(
@@ -5681,8 +5706,9 @@ class GatewaySlashCommandsMixin:
         flow as the CLI's synchronous input() approval.
 
         Supports multiple concurrent approvals (parallel subagents,
-        execute_code).  ``/approve`` resolves the oldest pending command;
-        ``/approve all`` resolves every pending command at once.
+        execute_code). Legacy prompts retain FIFO/all controls. Exact
+        one-operation prompts require their opaque ID and never accept FIFO,
+        all, session, or permanent authority.
 
         Usage:
             /approve              — approve oldest pending command once
@@ -5710,7 +5736,9 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
+            get_pending_gateway_approvals,
             has_blocking_approval,
+            has_exact_blocking_approval,
             resolve_gateway_approval,
             resolve_gateway_approval_by_id,
             resolve_gateway_owner_escalation_by_id,
@@ -5749,6 +5777,30 @@ class GatewaySlashCommandsMixin:
             choice = "session"
         else:
             choice = "once"
+
+        local_pending = get_pending_gateway_approvals(session_key)
+        selected = next(
+            (
+                item for item in local_pending
+                if item.get("approval_id") == approval_id
+            ),
+            None,
+        )
+        if (
+            isinstance(selected, dict)
+            and selected.get("exact_execution") is True
+            and choice not in {"once", "deny"}
+        ):
+            return (
+                "Exact approvals allow only one operation. Use "
+                f"`/approve {approval_id}` or `/deny {approval_id}`."
+            )
+        if not approval_id and has_exact_blocking_approval(session_key):
+            return (
+                "An exact approval is pending. Use the opaque ID shown in its "
+                "prompt: `/approve <approval_id>` or `/deny <approval_id>`. "
+                "FIFO and `all` are unavailable for exact approvals."
+            )
 
         has_local_pending = has_blocking_approval(session_key)
         if not has_local_pending and not (production_boundary and approval_id):
@@ -5821,6 +5873,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             has_blocking_approval,
+            has_exact_blocking_approval,
             resolve_gateway_approval,
             resolve_gateway_approval_by_id,
             resolve_gateway_owner_escalation_by_id,
@@ -5846,6 +5899,13 @@ class GatewaySlashCommandsMixin:
         # Cap to a sane one-liner; the agent only needs a short hint.
         if reason:
             reason = reason[:280].strip()
+
+        if not approval_id and has_exact_blocking_approval(session_key):
+            return (
+                "An exact approval is pending. Use the opaque ID shown in its "
+                "prompt: `/deny <approval_id> [reason]`. FIFO and `all` are "
+                "unavailable for exact approvals."
+            )
 
         has_local_pending = has_blocking_approval(session_key)
         if not has_local_pending and not (production_boundary and approval_id):

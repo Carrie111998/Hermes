@@ -2411,9 +2411,9 @@ def _(rid, params: dict) -> dict:
             session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
         _clear_pending(sid)
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import cancel_gateway_approvals
 
-            resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+            cancel_gateway_approvals(session["session_key"])
         except Exception:
             pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
@@ -2453,9 +2453,9 @@ def _(rid, params: dict) -> dict:
     # process, silently resolving them to empty strings.
     _clear_pending(params.get("session_id", ""))
     try:
-        from tools.approval import resolve_gateway_approval
+        from tools.approval import cancel_gateway_approvals
 
-        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+        cancel_gateway_approvals(session["session_key"])
     except Exception:
         pass
     return _ok(rid, {"status": "interrupted"})

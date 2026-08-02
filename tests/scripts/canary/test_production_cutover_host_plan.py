@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from gateway.mac_ops_edge_service import DEFAULT_PROJECT_ID
+from ops.muncho.runtime import upstream_sync_job_rail as dual_sync_rail
 from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_host_plan as producer
 from tests.scripts.canary.test_package_production_cutover_artifacts import (
@@ -41,6 +42,76 @@ def test_every_fixed_target_has_exactly_one_producer_source() -> None:
     assert producer.REVIEWED_RELEASE_ARTIFACT_NAMES == {
         "gateway_connector_drop_in"
     }
+    assert {
+        "dual_upstream_sync_service_unit",
+        "dual_upstream_sync_timer_unit",
+        "dual_upstream_sync_report_service_unit",
+        "dual_upstream_sync_report_timer_unit",
+    }.issubset(producer.OWNER_RUNTIME_ARTIFACT_NAMES)
+
+
+def test_dual_sync_owner_runtime_producer_returns_all_four_exact_payloads() -> None:
+    artifacts = {
+        dual_sync_rail.SYNC_SERVICE_UNIT: b"sync-service",
+        dual_sync_rail.SYNC_TIMER_UNIT: b"sync-timer",
+        dual_sync_rail.REPORT_SERVICE_UNIT: b"report-service",
+        dual_sync_rail.REPORT_TIMER_UNIT: b"report-timer",
+    }
+    rendered = dual_sync_rail.RailPackage(
+        revision=REVISION,
+        release_root=Path("/release"),
+        sender_revision=REVISION,
+        sender_release_root=Path("/release"),
+        source_digests={},
+        host_binary_digests={},
+        artifacts=artifacts,
+        manifest_bytes=b"manifest\n",
+        manifest_sha256="a" * 64,
+    )
+    calls: list[tuple[str, str]] = []
+
+    result = producer._dual_sync_host_payloads(
+        REVISION,
+        package_builder=lambda release, sender: (
+            calls.append((release, sender)) or rendered
+        ),
+    )
+
+    assert calls == [(REVISION, REVISION)]
+    assert result == {
+        "dual_upstream_sync_service_unit": b"sync-service",
+        "dual_upstream_sync_timer_unit": b"sync-timer",
+        "dual_upstream_sync_report_service_unit": b"report-service",
+        "dual_upstream_sync_report_timer_unit": b"report-timer",
+    }
+
+
+def test_dual_sync_owner_runtime_producer_rejects_wrong_sender() -> None:
+    wrong = dual_sync_rail.RailPackage(
+        revision=REVISION,
+        release_root=Path("/release"),
+        sender_revision="b" * 40,
+        sender_release_root=Path("/sender"),
+        source_digests={},
+        host_binary_digests={},
+        artifacts={
+            dual_sync_rail.SYNC_SERVICE_UNIT: b"1",
+            dual_sync_rail.SYNC_TIMER_UNIT: b"2",
+            dual_sync_rail.REPORT_SERVICE_UNIT: b"3",
+            dual_sync_rail.REPORT_TIMER_UNIT: b"4",
+        },
+        manifest_bytes=b"manifest\n",
+        manifest_sha256="a" * 64,
+    )
+
+    with pytest.raises(
+        producer.HostPlanProducerError,
+        match="host_plan_dual_sync_render_failed",
+    ):
+        producer._dual_sync_host_payloads(
+            REVISION,
+            package_builder=lambda _release, _sender: wrong,
+        )
 
 
 def test_every_fixed_target_has_an_install_identity() -> None:

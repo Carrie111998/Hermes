@@ -218,6 +218,25 @@ describe('respondToApprovalAction', () => {
     expect($approvalRequest.get()).toBeNull()
   })
 
+  it('includes an exact approval id in notification responses', async () => {
+    const approvalId = 'b'.repeat(32)
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      approvalId,
+      command: 'printf exact',
+      description: 'exact',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_id: approvalId,
+      choice: 'once',
+      session_id: 'bg'
+    })
+  })
+
   it('rejects via approval.respond {choice: "deny"}', async () => {
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })

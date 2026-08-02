@@ -15,7 +15,10 @@ import functools
 import hashlib
 import json
 import logging
+import ntpath
 import os
+import platform
+import posixpath
 import re
 import shlex
 import sys
@@ -67,6 +70,223 @@ def _exact_command_sha256(value: object) -> str:
     """
 
     return hashlib.sha256(str(value or "").strip().encode("utf-8")).hexdigest()
+
+
+_EXECUTION_RESOURCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "local": (),
+    "ssh": ("ssh_host", "ssh_user", "ssh_port", "ssh_key"),
+    "docker": (
+        "docker_image",
+        "docker_volumes",
+        "docker_mount_cwd_to_workspace",
+        "host_cwd",
+        "docker_run_as_host_user",
+        "docker_network",
+    ),
+    "singularity": ("singularity_image",),
+    "modal": ("modal_image", "modal_mode"),
+    "daytona": ("daytona_image",),
+    "isolated_worker": (
+        "isolated_worker_socket",
+        "isolated_worker_server_uid",
+        "isolated_worker_server_gid",
+        "isolated_worker_socket_uid",
+        "isolated_worker_socket_gid",
+    ),
+    "vercel_sandbox": ("vercel_runtime",),
+}
+
+
+def _json_exact_value(value: object) -> object:
+    """Return a deterministic JSON value without interpreting its meaning."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_exact_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _json_exact_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    return str(value)
+
+
+def _execution_resource_binding(
+    env_type: str = "",
+    *,
+    env_config: Optional[dict] = None,
+) -> tuple[str, str]:
+    """Return the exact terminal backend and opaque resource digest.
+
+    This is structural binding only.  It never inspects command/script text or
+    assigns risk.  The digest prevents a capability commissioned for one
+    concrete execution endpoint from authorizing the same bytes on another.
+    """
+
+    config = env_config
+    if config is None:
+        try:
+            from tools.terminal_tool import _get_env_config
+
+            config = _get_env_config()
+        except Exception:
+            config = {}
+    config = config if isinstance(config, dict) else {}
+    backend_kind = str(env_type or config.get("env_type") or "local").strip()
+    if backend_kind not in _EXECUTION_RESOURCE_FIELDS:
+        raise ValueError("unsupported execution backend binding")
+    selected = {
+        key: _json_exact_value(config.get(key))
+        for key in _EXECUTION_RESOURCE_FIELDS[backend_kind]
+    }
+    if backend_kind == "local":
+        selected = {
+            "machine": platform.node(),
+            "uid": os.getuid() if hasattr(os, "getuid") else None,
+        }
+    payload = json.dumps(
+        {
+            "version": 1,
+            "backend_kind": backend_kind,
+            "resource": selected,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return backend_kind, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_execution_cwd(
+    cwd: str = "",
+    *,
+    env_type: str = "",
+    env_config: Optional[dict] = None,
+    base_cwd: str = "",
+) -> str:
+    """Return the mechanical cwd identity used by execution and authority.
+
+    Command/script bytes are deliberately outside this function.  Paths are
+    normalized lexically only: local paths expand ``~`` and become absolute;
+    remote/backend paths use POSIX normalization and preserve remote ``~``.
+    Symlinks are never resolved and filesystem contents are never inspected.
+    Relative per-call paths are anchored to the current session/default cwd.
+    """
+
+    config = env_config if isinstance(env_config, dict) else {}
+    backend_kind = str(env_type or config.get("env_type") or "local").strip()
+    if backend_kind not in _EXECUTION_RESOURCE_FIELDS:
+        raise ValueError("unsupported execution backend binding")
+
+    raw_cwd = str(cwd or "")
+    raw_base = str(base_cwd or config.get("cwd") or "")
+    if "\x00" in raw_cwd or "\x00" in raw_base:
+        raise ValueError("execution cwd cannot contain NUL")
+
+    if backend_kind == "local":
+        from tools.environments.local import _msys_to_windows_path
+
+        def _local_path(value: str) -> str:
+            expanded = os.path.expanduser(value)
+            if platform.system() == "Windows":
+                return _msys_to_windows_path(expanded)
+            return expanded
+
+        selected = _local_path(raw_cwd or raw_base or os.getcwd())
+        if platform.system() == "Windows":
+            if ntpath.isabs(selected):
+                return ntpath.normpath(selected)
+            anchor = _local_path(raw_base or os.getcwd())
+            if not ntpath.isabs(anchor):
+                anchor = ntpath.abspath(anchor)
+            return ntpath.normpath(ntpath.join(anchor, selected))
+        if os.path.isabs(selected):
+            return os.path.normpath(selected)
+        anchor = _local_path(raw_base or os.getcwd())
+        if not os.path.isabs(anchor):
+            anchor = os.path.abspath(anchor)
+        return os.path.normpath(os.path.join(anchor, selected))
+
+    selected = raw_cwd or raw_base or "~"
+    if posixpath.isabs(selected) or selected == "~" or selected.startswith("~/"):
+        return posixpath.normpath(selected)
+    anchor = raw_base or str(config.get("cwd") or "") or "~"
+    if not (
+        posixpath.isabs(anchor)
+        or anchor == "~"
+        or anchor.startswith("~/")
+    ):
+        anchor = posixpath.join("~", anchor)
+    return posixpath.normpath(posixpath.join(anchor, selected))
+
+
+def _exact_execution_subject(
+    execution_kind: str,
+    raw_input: str,
+    *,
+    env_type: str = "",
+    env_config: Optional[dict] = None,
+    resource_sha256: str = "",
+    effective_cwd: str = "",
+) -> dict[str, str]:
+    """Build one typed opaque execution subject.
+
+    Raw bytes, tool kind, backend kind, endpoint resource, and terminal cwd are
+    all bound in the subject digest.  Command/script bytes are never normalized
+    or parsed.  The cwd uses only :func:`_normalize_execution_cwd`'s mechanical
+    path contract; no keyword matching or semantic classification participates.
+    """
+
+    if execution_kind not in {"terminal", "execute_code"}:
+        raise ValueError("unsupported execution kind")
+    if not isinstance(raw_input, str) or not raw_input:
+        raise ValueError("exact execution input must be a non-empty string")
+    backend_kind, observed_resource_sha256 = _execution_resource_binding(
+        env_type,
+        env_config=env_config,
+    )
+    requested_resource_sha256 = str(resource_sha256 or "").strip()
+    if (
+        requested_resource_sha256
+        and requested_resource_sha256 != observed_resource_sha256
+    ):
+        raise ValueError("execution resource binding mismatch")
+    resource_sha256 = observed_resource_sha256
+    if not re.fullmatch(r"[0-9a-f]{64}", resource_sha256):
+        raise ValueError("execution resource digest must be sha256")
+    raw_input_sha256 = hashlib.sha256(raw_input.encode("utf-8")).hexdigest()
+    cwd_sha256 = ""
+    if execution_kind == "terminal":
+        normalized_cwd = _normalize_execution_cwd(
+            effective_cwd,
+            env_type=backend_kind,
+            env_config=env_config,
+        )
+        cwd_sha256 = hashlib.sha256(
+            normalized_cwd.encode("utf-8")
+        ).hexdigest()
+    canonical = json.dumps(
+        {
+            "version": 2,
+            "execution_kind": execution_kind,
+            "raw_input_sha256": raw_input_sha256,
+            "backend_kind": backend_kind,
+            "resource_sha256": resource_sha256,
+            "cwd_sha256": cwd_sha256,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "execution_kind": execution_kind,
+        "raw_input_sha256": raw_input_sha256,
+        "backend_kind": backend_kind,
+        "resource_sha256": resource_sha256,
+        "cwd_sha256": cwd_sha256,
+        "subject_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
@@ -2192,6 +2412,15 @@ _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, 
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
+def _is_exact_one_operation_entry(entry: _ApprovalEntry) -> bool:
+    """Return whether broad/FIFO approval is structurally unavailable."""
+
+    return (
+        entry.data.get("exact_execution") is True
+        and entry.data.get("allow_session") is False
+    )
+
+
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
@@ -2223,9 +2452,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    Legacy approvals retain FIFO/``all`` behavior. Exact one-operation
+    approvals are never eligible: they require their opaque approval ID via
+    :func:`resolve_gateway_approval_by_id`.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2237,11 +2466,15 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
-            targets = list(queue)
-            queue.clear()
-        else:
-            targets = [queue.pop(0)]
+        eligible = [
+            entry for entry in queue
+            if not _is_exact_one_operation_entry(entry)
+        ]
+        if not eligible:
+            return 0
+        targets = eligible if resolve_all else eligible[:1]
+        for target in targets:
+            queue.remove(target)
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -2296,6 +2529,11 @@ def resolve_gateway_approval_by_id(
         )
         if target is None:
             return 0
+        if (
+            _is_exact_one_operation_entry(target)
+            and normalized_choice not in {"once", "deny"}
+        ):
+            return 0
         queue.remove(target)
         if not queue:
             _gateway_queues.pop(normalized_session, None)
@@ -2305,6 +2543,22 @@ def resolve_gateway_approval_by_id(
         target.reason = str(reason)
     target.event.set()
     return 1
+
+
+def cancel_gateway_approvals(session_key: str) -> int:
+    """Cancel every pending entry during trusted session teardown.
+
+    This is deliberately separate from user-facing FIFO/``all`` resolution:
+    teardown must wake blocked workers, but it must not turn ``/deny all`` or
+    any other broad user control into authority over exact entries.
+    """
+
+    with _lock:
+        entries = _gateway_queues.pop(str(session_key or ""), [])
+    for entry in entries:
+        entry.result = "deny"
+        entry.event.set()
+    return len(entries)
 
 
 def prepare_gateway_owner_escalation_binding(
@@ -2559,6 +2813,16 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def has_exact_blocking_approval(session_key: str) -> bool:
+    """Return whether the session contains an exact-ID-only approval."""
+
+    with _lock:
+        return any(
+            _is_exact_one_operation_entry(entry)
+            for entry in _gateway_queues.get(str(session_key or ""), ())
+        )
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -3206,16 +3470,17 @@ def grant_plan_capability(
     plan_revision: int | None = None,
     exact_commands: list[str],
     approved_by_user_id: str,
+    exact_code_scripts: Optional[list[str]] = None,
     ttl_seconds: int = 3600,
     max_uses_per_command: int = 3,
     canonical_case_id: str = "",
     source_refs: Optional[dict] = None,
 ) -> dict:
-    """Grant an expiring exact-command capability for an owner-approved plan.
+    """Grant expiring exact terminal/code capabilities for an approved plan.
 
     Hermes/GPT decides that the authenticated owner's current message approves
     the plan. This function only verifies identity/config and hashes exact
-    commands; it performs no semantic approval classification.
+    terminal/code subjects; it performs no semantic approval classification.
     """
     if is_delegated_exact_plan_consumer():
         raise PermissionError(
@@ -3318,17 +3583,64 @@ def grant_plan_capability(
             "Canonical Brain case does not contain the exact active plan_id/revision"
         )
     effective_plan_revision = plan_revision or 1
-    if not isinstance(exact_commands, list) or not 1 <= len(exact_commands) <= 64:
-        raise ValueError("exact_commands must contain 1..64 commands")
+    if not isinstance(exact_commands, list):
+        raise ValueError("exact_commands must be an array")
+    if exact_code_scripts is None:
+        exact_code_scripts = []
+    if not isinstance(exact_code_scripts, list):
+        raise ValueError("exact_code_scripts must be an array")
+    exact_subject_count = len(exact_commands) + len(exact_code_scripts)
+    if not 1 <= exact_subject_count <= 64:
+        raise ValueError(
+            "exact_commands and exact_code_scripts must contain 1..64 items total"
+        )
     ttl_seconds = max(60, min(int(ttl_seconds), 8 * 3600))
     max_uses_per_command = max(1, min(int(max_uses_per_command), 10))
+    try:
+        from tools.terminal_tool import _get_env_config, get_session_cwd
+
+        execution_env_config = _get_env_config()
+        session_cwd = get_session_cwd(session_key) or ""
+    except Exception:
+        execution_env_config = {}
+        session_cwd = ""
+    backend_kind, resource_sha256 = _execution_resource_binding(
+        env_config=execution_env_config,
+    )
+    terminal_cwd = _normalize_execution_cwd(
+        session_cwd,
+        env_type=backend_kind,
+        env_config=execution_env_config,
+    )
     command_uses: dict[str, int] = {}
+    subject_bindings: dict[str, dict[str, str]] = {}
     for command in exact_commands:
-        normalized = str(command or "").strip()
-        if not normalized:
+        if not isinstance(command, str) or not command:
             raise ValueError("exact_commands cannot contain empty commands")
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        subject = _exact_execution_subject(
+            "terminal",
+            command,
+            env_type=backend_kind,
+            env_config=execution_env_config,
+            resource_sha256=resource_sha256,
+            effective_cwd=terminal_cwd,
+        )
+        digest = subject["subject_sha256"]
         command_uses[digest] = max_uses_per_command
+        subject_bindings[digest] = subject
+    for code in exact_code_scripts:
+        if not isinstance(code, str) or not code:
+            raise ValueError("exact_code_scripts cannot contain empty scripts")
+        subject = _exact_execution_subject(
+            "execute_code",
+            code,
+            env_type=backend_kind,
+            env_config=execution_env_config,
+            resource_sha256=resource_sha256,
+        )
+        digest = subject["subject_sha256"]
+        command_uses[digest] = max_uses_per_command
+        subject_bindings[digest] = subject
     now = time.time()
     authority_source_refs = (
         _runtime_observed_approval_source_refs()
@@ -3424,6 +3736,9 @@ def grant_plan_capability(
             "session_key_sha256": expected_session_hash,
             "capability_epoch_sha256": capability_epoch_sha256,
             "command_hashes": sorted(command_uses),
+            "execution_subjects": [
+                subject_bindings[digest] for digest in sorted(subject_bindings)
+            ],
             "command_count": len(command_uses),
             "expires_at_epoch": expires_at,
             "expires_in_seconds": ttl_seconds,
@@ -3449,6 +3764,7 @@ def grant_plan_capability(
             and float(existing.get("expires_at") or 0) > now
             and existing.get("approved_by_user_id") == approved_by_user_id
             and set((existing.get("command_uses") or {}).keys()) == set(command_uses)
+            and existing.get("subject_bindings") == subject_bindings
             and int(existing.get("max_uses_per_command") or 0) == max_uses_per_command
             and str(existing.get("canonical_case_id") or "") == canonical_case_id
             and int(existing.get("plan_revision") or 0) == effective_plan_revision
@@ -3463,6 +3779,10 @@ def grant_plan_capability(
                 "approved_by_user_id": approved_by_user_id,
                 "session_key_sha256": existing["session_key_sha256"],
                 "command_hashes": sorted(command_uses),
+                "execution_subjects": [
+                    subject_bindings[digest]
+                    for digest in sorted(subject_bindings)
+                ],
                 "command_count": len(command_uses),
                 "granted_at": existing["granted_at"],
                 "expires_at": dt.datetime.fromtimestamp(
@@ -3491,6 +3811,10 @@ def grant_plan_capability(
         "granted_at": dt.datetime.fromtimestamp(now, dt.timezone.utc).replace(microsecond=0).isoformat(),
         "approval_source_sha256": approval_source_sha256,
         "command_uses": command_uses,
+        "subject_bindings": subject_bindings,
+        "execution_backend_kind": backend_kind,
+        "execution_resource_sha256": resource_sha256,
+        "consume_idempotency_receipts": {},
         "max_uses_per_command": max_uses_per_command,
         "canonical_case_id": canonical_case_id,
         "source_refs": authority_source_refs,
@@ -3536,6 +3860,9 @@ def grant_plan_capability(
         "approved_by_user_id": approved_by_user_id,
         "session_key_sha256": capability["session_key_sha256"],
         "command_hashes": sorted(command_uses),
+        "execution_subjects": [
+            subject_bindings[digest] for digest in sorted(subject_bindings)
+        ],
         "command_count": len(command_uses),
         "granted_at": capability["granted_at"],
         "expires_at": dt.datetime.fromtimestamp(expires_at, dt.timezone.utc).replace(microsecond=0).isoformat(),
@@ -3591,10 +3918,70 @@ def grant_plan_capability(
     return receipt
 
 
-def consume_plan_capability(session_key: str, command: str) -> str | None:
-    """Consume one exact-command use and return the authorizing plan id."""
+def consume_plan_capability(
+    session_key: str,
+    command: str,
+    *,
+    env_type: str = "",
+    env_config: Optional[dict] = None,
+    resource_sha256: str = "",
+    effective_cwd: str = "",
+    idempotency_key: str = "",
+) -> str | None:
+    """Consume one typed exact terminal-command use and return its plan id."""
+
+    subject = _exact_execution_subject(
+        "terminal",
+        command,
+        env_type=env_type,
+        env_config=env_config,
+        resource_sha256=resource_sha256,
+        effective_cwd=effective_cwd,
+    )
+    return _consume_plan_capability_digest(
+        session_key,
+        subject,
+        idempotency_key=idempotency_key,
+    )
+
+
+def consume_execute_code_plan_capability(
+    session_key: str,
+    code: str,
+    *,
+    env_type: str = "",
+    env_config: Optional[dict] = None,
+    resource_sha256: str = "",
+    idempotency_key: str = "",
+) -> str | None:
+    """Consume one typed exact execute_code script use."""
+
+    subject = _exact_execution_subject(
+        "execute_code",
+        code,
+        env_type=env_type,
+        env_config=env_config,
+        resource_sha256=resource_sha256,
+    )
+    return _consume_plan_capability_digest(
+        session_key,
+        subject,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _consume_plan_capability_digest(
+    session_key: str,
+    subject: dict[str, str],
+    *,
+    idempotency_key: str = "",
+) -> str | None:
+    """Consume one mechanically identified, idempotent execution subject."""
+
     session_key = str(session_key or "")
-    digest = hashlib.sha256(str(command or "").strip().encode("utf-8")).hexdigest()
+    digest = str(subject.get("subject_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
     observed_user_id = _observed_session_user_id()
     observed_platform = _observed_session_platform()
     try:
@@ -3606,6 +3993,26 @@ def consume_plan_capability(session_key: str, command: str) -> str | None:
             "Plan capability rejected: calling session authority epoch is retired"
         )
         return None
+    caller_idempotency_key = str(
+        idempotency_key or _approval_tool_call_id.get() or uuid.uuid4().hex
+    )
+    idempotency_payload = json.dumps(
+        {
+            "version": 1,
+            "session_key_sha256": hashlib.sha256(
+                session_key.encode("utf-8")
+            ).hexdigest(),
+            "capability_epoch_sha256": authority_epoch_sha256,
+            "subject_sha256": digest,
+            "caller_idempotency_key": caller_idempotency_key,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    consume_idempotency_sha256 = hashlib.sha256(
+        idempotency_payload.encode("utf-8")
+    ).hexdigest()
     writer_boundary_required = _writer_boundary_policy_required()
     canonical_required = (
         writer_boundary_required
@@ -3653,7 +4060,9 @@ def consume_plan_capability(session_key: str, command: str) -> str | None:
                 "Privileged plan capability rejected: runtime session/epoch mismatch"
             )
             return None
-        consume_idempotency_key = f"capability-consume:{uuid.uuid4()}"
+        consume_idempotency_key = (
+            f"capability-consume:{consume_idempotency_sha256}"
+        )
         try:
             result = canonical_writer_call(
                 CanonicalWriterOperation.CAPABILITY_CONSUME.value,
@@ -3702,7 +4111,15 @@ def consume_plan_capability(session_key: str, command: str) -> str | None:
             == authority_generation
             and str(capability.get("_capability_epoch_sha256") or "")
             == authority_epoch_sha256
-            and int((capability.get("command_uses") or {}).get(digest, 0)) > 0
+            and (
+                int((capability.get("command_uses") or {}).get(digest, 0)) > 0
+                or (
+                    (capability.get("consume_idempotency_receipts") or {}).get(
+                        consume_idempotency_sha256
+                    )
+                    == digest
+                )
+            )
         ]
 
     for plan_id in candidate_plan_ids:
@@ -3726,6 +4143,11 @@ def consume_plan_capability(session_key: str, command: str) -> str | None:
                     != authority_epoch_sha256
                 ):
                     continue
+                prior_idempotent_subject = (
+                    capability.get("consume_idempotency_receipts") or {}
+                ).get(consume_idempotency_sha256)
+                if prior_idempotent_subject == digest:
+                    return str(plan_id)
                 if float(capability.get("expires_at") or 0) <= time.time():
                     _plan_capabilities.get(session_key, {}).pop(plan_id, None)
                     continue
@@ -3840,6 +4262,18 @@ def consume_plan_capability(session_key: str, command: str) -> str | None:
                         plan_id,
                     )
                     return None
+            with _lock:
+                current = _plan_capabilities.get(session_key, {}).get(plan_id)
+                if current is not capability:
+                    return None
+                receipts = capability.setdefault(
+                    "consume_idempotency_receipts",
+                    {},
+                )
+                previous_subject = receipts.get(consume_idempotency_sha256)
+                if previous_subject not in {None, digest}:
+                    return None
+                receipts[consume_idempotency_sha256] = digest
             return str(plan_id)
     return None
 
@@ -4011,16 +4445,22 @@ def save_permanent_allowlist(patterns: set):
 def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
-                              approval_callback=None) -> str:
+                              approval_callback=None,
+                              allow_session: bool = True,
+                              approval_id: str = "",
+                              exact_execution: bool = False) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
         allow_permanent: When False, hide the [a]lways option (used when
             tirith warnings are present, since broad permanent allowlisting
             is inappropriate for content-level security findings).
+        allow_session: When False, expose only one-operation approval/deny.
+        approval_id: Optional opaque request identity for structured clients.
+        exact_execution: Marks the exact one-operation topology.
         approval_callback: Optional callback registered by the CLI for
             prompt_toolkit integration. Signature:
-            (command, description, *, allow_permanent=True) -> str.
+            (command, description, *, allow_permanent=True, ...) -> str.
 
     Returns: 'once', 'session', 'always', or 'deny'
     """
@@ -4037,10 +4477,21 @@ def prompt_dangerous_approval(command: str, description: str,
 
     if approval_callback is not None:
         try:
+            callback_kwargs = {"allow_permanent": allow_permanent}
+            # Preserve compatibility with third-party/legacy callbacks whose
+            # keyword-only contract predates exact execution. The additional
+            # identity/scope fields are sent only for the exact topology that
+            # requires them.
+            if not allow_session or approval_id or exact_execution:
+                callback_kwargs.update({
+                    "allow_session": allow_session,
+                    "approval_id": approval_id,
+                    "exact_execution": exact_execution,
+                })
             return approval_callback(
                 display_command,
                 display_description,
-                allow_permanent=allow_permanent,
+                **callback_kwargs,
             )
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
@@ -4524,7 +4975,245 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     """
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
+    return env_type in (
+        "singularity",
+        "modal",
+        "daytona",
+        "isolated_worker",
+        "vercel_sandbox",
+    )
+
+
+def _delegated_exact_capability_required(execution_kind: str) -> dict:
+    """Return the stable fail-closed contract for a delegated host execution.
+
+    ``execution_kind`` is an exact tool identifier supplied by the caller, not
+    a classification of command or code content.
+    """
+
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: delegated {execution_kind} execution outside a "
+            "mechanically isolated backend requires an unexpired exact "
+            "owner-approved plan capability for this exact input."
+        ),
+        "status": "blocked",
+        "outcome": "exact_plan_capability_required",
+        "error_code": "delegated_exact_plan_capability_required",
+        "user_consent": False,
+    }
+
+
+def _exact_plan_authority_required(session_key: str) -> bool:
+    """Return whether this session is already inside exact-plan authority.
+
+    The decision is based only on configured authority topology and exact
+    capability state.  Command/script content is never inspected.
+    """
+
+    if is_delegated_exact_plan_consumer():
+        return True
+    if _writer_boundary_policy_required() or _canonical_brain_required():
+        return True
+    try:
+        authority_generation, authority_epoch_sha256 = (
+            capture_session_authority_fence(session_key)
+        )
+    except PermissionError:
+        return True
+    now = time.time()
+    with _lock:
+        return any(
+            capability.get("durably_granted") is True
+            and int(capability.get("_authority_generation", -1))
+            == authority_generation
+            and str(capability.get("_capability_epoch_sha256") or "")
+            == authority_epoch_sha256
+            and float(capability.get("expires_at") or 0) > now
+            for capability in _plan_capabilities.get(session_key, {}).values()
+        )
+
+
+def _exact_plan_capability_required(execution_kind: str) -> dict:
+    """Return the stable exact-authority miss contract for top-level work."""
+
+    if is_delegated_exact_plan_consumer():
+        return _delegated_exact_capability_required(execution_kind)
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED: {execution_kind} execution is outside the exact "
+            "subjects commissioned by the active owner-approved plan. Add "
+            "this exact input to a new owner-approved plan revision or use "
+            "the exact one-operation approval prompt."
+        ),
+        "status": "blocked",
+        "outcome": "exact_plan_capability_required",
+        "error_code": "exact_plan_capability_required",
+        "user_consent": False,
+    }
+
+
+def _request_exact_execution_approval(
+    *,
+    session_key: str,
+    execution_kind: str,
+    raw_input: str,
+    subject: dict[str, str],
+    approval_callback=None,
+) -> dict:
+    """Transport one opaque exact-action grant without semantic policy.
+
+    Only ``once`` can authorize the action.  Session/permanent responses are
+    rejected rather than being converted into broad authority.
+    """
+
+    if is_delegated_exact_plan_consumer():
+        return _delegated_exact_capability_required(execution_kind)
+    from agent.redact import redact_sensitive_text
+
+    display_input = redact_sensitive_text(raw_input)
+    description = (
+        f"exact {execution_kind} input is not present in the active plan "
+        "capability; approval applies to this operation only"
+    )
+    exact_id = subject["subject_sha256"]
+    is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    if is_gateway or is_ask:
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+        if notify_cb is None:
+            return _exact_plan_capability_required(execution_kind)
+        decision = _await_gateway_decision(
+            session_key,
+            notify_cb,
+            {
+                "command": display_input,
+                "command_sha256": exact_id,
+                "pattern_key": f"exact:{execution_kind}:{exact_id}",
+                "pattern_keys": [f"exact:{execution_kind}:{exact_id}"],
+                "description": description,
+                "allow_permanent": False,
+                "allow_session": False,
+                "exact_execution": True,
+                "execution_kind": execution_kind,
+                "backend_kind": subject["backend_kind"],
+                "resource_sha256": subject["resource_sha256"],
+                "cwd_sha256": subject["cwd_sha256"],
+            },
+            surface="gateway_exact_execution",
+            include_authority_fence=True,
+        )
+        if decision.get("notify_failed"):
+            result = _exact_plan_capability_required(execution_kind)
+            result["message"] = decision.get("notify_model_message") or result["message"]
+            result["error_code"] = (
+                decision.get("notify_error_code") or "exact_approval_notify_failed"
+            )
+            return result
+        if (
+            decision.get("resolved") is not True
+            or decision.get("choice") != "once"
+            or decision.get("authority_stale") is True
+        ):
+            return _exact_plan_capability_required(execution_kind)
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "exact_one_operation": True,
+            "execution_subject_sha256": exact_id,
+        }
+
+    if not _is_interactive_cli() and approval_callback is None:
+        return _exact_plan_capability_required(execution_kind)
+    choice = prompt_dangerous_approval(
+        display_input,
+        description,
+        allow_permanent=False,
+        approval_callback=approval_callback,
+        allow_session=False,
+        approval_id=uuid.uuid4().hex,
+        exact_execution=True,
+    )
+    if choice != "once":
+        return _exact_plan_capability_required(execution_kind)
+    return {
+        "approved": True,
+        "message": None,
+        "user_approved": True,
+        "exact_one_operation": True,
+        "execution_subject_sha256": exact_id,
+    }
+
+
+def check_exact_execution_authority(
+    raw_input: str,
+    execution_kind: str,
+    env_type: str,
+    *,
+    env_config: Optional[dict] = None,
+    resource_sha256: str = "",
+    effective_cwd: str = "",
+    session_key: str = "",
+    has_host_access: bool = False,
+    approval_callback=None,
+) -> Optional[dict]:
+    """Resolve exact authority before any legacy semantic approval path.
+
+    ``None`` means this session has no exact-plan authority topology and the
+    legacy compatibility path may continue.  Any returned decision is final.
+    """
+
+    if _should_skip_container_guards(
+        env_type,
+        has_host_access=has_host_access,
+    ):
+        return {"approved": True, "message": None}
+    session_key = str(session_key or get_current_session_key())
+    subject = _exact_execution_subject(
+        execution_kind,
+        raw_input,
+        env_type=env_type,
+        env_config=env_config,
+        resource_sha256=resource_sha256,
+        effective_cwd=effective_cwd,
+    )
+    if execution_kind == "terminal":
+        plan_id = consume_plan_capability(
+            session_key,
+            raw_input,
+            env_type=env_type,
+            env_config=env_config,
+            resource_sha256=subject["resource_sha256"],
+            effective_cwd=effective_cwd,
+        )
+    else:
+        plan_id = consume_execute_code_plan_capability(
+            session_key,
+            raw_input,
+            env_type=env_type,
+            env_config=env_config,
+            resource_sha256=subject["resource_sha256"],
+        )
+    if plan_id:
+        return {
+            "approved": True,
+            "message": None,
+            "plan_capability": plan_id,
+            "execution_subject_sha256": subject["subject_sha256"],
+        }
+    if not _exact_plan_authority_required(session_key):
+        return None
+    return _request_exact_execution_approval(
+        session_key=session_key,
+        execution_kind=execution_kind,
+        raw_input=raw_input,
+        subject=subject,
+        approval_callback=approval_callback,
+    )
 
 
 def check_dangerous_command(command: str, env_type: str,
@@ -4906,7 +5595,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             env_config: Optional[dict] = None,
+                             resource_sha256: str = "",
+                             effective_cwd: str = "",
+                             session_key: str = "",
+                             exact_authority: Optional[dict] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -4922,6 +5616,22 @@ def check_all_command_guards(command: str, env_type: str,
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    exact_decision = exact_authority
+    if exact_decision is None:
+        exact_decision = check_exact_execution_authority(
+            command,
+            "terminal",
+            env_type,
+            env_config=env_config,
+            resource_sha256=resource_sha256,
+            effective_cwd=effective_cwd,
+            session_key=session_key,
+            has_host_access=has_host_access,
+            approval_callback=approval_callback,
+        )
+    if exact_decision is not None:
+        return exact_decision
 
     # Hardline floor: unconditional block for catastrophic commands
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
@@ -4961,10 +5671,6 @@ def check_all_command_guards(command: str, env_type: str,
         return {"approved": True, "message": None}
     if approval_mode == "off" and not _is_cron_session():
         return {"approved": True, "message": None}
-
-    plan_id = consume_plan_capability(get_current_session_key(), command)
-    if plan_id:
-        return {"approved": True, "message": None, "plan_capability": plan_id}
 
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
@@ -5365,7 +6071,11 @@ def check_all_command_guards(command: str, env_type: str,
 
 
 def check_execute_code_guard(code: str, env_type: str,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             env_config: Optional[dict] = None,
+                             resource_sha256: str = "",
+                             session_key: str = "",
+                             approval_callback=None) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
     execute_code runs arbitrary local Python — the script can call
@@ -5398,6 +6108,19 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    exact_decision = check_exact_execution_authority(
+        code,
+        "execute_code",
+        env_type,
+        env_config=env_config,
+        resource_sha256=resource_sha256,
+        session_key=session_key,
+        has_host_access=has_host_access,
+        approval_callback=approval_callback,
+    )
+    if exact_decision is not None:
+        return exact_decision
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     # Cron is intentionally evaluated first for mode=off so cron_mode=deny

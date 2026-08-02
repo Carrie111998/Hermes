@@ -213,13 +213,34 @@ def _(rid, params: dict) -> dict:
                 len(truncated),
                 ordinal,
             )
-            session["history"] = truncated
-            session["history_version"] = int(session.get("history_version", 0)) + 1
+            # Write-before-memory (mirrors gateway hygiene / manual /compress):
+            # persist the truncated transcript first. If replace_messages fails
+            # after we already rewrote session["history"], the turn still runs
+            # against the short list while state.db keeps the old tail. The
+            # agent flush is append-only for history-dict identities, so the
+            # new exchange is appended on top of the "undone" turns — durable
+            # zombie history on resume, and the edit/regenerate never sticks.
+            # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+                    logger.error(
+                        "prompt.submit: replace_messages failed for session %s "
+                        "(ordinal=%d); refusing turn so memory and DB stay "
+                        "aligned: %s",
+                        sid,
+                        ordinal,
+                        exc,
+                        exc_info=True,
+                    )
+                    return _err(
+                        rid,
+                        5008,
+                        f"failed to persist history truncation: {exc}",
+                    )
+            session["history"] = truncated
+            session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -892,17 +913,29 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from tools.approval import resolve_gateway_approval
+        from tools.approval import (
+            resolve_gateway_approval,
+            resolve_gateway_approval_by_id,
+        )
+
+        approval_id = str(params.get("approval_id") or "")
+        resolved = (
+            resolve_gateway_approval_by_id(
+                session["session_key"],
+                approval_id,
+                params.get("choice", "deny"),
+            )
+            if approval_id
+            else resolve_gateway_approval(
+                session["session_key"],
+                params.get("choice", "deny"),
+                resolve_all=params.get("all", False),
+            )
+        )
 
         return _ok(
             rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+            {"resolved": resolved},
         )
     except Exception as e:
         return _err(rid, 5004, str(e))

@@ -970,10 +970,22 @@ def _format_exec_approval_fallback(
     *,
     allow_permanent: bool = True,
     allow_session: bool = True,
+    approval_id: str = "",
+    exact_execution: bool = False,
 ) -> str:
     """Render a mechanical owner-approval prompt from declared capabilities."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
     heading = "⚠️ **Dangerous command requires approval:**"
+
+    if exact_execution:
+        if re.fullmatch(r"[0-9a-f]{32}", str(approval_id or "")) is None:
+            raise ValueError("exact approval fallback requires one opaque approval ID")
+        return (
+            f"{heading}\n"
+            f"```\n{cmd_preview}\n```\nReason: {description}\n\n"
+            f"Reply `{command_prefix}approve {approval_id}` to execute only "
+            f"this operation, or `{command_prefix}deny {approval_id}` to cancel it."
+        )
 
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
     if allow_session:
@@ -2433,8 +2445,10 @@ def _profile_runtime_scope(profile_home: "Path"):
         set_secret_scope,
         reset_secret_scope,
     )
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
+    hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
     try:
         yield
@@ -3438,14 +3452,163 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
-_CONTROL_INTERRUPT_MESSAGES = frozenset({
-    _INTERRUPT_REASON_STOP.lower(),
-    _INTERRUPT_REASON_RESET.lower(),
-    _INTERRUPT_REASON_TIMEOUT.lower(),
-    _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
-    _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
-    _INTERRUPT_REASON_GATEWAY_RESTART.lower(),
-})
+def _reap_gateway_turn_processes(
+    task_id: str,
+    process_baseline,
+    *,
+    source: str,
+    is_still_current: Optional[Callable[[], bool]] = None,
+) -> int:
+    """Reap only background processes created by one abandoned turn.
+
+    ``task_id`` is session-scoped (task_id == session_id), not turn-scoped,
+    so a *replacement* turn on the same session can start and spawn its own
+    legitimate process while this reap is still in flight. ``is_still_current``
+    — a closure over the run_generation captured when the reaping turn began
+    or was interrupted — lets the caller detect that a newer turn has since
+    claimed the session and bail out instead of killing that newer turn's
+    process. The newer turn snapshots its own baseline independently, so
+    skipping here does not leave anything permanently unreaped.
+    """
+    if not task_id:
+        # ProcessSession.task_id defaults to "" for sessionless callers, so a
+        # blank id would match (and kill) every unrelated empty-task process
+        # instead of this turn's own. Nothing session-scoped to reap.
+        return 0
+    if is_still_current is not None:
+        try:
+            if not is_still_current():
+                logger.debug(
+                    "Skipping reap for turn %s (%s): a newer turn already "
+                    "claimed this session; it owns its own baseline.",
+                    task_id,
+                    source,
+                )
+                return 0
+        except Exception:
+            logger.debug(
+                "is_still_current check failed for turn %s (%s); reaping anyway",
+                task_id,
+                source,
+                exc_info=True,
+            )
+
+    from tools.process_registry import process_registry
+
+    try:
+        killed = process_registry.kill_started_since(
+            task_id,
+            process_baseline,
+            source=source,
+        )
+    except Exception:
+        # Runs on a detached daemon thread (interrupt and timeout call
+        # sites both fire-and-forget it) — an uncaught exception here
+        # would only surface via threading.excepthook, bypassing the
+        # app's logger. Swallow and log through the normal channel instead.
+        logger.warning(
+            "Failed to reap background processes for turn %s (%s)",
+            task_id,
+            source,
+            exc_info=True,
+        )
+        return 0
+    if killed:
+        logger.warning(
+            "Reaped %d background process(es) created by abandoned turn %s (%s)",
+            killed,
+            task_id,
+            source,
+        )
+    return killed
+
+
+def _abandon_timed_out_gateway_turn(
+    *,
+    agent_holder,
+    task_id: str,
+    process_baseline,
+    worker_done: threading.Event,
+    timeout_fired: threading.Event,
+    cleanup_lock: threading.Lock,
+    is_still_current: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Interrupt one timed-out turn and reap only processes it created."""
+    with cleanup_lock:
+        if worker_done.is_set() or timeout_fired.is_set():
+            return False
+        timeout_fired.set()
+
+    agent = agent_holder[0] if agent_holder else None
+    if agent is not None and hasattr(agent, "interrupt"):
+        try:
+            agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+        except Exception:
+            logger.debug("Timed-out agent interrupt failed", exc_info=True)
+
+    try:
+        _reap_gateway_turn_processes(
+            task_id,
+            process_baseline,
+            source="gateway_turn_timeout",
+            is_still_current=is_still_current,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to reap background processes for timed-out turn %s",
+            task_id,
+            exc_info=True,
+        )
+    return True
+
+
+def _watch_gateway_turn_inactivity(
+    *,
+    agent_holder,
+    task_id: str,
+    process_baseline,
+    timeout: float,
+    worker_done: threading.Event,
+    timeout_fired: threading.Event,
+    cleanup_lock: threading.Lock,
+    poll_interval: float = 5.0,
+    is_still_current: Optional[Callable[[], bool]] = None,
+) -> None:
+    """Thread watchdog that remains runnable when gateway asyncio is starved."""
+    while not worker_done.wait(max(0.01, poll_interval)):
+        agent = agent_holder[0] if agent_holder else None
+        if agent is None or not hasattr(agent, "get_activity_summary"):
+            continue
+        try:
+            idle_seconds = float(
+                agent.get_activity_summary().get("seconds_since_activity", 0.0)
+            )
+        except Exception:
+            continue
+        if idle_seconds < timeout:
+            continue
+        _abandon_timed_out_gateway_turn(
+            agent_holder=agent_holder,
+            task_id=task_id,
+            process_baseline=process_baseline,
+            worker_done=worker_done,
+            timeout_fired=timeout_fired,
+            cleanup_lock=cleanup_lock,
+            is_still_current=is_still_current,
+        )
+        return
+
+
+_CONTROL_INTERRUPT_MESSAGES = frozenset(
+    {
+        _INTERRUPT_REASON_STOP.lower(),
+        _INTERRUPT_REASON_RESET.lower(),
+        _INTERRUPT_REASON_TIMEOUT.lower(),
+        _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
+        _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
+        _INTERRUPT_REASON_GATEWAY_RESTART.lower(),
+    }
+)
 
 
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
@@ -6269,6 +6432,11 @@ class TurnRunner:
         agent.thinking_progress = ctx._thinking_enabled
         # Store agent reference for interrupt support
         ctx.agent_holder[0] = agent
+        # Publish turn ownership for explicit /stop, /new, disconnect, and
+        # shutdown interrupts. Older session processes are outside this
+        # baseline and remain alive.
+        agent._gateway_turn_process_task_id = ctx.process_task_id
+        agent._gateway_turn_process_baseline = ctx.process_baseline
         # Capture the full tool definitions for transcript logging
         ctx.tools_holder[0] = agent.tools if hasattr(agent, "tools") else None
 
@@ -6513,6 +6681,8 @@ class TurnRunner:
                 _p,
                 allow_permanent=approval_data.get("allow_permanent", True),
                 allow_session=approval_data.get("allow_session", True),
+                approval_id=str(approval_data.get("approval_id", "") or ""),
+                exact_execution=approval_data.get("exact_execution") is True,
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
@@ -13686,10 +13856,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     logger.warning("No adapter available for %s", _pval)
                 continue
-
-            # Set up message + fatal error handlers
+            # Set up message + fatal error handlers. Under multiplexing the
+            # default profile needs the same whole-handler runtime scope as a
+            # secondary profile: authorization and prompt rendering both run
+            # before the narrower agent-turn scope is installed.
             adapter.gateway_runner = self
-            adapter.set_message_handler(self._handle_message)
+            adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -14879,7 +15051,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.gateway_runner = self
-                    adapter.set_message_handler(self._handle_message)
+                    adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -16269,6 +16441,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_message(event)
 
         return _handler
+
+    def _make_default_profile_message_handler(self):
+        """Scope a multiplexed default-profile message from ingress onward."""
+        profile_home = Path(get_hermes_home())
+
+        async def _handler(event):
+            with _profile_runtime_scope(profile_home):
+                return await self._handle_message(event)
+
+        return _handler
+
+    def _primary_message_handler(self):
+        """Return the correctly scoped handler for a primary adapter."""
+        if getattr(self.config, "multiplex_profiles", False):
+            return self._make_default_profile_message_handler()
+        return self._handle_message
 
     @staticmethod
     def _adapter_credential_claim(
@@ -29820,7 +30008,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         _iac_state = self._peek_session_state(session_key)
         running_agent = _iac_state.turn.agent if _iac_state else None
+        _process_task_id = ""
+        _process_baseline = None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            _process_task_id = getattr(
+                running_agent, "_gateway_turn_process_task_id", ""
+            )
+            _process_baseline = getattr(
+                running_agent, "_gateway_turn_process_baseline", None
+            )
             try:
                 running_agent.interrupt(interrupt_reason)
             except Exception:
@@ -29829,7 +30025,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                     exc_info=True,
                 )
-        self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
+        # Bump the generation *before* scheduling the reap thread and capture
+        # the post-bump value: task_id is session-scoped (task_id ==
+        # session_id), so if a replacement turn claims this session and
+        # spawns its own process before the reap thread actually runs, that
+        # claim bumps the generation again. The closure below then sees a
+        # stale generation and skips — the replacement turn's own baseline
+        # covers its own cleanup, so nothing is left permanently unreaped.
+        _generation_at_interrupt = self._invalidate_session_run_generation(
+            session_key, reason=invalidation_reason
+        )
+        if _process_task_id and _process_baseline is not None:
+            threading.Thread(
+                target=_reap_gateway_turn_processes,
+                args=(_process_task_id, _process_baseline),
+                kwargs={
+                    "source": "gateway_turn_interrupt",
+                    "is_still_current": lambda: self._is_session_run_current(
+                        session_key, _generation_at_interrupt
+                    ),
+                },
+                name=f"gateway-turn-reaper-{_process_task_id[:12]}",
+                daemon=True,
+            ).start()
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
             type(adapter), "interrupt_session_activity", None
@@ -32005,8 +32223,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
+
+            # A background=true process intentionally survives a successful
+            # turn, so capture existing IDs and reap only children created by
+            # THIS turn if it times out. The daemon watchdog is independent of
+            # asyncio: cgroup memory reclaim may starve the event loop that runs
+            # the normal timeout poll, but it need not also postpone cleanup
+            # until the loop recovers (#76115).
+            from tools.process_registry import process_registry
+
+            _turn_task_id = session_id or ""
+            _turn_process_baseline = process_registry.snapshot_running_ids(_turn_task_id)
+            turn_ctx.process_task_id = _turn_task_id
+            turn_ctx.process_baseline = _turn_process_baseline
+            _turn_worker_done = threading.Event()
+            _turn_timeout_fired = threading.Event()
+            _turn_cleanup_lock = threading.Lock()
+            # task_id above is session-scoped, not turn-scoped (#76115
+            # review): gate the eventual reap on this exact claim still
+            # being current, so a replacement turn that starts on the same
+            # session before the watchdog fires doesn't get its own fresh
+            # process killed by this turn's stale baseline.
+            _turn_run_generation = run_generation
+            _turn_is_current = (
+                (lambda: self._is_session_run_current(session_key, _turn_run_generation))
+                if _turn_run_generation is not None
+                else (lambda: True)
+            )
+
+            def _run_sync_with_timeout_lifecycle():
+                try:
+                    return run_sync()
+                finally:
+                    _turn_worker_done.set()
+                    # `.turn.agent` on the session state is only reset to
+                    # _AGENT_PENDING_SENTINEL when the *next* turn is
+                    # claimed (see _session_state(...).turn.agent = ... at
+                    # claim time), so a stale reference to this exact agent
+                    # instance stays reachable from
+                    # _interrupt_and_clear_session() until then. Clearing
+                    # the ownership markers here — the instant this turn's
+                    # own worker finishes — closes that window: an
+                    # explicit /stop landing on the already-finished turn
+                    # no longer reaps background work the turn deliberately
+                    # left running (#76115).
+                    _finished_agent = agent_holder[0] if agent_holder else None
+                    if _finished_agent is not None:
+                        _finished_agent._gateway_turn_process_task_id = ""
+                        _finished_agent._gateway_turn_process_baseline = frozenset()
+
+            if _agent_timeout is not None:
+                threading.Thread(
+                    target=_watch_gateway_turn_inactivity,
+                    kwargs={
+                        "agent_holder": agent_holder,
+                        "task_id": _turn_task_id,
+                        "process_baseline": _turn_process_baseline,
+                        "timeout": _agent_timeout,
+                        "worker_done": _turn_worker_done,
+                        "timeout_fired": _turn_timeout_fired,
+                        "cleanup_lock": _turn_cleanup_lock,
+                        "poll_interval": 5.0,
+                        "is_still_current": _turn_is_current,
+                    },
+                    name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
+                    daemon=True,
+                ).start()
+            # Keep the fork's exact worker-future ownership/registration while
+            # running the upstream lifecycle wrapper that publishes watchdog
+            # completion and clears abandoned-turn process markers.
             _executor_task, _executor_worker_future = (
-                self._submit_in_executor_with_context(run_sync)
+                self._submit_in_executor_with_context(
+                    _run_sync_with_timeout_lifecycle
+                )
             )
             if session_key:
                 self._register_running_agent_worker(
@@ -32083,7 +32372,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         {_executor_task}, timeout=_POLL_INTERVAL
                     )
                     if done:
+                        # Prefer the real result when the worker finished,
+                        # even if the watchdog fired in the same window: the
+                        # completed run already persisted its reply to session
+                        # history, so surfacing the "agent inactive" diagnostic
+                        # here would contradict the stored transcript. This
+                        # mirrors _abandon_timed_out_gateway_turn's own
+                        # worker_done-wins tiebreak (under cleanup_lock).
                         response = _executor_task.result()
+                        break
+                    if _turn_timeout_fired.is_set():
+                        _inactivity_timeout = True
                         break
                     # Agent still running — check inactivity.
                     _agent_ref = agent_holder[0]
@@ -32122,6 +32421,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                     if _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
+                        threading.Thread(
+                            target=_abandon_timed_out_gateway_turn,
+                            kwargs={
+                                "agent_holder": agent_holder,
+                                "task_id": _turn_task_id,
+                                "process_baseline": _turn_process_baseline,
+                                "worker_done": _turn_worker_done,
+                                "timeout_fired": _turn_timeout_fired,
+                                "cleanup_lock": _turn_cleanup_lock,
+                                "is_still_current": _turn_is_current,
+                            },
+                            name=f"gateway-turn-reaper-{_turn_task_id[:12]}",
+                            daemon=True,
+                        ).start()
                         break
                     # Backup interrupt check (same as unlimited path).
                     if not _interrupt_detected.is_set() and session_key:

@@ -618,6 +618,67 @@ class TestRunEvents:
                 )
 
     @pytest.mark.asyncio
+    async def test_exact_run_approval_rejects_session_and_permanent_scope(
+        self,
+        auth_adapter,
+    ):
+        app = _create_runs_app(auth_adapter)
+        run_id = "run_exact_scope"
+        session_id = "session-exact-scope"
+        epoch = "7" * 64
+        entry = approval_mod._ApprovalEntry(
+            {
+                "command": "printf exact",
+                "allow_permanent": False,
+                "allow_session": False,
+                "exact_execution": True,
+            },
+            capability_epoch_sha256=epoch,
+        )
+        run_scope = auth_adapter._api_request_scope("run", run_id)
+        approval_session_key = auth_adapter._api_request_scope(
+            "run-approval",
+            run_id,
+        ).internal_key
+        auth_adapter._run_statuses[run_scope] = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": "waiting_for_approval",
+        }
+        auth_adapter._run_approval_sessions[run_scope] = approval_session_key
+        with approval_mod._lock:
+            approval_mod._gateway_queues[approval_session_key] = [entry]
+
+        headers = {
+            **AUTH_HEADERS,
+            "X-Hermes-Session-Id": session_id,
+        }
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                for choice in ("session", "always"):
+                    response = await cli.post(
+                        f"/v1/runs/{run_id}/approval",
+                        json={
+                            "approval_id": entry.approval_id,
+                            "choice": choice,
+                        },
+                        headers=headers,
+                    )
+                    assert response.status == 400
+                    payload = await response.json()
+                    assert payload["error"]["code"] in {
+                        "approval_choice_not_allowed",
+                        "permanent_approval_not_allowed",
+                    }
+                    assert not entry.event.is_set()
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(
+                    approval_session_key,
+                    None,
+                )
+
+    @pytest.mark.asyncio
     async def test_run_approval_is_exact_owner_bound_and_out_of_order(self, auth_adapter):
         """Exact run/session/id proof resolves one sibling and never FIFO-falls back."""
         app = _create_runs_app(auth_adapter)
