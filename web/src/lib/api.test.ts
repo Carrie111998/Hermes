@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./api";
+import { api, fetchJSON, setManagementProfile } from "./api";
 
 const SESSION_HEADER = "X-Hermes-Session-Token";
 
 afterEach(() => {
+  setManagementProfile("");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -102,5 +103,72 @@ describe("api OAuth helpers", () => {
       expect(init.credentials).toBe("include");
       expect((init.headers as Headers).has(SESSION_HEADER)).toBe(false);
     }
+  });
+
+  it("scopes OAuth provider reads and mutations to the selected management profile", async () => {
+    vi.stubGlobal("window", {});
+    setManagementProfile("coder");
+    const fetchMock = jsonFetchMock({
+      flow: "device_code",
+      providers: [],
+      session_id: "oauth-session",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getOAuthProviders();
+    await api.startOAuthLogin("openai-codex");
+    await api.submitOAuthCode("anthropic", "oauth-session", "code-123");
+    await api.pollOAuthSession("anthropic", "oauth-session");
+    await api.cancelOAuthSession("oauth-session");
+    await api.disconnectOAuthProvider("anthropic");
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/providers/oauth?profile=coder",
+      "/api/providers/oauth/openai-codex/start?profile=coder",
+      "/api/providers/oauth/anthropic/submit?profile=coder",
+      "/api/providers/oauth/anthropic/poll/oauth-session?profile=coder",
+      "/api/providers/oauth/sessions/oauth-session?profile=coder",
+      "/api/providers/oauth/anthropic?profile=coder",
+    ]);
+  });
+
+  it("leaves OAuth provider helpers unscoped for the launch profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({
+      flow: "device_code",
+      providers: [],
+      session_id: "oauth-session",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getOAuthProviders();
+    await api.startOAuthLogin("openai-codex");
+    await api.submitOAuthCode("anthropic", "oauth-session", "code-123");
+    await api.pollOAuthSession("anthropic", "oauth-session");
+    await api.cancelOAuthSession("oauth-session");
+    await api.disconnectOAuthProvider("anthropic");
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/providers/oauth",
+      "/api/providers/oauth/openai-codex/start",
+      "/api/providers/oauth/anthropic/submit",
+      "/api/providers/oauth/anthropic/poll/oauth-session",
+      "/api/providers/oauth/sessions/oauth-session",
+      "/api/providers/oauth/anthropic",
+    ]);
+  });
+
+  it("does not rewrite an explicit OAuth provider profile", async () => {
+    vi.stubGlobal("window", {});
+    setManagementProfile("coder");
+    const fetchMock = jsonFetchMock({ providers: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchJSON("/api/providers/oauth?profile=default");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/oauth?profile=default",
+      expect.objectContaining({ credentials: "include" }),
+    );
   });
 });
