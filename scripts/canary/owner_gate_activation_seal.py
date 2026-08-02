@@ -115,6 +115,9 @@ _REQUIRED_ACTIVATION_PAYLOADS = frozenset({
     "bin/muncho-owner-gate-stage-activation-evidence",
     "scripts/canary/owner_gate_activation_evidence_stager.py",
     "scripts/canary/owner_gate_activation_seal.py",
+    "scripts/canary/passkey_v2_production_storage_growth.py",
+    "scripts/canary/passkey_v2_service.py",
+    "scripts/canary/production_storage_growth_contract.py",
 })
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")

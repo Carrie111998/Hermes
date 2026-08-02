@@ -27,6 +27,7 @@ from scripts.canary import production_cutover_owner_launcher as owner
 from scripts.canary import production_cutover_public_stager as stager
 from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_cutover_unit_input_rotation as rotation
+from scripts.canary import production_storage_growth_installer as storage_installer
 from tests.gateway.test_canonical_writer_production_cutover import (
     MemoryJournal,
     NOW,
@@ -3917,6 +3918,82 @@ def test_production_transport_invoke_uses_supported_remote_bounds() -> None:
         canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
     )
     assert len(captured["input_bytes"]) < captured["maximum_input_bytes"]
+
+
+def test_production_transport_installs_exact_root_wrapped_guest_without_sudoers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _production_transport()
+    request = storage_installer.build_guest_install_request(REVISION)
+    captured: dict[str, object] = {}
+    source_root = "/opt/muncho/releases/" + REVISION
+
+    monkeypatch.setattr(
+        transport,
+        "_prepare_source",
+        lambda revision, *, account: (
+            captured.update(revision=revision, account=account) or source_root
+        ),
+    )
+    unsigned = {
+        "schema": storage_installer.GUEST_READINESS_SCHEMA,
+        "release_sha": REVISION,
+        "entrypoint": str(storage_installer.GUEST_ENTRYPOINT),
+        "entrypoint_sha256": request["guest_source_sha256"],
+        "entrypoint_uid": 0,
+        "entrypoint_gid": 0,
+        "entrypoint_mode": "0755",
+        "entrypoint_link_count": 1,
+        "installer_sha256": request["installer_sha256"],
+        "interpreter_path": "/usr/bin/python3",
+        "interpreter_resolved_path": "/usr/bin/python3.11",
+        "interpreter_sha256": "8" * 64,
+        "installation_receipt_sha256": "1" * 64,
+        "sudoers_path": str(storage_installer.GUEST_SUDOERS_PATH),
+        "sudoers_required": False,
+        "sudoers_absent": True,
+        "root_transport_required": True,
+        "ready": True,
+    }
+    readiness = {
+        **unsigned,
+        "readiness_sha256": storage_installer.sha256_json(unsigned),
+    }
+
+    def run_remote_input(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=storage_installer.canonical_json_bytes(readiness) + b"\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(transport, "_run_remote_input", run_remote_input)
+
+    assert transport.install_production_storage_growth_guest(
+        release_sha=REVISION,
+        request=request,
+        account="owner@example.com",
+    ) == readiness
+    assert captured["revision"] == REVISION
+    assert captured["account"] == "owner@example.com"
+    assert captured["command"] == (
+        "/usr/bin/python3",
+        "-I",
+        "-S",
+        "-B",
+        f"{source_root}/scripts/canary/production_storage_growth_installer.py",
+        "install-guest",
+    )
+    assert captured["input_bytes"] == storage_installer.canonical_json_bytes(
+        request
+    )
+    assert captured["maximum_input_bytes"] == 64 * 1024
+    assert captured["maximum_output_bytes"] == 64 * 1024
+    assert captured["timeout_seconds"] == 300.0
+    assert "sudoers" not in " ".join(captured["command"])
 
 
 def test_production_transport_non_input_uses_supported_remote_bounds() -> None:

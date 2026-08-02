@@ -19,6 +19,9 @@ import pytest
 
 from scripts.canary import full_canary_owner_launcher as launcher
 from scripts.canary import owner_gate_owner_reauth as owner_reauth
+from scripts.canary import passkey_v2_protocol as protocol
+from scripts.canary import production_storage_growth_contract as storage_contract
+from scripts.canary import production_storage_growth_installer as storage_installer
 
 
 RELEASE_SHA = "a" * 40
@@ -971,6 +974,120 @@ def test_sealed_author_and_apply_has_one_exact_hostile_ambient_safe_command(
         "error": "owner_gate_author_operation_invalid",
         "ok": False,
     }
+
+
+def test_production_storage_direct_entrypoint_loads_only_installed_sealed_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _real_import_support_tree(tmp_path, monkeypatch)
+    entrypoint = (
+        root
+        / "source/scripts/canary/production_storage_growth_owner_cli.py"
+    )
+    hostile = tmp_path / "hostile-storage"
+    hostile.mkdir()
+    marker = tmp_path / "storage-ambient-imported"
+    (hostile / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n",
+        encoding="ascii",
+    )
+    unsigned = {
+        "schema": "muncho-production-storage-growth-owner-cli-frame.v1",
+        "operation": "request",
+        "document": {"path": "/tmp/attacker"},
+    }
+    frame = {
+        **unsigned,
+        "frame_sha256": protocol.sha256_json(unsigned),
+    }
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(entrypoint),
+            "--release-sha",
+            RELEASE_SHA,
+            "request",
+        ),
+        cwd=hostile,
+        input=_canonical(frame),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            "HOME": str(tmp_path),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONPATH": os.pathsep.join((str(hostile), str(REPOSITORY_ROOT))),
+        },
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 2, completed.stderr.decode(
+        "utf-8", errors="replace"
+    )
+    response = json.loads(completed.stdout)
+    assert response["error_code"] == "production_storage_owner_cli_frame_invalid"
+    assert response["operation"] == "request"
+    assert response["release_sha"] == RELEASE_SHA
+    assert not marker.exists()
+    assert not list(root.rglob("*.pyc"))
+    assert not list(root.rglob("__pycache__"))
+
+
+def test_installed_storage_artifact_observation_and_root_verifier_are_physical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _real_import_support_tree(tmp_path, monkeypatch)
+    source = root / "source"
+    manifest = launcher._validate_owner_support_manifest(
+        str(root),
+        release_sha=RELEASE_SHA,
+    )
+    attestation = storage_contract.observe_runtime_artifact_attestation(
+        source_root=source,
+        release_revision=RELEASE_SHA,
+        owner_support_manifest=manifest,
+    )
+    binding = storage_installer.build_owner_artifact_binding(
+        RELEASE_SHA,
+        attestation,
+    )
+    installer_path = (
+        source / "scripts/canary/production_storage_growth_installer.py"
+    )
+    assert storage_installer.verify_owner_artifact_binding_on_disk(
+        binding,
+        release_sha=RELEASE_SHA,
+        installer_path=installer_path,
+    ) == binding
+
+    tampered_unsigned = {
+        **{
+            name: item
+            for name, item in binding.items()
+            if name != "binding_sha256"
+        },
+        "owner_route_sha256": "f" * 64,
+    }
+    tampered = {
+        **tampered_unsigned,
+        "binding_sha256": storage_installer.sha256_json(tampered_unsigned),
+    }
+    with pytest.raises(
+        storage_installer.ProductionStorageInstallerError,
+        match="production_storage_owner_artifact_provenance_invalid",
+    ):
+        storage_installer.verify_owner_artifact_binding_on_disk(
+            tampered,
+            release_sha=RELEASE_SHA,
+            installer_path=installer_path,
+        )
 
 
 def _synthetic_publication_inputs(

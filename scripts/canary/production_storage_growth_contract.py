@@ -11,8 +11,12 @@ shell authority.
 from __future__ import annotations
 
 import copy
+import hashlib
+import os
 import re
+import stat
 import uuid
+from pathlib import Path
 from typing import Any, Mapping
 
 from scripts.canary import passkey_v2_protocol as protocol
@@ -20,6 +24,9 @@ from scripts.canary import passkey_v2_protocol as protocol
 
 OBSERVATION_SCHEMA = "muncho-production-storage-observation.v1"
 PLAN_SCHEMA = "muncho-production-storage-growth-plan.v1"
+RUNTIME_ARTIFACT_ATTESTATION_SCHEMA = (
+    "muncho-production-storage-runtime-artifact-attestation.v1"
+)
 OPERATION = "grow_exact_production_boot_disk_50_to_100.v1"
 
 PROJECT = "adventico-ai-platform"
@@ -132,6 +139,12 @@ _PLAN_FIELDS = frozenset({
     "mutation_wrapper_sha256",
     "read_only_collector_sha256",
     "remote_transport_sha256",
+    "owner_cli_sha256",
+    "owner_route_sha256",
+    "production_cutover_transport_sha256",
+    "installer_sha256",
+    "runtime_artifact_attestation",
+    "runtime_artifact_attestation_sha256",
     "maximum_provider_resize_operations",
     "online_partition_filesystem_growth_only",
     "stop_allowed",
@@ -148,6 +161,31 @@ _PLAN_FIELDS = frozenset({
     "caller_selected_targets_allowed",
     "generic_shell_fallback_allowed",
     "plan_sha256",
+})
+RUNTIME_ARTIFACT_RELATIVES = {
+    "plan_builder": "scripts/canary/production_storage_growth_owner_cli.py",
+    "owner_cli": "scripts/canary/production_storage_growth_owner_cli.py",
+    "owner_route": "scripts/canary/full_canary_owner_launcher.py",
+    "executor": "scripts/canary/production_storage_growth_executor.py",
+    "adapter": "scripts/canary/production_storage_growth_adapter.py",
+    "production_cutover": (
+        "scripts/canary/production_cutover_owner_launcher.py"
+    ),
+    "guest": "scripts/canary/production_storage_growth_guest.py",
+    "installer": "scripts/canary/production_storage_growth_installer.py",
+}
+_RUNTIME_ARTIFACT_ENTRY_FIELDS = frozenset({
+    "release_relative",
+    "sha256",
+    "size",
+})
+_RUNTIME_ARTIFACT_ATTESTATION_FIELDS = frozenset({
+    "schema",
+    "release_revision",
+    "owner_support_manifest_sha256",
+    "owner_support_source_tree_oid",
+    "artifacts",
+    "attestation_sha256",
 })
 
 
@@ -332,19 +370,152 @@ def build_observation(**values: Any) -> Mapping[str, Any]:
     )
 
 
+def validate_runtime_artifact_attestation(value: Any) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _RUNTIME_ARTIFACT_ATTESTATION_FIELDS
+        or value.get("schema") != RUNTIME_ARTIFACT_ATTESTATION_SCHEMA
+        or not isinstance(value.get("release_revision"), str)
+        or _SHA40.fullmatch(value["release_revision"]) is None
+        or not _is_sha256(value.get("owner_support_manifest_sha256"))
+        or not isinstance(value.get("owner_support_source_tree_oid"), str)
+        or _SHA40.fullmatch(value["owner_support_source_tree_oid"]) is None
+        or not isinstance(value.get("artifacts"), Mapping)
+        or set(value["artifacts"]) != set(RUNTIME_ARTIFACT_RELATIVES)
+    ):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_attestation_invalid"
+        )
+    artifacts: dict[str, Mapping[str, Any]] = {}
+    for name, relative in RUNTIME_ARTIFACT_RELATIVES.items():
+        item = value["artifacts"].get(name)
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != _RUNTIME_ARTIFACT_ENTRY_FIELDS
+            or item.get("release_relative") != relative
+            or not _is_sha256(item.get("sha256"))
+            or type(item.get("size")) is not int
+            or item["size"] <= 0
+            or item["size"] > 8 * 1024 * 1024
+        ):
+            raise ProductionStorageGrowthError(
+                "production_storage_runtime_artifact_attestation_invalid"
+            )
+        artifacts[name] = dict(item)
+    unsigned = {
+        name: item for name, item in value.items() if name != "attestation_sha256"
+    }
+    if (
+        value.get("attestation_sha256") != protocol.sha256_json(unsigned)
+        or artifacts["plan_builder"] != artifacts["owner_cli"]
+    ):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_attestation_invalid"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def observe_runtime_artifact_attestation(
+    *,
+    source_root: Path,
+    release_revision: str,
+    owner_support_manifest: Mapping[str, Any],
+    expected_uid: int | None = None,
+    expected_gid: int | None = None,
+) -> Mapping[str, Any]:
+    """Hash the exact sealed owner-side release artifacts from disk."""
+
+    uid = os.getuid() if expected_uid is None else expected_uid
+    gid = os.getgid() if expected_gid is None else expected_gid
+    if (
+        not isinstance(source_root, Path)
+        or not source_root.is_absolute()
+        or type(uid) is not int
+        or uid < 0
+        or type(gid) is not int
+        or gid < 0
+        or not isinstance(owner_support_manifest, Mapping)
+        or owner_support_manifest.get("release_sha") != release_revision
+        or not _is_sha256(owner_support_manifest.get("manifest_sha256"))
+        or not isinstance(owner_support_manifest.get("source_tree_oid"), str)
+        or _SHA40.fullmatch(owner_support_manifest["source_tree_oid"]) is None
+    ):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        )
+    try:
+        resolved_root = Path(os.path.realpath(source_root, strict=True))
+    except OSError:
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        ) from None
+    if resolved_root != source_root:
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        )
+    artifacts: dict[str, Mapping[str, Any]] = {}
+    for name, relative in RUNTIME_ARTIFACT_RELATIVES.items():
+        path = source_root / relative
+        try:
+            metadata = path.lstat()
+            resolved = Path(os.path.realpath(path, strict=True))
+            payload = path.read_bytes()
+        except OSError:
+            raise ProductionStorageGrowthError(
+                "production_storage_runtime_artifact_observation_invalid"
+            ) from None
+        if (
+            resolved != path
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+            or metadata.st_nlink != 1
+            or len(payload) != metadata.st_size
+            or not 0 < len(payload) <= 8 * 1024 * 1024
+        ):
+            raise ProductionStorageGrowthError(
+                "production_storage_runtime_artifact_observation_invalid"
+            )
+        artifacts[name] = {
+            "release_relative": relative,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+    unsigned = {
+        "schema": RUNTIME_ARTIFACT_ATTESTATION_SCHEMA,
+        "release_revision": release_revision,
+        "owner_support_manifest_sha256": owner_support_manifest[
+            "manifest_sha256"
+        ],
+        "owner_support_source_tree_oid": owner_support_manifest[
+            "source_tree_oid"
+        ],
+        "artifacts": artifacts,
+    }
+    return validate_runtime_artifact_attestation({
+        **unsigned,
+        "attestation_sha256": protocol.sha256_json(unsigned),
+    })
+
+
 def build_plan(
     *,
     source_preflight: Mapping[str, Any],
     release_revision: str,
-    executor_binary_sha256: str,
-    mutation_wrapper_sha256: str,
-    read_only_collector_sha256: str,
-    remote_transport_sha256: str,
+    runtime_artifact_attestation: Mapping[str, Any],
     now_unix: int,
 ) -> Mapping[str, Any]:
     source = validate_observation(source_preflight, now_unix=now_unix)
+    artifacts = validate_runtime_artifact_attestation(
+        runtime_artifact_attestation
+    )
     if source["disk"]["size_gb"] != SOURCE_SIZE_GB:
         raise ProductionStorageGrowthError("production_storage_source_size_invalid")
+    if artifacts["release_revision"] != release_revision:
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_attestation_invalid"
+        )
     digest_material = {
         "schema": "muncho-production-storage-growth-idempotency.v1",
         "disk_id": DISK_ID,
@@ -379,10 +550,19 @@ def build_plan(
         "minimum_postflight_available_bytes": (MINIMUM_POSTFLIGHT_AVAILABLE_BYTES),
         "provider_request_id": provider_request_id,
         "idempotency_key_sha256": idempotency_key,
-        "executor_binary_sha256": executor_binary_sha256,
-        "mutation_wrapper_sha256": mutation_wrapper_sha256,
-        "read_only_collector_sha256": read_only_collector_sha256,
-        "remote_transport_sha256": remote_transport_sha256,
+        "executor_binary_sha256": artifacts["artifacts"]["executor"]["sha256"],
+        "mutation_wrapper_sha256": artifacts["artifacts"]["guest"]["sha256"],
+        "read_only_collector_sha256": artifacts["artifacts"]["guest"]["sha256"],
+        "remote_transport_sha256": artifacts["artifacts"]["adapter"]["sha256"],
+        "owner_cli_sha256": artifacts["artifacts"]["owner_cli"]["sha256"],
+        "owner_route_sha256": artifacts["artifacts"]["owner_route"]["sha256"],
+        "production_cutover_transport_sha256": artifacts["artifacts"]
+        ["production_cutover"]["sha256"],
+        "installer_sha256": artifacts["artifacts"]["installer"]["sha256"],
+        "runtime_artifact_attestation": artifacts,
+        "runtime_artifact_attestation_sha256": artifacts[
+            "attestation_sha256"
+        ],
         "maximum_provider_resize_operations": 1,
         "online_partition_filesystem_growth_only": True,
         "stop_allowed": False,
@@ -417,11 +597,24 @@ def validate_plan(value: Any) -> Mapping[str, Any]:
         )
     except ProductionStorageGrowthError:
         raise ProductionStorageGrowthError("production_storage_plan_invalid") from None
+    try:
+        artifacts = validate_runtime_artifact_attestation(
+            plan.get("runtime_artifact_attestation")
+        )
+    except ProductionStorageGrowthError:
+        raise ProductionStorageGrowthError(
+            "production_storage_plan_invalid"
+        ) from None
     hash_names = (
         "executor_binary_sha256",
         "mutation_wrapper_sha256",
         "read_only_collector_sha256",
         "remote_transport_sha256",
+        "owner_cli_sha256",
+        "owner_route_sha256",
+        "production_cutover_transport_sha256",
+        "installer_sha256",
+        "runtime_artifact_attestation_sha256",
         "idempotency_key_sha256",
     )
     expected_idempotency_key = protocol.sha256_json({
@@ -470,7 +663,26 @@ def validate_plan(value: Any) -> Mapping[str, Any]:
         any(plan.get(name) != expected for name, expected in static.items())
         or not isinstance(plan.get("release_revision"), str)
         or _SHA40.fullmatch(plan["release_revision"]) is None
+        or artifacts["release_revision"] != plan.get("release_revision")
         or any(not _is_sha256(plan.get(name)) for name in hash_names)
+        or plan.get("runtime_artifact_attestation_sha256")
+        != artifacts["attestation_sha256"]
+        or plan.get("executor_binary_sha256")
+        != artifacts["artifacts"]["executor"]["sha256"]
+        or plan.get("mutation_wrapper_sha256")
+        != artifacts["artifacts"]["guest"]["sha256"]
+        or plan.get("read_only_collector_sha256")
+        != artifacts["artifacts"]["guest"]["sha256"]
+        or plan.get("remote_transport_sha256")
+        != artifacts["artifacts"]["adapter"]["sha256"]
+        or plan.get("owner_cli_sha256")
+        != artifacts["artifacts"]["owner_cli"]["sha256"]
+        or plan.get("owner_route_sha256")
+        != artifacts["artifacts"]["owner_route"]["sha256"]
+        or plan.get("production_cutover_transport_sha256")
+        != artifacts["artifacts"]["production_cutover"]["sha256"]
+        or plan.get("installer_sha256")
+        != artifacts["artifacts"]["installer"]["sha256"]
         or plan.get("source_preflight_sha256") != checked_source["observation_sha256"]
         or plan.get("boot_device_name")
         != checked_source["boot_attachment"]["device_name"]
@@ -502,6 +714,8 @@ __all__ = [
     "PLAN_SCHEMA",
     "PREFLIGHT_MAX_AGE_SECONDS",
     "PROJECT",
+    "RUNTIME_ARTIFACT_ATTESTATION_SCHEMA",
+    "RUNTIME_ARTIFACT_RELATIVES",
     "ProductionStorageGrowthError",
     "SOURCE_SIZE_GB",
     "TARGET_SIZE_GB",
@@ -509,6 +723,8 @@ __all__ = [
     "build_observation",
     "build_plan",
     "classify_observation",
+    "observe_runtime_artifact_attestation",
+    "validate_runtime_artifact_attestation",
     "validate_observation",
     "validate_plan",
 ]

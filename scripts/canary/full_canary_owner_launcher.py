@@ -274,6 +274,9 @@ OWNER_GATE_HOST_IDENTITY_RECEIPT_SCHEMA = (
 OWNER_GATE_HOST_IDENTITY_SSHSIG_NAMESPACE = (
     "muncho-owner-gate-iap-host-identity-v3"
 )
+PRODUCTION_STORAGE_IAM_SSHSIG_NAMESPACE = (
+    "muncho-production-storage-growth-external-iam-v1"
+)
 OWNER_GATE_HOST_IDENTITY_RECEIPT_RELATIVE = (
     ".hermes/trusted/owner-gate-iap-host-identity-v3.json"
 )
@@ -1689,6 +1692,7 @@ class _PhaseBOwnerExternalSigner:
                 SCHEMA_RECONCILIATION_CONTROL_INSTALL_SSHSIG_NAMESPACE,
                 SCHEMA_RECONCILIATION_CONTROL_CLEANUP_SSHSIG_NAMESPACE,
                 OWNER_GATE_HOST_IDENTITY_SSHSIG_NAMESPACE,
+                PRODUCTION_STORAGE_IAM_SSHSIG_NAMESPACE,
             }
         ):
             raise OwnerLauncherError("phase_b_owner_signing_request_invalid")
@@ -19577,6 +19581,7 @@ class OwnerGateIapTransport:
             raise OwnerLauncherError("owner_gate_iap_response_invalid")
         return response
 
+
     def _activation_argv(
         self,
         snapshot: tuple[Any, ...],
@@ -19727,6 +19732,880 @@ class OwnerGateIapTransport:
             decoded,
             expected_release_sha=self._release_sha,
         )
+
+
+def collect_fresh_production_storage_growth_external_iam(
+    *,
+    owner_identity: GcloudOwnerAccessToken,
+    production_transport: Any,
+    owner_signer: _PhaseBOwnerExternalSigner | None = None,
+    now_unix: int | None = None,
+) -> Mapping[str, Any]:
+    """Collect and owner-sign the exact human production mutation authority."""
+
+    from scripts.canary import passkey_v2_production_storage_growth as storage
+    from scripts.canary import production_cutover_owner_launcher as production
+    from scripts.canary import production_storage_growth_contract as contract
+
+    if not isinstance(production_transport, production.ProductionCutoverTransport):
+        raise OwnerLauncherError("production_storage_iam_transport_invalid")
+    account = owner_identity.account_for_read_only_preflight()
+    if account != contract.AUTHENTICATED_ACCOUNT:
+        raise OwnerLauncherError("production_storage_iam_account_invalid")
+    owner_subject = owner_identity.owner_subject_sha256
+    if not isinstance(owner_subject, str) or _SHA256.fullmatch(owner_subject) is None:
+        raise OwnerLauncherError("production_storage_iam_account_invalid")
+    before = production_transport._authorization_snapshot(account)
+    instance = production_transport._run_read_only_gcloud_json((
+        "compute",
+        "instances",
+        "describe",
+        contract.INSTANCE_NAME,
+        f"--project={contract.PROJECT}",
+        f"--zone={contract.ZONE}",
+        f"--account={account}",
+        "--format=json(id,name,selfLink,zone,status)",
+        "--quiet",
+    ))
+    disk = production_transport._run_read_only_gcloud_json((
+        "compute",
+        "disks",
+        "describe",
+        contract.DISK_NAME,
+        f"--project={contract.PROJECT}",
+        f"--zone={contract.ZONE}",
+        f"--account={account}",
+        "--format=json(id,name,selfLink,zone,status,sizeGb,type,users)",
+        "--quiet",
+    ))
+    if (
+        instance.get("id") != contract.INSTANCE_ID
+        or instance.get("name") != contract.INSTANCE_NAME
+        or instance.get("selfLink") != contract.INSTANCE_SELF_LINK
+        or str(instance.get("zone", "")).rsplit("/", 1)[-1] != contract.ZONE
+        or instance.get("status") != "RUNNING"
+        or disk.get("id") != contract.DISK_ID
+        or disk.get("name") != contract.DISK_NAME
+        or disk.get("selfLink") != contract.DISK_SELF_LINK
+        or str(disk.get("zone", "")).rsplit("/", 1)[-1] != contract.ZONE
+        or disk.get("status") != "READY"
+        or str(disk.get("type", "")).rsplit("/", 1)[-1] != contract.DISK_TYPE
+        or disk.get("users") != [contract.INSTANCE_SELF_LINK]
+    ):
+        raise OwnerLauncherError("production_storage_iam_resource_invalid")
+
+    project_resource = (
+        "//cloudresourcemanager.googleapis.com/projects/"
+        f"{contract.PROJECT}"
+    )
+    instance_resource = (
+        "//compute.googleapis.com/projects/"
+        f"{contract.PROJECT}/zones/{contract.ZONE}/instances/"
+        f"{contract.INSTANCE_NAME}"
+    )
+    disk_resource = (
+        "//compute.googleapis.com/projects/"
+        f"{contract.PROJECT}/zones/{contract.ZONE}/disks/"
+        f"{contract.DISK_NAME}"
+    )
+    iap_resource = (
+        "//iap.googleapis.com/projects/"
+        f"{storage.EXTERNAL_IAM_PROJECT_NUMBER}/iap_tunnel/zones/"
+        f"{contract.ZONE}/instances/{contract.INSTANCE_ID}"
+    )
+    permission_resources = {
+        "compute.disks.get": (
+            disk_resource,
+            "compute.googleapis.com",
+            "compute.googleapis.com/Disk",
+        ),
+        "compute.disks.resize": (
+            disk_resource,
+            "compute.googleapis.com",
+            "compute.googleapis.com/Disk",
+        ),
+        "compute.instances.get": (
+            instance_resource,
+            "compute.googleapis.com",
+            "compute.googleapis.com/Instance",
+        ),
+        "compute.instances.osAdminLogin": (
+            instance_resource,
+            "compute.googleapis.com",
+            "compute.googleapis.com/Instance",
+        ),
+        "iap.tunnelInstances.accessViaIAP": (
+            iap_resource,
+            "iap.googleapis.com",
+            "iap.googleapis.com/TunnelInstance",
+        ),
+    }
+    if set(permission_resources) != set(storage.EXTERNAL_IAM_PERMISSIONS):
+        raise OwnerLauncherError("production_storage_iam_contract_invalid")
+    permissions: dict[str, str] = {}
+    for permission in storage.EXTERNAL_IAM_PERMISSIONS:
+        resource_name, resource_service, resource_type = permission_resources[
+            permission
+        ]
+        result = production_transport._run_read_only_gcloud_json((
+            "policy-intelligence",
+            "troubleshoot-policy",
+            "iam",
+            project_resource,
+            f"--principal-email={account}",
+            f"--permission={permission}",
+            f"--resource-name={resource_name}",
+            f"--resource-service={resource_service}",
+            f"--resource-type={resource_type}",
+            f"--project={contract.PROJECT}",
+            f"--account={account}",
+            "--format=json(overallAccessState)",
+            "--quiet",
+        ))
+        if set(result) != {"overallAccessState"} or result.get(
+            "overallAccessState"
+        ) != "GRANTED":
+            raise OwnerLauncherError("production_storage_iam_permission_denied")
+        permissions[permission] = "GRANTED"
+    after = production_transport._authorization_snapshot(account)
+    owner_identity.require_stable()
+    if after != before:
+        raise OwnerLauncherError("production_storage_iam_authority_changed")
+    current = int(time.time()) if now_unix is None else now_unix
+    if type(current) is not int or current <= 0:
+        raise OwnerLauncherError("production_storage_iam_clock_invalid")
+    signer = owner_signer or _PhaseBOwnerExternalSigner()
+    authority = signer.inspect()
+    if (
+        authority.public_key_ed25519_hex
+        != storage.EXTERNAL_IAM_OWNER_PUBLIC_KEY_ED25519_HEX
+        or authority.key_id != storage.EXTERNAL_IAM_OWNER_KEY_ID
+        or authority.public_fingerprint != PHASE_B_OWNER_PUBLIC_KEY_FINGERPRINT
+    ):
+        raise OwnerLauncherError("production_storage_iam_signer_invalid")
+    unsigned = {
+        "schema": storage.EXTERNAL_IAM_RECEIPT_SCHEMA,
+        "account": account,
+        "owner_subject_sha256": owner_subject,
+        "project": contract.PROJECT,
+        "project_number": storage.EXTERNAL_IAM_PROJECT_NUMBER,
+        "zone": contract.ZONE,
+        "instance_name": contract.INSTANCE_NAME,
+        "instance_id": contract.INSTANCE_ID,
+        "disk_name": contract.DISK_NAME,
+        "disk_id": contract.DISK_ID,
+        "permissions": permissions,
+        "authorization_snapshot_sha256": _sha256(_canonical_bytes(list(before))),
+        "instance_evidence_sha256": _sha256(_canonical_bytes(instance)),
+        "disk_evidence_sha256": _sha256(_canonical_bytes(disk)),
+        "collected_at_unix": current,
+        "expires_at_unix": current + storage.EXTERNAL_IAM_TTL_SECONDS,
+        "owner_public_key_id": authority.key_id,
+    }
+    signed = {
+        **unsigned,
+        "receipt_sha256": _sha256(_canonical_bytes(unsigned)),
+    }
+    signature = signer.sign(
+        _canonical_bytes(signed),
+        namespace=PRODUCTION_STORAGE_IAM_SSHSIG_NAMESPACE,
+        expected_authority=authority,
+    )
+    return storage.validate_external_iam_receipt(
+        {**signed, "signature_sshsig": signature},
+        now_unix=current,
+    )
+
+
+def observe_exact_production_storage_runtime_artifacts(
+    *,
+    release_sha: str,
+    trusted_runtime: TrustedGcloudExecutable,
+) -> Mapping[str, Any]:
+    """Physically attest the fixed sealed owner-side storage artifacts."""
+
+    from scripts.canary import production_storage_growth_contract as contract
+
+    if not isinstance(trusted_runtime, TrustedGcloudExecutable):
+        raise OwnerLauncherError("production_storage_runtime_attestor_invalid")
+    trusted_runtime.trusted_command_prefix()
+    source_root, _site_root = trusted_runtime.trusted_owner_support_paths()
+    manifest = trusted_runtime.sealed_owner_support_manifest(
+        expected_release_sha=release_sha,
+    )
+    try:
+        attestation = contract.observe_runtime_artifact_attestation(
+            source_root=Path(source_root),
+            release_revision=release_sha,
+            owner_support_manifest=manifest,
+        )
+    except contract.ProductionStorageGrowthError:
+        raise OwnerLauncherError(
+            "production_storage_runtime_artifact_observation_invalid"
+        ) from None
+    trusted_runtime.trusted_command_prefix()
+    if trusted_runtime.sealed_owner_support_manifest(
+        expected_release_sha=release_sha,
+    ) != manifest:
+        raise OwnerLauncherError("production_storage_runtime_artifact_changed")
+    return attestation
+
+
+def build_exact_production_storage_growth_plan(
+    *,
+    release_sha: str,
+    source_preflight: Mapping[str, Any],
+    trusted_runtime: TrustedGcloudExecutable,
+    now_unix: int,
+) -> Mapping[str, Any]:
+    """Build the production plan only from freshly measured sealed bytes."""
+
+    from scripts.canary import production_storage_growth_contract as contract
+
+    artifacts = observe_exact_production_storage_runtime_artifacts(
+        release_sha=release_sha,
+        trusted_runtime=trusted_runtime,
+    )
+    try:
+        return contract.build_plan(
+            source_preflight=source_preflight,
+            release_revision=release_sha,
+            runtime_artifact_attestation=artifacts,
+            now_unix=now_unix,
+        )
+    except contract.ProductionStorageGrowthError:
+        raise OwnerLauncherError("production_storage_plan_invalid") from None
+
+
+def invoke_exact_production_storage_growth_owner_cli(
+    *,
+    release_sha: str,
+    operation: str,
+    document: Mapping[str, Any],
+    runner: SubprocessRunner = subprocess.run,
+) -> Mapping[str, Any]:
+    """Invoke the sealed direct CLI without importing it into this process."""
+
+    allowed = {
+        "build-plan",
+        "install-owner-state",
+        "install-guest",
+        "preflight",
+        "request",
+        "apply-or-recover",
+    }
+    if (
+        operation not in allowed
+        or not isinstance(document, Mapping)
+        or not callable(runner)
+    ):
+        raise OwnerLauncherError("production_storage_owner_cli_invalid")
+    launcher_sha256 = require_local_launcher_provenance(release_sha)
+    runtime = require_trusted_owner_runtime(release_sha)
+    source_root, _site_root = runtime.trusted_owner_support_paths()
+    entrypoint = Path(source_root) / (
+        "scripts/canary/production_storage_growth_owner_cli.py"
+    )
+    try:
+        if entrypoint.resolve(strict=True) != entrypoint:
+            raise OwnerLauncherError("production_storage_owner_cli_invalid")
+    except OSError:
+        raise OwnerLauncherError("production_storage_owner_cli_invalid") from None
+    prefix = runtime.trusted_command_prefix()
+    unsigned = {
+        "schema": "muncho-production-storage-growth-owner-cli-frame.v1",
+        "operation": operation,
+        "document": dict(document),
+    }
+    frame = {
+        **unsigned,
+        "frame_sha256": _sha256(_canonical_bytes(unsigned)),
+    }
+    command = (
+        prefix[0],
+        *_GCLOUD_PYTHON_ISOLATION_ARGS,
+        str(entrypoint),
+        "--release-sha",
+        release_sha,
+        operation,
+    )
+    try:
+        completed = runner(
+            command,
+            input=_canonical_bytes(frame),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "HOME": _canonical_owner_home(),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": _FIXED_OWNER_PATH,
+            },
+            timeout=1_200,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise OwnerLauncherError("production_storage_owner_cli_failed") from None
+    if (
+        completed.returncode != 0
+        or not isinstance(completed.stdout, bytes)
+        or not completed.stdout.endswith(b"\n")
+        or completed.stdout.endswith(b"\n\n")
+        or len(completed.stdout) > 2 * 1024 * 1024
+    ):
+        raise OwnerLauncherError("production_storage_owner_cli_failed")
+    try:
+        response = _decode_json_object(
+            completed.stdout[:-1],
+            maximum=2 * 1024 * 1024,
+        )
+    except OwnerLauncherError:
+        raise OwnerLauncherError("production_storage_owner_cli_failed") from None
+    response_unsigned = {
+        name: item for name, item in response.items() if name != "response_sha256"
+    }
+    if (
+        set(response)
+        != {
+            "schema",
+            "operation",
+            "release_sha",
+            "result",
+            "caller_selected_paths_allowed",
+            "caller_selected_commands_allowed",
+            "caller_selected_targets_allowed",
+            "response_sha256",
+        }
+        or response.get("schema")
+        != "muncho-production-storage-growth-owner-cli-response.v1"
+        or response.get("operation") != operation
+        or response.get("release_sha") != release_sha
+        or not isinstance(response.get("result"), Mapping)
+        or response.get("caller_selected_paths_allowed") is not False
+        or response.get("caller_selected_commands_allowed") is not False
+        or response.get("caller_selected_targets_allowed") is not False
+        or response.get("response_sha256")
+        != _sha256(_canonical_bytes(response_unsigned))
+    ):
+        raise OwnerLauncherError("production_storage_owner_cli_failed")
+    runtime.trusted_command_prefix()
+    if require_local_launcher_provenance(release_sha) != launcher_sha256:
+        raise OwnerLauncherError("local_launcher_changed")
+    return dict(response)
+
+
+class ProductionStorageGrowthOwnerRoute:
+    """Fixed owner-side request, consume, apply, and crash recovery route."""
+
+    def __init__(
+        self,
+        *,
+        release_sha: str,
+        owner_identity: GcloudOwnerAccessToken,
+        passkey_boundary: Any,
+        production_transport: Any,
+        runtime_artifact_attestor: Callable[[], Mapping[str, Any]],
+        owner_signer: _PhaseBOwnerExternalSigner | None = None,
+        state_root: Path | None = None,
+        wall_clock: Callable[[], int] = lambda: int(time.time()),
+        expected_state_uid: int = 0,
+        expected_state_gid: int = 0,
+        compute_urlopen: Callable[..., Any] = urllib.request.urlopen,
+        compute_sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        from scripts.canary import production_storage_growth_executor as executor
+
+        if (
+            _RELEASE_SHA.fullmatch(release_sha or "") is None
+            or not callable(getattr(passkey_boundary, "request", None))
+            or not callable(getattr(passkey_boundary, "consume", None))
+            or not callable(getattr(production_transport, "_run_remote_input", None))
+            or not callable(runtime_artifact_attestor)
+            or not callable(wall_clock)
+            or type(expected_state_uid) is not int
+            or expected_state_uid < 0
+            or type(expected_state_gid) is not int
+            or expected_state_gid < 0
+            or not callable(compute_urlopen)
+            or not callable(compute_sleep)
+        ):
+            raise OwnerLauncherError("production_storage_owner_route_invalid")
+        self._release_sha = release_sha
+        self._owner_identity = owner_identity
+        self._boundary = passkey_boundary
+        self._production_transport = production_transport
+        self._runtime_artifact_attestor = runtime_artifact_attestor
+        self._owner_signer = owner_signer
+        self._state_root = state_root or executor.PRODUCTION_STATE_ROOT
+        self._wall_clock = wall_clock
+        self._expected_state_uid = expected_state_uid
+        self._expected_state_gid = expected_state_gid
+        self._compute_urlopen = compute_urlopen
+        self._compute_sleep = compute_sleep
+
+    def _fixed_guest_client(self, *, account: str) -> Any:
+        from scripts.canary import production_storage_growth_adapter as adapter
+
+        def invoke_guest(frame: bytes) -> bytes:
+            completed = self._production_transport._run_remote_input(
+                (adapter.GUEST_ENTRYPOINT,),
+                account=account,
+                input_bytes=frame,
+                maximum_input_bytes=16_384,
+                maximum_output_bytes=64 * 1024,
+                timeout_seconds=300.0,
+            )
+            return completed.stdout
+
+        return adapter.FixedProductionIapGuestClient(
+            invoke_fixed_guest=invoke_guest,
+        )
+
+    def _attest_runtime_artifacts(
+        self,
+        *,
+        expected: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        from scripts.canary import production_storage_growth_contract as contract
+
+        try:
+            observed = contract.validate_runtime_artifact_attestation(
+                self._runtime_artifact_attestor()
+            )
+        except contract.ProductionStorageGrowthError:
+            raise OwnerLauncherError(
+                "production_storage_runtime_artifact_observation_invalid"
+            ) from None
+        except Exception:
+            raise OwnerLauncherError(
+                "production_storage_runtime_artifact_observation_invalid"
+            ) from None
+        if (
+            observed["release_revision"] != self._release_sha
+            or expected is not None
+            and observed != expected
+        ):
+            raise OwnerLauncherError(
+                "production_storage_runtime_artifact_changed"
+            )
+        return observed
+
+    def _owner_artifact_binding(self) -> Mapping[str, Any]:
+        from scripts.canary import production_storage_growth_installer as installer
+
+        return installer.build_owner_artifact_binding(
+            self._release_sha,
+            self._attest_runtime_artifacts(),
+        )
+
+    def install_guest_prerequisite(self) -> Mapping[str, Any]:
+        """Install only the fixed root guest entrypoint through cutover IAP."""
+
+        from scripts.canary import production_storage_growth_installer as installer
+
+        try:
+            binding = self._owner_artifact_binding()
+            owner_readiness = installer.attest_owner_state_root(
+                self._release_sha,
+                sealed_artifact_binding=binding,
+                state_root=self._state_root,
+                installation_receipt=self._state_root / ".installation.json",
+                expected_uid=self._expected_state_uid,
+                expected_gid=self._expected_state_gid,
+            )
+        except installer.ProductionStorageInstallerError:
+            raise OwnerLauncherError(
+                "production_storage_owner_state_not_installed"
+            ) from None
+        install = getattr(
+            self._production_transport,
+            "install_production_storage_growth_guest",
+            None,
+        )
+        if not callable(install):
+            raise OwnerLauncherError(
+                "production_storage_guest_installer_unavailable"
+            )
+        account = self._owner_identity.account_for_read_only_preflight()
+        request = installer.build_guest_install_request(self._release_sha)
+        try:
+            readiness = install(
+                release_sha=self._release_sha,
+                request=request,
+                account=account,
+            )
+            checked = installer.validate_guest_readiness(
+                readiness,
+                release_sha=self._release_sha,
+                guest_source_sha256=request["guest_source_sha256"],
+                installer_sha256=request["installer_sha256"],
+            )
+        except installer.ProductionStorageInstallerError:
+            raise OwnerLauncherError(
+                "production_storage_guest_installation_failed"
+            ) from None
+        unsigned = {
+            "schema": "muncho-production-storage-growth-prerequisites.v1",
+            "release_sha": self._release_sha,
+            "owner_state_readiness": owner_readiness,
+            "guest_readiness": checked,
+            "sudoers_widened": False,
+            "cloud_resource_mutation_performed": False,
+            "guest_installation_performed": True,
+        }
+        return {**unsigned, "receipt_sha256": _sha256(_canonical_bytes(unsigned))}
+
+    def preflight(
+        self,
+        *,
+        growth_plan: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Prove the real owner state root and fixed production guest handler."""
+
+        from scripts.canary import production_storage_growth_adapter as adapter
+        from scripts.canary import production_storage_growth_contract as contract
+        from scripts.canary import production_storage_growth_guest as guest
+        from scripts.canary import production_storage_growth_installer as installer
+        from scripts.canary import passkey_v2_protocol as protocol
+
+        observation_now_unix = self._wall_clock()
+        plan = contract.validate_plan(growth_plan)
+        contract.validate_observation(
+            plan["source_preflight"],
+            now_unix=observation_now_unix,
+        )
+        try:
+            artifacts = self._attest_runtime_artifacts(
+                expected=plan["runtime_artifact_attestation"]
+            )
+            binding = installer.build_owner_artifact_binding(
+                self._release_sha,
+                artifacts,
+            )
+            owner_readiness = installer.attest_owner_state_root(
+                self._release_sha,
+                sealed_artifact_binding=binding,
+                state_root=self._state_root,
+                installation_receipt=(
+                    self._state_root / ".installation.json"
+                ),
+                expected_uid=self._expected_state_uid,
+                expected_gid=self._expected_state_gid,
+            )
+        except installer.ProductionStorageInstallerError:
+            raise OwnerLauncherError(
+                "production_storage_owner_state_not_installed"
+            ) from None
+        account = self._owner_identity.account_for_read_only_preflight()
+        guest_client = self._fixed_guest_client(account=account)
+        try:
+            guest_readiness = installer.validate_guest_readiness(
+                guest_client.readiness(),
+                release_sha=self._release_sha,
+                guest_source_sha256=installer.source_sha256(
+                    installer.GUEST_SOURCE
+                ),
+                installer_sha256=installer.source_sha256(
+                    Path(installer.__file__)
+                ),
+            )
+        except (
+            adapter.ProductionStorageAdapterError,
+            installer.ProductionStorageInstallerError,
+        ):
+            raise OwnerLauncherError(
+                "production_storage_guest_handler_readiness_invalid"
+            )
+        observed_guest = guest_client.observe()
+        expected_guest = dict(plan["source_preflight"]["guest"])
+        expected_guest.pop("available_bytes")
+        comparable_guest = dict(observed_guest)
+        comparable_guest.pop("available_bytes", None)
+        if comparable_guest != expected_guest:
+            raise OwnerLauncherError(
+                "production_storage_guest_handler_readiness_invalid"
+            )
+        iam_now_unix = self._wall_clock()
+        iam = collect_fresh_production_storage_growth_external_iam(
+            owner_identity=self._owner_identity,
+            production_transport=self._production_transport,
+            owner_signer=self._owner_signer,
+            now_unix=iam_now_unix,
+        )
+        unsigned = {
+            "schema": "muncho-production-storage-growth-owner-readiness.v1",
+            "release_sha": self._release_sha,
+            "plan_sha256": plan["plan_sha256"],
+            "guest_entrypoint": adapter.GUEST_ENTRYPOINT,
+            "guest_request_schema": guest.REQUEST_SCHEMA,
+            "guest_response_schema": guest.RESPONSE_SCHEMA,
+            "guest_observation_sha256": protocol.sha256_json(observed_guest),
+            "guest_installation_readiness": guest_readiness,
+            "owner_state_readiness": owner_readiness,
+            "owner_state_root": str(self._state_root),
+            "owner_state_uid": owner_readiness["state_root_uid"],
+            "owner_state_gid": owner_readiness["state_root_gid"],
+            "owner_state_mode": "0700",
+            "external_iam_receipt": iam,
+            "production_handler_ready": True,
+            "observed_at_unix": iam_now_unix,
+        }
+        return {**unsigned, "receipt_sha256": _sha256(_canonical_bytes(unsigned))}
+
+    def request(
+        self,
+        *,
+        growth_plan: Mapping[str, Any],
+        authorization_nonce_sha256: str,
+    ) -> Mapping[str, Any]:
+        from scripts.canary import passkey_v2_production_storage_growth as storage
+        from scripts.canary import production_storage_growth_contract as contract
+
+        plan = contract.validate_plan(growth_plan)
+        self._attest_runtime_artifacts(
+            expected=plan["runtime_artifact_attestation"]
+        )
+        readiness = self.preflight(growth_plan=plan)
+        now_unix = self._wall_clock()
+        iam = storage.validate_external_iam_receipt(
+            readiness["external_iam_receipt"],
+            now_unix=now_unix,
+        )
+        requested = self._boundary.request(
+            growth_plan=plan,
+            authorization_nonce_sha256=authorization_nonce_sha256,
+            external_iam_receipt=iam,
+            now_unix=now_unix,
+        )
+        unsigned = {
+            "schema": "muncho-production-storage-growth-owner-request.v1",
+            "passkey_request": requested,
+            "owner_readiness_receipt_sha256": readiness["receipt_sha256"],
+            "external_iam_receipt": iam,
+            "production_mutation_performed": False,
+        }
+        return {**unsigned, "receipt_sha256": _sha256(_canonical_bytes(unsigned))}
+
+    def apply_or_recover(
+        self,
+        *,
+        growth_plan: Mapping[str, Any],
+        request_id: str,
+        consume_attempt_id: str,
+        external_iam_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+        from scripts.canary import passkey_v2_production_storage_growth as storage
+        from scripts.canary import production_storage_growth_adapter as adapter
+        from scripts.canary import production_storage_growth_contract as contract
+        from scripts.canary import production_storage_growth_executor as executor
+        from scripts.canary import production_storage_growth_installer as installer
+
+        now_unix = self._wall_clock()
+        plan = contract.validate_plan(growth_plan)
+        self._attest_runtime_artifacts(
+            expected=plan["runtime_artifact_attestation"]
+        )
+        authorized_iam = storage.validate_external_iam_receipt(
+            external_iam_receipt,
+            now_unix=now_unix,
+            minimum_remaining_seconds=0,
+        )
+        consumed = self._boundary.consume(
+            growth_plan=plan,
+            request_id=request_id,
+            consume_attempt_id=consume_attempt_id,
+            external_iam_receipt=authorized_iam,
+            now_unix=now_unix,
+        )
+        apply_iam = collect_fresh_production_storage_growth_external_iam(
+            owner_identity=self._owner_identity,
+            production_transport=self._production_transport,
+            owner_signer=self._owner_signer,
+            now_unix=self._wall_clock(),
+        )
+        stable_names = (
+            "account",
+            "owner_subject_sha256",
+            "project",
+            "project_number",
+            "zone",
+            "instance_name",
+            "instance_id",
+            "disk_name",
+            "disk_id",
+            "permissions",
+            "authorization_snapshot_sha256",
+            "instance_evidence_sha256",
+            "disk_evidence_sha256",
+            "owner_public_key_id",
+        )
+        if any(apply_iam[name] != authorized_iam[name] for name in stable_names):
+            raise OwnerLauncherError("production_storage_iam_authority_changed")
+        self._owner_identity.bind_approved_subject(
+            _sha256(contract.AUTHENTICATED_ACCOUNT.encode("utf-8"))
+        )
+        self._owner_identity.require_stable()
+        account = self._owner_identity.approved_account
+
+        cloud = adapter.FixedProductionComputeClient(
+            token_provider=self._owner_identity,
+            account_provider=lambda: self._owner_identity.approved_account,
+            urlopen=self._compute_urlopen,
+            sleep=self._compute_sleep,
+        )
+        guest_client = self._fixed_guest_client(account=account)
+        try:
+            guest_runtime_readiness = installer.validate_guest_readiness(
+                guest_client.readiness(),
+                release_sha=self._release_sha,
+                guest_source_sha256=plan["mutation_wrapper_sha256"],
+                installer_sha256=plan["installer_sha256"],
+            )
+        except (
+            adapter.ProductionStorageAdapterError,
+            installer.ProductionStorageInstallerError,
+        ):
+            raise OwnerLauncherError(
+                "production_storage_guest_handler_readiness_invalid"
+            ) from None
+        transport = adapter.FixedProductionStorageAdapter(
+            growth_plan=plan,
+            cloud=cloud,
+            guest_client=guest_client,
+            wall_clock=self._wall_clock,
+        )
+        try:
+            receipt_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(
+                consumed["receipt_public_key_ed25519_hex"]
+            ))
+            authorization_bundle = consumed["authorization_bundle"]
+            runtime_binding = authorization_bundle["authorization_receipt"][
+                "runtime_binding"
+            ]
+        except (KeyError, TypeError, ValueError):
+            raise OwnerLauncherError(
+                "production_storage_authorization_response_invalid"
+            ) from None
+        executed = executor.ProductionStorageGrowthExecutor(
+            state_root=self._state_root,
+            transport=transport,
+            receipt_public_key=receipt_key,
+            runtime_binding=runtime_binding,
+            read_only_collector_sha256=plan["read_only_collector_sha256"],
+            runtime_artifact_attestor=self._runtime_artifact_attestor,
+            wall_clock=self._wall_clock,
+            expected_state_uid=self._expected_state_uid,
+            expected_state_gid=self._expected_state_gid,
+        ).execute(
+            growth_plan=plan,
+            authorization_bundle=authorization_bundle,
+        )
+        self._owner_identity.require_stable()
+        unsigned = {
+            "schema": "muncho-production-storage-growth-owner-terminal.v1",
+            "state": executed["state"],
+            "release_sha": self._release_sha,
+            "plan_sha256": plan["plan_sha256"],
+            "authorized_external_iam_receipt_sha256": authorized_iam[
+                "receipt_sha256"
+            ],
+            "apply_external_iam_receipt_sha256": apply_iam["receipt_sha256"],
+            "authorization_bundle_sha256": authorization_bundle["bundle_sha256"],
+            "executor_result": executed,
+            "guest_runtime_readiness_sha256": guest_runtime_readiness[
+                "readiness_sha256"
+            ],
+            "owner_identity_stable": True,
+        }
+        return {**unsigned, "receipt_sha256": _sha256(_canonical_bytes(unsigned))}
+
+
+def build_exact_production_storage_growth_boundary(
+    *,
+    release_sha: str,
+    owner_identity: GcloudOwnerAccessToken,
+    gcloud_executable: TrustedGcloudExecutable,
+    gcloud_configuration: PinnedGcloudConfiguration,
+    host_identity: StableOwnerGateHostIdentity | None = None,
+    known_hosts: StableKnownHosts | None = None,
+    popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    timeout_seconds: float = 900.0,
+) -> Any:
+    """Build the exact production-storage Passkey boundary over fixed IAP."""
+
+    from scripts.canary import passkey_v2_production_storage_growth as storage
+
+    transport = OwnerGateIapTransport(
+        release_sha=release_sha,
+        owner_identity=owner_identity,
+        gcloud_executable=gcloud_executable,
+        gcloud_configuration=gcloud_configuration,
+        host_identity=host_identity,
+        known_hosts=known_hosts,
+        popen_factory=popen_factory,
+        timeout_seconds=timeout_seconds,
+    )
+    return storage.ProductionStoragePasskeyBoundary(release_sha, transport)
+
+
+def build_exact_production_storage_growth_owner_route(
+    *,
+    release_sha: str,
+    owner_identity: GcloudOwnerAccessToken,
+    gcloud_executable: TrustedGcloudExecutable,
+    gcloud_configuration: PinnedGcloudConfiguration,
+    owner_gate_host_identity: StableOwnerGateHostIdentity | None = None,
+    owner_gate_known_hosts: StableKnownHosts | None = None,
+    production_known_hosts: Any | None = None,
+    owner_signer: _PhaseBOwnerExternalSigner | None = None,
+    state_root: Path | None = None,
+    popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    preflight_runner: SubprocessRunner = subprocess.run,
+    wall_clock: Callable[[], int] = lambda: int(time.time()),
+    expected_state_uid: int = 0,
+    expected_state_gid: int = 0,
+) -> ProductionStorageGrowthOwnerRoute:
+    """Assemble the fixed owner-gate auth edge and owner-side production edge."""
+
+    from scripts.canary import production_cutover_owner_launcher as production
+
+    boundary = build_exact_production_storage_growth_boundary(
+        release_sha=release_sha,
+        owner_identity=owner_identity,
+        gcloud_executable=gcloud_executable,
+        gcloud_configuration=gcloud_configuration,
+        host_identity=owner_gate_host_identity,
+        known_hosts=owner_gate_known_hosts,
+        popen_factory=popen_factory,
+    )
+    production_transport = production.ProductionCutoverTransport(
+        owner_identity,
+        gcloud_executable=gcloud_executable,
+        gcloud_configuration=gcloud_configuration,
+        known_hosts=production_known_hosts,
+        popen_factory=popen_factory,
+        preflight_runner=preflight_runner,
+    )
+    return ProductionStorageGrowthOwnerRoute(
+        release_sha=release_sha,
+        owner_identity=owner_identity,
+        passkey_boundary=boundary,
+        production_transport=production_transport,
+        runtime_artifact_attestor=lambda: (
+            observe_exact_production_storage_runtime_artifacts(
+                release_sha=release_sha,
+                trusted_runtime=gcloud_executable,
+            )
+        ),
+        owner_signer=owner_signer,
+        state_root=state_root,
+        wall_clock=wall_clock,
+        expected_state_uid=expected_state_uid,
+        expected_state_gid=expected_state_gid,
+    )
 
 
 def validate_owner_gate_activation_response(
@@ -21269,6 +22148,7 @@ __all__ = [
     "OwnerStdinDiscordTokenReader",
     "PinnedGoogleComputeKnownHosts",
     "PinnedGcloudConfiguration",
+    "ProductionStorageGrowthOwnerRoute",
     "PROJECT",
     "RECOVERY_ACK_FRAME_MAGIC",
     "RECOVERY_ACK_FRAME_SCHEMA",
@@ -21336,6 +22216,9 @@ __all__ = [
     "build_discord_retirement_ack",
     "build_discord_retirement_ack_frame",
     "build_final_approval_frame",
+    "build_exact_production_storage_growth_boundary",
+    "build_exact_production_storage_growth_plan",
+    "build_exact_production_storage_growth_owner_route",
     "build_schema_reconciliation_admin_cleanup",
     "build_schema_reconciliation_admin_preflight",
     "build_schema_reconciliation_executor_cleanup",
@@ -21348,12 +22231,15 @@ __all__ = [
     "bootstrap_schema_reconciliation_control",
     "activate_trusted_owner_support",
     "install_owner_gate_activation_seal",
+    "invoke_exact_production_storage_growth_owner_cli",
     "harden_owner_secret_process",
     "launch_full_canary",
     "launch_session_bound_full_canary",
     "apply_phase_b_foundation",
     "collect_fresh_writer_external_iam",
+    "collect_fresh_production_storage_growth_external_iam",
     "main",
+    "observe_exact_production_storage_runtime_artifacts",
     "reconcile_legacy_canary_schema",
     "require_local_launcher_provenance",
     "require_trusted_owner_support_activation",

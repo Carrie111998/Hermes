@@ -599,13 +599,21 @@ def _environment(
         source / "scripts/canary/owner_gate_activation_evidence_stager.py",
         b"VALUE = 'activation-evidence-stager'\n",
     )
+    production_payloads = (
+        "scripts/canary/passkey_v2_production_storage_growth.py",
+        "scripts/canary/production_storage_growth_contract.py",
+    )
+    for relative in production_payloads:
+        _write(source / relative, f"VALUE = {relative!r}\n".encode("ascii"))
     monkeypatch.setattr(
         package,
         "ROOT_RUNTIME_FILES",
         (
             "scripts/canary/owner_gate_activation_evidence_stager.py",
             "scripts/canary/owner_gate_activation_seal.py",
+            "scripts/canary/passkey_v2_production_storage_growth.py",
             "scripts/canary/passkey_v2_service.py",
+            "scripts/canary/production_storage_growth_contract.py",
         ),
     )
     wheel_root, wheel_manifest = _wheelhouse(tmp_path)

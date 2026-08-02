@@ -392,6 +392,60 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
             process_isolated_preflight_runner
         )
 
+    def install_production_storage_growth_guest(
+        self,
+        *,
+        release_sha: str,
+        request: Mapping[str, Any],
+        account: str,
+    ) -> Mapping[str, Any]:
+        """Install one digest-bound root guest entrypoint; no sudoers grant."""
+
+        from scripts.canary import production_storage_growth_installer as installer
+
+        expected = installer.build_guest_install_request(release_sha)
+        if request != expected:
+            raise OwnerCutoverError(
+                "owner_cutover_production_storage_install_invalid"
+            )
+        source_root = self._prepare_source(release_sha, account=account)
+        remote_installer = (
+            f"{source_root}/scripts/canary/"
+            "production_storage_growth_installer.py"
+        )
+        completed = self._run_remote_input(
+            (
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                "-B",
+                remote_installer,
+                "install-guest",
+            ),
+            account=account,
+            input_bytes=installer.canonical_json_bytes(expected),
+            maximum_input_bytes=64 * 1024,
+            maximum_output_bytes=64 * 1024,
+            timeout_seconds=300.0,
+        )
+        raw = completed.stdout
+        if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+            raise OwnerCutoverError(
+                "owner_cutover_production_storage_install_invalid"
+            )
+        readiness = installer.decode_canonical_json(raw[:-1])
+        try:
+            return installer.validate_guest_readiness(
+                readiness,
+                release_sha=release_sha,
+                guest_source_sha256=expected["guest_source_sha256"],
+                installer_sha256=expected["installer_sha256"],
+            )
+        except installer.ProductionStorageInstallerError:
+            raise OwnerCutoverError(
+                "owner_cutover_production_storage_install_invalid"
+            ) from None
+
     def _remote_argv(
         self,
         remote_argv: Sequence[str],
