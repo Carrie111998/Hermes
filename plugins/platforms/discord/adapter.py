@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import contextvars
 import datetime as dt
 import hashlib
 import inspect
@@ -326,6 +327,134 @@ def _looks_like_nonconversational_history_message(content: str) -> bool:
     """Fallback recognizer for legacy status bumps missing persisted IDs."""
     text = content or ""
     return any(pattern.match(text) for pattern in _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS)
+
+
+# ── delivery-path target validation (docs/specs/discord-delivery-acceptance.md) ──
+# A Discord snowflake is a positive 64-bit integer written in ASCII decimal
+# digits.  ``int()`` is far more permissive than that: it accepts a sign
+# ("+123"), PEP 515 separators ("1_2" -> 12), surrounding whitespace
+# ("\n123\t") and non-ASCII decimal digits ("١٢٣" -> 123).  Each of those
+# addresses a DIFFERENT channel than the operator typed, so the delivery path
+# validates with this pattern BEFORE any int() (spec §2).
+_DISCORD_SNOWFLAKE_RE = re.compile(r"[1-9][0-9]{0,19}")
+# URL-shaped substrings are stripped from provider errors before they reach a
+# log record or SendResult.error: a Discord API error routinely embeds the
+# request URL, and a request URL can carry credentials (spec §4.4).
+_DISCORD_URL_IN_ERROR_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://\S+")
+# Caller-supplied literals (bot token, message body) are redacted from error
+# text only when at least this long — replacing a one-character chunk would
+# shred the diagnostic itself.
+_DISCORD_MIN_REDACTABLE_LEN = 12
+_DISCORD_ERROR_MAX_LEN = 300
+_DISCORD_TARGET_REPR_MAX_LEN = 80
+# Re-entrancy guard for the base-class recovery wrapper (spec §5.6).  A
+# ContextVar rather than an instance attribute: asyncio tasks copy the context
+# at creation, so concurrent sends on other tasks cannot see each other's
+# state, and there is nothing to clean up if a task is cancelled.
+_discord_acceptance_guard: contextvars.ContextVar = contextvars.ContextVar(
+    "discord_delivery_acceptance_guard", default=None,
+)
+
+
+def _valid_discord_id(value: Any) -> Optional[int]:
+    """Return ``value`` as an id when it is a valid snowflake, else ``None``.
+
+    Accepts a positive ``int`` (``bool`` excluded — ``True`` is not channel 1)
+    or a string that, after exactly one ``strip()``, is ASCII decimal digits
+    with no leading zero and at most 20 digits.  Everything else is invalid
+    and must never reach ``int()``.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        candidate = value.strip()
+        if _DISCORD_SNOWFLAKE_RE.fullmatch(candidate):
+            return int(candidate)
+    return None
+
+
+def _discord_channel_name_target(value: Any) -> Optional[str]:
+    """Return the bare channel name of a name-shaped target, else ``None``.
+
+    Name-shaped means: a string that is not a valid id (spec §2) and that,
+    after one ``strip()`` and removing at most one leading ``#``, is neither
+    empty nor whitespace-only.  ``"#"`` alone is therefore NOT name-shaped.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or _valid_discord_id(candidate) is not None:
+        return None
+    if candidate.startswith("#"):
+        candidate = candidate[1:]
+    if not candidate.strip():
+        return None
+    return candidate
+
+
+def _iter_discord_name_candidates(client: Any):
+    """Yield the deterministic candidate set for name resolution (spec §3.2).
+
+    Guild order, then per-collection order: ``text_channels``, ``forums``
+    (when the attribute exists), ``threads``.  Categories, voice channels and
+    DMs never participate.
+    """
+    guilds = getattr(client, "guilds", None)
+    if not guilds:
+        return
+    for guild in guilds:
+        for collection in ("text_channels", "forums", "threads"):
+            for candidate in getattr(guild, collection, None) or ():
+                yield candidate
+
+
+def _match_discord_channels_by_name(client: Any, name: str) -> List[Any]:
+    """Exact, case-sensitive name matches across the candidate set (spec §3.1).
+
+    No prefix, substring, fuzzy or case-insensitive matching: Discord
+    lowercases text-channel names on creation, so ``#General`` where only
+    ``general`` exists is a loud miss, never a guess.  Candidates without a
+    ``name`` attribute are skipped.
+    """
+    return [
+        candidate
+        for candidate in _iter_discord_name_candidates(client)
+        if getattr(candidate, "name", None) == name
+    ]
+
+
+def _sanitize_delivery_error(err: Any, redactions: Tuple[Any, ...] = ()) -> str:
+    """Render a provider error safely for a log record / ``SendResult.error``.
+
+    Strips URL-shaped substrings, redacts caller-supplied literals (bot token,
+    the message body a provider may echo back), collapses whitespace and
+    bounds the length (spec §4.4).  Callers pass the rendered string to
+    ``logger.error`` WITHOUT ``exc_info`` — a traceback is an unbounded,
+    unsanitised channel.
+    """
+    if isinstance(err, BaseException):
+        text = f"{type(err).__name__}: {err}"
+    else:
+        text = str(err)
+    text = _standalone_sanitize_error(text)
+    for secret in redactions:
+        if isinstance(secret, str) and len(secret) >= _DISCORD_MIN_REDACTABLE_LEN:
+            text = text.replace(secret, "<redacted>")
+    text = _DISCORD_URL_IN_ERROR_RE.sub("<url>", text)
+    text = " ".join(text.split())
+    if len(text) > _DISCORD_ERROR_MAX_LEN:
+        text = text[:_DISCORD_ERROR_MAX_LEN] + _DISCORD_ELLIPSIS
+    return text
+
+
+def _discord_target_repr(target: Any) -> str:
+    """Bounded repr of a requested target for diagnostics (spec §4.4)."""
+    text = repr(target)
+    if len(text) > _DISCORD_TARGET_REPR_MAX_LEN:
+        text = text[:_DISCORD_TARGET_REPR_MAX_LEN] + _DISCORD_ELLIPSIS
+    return text
 
 
 def _clean_discord_id(entry: str) -> str:
@@ -2952,6 +3081,167 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    async def _resolve_delivery_target(
+        self, target: Any, *, kind: str,
+    ) -> Tuple[Any, Optional[str]]:
+        """Resolve a channel/thread target to a channel object (spec §2/§3).
+
+        Returns ``(channel, None)`` on success and ``(None, error)`` on every
+        failure, so the caller reports it once and loudly.  A valid snowflake
+        is looked up by id; a name-shaped target is resolved by an exact,
+        case-sensitive scan of the connected guilds and the resolved object is
+        used directly (no ``int()`` round trip, no second lookup); anything
+        else is rejected before ``int()`` ever sees it.
+        """
+        channel_id = _valid_discord_id(target)
+        if channel_id is not None:
+            channel = self._client.get_channel(channel_id)
+            if not channel:
+                try:
+                    channel = await self._client.fetch_channel(channel_id)
+                except Exception as e:
+                    return None, (
+                        f"{kind} {channel_id} lookup failed: "
+                        f"{_sanitize_delivery_error(e)}"
+                    )
+            if not channel:
+                return None, f"{kind} {channel_id} not found"
+            return channel, None
+
+        name = _discord_channel_name_target(target)
+        if name is None:
+            return None, (
+                f"Invalid Discord {kind.lower()} target {_discord_target_repr(target)}: "
+                "not a snowflake id and not a channel name"
+            )
+        matches = _match_discord_channels_by_name(self._client, name)
+        if not matches:
+            return None, (
+                f"No Discord channel or thread named {name!r} (exact, case-sensitive) "
+                f"in any connected guild — requested {kind.lower()} target "
+                f"{_discord_target_repr(target)}"
+            )
+        if len(matches) > 1:
+            ids = ", ".join(str(getattr(match, "id", "?")) for match in matches)
+            return None, (
+                f"Ambiguous Discord {kind.lower()} target {name!r}: {len(matches)} "
+                f"channels/threads share that name (ids: {ids}) — address it by id"
+            )
+        return matches[0], None
+
+    async def _verify_posted_message(
+        self, channel: Any, posted_id: Any,
+    ) -> Optional[Tuple[str, str]]:
+        """Read a just-posted message back from ``channel`` (spec §5.1/§5.2).
+
+        Returns ``None`` when the target hands back a message whose id equals
+        the posted id, else ``(reason, detail)``.  Never re-posts, deletes or
+        otherwise mutates the channel: the side effect stands, the caller
+        reports it as unverified.
+        """
+        fetch = getattr(channel, "fetch_message", None)
+        if not callable(fetch):
+            return ("no_read_back_capability", "target exposes no callable fetch_message")
+        try:
+            fetched = await fetch(posted_id)
+        except Exception as e:
+            return ("read_back_error", _sanitize_delivery_error(e))
+        if fetched is None:
+            return ("read_back_absent", "target returned no message for the posted id")
+        fetched_id = getattr(fetched, "id", None)
+        if str(fetched_id) != str(posted_id):
+            return ("read_back_id_mismatch", f"target returned id {fetched_id}")
+        return None
+
+    async def _post_chunk(
+        self, channel: Any, chunk: str, reference: Any, reply_to: Optional[str],
+    ) -> Tuple[Any, bool]:
+        """Post one chunk, retrying once without a rejected reply reference.
+
+        Returns ``(message, reference_dropped)``.  The reply-reference retry is
+        a recovery, not a delivery failure, so it keeps its warning level
+        (spec §7).
+        """
+        try:
+            return await channel.send(content=chunk, reference=reference), False
+        except Exception as e:
+            err_text = str(e)
+            if (
+                reference is not None
+                and (
+                    (
+                        "error code: 50035" in err_text
+                        and "Cannot reply to a system message" in err_text
+                    )
+                    or "error code: 10008" in err_text
+                )
+            ):
+                logger.warning(
+                    "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
+                    self.name,
+                    reply_to,
+                )
+                return await channel.send(content=chunk, reference=None), True
+            raise
+
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+    ) -> SendResult:
+        """Base recovery wrapper, made safe for delivery acceptance (spec §5.6).
+
+        The base wrapper reacts to a failed send by calling ``send()`` again
+        (retry loop and plain-text fallback).  After an acceptance failure the
+        message is ALREADY in the channel, so a second call would duplicate a
+        user-visible message.  Arming this guard makes those re-entrant calls
+        short-circuit and return the original acceptance failure.
+        """
+        token = _discord_acceptance_guard.set({"result": None})
+        try:
+            return await super()._send_with_retry(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+                max_retries=max_retries,
+                base_delay=base_delay,
+            )
+        finally:
+            _discord_acceptance_guard.reset(token)
+
+    def _delivery_redactions(self, content: Optional[str]) -> Tuple[Any, ...]:
+        """Literals that must never appear in a delivery diagnostic (spec §4.4).
+
+        Provider errors echo back both the request URL (which can carry the bot
+        token) and, for validation errors, the message body.
+        """
+        return (getattr(self.config, "token", None), content)
+
+    def _fail_delivery(
+        self,
+        error: str,
+        *,
+        message_id: Optional[str] = None,
+        raw_response: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Report a delivery failure exactly once, at ERROR level (spec §4).
+
+        No ``exc_info``: ``error`` is already sanitised and bounded, whereas a
+        rendered traceback is an unbounded, unsanitised channel.
+        """
+        logger.error("[%s] %s", self.name, error)
+        return SendResult(
+            success=False,
+            error=error,
+            message_id=message_id,
+            raw_response=raw_response,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -2966,9 +3256,29 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Forum channels (type 15) reject direct messages — a thread post is
         created automatically.
+
+        The target is resolved by strict snowflake validation or exact
+        channel-name lookup, and every posted chunk is read back from the
+        target before the send is reported as a success
+        (docs/specs/discord-delivery-acceptance.md).
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+
+        # §5.6: the base recovery wrapper re-enters send() after a failure.
+        # An acceptance failure means the message already landed, so posting
+        # again would duplicate it — return the original failure instead.
+        # Reported at warning level: the failure itself already emitted its
+        # one ERROR record (§4.2), and this is the same failure, not a new one.
+        guard = _discord_acceptance_guard.get()
+        if guard is not None and guard.get("result") is not None:
+            logger.warning(
+                "[%s] Suppressing re-entrant send after unverified delivery of message %s "
+                "— the post already landed; re-sending would duplicate it",
+                self.name,
+                guard["result"].message_id,
+            )
+            return guard["result"]
 
         try:
             # Determine target channel: thread_id in metadata takes precedence.
@@ -2979,19 +3289,16 @@ class DiscordAdapter(BasePlatformAdapter):
             final_delivery = bool(metadata and metadata.get("notify"))
 
             if thread_id:
-                # Fetch the thread directly — threads are addressed by their own ID.
-                channel = self._client.get_channel(int(thread_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(thread_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Thread {thread_id} not found")
+                # Threads are addressed by their own ID (or name).
+                channel, resolve_error = await self._resolve_delivery_target(
+                    thread_id, kind="Thread",
+                )
             else:
-                # Get the parent channel
-                channel = self._client.get_channel(int(chat_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Channel {chat_id} not found")
+                channel, resolve_error = await self._resolve_delivery_target(
+                    chat_id, kind="Channel",
+                )
+            if channel is None:
+                return self._fail_delivery(resolve_error)
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
@@ -3009,8 +3316,12 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            message_ids = []
+            message_ids: List[str] = []
+            verified_ids: List[str] = []
+            acceptance: Optional[Dict[str, Any]] = None
+            send_error: Optional[str] = None
             reference = None
+            redactions = self._delivery_redactions(content)
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -3028,38 +3339,40 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
+                    msg, reference_dropped = await self._post_chunk(
+                        channel, chunk, chunk_reference, reply_to,
                     )
                 except Exception as e:
-                    err_text = str(e)
-                    if (
-                        chunk_reference is not None
-                        and (
-                            (
-                                "error code: 50035" in err_text
-                                and "Cannot reply to a system message" in err_text
-                            )
-                            or "error code: 10008" in err_text
-                        )
-                    ):
-                        logger.warning(
-                            "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
-                            self.name,
-                            reply_to,
-                        )
-                        reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
-                    else:
-                        raise
-                message_ids.append(str(msg.id))
+                    send_error = (
+                        f"Discord send failed on chunk {i + 1}/{len(chunks)} to "
+                        f"{_discord_target_repr(thread_id or chat_id)}: "
+                        f"{_sanitize_delivery_error(e, redactions)}"
+                    )
+                    break
+                if reference_dropped:
+                    reference = None
+                posted_id = str(msg.id)
+                message_ids.append(posted_id)
+
+                # §5: posted is not delivered.  Read the id back from the same
+                # target before counting the chunk as accepted, and stop at the
+                # first chunk that fails (§5.5) — never re-post (§5.4).
+                failure = await self._verify_posted_message(channel, msg.id)
+                if failure is not None:
+                    reason, detail = failure
+                    acceptance = {
+                        "reason": reason,
+                        "detail": detail,
+                        "unverified_message_id": posted_id,
+                        "verified_message_ids": list(verified_ids),
+                    }
+                    break
+                verified_ids.append(posted_id)
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
+            # §5.8: this records what is really IN the channel, so it reflects
+            # what was posted regardless of the acceptance outcome.
             if message_ids:
                 _target_id = thread_id or chat_id
                 if nonconversational:
@@ -3067,11 +3380,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
 
-            result = SendResult(
-                success=True,
-                message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
-            )
+            if send_error is not None:
+                result = self._fail_delivery(
+                    send_error, raw_response={"message_ids": message_ids},
+                )
+            elif acceptance is not None:
+                result = self._fail_delivery(
+                    f"Discord accepted message {acceptance['unverified_message_id']} but it "
+                    f"could not be read back from "
+                    f"{_discord_target_repr(thread_id or chat_id)} "
+                    f"({acceptance['reason']}: {acceptance['detail']}) — delivery unverified",
+                    # Repair evidence (§5.3): the posted ids survive the failure.
+                    message_id=message_ids[0],
+                    raw_response={
+                        "message_ids": message_ids,
+                        "delivery_acceptance": acceptance,
+                    },
+                )
+                if guard is not None and guard.get("result") is None:
+                    guard["result"] = result
+            else:
+                result = SendResult(
+                    success=True,
+                    message_id=message_ids[0] if message_ids else None,
+                    raw_response={"message_ids": message_ids}
+                )
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
@@ -3082,8 +3415,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return result
 
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            result = SendResult(success=False, error=str(e))
+            error = (
+                "Failed to send Discord message: "
+                f"{_sanitize_delivery_error(e, self._delivery_redactions(content))}"
+            )
+            logger.error("[%s] %s", self.name, error)
+            result = SendResult(success=False, error=error)
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
