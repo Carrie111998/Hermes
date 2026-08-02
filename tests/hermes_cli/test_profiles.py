@@ -142,6 +142,10 @@ class TestCreateProfile:
         (default_home / "config.yaml").write_text("model: test")
         (default_home / ".env").write_text("KEY=val")
         (default_home / "SOUL.md").write_text("Be helpful.")
+        memories = default_home / "memories"
+        memories.mkdir()
+        (memories / "MEMORY.md").write_text("Curated agent memory.")
+        (memories / "USER.md").write_text("Curated user context.")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
@@ -150,6 +154,8 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (profile_dir / "memories" / "MEMORY.md").read_text() == "Curated agent memory."
+        assert (profile_dir / "memories" / "USER.md").read_text() == "Curated user context."
 
 
 
