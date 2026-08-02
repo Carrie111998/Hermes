@@ -131,6 +131,9 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
     assert len(posts) == 1
     assert posts[0]["session_id"] == "raw-sid-123"
     assert tid in posts[0]["text"]
+    assert "done once" in posts[0]["text"]
+    assert "ask what they would like to move to next" in posts[0]["text"]
+    assert "Suggest 2 or 3 concrete candidates" in posts[0]["text"]
     # The wake self-post IS the delivery on this path (no separate text-ping
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
