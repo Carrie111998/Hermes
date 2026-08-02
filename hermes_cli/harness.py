@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import platform
-import shutil
 import subprocess
 import sys
 import time
@@ -134,8 +133,15 @@ def _start_command(script_path: Path) -> list[str]:
     if configured_python:
         return [str(configured_python), str(script_path)]
 
-    if (script_path.parent / "pyproject.toml").is_file() and shutil.which("uv"):
-        return ["uv", "run", "--frozen", "python", str(script_path)]
+    if (script_path.parent / "pyproject.toml").is_file():
+        try:
+            from hermes_cli.managed_uv import resolve_uv
+
+            uv_bin = resolve_uv()
+        except Exception:
+            uv_bin = None
+        if uv_bin:
+            return [uv_bin, "run", "--frozen", "python", str(script_path)]
 
     return [sys.executable or "python", str(script_path)]
 

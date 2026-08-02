@@ -133,7 +133,8 @@ def test_start_command_keeps_uv_lockfile_frozen(monkeypatch, tmp_path):
     monkeypatch.delenv("HYPURA_HARNESS_PYTHON", raising=False)
     monkeypatch.setattr(harness_mod, "_harness_config", lambda: {})
     monkeypatch.setattr(
-        harness_mod.shutil, "which", lambda name: name if name == "uv" else None
+        "hermes_cli.managed_uv.resolve_uv",
+        lambda: "uv",
     )
 
     assert harness_mod._start_command(script_path) == [
