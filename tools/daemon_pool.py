@@ -49,16 +49,32 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
+            if hasattr(self, "_create_worker_context"):
+                # CPython 3.14+ removed _initializer/_initargs and replaced
+                # them with _create_worker_context(); the worker signature
+                # became (executor_reference, ctx, work_queue).  See issue
+                # #76621.
+                t = threading.Thread(
+                    name=thread_name,
+                    target=_worker,
+                    args=(
+                        weakref.ref(self, weakref_cb),
+                        self._create_worker_context(),
+                        self._work_queue,
+                    ),
+                    daemon=True,
+                )
+            else:
+                t = threading.Thread(
+                    name=thread_name,
+                    target=_worker,
+                    args=(
+                        weakref.ref(self, weakref_cb),
+                        self._work_queue,
+                        self._initializer,
+                        self._initargs,
+                    ),
+                    daemon=True,
+                )
             t.start()
             self._threads.add(t)

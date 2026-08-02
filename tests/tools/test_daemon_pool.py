@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest import mock
 
 from concurrent.futures.thread import _threads_queues
 
@@ -73,3 +74,32 @@ def _repo_root():
     import pathlib
 
     return pathlib.Path(__file__).resolve().parents[2]
+
+
+def test_py314_worker_context_branch_spawns_worker_with_ctx():
+    """#76621: on Python 3.14 the executor exposes _create_worker_context
+    instead of _initializer/_initargs; _adjust_thread_count must pass the
+    context object to _worker rather than the removed attributes.
+
+    Simulate the 3.14 shape by attaching _create_worker_context to a real
+    pool instance and capturing the Thread constructor args (the thread is
+    never actually started, so the interpreter-local _worker signature is
+    irrelevant).
+    """
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    ctx = object()
+    pool._create_worker_context = lambda: ctx  # simulate 3.14 layout
+    try:
+        with mock.patch("tools.daemon_pool.threading.Thread") as thread_cls:
+            thread_cls.return_value.start = mock.Mock()
+            pool._adjust_thread_count()
+        thread_cls.assert_called_once()
+        _, kwargs = thread_cls.call_args
+        args = kwargs["args"]
+        # (executor_ref, ctx, work_queue) — 3.14 worker signature
+        assert len(args) == 3
+        assert args[1] is ctx
+        assert args[2] is pool._work_queue
+        assert kwargs["daemon"] is True
+    finally:
+        pool.shutdown(wait=True)
