@@ -2817,6 +2817,9 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_INTERNAL_REVIEW_REMEDIATION_PREFIX = "review-remediation:"
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2844,6 +2847,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    _allow_internal_idempotency: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3042,6 +3046,11 @@ def create_task(
     # acceptable: two concurrent creators with the same key might both
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
+        if (
+            idempotency_key.startswith(_INTERNAL_REVIEW_REMEDIATION_PREFIX)
+            and not _allow_internal_idempotency
+        ):
+            raise ValueError("review remediation idempotency keys are reserved")
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
@@ -4312,6 +4321,14 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+_UNSUCCESSFUL_PARENT_OUTCOMES = frozenset({
+    "changes_requested",
+    "submitted_for_review",
+    "github_pr_superseded",
+    "github_pr_closed",
+})
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4361,12 +4378,20 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, r.outcome "
+                "FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
+                "LEFT JOIN task_runs r ON r.id = COALESCE(t.current_run_id, "
+                "(SELECT latest.id FROM task_runs latest WHERE latest.task_id = t.id "
+                "ORDER BY latest.id DESC LIMIT 1)) "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(
+                p["status"] in ("done", "archived")
+                and p["outcome"] not in _UNSUCCESSFUL_PARENT_OUTCOMES
+                for p in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4421,19 +4446,56 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        # parent is not yet 'done'. A changes-requested review is the one
+        # deliberate exception, but it must be authorized by the durable
+        # review event for this exact child. Do not trust a caller-controlled
+        # idempotency-key prefix: otherwise a forged child can bypass a
+        # failed parent's dependency gate.
+        parent_rows = conn.execute(
+            "SELECT p.id, p.status, p.current_run_id, r.id AS run_id, r.outcome, "
+            "c.idempotency_key AS child_idempotency_key "
+            "FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "JOIN tasks c ON c.id = l.child_id "
+            "LEFT JOIN task_runs r ON r.id = COALESCE(p.current_run_id, "
+            "(SELECT latest.id FROM task_runs latest WHERE latest.task_id = p.id "
+            "ORDER BY latest.id DESC LIMIT 1)) "
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
+        ).fetchall()
+        undone = None
+        for parent in parent_rows:
+            if parent["status"] not in ("done", "archived"):
+                undone = parent
+                break
+            outcome = parent["outcome"]
+            if outcome not in _UNSUCCESSFUL_PARENT_OUTCOMES:
+                continue
+            authorized = False
+            if outcome == "changes_requested" and parent["run_id"]:
+                events = conn.execute(
+                    "SELECT e.payload FROM task_events e "
+                    "JOIN task_runs r ON r.id = e.run_id "
+                    "WHERE e.task_id = ? AND e.run_id = ? "
+                    "AND e.kind = 'review_changes_requested' "
+                    "AND r.outcome = 'changes_requested'",
+                    (parent["id"], parent["run_id"]),
+                ).fetchall()
+                for event in events:
+                    try:
+                        payload = json.loads(event["payload"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    if (
+                        payload.get("remediation_task_id") == task_id
+                        and payload.get("remediation_key")
+                        == parent["child_idempotency_key"]
+                    ):
+                        authorized = True
+                        break
+            if not authorized:
+                undone = parent
+                break
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4709,7 +4771,7 @@ def request_review_changes(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Return the same card to its implementer for a changes-requested re-review."""
+    """Close the review card and create one idempotent remediation child."""
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
     with write_txn(conn):
@@ -4758,6 +4820,33 @@ def request_review_changes(
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
+        remediation_key = f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:{current_run_id}"
+        remediation_title = f"Address review feedback: {row['title']}"
+        remediation_body = (
+            f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"
+        )
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? LIMIT 1",
+            (remediation_key,),
+        ).fetchone()
+        if existing is not None:
+            # This key is an internal authorization binding, not a normal
+            # idempotency shortcut. Never adopt a pre-existing row: even a
+            # row whose visible fields look correct may carry unchecked
+            # execution fields (for example, model_override) or an
+            # attacker-controlled claim state.
+            return None
+        remediation_id = create_task(
+            conn, title=remediation_title, body=remediation_body,
+            assignee=implementer, created_by=row["assignee"] or "reviewer",
+            tenant=row["tenant"], priority=row["priority"],
+            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
+            branch_name=row["branch_name"], project_id=row["project_id"],
+            skills=json.loads(row["skills"]) if row["skills"] else None,
+            parents=(task_id,),
+            idempotency_key=remediation_key,
+            _allow_internal_idempotency=True,
+        )
         review_metadata = dict(metadata or {})
         review_metadata.update({
             "approved": False,
@@ -4766,24 +4855,37 @@ def request_review_changes(
             "original_implementer": implementer,
             "review_identity": handoff.get("review_identity"),
             "changes_requested": True,
+            "remediation_task_id": remediation_id,
+            "remediation_key": remediation_key,
         })
         cur = conn.execute(
-            "UPDATE tasks SET status='ready', assignee=?, result=?, completed_at=NULL, "
-            "consecutive_failures=0, last_failure_error=NULL, claim_lock=NULL, "
+            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
             "claim_expires=NULL, worker_pid=NULL WHERE id=? "
             "AND status='running' AND current_run_id IS NOT NULL",
-            (implementer, summary.strip(), task_id),
+            (summary.strip(), int(time.time()), task_id),
         )
         if cur.rowcount != 1:
-            return None
+            raise RuntimeError("review task changed while creating remediation")
         run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status="ready",
+            conn, task_id, outcome="changes_requested", status="done",
             summary=summary.strip(), metadata=review_metadata,
         )
         if run_id is None:
             raise RuntimeError("review run disappeared while requesting changes")
         _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
-    return task_id
+        # The remediation child is the one intentional exception to the
+        # unsuccessful-parent dependency guard: its parent is done precisely
+        # because review requested a new implementation cycle. Promote this
+        # child atomically so both public review-changes surfaces can report
+        # the ready handoff without making unrelated dependents ready.
+        promoted = conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND status='todo'",
+            (remediation_id,),
+        )
+        if promoted.rowcount == 1:
+            _append_event(conn, remediation_id, "promoted", None)
+    recompute_ready(conn)
+    return remediation_id
 
 
 def heartbeat_claim(
@@ -5201,6 +5303,91 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _review_completion_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Return a fail-closed error for an attempted native-review acceptance.
+
+    A task can only be completed as a review when its current run was claimed
+    from the native ``review`` lane and the closing evidence proves an
+    affirmative review plus passing checks for the immutable head.  Keeping
+    this gate at the DB boundary prevents goal-mode workers, CLI callers, and
+    webhook races from turning a COMMENTED/changes-requested review into a
+    successful dependency.
+    """
+    row = conn.execute(
+        "SELECT current_run_id, idempotency_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    run_id = row["current_run_id"] if row else None
+    if not run_id:
+        return None
+    claim = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        claim_payload = json.loads(claim["payload"]) if claim and claim["payload"] else {}
+    except (TypeError, json.JSONDecodeError):
+        claim_payload = {}
+    if claim_payload.get("source_status") != "review":
+        prior_changes = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_changes_requested' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if prior_changes:
+            return "changes-requested implementation must submit_for_review before completion"
+        return None
+    if not isinstance(metadata, dict) or metadata.get("approved") is not True:
+        return "native review completion requires approved=true"
+    if metadata.get("changes_requested") is True:
+        return "native review completion rejected: changes_requested=true"
+    review_state = str(
+        metadata.get("review_state") or metadata.get("review_decision") or ""
+    ).strip().lower()
+    if review_state in {"commented", "changes_requested", "request_changes", "dismissed"}:
+        return f"native review completion rejected: review state is {review_state}"
+    if metadata.get("checks_passed") is not True:
+        return "native review completion requires checks_passed=true for the exact head"
+    if metadata.get("mergeable") is False:
+        return "native review completion rejected: pull request is not mergeable"
+    if metadata.get("exact_head_checks") is not True:
+        return "native review completion requires exact_head_checks=true for the immutable head"
+    review_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_submitted' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        review_payload = (
+            json.loads(review_event["payload"])
+            if review_event and review_event["payload"]
+            else {}
+        )
+        submitted_metadata = review_payload.get("metadata") or {}
+    except (TypeError, json.JSONDecodeError):
+        submitted_metadata = {}
+    submitted_head_sha = submitted_metadata.get("head_sha")
+    if not isinstance(submitted_head_sha, str):
+        key_head = str(row["idempotency_key"] or "").rsplit(":", 1)[-1]
+        if _GITHUB_HEAD_SHA_RE.fullmatch(key_head):
+            submitted_head_sha = key_head
+    reviewed_head_sha = metadata.get("reviewed_head_sha")
+    if not isinstance(reviewed_head_sha, str) or not reviewed_head_sha.strip():
+        return "native review completion requires reviewed_head_sha for the immutable head"
+    if (
+        not isinstance(submitted_head_sha, str)
+        or reviewed_head_sha.strip().casefold() != submitted_head_sha.casefold()
+    ):
+        return "native review completion rejected: reviewed_head_sha does not match the submitted immutable head"
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5267,6 +5454,10 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    review_error = _review_completion_error(conn, task_id, metadata)
+    if review_error:
+        raise ValueError(review_error)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
