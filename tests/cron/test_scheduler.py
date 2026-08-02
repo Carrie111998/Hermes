@@ -5013,6 +5013,74 @@ class TestCronDeliveryMirror:
         mirror_mock.assert_not_called()
 
 
+    # --- Telegram topic-born jobs: fresh thread per run with mirroring ---
+
+    def test_topic_origin_with_mirror_opens_fresh_thread(self):
+        """Regression for #76548: a cron job created inside a Telegram topic
+        (origin carries a thread_id) should still open a fresh thread per run
+        when mirror_delivery is enabled. The prior guard ``and not thread_id``
+        blocked the fresh-thread branch for topic-born jobs, so every run
+        delivered back to the origin topic instead of a dedicated thread."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter._session_store = MagicMock()
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            try:
+                import asyncio as _asyncio
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        # Job created inside a Telegram topic — origin has thread_id.
+        # attach_to_session=True enables the continuable mirror.
+        job = {
+            "id": "topic-job",
+            "name": "Topic Brief",
+            "deliver": "origin",
+            "attach_to_session": True,
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "123456789",
+                "user_id": "987654321",
+                "thread_id": "100",  # topic-born: this was blocking the fresh-thread branch
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._open_continuable_cron_thread", return_value="42") as open_thread_mock, \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            _deliver_result(
+                job, "Brief content.",
+                adapters={Platform.TELEGRAM: adapter}, loop=loop,
+            )
+
+        # The fresh-thread branch MUST be taken even though the origin pins
+        # a thread_id — that is the documented behaviour for mirror-enabled
+        # continuable cron jobs.
+        open_thread_mock.assert_called_once()
+        call_args = open_thread_mock.call_args
+        assert call_args[0][0] is job
+        assert call_args[0][1] is adapter
+        assert call_args[0][2] == "123456789"
+
+
 class TestCronContinuableSurfaceInChannel:
     """cron_continuable_surface: in_channel — deliver a continuable cron FLAT
     into a channel (no dedicated thread), so a plain channel reply continues the

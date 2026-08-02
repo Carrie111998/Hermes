@@ -1701,7 +1701,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
-            and not thread_id  # never override an explicit origin thread/topic
         ):
             new_thread_id = _open_continuable_cron_thread(
                 job, runtime_adapter, chat_id, loop,
