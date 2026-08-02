@@ -604,6 +604,20 @@ class GatewayAuthorizationMixin:
         if source.chat_type in {"group", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
             group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+        # QQ Bot: C2C user openids (QQ_ALLOWED_USERS) and group member openids
+        # belong to different identity namespaces — a group sender's
+        # member_openid can never match the DM allowlist.  QQ group traffic is
+        # authorized by the chat-scoped QQ_GROUP_ALLOWED_USERS allowlist and/or
+        # the adapter's own group_policy gate (group_allow_from /
+        # group_member_allow_from), so the C2C allowlist must not be consulted
+        # for group/forum/channel sources.  This keeps the adapter's group
+        # decision authoritative and prevents member_openid values from being
+        # (mis)compared against private-chat identities.
+        if (
+            source.platform == Platform.QQBOT
+            and source.chat_type in {"group", "forum", "channel"}
+        ):
+            platform_allowlist = ""
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:

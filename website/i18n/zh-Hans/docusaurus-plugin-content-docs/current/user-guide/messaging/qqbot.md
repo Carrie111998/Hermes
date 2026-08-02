@@ -70,12 +70,19 @@ platforms:
       app_id: "your-app-id"
       client_secret: "your-secret"
       markdown_support: true       # enable QQ markdown (msg_type 2). Config-only; no env-var equivalent.
-      dm_policy: "open"          # open | allowlist | disabled
+      dm_policy: "open"          # open | allowlist | disabled | pairing
       allow_from:
         - "user_openid_1"
-      group_policy: "open"       # open | allowlist | disabled
+      group_policy: "allowlist"  # allowlist | disabled | pairing | open
+                                 # (默认 pairing 会拒绝所有群消息——QQ 没有群配对流程；
+                                 #  open 对 QQ 群不是授权路径：即使配置了群白名单，
+                                 #  网关 authz 层也会拒绝 open 的群流量——请使用 allowlist)
       group_allow_from:
-        - "group_openid_1"
+        - "group_openid_example"
+      group_member_allow_from:   # 可选；配置后仅这些成员可在被授权群内
+        - "member_openid_example" # @ 机器人
+                                 # 仅适用于 QQ 群 @ 消息中的 member_openid，
+                                 # 不会限制 QQ Guild/频道消息中的 author ID。
       stt:
         provider: "zai"          # zai (GLM-ASR), openai (Whisper), etc.
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4"

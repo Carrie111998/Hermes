@@ -264,13 +264,13 @@ class TestGroupAllowed:
 
     def test_allowlist_match(self):
         adapter = self._make_adapter(app_id="a", client_secret="b", group_policy="allowlist", group_allow_from="grp1")
-        assert adapter._is_group_allowed("grp1", "user1") is True
+        assert adapter._is_group_allowed("grp1") is True
 
 
     def test_pairing_default_blocks_groups(self):
         adapter = self._make_adapter(app_id="a", client_secret="b")
         assert adapter._group_policy == "pairing"
-        assert adapter._is_group_allowed("grp1", "user1") is False
+        assert adapter._is_group_allowed("grp1") is False
 
 
 # ---------------------------------------------------------------------------
