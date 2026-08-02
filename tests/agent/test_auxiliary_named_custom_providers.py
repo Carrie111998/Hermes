@@ -408,3 +408,52 @@ class TestResolveProviderClientMainRuntimeCustom:
         assert model == "explicit-model"
         assert "explicit.example.com" in str(client.base_url)
         assert client.api_key == "sk-explicit"
+
+
+class TestVisionExplicitProviderWithBaseUrlPreservesNamedCustom:
+    """#76602: an explicit provider + base_url must keep the identity (and
+    api_key) of a user-defined provider from config.yaml's providers/
+    custom_providers section — not be downgraded to anonymous 'custom'."""
+
+    def test_vision_preserves_named_custom_provider(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {"name": "agnes-ai.cn", "base_url": "https://api.agnes-ai.cn/v1", "api_key": "sk-test-123"},
+            ],
+        })
+        from agent.auxiliary_client import resolve_vision_provider_client
+
+        provider, client, model = resolve_vision_provider_client(
+            provider="agnes-ai.cn",
+            model="agnes-2.5-flash",
+            base_url="https://api.agnes-ai.cn/v1",
+            api_key=None,
+        )
+
+        assert provider == "agnes-ai.cn"
+        assert model == "agnes-2.5-flash"
+        assert client is not None
+        # The configured key must survive instead of the 'no-key-required'
+        # sentinel that produced 401s.
+        assert getattr(client, "api_key", None) == "sk-test-123"
+
+    def test_vision_unknown_provider_with_base_url_still_downgrades_to_custom(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {"name": "known-relay", "base_url": "http://relay.local/v1", "api_key": "k"},
+            ],
+        })
+        from agent.auxiliary_client import resolve_vision_provider_client
+
+        provider, client, model = resolve_vision_provider_client(
+            provider="totally-unknown-provider",
+            model="m",
+            base_url="http://unknown.local/v1",
+            api_key=None,
+        )
+
+        # Unknown providers keep the legacy anonymous-custom downgrade.
+        assert provider == "custom"
+        assert model == "m"

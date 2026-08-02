@@ -6884,7 +6884,16 @@ def _resolve_task_provider_model(
         try:
             from hermes_cli.providers import get_provider
 
-            return get_provider(normalized) is not None
+            if get_provider(normalized) is not None:
+                return True
+            # User-defined providers in config.yaml's providers: section
+            # must also keep their identity (and api_key) when an explicit
+            # base_url is present — otherwise they are downgraded to the
+            # anonymous "custom" branch, which drops the configured key and
+            # every call 401s (#76602).
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+
+            return _get_named_custom_provider(normalized) is not None
         except Exception:
             # Keep the high-risk provider-backed routes safe even if provider
             # catalog loading is unavailable during early import/test paths.
