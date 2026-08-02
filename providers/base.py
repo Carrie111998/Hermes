@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 # Sentinel for "omit temperature entirely" (Kimi: server manages it)
 OMIT_TEMPERATURE = object()
 
+# Conservative ordinary-generation output cap for local/custom providers when
+# neither user config nor provider metadata supplies one. This is deliberately
+# independent of context-window size.
+DEFAULT_CUSTOM_PROVIDER_MAX_TOKENS = 4096
+
 
 def _profile_user_agent() -> str:
     """Return a ``hermes-cli/<version>`` UA string, with a stable fallback.

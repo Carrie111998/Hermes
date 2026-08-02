@@ -16,6 +16,103 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+from providers.base import DEFAULT_CUSTOM_PROVIDER_MAX_TOKENS
+
+
+_OUTPUT_TOKEN_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+def _finalize_ordinary_output_limit(
+    api_kwargs: dict[str, Any],
+    *,
+    is_custom_provider: bool,
+    max_tokens_param_fn: Any,
+    request_overrides: Any,
+) -> dict[str, Any]:
+    """Reject invalid limits and restore the custom-provider default after overrides."""
+    nested_limit: int | None = None
+    extra_body = api_kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        extra_body = dict(extra_body)
+        nested_limits: list[tuple[str, int]] = []
+        for key in _OUTPUT_TOKEN_KEYS:
+            if key not in extra_body:
+                continue
+            value = extra_body.pop(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"invalid_type: ordinary-generation extra_body.{key} "
+                    "must be a positive integer"
+                )
+            if value <= 0:
+                raise ValueError(
+                    f"invalid_non_positive: ordinary-generation extra_body.{key} "
+                    "must be positive"
+                )
+            nested_limits.append((key, value))
+
+        if len(nested_limits) > 1:
+            raise ValueError(
+                "invalid_conflict: ordinary-generation extra_body contains "
+                "multiple output-token limits"
+            )
+        if nested_limits:
+            _, nested_limit = nested_limits[0]
+
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
+        else:
+            api_kwargs.pop("extra_body", None)
+
+    top_level_limits: list[tuple[str, int]] = []
+    for key, value in list(api_kwargs.items()):
+        if key not in _OUTPUT_TOKEN_KEYS:
+            continue
+        api_kwargs.pop(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"invalid_type: ordinary-generation {key} must be a positive integer"
+            )
+        if value <= 0:
+            raise ValueError(
+                f"invalid_non_positive: ordinary-generation {key} must be positive"
+            )
+        top_level_limits.append((key, value))
+
+    explicit_top_level_present = False
+    explicit_top_level_value: int | None = None
+    if isinstance(request_overrides, dict):
+        for key, value in request_overrides.items():
+            if key in _OUTPUT_TOKEN_KEYS and value is not None:
+                explicit_top_level_present = True
+                explicit_top_level_value = value
+
+    selected_value: int | None = None
+    if explicit_top_level_present:
+        # Canonical top-level overrides beat aliases hidden in extra_body.
+        selected_value = explicit_top_level_value
+    elif nested_limit is not None:
+        selected_value = nested_limit
+    elif top_level_limits:
+        # Collapse any remaining builder aliases to one provider-supported key.
+        _, selected_value = top_level_limits[-1]
+
+    if selected_value is not None:
+        if max_tokens_param_fn:
+            api_kwargs.update(max_tokens_param_fn(selected_value))
+        else:
+            api_kwargs["max_tokens"] = selected_value
+
+    if is_custom_provider and not any(key in api_kwargs for key in _OUTPUT_TOKEN_KEYS):
+        if max_tokens_param_fn:
+            api_kwargs.update(max_tokens_param_fn(DEFAULT_CUSTOM_PROVIDER_MAX_TOKENS))
+        else:
+            api_kwargs["max_tokens"] = DEFAULT_CUSTOM_PROVIDER_MAX_TOKENS
+    return api_kwargs
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
@@ -336,8 +433,14 @@ class ChatCompletionsTransport(ProviderTransport):
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
         if _profile:
-            return self._build_kwargs_from_profile(
+            api_kwargs = self._build_kwargs_from_profile(
                 _profile, model, sanitized, tools, params
+            )
+            return _finalize_ordinary_output_limit(
+                api_kwargs,
+                is_custom_provider=getattr(_profile, "name", "") == "custom",
+                max_tokens_param_fn=params.get("max_tokens_param_fn"),
+                request_overrides=params.get("request_overrides"),
             )
 
         # ── Legacy fallback (unregistered / unknown provider) ───────────
@@ -507,7 +610,12 @@ class ChatCompletionsTransport(ProviderTransport):
         if overrides:
             api_kwargs.update(overrides)
 
-        return api_kwargs
+        return _finalize_ordinary_output_limit(
+            api_kwargs,
+            is_custom_provider=bool(params.get("is_custom_provider", False)),
+            max_tokens_param_fn=params.get("max_tokens_param_fn"),
+            request_overrides=params.get("request_overrides"),
+        )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
         """Build API kwargs using a ProviderProfile — single path, no legacy flags.

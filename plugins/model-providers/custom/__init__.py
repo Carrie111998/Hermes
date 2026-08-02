@@ -15,7 +15,7 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
 from typing import Any
 
 from providers import register_provider
-from providers.base import ProviderProfile
+from providers.base import DEFAULT_CUSTOM_PROVIDER_MAX_TOKENS, ProviderProfile
 
 
 class CustomProfile(ProviderProfile):
@@ -93,11 +93,12 @@ custom = CustomProfile(
     ),
     env_vars=(),  # No fixed key — custom endpoint
     base_url="",  # User-configured
-    # Without this, no max_tokens is sent and Ollama falls back to its internal
-    # num_predict=128, truncating responses after a few tokens (#39281). This is
-    # only a floor used when the user hasn't set model.max_tokens — they can
-    # override per-model — so we set it generously rather than lowballing it.
-    default_max_tokens=65536,
+    # OpenAI-compatible local servers treat an omitted output limit differently;
+    # llama-server uses -1 (unbounded) while Ollama may fall back to a very small
+    # num_predict. Keep ordinary generation bounded independently of context
+    # length. Users can override this through model.max_tokens or the custom
+    # provider's max_output_tokens metadata.
+    default_max_tokens=DEFAULT_CUSTOM_PROVIDER_MAX_TOKENS,
 )
 
 register_provider(custom)

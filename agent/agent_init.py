@@ -60,6 +60,17 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+def _normalize_ordinary_output_limit(value: Any) -> tuple[Optional[int], str]:
+    """Classify and normalize an ordinary-generation output token limit."""
+    if value is None:
+        return None, "unset"
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, "invalid_type"
+    if value <= 0:
+        return None, "invalid_non_positive"
+    return value, "explicit_positive"
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -819,8 +830,18 @@ def init_agent(
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
     
-    # Model response configuration
-    agent.max_tokens = max_tokens  # None = use model default
+    # Model response configuration. Invalid values must never reach an API
+    # request: llama-server interprets -1 as unbounded generation.
+    agent.max_tokens, agent._max_tokens_classification = (
+        _normalize_ordinary_output_limit(max_tokens)
+    )
+    if agent._max_tokens_classification.startswith("invalid_"):
+        logger.warning(
+            "Ignoring invalid max_tokens=%r for ordinary generation "
+            "(classification=%s); using configured/provider fallback",
+            max_tokens,
+            agent._max_tokens_classification,
+        )
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
@@ -1569,11 +1590,12 @@ def init_agent(
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
-    agent._session_init_model_config = {
+    _session_init_model_config: Dict[str, Any] = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    agent._session_init_model_config = _session_init_model_config
     
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore
@@ -2069,7 +2091,14 @@ def init_agent(
                 if _parsed_max_tokens <= 0:
                     raise ValueError
                 agent.max_tokens = _parsed_max_tokens
+                agent._max_tokens_classification = "explicit_positive"
             except (TypeError, ValueError):
+                agent._max_tokens_classification = (
+                    "invalid_non_positive"
+                    if isinstance(_config_max_tokens, int)
+                    and not isinstance(_config_max_tokens, bool)
+                    else "invalid_type"
+                )
                 _ra().logger.warning(
                     "Invalid model.max_tokens in config.yaml: %r — "
                     "must be a positive integer (e.g. 4096). "
