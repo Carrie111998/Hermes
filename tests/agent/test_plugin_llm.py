@@ -328,6 +328,62 @@ class TestPluginLlmFacade:
         assert captured["max_tokens"] == 128
         assert captured["timeout"] == 10.0
 
+    def test_sync_surfaces_pass_provider_neutral_reasoning_config(self):
+        captured: list[dict] = []
+
+        def fake_caller(**kwargs):
+            captured.append(kwargs)
+            return "openai", "gpt-4o", _fake_response('{"ok": true}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+
+        plain = llm.complete(
+            [{"role": "user", "content": "hi"}],
+            reasoning_effort="none",
+        )
+        structured = llm.complete_structured(
+            instructions="Return ok",
+            input=[PluginLlmTextInput(text="data")],
+            json_mode=True,
+            reasoning_effort="high",
+        )
+
+        assert captured[0]["reasoning_config"] == {"enabled": False}
+        assert captured[1]["reasoning_config"] == {
+            "enabled": True,
+            "effort": "high",
+        }
+        assert plain.audit["reasoning_config"] == {"enabled": False}
+        assert structured.audit["reasoning_config"] == {
+            "enabled": True,
+            "effort": "high",
+        }
+
+    def test_explicit_unknown_reasoning_effort_fails_before_provider_call(self):
+        called = False
+
+        def fake_caller(**_kwargs):
+            nonlocal called
+            called = True
+            return "openai", "gpt-4o", _fake_response("unused")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+
+        with pytest.raises(ValueError, match="unsupported reasoning_effort"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                reasoning_effort="guess",
+            )
+        assert called is False
+
     def test_complete_structured_returns_parsed_json(self):
         def fake_caller(**_kwargs):
             return "openai", "gpt-4o", _fake_response(
@@ -425,6 +481,44 @@ class TestAsyncSurface:
         result = asyncio.run(_run())
         assert result.parsed == {"x": 42}
         assert result.content_type == "json"
+
+    def test_async_surfaces_pass_provider_neutral_reasoning_config(self):
+        captured: list[dict] = []
+
+        async def fake_async(**kwargs):
+            captured.append(kwargs)
+            return "openai", "gpt-4o", _fake_response('{"x": 42}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            async_caller=fake_async,
+        )
+
+        async def _run() -> tuple[PluginLlmCompleteResult, PluginLlmStructuredResult]:
+            plain = await llm.acomplete(
+                [{"role": "user", "content": "hi"}],
+                reasoning_effort="none",
+            )
+            structured = await llm.acomplete_structured(
+                instructions="Extract x",
+                input=[PluginLlmTextInput(text="data")],
+                json_mode=True,
+                reasoning_effort="low",
+            )
+            return plain, structured
+
+        plain, structured = asyncio.run(_run())
+        assert captured[0]["reasoning_config"] == {"enabled": False}
+        assert captured[1]["reasoning_config"] == {
+            "enabled": True,
+            "effort": "low",
+        }
+        assert plain.audit["reasoning_config"] == {"enabled": False}
+        assert structured.audit["reasoning_config"] == {
+            "enabled": True,
+            "effort": "low",
+        }
 
 
 # ---------------------------------------------------------------------------

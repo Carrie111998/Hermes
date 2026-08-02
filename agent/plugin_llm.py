@@ -18,15 +18,15 @@ The plugin gets ``ctx.llm`` exposed on its
 :class:`~hermes_cli.plugins.PluginContext`:
 
 * ``complete(messages, ...)`` — chat completion against the user's
-  active model + auth.
+  active model + auth, with an optional provider-neutral reasoning bound.
 * ``complete_structured(instructions=..., input=[...], json_schema=...)``
   — bounded structured inference with optional image inputs, JSON
   schema validation, and parsed JSON output.
 * async siblings ``acomplete()`` / ``acomplete_structured()`` for
   plugins running on asyncio loops (gateway adapters, hooks).
 
-Provider/model/agent_id/profile are explicit keyword arguments — no
-embedded slugs, no shorthands. This mirrors Hermes' main config
+Provider/model/agent_id/profile and reasoning effort are explicit keyword
+arguments — no embedded slugs, no shorthands. This mirrors Hermes' main config
 shape (``model.provider`` + ``model.model``) so plugin authors who
 already understand the host config don't have to learn anything new.
 
@@ -67,6 +67,27 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_plugin_reasoning_effort(
+    reasoning_effort: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Resolve an explicit plugin reasoning request through Hermes policy.
+
+    ``None`` means the plugin accepts the host/provider default.  Any supplied
+    value must be one Hermes understands; silently falling back would make a
+    bounded plugin call appear configured while leaving provider reasoning
+    uncontrolled.
+    """
+
+    if reasoning_effort is None:
+        return None
+    from hermes_constants import parse_reasoning_effort
+
+    reasoning_config = parse_reasoning_effort(reasoning_effort)
+    if reasoning_config is None:
+        raise ValueError(f"unsupported reasoning_effort: {reasoning_effort!r}")
+    return reasoning_config
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +649,7 @@ class PluginLlm:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
@@ -635,11 +657,12 @@ class PluginLlm:
         """Run a host-owned chat completion against the user's active model.
 
         ``messages`` is the standard OpenAI shape. ``provider``,
-        ``model``, ``agent_id``, and ``profile`` follow the same
+        ``model``, ``agent_id``, ``profile``, and ``reasoning_effort`` follow the same
         explicit shape as the host's main config (``model.provider``
         + ``model.model``). Each is independently gated by
         ``plugins.entries.<id>.llm.allow_*_override`` (see module
-        docstring).
+        docstring). Reasoning effort uses Hermes' provider-neutral levels and
+        does not alter provider or credential authority.
         """
         policy = self._policy_loader(self._plugin_id)
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
@@ -649,6 +672,7 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        reasoning_config = _parse_plugin_reasoning_effort(reasoning_effort)
         real_provider, real_model, response = self._invoke_sync(
             messages=messages,
             provider_override=eff_provider,
@@ -657,6 +681,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            reasoning_config=reasoning_config,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -670,6 +695,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                "reasoning_config": reasoning_config,
             },
         )
         logger.info(
@@ -694,6 +720,7 @@ class PluginLlm:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
@@ -723,6 +750,7 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        reasoning_config = _parse_plugin_reasoning_effort(reasoning_effort)
 
         messages = _build_structured_messages(
             instructions=instructions,
@@ -743,6 +771,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            reasoning_config=reasoning_config,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -762,6 +791,7 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "reasoning_config": reasoning_config,
             },
         )
         logger.info(
@@ -783,6 +813,7 @@ class PluginLlm:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
@@ -796,6 +827,7 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        reasoning_config = _parse_plugin_reasoning_effort(reasoning_effort)
         real_provider, real_model, response = await self._invoke_async(
             messages=messages,
             provider_override=eff_provider,
@@ -804,6 +836,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            reasoning_config=reasoning_config,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -817,6 +850,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                "reasoning_config": reasoning_config,
             },
         )
 
@@ -834,6 +868,7 @@ class PluginLlm:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
@@ -852,6 +887,7 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        reasoning_config = _parse_plugin_reasoning_effort(reasoning_effort)
         messages = _build_structured_messages(
             instructions=instructions,
             inputs=list(input),
@@ -870,6 +906,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            reasoning_config=reasoning_config,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -889,6 +926,7 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                "reasoning_config": reasoning_config,
             },
         )
 
@@ -927,6 +965,7 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
         ``agent.auxiliary_client`` to avoid circular deps at plugin
@@ -941,6 +980,7 @@ class PluginLlm:
                 max_tokens=max_tokens,
                 timeout=timeout,
                 extra_body=extra_body,
+                reasoning_config=reasoning_config,
             )
         from agent.auxiliary_client import call_llm
         merged_extra = dict(extra_body or {})
@@ -955,6 +995,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            reasoning_config=reasoning_config,
         )
         provider, model = _resolve_attribution(
             provider_override=provider_override,
@@ -974,6 +1015,7 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
             return await self._async_caller(
@@ -985,6 +1027,7 @@ class PluginLlm:
                 max_tokens=max_tokens,
                 timeout=timeout,
                 extra_body=extra_body,
+                reasoning_config=reasoning_config,
             )
         from agent.auxiliary_client import async_call_llm
         merged_extra = dict(extra_body or {})
@@ -999,6 +1042,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            reasoning_config=reasoning_config,
         )
         provider, model = _resolve_attribution(
             provider_override=provider_override,
