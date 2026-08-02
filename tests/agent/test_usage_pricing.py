@@ -210,18 +210,20 @@ def test_anthropic_claude_5_rows_resolve_with_full_cache_pricing():
 
 
 def test_kimi_first_party_slugs_resolve_to_moonshot_pricing():
-    """Every first-party Kimi provider slug (kimi-coding, kimi, kimi-cn)
-    must normalize onto provider="kimi" and hit the Moonshot pricing rows;
-    without the normalization the kimi-k3 verification children the SOUL.md
-    routing doctrine spawns all price as ``unknown``."""
+    """Every first-party Kimi provider slug (kimi-coding, kimi, kimi-cn,
+    kimi-coding-cn, moonshot) must normalize onto provider="kimi" and hit the
+    Moonshot pricing rows; without the normalization the kimi-k3 verification
+    children the SOUL.md routing doctrine spawns all price as ``unknown``.
+    HighSpeed rates are 2x the standard tier on ALL three rates (verified
+    2026-08-02 against platform.kimi.ai/docs/pricing/chat-k27-code)."""
     from decimal import Decimal
 
     expected = {
         "kimi-k3": (Decimal("3.00"), Decimal("15.00"), Decimal("0.30")),
         "kimi-k2.7-code": (Decimal("0.95"), Decimal("4.00"), Decimal("0.19")),
-        "kimi-k2.7-code-highspeed": (Decimal("0.95"), Decimal("8.00"), Decimal("0.19")),
+        "kimi-k2.7-code-highspeed": (Decimal("1.90"), Decimal("8.00"), Decimal("0.38")),
     }
-    for provider in ("kimi-coding", "kimi", "kimi-cn"):
+    for provider in ("kimi-coding", "kimi", "kimi-cn", "kimi-coding-cn", "moonshot"):
         for model, (input_rate, output_rate, cache_read) in expected.items():
             entry = get_pricing_entry(model, provider=provider)
             key = f"{provider}/{model}"
@@ -232,6 +234,24 @@ def test_kimi_first_party_slugs_resolve_to_moonshot_pricing():
             # Moonshot publishes no cache-write rate; entry must leave it
             # unset rather than inventing one.
             assert entry.cache_write_cost_per_million is None, key
+
+
+def test_kimi_first_party_hosts_resolve_to_moonshot_pricing():
+    """Bare-host sessions (no explicit provider) on the first-party Moonshot
+    endpoints must still route onto provider="kimi": api.moonshot.ai (global),
+    api.moonshot.cn (China — bills CNY at FX-parity equivalents), and
+    api.kimi.com (the global coding endpoint sk-kimi- keys redirect to)."""
+    from decimal import Decimal
+
+    for base_url in (
+        "https://api.moonshot.ai/v1",
+        "https://api.moonshot.cn/v1",
+        "https://api.kimi.com/coding",
+    ):
+        entry = get_pricing_entry("kimi-k3", base_url=base_url)
+        assert entry is not None, base_url
+        assert entry.input_cost_per_million == Decimal("3.00"), base_url
+        assert entry.output_cost_per_million == Decimal("15.00"), base_url
 
 
 def test_bedrock_cross_region_profile_prefix_resolves_to_pricing():

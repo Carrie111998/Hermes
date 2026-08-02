@@ -157,14 +157,19 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # the standard Anthropic 0.10x read / 1.25x write.  Both are fixed IDs
     # with no date suffix.
     # Source: https://platform.claude.com/docs/en/about-claude/pricing
-    # ── Kimi / Moonshot first-party (local patch, 2026-07-31) ────────────
+    # ── Kimi / Moonshot first-party (local patch, 2026-07-31; corrected 2026-08-02) ──
     # K3: flat $3/M cache-miss input, $0.30/M cache-hit, $15/M output across
     # the full window (API live 2026-07-16; reasoning tokens bill as output).
-    # K2.7-code: $0.95/$4.00, cache-hit $0.19; -highspeed doubles output to
-    # $8. Moonshot publishes no separate cache-WRITE rate (bills hits only),
-    # so cache_write is left unset like the fireworks entries.
-    # Sources: https://benchlm.ai/moonshot/api-pricing ·
-    # https://www.kimi.com/resources/kimi-k2-7-code-pricing
+    # K2.7-code: $0.95/$4.00, cache-hit $0.19; -highspeed is 2x on ALL three
+    # rates ($1.90/$8.00, cache-hit $0.38). Moonshot publishes no separate
+    # cache-WRITE rate (bills hits only), so cache_write is left unset like
+    # the fireworks entries. Rates verified 2026-08-02 against the first-party
+    # pricing pages below. (The China endpoint api.moonshot.cn bills in CNY at
+    # FX-parity equivalents — e.g. k2.7-code ¥6.50/¥27 ≈ $0.95/$4 at ~6.84 —
+    # so these USD rows price China sessions within FX drift; see
+    # resolve_billing_route.)
+    # Sources: https://platform.kimi.ai/docs/pricing/chat-k3 ·
+    # https://platform.kimi.ai/docs/pricing/chat-k27-code
     (
         "kimi",
         "kimi-k3",
@@ -173,7 +178,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         output_cost_per_million=Decimal("15.00"),
         cache_read_cost_per_million=Decimal("0.30"),
         source="official_docs_snapshot",
-        source_url="https://benchlm.ai/moonshot/api-pricing",
+        source_url="https://platform.kimi.ai/docs/pricing/chat-k3",
         pricing_version="moonshot-pricing-2026-07",
     ),
     (
@@ -184,18 +189,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         output_cost_per_million=Decimal("4.00"),
         cache_read_cost_per_million=Decimal("0.19"),
         source="official_docs_snapshot",
-        source_url="https://www.kimi.com/resources/kimi-k2-7-code-pricing",
+        source_url="https://platform.kimi.ai/docs/pricing/chat-k27-code",
         pricing_version="moonshot-pricing-2026-07",
     ),
     (
         "kimi",
         "kimi-k2.7-code-highspeed",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.95"),
+        input_cost_per_million=Decimal("1.90"),
         output_cost_per_million=Decimal("8.00"),
-        cache_read_cost_per_million=Decimal("0.19"),
+        cache_read_cost_per_million=Decimal("0.38"),
         source="official_docs_snapshot",
-        source_url="https://www.kimi.com/resources/kimi-k2-7-code-pricing",
+        source_url="https://platform.kimi.ai/docs/pricing/chat-k27-code",
         pricing_version="moonshot-pricing-2026-07",
     ),
     (
@@ -1089,11 +1094,15 @@ def resolve_billing_route(
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # Kimi / Moonshot first-party endpoints. The picker/registry slugs
-    # ("kimi-coding", "kimi", "kimi-cn") all bill at Moonshot's official
-    # platform rates, so normalize them onto provider="kimi" — mirroring the
-    # openai-api → openai normalization above. (Fireworks-hosted kimi models
-    # keep their own ("fireworks", ...) keys and rates.)
-    if provider_name in {"kimi", "kimi-coding", "kimi-cn", "moonshot"} or base_url_host_matches(base_url or "", "api.moonshot.ai"):
+    # ("kimi-coding", "kimi", "kimi-cn", "kimi-coding-cn") all bill at
+    # Moonshot's official platform rates, so normalize them onto
+    # provider="kimi" — mirroring the openai-api → openai normalization
+    # above. The China slug/host bills in CNY at FX-parity equivalents of the
+    # USD rows (verified 2026-08-02: k2.7-code ¥6.50/¥27 ≈ $0.95/$4), so USD
+    # pricing holds within FX drift. api.kimi.com is the global coding
+    # endpoint sk-kimi- keys redirect to. (Fireworks-hosted kimi models keep
+    # their own ("fireworks", ...) keys and rates.)
+    if provider_name in {"kimi", "kimi-coding", "kimi-cn", "kimi-coding-cn", "moonshot"} or base_url_host_matches(base_url or "", "api.moonshot.ai") or base_url_host_matches(base_url or "", "api.moonshot.cn") or base_url_host_matches(base_url or "", "api.kimi.com"):
         return BillingRoute(provider="kimi", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # Google AI Studio (Gemini) and Vertex AI host the same Gemini models.
     # Price them off the official docs snapshot — the pricing keys are
