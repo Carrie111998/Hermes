@@ -12,6 +12,7 @@ Covers:
 9. Message dispatch and threading
 """
 
+import email as email_lib
 import os
 import unittest
 from email.mime.text import MIMEText
@@ -84,6 +85,102 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertIn("world", result)
         self.assertNotIn("<p>", result)
         self.assertNotIn("<b>", result)
+
+    def test_strip_html_omits_non_content_blocks_from_plain_fallback(self):
+        """CSS and scripts must not leak into multipart plain alternatives."""
+        from plugins.platforms.email.adapter import _strip_html
+
+        html = (
+            "<!doctype html><html><head>"
+            "<style>.card { color: red; }</style>"
+            "<script>window.alert('nope')</script>"
+            "</head><body><p>Readable digest.</p></body></html>"
+        )
+        result = _strip_html(html)
+
+        self.assertEqual(result, "Readable digest.")
+
+
+class TestOutboundHtmlEmailContract(unittest.TestCase):
+    """Test conservative recognition and MIME composition for styled mail."""
+
+    def test_non_document_content_remains_unchanged_plain_text(self):
+        from plugins.platforms.email.adapter import _compose_outbound_email_body
+
+        invalid_payloads = (
+            "Subject: ordinary prose\n\nThis is still plain text.",
+            "<p>An HTML fragment is not a full email document.</p>",
+            "<!doctype html><html><body>Missing the closing document tag.",
+            (
+                "Cronjob Response: malformed\n"
+                "-------------\n\n"
+                "Subject: nope\n\n<html><body>Not safely wrapped.</body></html>"
+            ),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload[:40]):
+                message, subject, is_html = _compose_outbound_email_body(
+                    payload,
+                    multipart_plain=False,
+                )
+                self.assertFalse(is_html)
+                self.assertIsNone(subject)
+                self.assertEqual(message.get_content_type(), "text/plain")
+                payload_bytes = message.get_payload(decode=True)
+                self.assertIsInstance(payload_bytes, bytes)
+                body = bytes(payload_bytes).decode("utf-8")
+                self.assertEqual(body, payload)
+
+    def test_declared_subject_is_safe_in_flattened_bytes(self):
+        from plugins.platforms.email.adapter import _compose_outbound_email_body
+
+        unsafe_subject = "Digest\x00 " + ("x" * 300)
+        payload = (
+            f"Subject: {unsafe_subject}\n\n"
+            "<!doctype html><html><body><p>Safe body.</p></body></html>"
+        )
+        message, subject, is_html = _compose_outbound_email_body(
+            payload,
+            multipart_plain=False,
+        )
+        self.assertTrue(is_html)
+        self.assertIsNotNone(subject)
+        self.assertEqual(len(subject or ""), 255)
+        message["Subject"] = subject or ""
+
+        flattened = message.as_bytes()
+        reparsed = email_lib.message_from_bytes(flattened)
+        self.assertNotIn(b"\x00", flattened)
+        self.assertNotIn("\x00", reparsed["Subject"])
+
+    def test_live_and_standalone_html_have_matching_leaf_parts(self):
+        from plugins.platforms.email.adapter import _compose_outbound_email_body
+
+        payload = (
+            "Subject: Digest\n\n"
+            "<!doctype html><html><body><p>Same content.</p></body></html>"
+        )
+        standalone, standalone_subject, standalone_is_html = (
+            _compose_outbound_email_body(payload, multipart_plain=False)
+        )
+        live, live_subject, live_is_html = _compose_outbound_email_body(
+            payload,
+            multipart_plain=True,
+        )
+
+        self.assertEqual(standalone_subject, live_subject)
+        self.assertEqual(standalone_is_html, live_is_html)
+        standalone_leaves = [
+            (part.get_content_type(), part.get_payload(decode=True))
+            for part in standalone.walk()
+            if not part.is_multipart()
+        ]
+        live_leaves = [
+            (part.get_content_type(), part.get_payload(decode=True))
+            for part in live.walk()
+            if not part.is_multipart()
+        ]
+        self.assertEqual(standalone_leaves, live_leaves)
 
 
 class TestExtractTextBody(unittest.TestCase):
@@ -381,6 +478,47 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["In-Reply-To"], "<original@test.com>")
             self.assertEqual(send_call["References"], "<original@test.com>")
             self.assertIn("Date", send_call)
+            leaf_parts = [
+                part for part in send_call.walk() if not part.is_multipart()
+            ]
+            self.assertEqual(
+                [part.get_content_type() for part in leaf_parts],
+                ["text/plain"],
+            )
+            self.assertEqual(
+                leaf_parts[0].get_payload(decode=True).decode("utf-8"),
+                "Here is the answer.",
+            )
+
+    def test_declared_html_is_fresh_origination_despite_thread_context(self):
+        """Styled scheduled mail must not inherit an unrelated reply thread."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old conversation",
+            "message_id": "<old-thread@test.com>",
+        }
+        payload = (
+            "Subject: ⚛️ Daily arXiv Digest\n\n"
+            "<!doctype html><html><body><p>Fresh digest.</p></body></html>"
+        )
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email("user@test.com", payload, None)
+
+        sent_message = mock_server.send_message.call_args.args[0]
+        self.assertEqual(sent_message["Subject"], "⚛️ Daily arXiv Digest")
+        self.assertIsNone(sent_message["In-Reply-To"])
+        self.assertIsNone(sent_message["References"])
+        self.assertEqual(
+            [
+                part.get_content_type()
+                for part in sent_message.walk()
+                if not part.is_multipart()
+            ],
+            ["text/plain", "text/html"],
+        )
 
 
 class TestSendMethods(unittest.TestCase):
@@ -617,6 +755,91 @@ class TestSendEmailStandalone(unittest.TestCase):
             self.assertIn("Date", send_call)
             self.assertEqual(send_call["To"], "user@test.com")
             self.assertEqual(send_call["From"], "hermes@test.com")
+            self.assertEqual(send_call.get_content_type(), "text/plain")
+            self.assertEqual(
+                send_call.get_payload(decode=True).decode("utf-8"),
+                "Hello",
+            )
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    })
+    def test_scheduler_wrapped_html_uses_declared_subject_and_alternative_mime(self):
+        """A wrapped cron HTML payload should become a fresh styled email."""
+        import asyncio
+        from types import SimpleNamespace
+
+        from cron.scheduler import _deliver_result
+        from gateway.config import Platform
+        from plugins.platforms.email.adapter import (
+            _decode_header_value,
+            _standalone_send,
+        )
+
+        pconfig = SimpleNamespace(
+            enabled=True,
+            token=None,
+            api_key=None,
+            extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+        )
+        gateway_config = MagicMock()
+        gateway_config.platforms = {Platform.EMAIL: pconfig}
+        payload = (
+            "Subject: ⚛️ Daily arXiv Digest\n\n"
+            "<!doctype html><html><body><h1>Daily arXiv Digest</h1>"
+            "<p>One useful paper.</p></body></html>"
+        )
+        job = {
+            "id": "digest-job",
+            "name": "daily-arxiv-digest",
+            "deliver": "origin",
+            "origin": {"platform": "email", "chat_id": "user@test.com"},
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=gateway_config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}),
+            patch(
+                "tools.send_message_tool._send_to_platform",
+                new=AsyncMock(return_value={"success": True}),
+            ) as route_send,
+        ):
+            _deliver_result(job, payload)
+
+        wrapped_payload = route_send.await_args_list[0].args[3]
+        self.assertIn("Cronjob Response: daily-arxiv-digest", wrapped_payload)
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            result = asyncio.run(
+                _standalone_send(pconfig, "user@test.com", wrapped_payload)
+            )
+
+        self.assertTrue(result["success"])
+        sent_message = mock_server.send_message.call_args.args[0]
+        reparsed = email_lib.message_from_bytes(sent_message.as_bytes())
+        self.assertEqual(
+            _decode_header_value(reparsed["Subject"]),
+            "⚛️ Daily arXiv Digest",
+        )
+        self.assertEqual(reparsed.get_content_type(), "multipart/alternative")
+        leaf_parts = [part for part in reparsed.walk() if not part.is_multipart()]
+        self.assertEqual(
+            [part.get_content_type() for part in leaf_parts],
+            ["text/plain", "text/html"],
+        )
+        for part in leaf_parts:
+            payload_bytes = part.get_payload(decode=True)
+            self.assertIsInstance(payload_bytes, bytes)
+            body = bytes(payload_bytes).decode(
+                part.get_content_charset() or "utf-8"
+            )
+            self.assertNotIn("Cronjob Response:", body)
+            self.assertFalse(body.lstrip().startswith("Subject:"))
 
 
 class TestSmtpConnectionCleanup(unittest.TestCase):
