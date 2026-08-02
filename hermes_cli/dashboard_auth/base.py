@@ -37,6 +37,7 @@ class Session:
     # Handoff/resume binding — empty for full-dashboard sessions.
     bound_session_id: str = ""
     bound_profile: str = ""
+    device_id: str = ""
 
 
 @dataclass(frozen=True)

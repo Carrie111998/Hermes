@@ -1117,7 +1117,7 @@ The QR encodes a **single-use handoff URL**:
 https://<public-host>/<prefix>/handoff#ticket=<ticket>
 ```
 
-The fragment is never sent in the HTTP request line or `Referer` header. A small server-rendered `/handoff` page removes the fragment from browser history, exchanges the ticket through a same-origin JSON POST, receives a **resume-scoped** browser session cookie bound to the ticket's session/profile, and replaces the page with the bound Chat route. Client parameters cannot pivot to another session. Missing, expired, replayed, or cross-origin handoffs fail closed.
+The fragment is never sent in the HTTP request line or `Referer` header. A small server-rendered `/handoff` page removes the fragment from browser history, exchanges the ticket through a same-origin JSON POST, receives a **persistent, revocable resume-scoped linked-device cookie** bound to the ticket's session/profile, and replaces the page with the bound Chat route. Client parameters cannot pivot to another session. Missing, expired, replayed, revoked, or cross-origin handoffs fail closed.
 
 Prerequisites — Desktop checks all of these and won't render a QR code until they pass:
 
@@ -1139,7 +1139,7 @@ Desktop:
 |---------|-------|----------------|
 | Handoff ticket TTL | **120 seconds** | QR is momentary; expired tickets fail closed |
 | Handoff ticket use | **single-use** | Replay after consume fails closed |
-| Resume browser session TTL | **45 minutes** (not multi-hour admin sessions) | Limits blast radius if a phone is left unlocked |
+| Linked-device inactivity TTL | **90 days, sliding** | Persistent reconnection without broad dashboard authority; revoke a linked browser from Gateway settings |
 | Scope after consume | **`resume` only** | Denies `/api/env`, `/api/config`, session list, admin WS (`/api/ws`, `/api/console`, `/api/pub`) |
 | Logout | `/auth/logout` clears cookies and best-effort revokes provider refresh tokens | Phone end of session |
 

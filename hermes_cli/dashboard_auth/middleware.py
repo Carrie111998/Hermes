@@ -30,13 +30,16 @@ from hermes_cli.dashboard_auth.base import (
     RefreshExpiredError,
 )
 from hermes_cli.dashboard_auth.cookies import (
+    clear_linked_device_cookie,
     clear_sso_attempt_cookie,
     detect_https,
     read_session_cookies,
     read_session_provider,
+    read_linked_device_cookie,
     read_sso_attempt_cookie,
     set_session_cookies,
     set_session_provider_cookie,
+    set_linked_device_cookie,
     set_sso_attempt_cookie,
 )
 from hermes_cli.dashboard_auth.prefix import prefix_from_request
@@ -390,6 +393,29 @@ async def gated_auth_middleware(
     at, _rt = read_session_cookies(request)
     provider_hint = read_session_provider(request)
     if not at and not _rt:
+        # A linked browser is deliberately considered only after normal OAuth
+        # cookies: full dashboard authority always wins over resume authority.
+        linked_secret = read_linked_device_cookie(request)
+        if linked_secret:
+            from hermes_cli.dashboard_auth.linked_devices import authenticate
+            record = authenticate(linked_secret)
+            if record is not None:
+                from hermes_cli.dashboard_auth.base import Session
+                session = Session(user_id=record["user_id"], email=record["email"], display_name=record["display_name"], org_id=record["org_id"], provider=record["provider"], expires_at=0, access_token="", refresh_token="", scopes=("resume",), bound_session_id=record["session_id"], bound_profile=record["profile"], device_id=record["id"])
+                request.state.session = session
+                denied = _scope_denial_response(request, session)
+                if denied is not None:
+                    return denied
+                response = await call_next(request)
+                set_linked_device_cookie(response, secret=linked_secret, use_https=detect_https(request), prefix=prefix_from_request(request))
+                # Root and unbound chat land at the server-bound target.
+                if request.method == "GET" and request.url.path in ("/", "/chat") and not request.query_params.get("resume"):
+                    from hermes_cli.dashboard_auth.scopes import handoff_redirect_location
+                    return RedirectResponse(handoff_redirect_location({"session_id": record["session_id"], "profile": record["profile"]}, prefix=prefix_from_request(request)), status_code=302, headers=dict(response.headers))
+                return response
+            response = _unauth_response(request, reason="invalid_or_expired_session")
+            clear_linked_device_cookie(response, prefix=prefix_from_request(request))
+            return response
         # Neither token present — no session at all. Before bouncing to
         # login / auto-SSO, try a single-use ?handoff=<ticket> consume
         # (QR phone-path). Valid ticket → set resume-scoped session
@@ -611,8 +637,6 @@ def consume_handoff_response(
     to the normal unauth flow — intentionally no error leak about handoff
     validity.
     """
-    import time
-
     from hermes_cli.dashboard_auth.scopes import (
         exact_handoff_scopes_or_none,
         handoff_redirect_location,
@@ -648,17 +672,15 @@ def consume_handoff_response(
         )
         return None
 
-    access_token = info.get("access_token") or ""
-    if not access_token:
-        audit_log(
-            AuditEvent.HANDOFF_TICKET_REJECTED,
-            reason="missing_access_token",
-            ip=_client_ip(request),
-        )
-        return None
-
-    expires_at = int(info.get("access_token_expires_at") or 0)
-    expires_in = max(60, expires_at - int(time.time())) if expires_at else 60
+    from hermes_cli.dashboard_auth.cookies import read_linked_device_cookie, set_linked_device_cookie
+    from hermes_cli.dashboard_auth.linked_devices import create_or_rotate, device_label
+    previous = read_linked_device_cookie(request) or ""
+    previous_record = None
+    if previous:
+        from hermes_cli.dashboard_auth.linked_devices import authenticate
+        previous_record = authenticate(previous)
+    identity = {key: str(info.get(key) or "") for key in ("user_id", "email", "display_name", "org_id", "provider")}
+    device_id, secret = create_or_rotate(existing_id=str(previous_record["id"]) if previous_record else "", label=device_label(request.headers.get("user-agent", "")), session_id=str(info.get("session_id") or ""), profile=str(info.get("profile") or ""), identity=identity)
     # F-02: redirect from ticket-bound targets only (ignore client query).
     location = handoff_redirect_location(
         info,
@@ -672,16 +694,7 @@ def consume_handoff_response(
         )
     else:
         resp = RedirectResponse(url=location, status_code=302)
-    # Never issue a refresh token via handoff — resume-scoped AT only.
-    set_session_cookies(
-        resp,
-        access_token=access_token,
-        refresh_token="",
-        access_token_expires_in=expires_in,
-        use_https=detect_https(request),
-        prefix=prefix_from_request(request),
-        provider=str(info.get("provider") or "handoff"),
-    )
+    set_linked_device_cookie(resp, secret=secret, use_https=detect_https(request), prefix=prefix_from_request(request))
     audit_log(
         AuditEvent.HANDOFF_TICKET_CONSUMED,
         provider=str(info.get("provider") or ""),

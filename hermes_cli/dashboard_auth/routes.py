@@ -841,6 +841,7 @@ async def api_auth_ws_ticket(request: Request):
             bound_session_id=getattr(sess, "bound_session_id", "") or "",
             bound_profile=getattr(sess, "bound_profile", "") or "",
             allowed_endpoints=RESUME_WS_ENDPOINTS,
+            device_id=getattr(sess, "device_id", "") or "",
         )
         event_channel = resume_event_channel(
             user_id=sess.user_id,
@@ -1133,6 +1134,25 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
         "session_id": canon_sid,
         "profile": canon_profile,
     }
+
+
+@router.get("/api/auth/linked-devices", name="auth_linked_devices")
+async def api_linked_devices(request: Request):
+    """List local linked browsers. Only a full dashboard session may manage them."""
+    from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
+    from hermes_cli.dashboard_auth.linked_devices import list_devices
+    require_full_dashboard_session(getattr(request.state, "session", None))
+    return {"devices": list_devices()}
+
+
+@router.delete("/api/auth/linked-devices/{device_id}", name="auth_linked_devices_revoke")
+async def api_revoke_linked_device(request: Request, device_id: str):
+    from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
+    from hermes_cli.dashboard_auth.linked_devices import revoke
+    require_full_dashboard_session(getattr(request.state, "session", None))
+    if not revoke(device_id):
+        raise HTTPException(status_code=404, detail="Linked device not found")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

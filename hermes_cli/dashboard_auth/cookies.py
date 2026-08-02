@@ -70,6 +70,7 @@ SESSION_RT_COOKIE = "hermes_session_rt"
 # refresh token from being handed to the wrong provider when several dashboard
 # auth plugins are enabled (for example Basic + Nous OAuth).
 SESSION_PROVIDER_COOKIE = "hermes_session_provider"
+LINKED_DEVICE_COOKIE = "hermes_linked_device"
 PKCE_COOKIE = "hermes_session_pkce"
 # One-shot loop-guard marker for the auto-SSO redirect (Phase 1,
 # cloud-auto-discovery). Set when the gate auto-initiates the portal OAuth
@@ -284,6 +285,16 @@ def read_session_cookies(request: Request) -> Tuple[Optional[str], Optional[str]
 def read_session_provider(request: Request) -> Optional[str]:
     """Return the provider routing hint associated with the session cookies."""
     return _read_with_fallback(request, SESSION_PROVIDER_COOKIE)
+
+def set_linked_device_cookie(response: Response, *, secret: str, use_https: bool, prefix: str = "") -> None:
+    response.set_cookie(_resolved_name(LINKED_DEVICE_COOKIE, use_https=use_https, prefix=prefix), secret, max_age=90 * 24 * 60 * 60, **_common_attrs(use_https=use_https, prefix=prefix))
+
+def read_linked_device_cookie(request: Request) -> Optional[str]:
+    return _read_with_fallback(request, LINKED_DEVICE_COOKIE)
+
+def clear_linked_device_cookie(response: Response, *, prefix: str = "") -> None:
+    for variant in _NAME_VARIANTS:
+        response.set_cookie(f"{variant}{LINKED_DEVICE_COOKIE}", "", max_age=0, path=_cookie_path(prefix), httponly=True, samesite="lax")
 
 
 def read_pkce_cookie(request: Request) -> Optional[str]:

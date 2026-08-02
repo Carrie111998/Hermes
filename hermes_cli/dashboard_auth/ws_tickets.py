@@ -135,6 +135,7 @@ def mint_ticket(
     bound_session_id: str = "",
     bound_profile: str = "",
     allowed_endpoints: tuple[str, ...] | list[str] | frozenset[str] | None = None,
+    device_id: str = "",
 ) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
@@ -174,6 +175,7 @@ def mint_ticket(
         "bound_profile": str(bound_profile or ""),
         "allowed_endpoints": endpoints,
         "event_channel": event_channel,
+        "device_id": str(device_id or ""),
     }
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
