@@ -23,7 +23,7 @@ def _make_legacy_db(path: Path) -> None:
         CREATE TABLE task_comments (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
             author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE task_events (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
-            kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
+            kind TEXT NOT NULL, payload TEXT, run_id TEXT, created_at INTEGER NOT NULL);
         CREATE TABLE task_runs (id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
             profile TEXT, status TEXT NOT NULL, started_at INTEGER NOT NULL);
         CREATE TABLE kanban_notify_subs (task_id TEXT NOT NULL, platform TEXT NOT NULL,
@@ -34,9 +34,21 @@ def _make_legacy_db(path: Path) -> None:
     )
     conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('task-1', 'T', 'done', 1000)")
     conn.execute("INSERT INTO task_comments VALUES ('c-1', 'task-1', 'agent', 'hi', 1500)")
-    conn.execute("INSERT INTO task_events VALUES ('e-1', 'task-1', 'completed', NULL, 2000)")
-    conn.execute("INSERT INTO task_events VALUES ('e-2', 'task-1', 'blocked', NULL, 2100)")
+    conn.execute(
+        "INSERT INTO task_events VALUES "
+        "('e-1', 'task-1', 'completed', NULL, 'r-1', 2000)"
+    )
+    conn.execute(
+        "INSERT INTO task_events VALUES "
+        "('e-2', 'task-1', 'blocked', NULL, 'r-1', 2100)"
+    )
     conn.execute("INSERT INTO task_runs VALUES ('r-1', 'task-1', 'default', 'done', 1000)")
+    conn.execute("UPDATE tasks SET current_run_id = 'r-1' WHERE id = 'task-1'")
+    conn.execute(
+        "INSERT INTO task_run_evidence (run_id, digest, created_at) "
+        "VALUES ('r-1', ?, 1800)",
+        ("a" * 64,),
+    )
     conn.execute(
         "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at, last_event_id) "
         "VALUES ('task-1', 'telegram', '123', 1000, 'e-1')"
@@ -91,6 +103,17 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
+        remapped_run_id = conn.execute("SELECT id FROM task_runs").fetchone()["id"]
+        assert isinstance(remapped_run_id, int)
+        assert conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = 'task-1'"
+        ).fetchone()["current_run_id"] == remapped_run_id
+        assert {
+            row["run_id"] for row in conn.execute("SELECT run_id FROM task_events")
+        } == {remapped_run_id}
+        assert conn.execute(
+            "SELECT run_id FROM task_run_evidence"
+        ).fetchone()["run_id"] == remapped_run_id
         # Non-numeric legacy cursor ("e-1") casts to 0.
         assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
 

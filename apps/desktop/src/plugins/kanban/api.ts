@@ -21,7 +21,9 @@ import type {
   KanbanTaskDetail,
   OrchestrationSettings,
   TaskEstimate,
-  WorkerLog
+  WorkerLog,
+  WorkflowControllerResponse,
+  WorkflowProjection
 } from './types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
@@ -115,6 +117,101 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
   return rest ? rest<T>(path, opts) : Promise.reject(new Error('kanban api not ready'))
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function hasString(record: Record<string, unknown>, key: string): boolean {
+  return typeof record[key] === 'string'
+}
+
+function optionalNullableString(record: Record<string, unknown>, key: string): boolean {
+  return !(key in record) || record[key] == null || typeof record[key] === 'string'
+}
+
+function optionalNullableNumber(record: Record<string, unknown>, key: string): boolean {
+  return !(key in record) || record[key] == null || typeof record[key] === 'number'
+}
+
+function validController(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+
+  return (
+    typeof value.version === 'number' &&
+    typeof value.dispatch_enabled === 'boolean' &&
+    typeof value.broker_ready === 'boolean' &&
+    typeof value.status === 'string' &&
+    typeof value.updated_at === 'number' &&
+    optionalNullableString(value, 'controller_epoch') &&
+    optionalNullableNumber(value, 'heartbeat_at') &&
+    optionalNullableNumber(value, 'last_reconciled_at') &&
+    optionalNullableString(value, 'last_error')
+  )
+}
+
+function validCurrentRun(value: unknown): boolean {
+  if (value == null) {
+    return true
+  }
+
+  return (
+    isRecord(value) &&
+    (typeof value.id === 'number' || typeof value.id === 'string') &&
+    hasString(value, 'status') &&
+    hasString(value, 'fence_digest') &&
+    optionalNullableNumber(value, 'claim_expires_at') &&
+    optionalNullableNumber(value, 'last_evidence_at') &&
+    optionalNullableString(value, 'last_evidence_digest')
+  )
+}
+
+function validWorkflowLeaf(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.canonical) || !Array.isArray(value.dependencies)) {
+    return false
+  }
+
+  return (
+    ['id', 'title', 'status', 'leaf_key', 'leaf_family_key', 'spec_hash', 'pin_sha', 'capsule_hash'].every(key =>
+      hasString(value, key)
+    ) &&
+    value.canonical.source === 'github' &&
+    optionalNullableString(value.canonical, 'repository') &&
+    optionalNullableNumber(value.canonical, 'campaign_issue') &&
+    optionalNullableString(value, 'specification_version') &&
+    validCurrentRun(value.current_run) &&
+    value.dependencies.every(
+      dependency => isRecord(dependency) && hasString(dependency, 'id') && hasString(dependency, 'status')
+    )
+  )
+}
+
+function parseWorkflowProjection(value: unknown): WorkflowProjection {
+  if (
+    !isRecord(value) ||
+    value.projection !== 'workflow-runtime-v1' ||
+    value.canonical_source !== 'github' ||
+    !hasString(value, 'board') ||
+    typeof value.server_time !== 'number' ||
+    !validController(value.controller) ||
+    !Array.isArray(value.leaves) ||
+    !value.leaves.every(validWorkflowLeaf)
+  ) {
+    throw new Error('invalid Workflow projection from remote server')
+  }
+
+  return value as unknown as WorkflowProjection
+}
+
+function parseWorkflowControllerResponse(value: unknown): WorkflowControllerResponse {
+  if (!isRecord(value) || !validController(value.controller)) {
+    throw new Error('invalid Workflow controller response from remote server')
+  }
+
+  return value as unknown as WorkflowControllerResponse
+}
+
 /** Append the selected board (and other params) to a path. */
 function withBoard(path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params)
@@ -138,6 +235,7 @@ export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
+export const workflowKey = (slug: string) => ['kanban', 'workflow', slug] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
@@ -157,6 +255,11 @@ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profile
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
+
+/** Fresh remote-server projection. It is deliberately separate from the
+ * generic board cache: Workflow rows are not editable Kanban cards. */
+export const fetchWorkflow = async () =>
+  parseWorkflowProjection(await call<unknown>(withBoard('/workflow/projection')))
 
 // ── writes ────────────────────────────────────────────────────────────────────
 
@@ -242,6 +345,25 @@ export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/d
 
 export const saveOrchestration = (patch: Record<string, unknown>) =>
   call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
+
+/** Typed controller controls use optimistic concurrency. `networkMode:
+ * always` + `retry: false` belongs at the mutation call site so a request is
+ * attempted once and never parked for replay after a laptop reconnects. */
+export const pauseWorkflow = async (expectedVersion: number, reason: string) =>
+  parseWorkflowControllerResponse(
+    await call<unknown>(withBoard('/workflow/controller/pause'), {
+      method: 'POST',
+      body: { expected_version: expectedVersion, reason }
+    })
+  )
+
+export const resumeWorkflow = async (expectedVersion: number, reason: string) =>
+  parseWorkflowControllerResponse(
+    await call<unknown>(withBoard('/workflow/controller/resume'), {
+      method: 'POST',
+      body: { expected_version: expectedVersion, reason }
+    })
+  )
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

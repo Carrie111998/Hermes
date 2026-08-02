@@ -180,6 +180,85 @@ export interface OrchestrationSettings {
   resolved_default_assignee: string
 }
 
+/** GET /workflow/projection — GitHub canonical identity plus the remote controller's
+ * runtime overlay. The Desktop never treats this as an editable Kanban card. */
+export interface WorkflowControllerState {
+  version: number
+  dispatch_enabled: boolean
+  broker_ready: boolean
+  status: string
+  controller_epoch?: null | string
+  heartbeat_at?: null | number
+  last_reconciled_at?: null | number
+  last_error?: null | string
+  updated_at: number
+}
+
+export interface WorkflowLeafProjection {
+  id: string
+  title: string
+  status: string
+  leaf_key: string
+  leaf_family_key: string
+  specification_version?: null | string
+  spec_hash: string
+  pin_sha: string
+  capsule_hash: string
+  canonical: {
+    source: 'github'
+    repository?: null | string
+    campaign_issue?: null | number
+    snapshot?: null | {
+      repository_node_id: string
+      issue_node_id: string
+      project_item_id: string
+      source_updated_at: string
+      source_version: string
+      snapshot_version: number
+      content_hash: string
+      material_hash: string
+      issue: Record<string, unknown>
+      project: Record<string, unknown>
+      pull_requests: Array<Record<string, unknown>>
+    }
+  }
+  closeout?: null | {
+    candidate_sha: string
+    diff_digest: string
+    required_ci: boolean
+    reviewer?: null | string
+    review_approved?: null | boolean
+    ci_sha?: null | string
+    ci_suite?: null | string
+    ci_conclusion?: null | string
+    invalidation_reason?: null | string
+  }
+  failure_counts?: Record<string, number>
+  dependency_snapshot?: unknown
+  dependencies: Array<{ id: string; status: string }>
+  current_run?: null | {
+    id: number | string
+    status: string
+    claim_expires_at?: null | number
+    fence_digest: string
+    last_evidence_at?: null | number
+    last_evidence_digest?: null | string
+  }
+}
+
+export interface WorkflowProjection {
+  projection: 'workflow-runtime-v1'
+  canonical_source: 'github'
+  board: string
+  server_time: number
+  controller: WorkflowControllerState
+  leaves: WorkflowLeafProjection[]
+}
+
+export interface WorkflowControllerResponse {
+  controller: WorkflowControllerState
+}
+
 /** GET /profiles — the roster the decomposer routes across. */
 export interface KanbanProfile {
   name: string

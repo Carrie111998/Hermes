@@ -489,7 +489,7 @@ def _handle_show(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            task = kb.get_task(conn, tid)
+            task = kb.get_generic_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
             comments = kb.list_comments(conn, tid)
@@ -1166,7 +1166,7 @@ def _handle_attachments(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            if kb.get_task(conn, tid) is None:
+            if kb.get_generic_task(conn, tid) is None:
                 return tool_error(f"task {tid} not found")
             atts = kb.list_attachments(conn, tid)
             return json.dumps({

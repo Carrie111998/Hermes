@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from . import kanban_execution as workflow
 from hermes_cli import kanban_swarm as ks
 
 
@@ -719,6 +720,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
+    # --- Workflow v1 remote controller ---
+    p_workflow_status = sub.add_parser(
+        "workflow-status",
+        help="Show the remote Workflow controller, broker, and kill-switch state",
+    )
+    p_workflow_status.add_argument("--json", action="store_true")
+
+    p_workflow_pause = sub.add_parser(
+        "workflow-pause",
+        help="Pause evidence-fenced dispatch using the durable server kill switch",
+    )
+    p_workflow_pause.add_argument("--reason", required=True)
+    p_workflow_pause.add_argument("--json", action="store_true")
+
+    p_workflow_resume = sub.add_parser(
+        "workflow-resume",
+        help="Resume evidence-fenced dispatch (requires a verified worker broker)",
+    )
+    p_workflow_resume.add_argument("--reason", required=True)
+    p_workflow_resume.add_argument("--json", action="store_true")
+
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
         "daemon",
@@ -1065,10 +1087,13 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
-            "unblock":  _cmd_unblock,
-            "promote":  _cmd_promote,
-            "archive":  _cmd_archive,
-            "tail":     _cmd_tail,
+            "unblock": _cmd_unblock,
+            "promote": _cmd_promote,
+            "archive": _cmd_archive,
+            "tail": _cmd_tail,
+            "workflow-status": _cmd_workflow_status,
+            "workflow-pause": _cmd_workflow_pause,
+            "workflow-resume": _cmd_workflow_resume,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
@@ -1625,7 +1650,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task = kb.get_task(conn, args.task_id)
+        task = kb.get_generic_task(conn, args.task_id)
         if not task:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
@@ -1874,7 +1899,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
-            task = kb.get_task(conn, args.task)
+            task = kb.get_generic_task(conn, args.task)
             if task is None:
                 print(f"no such task: {args.task}", file=sys.stderr)
                 return 1
@@ -1889,7 +1914,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute(
-                "SELECT * FROM tasks WHERE status != 'archived'"
+                "SELECT * FROM tasks "
+                "WHERE status != 'archived' AND leaf_key IS NULL"
             ).fetchall())
             ids = [r["id"] for r in rows]
             if not ids:
@@ -2012,13 +2038,12 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        existing = kb.get_generic_task(conn, args.task_id)
+        if existing is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
-            # Report why
-            existing = kb.get_task(conn, args.task_id)
-            if existing is None:
-                print(f"no such task: {args.task_id}", file=sys.stderr)
-                return 1
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
                 f"lock={existing.claim_lock or '(none)'}",
@@ -2417,6 +2442,10 @@ def _cmd_archive(args: argparse.Namespace) -> int:
 
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
+    with kb.connect_closing() as conn:
+        if kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
     try:
         while True:
@@ -2431,6 +2460,67 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n(stopped)")
         return 0
+
+
+def _workflow_state_payload(state) -> dict[str, Any]:
+    return {
+        "version": state.version,
+        "dispatch_enabled": state.dispatch_enabled,
+        "broker_ready": state.broker_ready,
+        "status": state.status,
+        "controller_epoch": state.controller_epoch,
+        "heartbeat_at": state.heartbeat_at,
+        "last_reconciled_at": state.last_reconciled_at,
+        "last_error": state.last_error,
+        "updated_at": state.updated_at,
+    }
+
+
+def _cmd_workflow_status(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        state = workflow.get_workflow_controller_state(conn)
+    payload = _workflow_state_payload(state)
+    if getattr(args, "json", False):
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(f"Workflow controller: {state.status}")
+        print(f"  version:          {state.version}")
+        print(f"  dispatch enabled: {'yes' if state.dispatch_enabled else 'no'}")
+        print(f"  broker ready:     {'yes' if state.broker_ready else 'no'}")
+        print(f"  epoch:            {state.controller_epoch or '-'}")
+        print(f"  heartbeat:        {state.heartbeat_at or '-'}")
+        print(f"  reconciled:       {state.last_reconciled_at or '-'}")
+        if state.last_error:
+            print(f"  last error:       {state.last_error}")
+    return 0
+
+
+def _cmd_workflow_control(args: argparse.Namespace, *, enabled: bool) -> int:
+    actor = f"server-cli:{os.environ.get('HERMES_PROFILE', 'default')}"
+    with kb.connect_closing() as conn:
+        current = workflow.get_workflow_controller_state(conn)
+        state = workflow.set_workflow_dispatch_enabled(
+            conn,
+            enabled=enabled,
+            expected_version=current.version,
+            actor=actor,
+            reason=args.reason,
+        )
+    payload = _workflow_state_payload(state)
+    if getattr(args, "json", False):
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        action = "resumed" if enabled else "paused"
+        print(f"Workflow dispatch {action} at controller version {state.version}.")
+    return 0
+
+
+def _cmd_workflow_pause(args: argparse.Namespace) -> int:
+    return _cmd_workflow_control(args, enabled=False)
+
+
+def _cmd_workflow_resume(args: argparse.Namespace) -> int:
+    return _cmd_workflow_control(args, enabled=True)
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
@@ -2692,7 +2782,9 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     # Seed cursor at the latest id so we don't replay history.
     with kb.connect_closing() as conn:
         row = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+            "SELECT COALESCE(MAX(e.id), 0) AS m "
+            "FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            "WHERE t.leaf_key IS NULL"
         ).fetchone()
         cursor = int(row["m"])
 
@@ -2702,8 +2794,9 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                 rows = conn.execute(
                     "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
                     "       t.assignee, t.tenant "
-                    "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
-                    "WHERE e.id > ? ORDER BY e.id ASC LIMIT 200",
+                    "FROM task_events e JOIN tasks t ON t.id = e.task_id "
+                    "WHERE e.id > ? AND t.leaf_key IS NULL "
+                    "ORDER BY e.id ASC LIMIT 200",
                     (cursor,),
                 ).fetchall()
             for r in rows:
@@ -2752,8 +2845,8 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        if kb.get_task(conn, args.task_id) is None:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
+        if kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
             return 1
         kb.add_notify_sub(
             conn, task_id=args.task_id,
@@ -2770,6 +2863,9 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
 
 def _cmd_notify_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        if args.task_id and kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
         subs = kb.list_notify_subs(conn, args.task_id)
     if getattr(args, "json", False):
         print(json.dumps(subs, indent=2, ensure_ascii=False))
@@ -2787,6 +2883,9 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        if kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
         ok = kb.remove_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
@@ -2800,6 +2899,10 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
 
 
 def _cmd_log(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        if kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
     content = kb.read_worker_log(args.task_id, tail_bytes=args.tail)
     if content is None:
         print(f"(no log for {args.task_id} — task may not have spawned yet)",
@@ -2821,6 +2924,9 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
+        if kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
         runs = kb.list_runs(conn, args.task_id, **rsk)
     if getattr(args, "json", False):
         print(json.dumps([
@@ -2860,6 +2966,9 @@ def _cmd_runs(args: argparse.Namespace) -> int:
 
 def _cmd_context(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        if kb.get_generic_task(conn, args.task_id) is None:
+            print(f"no such ordinary task: {args.task_id}", file=sys.stderr)
+            return 1
         text = kb.build_worker_context(conn, args.task_id)
     print(text)
     return 0
@@ -3152,6 +3261,8 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `workflow-status`     Remote controller / kill-switch state
+  `workflow-pause`      Server-side emergency dispatch stop
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

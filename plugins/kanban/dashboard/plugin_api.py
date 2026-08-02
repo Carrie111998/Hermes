@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -44,12 +45,13 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_execution as workflow
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +176,36 @@ def _task_dict(
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
+
+
+def _require_generic_mutable(task: kanban_db.Task) -> None:
+    if task.leaf_key and task.lease_policy == "evidence":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Evidence-fenced leaves are read-only in generic Kanban; "
+                "use the Workflow controller"
+            ),
+        )
+
+
+def _require_generic_mutable_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> kanban_db.Task:
+    task = kanban_db.get_task(conn, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    _require_generic_mutable(task)
+    return task
+
+
+def _require_generic_run(conn, run_id: int) -> kanban_db.Run:
+    run = kanban_db.get_run(conn, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+    _require_generic_mutable_id(conn, run.task_id)
+    return run
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -371,6 +403,265 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+class WorkflowControlBody(BaseModel):
+    expected_version: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+def _workflow_runtime_leaf(
+    conn: sqlite3.Connection,
+    task: kanban_db.Task,
+) -> dict[str, Any]:
+    try:
+        envelope = json.loads(task.body or "")
+    except (TypeError, ValueError):
+        envelope = {}
+    spec = envelope.get("spec", {}) if isinstance(envelope, dict) else {}
+    if not isinstance(spec, dict):
+        spec = {}
+    run = (
+        kanban_db.get_run(
+            conn,
+            task.current_run_id,
+            allow_execution_leaf=True,
+        )
+        if task.current_run_id is not None
+        else None
+    )
+    fence_digest = None
+    if run is not None and run.claim_lock:
+        fence_digest = hashlib.sha256(run.claim_lock.encode("utf-8")).hexdigest()
+    dependencies = [
+        {
+            "id": row["parent_id"],
+            "status": row["status"],
+        }
+        for row in conn.execute(
+            "SELECT p.id AS parent_id, p.status, p.leaf_key "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? ORDER BY p.id",
+            (task.id,),
+        ).fetchall()
+    ]
+    raw_version = spec.get("version")
+    specification_version = None
+    if raw_version is not None:
+        version_text = str(raw_version)
+        specification_version = (
+            version_text if version_text.startswith("v") else f"v{version_text}"
+        )
+    snapshot_row = conn.execute(
+        "SELECT version, content_hash, material_hash, payload FROM workflow_github_snapshots "
+        "WHERE task_id=? ORDER BY version DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    snapshot = None
+    if snapshot_row is not None:
+        snapshot = json.loads(snapshot_row["payload"])
+        snapshot.update(
+            {
+                "snapshot_version": int(snapshot_row["version"]),
+                "content_hash": snapshot_row["content_hash"],
+                "material_hash": snapshot_row["material_hash"],
+            }
+        )
+    closeout = None
+    if run is not None:
+        closeout_row = conn.execute(
+            "SELECT candidate_sha, diff_digest, required_ci, reviewer, review_approved, "
+            "ci_sha, ci_suite, ci_conclusion, invalidation_reason "
+            "FROM workflow_run_closeout WHERE task_id=? AND run_id=?",
+            (task.id, run.id),
+        ).fetchone()
+        if closeout_row is not None:
+            closeout = dict(closeout_row)
+            closeout["required_ci"] = bool(closeout["required_ci"])
+            closeout["review_approved"] = (
+                bool(closeout["review_approved"])
+                if closeout["review_approved"] is not None
+                else None
+            )
+    failure_counts = {
+        row["failure_class"]: int(row["count"])
+        for row in conn.execute(
+            "SELECT failure_class, count FROM workflow_failure_counts WHERE task_id=?",
+            (task.id,),
+        ).fetchall()
+    }
+    return {
+        "id": task.id,
+        "title": task.title,
+        "canonical": {
+            "source": "github",
+            "repository": spec.get("repository"),
+            "campaign_issue": spec.get("campaign_issue"),
+            **({"snapshot": snapshot} if snapshot is not None else {}),
+        },
+        "leaf_key": task.leaf_key,
+        "leaf_family_key": task.leaf_family_key,
+        "specification_version": specification_version,
+        "spec_hash": task.spec_hash,
+        "pin_sha": task.pin_sha,
+        "capsule_hash": task.capsule_hash,
+        "status": task.status,
+        "closeout": closeout,
+        "failure_counts": failure_counts,
+        "dependencies": dependencies,
+        "current_run": (
+            {
+                "id": run.id,
+                "status": run.status,
+                "claim_expires_at": run.claim_expires,
+                "last_evidence_at": run.last_evidence_at,
+                "last_evidence_digest": run.last_evidence_digest,
+                "fence_digest": fence_digest,
+            }
+            if run is not None
+            else None
+        ),
+    }
+
+
+@router.get("/workflow/projection")
+def get_workflow_projection(
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
+):
+    """Return a fresh remote runtime projection for Desktop reconnect."""
+
+    resolved_board = _resolve_board(board)
+    with _conn(resolved_board) as conn:
+        controller = workflow.get_workflow_controller_state(conn)
+        task_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE leaf_key IS NOT NULL "
+                "ORDER BY created_at, id"
+            ).fetchall()
+        ]
+        leaves = []
+        for task_id in task_ids:
+            task = kanban_db.get_task(conn, task_id)
+            if task is not None:
+                leaves.append(_workflow_runtime_leaf(conn, task))
+    return {
+        "projection": "workflow-runtime-v1",
+        "canonical_source": "github",
+        "board": resolved_board or kanban_db.get_current_board(),
+        "server_time": int(time.time()),
+        "controller": asdict(controller),
+        "leaves": leaves,
+    }
+
+
+def _set_workflow_dispatch_from_api(
+    *,
+    enabled: bool,
+    body: WorkflowControlBody,
+    board: Optional[str],
+    actor: str,
+):
+    resolved_board = _resolve_board(board)
+    try:
+        with _conn(resolved_board) as conn:
+            controller = workflow.set_workflow_dispatch_enabled(
+                conn,
+                enabled=enabled,
+                expected_version=body.expected_version,
+                actor=actor,
+                reason=body.reason,
+            )
+    except workflow.WorkflowControlConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except workflow.WorkflowControlUnavailable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"controller": asdict(controller)}
+
+
+def _workflow_control_actor(request: Request, *, operation: str) -> str:
+    """Authorize a typed remote control and return its durable audit actor."""
+
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    kanban = config.get("kanban")
+    workflow_config = kanban.get("workflow") if isinstance(kanban, dict) else None
+    if not isinstance(workflow_config, dict) or workflow_config.get(
+        "remote_control_enabled"
+    ) is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="Workflow control is not enabled for remote dashboard sessions",
+        )
+
+    actor = ""
+    session = getattr(request.state, "session", None)
+    provider = getattr(session, "provider", "") if session is not None else ""
+    user_id = getattr(session, "user_id", "") if session is not None else ""
+    if provider and user_id:
+        actor = f"{provider}:user:{user_id}"
+
+    # Loopback mode authenticates the Desktop shell with a process-scoped,
+    # restart-rotated token rather than an OAuth Session object. Re-verify the
+    # exact request so a bare plugin router cannot accidentally authorize.
+    if not actor:
+        try:
+            from hermes_cli.web_server import _has_valid_session_token
+
+            if _has_valid_session_token(request):
+                actor = "dashboard:loopback-session"
+        except (ImportError, RuntimeError):
+            pass
+
+    if not actor:
+        raise HTTPException(
+            status_code=403,
+            detail="Authenticated Workflow control identity is required",
+        )
+
+    grants = workflow_config.get("remote_control_principals")
+    actor_grants = grants.get(actor) if isinstance(grants, dict) else None
+    if not isinstance(actor_grants, list) or operation not in actor_grants:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Workflow {operation} is not authorized for principal {actor}",
+        )
+    return actor
+
+
+@router.post("/workflow/controller/pause")
+def pause_workflow_controller(
+    body: WorkflowControlBody,
+    request: Request,
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
+):
+    return _set_workflow_dispatch_from_api(
+        enabled=False,
+        body=body,
+        board=board,
+        actor=_workflow_control_actor(request, operation="pause"),
+    )
+
+
+@router.post("/workflow/controller/resume")
+def resume_workflow_controller(
+    body: WorkflowControlBody,
+    request: Request,
+    board: Optional[str] = Query(
+        None, description="Kanban board slug (omit for current)"
+    ),
+):
+    return _set_workflow_dispatch_from_api(
+        enabled=True,
+        body=body,
+        board=board,
+        actor=_workflow_control_actor(request, operation="resume"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -406,10 +697,18 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
+        tasks = [
+            task
+            for task in tasks
+            if not (task.leaf_key and task.lease_policy == "evidence")
+        ]
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
-            "SELECT parent_id, child_id FROM task_links"
+            "SELECT link.parent_id, link.child_id FROM task_links link "
+            "JOIN tasks parent ON parent.id = link.parent_id "
+            "JOIN tasks child ON child.id = link.child_id "
+            "WHERE parent.leaf_key IS NULL AND child.leaf_key IS NULL"
         ).fetchall():
             link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
                 "children"
@@ -432,7 +731,9 @@ def get_board(
         progress: dict[str, dict[str, int]] = {}
         for row in conn.execute(
             "SELECT l.parent_id AS pid, t.status AS cstatus "
-            "FROM task_links l JOIN tasks t ON t.id = l.child_id"
+            "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE t.leaf_key IS NULL AND p.leaf_key IS NULL"
         ).fetchall():
             p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
             p["total"] += 1
@@ -443,10 +744,15 @@ def get_board(
         # We get the full structured list per task AND a compact
         # summary for the card badge (so cards don't carry the detail
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        diagnostics_per_task = _compute_task_diagnostics(
+            conn,
+            task_ids=[task.id for task in tasks],
+        ) if tasks else {}
 
         latest_event_id = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+            "SELECT COALESCE(MAX(event.id), 0) AS m FROM task_events event "
+            "JOIN tasks task ON task.id = event.task_id "
+            "WHERE task.leaf_key IS NULL"
         ).fetchone()["m"]
 
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
@@ -541,6 +847,7 @@ def get_task(
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable(task)
         # Drawer/detail view returns the FULL summary (no truncation) so
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
@@ -553,6 +860,8 @@ def get_task(
         for child_id in child_ids:
             child = kanban_db.get_task(conn, child_id)
             if child is None:
+                continue
+            if child.leaf_key and child.lease_policy == "evidence":
                 continue
             child_results.append({
                 "id": child.id,
@@ -698,8 +1007,7 @@ def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable_id(conn, task_id)
         return {
             "attachments": [
                 _attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)
@@ -725,8 +1033,7 @@ async def upload_task_attachment(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable_id(conn, task_id)
 
         safe_name = _safe_attachment_name(file.filename or "")
 
@@ -787,6 +1094,7 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         att = kanban_db.get_attachment(conn, attachment_id)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
+        _require_generic_mutable_id(conn, att.task_id)
         # Confirm the blob still lives under the board's attachments root
         # before serving — defense in depth against a tampered DB row.
         root = kanban_db.attachments_root(board=board).resolve()
@@ -811,9 +1119,12 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        att = kanban_db.delete_attachment(conn, attachment_id)
-        if att is None:
+        existing = kanban_db.get_attachment(conn, attachment_id)
+        if existing is None:
             raise HTTPException(status_code=404, detail="attachment not found")
+        _require_generic_mutable_id(conn, existing.task_id)
+        att = kanban_db.delete_attachment(conn, attachment_id)
+        assert att is not None
         return {"ok": True, "id": attachment_id}
     finally:
         conn.close()
@@ -859,6 +1170,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable(task)
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -1008,6 +1320,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable(task)
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1053,6 +1369,7 @@ def _set_status_direct(
     (user yanking a stuck worker back to the queue).
     """
     with kanban_db.write_txn(conn):
+        kanban_db._assert_generic_mutation_allowed(conn, task_id, "direct status edit")
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?",
@@ -1157,8 +1474,7 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable_id(conn, task_id)
         kanban_db.add_comment(
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
@@ -1183,6 +1499,8 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     try:
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True}
+    except PermissionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -1198,7 +1516,10 @@ def delete_link(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        try:
+            ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         return {"ok": bool(ok)}
     finally:
         conn.close()
@@ -1247,6 +1568,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 task = kanban_db.get_task(conn, tid)
                 if task is None:
                     entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                try:
+                    _require_generic_mutable(task)
+                except HTTPException as exc:
+                    entry.update(ok=False, error=str(exc.detail))
                     results.append(entry)
                     continue
                 if payload.archive:
@@ -1376,7 +1703,18 @@ def list_diagnostics(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        ordinary_task_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE leaf_key IS NULL ORDER BY created_at, id"
+            ).fetchall()
+        ]
+        if not ordinary_task_ids:
+            return {"diagnostics": [], "count": 0}
+        diags_by_task = _compute_task_diagnostics(
+            conn,
+            task_ids=ordinary_task_ids,
+        )
         if not diags_by_task:
             return {"diagnostics": [], "count": 0}
 
@@ -1479,6 +1817,7 @@ def list_active_workers(
             WHERE r.ended_at IS NULL
               AND r.worker_pid IS NOT NULL
               AND t.status = 'running'
+              AND t.leaf_key IS NULL
             ORDER BY r.started_at ASC
             """,
         ).fetchall()
@@ -1518,9 +1857,7 @@ def get_run_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        r = kanban_db.get_run(conn, run_id)
-        if r is None:
-            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        r = _require_generic_run(conn, run_id)
         return {"run": _run_dict(r)}
     finally:
         conn.close()
@@ -1547,9 +1884,7 @@ def inspect_run_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        r = kanban_db.get_run(conn, run_id)
-        if r is None:
-            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        r = _require_generic_run(conn, run_id)
     finally:
         conn.close()
 
@@ -1624,9 +1959,7 @@ def terminate_run_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        r = kanban_db.get_run(conn, run_id)
-        if r is None:
-            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        r = _require_generic_run(conn, run_id)
         if r.ended_at is not None:
             raise HTTPException(
                 status_code=409,
@@ -1670,6 +2003,7 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_generic_mutable_id(conn, task_id)
         ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
         if not ok:
             raise HTTPException(
@@ -1712,6 +2046,11 @@ def specify_task_endpoint(
     ``async def`` without an explicit ``run_in_executor``.
     """
     board = _resolve_board(board)
+    preflight = _conn(board=board)
+    try:
+        _require_generic_mutable_id(preflight, task_id)
+    finally:
+        preflight.close()
     # Pin the board for the duration of this call so the specifier module
     # (which calls ``kb.connect()`` with no args) hits the right DB. Use a
     # context-local override rather than mutating the process-global
@@ -1758,6 +2097,7 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_generic_mutable_id(conn, task_id)
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
@@ -1819,6 +2159,8 @@ def estimate_task_endpoint(task_id: str, board: Optional[str] = Query(None)):
     conn = _conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
+        if task is not None:
+            _require_generic_mutable(task)
     finally:
         conn.close()
     if task is None:
@@ -2015,6 +2357,7 @@ def get_home_channels(
         board = _resolve_board(board)
         conn = _conn(board=board)
         try:
+            _require_generic_mutable_id(conn, task_id)
             subs = kanban_db.list_notify_subs(conn, task_id)
         finally:
             conn.close()
@@ -2039,21 +2382,19 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
     Idempotent — re-subscribing is a no-op at the DB layer. 404 if the
     platform has no home channel configured. 404 if the task doesn't exist.
     """
-    homes = _configured_home_channels()
-    home = next((h for h in homes if h["platform"] == platform), None)
-    if not home:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No home channel configured for platform {platform!r}. "
-                   f"Set one from the messenger via /sethome, or configure "
-                   f"gateway.platforms.{platform}.home_channel in config.yaml.",
-        )
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        _require_generic_mutable_id(conn, task_id)
+        homes = _configured_home_channels()
+        home = next((h for h in homes if h["platform"] == platform), None)
+        if not home:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No home channel configured for platform {platform!r}. "
+                       f"Set one from the messenger via /sethome, or configure "
+                       f"gateway.platforms.{platform}.home_channel in config.yaml.",
+            )
         kanban_db.add_notify_sub(
             conn,
             task_id=task_id,
@@ -2070,16 +2411,17 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
 def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
     """Remove any notify subscription on *task_id* that matches *platform*'s home."""
-    homes = _configured_home_channels()
-    home = next((h for h in homes if h["platform"] == platform), None)
-    if not home:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No home channel configured for platform {platform!r}.",
-        )
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_generic_mutable_id(conn, task_id)
+        homes = _configured_home_channels()
+        home = next((h for h in homes if h["platform"] == platform), None)
+        if not home:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No home channel configured for platform {platform!r}.",
+            )
         kanban_db.remove_notify_sub(
             conn,
             task_id=task_id,
@@ -2151,6 +2493,8 @@ def get_task_log(
     conn = _conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
+        if task is not None:
+            _require_generic_mutable(task)
     finally:
         conn.close()
     if task is None:
@@ -2306,7 +2650,8 @@ def _board_counts(slug: str) -> dict[str, int]:
         conn = kanban_db.connect(board=slug)
         try:
             rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                "SELECT status, COUNT(*) AS n FROM tasks "
+                "WHERE leaf_key IS NULL GROUP BY status"
             ).fetchall()
             return {r["status"]: int(r["n"]) for r in rows}
         finally:
@@ -2637,6 +2982,11 @@ def decompose_task_endpoint(
     can take minutes on reasoning models.
     """
     board = _resolve_board(board)
+    preflight = _conn(board=board)
+    try:
+        _require_generic_mutable_id(preflight, task_id)
+    finally:
+        preflight.close()
     # Context-local board pin (see specify endpoint above): this sync
     # endpoint runs in FastAPI's threadpool, so mutating the process-global
     # HERMES_KANBAN_BOARD env var would let concurrent requests for
@@ -2817,7 +3167,13 @@ async def stream_events(ws: WebSocket):
             try:
                 rows = conn.execute(
                     "SELECT id, task_id, run_id, kind, payload, created_at "
-                    "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
+                    "FROM task_events WHERE id > ? "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM tasks "
+                    "WHERE tasks.id = task_events.task_id "
+                    "AND NOT (tasks.leaf_key IS NOT NULL "
+                    "AND tasks.lease_policy = 'evidence')"
+                    ") ORDER BY id ASC LIMIT 200",
                     (cursor_val,),
                 ).fetchall()
                 out: list[dict] = []

@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_execution as workflow
 
 
 @pytest.fixture
@@ -55,6 +56,47 @@ def test_kanban_list_json_includes_session_id(kanban_home):
         and row.get("session_id") == "acp-x"
         for row in payload
     )
+
+
+def test_server_cli_can_inspect_and_pause_workflow_without_desktop(kanban_home):
+    initial = json.loads(kc.run_slash("workflow-status --json"))
+    assert initial["dispatch_enabled"] is False
+    assert initial["broker_ready"] is False
+
+    unavailable = kc.run_slash("workflow-resume --reason 'no broker yet' --json")
+    assert "worker broker" in unavailable
+
+    with kb.connect_closing() as conn:
+        controller = workflow.set_workflow_broker_ready(
+            conn,
+            ready=True,
+            expected_version=initial["version"],
+            actor="remote-controller-test",
+            reason="isolated CLI fixture",
+        )
+        controller = workflow.set_workflow_dispatch_enabled(
+            conn,
+            enabled=True,
+            expected_version=controller.version,
+            actor="remote-controller-test",
+            reason="exercise emergency stop",
+        )
+    assert controller.dispatch_enabled is True
+
+    paused = json.loads(
+        kc.run_slash("workflow-pause --reason 'server emergency stop' --json")
+    )
+    assert paused["dispatch_enabled"] is False
+    assert paused["version"] == controller.version + 1
+
+    reloaded = json.loads(kc.run_slash("workflow-status --json"))
+    assert reloaded == paused
+    with kb.connect_closing() as conn:
+        event = conn.execute(
+            "SELECT kind, actor FROM workflow_controller_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert event["kind"] == "dispatch_paused"
+    assert event["actor"].startswith("server-cli:")
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):

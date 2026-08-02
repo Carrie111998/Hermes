@@ -8,10 +8,12 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_execution as workflow
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,14 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  workflow:\n"
+        "    remote_control_enabled: true\n"
+        "    remote_control_principals:\n"
+        "      'test:user:operator': [pause, resume]\n",
+        encoding="utf-8",
+    )
     kb.init_db()
     return home
 
@@ -56,6 +67,15 @@ def kanban_home(tmp_path, monkeypatch):
 @pytest.fixture
 def client(kanban_home):
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _authenticated_operator(request, call_next):
+        request.state.session = types.SimpleNamespace(
+            provider="test",
+            user_id="operator",
+        )
+        return await call_next(request)
+
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     return TestClient(app)
 
@@ -78,6 +98,310 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_workflow_reconnect_projection_and_typed_controller_are_remote(
+    client, kanban_home
+):
+    initial = client.get("/api/plugins/kanban/workflow/projection")
+    assert initial.status_code == 200
+    projection = initial.json()
+    assert projection["projection"] == "workflow-runtime-v1"
+    assert projection["canonical_source"] == "github"
+    assert projection["board"] == kb.DEFAULT_BOARD
+    assert projection["controller"]["version"] == 0
+    assert projection["controller"]["dispatch_enabled"] is False
+    assert projection["controller"]["broker_ready"] is False
+    assert projection["leaves"] == []
+
+    unavailable = client.post(
+        "/api/plugins/kanban/workflow/controller/resume",
+        json={"expected_version": 0, "reason": "Desktop reconnect"},
+    )
+    assert unavailable.status_code == 409
+    assert "broker" in unavailable.json()["detail"]
+
+    with kb.connect_closing() as conn:
+        controller = workflow.set_workflow_broker_ready(
+            conn,
+            ready=True,
+            expected_version=0,
+            actor="remote-controller-test",
+            reason="isolated broker fixture",
+        )
+        task_id = kb.create_task(
+            conn,
+            title="remote protected leaf",
+            body=json.dumps({
+                "schema": "hermes.execution-capsule.v1",
+                "spec": {
+                    "repository": "org/repo",
+                    "campaign_issue": 17,
+                    "leaf_id": "remote-leaf",
+                    "version": 1,
+                },
+                "capsule": {},
+            }),
+            assignee="coder",
+            workspace_kind="worktree",
+            workspace_path=str(kanban_home / "remote-worktree"),
+            leaf_key="github:org/repo:issue-17:leaf-remote-leaf:v1",
+            leaf_family_key="github:org/repo:issue-17:leaf-remote-leaf",
+            spec_hash="a" * 64,
+            pin_sha="b" * 40,
+            capsule_hash="c" * 64,
+            evidence_paths=("src/**",),
+            lease_policy="evidence",
+        )
+
+    ordinary_board = client.get("/api/plugins/kanban/board").json()
+    ordinary_ids = {
+        task["id"]
+        for column in ordinary_board["columns"]
+        for task in column["tasks"]
+    }
+    assert task_id not in ordinary_ids
+    assert ordinary_board["latest_event_id"] == 0
+    assert client.get(f"/api/plugins/kanban/tasks/{task_id}").status_code == 409
+    attachment = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("note.txt", b"generic mutation")},
+    )
+    assert attachment.status_code == 409
+
+    resumed = client.post(
+        "/api/plugins/kanban/workflow/controller/resume",
+        json={
+            "expected_version": controller.version,
+            "reason": "bounded test resume",
+        },
+    )
+    assert resumed.status_code == 200
+    resumed_controller = resumed.json()["controller"]
+    assert resumed_controller["dispatch_enabled"] is True
+    with kb.connect_closing() as conn:
+        actor = conn.execute(
+            "SELECT actor FROM workflow_controller_events "
+            "WHERE kind = 'dispatch_resumed' ORDER BY id DESC LIMIT 1"
+        ).fetchone()["actor"]
+    assert actor == "test:user:operator"
+
+    stale_pause = client.post(
+        "/api/plugins/kanban/workflow/controller/pause",
+        json={
+            "expected_version": controller.version,
+            "reason": "stale queued Desktop mutation",
+        },
+    )
+    assert stale_pause.status_code == 409
+    assert "stale" in stale_pause.json()["detail"]
+
+    paused = client.post(
+        "/api/plugins/kanban/workflow/controller/pause",
+        json={
+            "expected_version": resumed_controller["version"],
+            "reason": "remote emergency stop",
+        },
+    )
+    assert paused.status_code == 200
+    assert paused.json()["controller"]["dispatch_enabled"] is False
+
+    reconnected = client.get("/api/plugins/kanban/workflow/projection").json()
+    assert (
+        reconnected["controller"]["version"] == paused.json()["controller"]["version"]
+    )
+    assert reconnected["controller"]["dispatch_enabled"] is False
+    assert len(reconnected["leaves"]) == 1
+    leaf = reconnected["leaves"][0]
+    assert leaf["id"] == task_id
+    assert leaf["title"] == "remote protected leaf"
+    assert leaf["canonical"] == {
+        "source": "github",
+        "repository": "org/repo",
+        "campaign_issue": 17,
+    }
+    assert leaf["specification_version"] == "v1"
+    assert leaf["current_run"] is None
+    assert "workspace_path" not in leaf
+
+
+def test_workflow_remote_control_defaults_to_denied(client, kanban_home):
+    (kanban_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    denied = client.post(
+        "/api/plugins/kanban/workflow/controller/pause",
+        json={"expected_version": 0, "reason": "must be authorized"},
+    )
+
+    assert denied.status_code == 403
+    assert "workflow control" in denied.json()["detail"].lower()
+
+
+def test_workflow_remote_control_denies_unlisted_authenticated_principal(
+    client, kanban_home
+):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  workflow:\n"
+        "    remote_control_enabled: true\n"
+        "    remote_control_principals:\n"
+        "      'test:user:someone-else': [pause, resume]\n",
+        encoding="utf-8",
+    )
+
+    denied = client.post(
+        "/api/plugins/kanban/workflow/controller/pause",
+        json={"expected_version": 0, "reason": "principal must be granted"},
+    )
+
+    assert denied.status_code == 403
+    assert "authorized" in denied.json()["detail"].lower()
+
+
+def test_workflow_remote_control_denies_operation_not_granted_to_principal(
+    client, kanban_home
+):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  workflow:\n"
+        "    remote_control_enabled: true\n"
+        "    remote_control_principals:\n"
+        "      'test:user:operator': [pause]\n",
+        encoding="utf-8",
+    )
+
+    denied = client.post(
+        "/api/plugins/kanban/workflow/controller/resume",
+        json={"expected_version": 0, "reason": "resume is not granted"},
+    )
+
+    assert denied.status_code == 403
+    assert "resume" in denied.json()["detail"].lower()
+
+
+def test_generic_sibling_routes_and_aggregates_confine_protected_runtime(
+    client, kanban_home
+):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="protected sibling surface",
+            body=json.dumps({
+                "schema": "hermes.execution-capsule.v1",
+                "spec": {
+                    "repository": "org/repo",
+                    "campaign_issue": 18,
+                    "leaf_id": "sibling-surface",
+                    "version": 1,
+                },
+                "capsule": {},
+            }),
+            assignee="protected-only-profile",
+            workspace_kind="worktree",
+            workspace_path=str(kanban_home / "protected-worktree"),
+            leaf_key="github:org/repo:issue-18:leaf-sibling-surface:v1",
+            leaf_family_key="github:org/repo:issue-18:leaf-sibling-surface",
+            spec_hash="d" * 64,
+            pin_sha="e" * 40,
+            capsule_hash="f" * 64,
+            evidence_paths=("src/**",),
+            lease_policy="evidence",
+        )
+        raw_token = "must-never-cross-generic-rest"
+        run_id = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, worker_pid, started_at, leaf_key, leaf_family_key, "
+            "spec_hash, pin_sha, capsule_hash) "
+            "VALUES (?, 'coder', 'running', ?, ?, 424242, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                raw_token,
+                int(time.time()) + 600,
+                int(time.time()),
+                "github:org/repo:issue-18:leaf-sibling-surface:v1",
+                "github:org/repo:issue-18:leaf-sibling-surface",
+                "d" * 64,
+                "e" * 40,
+                "f" * 64,
+            ),
+        ).lastrowid
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ?, "
+            "worker_pid = 424242, current_run_id = ? WHERE id = ?",
+            (raw_token, int(time.time()) + 600, run_id, task_id),
+        )
+        attachment_id = conn.execute(
+            "INSERT INTO task_attachments (task_id, filename, stored_path, size, created_at) "
+            "VALUES (?, 'protected.txt', ?, 1, ?)",
+            (task_id, str(kanban_home / "protected.txt"), int(time.time())),
+        ).lastrowid
+        conn.commit()
+
+        assert kb.get_generic_task(conn, task_id) is None
+        assert task_id not in {task.id for task in kb.list_tasks(conn)}
+        with pytest.raises(PermissionError, match="controller-only"):
+            kb.list_attachments(conn, task_id)
+        with pytest.raises(PermissionError, match="controller-only"):
+            kb.delete_attachment(conn, attachment_id)
+
+        with pytest.raises(PermissionError, match="controller-only"):
+            kb.add_comment(conn, task_id, "generic", "forbidden")
+        with pytest.raises(PermissionError, match="controller-only"):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="test",
+                chat_id="test-chat",
+            )
+        with pytest.raises(PermissionError, match="controller-only"):
+            kb.remove_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="test",
+                chat_id="test-chat",
+            )
+
+    log_path = kb.worker_log_path(task_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("protected-log-sentinel", encoding="utf-8")
+
+    protected_requests = (
+        ("post", f"/api/plugins/kanban/tasks/{task_id}/comments", {"json": {"body": "x"}}, 409),
+        ("post", f"/api/plugins/kanban/tasks/{task_id}/estimate", {}, 409),
+        ("get", f"/api/plugins/kanban/tasks/{task_id}/log", {}, 409),
+        ("get", f"/api/plugins/kanban/home-channels?task_id={task_id}", {}, 409),
+        ("post", f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/test", {}, 409),
+        ("delete", f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/test", {}, 409),
+        ("get", f"/api/plugins/kanban/runs/{run_id}", {}, 404),
+        ("get", f"/api/plugins/kanban/runs/{run_id}/inspect", {}, 404),
+        (
+            "post",
+            f"/api/plugins/kanban/runs/{run_id}/terminate",
+            {"json": {"reason": "generic bypass"}},
+            404,
+        ),
+    )
+    for method, path, kwargs, expected_status in protected_requests:
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == expected_status, (method, path, response.text)
+        assert raw_token not in response.text
+        assert "protected-log-sentinel" not in response.text
+
+    workers = client.get("/api/plugins/kanban/workers/active").json()
+    assert workers["workers"] == []
+    diagnostics = client.get("/api/plugins/kanban/diagnostics").json()
+    assert diagnostics == {"diagnostics": [], "count": 0}
+    stats = client.get("/api/plugins/kanban/stats").json()
+    assert sum(stats["by_status"].values()) == 0
+    boards = client.get("/api/plugins/kanban/boards").json()["boards"]
+    default_board = next(board for board in boards if board["slug"] == kb.DEFAULT_BOARD)
+    assert default_board["total"] == 0
+    assignees = client.get("/api/plugins/kanban/assignees").json()["assignees"]
+    assert all(
+        sum(entry["counts"].values()) == 0
+        for entry in assignees
+        if entry["name"] == "protected-only-profile"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +606,66 @@ def test_delete_task(client):
     assert r.status_code == 404
 
 
+def test_generic_desktop_routes_cannot_mutate_evidence_fenced_leaf(client, kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="protected runtime leaf",
+            assignee="coder",
+            workspace_kind="worktree",
+            workspace_path=str(kanban_home / "protected-worktree"),
+            leaf_key="github:org/repo:issue-1:leaf-a:v1",
+            leaf_family_key="github:org/repo:issue-1:leaf-a",
+            spec_hash="a" * 64,
+            pin_sha="b" * 40,
+            capsule_hash="c" * 64,
+            evidence_paths=("src/**",),
+            lease_policy="evidence",
+        )
+
+    patch_response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"title": "local intent rewrite", "status": "archived"},
+    )
+    assert patch_response.status_code == 409
+    assert "Workflow controller" in patch_response.json()["detail"]
+
+    bulk_response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "status": "done", "priority": 99},
+    )
+    assert bulk_response.status_code == 200
+    assert bulk_response.json()["results"] == [
+        {
+            "id": task_id,
+            "ok": False,
+            "error": "Evidence-fenced leaves are read-only in generic Kanban; use the Workflow controller",
+        }
+    ]
+
+    for method, path, payload in (
+        ("delete", f"/api/plugins/kanban/tasks/{task_id}", None),
+        ("post", f"/api/plugins/kanban/tasks/{task_id}/reclaim", {}),
+        (
+            "post",
+            f"/api/plugins/kanban/tasks/{task_id}/reassign",
+            {"profile": "other"},
+        ),
+        ("post", f"/api/plugins/kanban/tasks/{task_id}/specify", {}),
+        ("post", f"/api/plugins/kanban/tasks/{task_id}/decompose", {}),
+    ):
+        response = client.request(method, path, json=payload)
+        assert response.status_code == 409, response.text
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.title == "protected runtime leaf"
+        assert task.status == "ready"
+        assert task.assignee == "coder"
+        assert task.priority != 99
+
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------
@@ -393,6 +777,48 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     # The bug symptom was a traceback; we don't assert on stderr because
     # capturing asyncio's internal "exception was never retrieved" logging
     # is flaky. The assertion that matters is: no CancelledError escaped.
+
+
+def test_websocket_events_exclude_protected_workflow_rows(
+    client, monkeypatch, kanban_home
+):
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(
+        web_server,
+        "_ws_auth_ok",
+        lambda ws: ws.query_params.get("token") == "ws-secret",
+    )
+    with kb.connect_closing() as conn:
+        ordinary_id = kb.create_task(conn, title="ordinary event")
+        protected_id = kb.create_task(
+            conn,
+            title="protected event",
+            body=json.dumps({
+                "schema": "hermes.execution-capsule.v1",
+                "spec": {"repository": "org/repo", "campaign_issue": 9},
+                "capsule": {},
+            }),
+            assignee="coder",
+            workspace_kind="worktree",
+            workspace_path=str(kanban_home / "protected-worktree"),
+            leaf_key="github:org/repo:issue-9:leaf-ws:v1",
+            leaf_family_key="github:org/repo:issue-9:leaf-ws",
+            spec_hash="a" * 64,
+            pin_sha="b" * 40,
+            capsule_hash="c" * 64,
+            evidence_paths=("src/**",),
+            lease_policy="evidence",
+        )
+
+    with client.websocket_connect(
+        "/api/plugins/kanban/events?token=ws-secret&since=0"
+    ) as ws:
+        frame = ws.receive_json()
+
+    event_task_ids = {event["task_id"] for event in frame["events"]}
+    assert ordinary_id in event_task_ids
+    assert protected_id not in event_task_ids
 
 
 # ---------------------------------------------------------------------------

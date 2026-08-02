@@ -80,6 +80,37 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_generic_model_reads_hide_protected_workflow_rows(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        protected_id = kb.create_task(
+            conn,
+            title="protected model-tool row",
+            body=json.dumps({
+                "spec": {"dependencies": [], "first_evidence_seconds": 600}
+            }),
+            workspace_kind="worktree",
+            workspace_path="/tmp/protected-model-tool-row",
+            leaf_key="github:org/repo:issue-19:leaf-model-tool:v1",
+            leaf_family_key="github:org/repo:issue-19:leaf-model-tool",
+            spec_hash="1" * 64,
+            pin_sha="2" * 40,
+            capsule_hash="3" * 64,
+            evidence_paths=("src/**",),
+            lease_policy="evidence",
+        )
+
+    show = json.loads(kt._handle_show({"task_id": protected_id}))
+    assert "not found" in show["error"]
+    attachments = json.loads(kt._handle_attachments({"task_id": protected_id}))
+    assert "not found" in attachments["error"]
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    listed = json.loads(kt._handle_list({"limit": 100}))
+    assert protected_id not in {task["id"] for task in listed["tasks"]}
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

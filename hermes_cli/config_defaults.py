@@ -2219,6 +2219,33 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Workflow v1 is a separate, evidence-fenced controller. It is
+        # intentionally opt-in and defaults to monitor/reconcile-only: this
+        # gateway watcher never invokes the generic dispatcher or starts a
+        # worker. Runtime dispatch has an additional durable per-board kill
+        # switch and broker-readiness gate in kanban.db.
+        "workflow": {
+            "enabled": False,
+            "controller_interval_seconds": 15,
+            # Independent process-creation readiness. Even when the watcher is
+            # enabled, durable per-board dispatch and broker readiness must
+            # also be true before the production runtime tick is called.
+            "launcher_ready": False,
+            # A real launcher is not ready without an explicit model/provider.
+            # These are ordinary config values; credentials remain in the
+            # profile auth store and are narrowed into an isolated worker home.
+            "worker_model": "",
+            "worker_provider": "",
+            # Permit authenticated Desktop/dashboard sessions to invoke the
+            # typed pause/resume API. Server-local CLI control remains
+            # available when this is false. Explicit opt-in keeps ordinary
+            # dashboard readers from inheriting controller authority.
+            "remote_control_enabled": False,
+            # Exact request-derived audit principals mapped to the typed
+            # operations each may invoke. Authentication alone never grants
+            # Workflow control.
+            "remote_control_principals": {},
+        },
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

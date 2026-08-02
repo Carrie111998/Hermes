@@ -34,6 +34,7 @@ import { $boardSlug, bindApi, boardKey, fetchBoard } from './api'
 import { KanbanBoardPage } from './board'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
+import { WorkflowPage } from './workflow'
 
 // Live "N running / ready" pill — one glance at fleet activity from anywhere,
 // clicks through to the board. Shares the board query (one cache, one poll with
@@ -110,10 +111,22 @@ const plugin: HermesPlugin = {
         render: () => <KanbanBoardPage />
       },
       {
+        id: 'workflow-page',
+        area: ROUTES_AREA,
+        data: { path: '/workflow' } satisfies RouteContribution,
+        render: () => <WorkflowPage />
+      },
+      {
         id: 'nav',
         area: SIDEBAR_NAV_AREA,
         order: 50,
         data: { codicon: 'project', label: 'Kanban', path: '/kanban' } satisfies SidebarNavContribution
+      },
+      {
+        id: 'workflow-nav',
+        area: SIDEBAR_NAV_AREA,
+        order: 51,
+        data: { codicon: 'git-pull-request', label: 'Workflow', path: '/workflow' } satisfies SidebarNavContribution
       },
       {
         id: 'count',
@@ -129,6 +142,16 @@ const plugin: HermesPlugin = {
           label: 'Kanban: Open board',
           keywords: ['kanban', 'board', 'tasks', 'agents'],
           run: () => host.navigate('/kanban')
+        } satisfies PaletteContribution
+      },
+      {
+        id: 'workflow-open',
+        area: PALETTE_AREA,
+        data: {
+          id: 'kanban.workflow.open',
+          label: 'Workflow: Open remote projection',
+          keywords: ['workflow', 'github', 'controller', 'remote'],
+          run: () => host.navigate('/workflow')
         } satisfies PaletteContribution
       },
       {

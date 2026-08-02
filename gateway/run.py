@@ -11187,6 +11187,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
+        # Start the remote Workflow v1 controller independently of generic
+        # Kanban dispatch. This opt-in watcher persists health and performs
+        # restart reconciliation even while dispatch_in_gateway remains false;
+        # it never spawns workers itself.
+        self._spawn_supervised(
+            self._workflow_controller_watcher,
+            "workflow_controller_watcher",
+            restart=False,
+        )
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or

@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -23,6 +24,31 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+_WORKFLOW_CONTROLLER_STALE_SECONDS = 60
+
+
+def _workflow_runtime_dispatch_allowed(
+    workflow_cfg: dict[str, Any],
+    state: Any,
+    *,
+    controller_epoch: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Require every config, durable, generation, and health dispatch gate."""
+
+    observed_at = int(time.time()) if now is None else int(now)
+    heartbeat_at = getattr(state, "heartbeat_at", None)
+    return bool(
+        workflow_cfg.get("launcher_ready") is True
+        and bool(str(workflow_cfg.get("worker_model") or "").strip())
+        and bool(str(workflow_cfg.get("worker_provider") or "").strip())
+        and getattr(state, "dispatch_enabled", False) is True
+        and getattr(state, "broker_ready", False) is True
+        and getattr(state, "status", None) == "healthy"
+        and getattr(state, "controller_epoch", None) == controller_epoch
+        and heartbeat_at is not None
+        and int(heartbeat_at) >= observed_at - _WORKFLOW_CONTROLLER_STALE_SECONDS
+    )
 
 
 def _resolve_auto_decompose_settings(
@@ -111,6 +137,9 @@ def _release_singleton_lock(handle) -> None:
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    _running: bool
+    _workflow_controller_lock_handle: Optional[object]
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
@@ -949,6 +978,183 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    async def _workflow_controller_watcher(self) -> None:
+        """Run Workflow v1 reconciliation on the remote gateway.
+
+        This watcher is intentionally separate from generic Kanban dispatch.
+        ``kanban.dispatch_in_gateway=false`` must not disable restart recovery,
+        controller health, or the durable kill switch. It never spawns a
+        worker unless launcher configuration and every durable controller gate
+        are healthy and current.
+        """
+
+        retry_delay = 1.0
+        lock_handle = None
+        _kb: Any = None
+        _workflow: Any = None
+        _workflow_runtime: Any = None
+        interval = 15.0
+        while self._running:
+            try:
+                from hermes_cli.config import load_config as _load_config
+                from hermes_cli import kanban_db as _kb
+                from hermes_cli import kanban_execution as _workflow
+                from hermes_cli import kanban_workflow_runtime as _workflow_runtime
+            except Exception:
+                logger.exception(
+                    "workflow controller: dependencies unavailable; retrying"
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 15.0)
+                continue
+
+            try:
+                cfg = _load_config()
+            except Exception:
+                logger.exception("workflow controller: cannot load config; retrying")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 15.0)
+                continue
+            if not isinstance(cfg, dict):
+                logger.warning("workflow controller: invalid config shape; retrying")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 15.0)
+                continue
+            kanban_cfg = cfg.get("kanban", {})
+            workflow_cfg = (
+                kanban_cfg.get("workflow", {})
+                if isinstance(kanban_cfg, dict)
+                else {}
+            )
+            if not isinstance(workflow_cfg, dict):
+                logger.warning("workflow controller: invalid workflow config; retrying")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 15.0)
+                continue
+            if not workflow_cfg.get("enabled", False):
+                logger.info("workflow controller: disabled via kanban.workflow.enabled")
+                return
+            try:
+                interval_value = workflow_cfg.get(
+                    "controller_interval_seconds",
+                    workflow_cfg.get("reconcile_interval_seconds", 15),
+                )
+                interval = float(interval_value or 15)
+            except (TypeError, ValueError):
+                logger.warning("workflow controller: invalid reconcile interval; using 15s")
+                interval = 15.0
+            interval = max(interval, 1.0)
+
+            try:
+                lock_path = _kb.kanban_home() / "kanban" / ".workflow-controller.lock"
+                lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+            except Exception:
+                logger.exception("workflow controller: lock acquisition failed; retrying")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2.0, 15.0)
+                continue
+            if lock_state == "held":
+                break
+            logger.warning(
+                "workflow controller: singleton lock %s at %s; standing by",
+                lock_state,
+                lock_path,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2.0, 15.0)
+
+        if (
+            not self._running
+            or lock_handle is None
+            or _kb is None
+            or _workflow is None
+            or _workflow_runtime is None
+        ):
+            return
+        self._workflow_controller_lock_handle = lock_handle
+        epoch = f"gateway:{os.getpid()}:{uuid.uuid4().hex}"
+        initialized_boards: set[str] = set()
+        logger.info(
+            "workflow controller: remote reconciliation enabled (epoch=%s, interval=%.1fs)",
+            epoch,
+            interval,
+        )
+
+        def _tick_board(slug: str) -> None:
+            """Open, reconcile, and close one board on the same worker thread."""
+
+            conn = None
+            try:
+                conn = _kb.connect(board=slug)
+                first_tick = slug not in initialized_boards
+                if first_tick:
+                    _workflow.begin_workflow_controller_epoch(
+                        conn,
+                        controller_epoch=epoch,
+                        actor="remote-gateway",
+                    )
+                    initialized_boards.add(slug)
+                adapter = getattr(self, "_workflow_coordinator_adapter", None)
+                if adapter is None:
+                    adapter = _workflow_runtime.PausedWorkflowCoordinatorAdapter()
+
+                def _runtime_tick() -> None:
+                    state = _workflow.get_workflow_controller_state(conn)
+                    launch_enabled = _workflow_runtime_dispatch_allowed(
+                        workflow_cfg, state, controller_epoch=epoch
+                    )
+                    _workflow_runtime.run_workflow_runtime_tick(
+                        conn,
+                        controller_epoch=epoch,
+                        launcher=_workflow_runtime.HermesWorkflowLauncher(
+                            model=str(workflow_cfg.get("worker_model") or ""),
+                            provider=str(workflow_cfg.get("worker_provider") or ""),
+                        ),
+                        launch_enabled=launch_enabled,
+                        coordinator=_workflow_runtime.WorkflowProductionCoordinator(
+                            adapter
+                        ),
+                    )
+
+                # Once an epoch is healthy, consume bounded progress/result
+                # channels before stale-lease reconciliation. Otherwise a
+                # terminal proposal written just before lease expiry can be
+                # reclaimed before the controller gets a chance to ingest it.
+                if not first_tick:
+                    _runtime_tick()
+                _workflow.run_workflow_controller_tick(
+                    conn,
+                    controller_epoch=epoch,
+                )
+                if first_tick:
+                    _runtime_tick()
+            finally:
+                if conn is not None:
+                    conn.close()
+
+        try:
+            while self._running:
+                try:
+                    boards = _kb.list_boards(include_archived=False)
+                except Exception:
+                    logger.exception("workflow controller: cannot enumerate boards")
+                    boards = []
+                for board_meta in boards:
+                    slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                    try:
+                        await asyncio.to_thread(_tick_board, slug)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "workflow controller: reconciliation failed on board %s",
+                            slug,
+                        )
+                await asyncio.sleep(interval)
+        finally:
+            self._workflow_controller_lock_handle = None
+            _release_singleton_lock(lock_handle)
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
