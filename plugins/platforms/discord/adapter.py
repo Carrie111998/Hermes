@@ -532,7 +532,8 @@ class VoiceReceiver:
         # with the playback token so STT completed after playback still goes
         # through the strict phrase gate instead of the normal model path.
         self._playback_capture_token: Optional[int] = None
-        self._buffer_playback_tokens: Dict[int, int] = {}
+        self._buffer_playback_tokens: Dict[int, Optional[int]] = {}
+        self._boundary_completed: List[Tuple[int, bytes, Optional[int]]] = []
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
@@ -576,6 +577,7 @@ class VoiceReceiver:
             self._ssrc_to_user.clear()
             self._playback_capture_token = None
             self._buffer_playback_tokens.clear()
+            self._boundary_completed.clear()
             self._playback_transport_stats.clear()
             self._playback_seen_ssrcs.clear()
             self._playback_inflight.clear()
@@ -658,12 +660,11 @@ class VoiceReceiver:
     def begin_playback_capture(self, token: int) -> None:
         """Enable and tag inbound capture for one TTS playback."""
         with self._lock:
-            # Audio buffered before TTS belongs to the completed conversational
-            # turn. It must never be relabeled as playback-overlap input or
-            # concatenated with the wake utterance for this epoch.
-            self._buffers.clear()
-            self._last_packet_time.clear()
-            self._buffer_playback_tokens.clear()
+            # Close any valid utterance that began before TTS as an untagged
+            # conversational segment. New PCM starts a fresh playback epoch,
+            # so the two generations can never be concatenated or relabeled.
+            for ssrc in list(self._buffers):
+                self._complete_buffer_locked(ssrc)
             self._playback_capture_token = token
             self._playback_transport_stats[token] = defaultdict(int)
             self._playback_seen_ssrcs[token] = set()
@@ -674,6 +675,50 @@ class VoiceReceiver:
             # cannot admit an untagged playback packet during the transition.
             self._paused = False
         logger.info("Discord voice playback capture armed (token=%s)", token)
+
+    def _complete_buffer_locked(self, ssrc: int) -> None:
+        """Move one complete-enough PCM generation to the endpoint queue."""
+        buf = self._buffers.get(ssrc)
+        if buf:
+            duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
+            if duration >= self.MIN_SPEECH_DURATION:
+                user_id = self._ssrc_to_user.get(ssrc, 0)
+                if not user_id:
+                    user_id = self._infer_user_for_ssrc(ssrc)
+                if user_id:
+                    self._boundary_completed.append(
+                        (
+                            user_id,
+                            bytes(buf),
+                            self._buffer_playback_tokens.get(ssrc),
+                        )
+                    )
+        self._buffers.pop(ssrc, None)
+        self._last_packet_time.pop(ssrc, None)
+        self._buffer_playback_tokens.pop(ssrc, None)
+
+    def _commit_decoded_pcm_locked(
+        self,
+        ssrc: int,
+        pcm: bytes,
+        playback_token: Optional[int],
+        *,
+        received_at: float,
+    ) -> None:
+        """Append PCM without crossing an entry-pinned playback generation."""
+        existing = self._buffers.get(ssrc)
+        existing_token = self._buffer_playback_tokens.get(ssrc)
+        if existing and existing_token != playback_token:
+            self._complete_buffer_locked(ssrc)
+
+        self._buffers[ssrc].extend(pcm)
+        self._last_packet_time[ssrc] = received_at
+        self._buffer_playback_tokens[ssrc] = playback_token
+        if playback_token is not None:
+            max_playback_bytes = self.SAMPLE_RATE * self.CHANNELS * 2 * 15
+            overflow = len(self._buffers[ssrc]) - max_playback_bytes
+            if overflow > 0:
+                del self._buffers[ssrc][:overflow]
 
     def end_playback_capture(self, token: int) -> None:
         """Stop new tagging; finalize after token-pinned callbacks drain."""
@@ -951,21 +996,12 @@ class VoiceReceiver:
                     and self._running
                 ):
                     if packet_token is None or self._retain_playback_pcm:
-                        self._buffers[decoded_ssrc].extend(decoded_pcm)
-                        self._last_packet_time[decoded_ssrc] = time.monotonic()
-                        if packet_token is not None:
-                            self._buffer_playback_tokens.setdefault(
-                                decoded_ssrc,
-                                packet_token,
-                            )
-                            max_playback_bytes = (
-                                self.SAMPLE_RATE * self.CHANNELS * 2 * 15
-                            )
-                            overflow = (
-                                len(self._buffers[decoded_ssrc]) - max_playback_bytes
-                            )
-                            if overflow > 0:
-                                del self._buffers[decoded_ssrc][:overflow]
+                        self._commit_decoded_pcm_locked(
+                            decoded_ssrc,
+                            decoded_pcm,
+                            packet_token,
+                            received_at=time.monotonic(),
+                        )
                     if packet_token is not None:
                         self._transport_stats["playback_tagged_packets"] += 1
                         token_stats = self._playback_transport_stats.get(packet_token)
@@ -1040,6 +1076,8 @@ class VoiceReceiver:
         endpoint_logs = []
 
         with self._lock:
+            completed.extend(self._boundary_completed)
+            self._boundary_completed.clear()
             ssrc_user_map = dict(self._ssrc_to_user)
             ssrc_list = list(self._buffers.keys())
 
@@ -1094,6 +1132,8 @@ class VoiceReceiver:
         flush_logs = []
 
         with self._lock:
+            completed.extend(self._boundary_completed)
+            self._boundary_completed.clear()
             ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc, buf in list(self._buffers.items()):
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec

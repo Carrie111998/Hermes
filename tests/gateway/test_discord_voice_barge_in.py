@@ -356,7 +356,7 @@ def test_playback_capture_reactivates_a_started_receiver_left_paused():
     assert receiver._packet_debug_count == 1
 
 
-def test_playback_capture_discards_pre_playback_pcm_before_tagging_new_epoch():
+def test_playback_capture_preserves_valid_pre_playback_onset_as_untagged():
     from plugins.platforms.discord.adapter import VoiceReceiver
 
     vc = MagicMock()
@@ -366,16 +366,42 @@ def test_playback_capture_discards_pre_playback_pcm_before_tagging_new_epoch():
     vc._connection.hook = None
 
     receiver = VoiceReceiver(vc)
-    receiver._buffers[100].extend(b"prior utterance pcm")
+    prior_pcm = b"\x00" * 96_000
+    receiver._ssrc_to_user[100] = 42
+    receiver._buffers[100].extend(prior_pcm)
     receiver._last_packet_time[100] = 123.0
-    receiver._buffer_playback_tokens[100] = 99
 
     receiver.begin_playback_capture(7)
 
+    assert receiver.check_silence(with_context=True) == [(42, prior_pcm, None)]
     assert dict(receiver._buffers) == {}
     assert receiver._last_packet_time == {}
     assert receiver._buffer_playback_tokens == {}
     assert receiver._playback_capture_token == 7
+
+
+def test_pre_arm_inflight_pcm_cannot_join_new_playback_generation():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+
+    receiver = VoiceReceiver(vc)
+    receiver._ssrc_to_user[100] = 42
+    prior_pcm = b"\x00" * 96_000
+    playback_pcm = b"\x01" * 3_840
+
+    receiver.begin_playback_capture(7)
+    with receiver._lock:
+        receiver._commit_decoded_pcm_locked(100, prior_pcm, None, received_at=1.0)
+        receiver._commit_decoded_pcm_locked(100, playback_pcm, 7, received_at=2.0)
+
+    assert bytes(receiver._buffers[100]) == playback_pcm
+    assert receiver._buffer_playback_tokens[100] == 7
+    assert receiver.check_silence(with_context=True) == [(42, prior_pcm, None)]
 
 
 @pytest.mark.asyncio
