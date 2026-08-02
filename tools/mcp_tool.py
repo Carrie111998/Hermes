@@ -2301,6 +2301,16 @@ class MCPServerTask:
                 # tool-capable server that doesn't implement it answers -32601;
                 # in that case fall back to the pre-ping ``list_tools`` probe
                 # for the rest of this connection rather than reconnect-looping.
+                #
+                # Never probe while an RPC is in flight (``_rpc_lock`` held): a
+                # single-threaded stdio server can't answer ping mid-dispatch,
+                # so the probe would time out and tear down a healthy transport,
+                # killing the very call it blames — the in-flight round-trip is
+                # itself the liveness signal, and its success path marks the
+                # session proven. The stdio recycle checks above already skip
+                # under the same condition.
+                if self.session and self._rpc_lock.locked():
+                    continue
                 if self.session:
                     try:
                         await self._keepalive_probe()
