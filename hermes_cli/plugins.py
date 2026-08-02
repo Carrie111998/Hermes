@@ -550,9 +550,11 @@ class _RegistrationTransaction:
                 for surface in _EXTERNAL_COMMIT_SURFACES
             ),
         ]
-        for lock in locks:
-            lock.acquire()
+        acquired_locks: List[Any] = []
         try:
+            for lock in locks:
+                lock.acquire()
+                acquired_locks.append(lock)
             self.manager_before = _PluginManagerState(manager)
             self.tool_snapshot = tool_registry._take_transaction_snapshot()
             self.external_snapshots = {
@@ -560,7 +562,7 @@ class _RegistrationTransaction:
                 for surface in _EXTERNAL_COMMIT_SURFACES
             }
         finally:
-            for lock in reversed(locks):
+            for lock in reversed(acquired_locks):
                 lock.release()
 
         self.manager_view = _PluginRegistrationView(
@@ -658,6 +660,25 @@ class _RegistrationTransaction:
             ),
         ]
         acquired_locks: List[Any] = []
+        publication_started = False
+        context_bindings_before = [
+            (
+                context,
+                context._registration_registry,
+                context._registration_manager,
+                context._registration_external_registries,
+                context._managed_generation,
+            )
+            for context in self.contexts
+        ]
+
+        def restore_context_binding(binding: tuple[Any, ...]) -> None:
+            context, registry, manager, external_registries, generation = binding
+            context._registration_registry = registry
+            context._registration_manager = manager
+            context._registration_external_registries = external_registries
+            context._managed_generation = generation
+
         try:
             if revoke_generation is not None:
                 self.manager._begin_live_context_revocation(revoke_generation)
@@ -681,6 +702,7 @@ class _RegistrationTransaction:
                     prepared_external[surface],
                 )
 
+            publication_started = True
             self.tool_registry._install_prepared_transaction_locked(
                 self.tool_snapshot,
                 prepared_tools,
@@ -697,6 +719,59 @@ class _RegistrationTransaction:
                 context._registration_external_registries = None
                 context._managed_generation = self.context_generation
             self.manager._install_owned_state_locked(next_manager)
+        except BaseException as primary:
+            if publication_started:
+                rollback_errors: List[BaseException] = []
+                rollback_steps = [
+                    (
+                        "tool",
+                        lambda: self.tool_registry._restore_transaction_snapshot_exact_locked(
+                            self.tool_snapshot,
+                        ),
+                    ),
+                    *(
+                        (
+                            surface,
+                            lambda surface=surface: self.external_transactions[
+                                surface
+                            ].restore_snapshot_locked(
+                                self.external_snapshots[surface],
+                            ),
+                        )
+                        for surface in _EXTERNAL_COMMIT_SURFACES
+                    ),
+                    *(
+                        (
+                            f"context[{index}]",
+                            lambda binding=binding: restore_context_binding(binding),
+                        )
+                        for index, binding in enumerate(context_bindings_before)
+                    ),
+                    (
+                        "manager",
+                        lambda: self.manager._restore_owned_state_locked(
+                            self.manager_before,
+                        ),
+                    ),
+                ]
+                for surface, restore in rollback_steps:
+                    try:
+                        restore()
+                    except BaseException as rollback_exc:
+                        logger.critical(
+                            "Plugin publication rollback failed for %s after %s",
+                            surface,
+                            type(primary).__name__,
+                            exc_info=True,
+                        )
+                        rollback_errors.append(rollback_exc)
+                if rollback_errors:
+                    primary.__notes__ = getattr(primary, "__notes__", []) + [
+                        "Plugin publication rollback failed; process-local "
+                        "registries may be partially published. Check logs "
+                        "for every rollback failure."
+                    ]
+            raise
         finally:
             for lock in reversed(acquired_locks):
                 lock.release()
@@ -737,6 +812,8 @@ class PluginContext:
         self._subagent_lifecycle: Any = None
 
     def _ensure_live_locked(self, target: Any) -> None:
+        if getattr(target, "_frozen", False):
+            raise RuntimeError("plugin registration view is frozen")
         generation = self._managed_generation
         if generation is None or not isinstance(target, PluginManager):
             return
@@ -1932,6 +2009,24 @@ class PluginManager:
         self._discovered = state._discovered
         self._live_context_generation = state._live_context_generation
         self._generation = max(self._generation, state._generation) + 1
+
+    def _restore_owned_state_locked(self, state: Any) -> None:
+        """Restore a transaction checkpoint exactly while ``_lock`` is held."""
+        self._plugins = state._plugins
+        self._hooks = state._hooks
+        self._middleware = state._middleware
+        self._plugin_tool_names = state._plugin_tool_names
+        self._plugin_platform_names = state._plugin_platform_names
+        self._plugin_external_names = state._plugin_external_names
+        self._cli_commands = state._cli_commands
+        self._context_engine = state._context_engine
+        self._plugin_commands = state._plugin_commands
+        self._plugin_skills = state._plugin_skills
+        self._aux_tasks = state._aux_tasks
+        self._slack_action_handlers = state._slack_action_handlers
+        self._discovered = state._discovered
+        self._live_context_generation = state._live_context_generation
+        self._generation = state._generation
 
     def discover_and_load(self, force: bool = False) -> None:
         """Load plugins, publishing a force reload as one complete generation."""

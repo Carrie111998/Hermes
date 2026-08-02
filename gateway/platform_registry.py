@@ -365,6 +365,14 @@ class PlatformRegistry:
         self._deferred = prepared._deferred
         self._generation = max(self._generation, prepared._generation) + 1
 
+    def restore_snapshot_locked(self, snapshot: _PlatformSnapshot) -> None:
+        """Restore an opaque snapshot exactly while the registry lock is held."""
+        self._validate_snapshot(snapshot)
+        self._entries = dict(snapshot._entries)
+        self._deferred = dict(snapshot._deferred)
+        self._resolving = dict(snapshot._resolving)
+        self._generation = snapshot._generation
+
     # -- deferred loading ----------------------------------------------------
 
     def register_deferred(self, name: str, loader: Callable[[], None]) -> None:

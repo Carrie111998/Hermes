@@ -30,6 +30,10 @@ _TOOL_NAME = "h1_transaction_generation_tool"
 _PLUGIN_NAME = "h1-transaction-concurrency"
 
 
+class _InjectedBaseException(BaseException):
+    pass
+
+
 class _ImageProvider(ImageGenProvider):
     def __init__(self, name: str, marker: str) -> None:
         self._name = name
@@ -332,6 +336,21 @@ def _read_external_generation(
     }
 
 
+def _surface_generations(manager: PluginManager) -> dict[str, int]:
+    transactions = plugins_module._external_registry_transactions()
+    return {
+        "manager": manager._generation,
+        "manager_context": manager._live_context_generation,
+        "tool": registry._generation,
+        **{
+            surface: transaction.take_snapshot()._generation
+            for surface, transaction in transactions.items()
+            if hasattr(transaction.take_snapshot(), "_generation")
+        },
+        "secret": transactions["secret"].take_snapshot()._mapping._generation,
+    }
+
+
 def _register_external_direct(
     surface: str,
     value: Any,
@@ -560,6 +579,90 @@ def test_force_reload_failure_preserves_old_generation_without_empty_window(
         getattr(value, "marker", getattr(value, "label", None))
         for value in observed.values()
     } == {"generation-a"}
+
+
+def test_force_reload_baseexception_after_tool_install_rolls_back_all_surfaces(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "tool-install-interrupt")
+    _support(old_values, "generation-a", released=True, register_generation_state=True)
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_tool = registry.get_entry(_TOOL_NAME)
+    old_generations = _surface_generations(manager)
+
+    new_values = _external_values("generation-b", "tool-install-interrupt")
+    _support(new_values, "generation-b", released=True, register_generation_state=True)
+    original_install = registry._install_prepared_transaction_locked
+
+    def install_then_interrupt(snapshot, prepared):
+        original_install(snapshot, prepared)
+        raise _InjectedBaseException("injected after tool install")
+
+    monkeypatch.setattr(registry, "_install_prepared_transaction_locked", install_then_interrupt)
+
+    with pytest.raises(_InjectedBaseException, match="injected after tool install"):
+        manager.discover_and_load(force=True)
+
+    assert _surface_generations(manager) == old_generations
+    assert manager._live_context_revoking == set()
+    assert manager.invoke_hook("post_tool_call") == ["generation-a"]
+    assert registry.get_entry(_TOOL_NAME) is old_tool
+    assert _read_external_generation(old_values, isolated_registries) == old_values
+    assert _read_external_generation(new_values, isolated_registries) == old_values
+
+
+def test_force_reload_baseexception_after_external_install_rolls_back_all_surfaces(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "external-install-interrupt")
+    _support(old_values, "generation-a", released=True, register_generation_state=True)
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_tool = registry.get_entry(_TOOL_NAME)
+    old_generations = _surface_generations(manager)
+
+    new_values = _external_values("generation-b", "external-install-interrupt")
+    _support(new_values, "generation-b", released=True, register_generation_state=True)
+    original_transactions = plugins_module._external_registry_transactions
+
+    class _InterruptingSurface:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+        def install_prepared_locked(self, snapshot, prepared) -> None:
+            self._wrapped.install_prepared_locked(snapshot, prepared)
+            raise _InjectedBaseException("injected after external install")
+
+    def transactions_with_interrupt():
+        transactions = original_transactions()
+        transactions["platform"] = _InterruptingSurface(transactions["platform"])
+        return transactions
+
+    monkeypatch.setattr(
+        plugins_module,
+        "_external_registry_transactions",
+        transactions_with_interrupt,
+    )
+
+    with pytest.raises(_InjectedBaseException, match="injected after external install"):
+        manager.discover_and_load(force=True)
+
+    assert _surface_generations(manager) == old_generations
+    assert manager._live_context_revoking == set()
+    assert manager.invoke_hook("post_tool_call") == ["generation-a"]
+    assert registry.get_entry(_TOOL_NAME) is old_tool
+    assert _read_external_generation(old_values, isolated_registries) == old_values
+    assert _read_external_generation(new_values, isolated_registries) == old_values
 
 
 def test_force_reload_removes_registrations_absent_from_new_generation(
@@ -819,6 +922,67 @@ def test_context_retained_after_commit_targets_live_external_registries(
     from agent.image_gen_registry import get_provider
 
     assert get_provider(late.name) is late
+
+
+def test_failed_initial_publication_restores_candidate_context_targets(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("candidate", "context-rollback")
+    support = _support(values, "candidate", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    original_install = manager._install_owned_state_locked
+
+    def interrupt_after_manager_install(state):
+        original_install(state)
+        raise KeyboardInterrupt("injected after manager install")
+
+    monkeypatch.setattr(
+        manager,
+        "_install_owned_state_locked",
+        interrupt_after_manager_install,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="injected after manager install"):
+        manager.discover_and_load()
+
+    candidate_context = support.saved_context
+    late = _ImageProvider("h1-failed-context-retarget-image", "late")
+    late_tool = "h1_failed_context_retarget_tool"
+    late_hook = lambda **kwargs: "late"
+
+    with pytest.raises(RuntimeError, match="transaction view is frozen"):
+        candidate_context.register_image_gen_provider(late)
+    with pytest.raises(RuntimeError, match="transaction view is frozen"):
+        candidate_context.register_tool(
+            late_tool,
+            "h1_transaction",
+            {
+                "name": late_tool,
+                "description": "late",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            lambda args, **kwargs: "late",
+        )
+    with pytest.raises(RuntimeError, match="registration view is frozen"):
+        candidate_context.register_hook("post_tool_call", late_hook)
+
+    from agent.image_gen_registry import get_provider
+
+    assert get_provider(late.name) is None
+    assert registry.get_entry(late_tool) is None
+    assert late_hook not in manager._hooks.get("post_tool_call", [])
 
 
 def test_retained_context_live_registration_does_not_validate_under_live_locks(
@@ -1225,6 +1389,64 @@ def test_force_reload_interrupt_after_revocation_keeps_old_context_live(
     )
     assert registry.get_entry(retained_tool) is not None
     assert isolated_registries.get(retained_platform) is not None
+
+
+def test_registration_transaction_constructor_lock_interrupt_releases_prior_locks(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("generation-a", "constructor-lock-interrupt")
+    _support(values, "generation-a", released=True)
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+
+    original_tool_lock = registry._lock
+    attempted_tool_acquire = threading.Event()
+
+    class _InterruptingToolLock:
+        def acquire(self, *args, **kwargs):
+            attempted_tool_acquire.set()
+            raise _InjectedBaseException("injected constructor acquisition failure")
+
+        def release(self) -> None:  # pragma: no cover - must not release unacquired lock
+            original_tool_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.release()
+
+    monkeypatch.setattr(registry, "_lock", _InterruptingToolLock())
+
+    with pytest.raises(_InjectedBaseException, match="injected constructor acquisition failure"):
+        plugins_module._RegistrationTransaction(manager)
+
+    assert attempted_tool_acquire.is_set()
+    monkeypatch.setattr(registry, "_lock", original_tool_lock)
+
+    acquired = threading.Event()
+    released = threading.Event()
+
+    def acquire_manager_lock_from_other_thread() -> None:
+        with manager._lock:
+            acquired.set()
+            released.wait(timeout=5)
+
+    thread = threading.Thread(target=acquire_manager_lock_from_other_thread, daemon=True)
+    thread.start()
+    assert acquired.wait(timeout=5), "constructor leaked the manager lock"
+    released.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+
+    with original_tool_lock:
+        assert True
+    for transaction in plugins_module._external_registry_transactions().values():
+        with transaction.lock:
+            assert True
 
 
 def test_force_reload_lock_acquisition_interrupt_releases_prior_locks(

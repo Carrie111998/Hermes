@@ -261,6 +261,13 @@ class MappingRegistry:
         self._items.update(prepared._items)
         self._generation = max(self._generation, prepared._generation) + 1
 
+    def restore_snapshot_locked(self, snapshot: _MappingSnapshot) -> None:
+        """Restore an opaque snapshot exactly while the registry lock is held."""
+        self._validate_snapshot(snapshot)
+        self._items.clear()
+        self._items.update(dict(snapshot._items))
+        self._generation = snapshot._generation
+
 
 class RegistryTransactionSurface:
     """Opaque plugin transaction API owned by one module registry."""
@@ -312,3 +319,6 @@ class RegistryTransactionSurface:
         prepared: _PreparedMapping,
     ) -> None:
         self._state.install_prepared_locked(snapshot, prepared)
+
+    def restore_snapshot_locked(self, snapshot: _MappingSnapshot) -> None:
+        self._state.restore_snapshot_locked(snapshot)

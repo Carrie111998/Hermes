@@ -29,6 +29,39 @@ def _make_schema(name="test_tool"):
     }
 
 
+class _ObservingRLock:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.held = False
+
+    def acquire(self, *args, **kwargs):
+        acquired = self._lock.acquire(*args, **kwargs)
+        if acquired:
+            self.held = True
+        return acquired
+
+    def release(self):
+        self.held = False
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+class _LockCheckingSchema(dict):
+    def __init__(self, lock: _ObservingRLock, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._observed_lock = lock
+
+    def get(self, key, default=None):
+        assert not self._observed_lock.held, "schema.get ran under tool registry lock"
+        return super().get(key, default)
+
+
 class TestRegisterAndDispatch:
     def test_register_and_dispatch(self):
         reg = ToolRegistry()
@@ -92,6 +125,60 @@ class TestRegisterAndDispatch:
             and "mcp__foo_bar__search" in record.message
             for record in caplog.records
         )
+
+    def test_empty_description_schema_fallback_resolves_before_live_lock(self):
+        reg = ToolRegistry()
+        observing_lock = _ObservingRLock()
+        reg._lock = observing_lock
+        schema = _LockCheckingSchema(
+            observing_lock,
+            {
+                "name": "empty_desc",
+                "description": "schema fallback",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        )
+
+        reg.register(
+            name="empty_desc",
+            toolset="plugin",
+            schema=schema,
+            handler=_dummy_handler,
+            description="",
+        )
+
+        assert reg.get_entry("empty_desc").description == "schema fallback"
+
+    def test_override_handler_globals_resolves_before_live_lock(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="protected",
+            toolset="terminal",
+            schema=_make_schema("protected"),
+            handler=_dummy_handler,
+        )
+        reg.register_plugin_override_policy("hermes_plugins.allowed", True)
+        observing_lock = _ObservingRLock()
+        reg._lock = observing_lock
+
+        class _Handler:
+            @property
+            def __globals__(self):
+                assert not observing_lock.held, "handler.__globals__ ran under tool registry lock"
+                return {"__name__": "hermes_plugins.allowed"}
+
+            def __call__(self, args, **kwargs):
+                return "override"
+
+        reg.register(
+            name="protected",
+            toolset="plugin",
+            schema=_make_schema("protected"),
+            handler=_Handler(),
+            override=True,
+        )
+
+        assert reg.get_entry("protected").handler({}) == "override"
 
 
 class TestHostPrivateTransactions:

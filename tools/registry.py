@@ -597,11 +597,25 @@ class ToolRegistry:
         snapshot: _ToolRegistrySnapshot,
     ) -> None:
         """Restore a valid checkpoint while ``self._lock`` is held."""
+        self._validate_transaction_snapshot(snapshot)
         self._tools = dict(snapshot._tools)
         self._toolset_checks = dict(snapshot._toolset_checks)
         self._toolset_aliases = dict(snapshot._toolset_aliases)
         self._plugin_override_policy = dict(snapshot._plugin_override_policy)
         self._generation = max(self._generation, snapshot._generation) + 1
+        invalidate_check_fn_cache()
+
+    def _restore_transaction_snapshot_exact_locked(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+    ) -> None:
+        """Restore a transaction checkpoint exactly while ``self._lock`` is held."""
+        self._validate_transaction_snapshot(snapshot)
+        self._tools = dict(snapshot._tools)
+        self._toolset_checks = dict(snapshot._toolset_checks)
+        self._toolset_aliases = dict(snapshot._toolset_aliases)
+        self._plugin_override_policy = dict(snapshot._plugin_override_policy)
+        self._generation = snapshot._generation
         invalidate_check_fn_cache()
 
     def _restore_transaction_snapshot(self, snapshot: _ToolRegistrySnapshot) -> None:
@@ -766,13 +780,16 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        prepared_owner = self._plugin_owner_of(handler)
+        prepared_requires_env = requires_env or []
+        prepared_description = description or schema.get("description", "")
         with self._lock:
             if self._transaction_frozen:
                 raise RuntimeError("tool transaction view is frozen")
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
                 if override:
-                    _owner = self._plugin_owner_of(handler)
+                    _owner = prepared_owner
                     if _owner is not None and not self._plugin_override_policy.get(_owner, False):
                         logger.error(
                             "Tool registration REJECTED: plugin %r attempted to "
@@ -812,9 +829,9 @@ class ToolRegistry:
                 schema=schema,
                 handler=handler,
                 check_fn=check_fn,
-                requires_env=requires_env or [],
+                requires_env=prepared_requires_env,
                 is_async=is_async,
-                description=description or schema.get("description", ""),
+                description=prepared_description,
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,

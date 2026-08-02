@@ -169,6 +169,12 @@ class _SecretTransactionSurface:
         )
         _BUILTINS_LOADED = prepared._builtins_loaded
 
+    def restore_snapshot_locked(self, snapshot) -> None:
+        global _BUILTINS_LOADED
+        self._validate_snapshot(snapshot)
+        _registry_state.restore_snapshot_locked(snapshot._mapping)
+        _BUILTINS_LOADED = snapshot._builtins_loaded
+
 
 _plugin_transaction = _SecretTransactionSurface()
 
