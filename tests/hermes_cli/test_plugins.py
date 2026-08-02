@@ -1229,3 +1229,51 @@ class TestSysPathIsolation:
             "Plugin A's sys.path mutation must not survive into Plugin B or post-load"
         )
         assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+    # ── Entry-point plugin ──────────────────────────────────────────────
+
+    def test_entrypoint_plugin_sys_path_restored(self, tmp_path, monkeypatch):
+        """sys.path is restored after ep.load() in _load_entrypoint_module."""
+        import importlib.metadata
+        import importlib.util
+
+        # Create a fake plugin module that mutates sys.path
+        ep_module_path = tmp_path / "ep_plugin.py"
+        ep_module_path.write_text(
+            "import sys\nsys.path.insert(0, '/injected/by/ep')\n"
+        )
+
+        spec = importlib.util.spec_from_file_location("ep_plugin", ep_module_path)
+
+        class _FakeEntryPoint:
+            name = "test_ep_plugin"
+            group = ENTRY_POINTS_GROUP
+
+            def load(self):
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["ep_plugin"] = mod
+                spec.loader.exec_module(mod)
+                return mod
+
+        monkeypatch.setattr(
+            importlib.metadata, "entry_points",
+            lambda **kwargs: [_FakeEntryPoint()],
+        )
+
+        manifest = PluginManifest(
+            name="test_ep_plugin",
+            source="entrypoint",
+        )
+
+        saved = list(sys.path)
+
+        mgr = PluginManager()
+        mgr._load_entrypoint_module(manifest)
+
+        assert "/injected/by/ep" not in sys.path, (
+            "sys.path must be restored after ep.load()"
+        )
+        assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+        # Cleanup
+        sys.modules.pop("ep_plugin", None)
