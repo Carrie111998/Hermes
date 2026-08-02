@@ -18614,14 +18614,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             adapter = self._adapter_for_source(event.source)
 
-            # If connected to a voice channel, play there instead of sending a file
+            # If connected to a voice channel, play there instead of sending a file.
+            # Some synthetic events (for example, an async-completion turn that
+            # recursively drains an interrupting voice follow-up) retain the outer
+            # event and therefore have no raw guild metadata. In that case, defer
+            # to the current adapter's play_tts contract: Discord can resolve its
+            # live text-channel-to-voice-channel binding from chat_id.
             guild_id = self._get_guild_id(event)
             if (guild_id
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
                 await adapter.play_in_voice_channel(guild_id, actual_path)
-            elif adapter and hasattr(adapter, "send_voice"):
+            elif adapter:
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
@@ -18642,7 +18647,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                if isinstance(adapter, BasePlatformAdapter):
+                    await adapter.play_tts(**send_kwargs)
+                elif hasattr(adapter, "send_voice"):
+                    await cast(Any, adapter).send_voice(**send_kwargs)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
