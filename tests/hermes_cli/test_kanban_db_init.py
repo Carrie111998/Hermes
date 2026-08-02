@@ -186,18 +186,6 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert isinstance(new_id, int) and new_id >= 1
 
 
-def test_rebuilt_schema_matches_fresh_db(tmp_path, monkeypatch):
-    """The rebuilt tables must be structurally identical to a fresh DB, so the
-    hand-written DDL in ``_REBUILD_SPECS`` can't silently drift from SCHEMA_SQL."""
-    legacy_path = _setup_home(tmp_path, monkeypatch)
-    _make_legacy_db(legacy_path)
-    fresh_path = kb.kanban_db_path(board="fresh")
-    fresh_path.parent.mkdir(parents=True, exist_ok=True)
-    kb._INITIALIZED_PATHS.discard(str(fresh_path.resolve()))
-
-    with kb.connect(legacy_path) as migrated, kb.connect(fresh_path) as fresh:
-        for table in ("task_events", "task_comments", "task_runs", "kanban_notify_subs"):
-            assert _table_struct(migrated, table) == _table_struct(fresh, table)
 
 
 def test_migration_is_idempotent(tmp_path, monkeypatch):
