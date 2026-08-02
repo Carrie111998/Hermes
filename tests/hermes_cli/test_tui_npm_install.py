@@ -241,6 +241,53 @@ def test_workspace_mode_ignores_packages_from_other_workspaces(
     assert main_mod._tui_need_npm_install(tui_dir) is False
 
 
+def test_workspace_mode_detects_missing_direct_tui_dependency(
+    tmp_path: Path, main_mod
+) -> None:
+    """A missing package reachable from ui-tui must still trigger repair."""
+    tui_dir = _make_workspace_checkout(tmp_path)
+    _write_lock(
+        tmp_path / "package-lock.json",
+        {
+            "": {"name": "monorepo"},
+            "ui-tui": {"dependencies": {"ink": "1.2.3"}},
+            "node_modules/ink": dict(_PKG),
+        },
+    )
+    _write_lock(
+        tmp_path / "node_modules" / ".package-lock.json",
+        {"": {"name": "monorepo"}, "ui-tui": {"dependencies": {"ink": "1.2.3"}}},
+    )
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
+
+
+def test_workspace_mode_detects_missing_nested_tui_dependency(
+    tmp_path: Path, main_mod
+) -> None:
+    """A missing transitive package in the ui-tui closure must trigger repair."""
+    tui_dir = _make_workspace_checkout(tmp_path)
+    _write_lock(
+        tmp_path / "package-lock.json",
+        {
+            "": {"name": "monorepo"},
+            "ui-tui": {"dependencies": {"ink": "1.2.3"}},
+            "node_modules/ink": {"dependencies": {"nested": "1.0.0"}, **_PKG},
+            "node_modules/ink/node_modules/nested": dict(_PKG),
+        },
+    )
+    _write_lock(
+        tmp_path / "node_modules" / ".package-lock.json",
+        {
+            "": {"name": "monorepo"},
+            "ui-tui": {"dependencies": {"ink": "1.2.3"}},
+            "node_modules/ink": {"dependencies": {"nested": "1.0.0"}, **_PKG},
+        },
+    )
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
+
+
 def test_workspace_mode_ignores_dev_flag_skew(tmp_path: Path, main_mod) -> None:
     """#45657 secondary trigger: npm recomputes ``dev`` against the installed
     subset — a package that is a prod dep of an *uninstalled* workspace has
