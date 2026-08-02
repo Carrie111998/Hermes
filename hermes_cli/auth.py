@@ -1557,6 +1557,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    reset_statuses: bool = False,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1575,6 +1576,14 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    Pass ``reset_statuses=True`` to perform an atomic read-clear-write that
+    clears all status fields on every entry currently on disk.  Unlike the
+    default merge path, this reads the *latest* on-disk state inside the same
+    lock before clearing, so a concurrent 429 written by a gateway between
+    the caller's ``load_pool`` and this call is not lost (it is cleared along
+    with every other status, which is the intended ``auth reset`` semantic).
+    Used by ``CredentialPool.reset_statuses`` (issue #73748).
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
@@ -1583,6 +1592,27 @@ def write_credential_pool(
         if not isinstance(pool, dict):
             pool = {}
             auth_store["credential_pool"] = pool
+
+        if reset_statuses:
+            # Atomic read-clear-write: read the latest on-disk entries,
+            # clear status fields, and write back — all under the same lock
+            # so a concurrent gateway 429 is not silently dropped.
+            existing = pool.get(provider_id)
+            existing_list = existing if isinstance(existing, list) else []
+            cleared: List[Dict[str, Any]] = []
+            for entry in existing_list:
+                if isinstance(entry, dict):
+                    cleared_entry = dict(entry)
+                    for field in _POOL_STATUS_FIELDS:
+                        cleared_entry.pop(field, None)
+                    cleared.append(
+                        sanitize_borrowed_credential_payload(cleared_entry, provider_id)
+                    )
+                else:
+                    cleared.append(entry)
+            pool[provider_id] = cleared
+            return _save_auth_store(auth_store)
+
         sanitized_entries = [
             sanitize_borrowed_credential_payload(entry, provider_id)
             if isinstance(entry, dict) else entry
@@ -1604,8 +1634,7 @@ def write_credential_pool(
             _merge_disk_cooldown_state(
                 entry, existing_by_id.get(entry.get("id")), provider_id
             )
-            if isinstance(entry, dict)
-            else entry
+            if isinstance(entry, dict) else entry
             for entry in sanitized_entries
         ]
         for disk_entry in existing_list:

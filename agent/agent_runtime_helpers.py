@@ -1079,6 +1079,52 @@ def recover_with_credential_pool(
         if current_entry is None:
             current_entry = pool.current()
         current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
+
+        # Before examining the current entry's exhaustion status, reload
+        # the pool from disk.  An out-of-process ``hermes auth reset`` may
+        # have cleared exhaustion flags on disk while our in-memory pool
+        # still carries stale ``STATUS_EXHAUSTED`` entries (issue #73748,
+        # Bug 2).  Reloading *before* any rotation/persist ensures the
+        # disk-cleared state is not overwritten back to exhausted by a
+        # subsequent ``mark_exhausted_and_rotate`` → ``_persist`` cycle.
+        _was_exhausted_before_reload = current_last_status == STATUS_EXHAUSTED
+        _reload_fn = getattr(pool, "reload_from_disk", None)
+        _did_reload = _reload_fn() if _reload_fn else 0
+        if _did_reload:
+            _ra().logger.info(
+                "Reloaded %d credential entries from disk before recovery "
+                "attempt (possible out-of-process auth reset)",
+                _did_reload,
+            )
+            # Re-resolve current entry after reload — its status may have
+            # changed from EXHAUSTED to OK.
+            if _credential_id:
+                current_entry = next(
+                    (e for e in pool.entries() if e.id == _credential_id),
+                    None,
+                )
+            if _api_key_hint:
+                current_entry = current_entry or next(
+                    (e for e in pool.entries() if e.runtime_api_key == _api_key_hint),
+                    None,
+                )
+            if current_entry is None:
+                current_entry = pool.current()
+            current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
+
+            # If the current entry was exhausted before but the reload
+            # cleared it (e.g. auth reset ran while this turn was failing),
+            # the entry is now usable — signal recovery so the caller
+            # retries the same credential.
+            if _was_exhausted_before_reload and current_last_status != STATUS_EXHAUSTED:
+                _ra().logger.info(
+                    "Credential %s was exhausted but disk reload cleared it "
+                    "(last_status now %s) — retrying same credential",
+                    _credential_id or _api_key_hint,
+                    current_last_status,
+                )
+                return True, False
+
         if current_last_status == STATUS_EXHAUSTED:
             _ra().logger.info(
                 "Credential already exhausted (last_status=%s) — rotating immediately instead of retrying",
@@ -1094,6 +1140,9 @@ def recover_with_credential_pool(
                 )
                 agent._swap_credential(next_entry)
                 return True, False
+
+            # All entries still exhausted even after disk reload — cannot
+            # recover this turn.
             return False, True
 
         usage_limit_reached = False
@@ -1118,6 +1167,9 @@ def recover_with_credential_pool(
             )
             agent._swap_credential(next_entry)
             return True, False
+
+        # All entries still exhausted even after disk reload — cannot
+        # recover this turn.
         return False, True
 
     if effective_reason == FailoverReason.auth:

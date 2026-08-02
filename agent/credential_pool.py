@@ -662,11 +662,12 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(self, *, removed_ids: Optional[List[str]] = None, reset_statuses: bool = False) -> None:
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
+            reset_statuses=reset_statuses,
         )
 
     def _is_terminal_auth_failure(
@@ -2072,8 +2073,89 @@ class CredentialPool:
                     new_entries.append(entry)
             if count:
                 self._entries = new_entries
-                self._persist()
+                # Atomic read-clear-write: reset_statuses=True makes
+                # write_credential_pool re-read the latest disk state inside
+                # the same _auth_store_lock before clearing, so a concurrent
+                # gateway 429 is not silently dropped (issue #73748).
+                self._persist(reset_statuses=True)
             return count
+
+    # -- reload_from_disk --------------------------------------------------
+    def reload_from_disk(self) -> int:
+        """Re-read credential entries from the on-disk store and refresh
+        in-memory state.  This is the inverse of ``_persist``: whereas
+        ``_persist`` pushes memory → disk, this pulls disk → memory.
+
+        The primary use-case is recovering from an out-of-process
+        ``hermes auth reset`` that cleared exhaustion flags on disk while
+        the gateway's in-memory pool still carried stale ``STATUS_EXHAUSTED``
+        entries (issue #73748, Bug 2).
+
+        Returns the number of entries whose status fields were refreshed
+        from disk.  New entries that appeared on disk (e.g. a freshly-added
+        credential) are appended; entries that disappeared from disk are
+        left untouched (the gateway may still be mid-turn on that entry).
+        """
+        from hermes_cli.auth import read_credential_pool
+
+        raw_entries = read_credential_pool(self.provider)
+        if not isinstance(raw_entries, list):
+            return 0
+
+        # Build a lookup of disk entries by id.
+        disk_by_id: Dict[str, Dict[str, Any]] = {}
+        for payload in raw_entries:
+            entry_id = payload.get("id") if isinstance(payload, dict) else None
+            if isinstance(entry_id, str) and entry_id:
+                disk_by_id[entry_id] = payload
+
+        refreshed = 0
+        with self._lock:
+            new_entries = list(self._entries)
+            for idx, existing in enumerate(new_entries):
+                disk_payload = disk_by_id.get(existing.id)
+                if disk_payload is None:
+                    # Entry not on disk — leave as-is (may be mid-turn).
+                    continue
+                disk_entry = PooledCredential.from_dict(self.provider, disk_payload)
+                # Only refresh status-related fields; preserve in-flight
+                # mutations to runtime fields (priority, label, etc.) that
+                # this process might own.
+                status_changed = (
+                    existing.last_status != disk_entry.last_status
+                    or existing.last_status_at != disk_entry.last_status_at
+                    or existing.last_error_code != disk_entry.last_error_code
+                    or existing.last_error_reason != disk_entry.last_error_reason
+                    or existing.last_error_message != disk_entry.last_error_message
+                    or existing.last_error_reset_at != disk_entry.last_error_reset_at
+                )
+                if status_changed:
+                    new_entries[idx] = replace(
+                        existing,
+                        last_status=disk_entry.last_status,
+                        last_status_at=disk_entry.last_status_at,
+                        last_error_code=disk_entry.last_error_code,
+                        last_error_reason=disk_entry.last_error_reason,
+                        last_error_message=disk_entry.last_error_message,
+                        last_error_reset_at=disk_entry.last_error_reset_at,
+                    )
+                    refreshed += 1
+
+            # Append new entries that exist on disk but not in memory.
+            existing_ids = {e.id for e in new_entries}
+            for entry_id, payload in disk_by_id.items():
+                if entry_id not in existing_ids:
+                    new_entries.append(
+                        PooledCredential.from_dict(self.provider, payload)
+                    )
+                    refreshed += 1
+
+            if refreshed:
+                self._entries = new_entries
+                # Do NOT persist back — the disk is authoritative here.
+                # We only updated in-memory state to match disk.
+
+            return refreshed
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         with self._lock:
