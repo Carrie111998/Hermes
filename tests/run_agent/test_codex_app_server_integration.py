@@ -73,6 +73,33 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_scoped_child_cannot_enter_codex_app_server(self, monkeypatch):
+        from agent.delegation_context import DelegatedApprovalScope
+
+        entered = False
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            nonlocal entered
+            entered = True
+            raise AssertionError("scoped child entered codex app-server")
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        agent = _make_codex_agent()
+        setattr(
+            agent,
+            "_delegated_approval_scope",
+            DelegatedApprovalScope(
+                enabled=True,
+                approved_mission_summary="Inspect safely",
+                allowed_workspace_path="/tmp/workspace",
+            ),
+        )
+
+        with pytest.raises(PermissionError, match="delegated approval scope"):
+            agent.run_conversation("call browser_type")
+
+        assert entered is False
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

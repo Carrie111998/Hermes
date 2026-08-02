@@ -1585,6 +1585,10 @@ def _build_child_agent(
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
+    # ponytail: keep scoped children on Hermes' guarded executor until the
+    # app-server's stateless MCP callback can carry and enforce immutable scopes.
+    if approval_scope.enabled and effective_api_mode == "codex_app_server":
+        effective_api_mode = "codex_responses"
     # Defensive: validate trusted delegation.command exists on PATH before
     # honoring it. Stale config should not force a child onto the ACP transport
     # and then fail at subprocess startup.

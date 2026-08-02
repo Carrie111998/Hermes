@@ -1757,6 +1757,39 @@ class TestDelegatedApprovalScope(unittest.TestCase):
 
     @patch(
         "tools.delegate_tool._load_config",
+        return_value={"approval_inheritance": True},
+    )
+    @patch(
+        "tools.delegate_tool._resolve_workspace_hint",
+        return_value="/tmp/workspace",
+    )
+    def test_scoped_codex_app_server_child_uses_guarded_runtime(
+        self, _mock_workspace, _mock_cfg
+    ):
+        parent = _make_mock_parent()
+        parent.provider = "openai-codex"
+        parent.api_mode = "codex_app_server"
+        parent._delegated_approval_scope = None
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            MockAgent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["api_mode"], "codex_responses")
+        self.assertTrue(child._delegated_approval_scope.enabled)
+
+    @patch(
+        "tools.delegate_tool._load_config",
         return_value={
             "approval_inheritance": {"enabled": False},
             "subagent_auto_approve": True,

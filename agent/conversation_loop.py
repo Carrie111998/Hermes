@@ -1305,6 +1305,11 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        scope = getattr(agent, "_delegated_approval_scope", None)
+        if getattr(scope, "enabled", False):
+            raise PermissionError(
+                "codex_app_server is unavailable under a delegated approval scope"
+            )
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
