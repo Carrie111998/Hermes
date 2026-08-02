@@ -1352,6 +1352,74 @@ def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
     assert entries[0].base_url == "https://api.githubcopilot.com"
 
 
+def test_load_pool_tags_env_copilot_source_as_env_var(tmp_path, monkeypatch):
+    """An env-var copilot token must be tagged env:<VAR>, not gh_cli.
+
+    Regression test: the source-name mapping used ``"gh" in
+    source.lower()``, which matches EVERY env var name — COPILOT_GITHUB_TOKEN,
+    GH_TOKEN and GITHUB_TOKEN all contain the substring "gh" — so env-seeded
+    entries were mislabelled as gh_cli. Only the gh CLI path returns the
+    literal "gh auth token", so the mapping must be an exact match.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_fake_token_abc123", "GH_TOKEN"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda token: ("exchanged_api_token", None),
+    )
+
+    from agent.credential_pool import load_pool
+    pool = load_pool("copilot")
+
+    assert pool.has_credentials()
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].source == "env:GH_TOKEN"
+    assert entries[0].access_token == "exchanged_api_token"
+
+
+def test_load_pool_env_copilot_ignores_gh_cli_suppression(tmp_path, monkeypatch):
+    """Suppressing gh_cli must not suppress an env-var copilot source.
+
+    With the old substring mapping both sources collapsed to "gh_cli", so a
+    user who suppressed the gh CLI path (hermes auth remove copilot gh_cli)
+    lost their env-var token too. With the exact mapping the env source stays
+    independent: suppressing gh_cli leaves env:GH_TOKEN seedable.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {},
+            "suppressed_sources": {"copilot": ["gh_cli"]},
+        },
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_fake_token_abc123", "GH_TOKEN"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda token: ("exchanged_api_token", None),
+    )
+
+    from agent.credential_pool import load_pool
+    pool = load_pool("copilot")
+
+    # gh_cli suppressed, but the env source is a different source — it must seed.
+    assert pool.has_credentials()
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].source == "env:GH_TOKEN"
+
+
 
 
 def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
