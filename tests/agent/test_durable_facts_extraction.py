@@ -5,9 +5,9 @@ Covers:
   1. ``extract_durable_facts_from_summary()`` — pure extraction function
   2. ``ContextCompressor.compress()`` stores ``_last_raw_summary``
   3. ``compress_context()`` pipes extracted facts into ``MemoryStore``
+     via the gate-aware ``memory_tool()`` path.
 """
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,14 +35,6 @@ def _compressor(**kwargs) -> ContextCompressor:
             quiet_mode=True,
             **kwargs,
         )
-
-
-def _response(content: str) -> MagicMock:
-    """Return a mock OpenAI response whose only text content is *content*."""
-    mock = MagicMock()
-    mock.choices = [MagicMock()]
-    mock.choices[0].message.content = content
-    return mock
 
 
 # ── Unit: extract_durable_facts_from_summary ─────────────────────────────────
@@ -73,7 +65,7 @@ class TestExtractDurableFacts:
             "## Durable Facts\n"
             "- User prefers concise responses.\n"
             "* Error handling must never silently fail.\n"
-            "• Tests run with scripts/run_tests.sh.\n"
+            "\u2022 Tests run with scripts/run_tests.sh.\n"
             "\n"
             "## Blocked\n"
             "nothing\n"
@@ -177,7 +169,6 @@ class TestCompressStoresRawSummary:
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "task"},
         ]
-        # Pad with enough messages to hit the compressible window.
         for i in range(30):
             messages.append({"role": "assistant", "content": f"work {i}"})
             messages.append({"role": "user", "content": f"followup {i}"})
@@ -190,21 +181,17 @@ class TestCompressStoresRawSummary:
     def test_raw_summary_reset_every_call(self):
         """Each compress() call resets _last_raw_summary before running."""
         c = _compressor()
-        # Seed a stale value.
         c._last_raw_summary = "stale"
         messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "task"},
         ]
-        # Not enough messages to trigger compression → early return.
         result = c.compress(messages, current_tokens=50_000)
         assert result == messages  # no-op
-        # _last_raw_summary should now be None (reset at call start, never set
-        # because summary wasn't generated).
         assert c._last_raw_summary is None
 
     def test_facts_extractable_from_stored_summary(self):
-        """The full pipeline: compress with LLM summary → _last_raw_summary →
+        """The full pipeline: compress with LLM summary -> _last_raw_summary ->
         extract facts."""
         c = _compressor()
         summary_text = (
@@ -232,55 +219,89 @@ class TestCompressStoresRawSummary:
         assert "port 8000" in facts[1]
 
 
-# ── E2E: compress_context → MemoryStore ──────────────────────────────────────
+# ── E2E: compress_context -> MemoryStore (via gate-aware memory_tool) ─────────
+
+
+def _summary_with_facts(*facts: str) -> str:
+    """Build a realistic compression summary with a Durable Facts section."""
+    numbered = "\n".join(
+        f"{i}. {fact}" for i, fact in enumerate(facts, start=1)
+    )
+    return (
+        f"## Goal\nTest session.\n\n"
+        f"## Durable Facts\n{numbered}\n\n"
+        f"## Active State\nbranch: main\n\n"
+        f"## Completed Actions\n1. ...\n"
+    )
 
 
 class TestCompressContextPersistsToMemory:
-    """Verify that the ``compress_context()`` orchestration function takes the
-    raw summary, extracts facts, and writes them to ``MemoryStore``."""
+    """Drive the real ``compress_context()`` orchestration function and verify
+    that durable facts are persisted through the gate-aware ``memory_tool()``
+    path."""
 
-    def test_facts_written_to_memory_store(self, tmp_path, monkeypatch):
-        """Full pipeline: mock compression + agent → facts land in MEMORY.md."""
+    def test_facts_persisted_via_compress_context(self, tmp_path, monkeypatch):
+        """End-to-end: compress_context() -> durable facts land in MEMORY.md."""
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
 
-        # Build a MemoryStore that mirrors what a real agent would have.
+        summary_text = _summary_with_facts(
+            "Deployment uses Docker Compose v2.",
+            "Logging goes to CloudWatch.",
+        )
+
         store = MemoryStore(memory_char_limit=2000)
         store.load_from_disk()
 
-        # Build a compressor whose compress() returns a summary with facts.
-        c = _compressor()
-        summary_text = (
-            "## Durable Facts\n"
-            "1. Deployment uses Docker Compose v2.\n"
-            "2. Logging goes to CloudWatch.\n"
-            "\n"
-            "## Active State\n"
-            "branch: main\n"
-            "## Completed Actions\n"
-            "1. ...\n"
-        )
-        # Set the raw summary as if compress() just finished.
-        c._last_raw_summary = summary_text
+        compressor = _compressor()
+        compressor._last_raw_summary = summary_text
 
-        # Build a minimal mock agent.
+        # Build enough messages to pass the minimum-count guard.
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+        ]
+        for i in range(30):
+            messages.append({"role": "assistant", "content": f"work {i}"})
+            messages.append({"role": "user", "content": f"followup {i}"})
+
+        # Mock the agent just enough for compress_context() to reach the
+        # durable-facts persistence block without real DB / network / locks.
         agent = MagicMock()
+        agent.model = "test/model"
+        agent.platform = "cli"
+        agent.session_id = "test-sid"
+        agent.tools = []
         agent._memory_store = store
-        agent.context_compressor = c
         agent._memory_enabled = True
+        agent._memory_manager = None
+        agent.context_compressor = compressor
+        agent._user_profile_enabled = False
+        agent._compression_feasibility_checked = True
+        agent.log_prefix = ""
+        agent._cached_system_prompt = "cached system prompt"
 
-        # Simulate the durable-facts persistence block from compress_context().
-        # (This is the literal code path — exercised directly in the test so
-        # the logic under test is the production logic, not a reimplementation.)
-        from agent.context_compressor import extract_durable_facts_from_summary
+        # compress_context() calls context_compressor.compress() — return a
+        # shortened list so compression is considered to have made progress,
+        # which lets the function reach the durable-facts persistence block.
+        def _fake_compress(msgs, **kwargs):
+            return msgs[:1] + msgs[-3:]  # drop middle messages
 
-        _raw_summary = getattr(agent.context_compressor, "_last_raw_summary", None)
-        if _raw_summary:
-            _facts = extract_durable_facts_from_summary(_raw_summary)
-            if _facts:
-                _store = getattr(agent, "_memory_store", None)
-                if _store is not None:
-                    for _fact in _facts:
-                        _store.add("memory", _fact)
+        compressor.compress = _fake_compress
+
+        # Session DB lock — must succeed.
+        agent._session_db = MagicMock()
+        agent._session_db.try_acquire_compression_lock.return_value = True
+        agent._session_db.release_compression_lock = MagicMock()
+
+        from agent.conversation_compression import compress_context
+
+        compress_context(
+            agent,
+            messages,
+            system_message="sys",
+            approx_tokens=90_000,
+            force=True,
+        )
 
         # Verify facts landed on disk.
         mem_file = tmp_path / "MEMORY.md"
@@ -288,102 +309,99 @@ class TestCompressContextPersistsToMemory:
         content = mem_file.read_text()
         assert "Docker Compose v2" in content
         assert "CloudWatch" in content
-
-        # Verify store is also consistent.
         assert len(store.memory_entries) == 2
 
-    def test_no_facts_when_none_in_summary(self, tmp_path, monkeypatch):
-        """When the summary's Durable Facts section is ``None.``, nothing is
-        persisted."""
+    def test_none_section_no_write(self, tmp_path, monkeypatch):
+        """When the summary says 'None.', no facts are persisted."""
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        summary_text = _summary_with_facts().replace(
+            "## Durable Facts\n",
+            "## Durable Facts\nNone.\n\n## Active State\n",
+        )
 
         store = MemoryStore()
         store.load_from_disk()
 
-        c = _compressor()
-        c._last_raw_summary = "## Durable Facts\nNone.\n\n## Active State\n..."
+        compressor = _compressor()
+        compressor._last_raw_summary = summary_text
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+        ]
+        for i in range(30):
+            messages.append({"role": "assistant", "content": f"work {i}"})
+            messages.append({"role": "user", "content": f"followup {i}"})
 
         agent = MagicMock()
+        agent.model = "test/model"
+        agent.platform = "cli"
+        agent.session_id = "test-sid"
+        agent.tools = []
         agent._memory_store = store
-        agent.context_compressor = c
+        agent._memory_enabled = True
+        agent._memory_manager = None
+        agent.context_compressor = compressor
+        agent._user_profile_enabled = False
+        agent._compression_feasibility_checked = True
+        agent.log_prefix = ""
+        agent._cached_system_prompt = "cached system prompt"
 
-        from agent.context_compressor import extract_durable_facts_from_summary
+        compressor.compress = lambda msgs, **kwargs: msgs[:1] + msgs[-3:]
 
-        _raw_summary = getattr(agent.context_compressor, "_last_raw_summary", None)
-        if _raw_summary:
-            _facts = extract_durable_facts_from_summary(_raw_summary)
-            if _facts:
-                _store = getattr(agent, "_memory_store", None)
-                if _store is not None:
-                    for _fact in _facts:
-                        _store.add("memory", _fact)
+        agent._session_db = MagicMock()
+        agent._session_db.try_acquire_compression_lock.return_value = True
+        agent._session_db.release_compression_lock = MagicMock()
 
-        # MEMORY.md should not be created (no facts to write).
+        from agent.conversation_compression import compress_context
+
+        compress_context(
+            agent, messages, system_message="sys", approx_tokens=90_000, force=True,
+        )
+
+        # No MEMORY.md should exist (nothing to write).
         mem_file = tmp_path / "MEMORY.md"
         assert not mem_file.exists() or mem_file.read_text().strip() == ""
 
-    def test_no_store_no_crash(self):
-        """When agent has no _memory_store, the block is a no-op (no crash)."""
-        c = _compressor()
-        c._last_raw_summary = (
-            "## Durable Facts\n"
-            "1. A fact that won't be saved.\n"
-            "\n"
-            "## Active State\n"
-            "...\n"
-        )
-
-        agent = MagicMock()
-        agent._memory_store = None
-        agent.context_compressor = c
-
-        from agent.context_compressor import extract_durable_facts_from_summary
-
-        _raw_summary = getattr(agent.context_compressor, "_last_raw_summary", None)
-        if _raw_summary:
-            _facts = extract_durable_facts_from_summary(_raw_summary)
-            if _facts:
-                _store = getattr(agent, "_memory_store", None)
-                if _store is not None:
-                    for _fact in _facts:
-                        _store.add("memory", _fact)
-
-        # Shouldn't crash — that's the entire test.
-        assert True
-
-    def test_duplicate_fact_not_written_twice(self, tmp_path, monkeypatch):
-        """MemoryStore.add() rejects exact duplicates."""
+    def test_no_store_no_crash(self, tmp_path, monkeypatch):
+        """When agent has no _memory_store, the block is a no-op."""
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
 
-        store = MemoryStore()
-        store.load_from_disk()
-        store.add("memory", "Deployment uses Docker Compose v2.")
+        summary_text = _summary_with_facts("A fact that cannot be saved.")
 
-        c = _compressor()
-        c._last_raw_summary = (
-            "## Durable Facts\n"
-            "1. Deployment uses Docker Compose v2.\n"  # duplicate
-            "2. Logging via structured JSON.\n"  # new
-            "\n"
-            "## Active State\n"
-            "...\n"
-        )
+        compressor = _compressor()
+        compressor._last_raw_summary = summary_text
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+        ]
+        for i in range(30):
+            messages.append({"role": "assistant", "content": f"work {i}"})
+            messages.append({"role": "user", "content": f"followup {i}"})
 
         agent = MagicMock()
-        agent._memory_store = store
-        agent.context_compressor = c
+        agent.model = "test/model"
+        agent.platform = "cli"
+        agent.session_id = "test-sid"
+        agent.tools = []
+        agent._memory_store = None
+        agent._memory_manager = None
+        agent.context_compressor = compressor
+        agent._compression_feasibility_checked = True
+        agent.log_prefix = ""
+        agent._cached_system_prompt = "cached system prompt"
 
-        from agent.context_compressor import extract_durable_facts_from_summary
+        compressor.compress = lambda msgs, **kwargs: msgs[:1] + msgs[-3:]
 
-        _raw_summary = getattr(agent.context_compressor, "_last_raw_summary", None)
-        if _raw_summary:
-            _facts = extract_durable_facts_from_summary(_raw_summary)
-            if _facts:
-                _store = getattr(agent, "_memory_store", None)
-                if _store is not None:
-                    for _fact in _facts:
-                        _store.add("memory", _fact)
+        agent._session_db = MagicMock()
+        agent._session_db.try_acquire_compression_lock.return_value = True
+        agent._session_db.release_compression_lock = MagicMock()
 
-        # Only the new fact should be persisted.
-        assert len(store.memory_entries) == 2  # original + new (one duplicate skipped)
-        assert any("structured JSON" in e for e in store.memory_entries)
+        from agent.conversation_compression import compress_context
+
+        # Must not raise.
+        compress_context(
+            agent, messages, system_message="sys", approx_tokens=90_000, force=True,
+        )

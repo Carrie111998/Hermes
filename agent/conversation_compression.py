@@ -2381,13 +2381,29 @@ def compress_context(
                 if _facts:
                     _store = getattr(agent, "_memory_store", None)
                     if _store is not None:
+                        from tools.memory_tool import memory_tool
+
+                        _persisted = 0
                         for _fact in _facts:
-                            _store.add("memory", _fact)
-                        logger.info(
-                            "persisted %d durable fact(s) from compression "
-                            "summary to memory store",
-                            len(_facts),
-                        )
+                            _result_json = memory_tool(
+                                action="add",
+                                target="memory",
+                                content=_fact,
+                                store=_store,
+                            )
+                            try:
+                                _result = json.loads(_result_json)
+                                if _result.get("success"):
+                                    _persisted += 1
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        if _persisted:
+                            logger.info(
+                                "persisted %d durable fact(s) from compression "
+                                "summary to memory store (%d skipped)",
+                                _persisted,
+                                len(_facts) - _persisted,
+                            )
         except Exception as _exc:
             logger.debug(
                 "durable facts persistence after compression failed: %s", _exc
