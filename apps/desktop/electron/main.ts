@@ -97,7 +97,6 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
-import { registerLoginItemHandlers } from './login-item'
 import {
   fileDiffVsHead,
   repoStatus,
@@ -136,6 +135,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import { registerLoginItemHandlers } from './login-item'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
