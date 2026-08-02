@@ -63,21 +63,7 @@ def test_wsl_without_forwarding_still_blocks(monkeypatch):
     assert any("WSL" in w for w in res["warnings"])
 
 
-def test_wsl_without_forwarding_but_powershell_fallback_allows_tts(monkeypatch):
-    """The WSL2 PowerShell TTS fallback relaxes the no-forwarding block for
-    OUTPUT (TTS playback) while keeping recording guidance visible.
-
-    Regression for the stale-test bug: this path was added by the PowerShell
-    fallback feature but never unit-tested, so a WSL host with powershell.exe
-    and ffmpeg (the fallback's only preconditions) flipped the no-forwarding
-    test from pass to fail depending on the machine.
-    """
-    _base(monkeypatch)
-    _force_wsl(monkeypatch)  # no PULSE_SERVER, no PIPEWIRE_REMOTE
-    from tools.voice_mode import detect_audio_environment
-    monkeypatch.setattr("tools.voice_mode._wsl_powershell_tts_available", lambda: True)
-    res = detect_audio_environment()
-    # TTS playback works via Media.SoundPlayer on the Windows host, so voice
-    # mode is available — but the WSL guidance notice must still surface.
-    assert res["available"] is True
-    assert any("WSL" in w for w in res["notices"])
+# Note: the positive PowerShell-fallback path (probe True, voice available,
+# recording guidance surfaced) is covered by
+# TestWSLAudioEnvironmentGate::test_wsl_no_pulse_but_powershell_available_not_hard_blocked
+# in tests/tools/test_voice_mode.py — do not re-add it here.
