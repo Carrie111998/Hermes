@@ -114,6 +114,7 @@ CONFIGURABLE_TOOLSETS = [
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
+    ("messaging",       "📨 Outbound Messaging (opt-in)", "send messages or reactions across platforms (outbound side effects)"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
@@ -138,9 +139,8 @@ def gui_toolset_label(label: str) -> str:
     return text
 
 
-# Toolsets that are OFF by default for new installs.
-# They're still in _HERMES_CORE_TOOLS (available at runtime if enabled),
-# but the setup checklist won't pre-select them for first-time users.
+# Toolsets that are OFF by default for new installs. They are exposed only
+# after an operator explicitly enables them for a platform.
 #
 # Video gen is off by default — it's a niche, paid, slow feature. Users
 # who want it opt in via `hermes tools` → Video Generation, which walks
@@ -152,7 +152,7 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "messaging", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
