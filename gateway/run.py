@@ -2708,6 +2708,7 @@ from gateway.config import (
     _BUILTIN_PLATFORM_VALUES,
     GatewayConfig,
     PlatformConfig,
+    _getenv,
     load_gateway_config,
 )
 from gateway.session import (
@@ -2831,22 +2832,14 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
             continue
         dm_env, group_env, allow_all_env = open_env
         extra = getattr(platform_config, "extra", None) or {}
-        dm_policy = (
-            str(
-                extra.get("dm_policy")
-                or (os.getenv(dm_env, "pairing") if dm_env else "pairing")
-            )
-            .strip()
-            .lower()
-        )
-        group_policy = (
-            str(
-                extra.get("group_policy")
-                or (os.getenv(group_env, "pairing") if group_env else "pairing")
-            )
-            .strip()
-            .lower()
-        )
+        dm_policy = str(
+            extra.get("dm_policy")
+            or (_getenv(dm_env, "pairing") if dm_env else "pairing")
+        ).strip().lower()
+        group_policy = str(
+            extra.get("group_policy")
+            or (_getenv(group_env, "pairing") if group_env else "pairing")
+        ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
         gateway_allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
@@ -2856,7 +2849,7 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         }
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and os.getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue
@@ -30700,7 +30693,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "error": "proxy_url_not_configured",
             }
 
-        proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        # Scope-aware read: the proxy key is a per-profile credential; under
+        # multiplex honor the installed scope's verdict (Slack pattern for
+        # the unscoped default-profile loop).
+        try:
+            from agent.secret_scope import UnscopedSecretError, get_secret
+
+            try:
+                proxy_key = (get_secret("GATEWAY_PROXY_KEY") or "").strip()
+            except UnscopedSecretError:
+                proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        except Exception:
+            proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -33410,6 +33414,7 @@ def _start_gateway_housekeeping(
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    MEMORY_TRIM_EVERY = 1    # shared helper cooldown bounds actual allocator work
 
     # Every platform media cache prunes on the same hourly cadence — one loop
     # over (name, cleanup_fn), not a copy-pasted try/except per cache.
@@ -33521,6 +33526,25 @@ def _start_gateway_housekeeping(
                         _adb.close()
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
+
+        # This is the long-lived messaging-gateway counterpart to the TUI idle
+        # reaper. The helper is config-gated and rate-limited, so calling it on
+        # the 60s housekeeping cadence does not create a trim storm.
+        if tick_count % MEMORY_TRIM_EVERY == 0:
+            try:
+                from hermes_cli.mem_trim import trim_memory
+
+                trim_memory(reason="messaging gateway housekeeping")
+            except Exception as exc:
+                # debug, not warning: sibling housekeeping branches all log
+                # failures at debug, and a persistent failure (e.g. broken
+                # import after a partial update) would otherwise warn every
+                # 60s forever.
+                logger.debug(
+                    "gateway housekeeping memory trim failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         stop_event.wait(timeout=interval)
     logger.info("Gateway housekeeping stopped")
