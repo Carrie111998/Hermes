@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
-import { api, post, when, USER, type Component } from "../lib/api";
+import { api, post, when, USER, onComponentRefresh, refreshCadence, type Component } from "../lib/api";
 import { badgeClass, avatarHue, faviconFor } from "../lib/accents";
 import { Button } from "./ui";
 import {
@@ -14,22 +14,28 @@ import {
 export function useComponentData(c: Component, proposalId?: string) {
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string>("");
+  const [flash, setFlash] = useState(false);
+  const firstLoad = useRef(true);
   const refresh = async () => {
     try {
       const pv = proposalId ? `&proposal_id=${proposalId}` : "";
       setData(await api(`/api/component/${c.id}/data?user_id=${USER}${pv}`));
       setErr("");
+      if (!firstLoad.current) { setFlash(true); setTimeout(() => setFlash(false), 900); }
+      firstLoad.current = false;
     } catch (e: any) {
       setErr(String(e.message || e));
     }
   };
   useEffect(() => {
+    firstLoad.current = true;
     refresh();
-    const t = setInterval(refresh, 45000);
-    return () => clearInterval(t);
+    const t = setInterval(refresh, refreshCadence(c));
+    const off = onComponentRefresh(c.id, refresh);
+    return () => { clearInterval(t); off(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [c.id, JSON.stringify(c.props), proposalId]);
-  return { data, err, refresh };
+  return { data, err, refresh, flash };
 }
 
 export function Skeleton({ rows = 3 }: { rows?: number }) {
@@ -80,6 +86,9 @@ export function DataView({ c, data, err }: { c: Component; data: any; err: strin
       return <div className="text-[13.5px] leading-relaxed text-ink-2 whitespace-pre-wrap">{data.markdown}</div>;
     case "connections": return <ConnectionsView data={data} />;
     case "workflow": return <WorkflowView c={c} data={data} />;
+    case "heatmap": return <HeatmapView data={data} />;
+    case "logs": return <LogsView data={data} />;
+    case "tasklist": return <TasklistView c={c} data={data} />;
     case "unconnected":
       return (
         <div className="text-[13px] text-ink-2 leading-relaxed">
@@ -386,6 +395,98 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
           {result}
         </div>
       )}
+    </div>
+  );
+}
+
+
+/* ---------- GitHub-style activity heatmap ---------- */
+function HeatmapView({ data }: { data: any }) {
+  const days: { date: string; count: number }[] = data.days || [];
+  const weeks: { date: string; count: number }[][] = [];
+  for (let i = 0; i < days.length; i += 7) weeks.push(days.slice(i, i + 7));
+  const max = Math.max(1, ...days.map((d) => d.count));
+  const shade = (c: number) =>
+    c === 0 ? "rgba(255,255,255,0.045)"
+      : `rgba(59,130,246,${0.25 + 0.75 * Math.min(c / max, 1)})`;
+  return (
+    <div className="flex flex-col h-full">
+      <div className="text-[12px] text-ink-3 mb-2">
+        <span className="text-ink w510 tabular-nums">{data.total}</span> commits ·{" "}
+        <span className="font-mono text-[11px]">{data.repo}</span>
+      </div>
+      <div className="flex gap-[3px] flex-1 items-start overflow-hidden">
+        {weeks.map((w, i) => (
+          <div key={i} className="flex flex-col gap-[3px]">
+            {w.map((d) => (
+              <div key={d.date} title={`${d.date}: ${d.count} commit${d.count === 1 ? "" : "s"}`}
+                   className="w-[11px] h-[11px] rounded-[2.5px] transition-colors hover:ring-1 hover:ring-blue-2"
+                   style={{ background: shade(d.count) }} />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- live log tail ---------- */
+function LogsView({ data }: { data: any }) {
+  const endRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ block: "end" }); }, [data.lines]);
+  const color = (l: string) =>
+    /error|fail|critical|traceback/i.test(l) ? "text-red"
+      : /warn/i.test(l) ? "text-amber"
+      : /\[CLIENT\]|info/i.test(l) ? "text-ink-2" : "text-ink-3";
+  return (
+    <div className="h-full flex flex-col font-mono text-[11.5px] leading-[1.6]">
+      <div className="text-[10.5px] text-ink-4 pb-1.5 truncate shrink-0">{data.path}</div>
+      <div className="flex-1 overflow-auto min-h-0 bg-[#0a1322] rounded-lg border border-line px-3 py-2">
+        {(data.lines || []).map((l: string, i: number) => (
+          <div key={i} className={`whitespace-pre-wrap break-all ${color(l)}`}>{l || " "}</div>
+        ))}
+        <div ref={endRef} />
+      </div>
+    </div>
+  );
+}
+
+/* ---------- agent-editable task list ---------- */
+function TasklistView({ c, data }: { c: Component; data: any }) {
+  const [items, setItems] = useState<{ text: string; done: boolean }[]>(data.items || []);
+  useEffect(() => { setItems(data.items || []); }, [JSON.stringify(data.items)]);
+  const toggle = async (i: number) => {
+    const next = items.map((it, j) => (j === i ? { ...it, done: !it.done } : it));
+    setItems(next);
+    // persist through the layout (tasklist state lives in props.items)
+    const st = await api(`/api/state?user_id=${USER}`);
+    const spec = st.layout;
+    const comp = spec.components.find((x: any) => x.id === c.id);
+    if (comp) { comp.props = { ...comp.props, items: next };
+      await post("/api/layout", { user_id: USER, spec }); }
+  };
+  const doneCount = items.filter((i) => i.done).length;
+  return (
+    <div className="flex flex-col h-full">
+      <div className="h-1.5 rounded-full bg-line overflow-hidden mb-2.5 shrink-0">
+        <div className="h-full bg-blue rounded-full transition-all duration-300"
+             style={{ width: `${items.length ? (doneCount / items.length) * 100 : 0}%` }} />
+      </div>
+      <div className="flex-1 overflow-auto min-h-0">
+        {items.length === 0 && (
+          <div className="text-[12.5px] text-ink-4">No tasks — ask Hermes to track something here.</div>
+        )}
+        {items.map((it, i) => (
+          <button key={i} onClick={() => toggle(i)}
+                  className="w-full flex items-start gap-2.5 py-[5px] text-left group/task cursor-pointer">
+            <span className={`mt-[3px] w-[15px] h-[15px] rounded-[4px] border shrink-0 flex items-center justify-center transition-colors
+              ${it.done ? "bg-blue border-blue" : "border-line-2 group-hover/task:border-ink-3"}`}>
+              {it.done && <svg viewBox="0 0 10 8" className="w-2.5 h-2"><path d="M1 4l2.5 2.5L9 1" stroke="white" strokeWidth="1.8" fill="none" strokeLinecap="round" /></svg>}
+            </span>
+            <span className={`text-[13px] leading-snug ${it.done ? "text-ink-4 line-through" : "text-ink-2"}`}>{it.text}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

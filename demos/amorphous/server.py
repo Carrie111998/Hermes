@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -181,6 +181,8 @@ def _component_payload(comp: dict, user_id: str) -> dict:
                                  store=store, user_id=user_id)
     if ctype == "notes":
         return {"kind": "notes", "markdown": props.get("markdown", "")}
+    if ctype == "tasklist":
+        return {"kind": "tasklist", "items": props.get("items", [])}
     if ctype == "connections":
         return {"kind": "connections", "connections": datasources.detect_connections()}
     if ctype in ("workflow_button", "workflow_panel"):
@@ -365,6 +367,23 @@ def chat(body: ChatMessage):
     return {"reply": reply, "proposal": None}
 
 
+# ---------- client black box ----------
+@app.post("/api/client-log")
+async def client_log(request: Request):
+    try:
+        body = (await request.body())[:4000]
+        entry = body.decode("utf-8", "replace")
+    except Exception as e:
+        entry = f"<unreadable: {e}>"
+    print(f"[CLIENT] {entry}", flush=True)
+    return {"ok": True}
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "spa": (_DIST / "index.html").exists(), "ts": time.time()}
+
+
 # ---------- SSE events (live updates) ----------
 @app.get("/api/events")
 def sse_events():
@@ -416,6 +435,56 @@ def _curator_loop():
             _curator_state["runs"] += 1
 
 
+# ---------- live data watcher ----------
+# Re-queries every visible data component at its cadence (props.refresh_s >
+# per-source DEFAULT_REFRESH > 60s), hashes results, and pushes `data_changed`
+# SSE events so clients refetch exactly the changed card.
+_watch_state: dict[tuple, dict] = {}
+
+
+def _data_watcher_loop():
+    import hashlib
+    while True:
+        time.sleep(5)
+        try:
+            now = time.time()
+            for user_id in store.list_users():
+                spec = store.get_active_layout(user_id)
+                if not spec:
+                    continue
+                live_keys = set()
+                for comp in spec.get("components", []):
+                    props = comp.get("props") or {}
+                    source = props.get("source")
+                    if comp.get("hidden") or not source:
+                        continue
+                    key = (user_id, comp["id"])
+                    live_keys.add(key)
+                    cadence = props.get("refresh_s") or datasources.DEFAULT_REFRESH.get(source, 60)
+                    st = _watch_state.setdefault(key, {"hash": None, "next_at": 0})
+                    if now < st["next_at"]:
+                        continue
+                    st["next_at"] = now + max(int(cadence), 5)
+                    try:
+                        data = datasources.query(source, props.get("query", {}),
+                                                 store=store, user_id=user_id)
+                    except Exception:
+                        continue
+                    if data.get("kind") == "error":
+                        continue
+                    digest = hashlib.sha1(
+                        json.dumps(data, sort_keys=True, default=str).encode()
+                    ).hexdigest()
+                    if st["hash"] is not None and digest != st["hash"]:
+                        _emit("data_changed", user_id=user_id,
+                              component_id=comp["id"], source=source)
+                    st["hash"] = digest
+                for k in [k for k in _watch_state if k[0] == user_id and k not in live_keys]:
+                    _watch_state.pop(k, None)
+        except Exception:
+            pass
+
+
 def create_app(db_path: str | Path, curator_interval_s: int = 6 * 3600) -> FastAPI:
     global store
     store = Store(db_path)
@@ -423,6 +492,13 @@ def create_app(db_path: str | Path, curator_interval_s: int = 6 * 3600) -> FastA
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     if (_DIST / "assets").exists():
         app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
+
+        @app.middleware("http")
+        async def _no_store_assets(request, call_next):
+            response = await call_next(request)
+            if request.url.path.startswith("/assets/"):
+                response.headers["Cache-Control"] = "no-store, must-revalidate"
+            return response
     if (_DIST / "art").exists():
         app.mount("/art", StaticFiles(directory=_DIST / "art"), name="art")
     return app
@@ -432,14 +508,16 @@ def main() -> None:
     import uvicorn
     ap = argparse.ArgumentParser(description="Hermes Station")
     ap.add_argument("--port", type=int, default=8877)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="bind address (0.0.0.0 so LAN/tunnel access works)")
     ap.add_argument("--db", default=str(HERE / "amorphous.db"))
     ap.add_argument("--curator-minutes", type=float, default=360)
     args = ap.parse_args()
     create_app(args.db, curator_interval_s=int(args.curator_minutes * 60))
     threading.Thread(target=_curator_loop, daemon=True).start()
+    threading.Thread(target=_data_watcher_loop, daemon=True).start()
     print(f"Hermes Station → http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=True)
 
 
 if __name__ == "__main__":

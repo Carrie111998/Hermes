@@ -1,7 +1,8 @@
 /* Visual vocabulary — Linear-style: achromatic chrome, semantic color only in DATA. */
 import {
   GitBranch, Cpu, Play, SlidersHorizontal, Table2, LineChart, ListTodo,
-  Newspaper, Activity, StickyNote, Plug, CloudSun, type LucideIcon,
+  Newspaper, Activity, StickyNote, Plug, CloudSun, CalendarDays, Terminal,
+  ListChecks, type LucideIcon,
 } from "lucide-react";
 
 export const TYPE_ICONS: Record<string, LucideIcon> = {
@@ -15,6 +16,9 @@ export const TYPE_ICONS: Record<string, LucideIcon> = {
   workflow_panel: ListTodo,
   notes: StickyNote,
   connections: Plug,
+  heatmap: CalendarDays,
+  logs: Terminal,
+  tasklist: ListChecks,
 };
 
 export const SOURCE_ICONS: Record<string, LucideIcon> = {
@@ -30,6 +34,8 @@ export const SOURCE_ICONS: Record<string, LucideIcon> = {
   "betterstack.monitors": Activity,
   "station.activity": Activity,
   weather: CloudSun,
+  "git.heatmap": CalendarDays,
+  "log.tail": Terminal,
 };
 
 export function iconFor(type: string, source?: string): LucideIcon {

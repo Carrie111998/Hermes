@@ -24,6 +24,9 @@ COMPONENT_LIBRARY: dict[str, dict] = {
     "workflow_panel":  {"name": "Workflow panel", "min_w": 3, "min_h": 2},
     "notes":           {"name": "Notes / briefing", "min_w": 2, "min_h": 1},
     "connections":     {"name": "Connections status", "min_w": 2, "min_h": 1},
+    "heatmap":         {"name": "Activity heatmap", "min_w": 3, "min_h": 2},
+    "logs":            {"name": "Live log tail", "min_w": 4, "min_h": 2},
+    "tasklist":        {"name": "Task list", "min_w": 2, "min_h": 2},
 }
 
 

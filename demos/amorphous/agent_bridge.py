@@ -158,11 +158,14 @@ _STATION_TOOLS = [
      "remove, retitle {title}, set_props {props}, set_notes {markdown}, "
      "add {component:{id,type,title,w,h,props}}, move_chat_dock {position}. "
      "Component types: metric,timeseries,table,kv,feed,links,workflow_button,"
-     "workflow_panel,notes,connections. Data components take props "
+     "workflow_panel,notes,connections,heatmap,logs,tasklist. "
+     "tasklist props: {items:[{text,done}]} — agent-editable via set_props "
+     "(great for tracking work you're doing for the user). Data components take props "
      "{source, query:{...}} — sources: git.log{repo,limit}, git.status{repo}, "
      "github.prs{repo?,limit}, github.issues{repo?}, system.stats{}, "
      "crypto.price{coins}, crypto.chart{coin}, rss{url,limit}, weather{lat,lon}, "
-     "datadog.query{query}, betterstack.monitors{}, station.activity{}. "
+     "datadog.query{query}, betterstack.monitors{}, station.activity{}, "
+     "git.heatmap{repo,weeks} (commit calendar), log.tail{path,lines} (live file tail, 5s). "
      "Changes apply IMMEDIATELY (the user watches live) — no approval loop for "
      "chat-driven edits.",
      {"type": "object", "properties": {

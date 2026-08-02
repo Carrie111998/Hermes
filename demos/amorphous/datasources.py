@@ -124,7 +124,7 @@ def src_crypto_price(props: dict) -> dict:
         return json.loads(_get(
             f"https://api.coingecko.com/api/v3/simple/price?ids={coins}"
             "&vs_currencies=usd&include_24hr_change=true"))
-    data = _cached(f"cg:{coins}", 60, fetch)
+    data = _cached(f"cg:{coins}", 30, fetch)
     rows = [[c, f"${v['usd']:,.2f}", f"{v.get('usd_24h_change', 0):+.2f}%"]
             for c, v in data.items()]
     return {"kind": "table", "columns": ["Asset", "Price", "24h"], "rows": rows}
@@ -183,6 +183,43 @@ def src_weather(props: dict) -> dict:
             ["Tomorrow", f"{days['temperature_2m_min'][1]}–{days['temperature_2m_max'][1]}°F"],
         ]}
     return _cached(f"wx:{lat},{lon}", 900, fetch)
+
+
+def src_git_heatmap(props: dict) -> dict:
+    """GitHub-style commit activity calendar. props: {repo, weeks}"""
+    repo = os.path.expanduser(props.get("repo", "."))
+    weeks = int(props.get("weeks", 16))
+    out = _run(["git", "log", f"--since={weeks}.weeks", "--format=%ct"], cwd=repo)
+    import datetime as _dt
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        if line.strip():
+            d = _dt.date.fromtimestamp(int(line.strip())).isoformat()
+            counts[d] = counts.get(d, 0) + 1
+    today = _dt.date.today()
+    start = today - _dt.timedelta(days=today.weekday() + 7 * (weeks - 1))
+    days = []
+    d = start
+    while d <= today:
+        days.append({"date": d.isoformat(), "count": counts.get(d.isoformat(), 0)})
+        d += _dt.timedelta(days=1)
+    return {"kind": "heatmap", "days": days,
+            "total": sum(counts.values()), "repo": Path(repo).name}
+
+
+def src_log_tail(props: dict) -> dict:
+    """Live tail of a local file. props: {path, lines}"""
+    path = Path(os.path.expanduser(props.get("path", ""))).resolve()
+    n = min(int(props.get("lines", 40)), 200)
+    if not path.is_file():
+        return {"kind": "error", "error": f"no such file: {path}"}
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - 65536))
+        tail = f.read().decode("utf-8", "replace")
+    lines = tail.splitlines()[-n:]
+    return {"kind": "logs", "path": str(path), "lines": lines}
 
 
 def src_datadog(props: dict) -> dict:
@@ -248,8 +285,29 @@ HANDLERS = {
     "crypto.chart": src_crypto_chart,
     "rss": src_rss,
     "weather": src_weather,
+    "git.heatmap": src_git_heatmap,
+    "log.tail": src_log_tail,
     "datadog.query": src_datadog,
     "betterstack.monitors": src_betterstack,
+}
+
+# Default refresh cadence (seconds) per source; components override with
+# props.refresh_s (agent-settable via station_mutate).
+DEFAULT_REFRESH = {
+    "system.stats": 10,
+    "station.activity": 15,
+    "git.status": 20,
+    "git.log": 30,
+    "github.prs": 60,
+    "github.issues": 60,
+    "crypto.price": 45,
+    "crypto.chart": 120,
+    "datadog.query": 30,
+    "betterstack.monitors": 60,
+    "rss": 300,
+    "weather": 600,
+    "git.heatmap": 300,
+    "log.tail": 5,
 }
 
 

@@ -5,11 +5,51 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hermes Station</title>
+    <style>html{background:#0b1120}body{margin:0;background:#0b1120}</style>
+    <script>
+      (function () {
+        function beacon(kind, payload) {
+          try {
+            var body = JSON.stringify({ kind: kind, payload: payload,
+              ua: navigator.userAgent, url: location.href, ts: Date.now() });
+            if (navigator.sendBeacon) navigator.sendBeacon("/api/client-log", body);
+            else fetch("/api/client-log", { method: "POST", body: body, keepalive: true });
+          } catch (e) {}
+        }
+        window.__beacon = beacon;
+        window.addEventListener("error", function (e) {
+          beacon("js-error", { message: String(e.message || e.error || "unknown"),
+            source: (e.filename || "") + ":" + (e.lineno || 0),
+            stack: e.error && e.error.stack ? String(e.error.stack).slice(0, 1200) : null });
+        });
+        window.addEventListener("unhandledrejection", function (e) {
+          beacon("unhandled-rejection", { message: String((e.reason && (e.reason.message || e.reason)) || "unknown") });
+        });
+        beacon("boot", { stage: "html-parsed" });
+        window.addEventListener("load", function () {
+          setTimeout(function () {
+            var root = document.getElementById("root");
+            beacon("boot", { stage: "post-load", mounted: !!(root && root.children.length > 0) });
+          }, 1500);
+        });
+        setTimeout(function () {
+          var root = document.getElementById("root");
+          if (root && root.children.length === 0) {
+            if (location.search.indexOf("bust=") === -1) {
+              var sep = location.search ? "&" : "?";
+              location.replace(location.pathname + location.search + sep + "bust=" + Date.now() + location.hash);
+            } else {
+              root.innerHTML = '<div style="height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#94a3b8;font-family:system-ui;background:#0b1120"><div style="font-size:28px">\u2624</div><div style="color:#f8fafc;font-weight:600">Hermes Station couldn\u2019t load</div><div style="font-size:13px">The server may be restarting \u2014 <a href="javascript:location.reload(true)" style="color:#60a5fa">try again</a>.</div></div>';
+            }
+          }
+        }, 5000);
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script type="module" crossorigin src="/assets/index-B7oLIyy7.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CLbBkR-7.css">
+    <script type="module" crossorigin src="/assets/index.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index.css">
   </head>
   <body>
     <div id="root"></div>

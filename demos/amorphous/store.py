@@ -141,6 +141,13 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_users(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT user_id FROM layouts"
+            ).fetchall()
+        return [r["user_id"] for r in rows]
+
     # ---------- telemetry ----------
     def record_event(self, user_id: str, etype: str, component_id: str | None,
                      payload: Any = None) -> None:

@@ -75,3 +75,29 @@ export function when(ts: number) {
     minute: "2-digit",
   });
 }
+
+/* ---------- live refresh bus (server data_changed -> per-card refetch) ---------- */
+type RefreshListener = () => void;
+const refreshListeners = new Map<string, Set<RefreshListener>>();
+
+export function onComponentRefresh(componentId: string, fn: RefreshListener) {
+  let set = refreshListeners.get(componentId);
+  if (!set) { set = new Set(); refreshListeners.set(componentId, set); }
+  set.add(fn);
+  return () => { set!.delete(fn); };
+}
+
+export function emitComponentRefresh(componentId: string) {
+  refreshListeners.get(componentId)?.forEach((fn) => fn());
+}
+
+export const SOURCE_REFRESH_S: Record<string, number> = {
+  "system.stats": 10, "station.activity": 15, "git.status": 20, "git.log": 30,
+  "github.prs": 60, "github.issues": 60, "crypto.price": 45, "crypto.chart": 120,
+  "datadog.query": 30, "betterstack.monitors": 60, rss: 300, weather: 600,
+  "git.heatmap": 300, "log.tail": 5,
+};
+export function refreshCadence(c: { props?: any }): number {
+  const p = c.props || {};
+  return (p.refresh_s ? Number(p.refresh_s) : SOURCE_REFRESH_S[p.source] || 60) * 1000;
+}

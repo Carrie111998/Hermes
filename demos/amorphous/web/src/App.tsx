@@ -9,8 +9,9 @@ import Card from "./components/Card";
 import ChatDock, { type ChatMsg } from "./components/ChatDock";
 import Onboarding from "./Onboarding";
 import Inspector from "./components/Inspector";
+import CommandPalette from "./components/CommandPalette";
 import { Button, TooltipProvider } from "./components/ui";
-import { api, post, track, when, USER, type Component, type Proposal, type StationState } from "./lib/api";
+import { api, post, track, when, USER, emitComponentRefresh, type Component, type Proposal, type StationState } from "./lib/api";
 
 export default function App() {
   const [state, setState] = useState<StationState | null>(null);
@@ -55,6 +56,7 @@ export default function App() {
       es.onmessage = async (e) => {
         try {
           const ev = JSON.parse(e.data);
+          if (ev.kind === "data_changed") { emitComponentRefresh(ev.component_id); return; }
           if (preview) return;
           if (ev.kind === "layout_changed") {
             await load();
@@ -214,6 +216,7 @@ export default function App() {
       <header className="h-14 shrink-0 flex items-center justify-between px-5 border-b border-line bg-background/85 backdrop-blur-xl">
         <div className="flex items-center gap-3">
           <span className="text-[15.5px] w590">{state.layout.title || "Dashboard"}</span>
+          <kbd className="hidden lg:inline-flex items-center h-6 px-2 rounded-md border border-line text-[10.5px] text-ink-4">⌘K</kbd>
           <span className="hidden md:inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-green/10 text-green text-[11px] w510">
             <span className="w-1.5 h-1.5 rounded-full bg-green" /> live
           </span>
@@ -289,6 +292,29 @@ export default function App() {
         )}
         </div>
       </main>
+
+      <CommandPalette
+        state={state}
+        onAsk={(t) => { setDockCollapsed(false); sendChat(t); }}
+        onRunWorkflow={async (wfId) => {
+          showToast("Workflow started — result lands in its card");
+          try { await post(`/api/workflow/${wfId}/run`, { user_id: USER, inputs: {} }); await load(); }
+          catch (e: any) { showToast(`Workflow failed: ${e.message.slice(0, 80)}`); }
+        }}
+        onFocusCard={async (id) => {
+          const comp = state.layout.components.find((c) => c.id === id);
+          if (comp?.hidden) { await showComp(id); return; }
+          const el = document.querySelector(`[data-cid="${id}"]`) || 
+            Array.from(document.querySelectorAll(".card-surface")).find((el2) =>
+              el2.textContent?.includes(comp?.title || "\u0000"));
+          el?.scrollIntoView({ behavior: "smooth", block: "center" });
+          el?.classList.add("ring-2", "ring-blue");
+          setTimeout(() => el?.classList.remove("ring-2", "ring-blue"), 1600);
+        }}
+        onHideCard={hideComp}
+        onEvolve={evolveNow}
+        onProposals={() => setTrayOpen(true)}
+      />
 
       {/* docked chat: bottom = in-flow structural panel; right = fixed side panel */}
       <ChatDock

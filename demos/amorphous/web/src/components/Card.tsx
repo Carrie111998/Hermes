@@ -21,7 +21,7 @@ interface Props {
 }
 
 export default function Card({ c, preview, onHide, onRemove }: Props) {
-  const { data, err, refresh } = useComponentData(c, preview);
+  const { data, err, refresh, flash } = useComponentData(c, preview);
   const [chatOpen, setChatOpen] = useState(false);
   const [maxOpen, setMaxOpen] = useState(false);
   const Icon = iconFor(c.type, c.props?.source);
@@ -52,6 +52,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
             <div className="flex items-center gap-2 min-w-0">
               <Icon size={14} className="text-ink-4 shrink-0" strokeWidth={1.75} />
               <span className="text-[13px] w510 text-ink-2 truncate">{c.title}</span>
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 transition-all duration-500 ${flash ? "bg-green shadow-[0_0_8px] shadow-green scale-110" : "bg-transparent"}`} />
             </div>
             {!preview && (
               <div className="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
