@@ -1261,6 +1261,58 @@ class PluginContext:
 
 
 # ---------------------------------------------------------------------------
+# Hook callback timeout (non-blocking abandon)
+# ---------------------------------------------------------------------------
+
+# Wall-clock cap for a single Python plugin hook callback. Shell hooks already
+# enforce their own subprocess timeout; this bounds in-process callbacks so a
+# blocking plugin cannot wedge the agent loop indefinitely.
+_HOOK_CALLBACK_TIMEOUT_SECS = 30.0
+
+
+def _call_hook_callback(cb: Callable[..., Any], timeout: float, **kwargs: Any) -> Any:
+    """Run *cb* with a timeout that does not wait for the worker on expiry.
+
+    PR #6622 wrapped callbacks in ``ThreadPoolExecutor`` and used
+    ``future.result(timeout=…)`` inside a ``with`` block. On timeout the
+    context-manager ``shutdown(wait=True)`` still joined the stuck worker, so
+    the caller hung anyway. Here we start a **daemon** thread and wait only on
+    an ``Event``; on timeout we return control immediately and abandon the
+    thread (Python cannot forcibly kill it).
+    """
+    if timeout <= 0:
+        return cb(**kwargs)
+
+    outcome: Dict[str, Any] = {}
+    failure: Dict[str, Exception] = {}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            outcome["value"] = cb(**kwargs)
+        except Exception as exc:
+            failure["exc"] = exc
+        finally:
+            done.set()
+
+    cb_name = getattr(cb, "__name__", "callback")
+    thread = threading.Thread(
+        target=_runner,
+        name=f"hermes-hook-{cb_name}"[:40],
+        daemon=True,
+    )
+    thread.start()
+    if not done.wait(timeout=timeout):
+        # Do not join — that would reintroduce the #6622 hang.
+        raise TimeoutError(
+            f"Hook callback did not complete within {timeout:g}s"
+        )
+    if "exc" in failure:
+        raise failure["exc"]
+    return outcome.get("value")
+
+
+# ---------------------------------------------------------------------------
 # PluginManager
 # ---------------------------------------------------------------------------
 
@@ -1912,7 +1964,9 @@ class PluginManager:
         """Call all registered callbacks for *hook_name*.
 
         Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
+        plugin cannot break the core agent loop. Callbacks that exceed
+        ``_HOOK_CALLBACK_TIMEOUT_SECS`` are skipped without waiting for the
+        abandoned worker thread (see :func:`_call_hook_callback`).
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -1933,9 +1987,18 @@ class PluginManager:
         results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
+                ret = _call_hook_callback(
+                    cb, _HOOK_CALLBACK_TIMEOUT_SECS, **kwargs
+                )
                 if ret is not None:
                     results.append(ret)
+            except TimeoutError:
+                logger.warning(
+                    "Hook '%s' callback %s timed out after %gs — skipping",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    _HOOK_CALLBACK_TIMEOUT_SECS,
+                )
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",

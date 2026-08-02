@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -367,6 +368,67 @@ class TestPluginHooks:
         )
         assert results == [{"seen": 2, "mc": 5, "tc": 3}]
 
+    def test_hook_timeout_does_not_block_caller(self, monkeypatch):
+        """A hung callback must be abandoned without joining the worker.
+
+        Regression for the #6622 approach: ThreadPoolExecutor + result(timeout)
+        inside a ``with`` still waits on shutdown after TimeoutError.
+        """
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 0.15
+        )
+
+        hold = threading.Event()
+        started = threading.Event()
+
+        def blocker(**_kwargs):
+            started.set()
+            hold.wait(timeout=10.0)
+            return "late"
+
+        def fast(**_kwargs):
+            return {"ok": True}
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [blocker, fast]
+
+        t0 = time.monotonic()
+        results = mgr.invoke_hook(
+            "post_tool_call",
+            tool_name="terminal",
+            args={},
+            result="{}",
+        )
+        elapsed = time.monotonic() - t0
+
+        assert started.wait(timeout=1.0)
+        assert results == [{"ok": True}]
+        assert elapsed < 1.0, f"caller blocked for {elapsed:.2f}s after timeout"
+        hold.set()
+
+    def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 1.0
+        )
+        mgr = PluginManager()
+        mgr._hooks["pre_llm_call"] = [lambda **_kw: {"context": "hi"}]
+        assert mgr.invoke_hook("pre_llm_call", session_id="s1") == [
+            {"context": "hi"}
+        ]
+
+    def test_hook_exception_still_isolated_under_timeout_path(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 1.0
+        )
+
+        def boom(**_kwargs):
+            raise RuntimeError("plugin blew up")
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [boom, lambda **_kw: "survived"]
+        assert mgr.invoke_hook("post_tool_call") == ["survived"]
 
 
 class TestPreToolCallBlocking:
