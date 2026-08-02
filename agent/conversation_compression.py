@@ -2196,7 +2196,13 @@ def compress_context(
     # second clear before lock acquisition below stays for the same reason
     # it was added in #69870 and is simply idempotent now.
     agent._compression_skipped_due_to_lock = None
-    agent._speculative_install_status = None
+    # Terminal-status contract for candidate-bearing calls: any exit other
+    # than a committed install reports "rejected" (or "deferred_lock" when
+    # the session compression lock was contended), so callers and telemetry
+    # can distinguish a genuine rejection from a transient deferral.
+    agent._speculative_install_status = (
+        "rejected" if speculative_candidate is not None else None
+    )
 
     if speculative_candidate is not None:
         try:
@@ -2543,6 +2549,8 @@ def compress_context(
                 failure_class="lock_contended",
             )
             _complete_compaction_lifecycle()
+            if speculative_candidate is not None:
+                agent._speculative_install_status = "deferred_lock"
             return messages, _existing_sp
     _lock_released = False
     _lock_release_guard = threading.Lock()
@@ -2791,12 +2799,39 @@ def compress_context(
             _speculative_settings = getattr(
                 agent, "speculative_compression_settings", None
             )
-            _speculative_max_age = float(
-                getattr(_speculative_settings, "max_age_seconds", 180.0) or 180.0
+            # Preserve an explicit 0 (immediate expiry) — ``or 180.0`` would
+            # silently convert a configured zero into the default.
+            _spec_raw_max_age = getattr(
+                _speculative_settings, "max_age_seconds", None
             )
+            _speculative_max_age = (
+                float(_spec_raw_max_age)
+                if _spec_raw_max_age is not None
+                else 180.0
+            )
+            _spec_compressor_fp = getattr(
+                speculative_candidate, "compressor_fingerprint", None
+            )
+            _spec_live_compressor_fp = None
+            if _spec_compressor_fp is not None:
+                try:
+                    from agent.speculative_compression import (
+                        compressor_settings_fingerprint,
+                    )
+
+                    _spec_live_compressor_fp = compressor_settings_fingerprint(
+                        agent.context_compressor
+                    )
+                except Exception:
+                    _spec_live_compressor_fp = None
             if (
                 speculative_candidate.is_expired(_speculative_max_age)
                 or not speculative_candidate.matches(messages, agent.session_id)
+                or (
+                    _spec_compressor_fp is not None
+                    and _spec_live_compressor_fp is not None
+                    and _spec_compressor_fp != _spec_live_compressor_fp
+                )
             ):
                 agent._speculative_install_status = "rejected"
                 _release_lock()

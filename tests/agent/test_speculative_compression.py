@@ -119,3 +119,19 @@ def test_candidate_rejects_changed_boundary_and_prefix():
     assert not candidate.matches(truncated, "session-1")
     with pytest.raises(ValueError, match="no longer matches"):
         candidate.assemble(changed_boundary, "session-1")
+
+
+def test_fingerprint_strips_only_top_level_bookkeeping():
+    """_db_persisted / tail-marker keys are bookkeeping ONLY at the message
+    root; a nested payload key with the same name must still be hashed."""
+    with_marker = [{"role": "user", "content": "x", "_db_persisted": 1}]
+    without_marker = [{"role": "user", "content": "x"}]
+    assert fingerprint_messages(with_marker) == fingerprint_messages(without_marker)
+
+    nested_a = [{"role": "user", "content": "x", "extra": {"_db_persisted": 1}}]
+    nested_b = [{"role": "user", "content": "x", "extra": {"_db_persisted": 2}}]
+    assert fingerprint_messages(nested_a) != fingerprint_messages(nested_b)
+
+    tail_a = [{"role": "user", "content": "x", "nested": {"_speculative_tail_marker": "m1"}}]
+    tail_b = [{"role": "user", "content": "x", "nested": {"_speculative_tail_marker": "m2"}}]
+    assert fingerprint_messages(tail_a) != fingerprint_messages(tail_b)

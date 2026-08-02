@@ -89,14 +89,15 @@ def _try_install_speculative_candidate(
     except Exception:
         return messages, None, False, False
 
-    hard_pressure = int(approx_tokens or 0) >= hard_trigger
-    if hard_pressure:
-        # Anti-thrash guard: when the live compressor has backed off because
-        # recent passes saved <10% ("ineffective"), do NOT force the
-        # synchronous fallback — that is exactly the freeze/thrash loop
-        # #40803/#11529 exists to prevent. A ready candidate is still
-        # installable (its summary LLM call already happened on the worker);
-        # only the forced re-compression is suppressed.
+    over_hard = int(approx_tokens or 0) >= hard_trigger
+    # Anti-thrash guard: when the live compressor has backed off because
+    # recent passes saved <10% ("ineffective"), do NOT force the
+    # synchronous fallback — that is exactly the freeze/thrash loop
+    # #40803/#11529 exists to prevent. A ready candidate is still
+    # installable (its summary LLM call already happened on the worker);
+    # only the forced re-compression is suppressed.
+    force_sync = over_hard
+    if over_hard:
         _info_fn = getattr(compressor, "should_compress_info", None)
         if callable(_info_fn):
             try:
@@ -109,15 +110,15 @@ def _try_install_speculative_candidate(
             except Exception:
                 _block_reason = None
             if _block_reason == "ineffective":
-                hard_pressure = False
+                force_sync = False
     try:
         normal_pressure = bool(compressor.should_compress(approx_tokens))
     except Exception:
         normal_pressure = False
-    if not hard_pressure and not normal_pressure:
+    if not over_hard and not normal_pressure:
         return messages, None, False, False
 
-    wait_seconds = settings.hard_wait_seconds if hard_pressure else 0.0
+    wait_seconds = settings.hard_wait_seconds if over_hard else 0.0
     candidate = manager.take_matching_candidate(
         str(getattr(agent, "session_id", "") or ""),
         messages,
@@ -125,7 +126,7 @@ def _try_install_speculative_candidate(
         max_age_seconds=settings.max_age_seconds,
     )
     if candidate is None:
-        return messages, None, False, hard_pressure
+        return messages, None, False, force_sync
     try:
         compressed, active_system_prompt = agent._compress_context(
             messages,
@@ -139,10 +140,27 @@ def _try_install_speculative_candidate(
         # rebuild) degrades to the unchanged synchronous path — the optional
         # speculative path must never crash the turn.
         logger.debug("speculative candidate install failed", exc_info=True)
-        return messages, None, False, hard_pressure
+        _restore_speculative_candidate(agent, candidate)
+        return messages, None, False, force_sync
     if getattr(agent, "_speculative_install_status", None) != "installed":
-        return messages, None, False, hard_pressure
-    return compressed, active_system_prompt, True, hard_pressure
+        # Deferred by lock contention (or rejected as stale by the commit
+        # path). A still-valid candidate must not be lost — requeue it so a
+        # later attempt can reclaim it instead of re-running the summary LLM.
+        _restore_speculative_candidate(agent, candidate)
+        return messages, None, False, force_sync
+    return compressed, active_system_prompt, True, force_sync
+
+
+def _restore_speculative_candidate(agent: Any, candidate: Any) -> None:
+    """Requeue a claimed candidate when installation did not commit."""
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    restore = getattr(manager, "restore_candidate", None)
+    if restore is None:
+        return
+    try:
+        restore(str(getattr(agent, "session_id", "") or ""), candidate)
+    except Exception:
+        logger.debug("speculative candidate restore failed", exc_info=True)
 
 
 def compose_user_api_content(

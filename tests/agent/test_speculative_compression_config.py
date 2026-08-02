@@ -59,6 +59,67 @@ def test_thresholds_use_effective_input_window_after_output_reservation():
     assert speculative_thresholds(Compressor(), settings) == (137_200, 166_600)
 
 
+def test_thresholds_respect_absolute_cap_below_ratio_watermark():
+    class Compressor:
+        context_length = 260_000
+        max_tokens = 64_000
+        threshold_tokens_cap = 100_000
+
+        @staticmethod
+        def _compute_threshold_tokens(context_length, ratio, max_tokens):
+            return int((context_length - max_tokens) * ratio)
+
+    settings = normalize_speculative_compression_settings({
+        "start_ratio": 0.70,
+        "hard_ratio": 0.85,
+    })
+    # Both watermarks cap at the operator's absolute admission point, and
+    # hard never falls below soft.
+    soft, hard = speculative_thresholds(Compressor(), settings)
+    assert soft == 100_000
+    assert hard == 100_000
+    assert hard >= soft
+
+
+def test_thresholds_ignore_cap_above_ratio_watermark():
+    class Compressor:
+        context_length = 260_000
+        max_tokens = 64_000
+        threshold_tokens_cap = 400_000
+
+        @staticmethod
+        def _compute_threshold_tokens(context_length, ratio, max_tokens):
+            return int((context_length - max_tokens) * ratio)
+
+    settings = normalize_speculative_compression_settings({
+        "start_ratio": 0.70,
+        "hard_ratio": 0.85,
+    })
+    assert speculative_thresholds(Compressor(), settings) == (137_200, 166_600)
+
+
+def test_thresholds_disable_speculation_on_collapsed_watermarks():
+    """A small window whose floor collapses soft==hard disables speculation."""
+    from agent.context_compressor import ContextCompressor
+
+    compressor = ContextCompressor(model="test", config_context_length=64_000)
+    settings = normalize_speculative_compression_settings({})
+    assert speculative_thresholds(compressor, settings) == (2**63 - 1, 2**63 - 1)
+
+
+def test_invalid_boolean_warns_and_falls_back_to_default(caplog):
+    with caplog.at_level(logging.WARNING):
+        settings = normalize_speculative_compression_settings({
+            "enabled": "treu",
+            "during_tool_wait": "yess",
+        })
+
+    assert settings.enabled is False  # default
+    assert settings.during_tool_wait is True  # default, not silently False
+    assert "Invalid compression.speculative enabled" in caplog.text
+    assert "Invalid compression.speculative during_tool_wait" in caplog.text
+
+
 def test_codex_native_and_plugin_context_engines_are_not_eligible():
     from agent.context_compressor import ContextCompressor
 

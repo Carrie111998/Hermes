@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import CancelledError, Future, TimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -48,12 +48,31 @@ class SpeculativeCompressionSettings:
 DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS = SpeculativeCompressionSettings()
 
 
-def _as_bool(value: Any, default: bool) -> bool:
+def _parse_bool(
+    value: Any, default: bool, log: logging.Logger, name: str
+) -> bool:
+    """Parse a boolean config value, warning and defaulting on garbage."""
     if isinstance(value, bool):
         return value
     if value is None:
         return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    try:
+        return float(value) != 0.0
+    except (TypeError, ValueError):
+        pass
+    log.warning(
+        "Invalid compression.speculative %s=%r; using default %r",
+        name,
+        value,
+        default,
+    )
+    return default
 
 
 def _finite_float(value: Any, default: float, *, minimum: float | None = None) -> float:
@@ -111,15 +130,17 @@ def normalize_speculative_compression_settings(
         minimum=0.0,
     )
     return SpeculativeCompressionSettings(
-        enabled=_as_bool(values.get("enabled"), defaults.enabled),
+        enabled=_parse_bool(values.get("enabled"), defaults.enabled, log, "enabled"),
         start_ratio=start,
         hard_ratio=hard,
         max_age_seconds=max_age,
         hard_wait_seconds=max(0.0, hard_wait),
-        during_tool_wait=_as_bool(
-            values.get("during_tool_wait"), defaults.during_tool_wait
+        during_tool_wait=_parse_bool(
+            values.get("during_tool_wait"), defaults.during_tool_wait, log, "during_tool_wait"
         ),
-        during_idle=_as_bool(values.get("during_idle"), defaults.during_idle),
+        during_idle=_parse_bool(
+            values.get("during_idle"), defaults.during_idle, log, "during_idle"
+        ),
     )
 
 
@@ -140,12 +161,14 @@ def is_builtin_compression_eligible(
         return False
 
 
-def _canonical_value(value: Any) -> Any:
+def _canonical_value(value: Any, *, top_level: bool = False) -> Any:
     if isinstance(value, Mapping):
         return {
             str(key): _canonical_value(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if str(key) not in {_DB_PERSISTED_MARKER, _TAIL_MARKER}
+            if not (
+                top_level and str(key) in {_DB_PERSISTED_MARKER, _TAIL_MARKER}
+            )
         }
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
@@ -170,7 +193,7 @@ def fingerprint_messages(messages: Iterable[Mapping[str, Any]]) -> str:
     """Hash provider-visible message content deterministically."""
 
     encoded = json.dumps(
-        [_canonical_value(message) for message in messages],
+        [_canonical_value(message, top_level=True) for message in messages],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -187,7 +210,10 @@ def _freeze(value: Any) -> Any:
         return tuple(_freeze(item) for item in value)
     if isinstance(value, set):
         return frozenset(_freeze(item) for item in value)
-    return value
+    # Unsupported objects are snapshotted by value, not by reference: a
+    # retained mutable object must not mutate the source transcript after
+    # fingerprinting.
+    return copy.deepcopy(value)
 
 
 def _thaw(value: Any) -> Any:
@@ -228,6 +254,7 @@ class SpeculativeSnapshot:
     original_count: int
     request_tokens: int | None
     captured_at: float
+    compressor_fingerprint: str | None = None
 
     @property
     def source_message_count(self) -> int:
@@ -265,6 +292,7 @@ def capture_snapshot(
         messages=tuple(_freeze(message) for message in copied),
         source_fingerprint=fingerprint_messages(covered),
         boundary_fingerprint=fingerprint_messages([boundary]),
+        compressor_fingerprint=compressor_settings_fingerprint(compressor),
         cut_index=cut,
         compress_start=head_end,
         original_count=len(copied),
@@ -293,6 +321,7 @@ class SpeculativeCandidate:
     summary_has_user_turn: bool | None = None
     made_progress: bool | None = None
     savings_pct: float | None = None
+    compressor_fingerprint: str | None = None
 
     @property
     def source_session_id(self) -> str:
@@ -393,6 +422,7 @@ def build_candidate(
         session_id=snapshot.session_id,
         source_fingerprint=snapshot.source_fingerprint,
         boundary_fingerprint=snapshot.boundary_fingerprint,
+        compressor_fingerprint=snapshot.compressor_fingerprint,
         cut_index=snapshot.cut_index,
         compress_start=snapshot.compress_start,
         original_count=snapshot.original_count,
@@ -451,20 +481,81 @@ def speculative_thresholds(
     compressor: Any,
     settings: SpeculativeCompressionSettings,
 ) -> Tuple[int, int]:
-    """Return soft/hard trigger budgets from the effective input window."""
+    """Return soft/hard trigger budgets from the effective input window.
+
+    When ``compression.threshold_tokens`` (an absolute cap) is configured
+    below the ratio-derived watermark, ordinary synchronous compression
+    fires at the cap first and the speculative overlap would never engage.
+    Cap the speculative watermarks at the same admission point so the
+    optimization stays aligned with the operator's effective budget.
+    """
 
     context_length = int(getattr(compressor, "context_length", 0) or 0)
     max_tokens = getattr(compressor, "max_tokens", None)
     compute = getattr(type(compressor), "_compute_threshold_tokens", None)
     if callable(compute) and context_length > 0:
-        return (
+        soft, hard = (
             int(compute(context_length, settings.start_ratio, max_tokens)),
             int(compute(context_length, settings.hard_ratio, max_tokens)),
         )
-    effective = context_length - int(max_tokens or 0)
-    if effective <= 0:
-        effective = context_length
-    return int(effective * settings.start_ratio), int(effective * settings.hard_ratio)
+    else:
+        effective = context_length - int(max_tokens or 0)
+        if effective <= 0:
+            effective = context_length
+        soft, hard = (
+            int(effective * settings.start_ratio),
+            int(effective * settings.hard_ratio),
+        )
+    if hard <= soft:
+        # The minimum-window floor collapsed the watermarks (e.g. a 64K
+        # window yields identical soft/hard triggers). There is no useful
+        # overlap window — disable speculation entirely rather than
+        # degenerating into hard-only mode.
+        return (2**63 - 1, 2**63 - 1)
+    _cap_raw = getattr(compressor, "threshold_tokens_cap", None)
+    try:
+        _cap = int(_cap_raw) if _cap_raw else None
+    except (TypeError, ValueError):
+        _cap = None
+    if _cap and _cap > 0:
+        soft = min(soft, _cap)
+        hard = min(hard, _cap)
+        if hard < soft:
+            hard = soft
+    return soft, hard
+
+
+def compressor_settings_fingerprint(compressor: Any) -> str:
+    """Fingerprint the compressor settings a candidate was built under.
+
+    A model/context-window/summary-budget change with an unchanged
+    transcript must not reuse a candidate produced by the old compressor:
+    switching from a large to a small context model could install an
+    oversized old-tail candidate that overflows the new window. The
+    snapshot captures this fingerprint and install-time validation
+    rejects any mismatch against the live compressor.
+    """
+
+    return fingerprint_messages([
+        {
+            "model": getattr(compressor, "model", ""),
+            "context_length": (
+                getattr(compressor, "_resolved_context_length", None)
+                or getattr(compressor, "context_length", None)
+            ),
+            "max_tokens": getattr(compressor, "max_tokens", None),
+            "threshold_percent": getattr(compressor, "threshold_percent", None),
+            "summary_target_ratio": getattr(
+                compressor, "summary_target_ratio", None
+            ),
+            "protect_first_n": getattr(compressor, "protect_first_n", None),
+            "protect_last_n": getattr(compressor, "protect_last_n", None),
+            "model_thresholds": getattr(compressor, "model_thresholds", None),
+            "threshold_tokens_cap": getattr(
+                compressor, "threshold_tokens_cap", None
+            ),
+        }
+    ])
 
 
 def schedule_tool_wait_candidate(
@@ -493,6 +584,33 @@ def schedule_tool_wait_candidate(
     soft_trigger, _hard_trigger = speculative_thresholds(compressor, settings)
     if int(request_tokens or 0) < soft_trigger:
         return "below_soft_trigger"
+    # Do not start NEW worker work while the summary LLM is in failure
+    # cooldown or the anti-thrash breaker has backed off: every worker call
+    # would exercise the exact backend/strategy under backoff. A candidate
+    # already prepared before the block stays installable (the foreground
+    # install path does not re-run the summary LLM).
+    _cooldown_fn = getattr(
+        compressor, "get_active_compression_failure_cooldown", None
+    )
+    if callable(_cooldown_fn):
+        try:
+            if _cooldown_fn():
+                return "blocked_cooldown"
+        except Exception:
+            pass
+    _info_fn = getattr(compressor, "should_compress_info", None)
+    if callable(_info_fn):
+        try:
+            _info_result = _info_fn(int(request_tokens))
+            _block_reason = (
+                _info_result[1]
+                if isinstance(_info_result, tuple) and len(_info_result) > 1
+                else None
+            )
+            if _block_reason == "ineffective":
+                return "blocked_ineffective"
+        except Exception:
+            pass
     try:
         snapshot = capture_snapshot(
             messages,
@@ -517,11 +635,12 @@ def schedule_tool_wait_candidate(
 
 @dataclass
 class _Job:
-    snapshot: SpeculativeSnapshot
+    snapshot: SpeculativeSnapshot | None
     future: Future
     cancel_event: threading.Event
     started_at: float
     max_age_seconds: float
+    published: threading.Event = field(default_factory=threading.Event)
     rerun_snapshot: SpeculativeSnapshot | None = None
     rerun_factory: Callable[[], Any] | None = None
     candidate: SpeculativeCandidate | None = None
@@ -613,6 +732,24 @@ class SpeculativeCompressionManager:
             self._executor.start()
         return self._executor
 
+    def _prune_completed_entries(self, now: float) -> None:
+        """Drop completed entries with no pending rerun and no live candidate.
+
+        One-shot gateway sessions otherwise retain full snapshots, candidates,
+        and exception-bearing futures/tracebacks indefinitely in the
+        process-global manager. Called on every manager access point.
+        """
+        for sid, job in list(self._entries.items()):
+            if (
+                job.future.done()
+                and job.rerun_snapshot is None
+                and (
+                    job.candidate is None
+                    or job.candidate.is_expired(job.max_age_seconds, now=now)
+                )
+            ):
+                self._entries.pop(sid, None)
+
     def maybe_start(
         self,
         session_id: str,
@@ -626,6 +763,7 @@ class SpeculativeCompressionManager:
         with self._lock:
             if self._shutdown:
                 return "shutdown"
+            self._prune_completed_entries(self._clock())
             existing = self._entries.get(str(session_id))
             if existing is not None and not existing.future.done():
                 existing.rerun_snapshot = snapshot
@@ -646,6 +784,11 @@ class SpeculativeCompressionManager:
                         and existing.candidate.boundary_fingerprint
                         == snapshot.boundary_fingerprint
                         and existing.candidate.cut_index == snapshot.cut_index
+                        and (
+                            snapshot.compressor_fingerprint is None
+                            or existing.candidate.compressor_fingerprint
+                            == snapshot.compressor_fingerprint
+                        )
                     ):
                         return "ready"
                     # A completed candidate for a changed prefix cannot be
@@ -666,16 +809,21 @@ class SpeculativeCompressionManager:
                 max_age_seconds=max_age_seconds,
             )
             self._entries[str(session_id)] = job
-            future.add_done_callback(
-                lambda done, sid=str(session_id): self._finish_job(sid, done)
-            )
             logger.debug(
                 "speculative compression session=%s disposition=started fingerprint=%s source_tokens=%s",
                 session_id,
                 snapshot.source_fingerprint[:12],
                 snapshot.request_tokens,
             )
-            return "started"
+        # Register OUTSIDE the lock: if the future already completed, the
+        # callback runs synchronously on this thread and _finish_job() needs
+        # the lock — registering while holding it would deadlock the global
+        # manager (verified: a fast no-op/error froze every session sharing
+        # the default manager).
+        future.add_done_callback(
+            lambda done, sid=str(session_id): self._finish_job(sid, done)
+        )
+        return "started"
 
     @staticmethod
     def _run_job(
@@ -691,6 +839,9 @@ class SpeculativeCompressionManager:
         return candidate
 
     def _finish_job(self, session_id: str, future: Future) -> None:
+        rerun_snapshot = None
+        rerun_factory = None
+        rerun_max_age = 180.0
         with self._lock:
             job = self._entries.get(session_id)
             if job is None or job.future is not future:
@@ -717,37 +868,61 @@ class SpeculativeCompressionManager:
                     type(exc).__name__,
                     exc,
                 )
+            # Publish AFTER the future completes so waiters can distinguish a
+            # ready/errored result from an in-flight one (the future itself
+            # completes before this callback runs on the executor thread).
+            job.published.set()
 
             pending = job.rerun_snapshot
             factory = job.rerun_factory
             if pending is not None and factory is not None:
                 if job.candidate is not None and (
-                    pending.source_fingerprint == job.candidate.source_fingerprint
+                    pending.source_fingerprint
+                    == job.candidate.source_fingerprint
+                    and pending.boundary_fingerprint
+                    == job.candidate.boundary_fingerprint
                     and pending.cut_index == job.candidate.cut_index
                 ):
+                    # Rerun dedup must compare the complete snapshot identity:
+                    # a boundary-only change makes the old candidate unusable
+                    # even when the prefix fingerprint matches.
                     job.rerun_snapshot = None
                     job.rerun_factory = None
                     return
                 if not self._shutdown:
-                    cancel_event = threading.Event()
-                    next_future = self._get_executor().submit(
-                        self._run_job, pending, factory, cancel_event
-                    )
-                    self._entries[session_id] = _Job(
-                        snapshot=pending,
-                        future=next_future,
-                        cancel_event=cancel_event,
-                        started_at=self._clock(),
-                        max_age_seconds=job.max_age_seconds,
-                    )
-                    next_future.add_done_callback(
-                        lambda done, sid=session_id: self._finish_job(sid, done)
-                    )
-                    logger.debug(
-                        "speculative compression session=%s disposition=rerun fingerprint=%s",
-                        session_id,
-                        pending.source_fingerprint[:12],
-                    )
+                    rerun_snapshot = pending
+                    rerun_factory = factory
+                    rerun_max_age = job.max_age_seconds
+            self._prune_completed_entries(self._clock())
+        if rerun_snapshot is not None and rerun_factory is not None:
+            cancel_event = threading.Event()
+            next_future = self._get_executor().submit(
+                self._run_job, rerun_snapshot, rerun_factory, cancel_event
+            )
+            new_job = _Job(
+                snapshot=rerun_snapshot,
+                future=next_future,
+                cancel_event=cancel_event,
+                started_at=self._clock(),
+                max_age_seconds=rerun_max_age,
+            )
+            replaced = False
+            with self._lock:
+                current = self._entries.get(session_id)
+                if current is None or current.future is future:
+                    self._entries[session_id] = new_job
+                    replaced = True
+            if replaced:
+                # Register outside the lock (same deadlock rationale as
+                # maybe_start: a fast rerun could complete before this).
+                next_future.add_done_callback(
+                    lambda done, sid=session_id: self._finish_job(sid, done)
+                )
+                logger.debug(
+                    "speculative compression session=%s disposition=rerun fingerprint=%s",
+                    session_id,
+                    rerun_snapshot.source_fingerprint[:12],
+                )
 
     def take_matching_candidate(
         self,
@@ -759,13 +934,23 @@ class SpeculativeCompressionManager:
     ) -> SpeculativeCandidate | None:
         sid = str(session_id or "")
         with self._lock:
+            self._prune_completed_entries(self._clock())
             job = self._entries.get(sid)
             future = job.future if job is not None and not job.future.done() else None
-        if future is not None and wait_seconds > 0:
-            try:
-                future.result(timeout=max(0.0, float(wait_seconds)))
-            except BaseException:
-                pass
+            published = job.published if job is not None else None
+        if wait_seconds > 0:
+            if published is not None:
+                # Wait for the manager-owned publication, which _finish_job
+                # sets AFTER the future completes and the candidate is
+                # stored. Waiting on the future alone races the callback and
+                # can miss a ready candidate (observed flake in the rerun
+                # test).
+                published.wait(timeout=max(0.0, float(wait_seconds)))
+            elif future is not None:
+                try:
+                    future.result(timeout=max(0.0, float(wait_seconds)))
+                except BaseException:
+                    pass
 
         with self._lock:
             job = self._entries.get(sid)
@@ -800,6 +985,45 @@ class SpeculativeCompressionManager:
             job.future.cancel()
             logger.debug(
                 "speculative compression session=%s disposition=cancelled", sid
+            )
+
+    def restore_candidate(
+        self, session_id: str, candidate: SpeculativeCandidate
+    ) -> None:
+        """Requeue a claimed candidate whose install was deferred.
+
+        ``take_matching_candidate`` consumes destructively so a candidate is
+        never double-installed; when the foreground install path loses the
+        compression lock (or is otherwise deferred), the candidate is still
+        valid and must not be discarded. Re-insert it as a completed entry so
+        a later take can reclaim it. A running job or a newer candidate for
+        the same session wins over the restore.
+        """
+        sid = str(session_id or "")
+        with self._lock:
+            if self._shutdown:
+                return
+            self._prune_completed_entries(self._clock())
+            existing = self._entries.get(sid)
+            if existing is not None:
+                if existing.candidate is not None or not existing.future.done():
+                    return
+            done = Future()
+            done.set_result(candidate)
+            restored_job = _Job(
+                snapshot=None,
+                future=done,
+                cancel_event=threading.Event(),
+                started_at=self._clock(),
+                max_age_seconds=180.0,
+                candidate=candidate,
+            )
+            restored_job.published.set()
+            self._entries[sid] = restored_job
+            logger.debug(
+                "speculative compression session=%s disposition=restored fingerprint=%s",
+                sid,
+                candidate.source_fingerprint[:12],
             )
 
     def shutdown(self, *, wait: bool = True) -> None:

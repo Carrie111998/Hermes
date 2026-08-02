@@ -103,6 +103,58 @@ def test_stale_candidate_is_rejected_before_install(tmp_path):
     assert db.get_compression_lock_holder(session_id) is None
 
 
+def test_zero_max_age_expires_candidate_immediately(tmp_path):
+    """max_age_seconds: 0 must mean immediate expiry at install time, not
+    fall back to the 180s default (regression for the `or 180.0` bug)."""
+    agent, db, session_id = _agent_with_candidate_db(tmp_path)
+    agent.speculative_compression_settings = SpeculativeCompressionSettings(
+        enabled=True, max_age_seconds=0
+    )
+    messages = _messages()
+
+    returned, _prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=100,
+        speculative_candidate=_candidate(messages, session_id),
+    )
+
+    assert agent._speculative_install_status == "rejected"
+    assert returned == messages
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_compressor_fingerprint_mismatch_rejects_candidate(tmp_path):
+    """A candidate built under a different compressor (model/context change)
+    must be rejected even when the transcript is unchanged."""
+    agent, db, session_id = _agent_with_candidate_db(tmp_path)
+    messages = _messages()
+
+    candidate = _candidate(messages, session_id)
+    candidate = SpeculativeCandidate(
+        session_id=candidate.session_id,
+        source_fingerprint=candidate.source_fingerprint,
+        boundary_fingerprint=candidate.boundary_fingerprint,
+        cut_index=candidate.cut_index,
+        compress_start=candidate.compress_start,
+        original_count=candidate.original_count,
+        compressed_prefix=candidate.compressed_prefix,
+        created_at=candidate.created_at,
+        compressor_fingerprint="different-compressor",
+    )
+
+    returned, _prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=100,
+        speculative_candidate=candidate,
+    )
+
+    assert agent._speculative_install_status == "rejected"
+    assert returned == messages
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_failed_durable_commit_rejects_candidate_and_releases_lock(
     tmp_path, monkeypatch
 ):

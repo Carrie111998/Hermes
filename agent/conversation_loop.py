@@ -6402,6 +6402,18 @@ def run_conversation(
                         lambda: None,
                     )()
                     if not _post_tool_cooldown:
+                        # Admission for the SPECULATIVE path uses a fresh
+                        # full-request estimate (current messages incl. the
+                        # just-appended tool result, plus the active system
+                        # prompt). _real_tokens above is the pre-tool provider
+                        # count when last_prompt_tokens > 0, which misses a
+                        # huge tool result; the fresh estimate keeps a ready
+                        # candidate reachable right after tool execution.
+                        _spec_admission_tokens = estimate_request_tokens_rough(
+                            messages,
+                            system_prompt=active_system_prompt or "",
+                            tools=agent.tools or None,
+                        )
                         (
                             _speculative_messages,
                             _speculative_prompt,
@@ -6411,7 +6423,7 @@ def run_conversation(
                             agent,
                             messages,
                             system_message,
-                            _real_tokens,
+                            _spec_admission_tokens,
                             effective_task_id,
                         )
 
