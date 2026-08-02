@@ -599,10 +599,70 @@ def test_successor_rebind_v4_wrapper_has_only_one_fixed_action() -> None:
     assert "runtime_base=/usr/lib/muncho-successor-rebind-runtime" in raw
     assert "production_successor_rebind_owner_runtime_preexec" in raw
     assert "exec /usr/bin/python3 -I -S -B" in raw
+    assert 'runpy.run_path(path,run_name="__main__")' in raw
+    assert "runpy.run_module" not in raw
+    assert "sys.path.insert" not in raw
     assert "expected_preexec_sha256" in raw
     assert "hermes-agent-releases" not in raw
     assert '"$@"' not in raw
     assert "systemctl" not in raw
+
+
+def test_successor_rebind_v4_preexec_does_not_import_package_initializers(
+    tmp_path: Path,
+) -> None:
+    raw = (
+        ROOT / "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
+    ).read_text(encoding="utf-8")
+    expression_match = re.search(
+        r"exec /usr/bin/python3 -I -S -B -c \\\n  '([^']+)' \\\n",
+        raw,
+    )
+    assert expression_match is not None
+
+    library = tmp_path / "target-revision"
+    canary = library / "scripts/canary"
+    canary.mkdir(parents=True)
+    scripts_marker = tmp_path / "scripts-init-executed"
+    canary_marker = tmp_path / "canary-init-executed"
+    (library / "scripts/__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(scripts_marker)!r}).write_text('bad')\n",
+        encoding="utf-8",
+    )
+    (canary / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(canary_marker)!r}).write_text('bad')\n",
+        encoding="utf-8",
+    )
+    verifier = canary / "production_successor_rebind_owner_runtime_preexec.py"
+    verifier.write_text(
+        "import json,sys\nprint(json.dumps(sys.argv))\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            expression_match.group(1),
+            str(verifier),
+            "muncho-successor-rebind-owner-runtime-preexec",
+            "sentinel",
+        ),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == [
+        str(verifier),
+        "sentinel",
+    ]
+    assert not scripts_marker.exists()
+    assert not canary_marker.exists()
 
 
 def test_revision_qualified_foundation_keeps_two_revisions_side_by_side(

@@ -69,7 +69,7 @@ EVIDENCE_ROOT = Path(
 RUNTIME_RELATIVE = Path("scripts/canary/upstream_sync_rail_successor_rebind.py")
 FOUNDATION_V4_WRAPPER = Path("/usr/libexec/muncho-release-foundation-exec-v4")
 FOUNDATION_V4_WRAPPER_SHA256 = (
-    "ec692b7f7edef34c86f329de51fedc8487ec6999853586fefbe9fd68d5c1d658"
+    "69a93dba1b6177ef015fb61aa8b65fef5b8ca9173f7a76848867236ba17c746b"
 )
 PREEXEC_VERIFIER_SHA256 = (
     "4cb6d6924a86393776a723597a5110c19fbf6d71f7f5bd37550b29dc407030aa"
