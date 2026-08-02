@@ -1,6 +1,6 @@
 ---
 name: bitwarden-secrets
-description: Authoritative Bitwarden Secrets Manager (bws) protocol for Hermes — encrypted-only cache, no plaintext at rest, masked output, child-process env hygiene.
+description: "Operate Hermes BWS integration: encrypted-only cache."
 version: 1.0.0
 author: Axl Ibiza
 license: MIT
@@ -14,6 +14,8 @@ metadata:
 # Bitwarden Secrets Manager — Hermes Secrets-Handling Protocol
 
 The authoritative protocol for operating Bitwarden Secrets Manager (`bws`) inside Hermes. It encodes the post-hardening guarantees: **secrets are never persisted as plaintext, never emitted into status lines or logs, and never inherited by child processes**. If you are configuring, rotating, debugging, or auditing the Bitwarden integration, follow this skill.
+
+The guarantees below are the security contract implemented by the secrets-exfiltration hardening series (`#77008`, `#77012`, `#77020`, `#77027`, `#77031`, `#77039`). Until that series lands on `main`, current main still reads and writes the plaintext `bws_cache.json` when encryption is disabled — treat the invariants as the contract the series implements, and the rotation instruction below as mandatory for anyone on a pre-hardening version.
 
 ## When to Use
 
@@ -29,7 +31,7 @@ The authoritative protocol for operating Bitwarden Secrets Manager (`bws`) insid
 3. **No secret values in output.** Secret-source error, remediation-hint, warning, and conflict lines are masked before reaching stderr. `RedactingFormatter` masks opaque credential values in all log output (shape-based regex + exact-value pass). If you see a raw secret value in any status line or log, that is a regression — stop and fix, do not route around.
 4. **No credentials in child environments.** `BWS_ACCESS_TOKEN` (under its exact configured name) and every `*_PASSWORD` are stripped from spawned children on every surface: terminal (`build_subprocess_env`) and non-terminal (browser worker, ACP executor, computer-use driver, TUI/Node host). The only child that receives the token is the `bws` CLI itself, explicitly, never by inheritance.
 5. **Fail-closed read scope.** Credential-shaped environment reads route through `agent.secret_scope.get_secret()`. The credential-read audit (#77031) documents every read path; any new env read of credential-shaped names must go through the gate.
-6. **The gate is tested.** The end-to-end no-exfiltration test (#77039) pins invariant 3+4: a loaded secret's name and value never surface in stdout, stderr, or formatted output. Run it as part of any change to this integration.
+6. **The gate is tested.** The end-to-end no-exfiltration test, added with the hardening series (#77039), pins invariants 3+4: a loaded secret's name and value never surface in stdout, stderr, or formatted output. Run it as part of any change to this integration once it lands.
 
 ## Quick Reference
 
@@ -62,6 +64,7 @@ The authoritative protocol for operating Bitwarden Secrets Manager (`bws`) insid
 The agent's role is to **instruct and verify**:
 
 - If the user used this integration on **any pre-hardening Hermes version**, tell them the first action is theirs: revoke the old machine-account access token in the web app, create a new one, and run `hermes secrets bitwarden token` in their terminal, pasting the new value when prompted. Do not proceed with anything that depends on fresh secrets until they confirm this is done. This is the one token that was persisted everywhere — plaintext cache file, status lines, logs, and every spawned child's environment — so rotation comes first, before any other mitigation.
+- **Clipboard discipline during rotation.** The new token should go straight from creation to the terminal: create it in the Bitwarden web app, copy it to the clipboard, paste it into the `hermes secrets bitwarden token` prompt, and **do not save it anywhere else in between** — no notes app, no file, no chat, no screenshot. The clipboard is a temporary staging area, not storage. If the paste fails, re-copy from the web app rather than retyping the token.
 - After the user reports rotating, verify with `hermes secrets bitwarden status` (token present and valid) — but the token VALUE never enters the conversation. If the user pastes a token value into chat, do not repeat it, log it, or store it; tell them to run `hermes secrets bitwarden token` themselves and delete the message.
 
 `hermes secrets bitwarden token` probes the new token against Bitwarden **before** writing anything — a rejected token leaves the current `.env` untouched. On success it stores the token, clears fetch caches, and warns if the configured project is invisible to the new machine account.
@@ -89,4 +92,5 @@ The agent's role is to **instruct and verify**:
 - [ ] Only `bws_cache.enc.json` (or nothing) exists under `~/.hermes/cache/`; no plaintext `bws_cache.json`.
 - [ ] A spawned child process (terminal and non-terminal surfaces) sees neither `BWS_ACCESS_TOKEN` nor any `*_PASSWORD` unless explicitly passthrough-registered.
 - [ ] A simulated fetch error/warning emits masked output (`***`) — no raw secret values on stderr.
-- [ ] `tests/test_secrets_exfiltration.py` (no-exfiltration gate) and `tests/test_bitwarden_secrets.py` pass.
+- [ ] `tests/test_bitwarden_secrets.py` passes.
+- [ ] When the no-exfiltration gate lands with the hardening series (#77039: `tests/test_secrets_exfiltration.py`), run it as part of any change to this integration.

@@ -17,11 +17,15 @@ If you have used this integration on **any Hermes version before the secrets-exf
 
 5. **Paste the new token value** when prompted (input is hidden).
 
+Clipboard discipline: the new token should go **straight from creation to the terminal** — create it in the web app, copy to clipboard, paste into the `hermes secrets bitwarden token` prompt, and **do not save it anywhere else in between** (no notes app, no file, no chat, no screenshot). If the paste fails, re-copy from the web app rather than retyping the token.
+
 The command probes Bitwarden with the new token **before** writing anything — a rejected token leaves your current `.env` untouched — and on success clears the fetch caches. After rotating, also rotate any high-value secrets (provider API keys, database passwords) that were exposed to processes spawned while the old token was live, since those values could have been read by any child process during that window.
 
 ## The security posture is the feature
 
 Hermes does not merely *support* Bitwarden Secrets Manager — it implements the integration so that **the plaintext-secrets vulnerability class does not exist in the default configuration**. Four disclosure channels are closed by design, and a hermetic end-to-end test pins them shut:
+
+> **Status note.** This contract is implemented by the secrets-exfiltration hardening series (`#77008`, `#77012`, `#77020`, `#77027`, `#77031`, `#77039`). Until that series lands on `main`, current main still reads and writes the plaintext `bws_cache.json` when `encrypted_cache.enabled: false` and defaults that setting to `false`. The sections below describe the contract the series implements — and the rotation instruction above is mandatory *today* for anyone on a pre-hardening version, because that plaintext file and the child-process exposure already exist on main.
 
 1. **No plaintext at rest — encrypted-only by default.** Every fetched secret is persisted only as AES-GCM ciphertext in `~/.hermes/cache/bws_cache.enc.json`, keyed off the bootstrap token. There is no plaintext write branch in the codebase. Setting `encrypted_cache.enabled: false` means **memory-only**: disk persistence is disabled entirely, and plaintext is never consulted or written as an alternative.
 2. **Legacy plaintext is destroyed, not tolerated.** A pre-hardening `bws_cache.json` (written by older Hermes versions) is re-encrypted and removed on first read — including in memory-only mode. After any run, a plaintext cache file cannot survive.
