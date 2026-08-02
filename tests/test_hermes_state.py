@@ -68,6 +68,24 @@ class _NoTrigramConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramCursor)
 
 
+class _TrigramDropFailureCursor(sqlite3.Cursor):
+    """Simulate an older SQLite build rejecting optional trigram DDL."""
+
+    def execute(self, sql, parameters=()):
+        probe = sql.strip()
+        if (
+            probe.startswith("DROP TRIGGER IF EXISTS messages_fts_trigram")
+            or probe == "DROP TABLE IF EXISTS messages_fts_trigram"
+        ):
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
+
+class _TrigramDropFailureConnection(sqlite3.Connection):
+    def cursor(self, factory=None):
+        return super().cursor(factory or _TrigramDropFailureCursor)
+
+
 @pytest.fixture()
 def db(tmp_path):
     """Create a SessionDB with a temp database file."""
@@ -1841,6 +1859,30 @@ class TestOptimizeFts:
             assert reopened._trigram_available is False
             assert len(reopened.search_messages("needle")) == 2
             assert len(reopened.search_messages("大别山")) == 1
+        finally:
+            reopened.close()
+
+    def test_trigram_drop_failure_does_not_hide_messages(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "trigram-drop-failure.db"
+        first = SessionDB(db_path=db_path)
+        try:
+            first.create_session(session_id="s1", source="cli")
+            first.append_message(session_id="s1", role="user", content="preserve me")
+        finally:
+            first.close()
+
+        monkeypatch.setenv("HERMES_DISABLE_FTS_TRIGRAM", "1")
+        real_connect = sqlite3.connect
+
+        def connect_with_trigram_drop_failure(*args, **kwargs):
+            kwargs["factory"] = _TrigramDropFailureConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_with_trigram_drop_failure)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.get_session("s1") is not None
+            assert reopened.search_messages("preserve")
         finally:
             reopened.close()
 

@@ -66,9 +66,16 @@ class SessionSchemaMixin:
 
     @staticmethod
     def _drop_trigram_fts(cursor: sqlite3.Cursor) -> None:
+        """Drop optional trigram search data without risking canonical rows."""
         for trigger in _TRIGRAM_FTS_TRIGGERS:
-            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.OperationalError:
+            pass
 
     @staticmethod
     def _trigram_message_cap() -> Optional[int]:
@@ -96,10 +103,16 @@ class SessionSchemaMixin:
         cap = self._trigram_message_cap()
         if cap is None:
             return True
-        count = int(cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+        try:
+            row = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()
+            count = int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+        except sqlite3.Error:
+            return True
         if count > cap:
             logger.warning(
-                "Disabling trigram FTS for %s: %d messages exceeds cap %d",
+                "Disabling trigram FTS for %s: %d messages exceeds cap %d; "
+                "CJK search will fall back to LIKE. Set "
+                "HERMES_FTS_TRIGRAM_MAX_MESSAGES=0 to keep trigram unlimited.",
                 self.db_path,
                 count,
                 cap,
