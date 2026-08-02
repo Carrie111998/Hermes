@@ -3177,6 +3177,14 @@ def openrouter_zdr_enabled() -> bool:
                 "could not be parsed"
             )
 
+        from hermes_cli import managed_scope
+
+        if managed_scope.managed_config_load_degraded():
+            raise RuntimeError(
+                "OpenRouter ZDR state is unknown because the managed config "
+                "could not be parsed"
+            )
+
     openrouter = config.get("openrouter")
     if not isinstance(openrouter, dict):
         raise ValueError("effective openrouter config must be a mapping")

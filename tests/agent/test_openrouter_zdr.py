@@ -75,6 +75,96 @@ def test_parse_failure_state_clears_after_config_is_fixed(monkeypatch, tmp_path)
     assert fixed_kwargs["extra_body"]["provider"]["zdr"] is False
 
 
+def _write_managed_config(monkeypatch, tmp_path, *, managed_text):
+    config_mod = _write_raw_config(
+        monkeypatch, tmp_path, "openrouter:\n  zdr: false\n"
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(managed_text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    return config_mod, managed_scope, managed_dir
+
+
+def test_invalid_managed_yaml_enforces_zdr_fail_closed(
+    monkeypatch, tmp_path, caplog
+):
+    _write_managed_config(
+        monkeypatch, tmp_path, managed_text="openrouter: ["
+    )
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "managed config could not be parsed" in caplog.text
+
+
+def test_malformed_managed_zdr_value_enforces_zdr_fail_closed(
+    monkeypatch, tmp_path, caplog
+):
+    _write_managed_config(
+        monkeypatch,
+        tmp_path,
+        managed_text='openrouter:\n  zdr: "true"\n',
+    )
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "effective openrouter.zdr must be a boolean" in caplog.text
+
+
+def test_managed_failure_state_clears_after_repair_or_removal(
+    monkeypatch, tmp_path
+):
+    config_mod, managed_scope, managed_dir = _write_managed_config(
+        monkeypatch, tmp_path, managed_text="openrouter: ["
+    )
+    failed_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        failed_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert failed_kwargs["extra_body"]["provider"]["zdr"] is True
+
+    (managed_dir / "config.yaml").write_text(
+        "openrouter:\n  zdr: false\n", encoding="utf-8"
+    )
+    repaired_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        repaired_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert repaired_kwargs["extra_body"]["provider"]["zdr"] is False
+    assert managed_scope.managed_config_load_degraded() is False
+
+    (managed_dir / "config.yaml").unlink()
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    removed_kwargs = {"extra_body": {"provider": {"zdr": False}}}
+    enforce_openrouter_zdr(
+        removed_kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert removed_kwargs["extra_body"]["provider"]["zdr"] is False
+    assert managed_scope.managed_config_load_degraded() is False
+
+
 def test_quoted_zdr_value_enforces_zdr_fail_closed(monkeypatch, tmp_path, caplog):
     _write_raw_config(monkeypatch, tmp_path, 'openrouter:\n  zdr: "true"\n')
     kwargs = {"extra_body": {"provider": {"zdr": False}}}
