@@ -123,6 +123,13 @@ def _load_policy_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     if not isinstance(website_blocklist, dict):
         raise WebsitePolicyError("security.website_blocklist must be a mapping")
 
+    unknown_keys = set(website_blocklist) - set(_DEFAULT_WEBSITE_BLOCKLIST)
+    if unknown_keys:
+        logger.warning(
+            "Unknown security.website_blocklist keys ignored: %s",
+            ", ".join(sorted(map(str, unknown_keys))),
+        )
+
     policy = dict(_DEFAULT_WEBSITE_BLOCKLIST)
     policy.update(website_blocklist)
     return policy

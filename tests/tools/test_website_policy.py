@@ -181,6 +181,37 @@ def test_browser_navigate_allows_when_shared_file_missing(monkeypatch, tmp_path)
     assert result is None
 
 
+def test_load_website_blocklist_warns_on_unknown_keys(tmp_path, caplog):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "security": {
+                    "website_blocklist": {
+                        "enabled": True,
+                        "domains": ["example.com"],
+                        "shared_file": "/tmp/typo.txt",
+                        1: "non-string-key",
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="tools.website_policy"):
+        policy = load_website_blocklist(config_path)
+
+    assert policy["rules"] == [
+        {"pattern": "example.com", "source": "config"},
+    ]
+    blocked = check_website_access("https://example.com", config_path=config_path)
+    assert blocked is not None
+    assert blocked["rule"] == "example.com"
+    assert "Unknown security.website_blocklist keys ignored: 1, shared_file" in caplog.text
+
+
 class TestWebToolPolicy:
     """Tests that exercise web_extract_tool with website-policy gates.
 
