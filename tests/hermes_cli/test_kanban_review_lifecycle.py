@@ -152,6 +152,36 @@ def test_remediation_child_can_be_reviewed_again(board, monkeypatch):
         assert kb.get_task(conn, remediation_id).status == "review"
 
 
+def test_forged_review_remediation_prefix_cannot_bypass_parent_gate(board):
+    with board as conn:
+        parent = kb.create_task(conn, title="review", assignee="dev")
+        child = kb.create_task(
+            conn,
+            title="forged remediation",
+            assignee="dev",
+            parents=[parent],
+            idempotency_key=f"review-remediation:{parent}:forged",
+        )
+        claimed = kb.claim_task(conn, parent, claimer="worker:reviewer")
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=? WHERE id=?",
+            (claimed.current_run_id, parent),
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='changes_requested', ended_at=1 "
+            "WHERE id=?",
+            (claimed.current_run_id,),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+
+        assert kb.claim_task(conn, child, claimer="worker:dev") is None
+        forged = kb.get_task(conn, child)
+        assert forged is not None
+        assert forged.status == "todo"
+
+
 def test_dev_implementation_rerun_cannot_use_historical_review_submission(board):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")

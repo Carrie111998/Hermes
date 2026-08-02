@@ -4437,30 +4437,50 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. Review remediation children are the
-        # deliberate exception: their parent ended with ``changes_requested``
-        # and the child is the new implementation cycle.
-        child_row = conn.execute(
-            "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        is_review_remediation = bool(
-            child_row and str(child_row["idempotency_key"] or "").startswith("review-remediation:")
-        )
-        unsuccessful_outcomes = _UNSUCCESSFUL_PARENT_OUTCOMES - (
-            {"changes_requested"} if is_review_remediation else set()
-        )
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        # parent is not yet 'done'. A changes-requested review is the one
+        # deliberate exception, but it must be authorized by the durable
+        # review event for this exact child. Do not trust a caller-controlled
+        # idempotency-key prefix: otherwise a forged child can bypass a
+        # failed parent's dependency gate.
+        parent_rows = conn.execute(
+            "SELECT p.id, p.status, p.current_run_id, r.id AS run_id, r.outcome "
+            "FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
             "LEFT JOIN task_runs r ON r.id = COALESCE(p.current_run_id, "
             "(SELECT latest.id FROM task_runs latest WHERE latest.task_id = p.id "
             "ORDER BY latest.id DESC LIMIT 1)) "
-            "WHERE l.child_id = ? "
-            "AND (p.status NOT IN ('done', 'archived') "
-            "OR r.outcome IN (" + ",".join("?" * len(unsuccessful_outcomes)) + ")) "
-            "LIMIT 1",
-            (task_id, *unsuccessful_outcomes),
-        ).fetchone()
+            "WHERE l.child_id = ?",
+            (task_id,),
+        ).fetchall()
+        undone = None
+        for parent in parent_rows:
+            if parent["status"] not in ("done", "archived"):
+                undone = parent
+                break
+            outcome = parent["outcome"]
+            if outcome not in _UNSUCCESSFUL_PARENT_OUTCOMES:
+                continue
+            authorized = False
+            if outcome == "changes_requested" and parent["run_id"]:
+                events = conn.execute(
+                    "SELECT e.payload FROM task_events e "
+                    "JOIN task_runs r ON r.id = e.run_id "
+                    "WHERE e.task_id = ? AND e.run_id = ? "
+                    "AND e.kind = 'review_changes_requested' "
+                    "AND r.outcome = 'changes_requested'",
+                    (parent["id"], parent["run_id"]),
+                ).fetchall()
+                for event in events:
+                    try:
+                        payload = json.loads(event["payload"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    if payload.get("remediation_task_id") == task_id:
+                        authorized = True
+                        break
+            if not authorized:
+                undone = parent
+                break
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "

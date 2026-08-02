@@ -622,12 +622,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_submit_review.add_argument("task_id")
     p_submit_review.add_argument(
-        "reviewer_or_summary", nargs="?",
-        help="Reviewer profile (legacy form) or first summary word",
+        "summary", nargs="+", help="Review handoff summary",
     )
-    p_submit_review.add_argument("summary", nargs="*", help="Review handoff summary")
     p_submit_review.add_argument(
-        "--reviewer", default=None, help="Reviewer profile (default: orion)"
+        "--reviewer", default="orion", help="Reviewer profile (default: orion)"
     )
     p_submit_review.add_argument("--metadata", default=None, help="JSON evidence object")
 
@@ -2212,17 +2210,8 @@ def _cmd_submit_review(args: argparse.Namespace) -> int:
         metadata = json.loads(args.metadata)
         if not isinstance(metadata, dict):
             raise ValueError("--metadata must be a JSON object")
-    first = args.reviewer_or_summary
-    if args.reviewer is not None:
-        reviewer = args.reviewer
-        summary_words = ([first] if first else []) + list(args.summary)
-    elif args.summary:
-        # Preserve the original positional form: <task> <reviewer> <summary...>.
-        reviewer = first
-        summary_words = list(args.summary)
-    else:
-        reviewer = "orion"
-        summary_words = [first] if first else []
+    reviewer = args.reviewer
+    summary_words = list(args.summary)
     if not reviewer or not summary_words:
         raise ValueError("reviewer and summary are required")
     with kb.connect_closing() as conn:
