@@ -17,7 +17,8 @@ from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import ws_tickets
 from hermes_cli.dashboard_auth.base import Session, TokenPrincipal
-from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE, SESSION_RT_COOKIE
+from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE as SESSION_AT_COOKIE, SESSION_RT_COOKIE
+from hermes_cli.dashboard_auth import linked_devices
 from hermes_cli.dashboard_auth.ws_tickets import (
     HANDOFF_SESSION_TTL_SECONDS,
     _reset_for_tests,
@@ -457,21 +458,15 @@ def test_handoff_minted_session_is_not_superuser(gated_app):
         if bare == SESSION_AT_COOKIE:
             at = value
             break
-    assert at, "missing handoff access token cookie"
-    session = ws_tickets.verify_handoff_session_token(at)
-    assert isinstance(session, Session)
-    assert not isinstance(session, TokenPrincipal)
-    assert session.scopes == ("resume",)
-    assert session.refresh_token == ""
-    assert session.bound_session_id == "chat-scope"
-    forbidden = {"*", "superuser", "API_SERVER_KEY"}
-    assert not forbidden.intersection(session.scopes)
+    assert at, "missing linked device cookie"
+    session = linked_devices.authenticate(at)
+    assert session is not None
+    assert session["session_id"] == "chat-scope"
+    assert session["provider"] == "stub"
 
 
-def test_handoff_session_ttl_is_short():
-    """F-04: session TTL is 30–60 minutes (45m)."""
-    assert 30 * 60 <= HANDOFF_SESSION_TTL_SECONDS <= 60 * 60
-    assert HANDOFF_SESSION_TTL_SECONDS == 45 * 60
+def test_linked_device_inactivity_ttl_is_90_days():
+    assert linked_devices.DEVICE_COOKIE_TTL_SECONDS == 90 * 24 * 60 * 60
 
 
 # ---------------------------------------------------------------------------

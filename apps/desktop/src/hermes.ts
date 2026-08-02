@@ -20,6 +20,7 @@ import type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DashboardHandoffTicketResponse,
+  LinkedDevicesResponse,
   DashboardRemoteAccessResponse,
   DebugShareResponse,
   ElevenLabsVoicesResponse,
@@ -695,6 +696,14 @@ export function getDashboardHandoffTicket(
     method: 'POST',
     path: '/api/auth/handoff-ticket'
   })
+}
+
+export function getLinkedDevices(): Promise<LinkedDevicesResponse> {
+  return window.hermesDesktop.api<LinkedDevicesResponse>({ path: '/api/auth/linked-devices' })
+}
+
+export function revokeLinkedDevice(id: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({ method: 'DELETE', path: `/api/auth/linked-devices/${encodeURIComponent(id)}` })
 }
 
 export function getLogs(params: {

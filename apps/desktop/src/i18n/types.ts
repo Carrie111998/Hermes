@@ -626,6 +626,16 @@ export interface Translations {
       sshErrTimeout: string
       sshErrUpdateRequired: string
       sshErrUnknown: string
+      linkedDevicesTitle: string
+      linkedDevicesLoading: string
+      linkedDevicesError: string
+      linkedDevicesEmpty: string
+      linkedDevicesEmptyDesc: string
+      linkedDevicesDates: (linked: string, used: string) => string
+      linkedDevicesRevoke: string
+      linkedDevicesRevoking: string
+      linkedDevicesRevoked: string
+      linkedDevicesRevokeFailed: string
     }
     keys: {
       loading: string

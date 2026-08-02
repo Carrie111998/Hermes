@@ -406,12 +406,14 @@ async def gated_auth_middleware(
                 denied = _scope_denial_response(request, session)
                 if denied is not None:
                     return denied
-                response = await call_next(request)
-                set_linked_device_cookie(response, secret=linked_secret, use_https=detect_https(request), prefix=prefix_from_request(request))
                 # Root and unbound chat land at the server-bound target.
                 if request.method == "GET" and request.url.path in ("/", "/chat") and not request.query_params.get("resume"):
                     from hermes_cli.dashboard_auth.scopes import handoff_redirect_location
-                    return RedirectResponse(handoff_redirect_location({"session_id": record["session_id"], "profile": record["profile"]}, prefix=prefix_from_request(request)), status_code=302, headers=dict(response.headers))
+                    response = RedirectResponse(handoff_redirect_location({"session_id": record["session_id"], "profile": record["profile"]}, prefix=prefix_from_request(request)), status_code=302)
+                    set_linked_device_cookie(response, secret=linked_secret, use_https=detect_https(request), prefix=prefix_from_request(request))
+                    return response
+                response = await call_next(request)
+                set_linked_device_cookie(response, secret=linked_secret, use_https=detect_https(request), prefix=prefix_from_request(request))
                 return response
             response = _unauth_response(request, reason="invalid_or_expired_session")
             clear_linked_device_cookie(response, prefix=prefix_from_request(request))
@@ -540,11 +542,8 @@ async def gated_auth_middleware(
             # token on the next refresh and (outside Portal's grace) revoke
             # the whole session. Bind cookie Secure/Path to the request shape.
             from hermes_cli.dashboard_auth.cookies import (
-                detect_https,
                 set_session_cookies,
             )
-            from hermes_cli.dashboard_auth.prefix import prefix_from_request
-
             set_session_cookies(
                 response,
                 access_token=new_session.access_token,
@@ -575,7 +574,6 @@ async def gated_auth_middleware(
         # prefix so the deletion's Path matches the set-Path (otherwise
         # the browser ignores it).
         from hermes_cli.dashboard_auth.cookies import clear_session_cookies
-        from hermes_cli.dashboard_auth.prefix import prefix_from_request
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
@@ -585,9 +583,6 @@ async def gated_auth_middleware(
         return scope_block
     response = await call_next(request)
     if not provider_hint and session.provider:
-        from hermes_cli.dashboard_auth.cookies import detect_https
-        from hermes_cli.dashboard_auth.prefix import prefix_from_request
-
         set_session_provider_cookie(
             response,
             provider=session.provider,

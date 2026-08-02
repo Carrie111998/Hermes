@@ -1130,6 +1130,15 @@ export interface DashboardHandoffTicketResponse {
   profile: string
 }
 
+export interface LinkedDevice {
+  id: string
+  label: string
+  created_at: number
+  last_seen_at: number
+}
+
+export interface LinkedDevicesResponse { devices: LinkedDevice[] }
+
 export interface ActionResponse {
   name: string
   ok: boolean

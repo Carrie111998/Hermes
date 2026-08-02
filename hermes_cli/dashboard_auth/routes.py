@@ -40,11 +40,13 @@ from hermes_cli.dashboard_auth.base import (
 )
 from hermes_cli.dashboard_auth.cookies import (
     clear_pkce_cookie,
+    clear_linked_device_cookie,
     clear_session_cookies,
     clear_sso_attempt_cookie,
     detect_https,
     read_pkce_cookie,
     read_session_cookies,
+    read_linked_device_cookie,
     set_pkce_cookie,
     set_session_cookies,
 )
@@ -767,7 +769,13 @@ async def auth_logout(request: Request):
 
     prefix = _prefix(request)
     resp = RedirectResponse(url=f"{prefix}/login", status_code=302)
+    # A resume-scoped session was derived from a verified device credential.
+    # Revoke only that verified record, never an arbitrary stale cookie.
+    if getattr(sess, "device_id", ""):
+        from hermes_cli.dashboard_auth.linked_devices import revoke
+        revoke(sess.device_id)
     clear_session_cookies(resp, prefix=prefix)
+    clear_linked_device_cookie(resp, prefix=prefix)
     clear_pkce_cookie(resp, prefix=prefix)
     return resp
 
@@ -1048,6 +1056,22 @@ class _HandoffTicketBody(BaseModel):
     profile: str = ""
 
 
+def _full_dashboard_session_or_local_desk(request: Request):
+    """Return the authenticated full session, or loopback Desktop's local trust."""
+    import time as _time
+    from hermes_cli.dashboard_auth.base import Session as _Session
+    from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
+    sess = getattr(request.state, "session", None)
+    if sess is None and not getattr(request.app.state, "auth_required", False):
+        return _Session(
+            user_id="local-desk", email="", display_name="Local desk", org_id="",
+            provider="loopback", expires_at=int(_time.time()) + 3600,
+            access_token="", refresh_token="",
+        )
+    require_full_dashboard_session(sess)
+    return sess
+
+
 @router.post("/api/auth/handoff-ticket", name="auth_handoff_ticket")
 async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
     """Mint a single-use phone-handoff ticket for a chat session.
@@ -1060,33 +1084,10 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
     consume, mints a resume-scoped browser session cookie — never
     ``API_SERVER_KEY`` / superuser / ``*`` scope.
     """
-    import time as _time
-
-    from hermes_cli.dashboard_auth.base import Session as _Session
     from hermes_cli.dashboard_auth.scopes import (
-        require_full_dashboard_session,
         validate_handoff_target,
     )
-
-    sess = getattr(request.state, "session", None)
-    if sess is None and not getattr(request.app.state, "auth_required", False):
-        # Local desk trust boundary (loopback + session token already checked).
-        sess = _Session(
-            user_id="local-desk",
-            email="",
-            display_name="Local desk",
-            org_id="",
-            provider="loopback",
-            expires_at=int(_time.time()) + 3600,
-            access_token="",
-            refresh_token="",
-            scopes=(),
-        )
-    if sess is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # F-01: resume sessions cannot mint new handoffs (full desk only).
-    require_full_dashboard_session(sess)
+    sess = _full_dashboard_session_or_local_desk(request)
 
     session_id = (body.session_id or "").strip()
     if not session_id:
@@ -1139,17 +1140,15 @@ async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
 @router.get("/api/auth/linked-devices", name="auth_linked_devices")
 async def api_linked_devices(request: Request):
     """List local linked browsers. Only a full dashboard session may manage them."""
-    from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
     from hermes_cli.dashboard_auth.linked_devices import list_devices
-    require_full_dashboard_session(getattr(request.state, "session", None))
+    _full_dashboard_session_or_local_desk(request)
     return {"devices": list_devices()}
 
 
 @router.delete("/api/auth/linked-devices/{device_id}", name="auth_linked_devices_revoke")
 async def api_revoke_linked_device(request: Request, device_id: str):
-    from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
     from hermes_cli.dashboard_auth.linked_devices import revoke
-    require_full_dashboard_session(getattr(request.state, "session", None))
+    _full_dashboard_session_or_local_desk(request)
     if not revoke(device_id):
         raise HTTPException(status_code=404, detail="Linked device not found")
     return {"ok": True}

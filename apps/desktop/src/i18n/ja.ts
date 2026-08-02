@@ -806,7 +806,8 @@ export const ja = defineLocale({
         'サポートされていないリモートプラットフォームです。Hermes Desktop の SSH モードは Linux、macOS、Windows のリモートホストに対応しています。',
       sshErrTimeout: 'SSH 接続がタイムアウトしました。ホストが到達不能、またはスリープ中の可能性があります。',
       sshErrUpdateRequired: 'Desktop SSH で接続する前に、リモートホストの Hermes を更新してください。',
-      sshErrUnknown: 'SSH 接続に失敗しました。'
+      sshErrUnknown: 'SSH 接続に失敗しました。',
+      linkedDevicesTitle: 'リンク済みデバイス', linkedDevicesLoading: 'リンク済みデバイスを読み込んでいます…', linkedDevicesError: 'リンク済みデバイスを読み込めませんでした。', linkedDevicesEmpty: 'リンク済みデバイスはありません', linkedDevicesEmptyDesc: 'チャットからスマートフォンをリンクすると、ここに表示されます。', linkedDevicesDates: (linked, used) => `リンク: ${linked} · 最終使用: ${used}`, linkedDevicesRevoke: '取り消す', linkedDevicesRevoking: '取り消し中…', linkedDevicesRevoked: 'リンク済みデバイスを取り消しました。', linkedDevicesRevokeFailed: 'リンク済みデバイスを取り消せませんでした。'
     },
     keys: {
       loading: 'API キーと認証情報を読み込み中...',
@@ -1762,8 +1763,8 @@ export const ja = defineLocale({
       rename: '名前を変更',
       archive: 'アーカイブ',
       newWindow: '新しいウィンドウ',
-      continueOnPhone: 'スマートフォンで続ける',
-      continueOnPhoneTitle: 'スマートフォンで続ける',
+      continueOnPhone: 'スマートフォンをリンク',
+      continueOnPhoneTitle: 'スマートフォンをリンク',
       continueOnPhoneDesc: 'スマートフォンで QR コードを読み取り、サインインしてこのセッションを続けます。',
       continueOnPhonePreparing: '安全なリモートアクセスを確認しています…',
       continueOnPhoneQrAlt: 'この Hermes セッションの QR コード',

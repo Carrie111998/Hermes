@@ -22,6 +22,7 @@ def _path() -> Path:
     if not path.exists():
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
+    os.chmod(path, 0o600)
     return path
 
 
@@ -45,7 +46,8 @@ def device_label(user_agent: str) -> str:
     ua = (user_agent or "").lower()
     if "iphone" in ua: return "iPhone"
     if "ipad" in ua: return "iPad"
-    if "android" in ua: return "Android tablet" if "tablet" in ua else "Android phone"
+    if "android" in ua:
+        return "Android phone" if "mobile" in ua else "Android tablet"
     return "Browser"
 
 
@@ -78,9 +80,17 @@ def authenticate(secret: str) -> dict[str, Any] | None:
 
 
 def list_devices() -> list[dict[str, Any]]:
+    cutoff = int(time.time()) - DEVICE_COOKIE_TTL_SECONDS
     with _db() as db:
-        rows = db.execute("SELECT id,label,created_at,last_seen_at FROM linked_devices WHERE revoked_at IS NULL ORDER BY last_seen_at DESC").fetchall()
+        rows = db.execute("SELECT id,label,created_at,last_seen_at FROM linked_devices WHERE revoked_at IS NULL AND last_seen_at >= ? ORDER BY last_seen_at DESC", (cutoff,)).fetchall()
     return [dict(zip(("id", "label", "created_at", "last_seen_at"), r)) for r in rows]
+
+
+def is_active(device_id: str) -> bool:
+    """True only while the device is unrevoked and within its inactivity TTL."""
+    with _db() as db:
+        row = db.execute("SELECT last_seen_at, revoked_at FROM linked_devices WHERE id=?", (device_id,)).fetchone()
+    return bool(row and row[1] is None and int(time.time()) - row[0] <= DEVICE_COOKIE_TTL_SECONDS)
 
 
 def revoke(device_id: str) -> bool:

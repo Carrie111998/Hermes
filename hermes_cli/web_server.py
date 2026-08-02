@@ -14452,8 +14452,8 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
             device_id = ticket_info.get("device_id") if isinstance(ticket_info, dict) else ""
             if device_id:
-                from hermes_cli.dashboard_auth.linked_devices import list_devices
-                if not any(item["id"] == device_id for item in list_devices()):
+                from hermes_cli.dashboard_auth.linked_devices import is_active
+                if not is_active(device_id):
                     await ws.close(code=4401, reason="linked device revoked")
                     break
             # Resize escape is consumed locally, never written to the PTY.
@@ -15852,8 +15852,8 @@ async def pty_ws(ws: WebSocket) -> None:
             ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
             device_id = ticket_info.get("device_id") if isinstance(ticket_info, dict) else ""
             if device_id:
-                from hermes_cli.dashboard_auth.linked_devices import list_devices
-                if not any(item["id"] == device_id for item in list_devices()):
+                from hermes_cli.dashboard_auth.linked_devices import is_active
+                if not is_active(device_id):
                     await ws.close(code=4401, reason="linked device revoked")
                     break
 

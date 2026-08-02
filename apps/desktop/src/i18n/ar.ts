@@ -721,7 +721,8 @@ export const ar = defineLocale({
       signOutFailed: 'فشل تسجيل الخروج',
       testFailed: 'فشل اختبار البوابة البعيدة',
       applyFailed: 'تعذر تطبيق إعدادات البوابة',
-      saveFailed: 'تعذر حفظ إعدادات البوابة'
+      saveFailed: 'تعذر حفظ إعدادات البوابة',
+      linkedDevicesTitle: 'الأجهزة المرتبطة', linkedDevicesLoading: 'جار تحميل الأجهزة المرتبطة…', linkedDevicesError: 'تعذر تحميل الأجهزة المرتبطة.', linkedDevicesEmpty: 'لا توجد أجهزة مرتبطة', linkedDevicesEmptyDesc: 'اربط هاتفاً من محادثة ليظهر هنا.', linkedDevicesDates: (linked, used) => `مرتبط ${linked} · آخر استخدام ${used}`, linkedDevicesRevoke: 'إلغاء الربط', linkedDevicesRevoking: 'جار الإلغاء…', linkedDevicesRevoked: 'تم إلغاء ربط الجهاز.', linkedDevicesRevokeFailed: 'تعذر إلغاء ربط الجهاز.'
     },
     keys: {
       loading: 'جار تحميل مفاتيح API وبيانات الاعتماد...',
@@ -1626,8 +1627,8 @@ export const ar = defineLocale({
       rename: 'إعادة تسمية',
       archive: 'أرشفة',
       newWindow: 'فتح في نافذة جديدة',
-      continueOnPhone: 'المتابعة على الهاتف',
-      continueOnPhoneTitle: 'المتابعة على الهاتف',
+      continueOnPhone: 'ربط الهاتف',
+      continueOnPhoneTitle: 'ربط الهاتف',
       continueOnPhoneDesc: 'امسح الرمز بهاتفك لفتح متابعة آمنة لهذه الجلسة.',
       continueOnPhonePreparing: 'جار التحقق من الوصول الآمن عن بُعد...',
       continueOnPhoneQrAlt: 'رمز QR لجلسة Hermes هذه',
