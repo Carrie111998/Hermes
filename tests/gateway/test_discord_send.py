@@ -321,10 +321,16 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
 
     assert result.success is True
     assert result.message_id == "1234"
-    assert channel.fetch_message.await_count == 1
+    assert channel.fetch_message.await_count == 0
     assert channel.send.await_count == 2
-    ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
-    assert send_calls[0]["reference"] is reference_obj
+    ref_msg.to_reference.assert_not_called()
+    _discord_mod.MessageReference.assert_any_call(
+        message_id=99,
+        channel_id=None,
+        guild_id=1,
+        fail_if_not_exists=False,
+    )
+    assert send_calls[0]["reference"] is _discord_mod.MessageReference.return_value
     assert send_calls[1]["reference"] is None
 
 
@@ -359,10 +365,15 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
 
     assert result.success is True
     assert result.message_id == "1001"
-    assert channel.fetch_message.await_count == 1
+    # ids-only reference: the fetch is gone entirely — the retry happens
+    # on the send-side 10008, not a fetch failure
+    assert channel.fetch_message.await_count == 0
     assert channel.send.await_count == 3
-    ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
-    assert send_calls[0]["reference"] is reference_obj
+    # the reference is constructed from ids, not fetched + to_reference()
+    _discord_mod.MessageReference.assert_any_call(
+        message_id=99, channel_id=None, guild_id=1,
+        fail_if_not_exists=False)
+    assert send_calls[0]["reference"] is _discord_mod.MessageReference.return_value
     assert send_calls[1]["reference"] is None
     assert send_calls[2]["reference"] is None
 
@@ -402,7 +413,9 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert "50013" in (result.error or "")
     # Only the first attempt happens — no reference-retry replay.
     assert channel.send.await_count == 1
-    assert send_calls[0]["reference"] is reference_obj
+    assert channel.fetch_message.await_count == 0
+    ref_msg.to_reference.assert_not_called()
+    assert send_calls[0]["reference"] is _discord_mod.MessageReference.return_value
 
 
 @pytest.mark.asyncio

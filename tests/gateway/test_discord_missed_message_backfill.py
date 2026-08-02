@@ -831,7 +831,7 @@ async def test_send_uses_notify_metadata_as_final_delivery_signal(adapter):
 async def test_final_stream_edit_marks_original_request_complete(adapter):
     channel = FakeChannel(channel_id=123)
     message = SimpleNamespace(edit=AsyncMock())
-    channel.fetch_message = AsyncMock(return_value=message)
+    channel.get_partial_message = MagicMock(return_value=message)
     adapter._client.get_channel = lambda _channel_id: channel
 
     result = await adapter.edit_message(
@@ -843,6 +843,7 @@ async def test_final_stream_edit_marks_original_request_complete(adapter):
     )
 
     assert result.success is True
+    channel.get_partial_message.assert_called_once_with(9009)
     assert adapter._discord_message_is_persistently_complete("102") is True
 
 
