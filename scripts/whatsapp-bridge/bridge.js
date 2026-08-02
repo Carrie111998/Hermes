@@ -34,6 +34,12 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
+  createCachedVersionResolver,
+  createConnectionWatchdog,
+  createReconnectScheduler,
+  reconnectDelayForReason,
+} from './reconnect.js';
+import {
   buildPollPayload,
   buildLocationPayload,
   buildTextSendPayload,
@@ -385,6 +391,22 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+const resolveBaileysVersion = createCachedVersionResolver(
+  fetchLatestBaileysVersion,
+  {
+    timeoutMs: 10_000,
+    onFallback: (error) => {
+      logger.warn({ err: error }, 'Baileys version discovery failed; using packaged default');
+    },
+  },
+);
+const reconnectScheduler = createReconnectScheduler({
+  onError: (error) => {
+    logger.error({ err: error }, 'WhatsApp reconnect failed; exiting for supervisor recovery');
+    process.exit(1);
+  },
+});
+const connectionWatchdog = createConnectionWatchdog();
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -395,10 +417,9 @@ function emitPairEvent(event) {
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveBaileysVersion();
 
-  sock = makeWASocket({
-    version,
+  const socketOptions = {
     auth: state,
     logger,
     printQRInTerminal: false,
@@ -412,11 +433,19 @@ async function startSocket() {
       // This is enough for Baileys to complete the retry handshake.
       return { conversation: '' };
     },
-  });
+  };
+  if (version) socketOptions.version = version;
+  const currentSock = makeWASocket(socketOptions);
+  sock = currentSock;
+  connectionWatchdog.arm(() => {
+    if (sock !== currentSock || connectionState === 'connected') return;
+    logger.error('WhatsApp socket did not settle within 45s; exiting for supervisor recovery');
+    process.exit(1);
+  }, 45_000);
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  currentSock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
-  sock.ev.on('connection.update', (update) => {
+  currentSock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -430,6 +459,8 @@ async function startSocket() {
     }
 
     if (connection === 'close') {
+      if (sock !== currentSock) return;
+      connectionWatchdog.cancel();
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
@@ -449,14 +480,17 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        reconnectScheduler.schedule(startSocket, reconnectDelayForReason(reason));
       }
     } else if (connection === 'open') {
+      if (sock !== currentSock) return;
+      connectionWatchdog.cancel();
+      reconnectScheduler.cancel();
       connectionState = 'connected';
-      const connectedUser = sock?.user
+      const connectedUser = currentSock?.user
         ? {
-            id: sock.user.id || null,
-            name: sock.user.name || sock.user.verifiedName || null,
+            id: currentSock.user.id || null,
+            name: currentSock.user.name || currentSock.user.verifiedName || null,
           }
         : null;
       emitPairEvent({ event: 'connected', user: connectedUser });
@@ -1145,6 +1179,9 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    startSocket().catch((error) => {
+      logger.error({ err: error }, 'WhatsApp socket startup failed');
+      process.exit(1);
+    });
   });
 }

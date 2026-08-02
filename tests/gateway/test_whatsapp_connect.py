@@ -66,6 +66,8 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    adapter._poll_task = None
+    adapter._shutting_down = False
     return adapter
 
 
@@ -478,3 +480,62 @@ class TestNoCredsPreflight:
         # but the fatal-error code is NOT the "not paired" one.
         assert result is False
         assert adapter._fatal_error_code != "whatsapp_not_paired"
+
+
+class TestDisconnectFromPollTask:
+    @pytest.mark.asyncio
+    async def test_disconnect_does_not_cancel_or_await_current_poll_task(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._session_path = tmp_path
+        adapter._bridge_process = None
+        adapter._http_session = None
+        adapter._release_platform_lock = MagicMock()
+        adapter._mark_disconnected = MagicMock()
+        adapter._close_bridge_log = MagicMock()
+
+        async def invoke_disconnect_from_poll_task():
+            adapter._poll_task = asyncio.current_task()
+            await adapter.disconnect()
+
+        task = asyncio.create_task(invoke_disconnect_from_poll_task())
+        await asyncio.wait_for(task, timeout=1)
+
+        assert adapter._poll_task is None
+        adapter._mark_disconnected.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_poll_fatal_handoff_reaches_runner_reconnect_queue(self, tmp_path):
+        from gateway.config import GatewayConfig, PlatformConfig
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        adapter._session_path = tmp_path
+        adapter._running = True
+        adapter._release_platform_lock = MagicMock()
+        adapter._mark_disconnected = MagicMock()
+        adapter._close_bridge_log = MagicMock()
+        dead_proc = MagicMock()
+        dead_proc.pid = 999_999_999
+        dead_proc.poll.return_value = -15
+        dead_proc.returncode = -15
+        adapter._bridge_process = dead_proc
+
+        config = GatewayConfig(
+            platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")},
+            sessions_dir=tmp_path / "sessions",
+        )
+        runner = GatewayRunner(config)
+        runner.adapters = {Platform.WHATSAPP: adapter}
+        runner.delivery_router.adapters = runner.adapters
+        adapter.set_fatal_error_handler(runner._handle_adapter_fatal_error)
+
+        async def report_fatal_from_poll_task():
+            adapter._poll_task = asyncio.current_task()
+            return await adapter._check_managed_bridge_exit()
+
+        task = asyncio.create_task(report_fatal_from_poll_task())
+        result = await asyncio.gather(task, return_exceptions=True)
+
+        assert result == ["WhatsApp bridge process exited unexpectedly (code -15)."]
+        assert runner.adapters == {}
+        assert Platform.WHATSAPP in runner._failed_platforms

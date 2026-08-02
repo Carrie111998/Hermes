@@ -796,6 +796,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             logger.error("[%s] %s", self.name, message)
             self._set_fatal_error("whatsapp_bridge_exited", message, retryable=True)
             self._close_bridge_log()
+            # The poll task is the owner reporting this fatal error. Runner
+            # teardown calls disconnect() in a child task; if _poll_task still
+            # points at this task, disconnect() cancels its parent while the
+            # parent is awaiting the fatal handler, aborting before the runner
+            # can queue background reconnection.
+            if self._poll_task is asyncio.current_task():
+                self._poll_task = None
             await self._notify_fatal_error()
         return self.fatal_error_message or message
 
