@@ -1561,6 +1561,42 @@ def _host_transition(
             0o400,
             absent,
         ),
+        "dual_upstream_sync_service_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync.service",
+            cutover._sha256_json({"unit": "dual_upstream_sync_service"}),
+            0,
+            0,
+            0o644,
+            absent,
+        ),
+        "dual_upstream_sync_timer_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync.timer",
+            cutover._sha256_json({"unit": "dual_upstream_sync_timer"}),
+            0,
+            0,
+            0o644,
+            absent,
+        ),
+        "dual_upstream_sync_report_service_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync-report.service",
+            cutover._sha256_json(
+                {"unit": "dual_upstream_sync_report_service"}
+            ),
+            0,
+            0,
+            0o644,
+            absent,
+        ),
+        "dual_upstream_sync_report_timer_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync-report.timer",
+            cutover._sha256_json(
+                {"unit": "dual_upstream_sync_report_timer"}
+            ),
+            0,
+            0,
+            0o644,
+            absent,
+        ),
     }
     for domain in sorted(cutover.CREDENTIALS_BY_DOMAIN):
         file_specs[f"operational_edge_unit_{domain}"] = (
