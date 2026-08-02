@@ -3083,9 +3083,68 @@ def _normalize_managed_eol(git_cmd, repo_root):
             return None
         return {p for p in out.stdout.split("\0") if p}
 
+    def _tracked():
+        out = subprocess.run(
+            git_cmd + ["ls-files", "-z"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if out.returncode != 0:
+            return None
+        return {p for p in out.stdout.split("\0") if p}
+
+    def _clean(path=None, *, ignore_cr=False):
+        cmd = probe + ["diff"]
+        if ignore_cr:
+            cmd.append("--ignore-cr-at-eol")
+        cmd.append("--quiet")
+        if path is not None:
+            cmd += ["--", path]
+        out = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if out.returncode == 0:
+            return True
+        if out.returncode == 1:
+            return False
+        return None
+
+    def _clean_ignoring_cr(path=None):
+        return _clean(path, ignore_cr=True)
+
+    def _real_dirty(paths):
+        real_dirty = set()
+        for path in paths:
+            clean = _clean_ignoring_cr(path)
+            if clean is None:
+                return None
+            if not clean:
+                real_dirty.add(path)
+        return real_dirty
+
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
-        if all_dirty is None or real_dirty is None:
+        all_dirty = _dirty()
+        if all_dirty is None:
+            return None
+        plain_clean = _clean()
+        if plain_clean is None:
+            return None
+        if plain_clean:
+            return set()
+        all_clean = _clean_ignoring_cr()
+        if all_clean is None:
+            return None
+        if all_clean:
+            # The index may still cache CRLF checkout stats, so name-only can
+            # under-report pure EOL churn. With no real edits, restoring every
+            # tracked path is the safe way to force LF bytes back to disk.
+            return _tracked()
+        real_dirty = _real_dirty(sorted(all_dirty))
+        if real_dirty is None:
             return None
         return all_dirty - real_dirty
 
@@ -3111,7 +3170,7 @@ def _normalize_managed_eol(git_cmd, repo_root):
                 probe
                 + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
                 cwd=repo_root,
-                input="\0".join(sorted(eol_only)),
+                input="\0".join(sorted(eol_only)) + "\0",
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 check=False,
