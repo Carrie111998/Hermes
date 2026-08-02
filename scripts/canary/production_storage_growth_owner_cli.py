@@ -177,7 +177,7 @@ def _read_frame(operation: str) -> Mapping[str, Any]:
         )
     document = frame["document"]
     expected_fields = {
-        "build-plan": frozenset({"source_preflight"}),
+        "build-plan": frozenset(),
         "install-owner-state": frozenset(),
         "install-guest": frozenset(),
         "preflight": frozenset({"growth_plan"}),
@@ -344,10 +344,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         document = _read_frame(operation)
         if operation == "build-plan":
-            runtime, _artifacts = _runtime_artifacts(release_sha)
+            route, runtime = _build_route(release_sha)
+            source_preflight = route.collect_source_preflight()
             result = owner.build_exact_production_storage_growth_plan(
                 release_sha=release_sha,
-                source_preflight=document["source_preflight"],
+                source_preflight=source_preflight,
                 trusted_runtime=runtime,
                 now_unix=int(time.time()),
             )

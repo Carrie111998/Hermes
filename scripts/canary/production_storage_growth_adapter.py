@@ -217,6 +217,92 @@ class FixedProductionIapGuestClient:
         return self._invoke("grow", {"idempotency_key_sha256": idempotency_key_sha256})
 
 
+def build_exact_observation(
+    *,
+    instance: Mapping[str, Any],
+    disk: Mapping[str, Any],
+    guest_facts: Mapping[str, Any],
+    collected_at_unix: int,
+) -> Mapping[str, Any]:
+    """Build one canonical observation from fixed read-only source facts."""
+
+    if (
+        not isinstance(instance, Mapping)
+        or not isinstance(disk, Mapping)
+        or not isinstance(guest_facts, Mapping)
+        or type(collected_at_unix) is not int
+        or collected_at_unix <= 0
+    ):
+        raise ProductionStorageAdapterError(
+            "production_storage_cloud_identity_invalid"
+        )
+    attachments = instance.get("disks")
+    boot = (
+        [
+            item
+            for item in attachments
+            if isinstance(item, Mapping) and item.get("boot")
+        ]
+        if isinstance(attachments, list)
+        else []
+    )
+    source_image = str(disk.get("sourceImage", ""))
+    if len(boot) != 1:
+        raise ProductionStorageAdapterError(
+            "production_storage_cloud_identity_invalid"
+        )
+    attachment = boot[0]
+    try:
+        return contract.build_observation(
+            collected_at_unix=collected_at_unix,
+            authenticated_account=contract.AUTHENTICATED_ACCOUNT,
+            impersonated_service_account=None,
+            project=contract.PROJECT,
+            zone=contract.ZONE,
+            instance={
+                "name": instance["name"],
+                "id": str(instance["id"]),
+                "status": instance["status"],
+                "zone": str(instance["zone"]).rsplit("/", 1)[-1],
+                "self_link": instance["selfLink"],
+                "boot_disk_count": len(boot),
+            },
+            disk={
+                "name": disk["name"],
+                "id": str(disk["id"]),
+                "type": str(disk["type"]).rsplit("/", 1)[-1],
+                "size_gb": int(disk["sizeGb"]),
+                "zone": str(disk["zone"]).rsplit("/", 1)[-1],
+                "self_link": disk["selfLink"],
+                "users": disk["users"],
+                "status": disk["status"],
+                "source_image_project": source_image.split("/projects/", 1)[
+                    1
+                ].split("/", 1)[0],
+                "source_image_name": source_image.rsplit("/", 1)[-1],
+            },
+            boot_attachment={
+                "boot": attachment["boot"],
+                "auto_delete": attachment["autoDelete"],
+                "device_name": attachment["deviceName"],
+                "mode": attachment["mode"],
+                "type": attachment["type"],
+                "source": attachment["source"],
+            },
+            guest=guest_facts,
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        IndexError,
+        contract.ProductionStorageGrowthError,
+    ):
+        raise ProductionStorageAdapterError(
+            "production_storage_cloud_identity_invalid"
+        ) from None
+
+
 class FixedProductionStorageAdapter:
     """Exact executor transport assembled from the fixed cloud and IAP clients."""
 
@@ -251,71 +337,18 @@ class FixedProductionStorageAdapter:
         instance = self._cloud.get_instance()
         disk = self._cloud.get_disk()
         guest_facts = self._guest.observe()
-        attachments = instance.get("disks")
-        boot = (
-            [
-                item
-                for item in attachments
-                if isinstance(item, Mapping) and item.get("boot")
-            ]
-            if isinstance(attachments, list)
-            else []
-        )
-        source_image = str(disk.get("sourceImage", ""))
-        if len(boot) != 1:
-            raise ProductionStorageAdapterError(
-                "production_storage_cloud_identity_invalid"
-            )
-        attachment = boot[0]
         try:
-            return contract.build_observation(
-                collected_at_unix=int(self._wall_clock()),
-                authenticated_account=contract.AUTHENTICATED_ACCOUNT,
-                impersonated_service_account=None,
-                project=contract.PROJECT,
-                zone=contract.ZONE,
-                instance={
-                    "name": instance["name"],
-                    "id": str(instance["id"]),
-                    "status": instance["status"],
-                    "zone": str(instance["zone"]).rsplit("/", 1)[-1],
-                    "self_link": instance["selfLink"],
-                    "boot_disk_count": len(boot),
-                },
-                disk={
-                    "name": disk["name"],
-                    "id": str(disk["id"]),
-                    "type": str(disk["type"]).rsplit("/", 1)[-1],
-                    "size_gb": int(disk["sizeGb"]),
-                    "zone": str(disk["zone"]).rsplit("/", 1)[-1],
-                    "self_link": disk["selfLink"],
-                    "users": disk["users"],
-                    "status": disk["status"],
-                    "source_image_project": source_image.split("/projects/", 1)[
-                        1
-                    ].split("/", 1)[0],
-                    "source_image_name": source_image.rsplit("/", 1)[-1],
-                },
-                boot_attachment={
-                    "boot": attachment["boot"],
-                    "auto_delete": attachment["autoDelete"],
-                    "device_name": attachment["deviceName"],
-                    "mode": attachment["mode"],
-                    "type": attachment["type"],
-                    "source": attachment["source"],
-                },
-                guest=guest_facts,
-            )
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-            IndexError,
-            contract.ProductionStorageGrowthError,
-        ):
+            collected_at_unix = int(self._wall_clock())
+        except (TypeError, ValueError):
             raise ProductionStorageAdapterError(
                 "production_storage_cloud_identity_invalid"
             ) from None
+        return build_exact_observation(
+            instance=instance,
+            disk=disk,
+            guest_facts=guest_facts,
+            collected_at_unix=collected_at_unix,
+        )
 
     def resize_exact_disk_once(self, *, provider_request_id: str) -> Mapping[str, Any]:
         if provider_request_id != self._plan["provider_request_id"]:
@@ -335,6 +368,7 @@ class FixedProductionStorageAdapter:
 
 
 __all__ = [
+    "build_exact_observation",
     "FixedProductionComputeClient",
     "FixedProductionIapGuestClient",
     "FixedProductionStorageAdapter",

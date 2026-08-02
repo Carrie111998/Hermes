@@ -20255,6 +20255,156 @@ class ProductionStorageGrowthOwnerRoute:
         }
         return {**unsigned, "receipt_sha256": _sha256(_canonical_bytes(unsigned))}
 
+    def collect_source_preflight(self) -> Mapping[str, Any]:
+        """Collect the fixed live 50 GiB source without mutation authority."""
+
+        from scripts.canary import production_storage_growth_adapter as adapter
+        from scripts.canary import production_storage_growth_contract as contract
+        from scripts.canary import production_storage_growth_installer as installer
+
+        read_json = getattr(
+            self._production_transport,
+            "_run_read_only_gcloud_json",
+            None,
+        )
+        authority_snapshot = getattr(
+            self._production_transport,
+            "_authorization_snapshot",
+            None,
+        )
+        if not callable(read_json) or not callable(authority_snapshot):
+            raise OwnerLauncherError(
+                "production_storage_source_preflight_unavailable"
+            )
+        artifacts = self._attest_runtime_artifacts()
+        binding = installer.build_owner_artifact_binding(
+            self._release_sha,
+            artifacts,
+        )
+        try:
+            installer.attest_owner_state_root(
+                self._release_sha,
+                sealed_artifact_binding=binding,
+                state_root=self._state_root,
+                installation_receipt=self._state_root / ".installation.json",
+                expected_uid=self._expected_state_uid,
+                expected_gid=self._expected_state_gid,
+            )
+        except installer.ProductionStorageInstallerError:
+            raise OwnerLauncherError(
+                "production_storage_owner_state_not_installed"
+            ) from None
+        account = self._owner_identity.account_for_read_only_preflight()
+        if account != contract.AUTHENTICATED_ACCOUNT:
+            raise OwnerLauncherError(
+                "production_storage_source_preflight_identity_invalid"
+            )
+        before = authority_snapshot(account)
+        guest_client = self._fixed_guest_client(account=account)
+
+        def read_cloud() -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+            instance_value = read_json((
+                "compute",
+                "instances",
+                "describe",
+                contract.INSTANCE_NAME,
+                f"--project={contract.PROJECT}",
+                f"--zone={contract.ZONE}",
+                f"--account={account}",
+                "--format=json(disks,id,name,selfLink,status,zone)",
+                "--quiet",
+            ))
+            disk_value = read_json((
+                "compute",
+                "disks",
+                "describe",
+                contract.DISK_NAME,
+                f"--project={contract.PROJECT}",
+                f"--zone={contract.ZONE}",
+                f"--account={account}",
+                "--format=json(id,name,selfLink,sizeGb,sourceImage,status,type,users,zone)",
+                "--quiet",
+            ))
+            return instance_value, disk_value
+
+        try:
+            readiness_request = installer.build_guest_install_request(
+                self._release_sha
+            )
+            installer.validate_guest_readiness(
+                guest_client.readiness(),
+                release_sha=self._release_sha,
+                guest_source_sha256=readiness_request[
+                    "guest_source_sha256"
+                ],
+                installer_sha256=readiness_request["installer_sha256"],
+            )
+            collection_started_at_unix = self._wall_clock()
+            instance_before, disk_before = read_cloud()
+            guest_facts = guest_client.observe()
+            instance, disk = read_cloud()
+            collection_completed_at_unix = self._wall_clock()
+            if (
+                type(collection_started_at_unix) is not int
+                or type(collection_completed_at_unix) is not int
+                or collection_started_at_unix <= 0
+                or collection_completed_at_unix < collection_started_at_unix
+                or collection_completed_at_unix - collection_started_at_unix
+                > contract.PREFLIGHT_MAX_AGE_SECONDS
+            ):
+                raise adapter.ProductionStorageAdapterError(
+                    "production_storage_cloud_identity_invalid"
+                )
+            if instance != instance_before or disk != disk_before:
+                raise adapter.ProductionStorageAdapterError(
+                    "production_storage_cloud_identity_invalid"
+                )
+            if (
+                set(instance)
+                != {"disks", "id", "name", "selfLink", "status", "zone"}
+                or set(disk)
+                != {
+                    "id",
+                    "name",
+                    "selfLink",
+                    "sizeGb",
+                    "sourceImage",
+                    "status",
+                    "type",
+                    "users",
+                    "zone",
+                }
+            ):
+                raise adapter.ProductionStorageAdapterError(
+                    "production_storage_cloud_identity_invalid"
+                )
+            observation = adapter.build_exact_observation(
+                instance=instance,
+                disk=disk,
+                guest_facts=guest_facts,
+                collected_at_unix=collection_started_at_unix,
+            )
+            checked = contract.validate_observation(
+                observation,
+                now_unix=collection_completed_at_unix,
+            )
+        except (
+            adapter.ProductionStorageAdapterError,
+            installer.ProductionStorageInstallerError,
+            contract.ProductionStorageGrowthError,
+        ):
+            raise OwnerLauncherError(
+                "production_storage_source_preflight_invalid"
+            ) from None
+        after = authority_snapshot(account)
+        self._owner_identity.require_stable()
+        if after != before:
+            raise OwnerLauncherError(
+                "production_storage_source_preflight_authority_changed"
+            )
+        self._attest_runtime_artifacts(expected=artifacts)
+        return checked
+
     def preflight(
         self,
         *,

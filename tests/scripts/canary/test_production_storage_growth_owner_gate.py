@@ -230,6 +230,328 @@ def _plan() -> dict:
     )
 
 
+@pytest.mark.parametrize("collection_seconds", (-1, 1, 301))
+def test_owner_route_collects_and_rechecks_fixed_source_before_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collection_seconds: int,
+) -> None:
+    source = _observation(collected_at_unix=NOW)
+    attachment = source["boot_attachment"]
+    instance = {
+        "disks": [{
+            "boot": attachment["boot"],
+            "autoDelete": attachment["auto_delete"],
+            "deviceName": attachment["device_name"],
+            "mode": attachment["mode"],
+            "type": attachment["type"],
+            "source": attachment["source"],
+        }],
+        "id": contract.INSTANCE_ID,
+        "name": contract.INSTANCE_NAME,
+        "selfLink": contract.INSTANCE_SELF_LINK,
+        "status": "RUNNING",
+        "zone": (
+            "https://www.googleapis.com/compute/v1/projects/"
+            f"{contract.PROJECT}/zones/{contract.ZONE}"
+        ),
+    }
+    disk = {
+        "id": contract.DISK_ID,
+        "name": contract.DISK_NAME,
+        "selfLink": contract.DISK_SELF_LINK,
+        "sizeGb": str(contract.SOURCE_SIZE_GB),
+        "sourceImage": (
+            "https://www.googleapis.com/compute/v1/projects/"
+            f"{contract.SOURCE_IMAGE_PROJECT}/global/images/"
+            f"{contract.SOURCE_IMAGE_NAME}"
+        ),
+        "status": "READY",
+        "type": (
+            "https://www.googleapis.com/compute/v1/projects/"
+            f"{contract.PROJECT}/zones/{contract.ZONE}/diskTypes/"
+            f"{contract.DISK_TYPE}"
+        ),
+        "users": [contract.INSTANCE_SELF_LINK],
+        "zone": (
+            "https://www.googleapis.com/compute/v1/projects/"
+            f"{contract.PROJECT}/zones/{contract.ZONE}"
+        ),
+    }
+    calls: list[str] = []
+
+    class Identity:
+        def account_for_read_only_preflight(self) -> str:
+            calls.append("identity")
+            return contract.AUTHENTICATED_ACCOUNT
+
+        def require_stable(self) -> None:
+            calls.append("identity_stable")
+
+    class Boundary:
+        def request(self, **_kwargs):  # pragma: no cover - unused
+            raise AssertionError("request is not part of source collection")
+
+        def consume(self, **_kwargs):  # pragma: no cover - unused
+            raise AssertionError("consume is not part of source collection")
+
+    class ProductionTransport:
+        def _authorization_snapshot(self, account: str) -> tuple[str, ...]:
+            assert account == contract.AUTHENTICATED_ACCOUNT
+            calls.append("authority")
+            return ("fixed-authority",)
+
+        def _run_read_only_gcloud_json(self, argv):
+            assert "--quiet" in argv
+            assert f"--account={contract.AUTHENTICATED_ACCOUNT}" in argv
+            if argv[1] == "instances":
+                calls.append("get_instance")
+                return copy.deepcopy(instance)
+            if argv[1] == "disks":
+                calls.append("get_disk")
+                return copy.deepcopy(disk)
+            raise AssertionError("unexpected cloud command")
+
+        def _run_remote_input(self, _argv, *, input_bytes: bytes, **_kwargs):
+            request = protocol.decode_canonical_json(input_bytes)
+            operation = request["operation"]
+            calls.append(f"guest_{operation}")
+            if operation == "readiness":
+                install = installer.build_guest_install_request(RELEASE)
+                unsigned_readiness = {
+                    "schema": installer.GUEST_READINESS_SCHEMA,
+                    "release_sha": RELEASE,
+                    "entrypoint": str(installer.GUEST_ENTRYPOINT),
+                    "entrypoint_sha256": install["guest_source_sha256"],
+                    "entrypoint_uid": 0,
+                    "entrypoint_gid": 0,
+                    "entrypoint_mode": "0755",
+                    "entrypoint_link_count": 1,
+                    "installer_sha256": install["installer_sha256"],
+                    "interpreter_path": "/usr/bin/python3",
+                    "interpreter_resolved_path": "/usr/bin/python3.11",
+                    "interpreter_sha256": "8" * 64,
+                    "installation_receipt_sha256": "9" * 64,
+                    "sudoers_path": str(installer.GUEST_SUDOERS_PATH),
+                    "sudoers_required": False,
+                    "sudoers_absent": True,
+                    "root_transport_required": True,
+                    "ready": True,
+                }
+                document = {
+                    **unsigned_readiness,
+                    "readiness_sha256": protocol.sha256_json(
+                        unsigned_readiness
+                    ),
+                }
+            elif operation == "observe":
+                document = source["guest"]
+            else:
+                raise AssertionError("mutation guest operation reached")
+            unsigned = {
+                "schema": "muncho-production-storage-growth-guest-response.v1",
+                "operation": operation,
+                "ok": True,
+                "document": document,
+            }
+            return subprocess.CompletedProcess(
+                (),
+                0,
+                protocol.canonical_json_bytes({
+                    **unsigned,
+                    "response_sha256": protocol.sha256_json(unsigned),
+                }),
+                b"",
+            )
+
+    monkeypatch.setattr(
+        installer,
+        "attest_owner_state_root",
+        lambda *_args, **_kwargs: {"ready": True},
+    )
+    artifacts = _artifact_attestation()
+    moments = iter((NOW, NOW + collection_seconds))
+    route = owner_launcher.ProductionStorageGrowthOwnerRoute(
+        release_sha=RELEASE,
+        owner_identity=Identity(),
+        passkey_boundary=Boundary(),
+        production_transport=ProductionTransport(),
+        runtime_artifact_attestor=lambda: (
+            calls.append("artifacts") or artifacts
+        ),
+        state_root=tmp_path,
+        wall_clock=lambda: next(moments),
+        expected_state_uid=os.getuid(),
+        expected_state_gid=os.getgid(),
+    )
+
+    if (
+        collection_seconds < 0
+        or collection_seconds > contract.PREFLIGHT_MAX_AGE_SECONDS
+    ):
+        with pytest.raises(
+            owner_launcher.OwnerLauncherError,
+            match="production_storage_source_preflight_invalid",
+        ):
+            route.collect_source_preflight()
+        assert "identity_stable" not in calls
+        return
+
+    observed = route.collect_source_preflight()
+
+    assert observed == source
+    assert calls == [
+        "artifacts",
+        "identity",
+        "authority",
+        "guest_readiness",
+        "get_instance",
+        "get_disk",
+        "guest_observe",
+        "get_instance",
+        "get_disk",
+        "authority",
+        "identity_stable",
+        "artifacts",
+    ]
+
+
+def test_owner_route_source_collection_rejects_cloud_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    reads = 0
+
+    class Identity:
+        def account_for_read_only_preflight(self) -> str:
+            return contract.AUTHENTICATED_ACCOUNT
+
+        def require_stable(self) -> None:  # pragma: no cover - drift first
+            raise AssertionError("identity stability reached after cloud drift")
+
+    class Boundary:
+        request = lambda self, **_kwargs: None
+        consume = lambda self, **_kwargs: None
+
+    class ProductionTransport:
+        def _authorization_snapshot(self, _account: str) -> tuple[str, ...]:
+            return ("fixed-authority",)
+
+        def _run_read_only_gcloud_json(self, argv):
+            nonlocal reads
+            reads += 1
+            if argv[1] == "instances":
+                observation = plan["source_preflight"]
+                attachment = observation["boot_attachment"]
+                return {
+                    "disks": [{
+                        "boot": attachment["boot"],
+                        "autoDelete": attachment["auto_delete"],
+                        "deviceName": attachment["device_name"],
+                        "mode": attachment["mode"],
+                        "type": attachment["type"],
+                        "source": attachment["source"],
+                    }],
+                    "id": contract.INSTANCE_ID,
+                    "name": contract.INSTANCE_NAME,
+                    "selfLink": contract.INSTANCE_SELF_LINK,
+                    "status": "RUNNING",
+                    "zone": contract.ZONE,
+                }
+            return {
+                "id": contract.DISK_ID,
+                "name": contract.DISK_NAME,
+                "selfLink": contract.DISK_SELF_LINK,
+                "sizeGb": str(
+                    contract.TARGET_SIZE_GB
+                    if reads > 3
+                    else contract.SOURCE_SIZE_GB
+                ),
+                "sourceImage": (
+                    "https://www.googleapis.com/compute/v1/projects/"
+                    f"{contract.SOURCE_IMAGE_PROJECT}/global/images/"
+                    f"{contract.SOURCE_IMAGE_NAME}"
+                ),
+                "status": "READY",
+                "type": contract.DISK_TYPE,
+                "users": [contract.INSTANCE_SELF_LINK],
+                "zone": contract.ZONE,
+            }
+
+        def _run_remote_input(self, _argv, *, input_bytes: bytes, **_kwargs):
+            request = protocol.decode_canonical_json(input_bytes)
+            operation = request["operation"]
+            if operation == "readiness":
+                install = installer.build_guest_install_request(RELEASE)
+                unsigned_document = {
+                    "schema": installer.GUEST_READINESS_SCHEMA,
+                    "release_sha": RELEASE,
+                    "entrypoint": str(installer.GUEST_ENTRYPOINT),
+                    "entrypoint_sha256": install["guest_source_sha256"],
+                    "entrypoint_uid": 0,
+                    "entrypoint_gid": 0,
+                    "entrypoint_mode": "0755",
+                    "entrypoint_link_count": 1,
+                    "installer_sha256": install["installer_sha256"],
+                    "interpreter_path": "/usr/bin/python3",
+                    "interpreter_resolved_path": "/usr/bin/python3.11",
+                    "interpreter_sha256": "8" * 64,
+                    "installation_receipt_sha256": "9" * 64,
+                    "sudoers_path": str(installer.GUEST_SUDOERS_PATH),
+                    "sudoers_required": False,
+                    "sudoers_absent": True,
+                    "root_transport_required": True,
+                    "ready": True,
+                }
+                document = {
+                    **unsigned_document,
+                    "readiness_sha256": protocol.sha256_json(
+                        unsigned_document
+                    ),
+                }
+            else:
+                document = plan["source_preflight"]["guest"]
+            unsigned = {
+                "schema": "muncho-production-storage-growth-guest-response.v1",
+                "operation": operation,
+                "ok": True,
+                "document": document,
+            }
+            return subprocess.CompletedProcess(
+                (),
+                0,
+                protocol.canonical_json_bytes({
+                    **unsigned,
+                    "response_sha256": protocol.sha256_json(unsigned),
+                }),
+                b"",
+            )
+
+    monkeypatch.setattr(
+        installer,
+        "attest_owner_state_root",
+        lambda *_args, **_kwargs: {"ready": True},
+    )
+    route = owner_launcher.ProductionStorageGrowthOwnerRoute(
+        release_sha=RELEASE,
+        owner_identity=Identity(),
+        passkey_boundary=Boundary(),
+        production_transport=ProductionTransport(),
+        runtime_artifact_attestor=_artifact_attestation,
+        state_root=tmp_path,
+        wall_clock=lambda: NOW,
+        expected_state_uid=os.getuid(),
+        expected_state_gid=os.getgid(),
+    )
+
+    with pytest.raises(
+        owner_launcher.OwnerLauncherError,
+        match="production_storage_source_preflight_invalid",
+    ):
+        route.collect_source_preflight()
+
+
 def test_external_iam_receipt_requires_exact_signed_permissions_and_freshness() -> None:
     key = Ed25519PrivateKey.generate()
     receipt = _external_iam_receipt(key)
