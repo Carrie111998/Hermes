@@ -210,6 +210,67 @@ def test_unreadable_creation_provenance_fails_closed(
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_deep_creation_provenance_does_not_abort_recompute_ready(
+    kanban_home: Path,
+) -> None:
+    """Recursive JSON corruption must preserve the blocked card."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="blocked with deeply nested provenance",
+            initial_status="blocked",
+        )
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND kind = 'created'",
+            ("[" * 2000 + "]" * 2000, tid),
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_dispatch_does_not_claim_or_spawn_deep_creation_provenance(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One corrupt created event must not abort or release dispatch work."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="blocked with deeply nested provenance",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND kind = 'created'",
+            ("[" * 2000 + "]" * 2000, tid),
+        )
+        claim_calls: list[str] = []
+        spawn_calls: list[str] = []
+        real_claim_task = kb.claim_task
+
+        def spy_claim_task(connection, task_id, **kwargs):
+            claim_calls.append(task_id)
+            return real_claim_task(connection, task_id, **kwargs)
+
+        def fake_spawn(task, _workspace):
+            spawn_calls.append(task.id)
+            return 12345
+
+        monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+        monkeypatch.setattr(kb, "claim_task", spy_claim_task)
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert result.promoted == 0
+        assert result.spawned == []
+        assert claim_calls == []
+        assert spawn_calls == []
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 
 
 # ---------------------------------------------------------------------------

@@ -4143,7 +4143,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
     try:
         payload = json.loads(raw_payload)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         # Provenance corruption must not crash the whole dispatcher or turn a
         # human-held blocked card into runnable work.  The caller only asks
         # about tasks whose current status is already ``blocked``, so preserve
