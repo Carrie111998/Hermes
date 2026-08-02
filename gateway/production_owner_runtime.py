@@ -67,7 +67,9 @@ REQUIRED_MODULES = (
     "scripts.canary.production_database_recovery_gate",
     "scripts.canary.production_database_recovery_probe",
     "scripts.canary.production_os_login_metadata_migration",
+    "scripts.canary.production_release_update_stage0",
     "scripts.canary.stage_production_cron_continuity",
+    "scripts.canary.upstream_sync_rail_successor_rebind",
 )
 
 _REVISION = re.compile(r"^[0-9a-f]{40}$")

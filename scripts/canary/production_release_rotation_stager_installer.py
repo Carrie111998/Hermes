@@ -34,6 +34,9 @@ REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA = (
 LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA = (
     "muncho-production-unit-input-rotation-stager-installation.v3"
 )
+SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA = (
+    "muncho-production-unit-input-rotation-stager-installation.v4"
+)
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -137,6 +140,13 @@ _LATCHED_REVISION_STATIC_ASSETS: Mapping[str, tuple[str, int]] = {
     ),
     "ops/muncho/release-updater/muncho-release-foundation-exec-v3": (
         "libexec/muncho-release-foundation-exec-v3",
+        0o555,
+    ),
+}
+_SUCCESSOR_REBIND_STATIC_ASSETS: Mapping[str, tuple[str, int]] = {
+    **_LATCHED_REVISION_STATIC_ASSETS,
+    "ops/muncho/release-updater/muncho-release-foundation-exec-v4": (
+        "libexec/muncho-release-foundation-exec-v4",
         0o555,
     ),
 }
@@ -412,8 +422,11 @@ def _install_for_test(
     foundation_validator: Callable[[InstallerRoots], None] | None = None,
     revision_qualified: bool = False,
     revision_qualified_v3: bool = False,
+    revision_qualified_v4: bool = False,
 ) -> Mapping[str, Any]:
-    revisioned = revision_qualified or revision_qualified_v3
+    revisioned = (
+        revision_qualified or revision_qualified_v3 or revision_qualified_v4
+    )
     if (
         not isinstance(roots, InstallerRoots)
         or _REVISION.fullmatch(release_revision or "") is None
@@ -426,7 +439,15 @@ def _install_for_test(
         or type(production) is not bool
         or type(revision_qualified) is not bool
         or type(revision_qualified_v3) is not bool
-        or revision_qualified and revision_qualified_v3
+        or type(revision_qualified_v4) is not bool
+        or sum(
+            int(item)
+            for item in (
+                revision_qualified,
+                revision_qualified_v3,
+                revision_qualified_v4,
+            )
+        ) > 1
         or (
             production
             and (
@@ -498,14 +519,14 @@ def _install_for_test(
     )
     builder_unit_source = (
         "ops/muncho/release-updater/muncho-release-builder-v3@.service"
-        if revision_qualified_v3
+        if revision_qualified_v3 or revision_qualified_v4
         else "ops/muncho/release-updater/muncho-release-builder-v2@.service"
         if revision_qualified
         else "ops/muncho/release-updater/muncho-release-builder@.service"
     )
     builder_wrapper_source = (
         "ops/muncho/release-updater/muncho-release-foundation-exec-v3"
-        if revision_qualified_v3
+        if revision_qualified_v3 or revision_qualified_v4
         else "ops/muncho/release-updater/muncho-release-foundation-exec-v2"
         if revision_qualified
         else "ops/muncho/release-updater/muncho-release-builder-phase"
@@ -566,14 +587,14 @@ def _install_for_test(
             _fail("rotation_stager_installer_protocol_drift")
         unit_hash_name = (
             "PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT_SHA256"
-            if revision_qualified_v3
+            if revision_qualified_v3 or revision_qualified_v4
             else "PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256"
             if revision_qualified
             else "PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256"
         )
         wrapper_hash_name = (
             "PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER_SHA256"
-            if revision_qualified_v3
+            if revision_qualified_v3 or revision_qualified_v4
             else "PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256"
             if revision_qualified
             else "PRODUCTION_BUILDER_WRAPPER_SHA256"
@@ -621,7 +642,9 @@ def _install_for_test(
     installed: list[Mapping[str, Any]] = []
     created_count = 0
     selected_assets = (
-        {**_REVISION_LIBRARY_ASSETS, **_LATCHED_REVISION_STATIC_ASSETS}
+        {**_REVISION_LIBRARY_ASSETS, **_SUCCESSOR_REBIND_STATIC_ASSETS}
+        if revision_qualified_v4
+        else {**_REVISION_LIBRARY_ASSETS, **_LATCHED_REVISION_STATIC_ASSETS}
         if revision_qualified_v3
         else {**_REVISION_LIBRARY_ASSETS, **_REVISION_STATIC_ASSETS}
         if revision_qualified
@@ -686,7 +709,9 @@ def _install_for_test(
     ]
     unsigned = {
         "schema": (
-            LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+            SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA
+            if revision_qualified_v4
+            else LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
             if revision_qualified_v3
             else REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
             if revision_qualified
@@ -729,7 +754,9 @@ def _install_for_test(
         unsigned = {
             **unsigned,
             "foundation_layout": (
-                "latched-revision-qualified-v3"
+                "successor-rebind-revision-qualified-v4"
+                if revision_qualified_v4
+                else "latched-revision-qualified-v3"
                 if revision_qualified_v3
                 else "revision-qualified-v2"
             ),
@@ -764,6 +791,19 @@ def install_latched_revision_qualified_foundation(
     )
 
 
+def install_successor_rebind_foundation(
+    **kwargs: Any,
+) -> Mapping[str, Any]:
+    """Install only exact v4 foundation assets; never activate them."""
+
+    return _install_for_test(
+        roots=InstallerRoots(),
+        production=True,
+        revision_qualified_v4=True,
+        **kwargs,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
@@ -773,10 +813,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     generation = parser.add_mutually_exclusive_group()
     generation.add_argument("--revision-qualified", action="store_true")
     generation.add_argument("--revision-qualified-v3", action="store_true")
+    generation.add_argument("--revision-qualified-v4", action="store_true")
     arguments = parser.parse_args(argv)
     try:
         installer = (
-            install_latched_revision_qualified_foundation
+            install_successor_rebind_foundation
+            if arguments.revision_qualified_v4
+            else install_latched_revision_qualified_foundation
             if arguments.revision_qualified_v3
             else install_revision_qualified_foundation
             if arguments.revision_qualified
@@ -806,9 +849,11 @@ __all__ = [
     "INSTALL_RECEIPT_SCHEMA",
     "LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA",
     "REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA",
+    "SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA",
     "InstallerRoots",
     "RotationStagerInstallerError",
     "install_latched_revision_qualified_foundation",
     "install_revision_qualified_foundation",
     "install_rotation_stager_foundation",
+    "install_successor_rebind_foundation",
 ]

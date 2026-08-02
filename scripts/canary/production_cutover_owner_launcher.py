@@ -4141,8 +4141,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     resume.add_argument("--revision", required=True)
     resume.add_argument("--workspace", type=Path, required=True)
     resume.add_argument("--output", type=Path, required=True)
+    successor_rebind = subparsers.add_parser(
+        "upstream-sync-successor-owner-apply"
+    )
+    successor_rebind.add_argument("--revision", required=True)
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "upstream-sync-successor-owner-apply":
+            _active_owner_runtime_attestation(arguments.revision)
+            from scripts.canary import (
+                upstream_sync_rail_successor_rebind as successor_rebind_runtime,
+            )
+
+            result = successor_rebind_runtime.owner_apply_framed_stdin()
+            print(_canonical(result).decode("ascii"))
+            return 0
         if not arguments.output.is_absolute():
             raise OwnerCutoverError("owner_cutover_output_path_invalid")
         runtime_attestation = _active_owner_runtime_attestation(

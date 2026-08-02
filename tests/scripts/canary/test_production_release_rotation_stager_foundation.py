@@ -272,6 +272,8 @@ def _installer_source(tmp_path: Path) -> tuple[Path, str]:
         installer._REVISION_STATIC_ASSETS
     ) | set(
         installer._LATCHED_REVISION_STATIC_ASSETS
+    ) | set(
+        installer._SUCCESSOR_REBIND_STATIC_ASSETS
     )
     files = {
         relative: (ROOT / relative).read_bytes()
@@ -510,6 +512,69 @@ def test_latched_revision_foundation_is_create_only_and_inert(
     assert not any("systemctl" in item for call in calls for item in call)
     assert first["systemd_daemon_reload_performed"] is False
     assert first["unit_started"] is False
+
+
+def test_successor_rebind_v4_foundation_is_create_only_and_inert(
+    tmp_path: Path,
+) -> None:
+    source, revision = _installer_source(tmp_path)
+    roots = _installer_roots(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    kwargs = {
+        "source_root": source,
+        "source_remote": "fork",
+        "repository_url": REMOTE_URL,
+        "release_revision": revision,
+        "roots": roots,
+        "production": False,
+        "command_runner": lambda argv: _fake_foundation_command(
+            roots, calls, argv
+        ),
+        "identity_validator": lambda: None,
+        "foundation_validator": _validate_test_foundation,
+        "revision_qualified_v4": True,
+    }
+
+    first = installer._install_for_test(**kwargs)
+    second = installer._install_for_test(**kwargs)
+
+    expected_assets = len(installer._REVISION_LIBRARY_ASSETS) + len(
+        installer._SUCCESSOR_REBIND_STATIC_ASSETS
+    )
+    assert (
+        first["schema"]
+        == installer.SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA
+    )
+    assert first["foundation_layout"] == (
+        "successor-rebind-revision-qualified-v4"
+    )
+    assert first["created_asset_count"] == expected_assets
+    assert second["created_asset_count"] == 0
+    wrapper = roots.libexec / "muncho-release-foundation-exec-v4"
+    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o555
+    assert not any("systemctl" in item for call in calls for item in call)
+    assert first["systemd_daemon_reload_performed"] is False
+    assert first["unit_enabled"] is False
+    assert first["unit_started"] is False
+    assert first["unit_scheduled"] is False
+    assert first["activation_performed"] is False
+
+
+def test_successor_rebind_v4_wrapper_has_only_one_fixed_action() -> None:
+    raw = (
+        ROOT
+        / "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
+    ).read_text(encoding="utf-8")
+
+    assert "successor-rebind-owner-apply" in raw
+    assert "upstream-sync-successor-owner-apply" in raw
+    assert "owner-apply-fixed" not in raw
+    assert 'if [ "$#" -ne 3 ]' in raw
+    assert 'if [ "$operation" != successor-rebind-owner-apply ]' in raw
+    assert 'runtime_base=/usr/lib/muncho-successor-rebind-runtime' in raw
+    assert "hermes-agent-releases" not in raw
+    assert '"$@"' not in raw
+    assert "systemctl" not in raw
 
 
 def test_revision_qualified_foundation_keeps_two_revisions_side_by_side(

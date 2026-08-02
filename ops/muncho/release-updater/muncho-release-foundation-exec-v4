@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+fixed_wrapper=/usr/libexec/muncho-release-foundation-exec-v4
+runtime_base=/usr/lib/muncho-successor-rebind-runtime
+
+if [ "$#" -ne 3 ]; then
+  exit 2
+fi
+
+revision=$1
+operation=$2
+expected_wrapper_sha256=$3
+
+if [ "${#revision}" -ne 40 ] || [ "${#expected_wrapper_sha256}" -ne 64 ]; then
+  exit 2
+fi
+case "$revision$expected_wrapper_sha256" in
+  *[!0-9a-f]*) exit 2 ;;
+esac
+if [ "$operation" != successor-rebind-owner-apply ]; then
+  exit 2
+fi
+
+# The transport may select only this exact installed wrapper revision/digest.
+# Symlinked, replaced, writable, non-root, or multiply-linked launchers fail
+# before the sealed runtime reads the framed owner request from stdin.
+if [ "$0" != "$fixed_wrapper" ] || [ -L "$fixed_wrapper" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$fixed_wrapper")" != "0:0:555:1" ]; then
+  exit 2
+fi
+observed_wrapper_sha256=$(
+  /usr/bin/sha256sum -- "$fixed_wrapper" | /usr/bin/cut -d ' ' -f 1
+)
+if [ "$observed_wrapper_sha256" != "$expected_wrapper_sha256" ]; then
+  exit 2
+fi
+
+runtime_root="$runtime_base/$revision"
+python="$runtime_root/venv/bin/python"
+manifest="$runtime_root/production-owner-runtime-manifest.json"
+if [ -L "$runtime_base" ] || [ -L "$runtime_root" ] || [ -L "$python" ] || [ -L "$manifest" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$runtime_base")" != "0:0:755" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$runtime_root")" != "0:0:555" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$python")" != "0:0:555:1" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$manifest")" != "0:0:444:1" ]; then
+  exit 2
+fi
+
+exec "$python" -I -B -m gateway.production_owner_runtime \
+  --revision "$revision" run -- \
+  upstream-sync-successor-owner-apply --revision "$revision"

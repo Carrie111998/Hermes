@@ -2397,6 +2397,15 @@ def owner_apply(request: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+def owner_apply_framed_stdin() -> dict[str, Any]:
+    """Consume the sole fixed framed owner request from process stdin."""
+
+    if sys.stdin.isatty():
+        _fail("upstream_sync_successor_owner_cli_invalid")
+    frame = sys.stdin.buffer.read(_OWNER_FRAME_MAX_BYTES + 9)
+    return owner_apply(decode_owner_request(frame))
+
+
 class OwnerRebindTransport(Protocol):
     """One fixed IAP edge; callers cannot provide argv, paths, or targets."""
 
@@ -2736,8 +2745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             or sys.stdin.isatty()
         ):
             _fail("upstream_sync_successor_owner_cli_invalid")
-        frame = sys.stdin.buffer.read(_OWNER_FRAME_MAX_BYTES + 9)
-        _write_stdout(owner_apply(decode_owner_request(frame)))
+        _write_stdout(owner_apply_framed_stdin())
         return 0
     if any(item is not None for item in owner_fields):
         _fail("upstream_sync_successor_owner_cli_invalid")
@@ -2791,6 +2799,7 @@ __all__ = [
     "encode_owner_request",
     "main",
     "owner_apply",
+    "owner_apply_framed_stdin",
     "owner_run",
     "preflight",
     "rebind",
