@@ -248,13 +248,14 @@ def test_partial_auxiliary_stream_failure_closes_before_recovery(
             next(stream)
 
         assert caught.value is provider_error
-        assert outcomes == ["failed"]
+        # Compatibility returns a raw stream and has no semantic authority.
+        assert outcomes == []
         assert turn.logical_llm_calls == {}
 
         result = recover("moa")
 
         assert result.choices[0].message.content == "recovered"
-        assert outcomes == ["failed", "success"]
+        assert outcomes == ["success"]
         assert turn.logical_llm_calls == {}
     finally:
         turn.lease.host.release_managed_execution(consumer)
@@ -299,7 +300,7 @@ def test_auxiliary_stream_unwraps_completed_response(relay_turn):
     assert run("moa_aggregator") is completed
 
 
-def test_codex_auxiliary_stream_has_detached_lifecycle_and_exact_chunks(
+def test_codex_auxiliary_stream_is_observer_only_with_exact_chunks(
     relay_turn,
     monkeypatch,
 ):
@@ -350,14 +351,14 @@ def test_codex_auxiliary_stream_has_detached_lifecycle_and_exact_chunks(
         assert len(provider_calls) == 1
         assert received == chunks
         assert all(actual is expected for actual, expected in zip(received, chunks))
-        assert len(pushes) == 1
-        assert outcomes == ["success"]
+        assert pushes == []
+        assert outcomes == []
         assert turn.logical_llm_calls == {}
     finally:
         turn.lease.host.release_managed_execution(consumer)
 
 
-def test_codex_auxiliary_completed_stream_keeps_lifecycle_without_iteration(
+def test_codex_auxiliary_completed_stream_has_no_lifecycle_authority(
     relay_turn,
     monkeypatch,
 ):
@@ -418,8 +419,8 @@ def test_codex_auxiliary_completed_stream_keeps_lifecycle_without_iteration(
 
         assert result is completed
         assert len(provider_calls) == 1
-        assert len(pushes) == 1
-        assert outcomes == ["success"]
+        assert pushes == []
+        assert outcomes == []
         assert turn.logical_llm_calls == {}
     finally:
         turn.lease.host.release_managed_execution(consumer)

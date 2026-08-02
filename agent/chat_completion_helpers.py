@@ -2223,6 +2223,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    def _complete_stream_lifecycle(outcome: str) -> None:
+        """Finalize only after this trusted consumer accepts or rejects output."""
+        try:
+            from agent import relay_llm
+
+            relay_llm.complete_logical_call(
+                str(getattr(agent, "_current_api_request_id", "") or ""),
+                outcome=outcome,
+            )
+        except Exception:
+            # Lifecycle observation is fail-open and cannot replace the
+            # provider response or its exact error.
+            logger.warning(
+                "Provider stream lifecycle finalization failed",
+                exc_info=True,
+            )
+
     # Cron and other non-interactive, nested-pool contexts deadlock on the
     # spawned worker thread (#62151). They also have no stream consumer, so the
     # deltas this path produces go nowhere. Delegate to the non-streaming entry
@@ -2390,6 +2407,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         while t.is_alive():
             t.join(timeout=0.3)
             if agent._interrupt_requested:
+                _complete_stream_lifecycle("cancelled")
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             # Liveness watchdog: no Bedrock event for longer than the stale
             # timeout means the stream has wedged (open socket, keep-alives but
@@ -2450,14 +2468,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Bedrock path — mirrors the post-worker guard on the main streaming
         # loop. (#59999 area)
         if agent._interrupt_requested:
+            _complete_stream_lifecycle("cancelled")
             raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
         if result["error"] is not None:
+            _complete_stream_lifecycle("failed")
             raise result["error"]
         # Success — clear the cross-turn breaker (#58962): Bedrock proved
         # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
         # recovered provider doesn't carry a stale streak into later turns.
         if result["response"] is not None:
             _reset_stale_streak(agent)
+            _complete_stream_lifecycle("success")
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -3896,6 +3917,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _close_request_client_once("stream_interrupt_abort")
             except Exception:
                 pass
+            _complete_stream_lifecycle("cancelled")
             raise InterruptedError("Agent interrupted during streaming API call")
     # Worker thread exited before the main thread's poll loop could check
     # the interrupt flag.  If the worker returned early due to an interrupt
@@ -3903,6 +3925,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # None), the InterruptedError above was never raised.  Re-check the
     # flag here so /stop is not silently swallowed.  (#59999 area)
     if agent._interrupt_requested:
+        _complete_stream_lifecycle("cancelled")
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
         if deltas_were_sent["yes"]:
@@ -4002,12 +4025,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            _complete_stream_lifecycle("success")
             return _stub
+        _complete_stream_lifecycle("failed")
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _complete_stream_lifecycle("success")
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

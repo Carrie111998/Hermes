@@ -124,46 +124,23 @@ def stream_current(
 ) -> Any:
     """Open a direct provider stream through the historical current-turn API.
 
-    When ``completed_response_predicate`` is set and the stream_factory returns
-    a complete response instead of an iterator (e.g. AnthropicAuxiliaryClient
-    and other shims that ignore ``stream=True``), unwrap and return the
-    completed response directly. This mirrors the pre-Relay behavior where
-    ``call_llm(stream=True)`` returned the raw response and the consumer's
-    own ``hasattr(stream, "choices")`` check handled it (#11732, #55933) —
-    without the unwrap the response stays trapped as ``final_response`` on the
-    inner compatibility view and the outer consumer sees an empty stream.
+    This is an observer-only compatibility surface, so it returns the exact
+    provider object whether that object is an iterator or an already-completed
+    response. It cannot derive or finalize a logical outcome from transport
+    iteration state.
     """
-    del finalizer, defer_logical_completion
-
-    # Preserve the historical raw-stream contract unless an already-active
-    # Relay runtime has explicitly retained lifecycle observation.  Relay is
-    # never placed between Hermes and the provider: even in the observed case
-    # below, the provider factory is called directly and its chunks remain the
-    # authoritative objects returned to the consumer.
-    logical = _begin_logical_notification(
-        _execution_notification_metadata(
-            metadata,
-            name=name,
-            model_name=model_name,
-        )
+    del (
+        name,
+        model_name,
+        finalizer,
+        metadata,
+        defer_logical_completion,
+        completed_response_predicate,
     )
-    if logical is None:
-        return stream_factory(request)
-
-    def notify_terminal(outcome: str) -> None:
-        _complete_logical(logical, outcome=outcome)
-
-    direct = provider_stream(
-        request,
-        stream_factory,
-        on_terminal=notify_terminal,
-        completed_response_predicate=completed_response_predicate,
-    )
-    if completed_response_predicate is not None:
-        completed = direct.final_response
-        if completed is not None:
-            return completed
-    return direct
+    # Historical/extension callers get the exact raw provider object. They do
+    # not own semantic validation and therefore cannot open or finalize a
+    # logical lifecycle scope from raw iteration state.
+    return stream_factory(request)
 
 
 def provider_stream(
@@ -173,26 +150,22 @@ def provider_stream(
     on_provider_chunk: Callable[[Any], None] | None = None,
     observer: Callable[[Any], None] | None = None,
     accept_chunk: Callable[[Any], bool] | None = None,
-    on_terminal: Callable[[str], None] | None = None,
     lifecycle_metadata: dict[str, Any] | None = None,
     lifecycle_session_id: str | None = None,
     completed_response_predicate: Callable[[Any], bool] | None = None,
 ) -> "ProviderLlmStream":
     """Open one direct, model-authoritative provider stream.
 
-    Lifecycle observation receives detached structural metadata and a terminal
-    outcome only.  It never receives the request, provider callback, chunks,
-    or final response and therefore cannot alter model execution.
+    Lifecycle observation receives detached structural metadata only.  Raw
+    stream exhaustion, cleanup, and transport failures are deliberately not
+    logical outcomes: only the trusted consumer can decide whether the bytes
+    form a semantically accepted response.  It completes the logical call via
+    :func:`complete_logical_call` after validation.
     """
-    logical = _begin_logical_notification(
+    _begin_logical_notification(
         lifecycle_metadata,
         session_id=lifecycle_session_id,
     )
-
-    def notify_terminal(outcome: str) -> None:
-        _complete_logical(logical, outcome=outcome)
-        if on_terminal is not None:
-            on_terminal(outcome)
 
     return ProviderLlmStream(
         request,
@@ -200,7 +173,6 @@ def provider_stream(
         on_provider_chunk=on_provider_chunk,
         observer=observer,
         accept_chunk=accept_chunk,
-        on_terminal=(notify_terminal if logical is not None or on_terminal else None),
         completed_response_predicate=completed_response_predicate,
     )
 
@@ -223,9 +195,10 @@ def stream(
     """Return a model-authoritative synchronous provider stream view.
 
     The historical Relay-shaped arguments are accepted for compatibility but
-    are notification metadata only; they never participate in execution.
+    are inert. Only the detached chunk observer remains; compatibility callers
+    cannot open or finalize logical lifecycle state.
     """
-    del finalizer, chunk_adapter
+    del session_id, name, model_name, finalizer, chunk_adapter, metadata
     # Historical Relay/plugin callers cannot install a stop predicate.  Only
     # trusted core call sites can use ``provider_stream(accept_chunk=...)`` for
     # exact single-writer/stale-attempt fencing.
@@ -235,12 +208,6 @@ def stream(
         request,
         stream_factory,
         observer=on_chunk,
-        lifecycle_metadata=_execution_notification_metadata(
-            metadata,
-            name=name,
-            model_name=model_name,
-        ),
-        lifecycle_session_id=session_id,
         completed_response_predicate=completed_response_predicate,
     )
 
@@ -265,7 +232,6 @@ class ProviderLlmStream(Iterator[Any]):
         on_provider_chunk: Callable[[Any], None] | None,
         observer: Callable[[Any], None] | None,
         accept_chunk: Callable[[Any], bool] | None,
-        on_terminal: Callable[[str], None] | None,
         completed_response_predicate: Callable[[Any], bool] | None,
     ) -> None:
         self.final_response: Any = None
@@ -275,16 +241,10 @@ class ProviderLlmStream(Iterator[Any]):
         self._on_provider_chunk = on_provider_chunk
         self._observer = observer
         self._accept_chunk = accept_chunk
-        self._on_terminal = on_terminal
-        self._terminal_outcome: str | None = None
         self._stream: Any = None
         self._raw_stream_resource: Any = None
 
-        try:
-            raw_stream = stream_factory(request)
-        except BaseException:
-            self._notify_terminal("failed")
-            raise
+        raw_stream = stream_factory(request)
 
         self._raw_stream_resource = raw_stream
         try:
@@ -295,13 +255,11 @@ class ProviderLlmStream(Iterator[Any]):
                 self.final_response = raw_stream
                 self._raw_stream_resource = None
                 self._stream = iter(())
-                self._notify_terminal("success")
                 return
 
             self._stream = iter(raw_stream)
         except BaseException:
             self._close()
-            self._notify_terminal("failed")
             raise
 
     def __iter__(self) -> "ProviderLlmStream":
@@ -314,16 +272,13 @@ class ProviderLlmStream(Iterator[Any]):
             chunk = next(self._stream)
         except StopIteration:
             self._close()
-            self._notify_terminal("success")
             raise
         except BaseException:
             self._close()
-            self._notify_terminal("failed")
             raise
 
         if self._accept_chunk is not None and not self._accept_chunk(chunk):
             self._close()
-            self._notify_terminal("cancelled")
             raise StopIteration
 
         if self._on_provider_chunk is not None:
@@ -334,7 +289,6 @@ class ProviderLlmStream(Iterator[Any]):
                 self._on_provider_chunk(chunk)
             except BaseException:
                 self._close()
-                self._notify_terminal("failed")
                 raise
 
         if self._observer is not None:
@@ -353,7 +307,6 @@ class ProviderLlmStream(Iterator[Any]):
     def close(self) -> None:
         """Close an explicitly abandoned provider stream exactly once."""
         self._close()
-        self._notify_terminal("cancelled")
         close_error = self._close_error
         self._close_error = None
         if close_error is not None:
@@ -381,24 +334,8 @@ class ProviderLlmStream(Iterator[Any]):
                     self._close_error = exc
                 logger.debug("Provider stream cleanup failed", exc_info=True)
 
-    def _notify_terminal(self, outcome: str) -> None:
-        """Emit one fail-open lifecycle observation after provider outcome."""
-        if self._terminal_outcome is not None:
-            return
-        self._terminal_outcome = outcome
-        if self._on_terminal is None:
-            return
-        try:
-            self._on_terminal(outcome)
-        except Exception:
-            logger.warning(
-                "Provider stream terminal observer failed; preserving provider outcome",
-                exc_info=True,
-            )
-
     def __del__(self) -> None:
         self._close()
-        self._notify_terminal("cancelled")
 
 
 # Backward-compatible name for extensions that imported the historical type.

@@ -200,6 +200,9 @@ def test_primary_stream_restores_only_detached_lifecycle_observation(
     assert provider_requests[0] is request
     assert received == chunks
     assert received[0] is chunks[0]
+    assert outcomes == []
+    assert set(turn.logical_llm_calls) == {"primary-stream-1"}
+    relay_llm.complete_logical_call("primary-stream-1", outcome="success")
     assert outcomes == ["success"]
     assert turn.logical_llm_calls == {}
     assert len(pushes) == 1
@@ -323,7 +326,7 @@ def test_main_nonstream_dispatch_emits_scalar_lifecycle_without_payload_access(
     assert "trusted-provider" in lifecycle_payload
 
 
-def test_legacy_stream_emits_lifecycle_and_preserves_exact_provider_chunks(
+def test_legacy_stream_is_observer_only_and_preserves_exact_provider_chunks(
     relay_turn,
     monkeypatch,
 ):
@@ -370,8 +373,8 @@ def test_legacy_stream_emits_lifecycle_and_preserves_exact_provider_chunks(
     assert provider_calls[0] is request
     assert received == chunks
     assert all(actual is expected for actual, expected in zip(received, chunks))
-    assert len(pushes) == 1
-    assert outcomes == ["success"]
+    assert pushes == []
+    assert outcomes == []
     assert turn.logical_llm_calls == {}
 
 

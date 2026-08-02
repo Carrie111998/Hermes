@@ -7,6 +7,7 @@ but they never sit between Hermes and a streaming model provider.
 from __future__ import annotations
 
 import json
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -139,26 +140,23 @@ def test_trusted_provider_chunk_parser_failure_is_visible() -> None:
         next(stream)
 
 
-def test_terminal_observer_cannot_replace_provider_stream_failure() -> None:
+def test_raw_provider_stream_has_no_logical_terminal_callback_surface() -> None:
+    assert "on_terminal" not in inspect.signature(relay_llm.provider_stream).parameters
+
+
+def test_raw_provider_stream_preserves_provider_failure_without_finalizing() -> None:
     class ProviderError(Exception):
         pass
 
     provider_error = ProviderError("exact provider failure")
     provider_chunk = {"delta": "exact"}
-    outcomes: list[str] = []
-
     def provider(_request):
         yield provider_chunk
         raise provider_error
 
-    def broken_terminal_observer(outcome: str) -> None:
-        outcomes.append(outcome)
-        raise RuntimeError("notification failed")
-
     stream = relay_llm.provider_stream(
         {"model": "trusted-model", "messages": []},
         provider,
-        on_terminal=broken_terminal_observer,
     )
 
     assert next(stream) is provider_chunk
@@ -166,34 +164,24 @@ def test_terminal_observer_cannot_replace_provider_stream_failure() -> None:
         next(stream)
 
     assert caught.value is provider_error
-    assert outcomes == ["failed"]
     stream.close()
-    assert outcomes == ["failed"]
 
 
-def test_terminal_observer_cannot_replace_provider_stream_open_failure() -> None:
+def test_raw_provider_stream_preserves_provider_open_failure() -> None:
     class ProviderOpenError(Exception):
         pass
 
     provider_error = ProviderOpenError("exact provider open failure")
-    outcomes: list[str] = []
-
     def provider(_request):
         raise provider_error
-
-    def broken_terminal_observer(outcome: str) -> None:
-        outcomes.append(outcome)
-        raise RuntimeError("notification failed")
 
     with pytest.raises(ProviderOpenError) as caught:
         relay_llm.provider_stream(
             {"model": "trusted-model", "messages": []},
             provider,
-            on_terminal=broken_terminal_observer,
         )
 
     assert caught.value is provider_error
-    assert outcomes == ["failed"]
 
 
 def test_relay_compatibility_cannot_supply_early_stop_predicate() -> None:
@@ -311,6 +299,59 @@ def test_anthropic_final_response_is_exact_provider_message() -> None:
     assert response.content[2].input == {"command": "pwd"}
     assert response.usage is usage
     assert response.stop_reason == "tool_use"
+
+
+def test_anthropic_empty_stream_retry_finalizes_only_after_semantic_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(api_mode="anthropic_messages")
+    agent._current_api_request_id = "anthropic-empty-retry-1"
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+
+    empty_stream = MagicMock()
+    empty_stream.__iter__ = MagicMock(return_value=iter(()))
+    empty_stream.get_final_message.side_effect = AssertionError("no message_start")
+    empty_manager = MagicMock()
+    empty_manager.__enter__.return_value = empty_stream
+    empty_manager.__exit__.return_value = False
+    empty_client = MagicMock()
+    empty_client.messages.stream.return_value = empty_manager
+
+    accepted = SimpleNamespace(
+        id="msg_after_retry",
+        model="claude-exact",
+        role="assistant",
+        content=[SimpleNamespace(type="text", text="accepted")],
+        stop_reason="end_turn",
+        stop_sequence=None,
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+    accepted_stream = MagicMock()
+    accepted_stream.__iter__ = MagicMock(
+        return_value=iter([SimpleNamespace(type="message_start")])
+    )
+    accepted_stream.get_final_message.return_value = accepted
+    accepted_manager = MagicMock()
+    accepted_manager.__enter__.return_value = accepted_stream
+    accepted_manager.__exit__.return_value = False
+    accepted_client = MagicMock()
+    accepted_client.messages.stream.return_value = accepted_manager
+
+    clients = iter([empty_client, accepted_client])
+    agent._create_request_anthropic_client = lambda *args, **kwargs: next(clients)
+
+    with patch("agent.relay_llm.complete_logical_call") as complete:
+        response = agent._interruptible_streaming_api_call(
+            {"model": "claude-exact", "messages": []}
+        )
+
+    assert response is accepted
+    assert empty_client.messages.stream.call_count == 1
+    assert accepted_client.messages.stream.call_count == 1
+    complete.assert_called_once_with(
+        "anthropic-empty-retry-1",
+        outcome="success",
+    )
 
 
 def test_bedrock_final_response_preserves_reasoning_tool_usage_and_finish() -> None:
@@ -491,6 +532,58 @@ def test_codex_final_response_preserves_items_reasoning_usage_and_status() -> No
     assert response.status == "completed"
     assert response.id == "resp_exact"
     assert response.model == "codex-exact"
+
+
+def test_codex_completed_response_survives_transport_error_while_draining() -> None:
+    import httpx
+
+    agent = _make_agent(api_mode="codex_responses")
+    agent._current_api_request_id = "codex-drain-error-1"
+    terminal = SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(
+            id="resp_drain_exact",
+            status="completed",
+            output=[],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        ),
+    )
+
+    class CompletedThenBrokenDrain:
+        def __init__(self):
+            self.index = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.index += 1
+            if self.index == 1:
+                return terminal
+            raise httpx.RemoteProtocolError("connection ended after terminal event")
+
+        def close(self):
+            self.closed = True
+
+    raw_stream = CompletedThenBrokenDrain()
+    request_client = MagicMock()
+    request_client.responses.create.return_value = raw_stream
+
+    with patch("agent.relay_llm.complete_logical_call") as complete:
+        response = agent._run_codex_stream(
+            {"model": "codex-exact", "instructions": "exact", "input": []},
+            client=request_client,
+        )
+
+    assert response.id == "resp_drain_exact"
+    assert response.status == "completed"
+    assert raw_stream.closed is True
+    request_client.responses.create.assert_called_once()
+    complete.assert_called_once_with(
+        "codex-drain-error-1",
+        outcome="success",
+    )
 
 
 def test_completed_provider_response_cannot_be_replaced_by_relay_finalizer() -> None:

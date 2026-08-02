@@ -1259,6 +1259,19 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     from agent import relay_llm
 
+    def _complete_stream_lifecycle(outcome: str) -> None:
+        """Finalize after the trusted Codex event consumer decides outcome."""
+        try:
+            relay_llm.complete_logical_call(
+                str(getattr(agent, "_current_api_request_id", "") or ""),
+                outcome=outcome,
+            )
+        except Exception:
+            logger.warning(
+                "Codex stream lifecycle finalization failed",
+                exc_info=True,
+            )
+
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1281,6 +1294,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
+            _complete_stream_lifecycle("cancelled")
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         writer_token = {"value": None}
@@ -1349,6 +1363,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     exc,
                 )
                 continue
+            _complete_stream_lifecycle("failed")
+            raise
+        except BaseException:
+            _complete_stream_lifecycle(
+                "cancelled" if agent._interrupt_requested else "failed"
+            )
             raise
 
         def _interrupt_or_superseded() -> bool:
@@ -1385,6 +1405,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:
+                    _complete_stream_lifecycle("success")
                     return event_stream.final_response
                 raise
 
@@ -1416,7 +1437,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(),
                 )
 
+            _complete_stream_lifecycle(
+                "failed" if final.status in {"incomplete", "failed"} else "success"
+            )
             return final
+        except BaseException:
+            _complete_stream_lifecycle(
+                "cancelled" if agent._interrupt_requested else "failed"
+            )
+            raise
         finally:
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
