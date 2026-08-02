@@ -1150,18 +1150,27 @@ def _cmd_ingest_pr(args: argparse.Namespace) -> int:
             return 2
     else:
         metadata = None
-    def as_bool(value):
+    def as_bool(value: Optional[str]) -> Optional[bool]:
         return None if value is None else value == "true"
+
     with kb.connect_closing() as conn:
         task_id = kb.ingest_pull_request(
-            conn, repository=args.repository, number=args.number, head_sha=args.head_sha,
-            title=args.title, reviewer=args.assignee, url=args.url, draft=args.draft,
-            checks_passed=as_bool(args.checks_passed), mergeable=as_bool(args.mergeable),
-            metadata=metadata, action=args.action,
+            conn,
+            repository=args.repository,
+            number=args.number,
+            head_sha=args.head_sha,
+            title=args.title,
+            reviewer=args.assignee,
+            url=args.url,
+            draft=args.draft,
+            checks_passed=as_bool(args.checks_passed),
+            mergeable=as_bool(args.mergeable),
+            metadata=metadata,
+            action=args.action,
         )
-        task = kb.get_task(conn, task_id)
+        task = kb.get_task(conn, task_id) if task_id else None
     if args.json:
-        print(json.dumps(_task_to_dict(task), ensure_ascii=False))
+        print(json.dumps(_task_to_dict(task) if task else None, ensure_ascii=False))
     else:
         print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
     return 0
@@ -1193,6 +1202,9 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "submit-review",
+    "review-changes",
+    "ingest-pr",
     "edit",
     "block",
     "schedule",

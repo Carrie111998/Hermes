@@ -2817,6 +2817,9 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_INTERNAL_REVIEW_REMEDIATION_PREFIX = "review-remediation:"
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2844,6 +2847,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    _allow_internal_idempotency: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3042,6 +3046,11 @@ def create_task(
     # acceptable: two concurrent creators with the same key might both
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
+        if (
+            idempotency_key.startswith(_INTERNAL_REVIEW_REMEDIATION_PREFIX)
+            and not _allow_internal_idempotency
+        ):
+            raise ValueError("review remediation idempotency keys are reserved")
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
@@ -4443,9 +4452,11 @@ def claim_task(
         # idempotency-key prefix: otherwise a forged child can bypass a
         # failed parent's dependency gate.
         parent_rows = conn.execute(
-            "SELECT p.id, p.status, p.current_run_id, r.id AS run_id, r.outcome "
+            "SELECT p.id, p.status, p.current_run_id, r.id AS run_id, r.outcome, "
+            "c.idempotency_key AS child_idempotency_key "
             "FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
+            "JOIN tasks c ON c.id = l.child_id "
             "LEFT JOIN task_runs r ON r.id = COALESCE(p.current_run_id, "
             "(SELECT latest.id FROM task_runs latest WHERE latest.task_id = p.id "
             "ORDER BY latest.id DESC LIMIT 1)) "
@@ -4475,7 +4486,11 @@ def claim_task(
                         payload = json.loads(event["payload"] or "{}")
                     except (TypeError, json.JSONDecodeError):
                         payload = {}
-                    if payload.get("remediation_task_id") == task_id:
+                    if (
+                        payload.get("remediation_task_id") == task_id
+                        and payload.get("remediation_key")
+                        == parent["child_idempotency_key"]
+                    ):
                         authorized = True
                         break
             if not authorized:
@@ -4805,10 +4820,42 @@ def request_review_changes(
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
-        remediation_key = f"review-remediation:{task_id}:{current_run_id}"
+        remediation_key = f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:{current_run_id}"
+        remediation_title = f"Address review feedback: {row['title']}"
+        remediation_body = (
+            f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"
+        )
+        existing = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (remediation_key,),
+        ).fetchone()
+        if existing is not None:
+            existing_parents = {
+                parent["parent_id"]
+                for parent in conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ?",
+                    (existing["id"],),
+                ).fetchall()
+            }
+            expected_skills = json.loads(row["skills"]) if row["skills"] else None
+            actual_skills = json.loads(existing["skills"]) if existing["skills"] else None
+            if (
+                existing["title"] != remediation_title
+                or existing["body"] != remediation_body
+                or _canonical_assignee(existing["assignee"]) != implementer
+                or existing["created_by"] != (row["assignee"] or "reviewer")
+                or existing["tenant"] != row["tenant"]
+                or existing["priority"] != row["priority"]
+                or existing["workspace_kind"] != row["workspace_kind"]
+                or existing["branch_name"] != row["branch_name"]
+                or existing["project_id"] != row["project_id"]
+                or actual_skills != expected_skills
+                or existing_parents != {task_id}
+            ):
+                return None
         remediation_id = create_task(
-            conn, title=f"Address review feedback: {row['title']}",
-            body=f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}",
+            conn, title=remediation_title, body=remediation_body,
             assignee=implementer, created_by=row["assignee"] or "reviewer",
             tenant=row["tenant"], priority=row["priority"],
             workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
@@ -4816,6 +4863,7 @@ def request_review_changes(
             skills=json.loads(row["skills"]) if row["skills"] else None,
             parents=(task_id,),
             idempotency_key=remediation_key,
+            _allow_internal_idempotency=True,
         )
         review_metadata = dict(metadata or {})
         review_metadata.update({
@@ -4826,6 +4874,7 @@ def request_review_changes(
             "review_identity": handoff.get("review_identity"),
             "changes_requested": True,
             "remediation_task_id": remediation_id,
+            "remediation_key": remediation_key,
         })
         cur = conn.execute(
             "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
