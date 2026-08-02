@@ -129,10 +129,14 @@ class TestProvider:
         p = self._make(basic)
         p.revoke_session(refresh_token="anything")  # must not raise
 
-    def test_oauth_methods_raise_not_implemented(self, basic):
+    def test_start_login_redirects_to_password_login(self, basic):
         p = self._make(basic)
-        with pytest.raises(NotImplementedError):
-            p.start_login(redirect_uri="https://x/auth/callback")
+        start = p.start_login(redirect_uri="https://x/auth/callback")
+        assert start.redirect_url.startswith("/auth/password-login")
+        assert "redirect_uri=https://x/auth/callback" in start.redirect_url
+
+    def test_complete_login_raises_not_implemented(self, basic):
+        p = self._make(basic)
         with pytest.raises(NotImplementedError):
             p.complete_login(
                 code="c", state="s", code_verifier="v", redirect_uri="r"
