@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import ctypes
+import errno
 import grp
 import hashlib
 import json
@@ -153,7 +155,40 @@ _SUCCESSOR_REBIND_STATIC_ASSETS: Mapping[str, tuple[str, int]] = {
         "libexec/muncho-release-foundation-exec-v4",
         0o555,
     ),
+    "ops/muncho/release-updater/muncho-successor-runtime-foundation-exec": (
+        "libexec/muncho-successor-runtime-foundation-exec",
+        0o555,
+    ),
 }
+_SUCCESSOR_RUNTIME_CONTROLLER_ASSETS: Mapping[str, tuple[str, int]] = {
+    "gateway/__init__.py": ("gateway/__init__.py", 0o444),
+    "gateway/production_owner_runtime.py": (
+        "gateway/production_owner_runtime.py",
+        0o444,
+    ),
+    "scripts/__init__.py": ("scripts/__init__.py", 0o444),
+    "scripts/canary/__init__.py": ("scripts/canary/__init__.py", 0o444),
+    "scripts/canary/package_production_owner_runtime.py": (
+        "scripts/canary/package_production_owner_runtime.py",
+        0o444,
+    ),
+    "scripts/canary/production_successor_rebind_owner_runtime.py": (
+        "scripts/canary/production_successor_rebind_owner_runtime.py",
+        0o444,
+    ),
+    "scripts/canary/production_successor_rebind_owner_runtime_preexec.py": (
+        "scripts/canary/production_successor_rebind_owner_runtime_preexec.py",
+        0o444,
+    ),
+    "scripts/canary/production_successor_rebind_owner_runtime_launcher.py": (
+        "scripts/canary/production_successor_rebind_owner_runtime_launcher.py",
+        0o444,
+    ),
+}
+SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_SCHEMA = (
+    "muncho-successor-runtime-controller-manifest.v1"
+)
+SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME = "controller-manifest.json"
 
 
 class RotationStagerInstallerError(RuntimeError):
@@ -265,6 +300,231 @@ def _line(raw: bytes) -> str:
     if not value or "\n" in value or "\r" in value:
         _fail("rotation_stager_installer_git_invalid")
     return value
+
+
+def _install_exact_source_snapshot(
+    *,
+    source_root: Path,
+    destination: Path,
+    release_revision: str,
+    source_tree_oid: str,
+    expected_uid: int,
+    expected_gid: int,
+) -> bool:
+    """Create one fixed, local-only Git source snapshot for the builder."""
+
+    incomplete = destination.with_name(
+        f".{destination.name}.{release_revision}.incomplete"
+    )
+
+    def validate(selected: Path) -> None:
+        try:
+            state = os.lstat(selected)
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_invalid", exc)
+        if (
+            not stat.S_ISDIR(state.st_mode)
+            or stat.S_ISLNK(state.st_mode)
+            or state.st_uid != expected_uid
+            or state.st_gid != expected_gid
+            or stat.S_IMODE(state.st_mode) & 0o022
+            or _line(_git(selected, "rev-parse", "HEAD")) != release_revision
+            or _line(_git(selected, "rev-parse", "HEAD^{tree}")) != source_tree_oid
+            or _git(selected, "status", "--porcelain=v1", "--untracked-files=all")
+        ):
+            _fail("rotation_stager_installer_source_snapshot_invalid")
+
+    created = False
+    if not os.path.lexists(destination):
+        if not os.path.lexists(incomplete):
+            try:
+                completed = subprocess.run(
+                    (
+                        "/usr/bin/git",
+                        "-c",
+                        "protocol.file.allow=always",
+                        "clone",
+                        "--quiet",
+                        "--no-hardlinks",
+                        "--no-checkout",
+                        "--",
+                        str(source_root),
+                        str(incomplete),
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=300,
+                    env=_git_environment(),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                _fail("rotation_stager_installer_source_snapshot_invalid", exc)
+            if completed.returncode != 0 or completed.stdout or completed.stderr:
+                _fail("rotation_stager_installer_source_snapshot_invalid")
+        try:
+            state = os.lstat(incomplete)
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_invalid", exc)
+        if (
+            not stat.S_ISDIR(state.st_mode)
+            or stat.S_ISLNK(state.st_mode)
+            or state.st_uid != expected_uid
+            or state.st_gid != expected_gid
+            or stat.S_IMODE(state.st_mode) & 0o022
+        ):
+            _fail("rotation_stager_installer_source_snapshot_invalid")
+        _git(
+            incomplete,
+            "checkout",
+            "--quiet",
+            "--force",
+            "--detach",
+            release_revision,
+        )
+        validate(incomplete)
+        _fsync_snapshot_tree(incomplete)
+        _rename_directory_noreplace(incomplete, destination)
+        _fsync_directory(destination.parent)
+        created = True
+    validate(destination)
+    return created
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        os.fsync(descriptor)
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_durability_failed", exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _fsync_snapshot_tree(root: Path) -> None:
+    directories: list[Path] = []
+    try:
+        for current, names, files in os.walk(root, followlinks=False):
+            selected = Path(current)
+            directories.append(selected)
+            for name in (*names, *files):
+                path = selected / name
+                state = os.lstat(path)
+                if not stat.S_ISREG(state.st_mode):
+                    continue
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        for directory in reversed(directories):
+            _fsync_directory(directory)
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_durability_failed", exc)
+
+
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform.startswith("linux"):
+            function = library.renameat2
+            function.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            function.restype = ctypes.c_int
+            result = function(
+                -100,
+                os.fsencode(source),
+                -100,
+                os.fsencode(destination),
+                1,
+            )
+        elif sys.platform == "darwin":
+            function = library.renamex_np
+            function.argtypes = (
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            function.restype = ctypes.c_int
+            result = function(os.fsencode(source), os.fsencode(destination), 0x00000004)
+        else:
+            _fail("rotation_stager_installer_source_snapshot_rename_unsupported")
+    except (AttributeError, OSError) as exc:
+        _fail("rotation_stager_installer_source_snapshot_rename_unsupported", exc)
+    if result != 0:
+        selected_errno = ctypes.get_errno()
+        if selected_errno == errno.EEXIST:
+            _fail("rotation_stager_installer_source_snapshot_conflict")
+        _fail("rotation_stager_installer_source_snapshot_rename_failed")
+
+
+def successor_runtime_controller_manifest_from_bytes(
+    *,
+    release_revision: str,
+    assets: Mapping[str, bytes],
+) -> Mapping[str, Any]:
+    files = []
+    for source_relative, (target_relative, mode) in sorted(
+        _SUCCESSOR_RUNTIME_CONTROLLER_ASSETS.items()
+    ):
+        raw = assets.get(source_relative)
+        if not isinstance(raw, bytes):
+            _fail("rotation_stager_installer_controller_manifest_invalid")
+        files.append({
+            "path": target_relative,
+            "mode": f"{mode:04o}",
+            "size": len(raw),
+            "sha256": _sha256(raw),
+        })
+    unsigned = {
+        "schema": SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_SCHEMA,
+        "release_revision": release_revision,
+        "directories": ["gateway", "scripts", "scripts/canary"],
+        "files": files,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return {
+        **unsigned,
+        "manifest_sha256": _sha256(_canonical(unsigned)),
+    }
+
+
+def _successor_runtime_controller_manifest(
+    *,
+    source_root: Path,
+    release_revision: str,
+) -> Mapping[str, Any]:
+    return successor_runtime_controller_manifest_from_bytes(
+        release_revision=release_revision,
+        assets={
+            source_relative: _git(
+                source_root,
+                "cat-file",
+                "blob",
+                f"{release_revision}:{source_relative}",
+            )
+            for source_relative in _SUCCESSOR_RUNTIME_CONTROLLER_ASSETS
+        },
+    )
 
 
 def _publish_exact(
@@ -549,6 +809,8 @@ def _install_for_test(
     successor_raw = b""
     preexec_raw = b""
     successor_wrapper_raw = b""
+    successor_runtime_wrapper_raw = b""
+    successor_runtime_launcher_raw = b""
     if revision_qualified_v4:
         successor_raw = _git(
             source_root,
@@ -575,6 +837,26 @@ def _install_for_test(
             (
                 f"{release_revision}:"
                 "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
+            ),
+        )
+        successor_runtime_wrapper_raw = _git(
+            source_root,
+            "cat-file",
+            "blob",
+            (
+                f"{release_revision}:"
+                "ops/muncho/release-updater/"
+                "muncho-successor-runtime-foundation-exec"
+            ),
+        )
+        successor_runtime_launcher_raw = _git(
+            source_root,
+            "cat-file",
+            "blob",
+            (
+                f"{release_revision}:"
+                "scripts/canary/"
+                "production_successor_rebind_owner_runtime_launcher.py"
             ),
         )
     try:
@@ -658,6 +940,16 @@ def _install_for_test(
                 "PREEXEC_VERIFIER_SHA256",
             )
             != _sha256(preexec_raw)
+            or literal_string(
+                successor_tree,
+                "SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER_SHA256",
+            )
+            != _sha256(successor_runtime_wrapper_raw)
+            or literal_string(
+                successor_tree,
+                "SUCCESSOR_RUNTIME_FOUNDATION_LAUNCHER_SHA256",
+            )
+            != _sha256(successor_runtime_launcher_raw)
         ):
             _fail("rotation_stager_installer_asset_binding_invalid")
     except (SyntaxError, UnicodeError, ValueError, TypeError) as exc:
@@ -685,6 +977,16 @@ def _install_for_test(
         library_root,
         library_root / "scripts",
         library_root / "scripts/canary",
+        *(
+            (
+                library_root / "controller",
+                library_root / "controller/gateway",
+                library_root / "controller/scripts",
+                library_root / "controller/scripts/canary",
+            )
+            if revision_qualified_v4
+            else ()
+        ),
     )
     for selected in library_children:
         _ensure_directory(selected, create=True, production=production)
@@ -700,8 +1002,18 @@ def _install_for_test(
         if revision_qualified
         else _SOURCE_ASSETS
     )
-    for source_relative in sorted(selected_assets):
-        target_relative, mode = selected_assets[source_relative]
+    selected_asset_items = list(sorted(selected_assets.items()))
+    if revision_qualified_v4:
+        selected_asset_items.extend(
+            (
+                source_relative,
+                (f"controller/{target_relative}", mode),
+            )
+            for source_relative, (target_relative, mode) in sorted(
+                _SUCCESSOR_RUNTIME_CONTROLLER_ASSETS.items()
+            )
+        )
+    for source_relative, (target_relative, mode) in selected_asset_items:
         raw = _git(
             source_root,
             "cat-file",
@@ -710,7 +1022,11 @@ def _install_for_test(
         )
         target = (
             library_root / target_relative
-            if revisioned and source_relative in _REVISION_LIBRARY_ASSETS
+            if revisioned
+            and (
+                source_relative in _REVISION_LIBRARY_ASSETS
+                or target_relative.startswith("controller/")
+            )
             else _target(roots, target_relative)
         )
         created = _publish_exact(
@@ -727,6 +1043,39 @@ def _install_for_test(
             "mode": f"{mode:04o}",
             "sha256": _sha256(raw),
             "created": created,
+        })
+    source_snapshot_created = False
+    controller_manifest: Mapping[str, Any] | None = None
+    if revision_qualified_v4:
+        source_snapshot_created = _install_exact_source_snapshot(
+            source_root=source_root,
+            destination=library_root / "source",
+            release_revision=release_revision,
+            source_tree_oid=tree_oid,
+            expected_uid=(0 if production else _read_posix_identity("geteuid")),
+            expected_gid=(0 if production else _read_posix_identity("getegid")),
+        )
+        controller_manifest = _successor_runtime_controller_manifest(
+            source_root=source_root,
+            release_revision=release_revision,
+        )
+        controller_manifest_path = (
+            library_root / "controller" / SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME
+        )
+        controller_manifest_created = _publish_exact(
+            controller_manifest_path,
+            _canonical(controller_manifest) + b"\n",
+            mode=0o444,
+            expected_uid=(0 if production else _read_posix_identity("geteuid")),
+            expected_gid=(0 if production else _read_posix_identity("getegid")),
+        )
+        created_count += int(controller_manifest_created)
+        installed.append({
+            "source_relative_path": "<generated-controller-manifest>",
+            "target_path": str(controller_manifest_path),
+            "mode": "0444",
+            "sha256": _sha256(_canonical(controller_manifest) + b"\n"),
+            "created": controller_manifest_created,
         })
     for selected in reversed(library_children):
         os.chmod(selected, 0o555)
@@ -815,6 +1164,19 @@ def _install_for_test(
             ),
             "foundation_asset_manifest_sha256": _sha256(
                 _canonical(deterministic_assets)
+            ),
+        }
+    if revision_qualified_v4:
+        assert controller_manifest is not None
+        unsigned = {
+            **unsigned,
+            "successor_runtime_source_root": str(library_root / "source"),
+            "successor_runtime_source_snapshot_created": source_snapshot_created,
+            "successor_runtime_controller_manifest_sha256": controller_manifest[
+                "manifest_sha256"
+            ],
+            "successor_runtime_controller_manifest_file_sha256": _sha256(
+                _canonical(controller_manifest) + b"\n"
             ),
         }
     return {**unsigned, "receipt_sha256": _sha256(_canonical(unsigned))}

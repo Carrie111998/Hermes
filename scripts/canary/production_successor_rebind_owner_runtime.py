@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Never
@@ -31,8 +32,14 @@ from scripts.canary import production_successor_rebind_owner_runtime_preexec as 
 
 STAGING_SCHEMA = "muncho-successor-rebind-owner-runtime-staging.v2"
 PUBLICATION_SCHEMA = "muncho-successor-rebind-owner-runtime-publication.v2"
+PROMOTION_INTENT_SCHEMA = "muncho-successor-rebind-owner-runtime-intent.v1"
+PROMOTION_FRAME_SCHEMA = "muncho-successor-rebind-owner-runtime-promote-frame.v1"
 RELEASE_BASE = Path("/usr/lib/muncho-successor-rebind-runtime")
 PUBLICATION_ROOT = Path("/var/lib/muncho-successor-rebind-runtime-publications")
+REVISION_LIBRARY_BASE = Path("/usr/lib/muncho-release-updater-releases")
+PRODUCTION_UV = Path("/usr/local/bin/uv")
+BUILDER_UID = 29104
+BUILDER_GID = 29104
 STAGING_NAME = "staging-publication.json"
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -145,6 +152,65 @@ def _write_exact(path: Path, value: Mapping[str, Any], *, uid: int, gid: int) ->
         if descriptor is not None:
             os.close(descriptor)
     _metadata(path, directory=False, mode=0o444, uid=uid, gid=gid)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError as exc:
+        _fail("successor_rebind_owner_runtime_durability_failed", exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _fsync_runtime_tree(root: Path, manifest: Mapping[str, Any]) -> None:
+    try:
+        directories = tuple(
+            root / entry["path"]
+            for entry in manifest["entries"]
+            if entry.get("kind") == "directory"
+        )
+    except (KeyError, TypeError) as exc:
+        _fail("successor_rebind_owner_runtime_durability_failed", exc)
+    for directory in reversed(directories):
+        _fsync_directory(directory)
+    _fsync_directory(root)
+
+
+def _ensure_publication_root(
+    publication_root: Path,
+    *,
+    root_uid: int,
+    root_gid: int,
+) -> None:
+    if publication_root.exists() or publication_root.is_symlink():
+        _metadata(
+            publication_root,
+            directory=True,
+            mode=0o755,
+            uid=root_uid,
+            gid=root_gid,
+        )
+        return
+    try:
+        publication_root.mkdir(mode=0o755)
+        publication_root.chmod(0o755)
+    except OSError as exc:
+        _fail("successor_rebind_owner_runtime_publication_failed", exc)
+    _metadata(
+        publication_root,
+        directory=True,
+        mode=0o755,
+        uid=root_uid,
+        gid=root_gid,
+    )
+    _fsync_directory(publication_root.parent)
+    _fsync_directory(publication_root)
 
 
 def _validate_digest_fields(value: Mapping[str, Any], names: tuple[str, ...]) -> bool:
@@ -305,6 +371,47 @@ def validate_publication(
         or value.get("publication_sha256") != _digest(unsigned)
     ):
         _fail("successor_rebind_owner_runtime_publication_invalid")
+    return copy.deepcopy(dict(value))
+
+
+def validate_promotion_intent(
+    value: Any,
+    *,
+    revision: str,
+    release_base: Path = RELEASE_BASE,
+) -> dict[str, Any]:
+    fields = {
+        "schema",
+        "release_revision",
+        "runtime_root",
+        "publication",
+        "intent_sha256",
+    }
+    unsigned = (
+        {name: item for name, item in value.items() if name != "intent_sha256"}
+        if isinstance(value, Mapping)
+        else {}
+    )
+    publication = (
+        validate_publication(
+            value.get("publication"),
+            revision=revision,
+            release_base=release_base,
+        )
+        if isinstance(value, Mapping)
+        else {}
+    )
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != fields
+        or value.get("schema") != PROMOTION_INTENT_SCHEMA
+        or value.get("release_revision") != revision
+        or value.get("runtime_root") != str(release_base / revision)
+        or value.get("publication") != publication
+        or _SHA256.fullmatch(str(value.get("intent_sha256", ""))) is None
+        or value.get("intent_sha256") != _digest(unsigned)
+    ):
+        _fail("successor_rebind_owner_runtime_intent_invalid")
     return copy.deepcopy(dict(value))
 
 
@@ -726,6 +833,96 @@ def _require_exact_publication_provenance(
         _fail("successor_rebind_owner_runtime_staging_authority_invalid")
 
 
+def _publication_from_staging(
+    *,
+    revision: str,
+    release_base: Path,
+    staging: Mapping[str, Any],
+    rebased: Mapping[str, Any],
+    attestation: Mapping[str, Any],
+) -> dict[str, Any]:
+    unsigned = {
+        "schema": PUBLICATION_SCHEMA,
+        "release_revision": revision,
+        "source_tree_oid": staging["source_tree_oid"],
+        "runtime_root": str(release_base / revision),
+        "staging_publication_sha256": staging["publication_sha256"],
+        "staging_manifest_sha256": staging["manifest_sha256"],
+        "staging_attestation_sha256": staging["attestation_sha256"],
+        "staging_tree_sha256": staging["tree_sha256"],
+        "staging_interpreter_sha256": staging["interpreter_sha256"],
+        "staging_pyvenv_cfg_sha256": staging["pyvenv_cfg_sha256"],
+        "stage_c_builder_terminal_receipt_sha256": staging[
+            "stage_c_builder_terminal_receipt_sha256"
+        ],
+        "owner_runtime_builder_receipt_sha256": staging[
+            "owner_runtime_builder_receipt_sha256"
+        ],
+        "owner_runtime_wheel_sha256": staging["owner_runtime_wheel_sha256"],
+        "manifest_sha256": rebased["manifest_sha256"],
+        "attestation_sha256": attestation["attestation_sha256"],
+        "tree_sha256": rebased["tree_sha256"],
+        "interpreter_sha256": rebased["interpreter"]["sha256"],
+        "pyvenv_cfg_sha256": rebased["pyvenv_cfg"]["sha256"],
+        "runtime_root_mode": "0555",
+        "interpreter_mode": "0555",
+        "manifest_mode": "0444",
+        "root_owned": True,
+        "create_only": True,
+        "systemd_daemon_reload_performed": False,
+        "unit_enabled": False,
+        "unit_started": False,
+        "unit_scheduled": False,
+        "deployment_performed": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return validate_publication(
+        {**unsigned, "publication_sha256": _digest(unsigned)},
+        revision=revision,
+        release_base=release_base,
+    )
+
+
+def _promotion_intent(
+    *,
+    revision: str,
+    release_base: Path,
+    publication: Mapping[str, Any],
+) -> dict[str, Any]:
+    unsigned = {
+        "schema": PROMOTION_INTENT_SCHEMA,
+        "release_revision": revision,
+        "runtime_root": str(release_base / revision),
+        "publication": copy.deepcopy(dict(publication)),
+    }
+    return validate_promotion_intent(
+        {**unsigned, "intent_sha256": _digest(unsigned)},
+        revision=revision,
+        release_base=release_base,
+    )
+
+
+def _verify_final_tree(
+    publication: Mapping[str, Any],
+    *,
+    revision: str,
+    release_base: Path,
+    root_uid: int,
+    root_gid: int,
+) -> None:
+    preexec.verify(
+        revision=revision,
+        expected_manifest_sha256=publication["manifest_sha256"],
+        expected_tree_sha256=publication["tree_sha256"],
+        expected_interpreter_sha256=publication["interpreter_sha256"],
+        expected_attestation_sha256=publication["attestation_sha256"],
+        runtime_base=release_base,
+        uid=root_uid,
+        gid=root_gid,
+    )
+
+
 def promote_staged_for_test(
     *,
     revision: str,
@@ -746,17 +943,16 @@ def promote_staged_for_test(
     expected_staging_interpreter_sha256: str,
     expected_staging_pyvenv_cfg_sha256: str,
     rename_noreplace: Callable[[Path, Path], None] = _rename_noreplace,
+    after_rename: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Data-only root promotion; no staged interpreter or wheel is executed."""
 
     final_root = release_base / revision
     publication_path = publication_root / f"{revision}.json"
-    if final_root.exists() or final_root.is_symlink():
-        publication = validate_publication(
-            _decode_exact(publication_path, uid=root_uid, gid=root_gid),
-            revision=revision,
-            release_base=release_base,
-        )
+    intent_path = publication_root / f"{revision}.promotion-intent.json"
+    incomplete = release_base / f".{revision}.root-copy-incomplete"
+
+    def require_external_authority(publication: Mapping[str, Any]) -> None:
         _require_exact_publication_provenance(
             publication,
             expected_staging_publication_sha256=(expected_staging_publication_sha256),
@@ -774,6 +970,63 @@ def promote_staged_for_test(
             expected_staging_interpreter_sha256=(expected_staging_interpreter_sha256),
             expected_staging_pyvenv_cfg_sha256=(expected_staging_pyvenv_cfg_sha256),
         )
+
+    def publish_verified(publication: Mapping[str, Any]) -> dict[str, Any]:
+        _verify_final_tree(
+            publication,
+            revision=revision,
+            release_base=release_base,
+            root_uid=root_uid,
+            root_gid=root_gid,
+        )
+        _ensure_publication_root(
+            publication_root,
+            root_uid=root_uid,
+            root_gid=root_gid,
+        )
+        _write_exact(
+            publication_path,
+            publication,
+            uid=root_uid,
+            gid=root_gid,
+        )
+        _fsync_directory(publication_root)
+        return copy.deepcopy(dict(publication))
+
+    if final_root.exists() or final_root.is_symlink():
+        if publication_path.exists() or publication_path.is_symlink():
+            publication = validate_publication(
+                _decode_exact(publication_path, uid=root_uid, gid=root_gid),
+                revision=revision,
+                release_base=release_base,
+            )
+            require_external_authority(publication)
+            _verify_final_tree(
+                publication,
+                revision=revision,
+                release_base=release_base,
+                root_uid=root_uid,
+                root_gid=root_gid,
+            )
+            return publication
+        intent = validate_promotion_intent(
+            _decode_exact(intent_path, uid=root_uid, gid=root_gid),
+            revision=revision,
+            release_base=release_base,
+        )
+        publication = intent["publication"]
+        require_external_authority(publication)
+        return publish_verified(publication)
+    if publication_path.exists() or publication_path.is_symlink():
+        _fail("successor_rebind_owner_runtime_existing_invalid")
+    if intent_path.exists() or intent_path.is_symlink():
+        intent = validate_promotion_intent(
+            _decode_exact(intent_path, uid=root_uid, gid=root_gid),
+            revision=revision,
+            release_base=release_base,
+        )
+        publication = intent["publication"]
+        require_external_authority(publication)
         preexec.verify(
             revision=revision,
             expected_manifest_sha256=publication["manifest_sha256"],
@@ -783,8 +1036,25 @@ def promote_staged_for_test(
             runtime_base=release_base,
             uid=root_uid,
             gid=root_gid,
+            physical_root=incomplete,
         )
-        return publication
+        recovered_manifest = _decode_exact(
+            incomplete / runtime.MANIFEST_NAME,
+            uid=root_uid,
+            gid=root_gid,
+        )
+        _fsync_runtime_tree(incomplete, recovered_manifest)
+        _fsync_directory(release_base)
+        try:
+            rename_noreplace(incomplete, final_root)
+        except SuccessorRebindOwnerRuntimeError:
+            raise
+        except OSError as exc:
+            _fail("successor_rebind_owner_runtime_promotion_failed", exc)
+        _fsync_directory(release_base)
+        if after_rename is not None:
+            after_rename()
+        return publish_verified(publication)
     staging_base = _staging_base(release_base, revision)
     staging_root = staging_base / revision
     staging = validate_staging_publication(
@@ -830,7 +1100,6 @@ def promote_staged_for_test(
         root_uid=root_uid,
         root_gid=root_gid,
     )
-    incomplete = release_base / f".{revision}.root-copy-incomplete"
     if incomplete.exists() or incomplete.is_symlink():
         _fail("successor_rebind_owner_runtime_incomplete_conflict")
     _copy_tree_exact(
@@ -870,81 +1139,38 @@ def promote_staged_for_test(
         gid=root_gid,
         physical_root=incomplete,
     )
+    publication = _publication_from_staging(
+        revision=revision,
+        release_base=release_base,
+        staging=staging,
+        rebased=rebased,
+        attestation=attestation,
+    )
+    require_external_authority(publication)
+    intent = _promotion_intent(
+        revision=revision,
+        release_base=release_base,
+        publication=publication,
+    )
+    _fsync_runtime_tree(incomplete, rebased)
+    _fsync_directory(release_base)
+    _ensure_publication_root(
+        publication_root,
+        root_uid=root_uid,
+        root_gid=root_gid,
+    )
+    _write_exact(intent_path, intent, uid=root_uid, gid=root_gid)
+    _fsync_directory(publication_root)
     try:
         rename_noreplace(incomplete, final_root)
     except SuccessorRebindOwnerRuntimeError:
         raise
     except OSError as exc:
         _fail("successor_rebind_owner_runtime_promotion_failed", exc)
-    preexec.verify(
-        revision=revision,
-        expected_manifest_sha256=rebased["manifest_sha256"],
-        expected_tree_sha256=rebased["tree_sha256"],
-        expected_interpreter_sha256=rebased["interpreter"]["sha256"],
-        expected_attestation_sha256=attestation["attestation_sha256"],
-        runtime_base=release_base,
-        uid=root_uid,
-        gid=root_gid,
-    )
-    if publication_root.exists() or publication_root.is_symlink():
-        _metadata(
-            publication_root,
-            directory=True,
-            mode=0o755,
-            uid=root_uid,
-            gid=root_gid,
-        )
-    else:
-        publication_root.mkdir(parents=True, mode=0o755)
-        publication_root.chmod(0o755)
-    unsigned = {
-        "schema": PUBLICATION_SCHEMA,
-        "release_revision": revision,
-        "source_tree_oid": staging["source_tree_oid"],
-        "runtime_root": str(final_root),
-        "staging_publication_sha256": staging["publication_sha256"],
-        "staging_manifest_sha256": staging["manifest_sha256"],
-        "staging_attestation_sha256": staging["attestation_sha256"],
-        "staging_tree_sha256": staging["tree_sha256"],
-        "staging_interpreter_sha256": staging["interpreter_sha256"],
-        "staging_pyvenv_cfg_sha256": staging["pyvenv_cfg_sha256"],
-        "stage_c_builder_terminal_receipt_sha256": staging[
-            "stage_c_builder_terminal_receipt_sha256"
-        ],
-        "owner_runtime_builder_receipt_sha256": staging[
-            "owner_runtime_builder_receipt_sha256"
-        ],
-        "owner_runtime_wheel_sha256": staging["owner_runtime_wheel_sha256"],
-        "manifest_sha256": rebased["manifest_sha256"],
-        "attestation_sha256": attestation["attestation_sha256"],
-        "tree_sha256": rebased["tree_sha256"],
-        "interpreter_sha256": rebased["interpreter"]["sha256"],
-        "pyvenv_cfg_sha256": rebased["pyvenv_cfg"]["sha256"],
-        "runtime_root_mode": "0555",
-        "interpreter_mode": "0555",
-        "manifest_mode": "0444",
-        "root_owned": True,
-        "create_only": True,
-        "systemd_daemon_reload_performed": False,
-        "unit_enabled": False,
-        "unit_started": False,
-        "unit_scheduled": False,
-        "deployment_performed": False,
-        "secret_material_recorded": False,
-        "secret_digest_recorded": False,
-    }
-    publication = validate_publication(
-        {**unsigned, "publication_sha256": _digest(unsigned)},
-        revision=revision,
-        release_base=release_base,
-    )
-    _write_exact(
-        publication_path,
-        publication,
-        uid=root_uid,
-        gid=root_gid,
-    )
-    return publication
+    _fsync_directory(release_base)
+    if after_rename is not None:
+        after_rename()
+    return publish_verified(publication)
 
 
 def validate_active_installation(
@@ -1015,16 +1241,325 @@ def validate_active_installation(
     return publication
 
 
+def _require_os_identity(*, uid: int, gid: int) -> None:
+    try:
+        observed_uid = os.geteuid()
+        observed_gid = os.getegid()
+    except (AttributeError, OSError) as exc:
+        _fail("successor_rebind_owner_runtime_identity_unavailable", exc)
+    if observed_uid != uid or observed_gid != gid or (uid == 0) != (gid == 0):
+        _fail("successor_rebind_owner_runtime_identity_invalid")
+
+
+def _production_source_root(revision: str) -> Path:
+    return REVISION_LIBRARY_BASE / revision / "source"
+
+
+def _require_exact_production_source(
+    *,
+    revision: str,
+    source_tree_oid: str,
+) -> Path:
+    source = _production_source_root(revision)
+    try:
+        state = os.lstat(source)
+    except OSError as exc:
+        _fail("successor_rebind_owner_runtime_source_invalid", exc)
+    if (
+        _REVISION.fullmatch(revision or "") is None
+        or _REVISION.fullmatch(source_tree_oid or "") is None
+        or not stat.S_ISDIR(state.st_mode)
+        or stat.S_ISLNK(state.st_mode)
+        or state.st_uid != 0
+        or state.st_gid != 0
+        or stat.S_IMODE(state.st_mode) & 0o022
+    ):
+        _fail("successor_rebind_owner_runtime_source_invalid")
+    environment = {
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    def git(*arguments: str) -> bytes:
+        try:
+            completed = subprocess.run(
+                (
+                    "/usr/bin/git",
+                    "-c",
+                    f"safe.directory={source}",
+                    "-C",
+                    str(source),
+                    *arguments,
+                ),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=60,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _fail("successor_rebind_owner_runtime_source_invalid", exc)
+        if (
+            completed.returncode != 0
+            or completed.stderr
+            or len(completed.stdout) > 1024 * 1024
+        ):
+            _fail("successor_rebind_owner_runtime_source_invalid")
+        return completed.stdout
+
+    try:
+        head = git("rev-parse", "HEAD").decode("ascii", errors="strict").strip()
+        tree = git("rev-parse", "HEAD^{tree}").decode("ascii", errors="strict").strip()
+    except UnicodeError as exc:
+        _fail("successor_rebind_owner_runtime_source_invalid", exc)
+    if (
+        head != revision
+        or tree != source_tree_oid
+        or git("status", "--porcelain=v1", "--untracked-files=all")
+    ):
+        _fail("successor_rebind_owner_runtime_source_invalid")
+    return source
+
+
+def prepare_runtime(revision: str) -> Path:
+    """Fixed production root phase; no target or build code is executed."""
+
+    _require_os_identity(uid=0, gid=0)
+    return prepare_staging_for_test(
+        revision=revision,
+        release_base=RELEASE_BASE,
+        root_uid=0,
+        root_gid=0,
+        builder_uid=BUILDER_UID,
+        builder_gid=BUILDER_GID,
+    )
+
+
+def build_runtime_as_dedicated_builder(
+    revision: str,
+    *,
+    source_tree_oid: str,
+    stage_c_builder_terminal_receipt_sha256: str,
+) -> dict[str, Any]:
+    """Fixed production builder phase; the root identity is always rejected."""
+
+    _require_os_identity(uid=BUILDER_UID, gid=BUILDER_GID)
+    source_root = _require_exact_production_source(
+        revision=revision,
+        source_tree_oid=source_tree_oid,
+    )
+
+    def fixed_builder(spec: package.OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
+        if (
+            spec.revision != revision
+            or spec.source_root != source_root
+            or spec.release_base != _staging_base(RELEASE_BASE, revision)
+        ):
+            _fail("successor_rebind_owner_runtime_builder_contract_invalid")
+        return package.build_owner_runtime(
+            package.OwnerRuntimeBuildSpec(
+                revision=revision,
+                source_root=source_root,
+                release_base=spec.release_base,
+                uv_executable=PRODUCTION_UV,
+                git_executable=Path("/usr/bin/git"),
+            )
+        )
+
+    return build_staged_for_test(
+        revision=revision,
+        source_root=source_root,
+        release_base=RELEASE_BASE,
+        builder_uid=BUILDER_UID,
+        builder_gid=BUILDER_GID,
+        effective_uid=os.geteuid(),
+        effective_gid=os.getegid(),
+        source_tree_oid=source_tree_oid,
+        stage_c_builder_terminal_receipt_sha256=(
+            stage_c_builder_terminal_receipt_sha256
+        ),
+        builder=fixed_builder,
+    )
+
+
+def validate_promotion_frame(value: Any, *, revision: str) -> dict[str, Any]:
+    digest_fields = (
+        "staging_publication_sha256",
+        "stage_c_builder_terminal_receipt_sha256",
+        "owner_runtime_builder_receipt_sha256",
+        "owner_runtime_wheel_sha256",
+        "staging_manifest_sha256",
+        "staging_attestation_sha256",
+        "staging_tree_sha256",
+        "staging_interpreter_sha256",
+        "staging_pyvenv_cfg_sha256",
+    )
+    fields = {
+        "schema",
+        "release_revision",
+        "source_tree_oid",
+        *digest_fields,
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "frame_sha256",
+    }
+    unsigned = (
+        {name: item for name, item in value.items() if name != "frame_sha256"}
+        if isinstance(value, Mapping)
+        else {}
+    )
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != fields
+        or value.get("schema") != PROMOTION_FRAME_SCHEMA
+        or value.get("release_revision") != revision
+        or _REVISION.fullmatch(str(value.get("source_tree_oid", ""))) is None
+        or not _validate_digest_fields(value, digest_fields + ("frame_sha256",))
+        or value.get("secret_material_recorded") is not False
+        or value.get("secret_digest_recorded") is not False
+        or value.get("frame_sha256") != _digest(unsigned)
+    ):
+        _fail("successor_rebind_owner_runtime_promotion_frame_invalid")
+    return copy.deepcopy(dict(value))
+
+
+def build_promotion_frame(
+    *,
+    revision: str,
+    source_tree_oid: str,
+    staging_publication_sha256: str,
+    stage_c_builder_terminal_receipt_sha256: str,
+    owner_runtime_builder_receipt_sha256: str,
+    owner_runtime_wheel_sha256: str,
+    staging_manifest_sha256: str,
+    staging_attestation_sha256: str,
+    staging_tree_sha256: str,
+    staging_interpreter_sha256: str,
+    staging_pyvenv_cfg_sha256: str,
+) -> dict[str, Any]:
+    unsigned = {
+        "schema": PROMOTION_FRAME_SCHEMA,
+        "release_revision": revision,
+        "source_tree_oid": source_tree_oid,
+        "staging_publication_sha256": staging_publication_sha256,
+        "stage_c_builder_terminal_receipt_sha256": (
+            stage_c_builder_terminal_receipt_sha256
+        ),
+        "owner_runtime_builder_receipt_sha256": (owner_runtime_builder_receipt_sha256),
+        "owner_runtime_wheel_sha256": owner_runtime_wheel_sha256,
+        "staging_manifest_sha256": staging_manifest_sha256,
+        "staging_attestation_sha256": staging_attestation_sha256,
+        "staging_tree_sha256": staging_tree_sha256,
+        "staging_interpreter_sha256": staging_interpreter_sha256,
+        "staging_pyvenv_cfg_sha256": staging_pyvenv_cfg_sha256,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return validate_promotion_frame(
+        {**unsigned, "frame_sha256": _digest(unsigned)},
+        revision=revision,
+    )
+
+
+def promote_runtime(frame: Mapping[str, Any]) -> dict[str, Any]:
+    """Fixed production root phase driven only by bound provenance bytes."""
+
+    _require_os_identity(uid=0, gid=0)
+    revision = str(frame.get("release_revision", ""))
+    value = validate_promotion_frame(frame, revision=revision)
+    return promote_staged_for_test(
+        revision=revision,
+        release_base=RELEASE_BASE,
+        publication_root=PUBLICATION_ROOT,
+        builder_uid=BUILDER_UID,
+        builder_gid=BUILDER_GID,
+        root_uid=0,
+        root_gid=0,
+        expected_staging_publication_sha256=value["staging_publication_sha256"],
+        expected_source_tree_oid=value["source_tree_oid"],
+        expected_stage_c_builder_terminal_receipt_sha256=value[
+            "stage_c_builder_terminal_receipt_sha256"
+        ],
+        expected_owner_runtime_builder_receipt_sha256=value[
+            "owner_runtime_builder_receipt_sha256"
+        ],
+        expected_owner_runtime_wheel_sha256=value["owner_runtime_wheel_sha256"],
+        expected_staging_manifest_sha256=value["staging_manifest_sha256"],
+        expected_staging_attestation_sha256=value["staging_attestation_sha256"],
+        expected_staging_tree_sha256=value["staging_tree_sha256"],
+        expected_staging_interpreter_sha256=value["staging_interpreter_sha256"],
+        expected_staging_pyvenv_cfg_sha256=value["staging_pyvenv_cfg_sha256"],
+    )
+
+
+def production_main(argv: tuple[str, ...] | None = None) -> int:
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    try:
+        if len(arguments) == 2 and arguments[0] == "prepare-runtime":
+            result: Any = {"staging_base": str(prepare_runtime(arguments[1]))}
+        elif (
+            len(arguments) == 4 and arguments[0] == "build-runtime-as-dedicated-builder"
+        ):
+            result = build_runtime_as_dedicated_builder(
+                arguments[1],
+                source_tree_oid=arguments[2],
+                stage_c_builder_terminal_receipt_sha256=arguments[3],
+            )
+        elif len(arguments) == 2 and arguments[0] == "promote-runtime":
+            raw = sys.stdin.buffer.read(runtime.MAX_MANIFEST_BYTES + 1)
+            if len(raw) > runtime.MAX_MANIFEST_BYTES or not raw.endswith(b"\n"):
+                _fail("successor_rebind_owner_runtime_promotion_frame_invalid")
+            try:
+                decoded = json.loads(raw[:-1].decode("ascii", errors="strict"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                _fail("successor_rebind_owner_runtime_promotion_frame_invalid", exc)
+            if (
+                not isinstance(decoded, Mapping)
+                or raw != _canonical(decoded) + b"\n"
+                or decoded.get("release_revision") != arguments[1]
+            ):
+                _fail("successor_rebind_owner_runtime_promotion_frame_invalid")
+            result = promote_runtime(decoded)
+        else:
+            _fail("successor_rebind_owner_runtime_action_invalid")
+    except (OSError, SuccessorRebindOwnerRuntimeError):
+        print(
+            '{"error_code":"successor_rebind_owner_runtime_foundation_failed","ok":false}',
+            file=sys.stderr,
+        )
+        return 2
+    print((_canonical(result) + b"\n").decode("ascii"), end="")
+    return 0
+
+
 __all__ = [
     "PUBLICATION_ROOT",
     "PUBLICATION_SCHEMA",
+    "PROMOTION_INTENT_SCHEMA",
+    "PROMOTION_FRAME_SCHEMA",
     "RELEASE_BASE",
     "STAGING_SCHEMA",
     "SuccessorRebindOwnerRuntimeError",
+    "build_promotion_frame",
+    "build_runtime_as_dedicated_builder",
     "build_staged_for_test",
     "prepare_staging_for_test",
+    "prepare_runtime",
+    "production_main",
+    "promote_runtime",
     "promote_staged_for_test",
     "validate_active_installation",
+    "validate_promotion_intent",
+    "validate_promotion_frame",
     "validate_publication",
     "validate_staging_publication",
 ]

@@ -15,6 +15,10 @@ from ops.muncho.runtime import upstream_sync_job_rail as rail
 from scripts.canary import package_production_cutover_artifacts as host_package
 from scripts.canary import production_release_update_contract as release_contract
 from scripts.canary import production_release_consumer_inventory as inventory
+from scripts.canary import production_release_rotation_stager_installer as foundation
+from scripts.canary import (
+    production_successor_rebind_owner_runtime as foundation_runtime,
+)
 from scripts.canary import production_cutover_owner_launcher as owner_launcher
 from scripts.canary import upstream_sync_rail_cutover as activation
 from scripts.canary import upstream_sync_rail_successor_rebind as successor
@@ -30,10 +34,26 @@ STAGE_C_BUILDER_RECEIPT = "9" * 64
 
 
 def _owner_runtime_kwargs() -> dict[str, str]:
+    controller_manifest = foundation.successor_runtime_controller_manifest_from_bytes(
+        release_revision=TARGET,
+        assets={
+            relative: (ROOT / relative).read_bytes()
+            for relative in foundation._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS  # noqa: SLF001
+        },
+    )
     return {
         "source_tree_oid": SOURCE_TREE,
         "stage_c_builder_terminal_receipt_sha256": STAGE_C_BUILDER_RECEIPT,
         "foundation_wrapper_sha256": successor.FOUNDATION_V4_WRAPPER_SHA256,
+        "successor_runtime_foundation_wrapper_sha256": (
+            successor.SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER_SHA256
+        ),
+        "successor_runtime_foundation_launcher_sha256": (
+            successor.SUCCESSOR_RUNTIME_FOUNDATION_LAUNCHER_SHA256
+        ),
+        "successor_runtime_controller_manifest_file_sha256": hashlib.sha256(
+            activation._canonical(controller_manifest) + b"\n"  # noqa: SLF001
+        ).hexdigest(),
         "controller_owner_runtime_manifest_sha256": "a" * 64,
         "controller_owner_runtime_attestation_sha256": "b" * 64,
         "controller_owner_runtime_tree_sha256": "c" * 64,
@@ -349,6 +369,13 @@ def _build_owner_harness(
     release_runtime = rail.release_root(TARGET) / successor.RUNTIME_RELATIVE
     release_runtime.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / successor.RUNTIME_RELATIVE, release_runtime)
+    for relative in (
+        *foundation._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS,  # noqa: SLF001
+        "ops/muncho/release-updater/muncho-successor-runtime-foundation-exec",
+    ):
+        target = release_runtime.parents[2] / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)
     harness.runtime_path = release_runtime
     harness.authority_path.unlink()
     harness.preflight_path.unlink()
@@ -1120,6 +1147,62 @@ def test_owner_path_recovers_crash_between_exact_authority_and_preflight_stage(
     assert owner.harness.preflight_path.exists()
 
 
+@pytest.mark.parametrize("stage_name", ("authority", "preflight"))
+def test_owner_path_recovers_crash_after_create_only_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage_name: str,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    target = (
+        owner.harness.authority_path
+        if stage_name == "authority"
+        else owner.harness.preflight_path
+    )
+    real_unlink = Path.unlink
+    crashed = False
+
+    def crash_before_pending_unlink(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal crashed
+        if (
+            not crashed
+            and path.name.startswith(f".{target.name}.")
+            and path.name.endswith(".stage")
+            and target.exists()
+            and path.lstat().st_ino == target.lstat().st_ino
+        ):
+            crashed = True
+            raise KeyboardInterrupt
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", crash_before_pending_unlink)
+    with pytest.raises(KeyboardInterrupt):
+        owner.apply()
+
+    raw = target.read_bytes()
+    pending = successor._stage_pending_path(  # noqa: SLF001
+        target,
+        hashlib.sha256(raw).hexdigest(),
+    )
+    assert crashed is True
+    assert pending.exists()
+    assert target.lstat().st_ino == pending.lstat().st_ino
+    assert target.stat().st_nlink == 2
+    crash_inode = target.stat().st_ino
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    result = owner.apply()
+
+    assert result["terminal_verified"] is True
+    assert not pending.exists()
+    assert target.stat().st_ino == crash_inode
+    assert target.stat().st_nlink == 1
+
+
 def test_owner_path_holds_stage0_bundle_through_staging_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1550,6 +1633,11 @@ def test_production_transport_keeps_controller_and_remote_runtime_proofs_separat
         ),
     )
     monkeypatch.setattr(owner_launcher, "ProductionCutoverTransport", Transport)
+    monkeypatch.setattr(
+        successor._ProductionOwnerRebindTransport,  # noqa: SLF001
+        "_prepare_build_promote",
+        lambda _self, _request: None,
+    )
 
     transport = successor._ProductionOwnerRebindTransport(request)  # noqa: SLF001
     assert (
@@ -1573,6 +1661,148 @@ def test_production_transport_keeps_controller_and_remote_runtime_proofs_separat
         )
     ]
     assert request["remote_owner_runtime_manifest_sha256"] != local["manifest_sha256"]
+
+
+def test_production_transport_runs_fixed_prepare_build_promote_before_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_activation_receipt_sha256=PREDECESSOR_RECEIPT,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+        **_owner_runtime_kwargs(),
+    )
+    local = {
+        name: request[f"controller_owner_runtime_{name}"]
+        for name in (
+            "manifest_sha256",
+            "attestation_sha256",
+            "tree_sha256",
+            "interpreter_sha256",
+        )
+    }
+    monkeypatch.setattr(
+        production_owner_runtime,
+        "require_active_owner_runtime",
+        lambda revision: local if revision == TARGET else pytest.fail(revision),
+    )
+
+    class Identity:
+        def account_for_read_only_preflight(self) -> str:
+            return "owner@example.invalid"
+
+    staging_base = foundation_runtime.RELEASE_BASE / f".{TARGET}.builder-staging"
+    built = {
+        "publication_sha256": request[
+            "remote_owner_runtime_staging_publication_sha256"
+        ],
+        "manifest_sha256": request["remote_owner_runtime_staging_manifest_sha256"],
+        "attestation_sha256": request[
+            "remote_owner_runtime_staging_attestation_sha256"
+        ],
+        "tree_sha256": request["remote_owner_runtime_staging_tree_sha256"],
+        "interpreter_sha256": request[
+            "remote_owner_runtime_staging_interpreter_sha256"
+        ],
+        "pyvenv_cfg_sha256": request["remote_owner_runtime_staging_pyvenv_cfg_sha256"],
+        "owner_runtime_builder_receipt_sha256": request[
+            "remote_owner_runtime_builder_receipt_sha256"
+        ],
+        "owner_runtime_wheel_sha256": request["remote_owner_runtime_wheel_sha256"],
+        "source_tree_oid": SOURCE_TREE,
+        "stage_c_builder_terminal_receipt_sha256": STAGE_C_BUILDER_RECEIPT,
+    }
+    promoted = {
+        "publication_sha256": request["remote_owner_runtime_publication_sha256"],
+        "manifest_sha256": request["remote_owner_runtime_manifest_sha256"],
+        "attestation_sha256": request["remote_owner_runtime_attestation_sha256"],
+        "tree_sha256": request["remote_owner_runtime_tree_sha256"],
+        "interpreter_sha256": request["remote_owner_runtime_interpreter_sha256"],
+    }
+    frame = {"schema": "fixed-promotion-frame"}
+    monkeypatch.setattr(
+        foundation_runtime,
+        "validate_staging_publication",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        foundation_runtime,
+        "validate_publication",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        foundation_runtime,
+        "build_promotion_frame",
+        lambda **_kwargs: frame,
+    )
+    monkeypatch.setattr(
+        owner_launcher,
+        "build_production_cutover_owner_identity",
+        lambda revision: (
+            (Identity(), Path("/usr/bin/gcloud"), "production-owner")
+            if revision == TARGET
+            else pytest.fail(revision)
+        ),
+    )
+
+    calls: list[tuple[tuple[str, ...], bytes]] = []
+    outputs = [
+        activation._canonical({"staging_base": str(staging_base)}) + b"\n",  # noqa: SLF001
+        activation._canonical(built) + b"\n",  # noqa: SLF001
+        activation._canonical(promoted) + b"\n",  # noqa: SLF001
+        b"exact-rebind-result\n",
+    ]
+
+    class Transport:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def _run_remote_input(
+            self,
+            argv: tuple[str, ...],
+            *,
+            input_bytes: bytes,
+            **_kwargs: Any,
+        ) -> Any:
+            calls.append((argv, input_bytes))
+            return type("Completed", (), {"stdout": outputs[len(calls) - 1]})()
+
+    monkeypatch.setattr(owner_launcher, "ProductionCutoverTransport", Transport)
+
+    transport = successor._ProductionOwnerRebindTransport(request)  # noqa: SLF001
+    assert (
+        transport.invoke_successor_rebind(
+            target_revision=TARGET,
+            request_frame=successor.encode_owner_request(request),
+        )
+        == b"exact-rebind-result\n"
+    )
+
+    foundation_prefix = (
+        str(successor.SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER),
+        TARGET,
+        request["successor_runtime_foundation_wrapper_sha256"],
+        request["successor_runtime_foundation_launcher_sha256"],
+        request["successor_runtime_controller_manifest_file_sha256"],
+    )
+    assert [call[0] for call in calls[:3]] == [
+        (foundation_prefix[0], "prepare-runtime", *foundation_prefix[1:]),
+        (
+            foundation_prefix[0],
+            "build-runtime-as-dedicated-builder",
+            *foundation_prefix[1:],
+            SOURCE_TREE,
+            STAGE_C_BUILDER_RECEIPT,
+        ),
+        (foundation_prefix[0], "promote-runtime", *foundation_prefix[1:]),
+    ]
+    assert calls[0][1] == b""
+    assert calls[1][1] == b""
+    assert calls[2][1] == activation._canonical(frame) + b"\n"  # noqa: SLF001
 
 
 def test_production_transport_rejects_controller_proof_mismatch_without_using_remote(

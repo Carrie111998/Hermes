@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
+import stat
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -19,6 +24,143 @@ SOURCE_TREE = "b" * 40
 STAGE_C_TERMINAL = "c" * 64
 BUILDER_RECEIPT = "d" * 64
 WHEEL = "e" * 64
+ROOT = Path(__file__).parents[3]
+
+
+@pytest.mark.parametrize("payload", (b"[]\n", b'"scalar"\n'))
+def test_production_promote_rejects_non_object_json_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: bytes,
+) -> None:
+    stdin = io.TextIOWrapper(io.BytesIO(payload), encoding="ascii")
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    assert publisher.production_main(("promote-runtime", REVISION)) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        '{"error_code":"successor_rebind_owner_runtime_foundation_failed","ok":false}\n'
+    )
+
+
+def test_production_builder_refuses_root_before_source_or_target_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(publisher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(publisher.os, "getegid", lambda: 0)
+    monkeypatch.setattr(
+        publisher,
+        "_require_exact_production_source",
+        lambda **_kwargs: pytest.fail("source must not be read as root"),
+    )
+
+    with pytest.raises(
+        publisher.SuccessorRebindOwnerRuntimeError,
+        match="successor_rebind_owner_runtime_identity_invalid",
+    ):
+        publisher.build_runtime_as_dedicated_builder(
+            REVISION,
+            source_tree_oid=SOURCE_TREE,
+            stage_c_builder_terminal_receipt_sha256=STAGE_C_TERMINAL,
+        )
+
+
+def test_production_entrypoint_refuses_simulated_root_builder_in_subprocess() -> None:
+    expression = (
+        "import sys;"
+        f"sys.path.insert(0,{str(ROOT)!r});"
+        "from scripts.canary import production_successor_rebind_owner_runtime as p;"
+        "p.os.geteuid=lambda:0;"
+        "p.os.getegid=lambda:0;"
+        f"raise SystemExit(p.production_main(('build-runtime-as-dedicated-builder',"
+        f"{REVISION!r},{SOURCE_TREE!r},{STAGE_C_TERMINAL!r})))"
+    )
+    completed = subprocess.run(
+        (sys.executable, "-I", "-S", "-B", "-c", expression),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"},
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == b""
+    assert completed.stderr == (
+        b'{"error_code":"successor_rebind_owner_runtime_foundation_failed",'
+        b'"ok":false}\n'
+    )
+    assert b"Traceback" not in completed.stderr
+
+
+def test_production_source_requires_exact_clean_revision_and_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "library/pending/source"
+    source.mkdir(parents=True)
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ("/usr/bin/git", *arguments),
+            cwd=source,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+            },
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "test")
+    git("config", "user.email", "test@example.invalid")
+    (source / "tracked.txt").write_text("exact\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "exact source")
+    revision = git("rev-parse", "HEAD")
+    tree = git("rev-parse", "HEAD^{tree}")
+    selected = tmp_path / "library" / revision / "source"
+    selected.parent.mkdir(parents=True)
+    source.rename(selected)
+
+    original_lstat = publisher.os.lstat
+
+    def root_owned_lstat(path: os.PathLike[str] | str) -> SimpleNamespace:
+        state = original_lstat(path)
+        return SimpleNamespace(
+            st_mode=stat.S_IFDIR | stat.S_IMODE(state.st_mode),
+            st_uid=0,
+            st_gid=0,
+        )
+
+    monkeypatch.setattr(publisher.os, "lstat", root_owned_lstat)
+    monkeypatch.setattr(publisher, "REVISION_LIBRARY_BASE", tmp_path / "library")
+
+    assert (
+        publisher._require_exact_production_source(  # noqa: SLF001
+            revision=revision,
+            source_tree_oid=tree,
+        )
+        == selected
+    )
+
+    (selected / "foreign.txt").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(
+        publisher.SuccessorRebindOwnerRuntimeError,
+        match="successor_rebind_owner_runtime_source_invalid",
+    ):
+        publisher._require_exact_production_source(  # noqa: SLF001
+            revision=revision,
+            source_tree_oid=tree,
+        )
 
 
 def _sha(raw: bytes) -> str:
@@ -367,3 +509,62 @@ def test_atomic_no_replace_race_preserves_foreign_target(tmp_path: Path) -> None
     ):
         publisher.promote_staged_for_test(**arguments)
     assert (staged.final_root / "foreign").read_bytes() == marker
+
+
+def test_retry_recovers_crash_after_rename_before_publication(tmp_path: Path) -> None:
+    staged = _staged_fixture(tmp_path)
+    arguments = staged.promotion_arguments()
+
+    def crash_after_rename() -> None:
+        raise RuntimeError("simulated process crash after durable rename")
+
+    arguments["after_rename"] = crash_after_rename
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        publisher.promote_staged_for_test(**arguments)
+
+    publication_path = staged.publication_root / f"{REVISION}.json"
+    intent_path = staged.publication_root / f"{REVISION}.promotion-intent.json"
+    assert staged.final_root.is_dir()
+    assert intent_path.is_file()
+    assert not publication_path.exists()
+
+    arguments.pop("after_rename")
+    publication = publisher.promote_staged_for_test(**arguments)
+
+    assert publication_path.is_file()
+    assert (
+        publication["publication_sha256"]
+        == publisher.validate_publication(
+            publisher._decode_exact(  # noqa: SLF001
+                publication_path,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+            ),
+            revision=REVISION,
+            release_base=staged.release_base,
+        )["publication_sha256"]
+    )
+
+
+def test_recovery_refuses_final_tree_changed_after_crash(tmp_path: Path) -> None:
+    staged = _staged_fixture(tmp_path)
+    arguments = staged.promotion_arguments()
+
+    def crash_after_rename() -> None:
+        raise RuntimeError("simulated process crash after durable rename")
+
+    arguments["after_rename"] = crash_after_rename
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        publisher.promote_staged_for_test(**arguments)
+
+    final_module = staged.final_root / staged.module_relative
+    final_module.chmod(0o644)
+    final_module.write_bytes(b"different post-crash tree\n")
+    final_module.chmod(0o444)
+    arguments.pop("after_rename")
+    with pytest.raises(
+        preexec.SuccessorRuntimePreExecError,
+        match="successor_runtime_preexec_",
+    ):
+        publisher.promote_staged_for_test(**arguments)
+    assert not (staged.publication_root / f"{REVISION}.json").exists()

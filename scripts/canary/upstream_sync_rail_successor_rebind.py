@@ -41,6 +41,9 @@ from scripts.canary.production_cutover_activation_lock import (
     authority_activation_lock,
 )
 from scripts.canary import production_release_builder_runtime as release_builder
+from scripts.canary import (
+    production_release_rotation_stager_installer as foundation_installer,
+)
 from scripts.canary import production_release_update_stage0 as release_stage0
 
 
@@ -74,6 +77,15 @@ FOUNDATION_V4_WRAPPER_SHA256 = (
 PREEXEC_VERIFIER_SHA256 = (
     "4cb6d6924a86393776a723597a5110c19fbf6d71f7f5bd37550b29dc407030aa"
 )
+SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER = Path(
+    "/usr/libexec/muncho-successor-runtime-foundation-exec"
+)
+SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER_SHA256 = (
+    "a5123cc93a9e43b3132cae602480cbac26eb021f9ea69d031182509f62b0b635"
+)
+SUCCESSOR_RUNTIME_FOUNDATION_LAUNCHER_SHA256 = (
+    "daf0f00cf137e58609eb48ebc870eef93e549c44817bd403ab2523fde19cd0e2"
+)
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -85,6 +97,9 @@ _OWNER_RUNTIME_IDENTITY_FIELDS = (
     "stage_c_builder_terminal_receipt_sha256",
     "foundation_wrapper_sha256",
     "preexec_verifier_sha256",
+    "successor_runtime_foundation_wrapper_sha256",
+    "successor_runtime_foundation_launcher_sha256",
+    "successor_runtime_controller_manifest_file_sha256",
     "controller_owner_runtime_manifest_sha256",
     "controller_owner_runtime_attestation_sha256",
     "controller_owner_runtime_tree_sha256",
@@ -206,6 +221,9 @@ def build_owner_request(
     remote_owner_runtime_builder_receipt_sha256: str,
     remote_owner_runtime_wheel_sha256: str,
     preexec_verifier_sha256: str,
+    successor_runtime_foundation_wrapper_sha256: str,
+    successor_runtime_foundation_launcher_sha256: str,
+    successor_runtime_controller_manifest_file_sha256: str,
 ) -> dict[str, Any]:
     """Build the sole public owner input from exact reviewed identities."""
 
@@ -274,6 +292,15 @@ def build_owner_request(
         ),
         "remote_owner_runtime_wheel_sha256": remote_owner_runtime_wheel_sha256,
         "preexec_verifier_sha256": preexec_verifier_sha256,
+        "successor_runtime_foundation_wrapper_sha256": (
+            successor_runtime_foundation_wrapper_sha256
+        ),
+        "successor_runtime_foundation_launcher_sha256": (
+            successor_runtime_foundation_launcher_sha256
+        ),
+        "successor_runtime_controller_manifest_file_sha256": (
+            successor_runtime_controller_manifest_file_sha256
+        ),
         "caller_selected_paths_allowed": False,
         "caller_selected_commands_allowed": False,
         "caller_selected_targets_allowed": False,
@@ -323,6 +350,9 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
         "remote_owner_runtime_builder_receipt_sha256",
         "remote_owner_runtime_wheel_sha256",
         "preexec_verifier_sha256",
+        "successor_runtime_foundation_wrapper_sha256",
+        "successor_runtime_foundation_launcher_sha256",
+        "successor_runtime_controller_manifest_file_sha256",
         "caller_selected_paths_allowed",
         "caller_selected_commands_allowed",
         "caller_selected_targets_allowed",
@@ -349,6 +379,10 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
         or request["target_revision"] == request["predecessor_revision"]
         or request["foundation_wrapper_sha256"] != FOUNDATION_V4_WRAPPER_SHA256
         or request["preexec_verifier_sha256"] != PREEXEC_VERIFIER_SHA256
+        or request["successor_runtime_foundation_wrapper_sha256"]
+        != SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER_SHA256
+        or request["successor_runtime_foundation_launcher_sha256"]
+        != SUCCESSOR_RUNTIME_FOUNDATION_LAUNCHER_SHA256
         or any(
             _SHA256.fullmatch(str(request.get(name, ""))) is None
             for name in (
@@ -377,6 +411,9 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
                 "remote_owner_runtime_builder_receipt_sha256",
                 "remote_owner_runtime_wheel_sha256",
                 "preexec_verifier_sha256",
+                "successor_runtime_foundation_wrapper_sha256",
+                "successor_runtime_foundation_launcher_sha256",
+                "successor_runtime_controller_manifest_file_sha256",
                 "request_sha256",
             )
         )
@@ -1322,6 +1359,31 @@ def _validate_stage0_bundle(
         expected_release_root = release_trust_root / (
             f"hermes-agent-{request['target_revision'][:12]}"
         )
+        controller_assets = {
+            relative: (bundle.release_root / relative).read_bytes()
+            for relative in foundation_installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS  # noqa: SLF001
+        }
+        controller_manifest = (
+            foundation_installer.successor_runtime_controller_manifest_from_bytes(
+                release_revision=request["target_revision"],
+                assets=controller_assets,
+            )
+        )
+        controller_manifest_file_sha256 = activation._sha256(  # noqa: SLF001
+            activation._canonical(controller_manifest) + b"\n"  # noqa: SLF001
+        )
+        foundation_wrapper_sha256 = activation._sha256(  # noqa: SLF001
+            (
+                bundle.release_root
+                / "ops/muncho/release-updater/muncho-successor-runtime-foundation-exec"
+            ).read_bytes()
+        )
+        launcher_sha256 = activation._sha256(  # noqa: SLF001
+            controller_assets[
+                "scripts/canary/production_successor_rebind_owner_runtime_launcher.py"
+            ]
+        )
+        bundle.assert_stable()
         if (
             publication.get("release_revision") != request["target_revision"]
             or plan.get("release_revision") != request["target_revision"]
@@ -1348,6 +1410,12 @@ def _validate_stage0_bundle(
             != request["source_tree_oid"]
             or bundle.builder_receipt.get("receipt_sha256")
             != request["stage_c_builder_terminal_receipt_sha256"]
+            or foundation_wrapper_sha256
+            != request["successor_runtime_foundation_wrapper_sha256"]
+            or launcher_sha256
+            != request["successor_runtime_foundation_launcher_sha256"]
+            or controller_manifest_file_sha256
+            != request["successor_runtime_controller_manifest_file_sha256"]
             or bundle.release_root != expected_release_root
             or bundle.builder_manifest.get("release_revision")
             != request["target_revision"]
@@ -1451,6 +1519,71 @@ def _read_pending_transaction_inode(
         or b"".join(chunks) != raw
     ):
         _fail("upstream_sync_successor_stage_hardlink_invalid")
+
+
+def _read_existing_stage_candidate(
+    path: Path,
+    *,
+    root_owned: bool,
+) -> Mapping[str, Any]:
+    """Read an existing stage while permitting only its recoverable link state."""
+
+    descriptor: int | None = None
+    try:
+        activation._validate_trusted_parent_chain(  # noqa: SLF001
+            path,
+            boundary=path.parent,
+            root_owned=root_owned,
+        )
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink not in {1, 2}
+            or not 0 < before.st_size <= activation.MAX_JSON_BYTES
+            or stat.S_IMODE(before.st_mode) != 0o444
+            or root_owned
+            and (before.st_uid != 0 or before.st_gid != 0)
+        ):
+            _fail("upstream_sync_successor_stage_invalid")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        reached = path.lstat()
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except (OSError, activation.UpstreamSyncRailCutoverError) as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    raw = b"".join(chunks)
+    if (
+        len(raw) != before.st_size
+        or len({
+            activation._identity(item)  # noqa: SLF001
+            for item in (before, opened, after, reached)
+        })
+        != 1
+        or not raw.endswith(b"\n")
+    ):
+        _fail("upstream_sync_successor_stage_invalid")
+    try:
+        return activation._decode(raw[:-1])  # noqa: SLF001
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
 
 
 def _fsync_directory(path: Path) -> None:
@@ -2901,11 +3034,17 @@ def _owner_apply_verified(
     authority: dict[str, Any]
     preflight_value: dict[str, Any]
     if authority_exists:
-        provisional = activation._read_canonical_json(  # noqa: SLF001
+        stability_guard()
+        provisional = _read_existing_stage_candidate(
             authority_path,
             root_owned=root_owned,
-            modes=frozenset({0o444}),
         )
+        _stage_create_only(
+            provisional,
+            path=authority_path,
+            root_owned=root_owned,
+        )
+        stability_guard()
         authority_digest = str(provisional.get("authority_sha256", ""))
         authority = validate_authority(
             provisional,
@@ -2921,11 +3060,17 @@ def _owner_apply_verified(
             release_trust_root=release_trust_root,
         )
         if preflight_exists:
-            provisional_preflight = activation._read_canonical_json(  # noqa: SLF001
+            stability_guard()
+            provisional_preflight = _read_existing_stage_candidate(
                 preflight_path,
                 root_owned=root_owned,
-                modes=frozenset({0o444}),
             )
+            _stage_create_only(
+                provisional_preflight,
+                path=preflight_path,
+                root_owned=root_owned,
+            )
+            stability_guard()
             preflight_digest = str(provisional_preflight.get("receipt_sha256", ""))
             preflight_value = _validate_preflight(
                 provisional_preflight,
@@ -3140,6 +3285,9 @@ class _ProductionOwnerRebindTransport:
     def __init__(self, request_value: Mapping[str, Any]) -> None:
         from gateway import production_owner_runtime
         from scripts.canary import production_cutover_owner_launcher as owner
+        from scripts.canary import (
+            production_successor_rebind_owner_runtime as foundation,
+        )
 
         request = validate_owner_request(request_value)
         target_revision = request["target_revision"]
@@ -3189,6 +3337,138 @@ class _ProductionOwnerRebindTransport:
             gcloud_executable=trusted,
             gcloud_configuration=configuration,
         )
+        self._foundation = foundation
+        self._account = self._identity.account_for_read_only_preflight()
+        self._prepare_build_promote(request)
+
+    def _foundation_call(
+        self,
+        request: Mapping[str, Any],
+        operation: str,
+        *,
+        extra_argv: tuple[str, ...] = (),
+        input_bytes: bytes = b"",
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        completed = self._transport._run_remote_input(  # noqa: SLF001
+            (
+                str(SUCCESSOR_RUNTIME_FOUNDATION_WRAPPER),
+                operation,
+                request["target_revision"],
+                request["successor_runtime_foundation_wrapper_sha256"],
+                request["successor_runtime_foundation_launcher_sha256"],
+                request["successor_runtime_controller_manifest_file_sha256"],
+                *extra_argv,
+            ),
+            account=self._account,
+            input_bytes=input_bytes,
+            maximum_input_bytes=self._foundation.runtime.MAX_MANIFEST_BYTES,
+            maximum_output_bytes=self._foundation.runtime.MAX_MANIFEST_BYTES,
+            timeout_seconds=timeout_seconds,
+        )
+        raw = completed.stdout
+        if (
+            not isinstance(raw, bytes)
+            or not raw.endswith(b"\n")
+            or raw.endswith(b"\n\n")
+        ):
+            _fail("upstream_sync_successor_owner_runtime_foundation_failed")
+        try:
+            value = activation._decode(raw[:-1])  # noqa: SLF001
+        except activation.UpstreamSyncRailCutoverError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_owner_runtime_foundation_failed"
+            ) from exc
+        if not isinstance(value, Mapping):
+            _fail("upstream_sync_successor_owner_runtime_foundation_failed")
+        return copy.deepcopy(dict(value))
+
+    def _prepare_build_promote(self, request: Mapping[str, Any]) -> None:
+        revision = request["target_revision"]
+        prepared = self._foundation_call(
+            request,
+            "prepare-runtime",
+            timeout_seconds=120.0,
+        )
+        expected_staging_base = (
+            self._foundation.RELEASE_BASE / f".{revision}.builder-staging"
+        )
+        if prepared != {"staging_base": str(expected_staging_base)}:
+            _fail("upstream_sync_successor_owner_runtime_foundation_failed")
+        built = self._foundation.validate_staging_publication(
+            self._foundation_call(
+                request,
+                "build-runtime-as-dedicated-builder",
+                extra_argv=(
+                    request["source_tree_oid"],
+                    request["stage_c_builder_terminal_receipt_sha256"],
+                ),
+                timeout_seconds=2_400.0,
+            ),
+            revision=revision,
+            staging_root=expected_staging_base / revision,
+        )
+        expected_staging = {
+            "publication_sha256": request[
+                "remote_owner_runtime_staging_publication_sha256"
+            ],
+            "manifest_sha256": request["remote_owner_runtime_staging_manifest_sha256"],
+            "attestation_sha256": request[
+                "remote_owner_runtime_staging_attestation_sha256"
+            ],
+            "tree_sha256": request["remote_owner_runtime_staging_tree_sha256"],
+            "interpreter_sha256": request[
+                "remote_owner_runtime_staging_interpreter_sha256"
+            ],
+            "pyvenv_cfg_sha256": request[
+                "remote_owner_runtime_staging_pyvenv_cfg_sha256"
+            ],
+            "owner_runtime_builder_receipt_sha256": request[
+                "remote_owner_runtime_builder_receipt_sha256"
+            ],
+            "owner_runtime_wheel_sha256": request["remote_owner_runtime_wheel_sha256"],
+            "source_tree_oid": request["source_tree_oid"],
+            "stage_c_builder_terminal_receipt_sha256": request[
+                "stage_c_builder_terminal_receipt_sha256"
+            ],
+        }
+        if any(built[name] != value for name, value in expected_staging.items()):
+            _fail("upstream_sync_successor_owner_runtime_foundation_failed")
+        frame = self._foundation.build_promotion_frame(
+            revision=revision,
+            source_tree_oid=request["source_tree_oid"],
+            staging_publication_sha256=built["publication_sha256"],
+            stage_c_builder_terminal_receipt_sha256=built[
+                "stage_c_builder_terminal_receipt_sha256"
+            ],
+            owner_runtime_builder_receipt_sha256=built[
+                "owner_runtime_builder_receipt_sha256"
+            ],
+            owner_runtime_wheel_sha256=built["owner_runtime_wheel_sha256"],
+            staging_manifest_sha256=built["manifest_sha256"],
+            staging_attestation_sha256=built["attestation_sha256"],
+            staging_tree_sha256=built["tree_sha256"],
+            staging_interpreter_sha256=built["interpreter_sha256"],
+            staging_pyvenv_cfg_sha256=built["pyvenv_cfg_sha256"],
+        )
+        promoted = self._foundation.validate_publication(
+            self._foundation_call(
+                request,
+                "promote-runtime",
+                input_bytes=activation._canonical(frame) + b"\n",  # noqa: SLF001
+                timeout_seconds=2_400.0,
+            ),
+            revision=revision,
+        )
+        expected_final = {
+            "publication_sha256": request["remote_owner_runtime_publication_sha256"],
+            "manifest_sha256": request["remote_owner_runtime_manifest_sha256"],
+            "attestation_sha256": request["remote_owner_runtime_attestation_sha256"],
+            "tree_sha256": request["remote_owner_runtime_tree_sha256"],
+            "interpreter_sha256": request["remote_owner_runtime_interpreter_sha256"],
+        }
+        if any(promoted[name] != value for name, value in expected_final.items()):
+            _fail("upstream_sync_successor_owner_runtime_foundation_failed")
 
     def invoke_successor_rebind(
         self,
@@ -3201,7 +3481,6 @@ class _ProductionOwnerRebindTransport:
         request = decode_owner_request(request_frame)
         if request["request_sha256"] != self._request_sha256:
             _fail("upstream_sync_successor_owner_request_changed")
-        account = self._identity.account_for_read_only_preflight()
         completed = self._transport._run_remote_input(  # noqa: SLF001
             (
                 str(FOUNDATION_V4_WRAPPER),
@@ -3209,7 +3488,7 @@ class _ProductionOwnerRebindTransport:
                 "successor-rebind-owner-apply",
                 *self._runtime_identities,
             ),
-            account=account,
+            account=self._account,
             input_bytes=request_frame,
             maximum_input_bytes=_OWNER_FRAME_MAX_BYTES + 8,
             maximum_output_bytes=64 * 1024,
@@ -3528,6 +3807,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--remote-owner-runtime-builder-receipt-sha256")
     parser.add_argument("--remote-owner-runtime-wheel-sha256")
     parser.add_argument("--preexec-verifier-sha256")
+    parser.add_argument("--successor-runtime-foundation-wrapper-sha256")
+    parser.add_argument("--successor-runtime-foundation-launcher-sha256")
+    parser.add_argument("--successor-runtime-controller-manifest-file-sha256")
     return parser
 
 
@@ -3562,6 +3844,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.remote_owner_runtime_builder_receipt_sha256,
         arguments.remote_owner_runtime_wheel_sha256,
         arguments.preexec_verifier_sha256,
+        arguments.successor_runtime_foundation_wrapper_sha256,
+        arguments.successor_runtime_foundation_launcher_sha256,
+        arguments.successor_runtime_controller_manifest_file_sha256,
     )
     if arguments.operation == "owner-run":
         if (
@@ -3645,6 +3930,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         arguments.remote_owner_runtime_wheel_sha256
                     ),
                     preexec_verifier_sha256=(arguments.preexec_verifier_sha256),
+                    successor_runtime_foundation_wrapper_sha256=(
+                        arguments.successor_runtime_foundation_wrapper_sha256
+                    ),
+                    successor_runtime_foundation_launcher_sha256=(
+                        arguments.successor_runtime_foundation_launcher_sha256
+                    ),
+                    successor_runtime_controller_manifest_file_sha256=(
+                        arguments.successor_runtime_controller_manifest_file_sha256
+                    ),
                 )
             )
         )

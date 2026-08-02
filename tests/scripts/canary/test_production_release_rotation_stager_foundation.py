@@ -18,6 +18,9 @@ from scripts.canary import production_release_builder_phase as phase
 from scripts.canary import production_release_rotation_stager_input_author as author
 from scripts.canary import production_release_rotation_stager_installer as installer
 from scripts.canary import production_release_rotation_stager_launcher as launcher
+from scripts.canary import (
+    production_successor_rebind_owner_runtime_launcher as foundation_launcher,
+)
 
 
 ROOT = Path(__file__).parents[3]
@@ -273,6 +276,7 @@ def _installer_source(tmp_path: Path) -> tuple[Path, str]:
         | set(installer._REVISION_STATIC_ASSETS)
         | set(installer._LATCHED_REVISION_STATIC_ASSETS)
         | set(installer._SUCCESSOR_REBIND_STATIC_ASSETS)
+        | set(installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS)
     )
     files = {relative: (ROOT / relative).read_bytes() for relative in source_paths}
     files["scripts/canary/production_cutover_unit_input_rotation.py"] = (
@@ -527,8 +531,11 @@ def test_successor_rebind_v4_foundation_is_create_only_and_inert(
     first = installer._install_for_test(**kwargs)
     second = installer._install_for_test(**kwargs)
 
-    expected_assets = len(installer._REVISION_LIBRARY_ASSETS) + len(
-        installer._SUCCESSOR_REBIND_STATIC_ASSETS
+    expected_assets = (
+        len(installer._REVISION_LIBRARY_ASSETS)
+        + len(installer._SUCCESSOR_REBIND_STATIC_ASSETS)
+        + len(installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS)
+        + 1
     )
     assert (
         first["schema"] == installer.SUCCESSOR_REBIND_FOUNDATION_INSTALL_RECEIPT_SCHEMA
@@ -536,6 +543,21 @@ def test_successor_rebind_v4_foundation_is_create_only_and_inert(
     assert first["foundation_layout"] == ("successor-rebind-revision-qualified-v4")
     assert first["created_asset_count"] == expected_assets
     assert second["created_asset_count"] == 0
+    library = roots.library_releases / revision
+    source_snapshot = library / "source"
+    controller = library / "controller"
+    assert first["successor_runtime_source_snapshot_created"] is True
+    assert second["successor_runtime_source_snapshot_created"] is False
+    assert _run("git", "rev-parse", "HEAD", cwd=source_snapshot) == revision
+    assert _run("git", "status", "--porcelain=v1", cwd=source_snapshot) == ""
+    manifest_raw = (
+        controller / installer.SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME
+    ).read_bytes()
+    assert (
+        hashlib.sha256(manifest_raw).hexdigest()
+        == first["successor_runtime_controller_manifest_file_sha256"]
+    )
+    assert stat.S_IMODE(controller.stat().st_mode) == 0o555
     wrapper = roots.libexec / "muncho-release-foundation-exec-v4"
     assert stat.S_IMODE(wrapper.stat().st_mode) == 0o555
     assert not any("systemctl" in item for call in calls for item in call)
@@ -550,7 +572,9 @@ def test_successor_rebind_v4_foundation_is_create_only_and_inert(
     "relative",
     (
         "ops/muncho/release-updater/muncho-release-foundation-exec-v4",
+        "ops/muncho/release-updater/muncho-successor-runtime-foundation-exec",
         "scripts/canary/production_successor_rebind_owner_runtime_preexec.py",
+        "scripts/canary/production_successor_rebind_owner_runtime_launcher.py",
     ),
 )
 def test_successor_rebind_v4_installer_rejects_stale_bound_digests(
@@ -583,6 +607,53 @@ def test_successor_rebind_v4_installer_rejects_stale_bound_digests(
         )
 
 
+def test_successor_source_snapshot_recovers_exact_incomplete_after_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, revision = _installer_source(tmp_path)
+    roots = _installer_roots(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    kwargs = {
+        "source_root": source,
+        "source_remote": "fork",
+        "repository_url": REMOTE_URL,
+        "release_revision": revision,
+        "roots": roots,
+        "production": False,
+        "command_runner": lambda argv: _fake_foundation_command(roots, calls, argv),
+        "identity_validator": lambda: None,
+        "foundation_validator": _validate_test_foundation,
+        "revision_qualified_v4": True,
+    }
+    real_rename = installer._rename_directory_noreplace  # noqa: SLF001
+    crashed = False
+
+    def crash_before_rename(source_path: Path, destination_path: Path) -> None:
+        nonlocal crashed
+        crashed = True
+        assert source_path.name.endswith(".incomplete")
+        assert destination_path.name == "source"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(installer, "_rename_directory_noreplace", crash_before_rename)
+    with pytest.raises(KeyboardInterrupt):
+        installer._install_for_test(**kwargs)
+
+    incomplete = roots.library_releases / revision / f".source.{revision}.incomplete"
+    assert crashed is True
+    assert incomplete.is_dir()
+    assert not (roots.library_releases / revision / "source").exists()
+
+    monkeypatch.setattr(installer, "_rename_directory_noreplace", real_rename)
+    receipt = installer._install_for_test(**kwargs)
+
+    assert receipt["successor_runtime_source_snapshot_created"] is True
+    assert not incomplete.exists()
+    snapshot = roots.library_releases / revision / "source"
+    assert _run("git", "rev-parse", "HEAD", cwd=snapshot) == revision
+
+
 def test_successor_rebind_v4_wrapper_has_only_one_fixed_action() -> None:
     raw = (
         ROOT / "ops/muncho/release-updater/muncho-release-foundation-exec-v4"
@@ -606,6 +677,395 @@ def test_successor_rebind_v4_wrapper_has_only_one_fixed_action() -> None:
     assert "hermes-agent-releases" not in raw
     assert '"$@"' not in raw
     assert "systemctl" not in raw
+
+
+def test_successor_runtime_wrapper_and_launcher_are_closed_before_import() -> None:
+    wrapper = (
+        ROOT / "ops/muncho/release-updater/muncho-successor-runtime-foundation-exec"
+    ).read_text(encoding="utf-8")
+    launcher = (
+        ROOT / "scripts/canary/production_successor_rebind_owner_runtime_launcher.py"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "fixed_wrapper=/usr/libexec/muncho-successor-runtime-foundation-exec" in wrapper
+    )
+    assert "library_base=/usr/lib/muncho-release-updater-releases" in wrapper
+    assert "builder_uid=29104" in wrapper
+    assert "builder_gid=29104" in wrapper
+    assert wrapper.count("prepare-runtime)") == 1
+    assert wrapper.count("build-runtime-as-dedicated-builder)") == 1
+    assert wrapper.count("promote-runtime)") == 1
+    assert '--reuid="$builder_uid"' in wrapper
+    assert '--regid="$builder_gid"' in wrapper
+    assert "--clear-groups" in wrapper
+    assert "--inh-caps=-all" in wrapper
+    assert "--ambient-caps=-all" in wrapper
+    assert "--bounding-set=-all" in wrapper
+    assert "--no-new-privs" in wrapper
+    assert "/usr/bin/env -i" in wrapper
+    assert "systemctl" not in wrapper
+    assert "eval " not in wrapper
+    dropped_identity = wrapper.index('--reuid="$builder_uid"')
+    assert dropped_identity < wrapper.index(
+        '/usr/bin/python3 -I -S -B "$launcher"',
+        dropped_identity,
+    )
+
+    validation = launcher.index(
+        "controller = _validate_controller(revision, controller_manifest_file_sha256)"
+    )
+    path_activation = launcher.index("sys.path.insert(0, str(controller))")
+    target_import = launcher.index(
+        "production_successor_rebind_owner_runtime as owner_runtime"
+    )
+    assert validation < path_activation < target_import
+    assert "import subprocess" not in launcher
+    assert "runpy.run_module" not in launcher
+
+
+def _successor_controller_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    revision = "a" * 40
+    library_base = tmp_path / "library"
+    controller = library_base / revision / "controller"
+    assets = {
+        relative: (ROOT / relative).read_bytes()
+        for relative in installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS
+    }
+    for relative, (
+        target_relative,
+        mode,
+    ) in installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS.items():
+        target = controller / target_relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(assets[relative])
+        target.chmod(mode)
+    manifest = installer.successor_runtime_controller_manifest_from_bytes(
+        release_revision=revision,
+        assets=assets,
+    )
+    manifest_path = controller / installer.SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME
+    manifest_path.write_bytes(installer._canonical(manifest) + b"\n")  # noqa: SLF001
+    manifest_path.chmod(0o444)
+    for directory in (
+        controller / "gateway",
+        controller / "scripts/canary",
+        controller / "scripts",
+        controller,
+        controller.parent,
+    ):
+        directory.chmod(0o555)
+    library_base.chmod(0o755)
+
+    original_lstat = os.lstat
+    original_fstat = os.fstat
+
+    def root_owned(state: os.stat_result) -> SimpleNamespace:
+        return SimpleNamespace(
+            st_dev=state.st_dev,
+            st_ino=state.st_ino,
+            st_mode=state.st_mode,
+            st_uid=0,
+            st_gid=0,
+            st_nlink=state.st_nlink,
+            st_size=state.st_size,
+            st_mtime_ns=state.st_mtime_ns,
+            st_ctime_ns=state.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(
+        foundation_launcher.os,
+        "lstat",
+        lambda path: root_owned(original_lstat(path)),
+    )
+    monkeypatch.setattr(
+        foundation_launcher.os,
+        "fstat",
+        lambda descriptor: root_owned(original_fstat(descriptor)),
+    )
+    monkeypatch.setattr(foundation_launcher, "LIBRARY_BASE", library_base)
+    monkeypatch.setattr(
+        foundation_launcher,
+        "__file__",
+        str(controller / foundation_launcher.ENTRY_RELATIVE),
+    )
+    return controller, revision, hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("mutation", ("manifest", "extra", "symlink"))
+def test_successor_controller_rejects_tamper_extra_and_symlink_before_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    controller, revision, manifest_sha256 = _successor_controller_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    manifest_path = controller / installer.SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME
+    if mutation == "manifest":
+        manifest_path.chmod(0o644)
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        manifest_path.chmod(0o444)
+    elif mutation == "extra":
+        controller.chmod(0o755)
+        extra = controller / "extra.py"
+        extra.write_bytes(b"foreign\n")
+        extra.chmod(0o444)
+        controller.chmod(0o555)
+    else:
+        gateway = controller / "gateway"
+        selected = gateway / "production_owner_runtime.py"
+        gateway.chmod(0o755)
+        selected.unlink()
+        selected.symlink_to(controller / "scripts/__init__.py")
+        gateway.chmod(0o555)
+
+    original_sys_path = list(sys.path)
+    with pytest.raises(
+        foundation_launcher.SuccessorRuntimeFoundationLauncherError,
+        match="successor_runtime_foundation_launcher_invalid",
+    ):
+        foundation_launcher.main(("prepare-runtime", revision, manifest_sha256))
+    assert sys.path == original_sys_path
+
+
+def test_sealed_controller_launcher_reaches_owner_runtime_in_isolated_subprocess(
+    tmp_path: Path,
+) -> None:
+    revision = "b" * 40
+    library_base = tmp_path / "library"
+    controller = library_base / revision / "controller"
+    launcher_relative = (
+        "scripts/canary/production_successor_rebind_owner_runtime_launcher.py"
+    )
+    launcher_raw = (ROOT / launcher_relative).read_text(encoding="utf-8")
+    launcher_raw = launcher_raw.replace(
+        'LIBRARY_BASE = Path("/usr/lib/muncho-release-updater-releases")',
+        f"LIBRARY_BASE = Path({str(library_base)!r})",
+    )
+    launcher_raw = launcher_raw.replace(
+        "before.st_uid != 0",
+        f"before.st_uid != {os.geteuid()}",
+    ).replace(
+        "before.st_gid != 0",
+        f"before.st_gid != {os.getegid()}",
+    )
+    launcher_raw = launcher_raw.replace(
+        "item.st_uid != 0",
+        f"item.st_uid != {os.geteuid()}",
+    ).replace(
+        "item.st_gid != 0",
+        f"item.st_gid != {os.getegid()}",
+    )
+    assets = {
+        relative: (ROOT / relative).read_bytes()
+        for relative in installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS
+    }
+    assets[launcher_relative] = launcher_raw.encode("utf-8")
+    for relative, (
+        target_relative,
+        mode,
+    ) in installer._SUCCESSOR_RUNTIME_CONTROLLER_ASSETS.items():
+        target = controller / target_relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(assets[relative])
+        target.chmod(mode)
+    manifest = installer.successor_runtime_controller_manifest_from_bytes(
+        release_revision=revision,
+        assets=assets,
+    )
+    manifest_path = controller / installer.SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME
+    manifest_path.write_bytes(installer._canonical(manifest) + b"\n")  # noqa: SLF001
+    manifest_path.chmod(0o444)
+    for directory in (
+        controller / "gateway",
+        controller / "scripts/canary",
+        controller / "scripts",
+        controller,
+        controller.parent,
+    ):
+        directory.chmod(0o555)
+    library_base.chmod(0o755)
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(controller / launcher_relative),
+            "prepare-runtime",
+            revision,
+            hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"},
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == b""
+    assert completed.stderr == (
+        b'{"error_code":"successor_rebind_owner_runtime_foundation_failed",'
+        b'"ok":false}\n'
+    )
+    assert b"successor_runtime_foundation_launcher_failed" not in completed.stderr
+
+
+def test_foundation_wrapper_subprocess_orders_fixed_identity_drop_before_builder(
+    tmp_path: Path,
+) -> None:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    log = tmp_path / "calls.log"
+    wrapper_path = tmp_path / "muncho-successor-runtime-foundation-exec"
+    library_base = tmp_path / "library"
+    launcher_path = library_base / ("c" * 40) / "controller/launcher.py"
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_bytes(b"sealed launcher\n")
+    launcher_path.chmod(0o444)
+
+    def executable(name: str, raw: str) -> Path:
+        path = tools / name
+        path.write_text(raw, encoding="utf-8")
+        path.chmod(0o555)
+        return path
+
+    fake_id = executable(
+        "id",
+        '#!/bin/sh\ncase "$1" in -u|-g) echo 0;; *) exit 2;; esac\n',
+    )
+    fake_stat = executable(
+        "stat",
+        "#!/bin/sh\n"
+        "for item do last=$item; done\n"
+        f'case "$last" in {shlex.quote(str(wrapper_path))}) echo 0:0:555:1;; '
+        f"{shlex.quote(str(launcher_path))}) echo 0:0:444:1;; "
+        f"{shlex.quote(str(library_base))}) echo 0:0:755;; *) echo 0:0:555;; esac\n",
+    )
+    fake_python = executable(
+        "python3",
+        "#!/bin/sh\n"
+        f"printf 'python' >> {shlex.quote(str(log))}\n"
+        f"for item do printf ' <%s>' \"$item\" >> {shlex.quote(str(log))}; done\n"
+        f"printf '\\n' >> {shlex.quote(str(log))}\n"
+        f"payload=$(cat); printf 'stdin=<%s>\\n' \"$payload\" >> {shlex.quote(str(log))}\n"
+        "printf '{\"ok\":true}\\n'\n",
+    )
+    fake_env = executable(
+        "env",
+        "#!/bin/sh\n"
+        f"printf 'env' >> {shlex.quote(str(log))}\n"
+        f"for item do printf ' <%s>' \"$item\" >> {shlex.quote(str(log))}; done\n"
+        f"printf '\\n' >> {shlex.quote(str(log))}\n"
+        '[ "$1" = -i ] && shift\n'
+        'while [ "${1#*=}" != "$1" ]; do shift; done\n'
+        'exec "$@"\n',
+    )
+    fake_setpriv = executable(
+        "setpriv",
+        "#!/bin/sh\n"
+        f"printf 'setpriv' >> {shlex.quote(str(log))}\n"
+        f"for item do printf ' <%s>' \"$item\" >> {shlex.quote(str(log))}; done\n"
+        f"printf '\\n' >> {shlex.quote(str(log))}\n"
+        'while [ "$1" != -- ]; do shift; done\n'
+        'shift\nexec "$@"\n',
+    )
+
+    wrapper = (
+        ROOT / "ops/muncho/release-updater/muncho-successor-runtime-foundation-exec"
+    ).read_text(encoding="utf-8")
+    replacements = {
+        "/usr/libexec/muncho-successor-runtime-foundation-exec": str(wrapper_path),
+        "/usr/lib/muncho-release-updater-releases": str(library_base),
+        "/usr/bin/id": str(fake_id),
+        "/usr/bin/stat": str(fake_stat),
+        "/usr/bin/python3": str(fake_python),
+        "/usr/bin/setpriv": str(fake_setpriv),
+        "/usr/bin/env": str(fake_env),
+        "/usr/bin/sha256sum": str(tools / "sha256sum"),
+    }
+    for old, new in replacements.items():
+        wrapper = wrapper.replace(old, new)
+    wrapper = wrapper.replace(
+        'launcher="$controller/scripts/canary/'
+        'production_successor_rebind_owner_runtime_launcher.py"',
+        f"launcher={shlex.quote(str(launcher_path))}",
+    )
+    wrapper_path.write_text(wrapper, encoding="utf-8")
+    wrapper_path.chmod(0o555)
+    wrapper_sha256 = hashlib.sha256(wrapper_path.read_bytes()).hexdigest()
+    launcher_sha256 = hashlib.sha256(launcher_path.read_bytes()).hexdigest()
+    executable(
+        "sha256sum",
+        "#!/bin/sh\n"
+        "for item do last=$item; done\n"
+        f"case \"$last\" in {shlex.quote(str(wrapper_path))}) echo {wrapper_sha256}'  x';; "
+        f"{shlex.quote(str(launcher_path))}) echo {launcher_sha256}'  x';; *) exit 2;; esac\n",
+    )
+    common = (
+        "c" * 40,
+        wrapper_sha256,
+        launcher_sha256,
+        "d" * 64,
+    )
+
+    prepare = subprocess.run(
+        (str(wrapper_path), "prepare-runtime", *common),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    build = subprocess.run(
+        (
+            str(wrapper_path),
+            "build-runtime-as-dedicated-builder",
+            *common,
+            "e" * 40,
+            "f" * 64,
+        ),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    promote_frame = b'{"frame":"exact"}\n'
+    promote = subprocess.run(
+        (str(wrapper_path), "promote-runtime", *common),
+        input=promote_frame,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+
+    assert (prepare.returncode, build.returncode, promote.returncode) == (0, 0, 0)
+    assert prepare.stdout == build.stdout == promote.stdout == b'{"ok":true}\n'
+    assert prepare.stderr == build.stderr == promote.stderr == b""
+    calls = log.read_text(encoding="utf-8")
+    setpriv_line = next(
+        line for line in calls.splitlines() if line.startswith("setpriv")
+    )
+    assert " <--reuid=29104>" in setpriv_line
+    assert " <--regid=29104>" in setpriv_line
+    assert " <--clear-groups>" in setpriv_line
+    assert " <--inh-caps=-all>" in setpriv_line
+    assert " <--ambient-caps=-all>" in setpriv_line
+    assert " <--bounding-set=-all>" in setpriv_line
+    assert " <--no-new-privs>" in setpriv_line
+    assert setpriv_line.index("<--no-new-privs>") < setpriv_line.index(
+        f"<{fake_python}>"
+    )
+    assert f"<{fake_env}> <-i>" in setpriv_line
+    assert "stdin=<" + promote_frame.decode("ascii").strip() + ">" in calls
 
 
 def test_successor_rebind_v4_preexec_does_not_import_package_initializers(
