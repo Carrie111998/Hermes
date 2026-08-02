@@ -24,6 +24,7 @@ import copy
 import os
 import re
 import stat
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,12 @@ PREFLIGHT_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-preflight.v1"
 STARTED_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-started.v1"
 ARCHIVE_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-archive.v1"
 TERMINAL_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-terminal.v1"
+OWNER_REQUEST_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-owner-request.v1"
+)
+OWNER_RESULT_SCHEMA = (
+    "muncho-dual-upstream-sync-successor-rebind-owner-result.v1"
+)
 ROLLBACK_SCHEMA = "muncho-dual-upstream-sync-successor-rebind-rollback.v1"
 ROLLBACK_INTENT_SCHEMA = (
     "muncho-dual-upstream-sync-successor-rebind-rollback-intent.v1"
@@ -55,6 +62,14 @@ SYSTEMD_ROOT = Path("/etc/systemd/system")
 STAGED_ROOT = rail.PACKAGE_ROOT
 AUTHORITY_PATH = STAGED_ROOT / "successor-rebind-authority.json"
 PREFLIGHT_PATH = STAGED_ROOT / "successor-rebind-preflight.json"
+STAGE_C_HOST_ARTIFACT_MANIFEST_PATH = Path(
+    "/var/lib/muncho-production-release-update/inputs/host-artifact-manifest.json"
+)
+STAGE_C_RELEASE_UPDATE_PUBLICATION_PATH = Path(
+    "/var/lib/muncho-production-release-update/authority/"
+    "release-update-publication.json"
+)
+STAGE_C_TRUST_ROOT = Path("/var/lib/muncho-production-release-update")
 EVIDENCE_ROOT = Path(
     "/var/lib/muncho-production-legacy-cutover/"
     "dual-upstream-sync-successor-rebind"
@@ -65,6 +80,8 @@ RUNTIME_RELATIVE = Path(
 
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_OWNER_FRAME_MAGIC = b"MSR1"
+_OWNER_FRAME_MAX_BYTES = 16 * 1024
 _UNIT_DIGEST_FIELDS = frozenset(UNIT_NAMES)
 _ENABLED_STATES = frozenset(
     {
@@ -131,6 +148,153 @@ def _receipt(unsigned: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_owner_request(
+    *,
+    target_revision: str,
+    target_package_manifest_sha256: str,
+    predecessor_revision: str,
+    predecessor_sender_revision: str,
+    stage_c_host_artifact_manifest_sha256: str,
+    stage_c_release_update_publication_sha256: str,
+    rebind_runtime_sha256: str,
+) -> dict[str, Any]:
+    """Build the sole public owner input from exact reviewed identities."""
+
+    unsigned = {
+        "schema": OWNER_REQUEST_SCHEMA,
+        "operation": OPERATION,
+        "target_revision": target_revision,
+        "target_package_manifest_sha256": target_package_manifest_sha256,
+        "predecessor_revision": predecessor_revision,
+        "predecessor_sender_revision": predecessor_sender_revision,
+        "stage_c_host_artifact_manifest_sha256": (
+            stage_c_host_artifact_manifest_sha256
+        ),
+        "stage_c_release_update_publication_sha256": (
+            stage_c_release_update_publication_sha256
+        ),
+        "rebind_runtime_sha256": rebind_runtime_sha256,
+        "caller_selected_paths_allowed": False,
+        "caller_selected_commands_allowed": False,
+        "caller_selected_targets_allowed": False,
+        "manual_json_allowed": False,
+        "semantic_decisions_allowed": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    request = {
+        **unsigned,
+        "request_sha256": activation._sha256(  # noqa: SLF001
+            activation._canonical(unsigned)  # noqa: SLF001
+        ),
+    }
+    return validate_owner_request(request)
+
+
+def validate_owner_request(value: Any) -> dict[str, Any]:
+    fields = {
+        "schema",
+        "operation",
+        "target_revision",
+        "target_package_manifest_sha256",
+        "predecessor_revision",
+        "predecessor_sender_revision",
+        "stage_c_host_artifact_manifest_sha256",
+        "stage_c_release_update_publication_sha256",
+        "rebind_runtime_sha256",
+        "caller_selected_paths_allowed",
+        "caller_selected_commands_allowed",
+        "caller_selected_targets_allowed",
+        "manual_json_allowed",
+        "semantic_decisions_allowed",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "request_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        _fail("upstream_sync_successor_owner_request_invalid")
+    request = copy.deepcopy(dict(value))
+    if (
+        request.get("schema") != OWNER_REQUEST_SCHEMA
+        or request.get("operation") != OPERATION
+        or any(
+            _SHA40.fullmatch(str(request.get(name, ""))) is None
+            for name in (
+                "target_revision",
+                "predecessor_revision",
+                "predecessor_sender_revision",
+            )
+        )
+        or request["target_revision"]
+        in {
+            request["predecessor_revision"],
+            request["predecessor_sender_revision"],
+        }
+        or any(
+            _SHA256.fullmatch(str(request.get(name, ""))) is None
+            for name in (
+                "target_package_manifest_sha256",
+                "stage_c_host_artifact_manifest_sha256",
+                "stage_c_release_update_publication_sha256",
+                "rebind_runtime_sha256",
+                "request_sha256",
+            )
+        )
+        or any(
+            request.get(name) is not False
+            for name in (
+                "caller_selected_paths_allowed",
+                "caller_selected_commands_allowed",
+                "caller_selected_targets_allowed",
+                "manual_json_allowed",
+                "semantic_decisions_allowed",
+                "secret_material_recorded",
+                "secret_digest_recorded",
+            )
+        )
+        or request["request_sha256"]
+        != activation._sha256(  # noqa: SLF001
+            activation._canonical(  # noqa: SLF001
+                {
+                    name: item
+                    for name, item in request.items()
+                    if name != "request_sha256"
+                }
+            )
+        )
+    ):
+        _fail("upstream_sync_successor_owner_request_invalid")
+    return request
+
+
+def encode_owner_request(value: Mapping[str, Any]) -> bytes:
+    request = validate_owner_request(value)
+    payload = activation._canonical(request)  # noqa: SLF001
+    if not payload or len(payload) > _OWNER_FRAME_MAX_BYTES:
+        _fail("upstream_sync_successor_owner_frame_invalid")
+    return _OWNER_FRAME_MAGIC + struct.pack(">I", len(payload)) + payload
+
+
+def decode_owner_request(frame: bytes) -> dict[str, Any]:
+    if (
+        not isinstance(frame, bytes)
+        or len(frame) < 9
+        or len(frame) > _OWNER_FRAME_MAX_BYTES + 8
+        or frame[:4] != _OWNER_FRAME_MAGIC
+    ):
+        _fail("upstream_sync_successor_owner_frame_invalid")
+    length = struct.unpack(">I", frame[4:8])[0]
+    if length != len(frame) - 8 or not 0 < length <= _OWNER_FRAME_MAX_BYTES:
+        _fail("upstream_sync_successor_owner_frame_invalid")
+    try:
+        value = activation._decode(frame[8:])  # noqa: SLF001
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_owner_frame_invalid"
+        ) from exc
+    return validate_owner_request(value)
+
+
 def _unit_digest_map(value: Any, *, code: str) -> dict[str, str]:
     if (
         not isinstance(value, Mapping)
@@ -177,6 +341,41 @@ def _expected_missing_roots(
     )
 
 
+def _validate_predecessor_unit_contracts(
+    *,
+    predecessor_revision: str,
+    predecessor_sender_revision: str,
+    predecessor_units: Mapping[str, bytes],
+) -> None:
+    report_raw = predecessor_units.get(rail.REPORT_SERVICE_UNIT)
+    if not isinstance(report_raw, bytes):
+        _fail("upstream_sync_successor_predecessor_unit_invalid")
+    match = re.search(
+        rb"(?:^| )--sender-python-sha256 ([0-9a-f]{64})(?: |\n|$)",
+        report_raw,
+    )
+    if match is None or len(match.groups()) != 1:
+        _fail("upstream_sync_successor_predecessor_unit_invalid")
+    try:
+        rail.validate_sync_service(
+            predecessor_units[rail.SYNC_SERVICE_UNIT],
+            revision=predecessor_revision,
+            release=rail.release_root(predecessor_revision),
+        )
+        rail.validate_sync_timer(predecessor_units[rail.SYNC_TIMER_UNIT])
+        rail.validate_report_service(
+            report_raw,
+            release=rail.release_root(predecessor_revision),
+            sender_release=rail.release_root(predecessor_sender_revision),
+            sender_python_sha256=match.group(1).decode("ascii", errors="strict"),
+        )
+        rail.validate_report_timer(predecessor_units[rail.REPORT_TIMER_UNIT])
+    except (KeyError, UnicodeError, rail.DualSyncRailError) as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_predecessor_unit_invalid"
+        ) from exc
+
+
 def build_authority(
     *,
     package: activation.PackageContext,
@@ -211,6 +410,11 @@ def build_authority(
     missing_roots = _expected_missing_roots(
         predecessor_revision,
         predecessor_sender_revision,
+    )
+    _validate_predecessor_unit_contracts(
+        predecessor_revision=predecessor_revision,
+        predecessor_sender_revision=predecessor_sender_revision,
+        predecessor_units=predecessor_units,
     )
     observed_refs = frozenset(
         ref for raw in predecessor_units.values() for ref in _release_references(raw)
@@ -618,6 +822,54 @@ def _validate_fresh_predecessor_state(
         _fail("upstream_sync_successor_timer_prestate_drifted")
 
 
+def _build_preflight_receipt(
+    *,
+    authority: Mapping[str, Any],
+    package: activation.PackageContext,
+    systemd_root: Path,
+    root_owned: bool,
+    host: RebindHost,
+) -> dict[str, Any]:
+    """Observe the complete fresh predecessor state without mutating it."""
+
+    units = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
+    _validate_predecessor_units(units, authority)
+    _prove_missing_predecessor_refs(authority)
+    observed = _observe_all(host, systemd_root=systemd_root)
+    _validate_loaded_digests(
+        observed,
+        expected_digests=authority["predecessor_unit_digests"],
+        systemd_root=systemd_root,
+    )
+    if any(observed[name].active_state != "inactive" for name in SERVICE_NAMES):
+        _fail("upstream_sync_successor_service_busy")
+    timer_prestates = _timer_state_map(observed)
+    return _receipt(
+        {
+            "schema": PREFLIGHT_SCHEMA,
+            "authority_sha256": authority["authority_sha256"],
+            "target_package_manifest_sha256": package.manifest[
+                "manifest_sha256"
+            ],
+            "predecessor_unit_digests": dict(
+                authority["predecessor_unit_digests"]
+            ),
+            "predecessor_missing_release_roots": list(
+                authority["predecessor_missing_release_roots"]
+            ),
+            "target_revision": authority["target_revision"],
+            "target_unit_digests": dict(authority["target_unit_digests"]),
+            "timer_prestates": timer_prestates,
+            "service_units_inactive": True,
+            "missing_release_refs_proven": True,
+            "unit_files_exact": True,
+            "runtime_mutation_performed": False,
+            "secret_material_recorded": False,
+            "secret_digest_recorded": False,
+        }
+    )
+
+
 def preflight(
     *,
     expected_authority_sha256: str,
@@ -647,38 +899,13 @@ def preflight(
         root_owned=root_owned,
         release_trust_root=(release_trust_root or rail.RELEASES_ROOT),
     )
-    units = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
-    _validate_predecessor_units(units, authority)
-    _prove_missing_predecessor_refs(authority)
     selected_host = host or _SystemdHost()
-    observed = _observe_all(selected_host, systemd_root=systemd_root)
-    _validate_loaded_digests(
-        observed,
-        expected_digests=authority["predecessor_unit_digests"],
+    return _build_preflight_receipt(
+        authority=authority,
+        package=package,
         systemd_root=systemd_root,
-    )
-    if any(observed[name].active_state != "inactive" for name in SERVICE_NAMES):
-        _fail("upstream_sync_successor_service_busy")
-    timer_prestates = _timer_state_map(observed)
-    return _receipt(
-        {
-            "schema": PREFLIGHT_SCHEMA,
-            "authority_sha256": authority["authority_sha256"],
-            "target_package_manifest_sha256": package.manifest["manifest_sha256"],
-            "predecessor_unit_digests": dict(authority["predecessor_unit_digests"]),
-            "predecessor_missing_release_roots": list(
-                authority["predecessor_missing_release_roots"]
-            ),
-            "target_revision": authority["target_revision"],
-            "target_unit_digests": dict(authority["target_unit_digests"]),
-            "timer_prestates": timer_prestates,
-            "service_units_inactive": True,
-            "missing_release_refs_proven": True,
-            "unit_files_exact": True,
-            "runtime_mutation_performed": False,
-            "secret_material_recorded": False,
-            "secret_digest_recorded": False,
-        }
+        root_owned=root_owned,
+        host=selected_host,
     )
 
 
@@ -749,6 +976,295 @@ def _validate_preflight(
     ):
         _fail("upstream_sync_successor_preflight_invalid")
     return copy.deepcopy(dict(value))
+
+
+def _validate_stage_c_public_artifacts(
+    *,
+    request: Mapping[str, Any],
+    host_artifact_manifest_path: Path,
+    release_update_publication_path: Path,
+    root_owned: bool,
+) -> None:
+    """Bind the two reviewed, secret-free Stage-C public documents."""
+
+    from scripts.canary import package_production_cutover_artifacts as host_package
+    from scripts.canary import production_release_update_contract as release_contract
+
+    try:
+        for path in (
+            host_artifact_manifest_path,
+            release_update_publication_path,
+        ):
+            activation._validate_trusted_parent_chain(  # noqa: SLF001
+                path,
+                boundary=(
+                    STAGE_C_TRUST_ROOT
+                    if root_owned
+                    else path.parent.parent
+                ),
+                root_owned=root_owned,
+            )
+        host_manifest = activation._read_canonical_json(  # noqa: SLF001
+            host_artifact_manifest_path,
+            root_owned=root_owned,
+            modes=frozenset({0o444}),
+        )
+        publication = activation._read_canonical_json(  # noqa: SLF001
+            release_update_publication_path,
+            root_owned=root_owned,
+            modes=frozenset({0o444}),
+        )
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_c_artifact_invalid"
+        ) from exc
+    host_digest = host_manifest.get("manifest_sha256")
+    publication_digest = publication.get("publication_sha256")
+    plan = publication.get("plan")
+    if (
+        not isinstance(plan, Mapping)
+        or host_manifest.get("schema") != host_package.MANIFEST_SCHEMA
+        or publication.get("schema") != release_contract.PUBLICATION_SCHEMA
+        or publication.get("action") != release_contract.PUBLICATION_ACTION
+        or host_manifest.get("release_revision") != request["target_revision"]
+        or publication.get("release_revision") != request["target_revision"]
+        or plan.get("release_revision") != request["target_revision"]
+        or plan.get("host_artifact_manifest_sha256")
+        != request["stage_c_host_artifact_manifest_sha256"]
+        or host_digest != request["stage_c_host_artifact_manifest_sha256"]
+        or publication_digest
+        != request["stage_c_release_update_publication_sha256"]
+        or host_digest
+        != activation._sha256(  # noqa: SLF001
+            activation._canonical(  # noqa: SLF001
+                {
+                    name: item
+                    for name, item in host_manifest.items()
+                    if name != "manifest_sha256"
+                }
+            )
+        )
+        or publication_digest
+        != activation._sha256(  # noqa: SLF001
+            activation._canonical(  # noqa: SLF001
+                {
+                    name: item
+                    for name, item in publication.items()
+                    if name != "publication_sha256"
+                }
+            )
+        )
+        or host_manifest.get("secret_material_recorded") is not False
+        or publication.get("secret_material_recorded") is not False
+        or publication.get("secret_digest_recorded") is not False
+    ):
+        _fail("upstream_sync_successor_stage_c_artifact_invalid")
+
+
+def _stage_pending_path(path: Path, digest: str) -> Path:
+    if _SHA256.fullmatch(digest or "") is None:
+        _fail("upstream_sync_successor_stage_identity_invalid")
+    return path.with_name(f".{path.name}.{digest}.stage")
+
+
+def _read_staged_exact(
+    path: Path,
+    *,
+    raw: bytes,
+    root_owned: bool,
+) -> None:
+    try:
+        observed, _metadata = activation._read_regular(  # noqa: SLF001
+            path,
+            maximum=activation.MAX_JSON_BYTES,
+            modes=frozenset({0o444}),
+            root_owned=root_owned,
+        )
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    if observed != raw:
+        _fail("upstream_sync_successor_stage_drifted")
+
+
+def _read_pending_transaction_inode(
+    *,
+    target: Path,
+    pending: Path,
+    raw: bytes,
+    root_owned: bool,
+) -> None:
+    """Verify the sole two-link staging inode through stable open identities."""
+
+    descriptor: int | None = None
+    try:
+        target_before = target.lstat()
+        pending_before = pending.lstat()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(pending, flags)
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        target_reached = target.lstat()
+        pending_reached = pending.lstat()
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_hardlink_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    identities = {
+        activation._identity(item)  # noqa: SLF001
+        for item in (
+            target_before,
+            pending_before,
+            opened,
+            after,
+            target_reached,
+            pending_reached,
+        )
+    }
+    if (
+        len(identities) != 1
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 2
+        or not 0 < opened.st_size <= activation.MAX_JSON_BYTES
+        or stat.S_IMODE(opened.st_mode) != 0o444
+        or root_owned
+        and (opened.st_uid != 0 or opened.st_gid != 0)
+        or b"".join(chunks) != raw
+    ):
+        _fail("upstream_sync_successor_stage_hardlink_invalid")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _stage_create_only(
+    value: Mapping[str, Any],
+    *,
+    path: Path,
+    root_owned: bool,
+) -> None:
+    """Publish exact immutable bytes without an overwrite-capable edge.
+
+    The deterministic pending inode makes crashes before or after ``link(2)``
+    recoverable.  A foreign target, foreign pending file, symlink, or unrelated
+    hard link is never removed or replaced.
+    """
+
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    digest = activation._sha256(raw)  # noqa: SLF001
+    pending = _stage_pending_path(path, digest)
+    try:
+        activation._validate_trusted_parent_chain(  # noqa: SLF001
+            path,
+            boundary=path.parent,
+            root_owned=root_owned,
+        )
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_parent_invalid"
+        ) from exc
+
+    target_exists = os.path.lexists(path)
+    pending_exists = os.path.lexists(pending)
+    if target_exists:
+        if pending_exists:
+            _read_pending_transaction_inode(
+                target=path,
+                pending=pending,
+                raw=raw,
+                root_owned=root_owned,
+            )
+            try:
+                pending.unlink()
+            except OSError as exc:
+                raise UpstreamSyncRailSuccessorRebindError(
+                    "upstream_sync_successor_stage_invalid"
+                ) from exc
+            _fsync_directory(path.parent)
+        _read_staged_exact(path, raw=raw, root_owned=root_owned)
+        return
+
+    if pending_exists:
+        _read_staged_exact(pending, raw=raw, root_owned=root_owned)
+    else:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(pending, flags, 0o444)
+            os.fchmod(descriptor, 0o444)
+            if root_owned and activation._effective_uid() == 0:  # noqa: SLF001
+                os.fchown(descriptor, 0, 0)
+            view = memoryview(raw)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    _fail("upstream_sync_successor_stage_invalid")
+                view = view[written:]
+            os.fsync(descriptor)
+        except UpstreamSyncRailSuccessorRebindError:
+            raise
+        except OSError as exc:
+            raise UpstreamSyncRailSuccessorRebindError(
+                "upstream_sync_successor_stage_invalid"
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        _read_staged_exact(pending, raw=raw, root_owned=root_owned)
+    try:
+        os.link(pending, path, follow_symlinks=False)
+    except FileExistsError:
+        _fail("upstream_sync_successor_stage_raced")
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    try:
+        pending.unlink()
+    except OSError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_invalid"
+        ) from exc
+    _fsync_directory(path.parent)
+    _read_staged_exact(path, raw=raw, root_owned=root_owned)
 
 
 def _transaction_path(
@@ -1519,6 +2035,460 @@ def rebind(
     )
 
 
+def _authority_matches_owner_request(
+    authority: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> None:
+    if (
+        authority.get("predecessor_revision")
+        != request["predecessor_revision"]
+        or authority.get("predecessor_sender_revision")
+        != request["predecessor_sender_revision"]
+        or authority.get("target_revision") != request["target_revision"]
+        or authority.get("target_package_manifest_sha256")
+        != request["target_package_manifest_sha256"]
+        or authority.get("stage_c_host_artifact_manifest_sha256")
+        != request["stage_c_host_artifact_manifest_sha256"]
+        or authority.get("stage_c_release_update_publication_sha256")
+        != request["stage_c_release_update_publication_sha256"]
+        or authority.get("rebind_runtime_sha256")
+        != request["rebind_runtime_sha256"]
+    ):
+        _fail("upstream_sync_successor_owner_authority_binding_invalid")
+
+
+def _owner_result(
+    *,
+    request: Mapping[str, Any],
+    authority: Mapping[str, Any],
+    preflight_value: Mapping[str, Any],
+    terminal: Mapping[str, Any],
+) -> dict[str, Any]:
+    unsigned = {
+        "schema": OWNER_RESULT_SCHEMA,
+        "operation": OPERATION,
+        "request_sha256": request["request_sha256"],
+        "target_revision": request["target_revision"],
+        "authority_sha256": authority["authority_sha256"],
+        "preflight_receipt_sha256": preflight_value["receipt_sha256"],
+        "terminal_receipt_sha256": terminal["receipt_sha256"],
+        "authority_staged_at_fixed_path": True,
+        "preflight_staged_at_fixed_path": True,
+        "terminal_verified": True,
+        "caller_selected_paths_allowed": False,
+        "caller_selected_commands_allowed": False,
+        "caller_selected_targets_allowed": False,
+        "manual_json_allowed": False,
+        "semantic_decisions_allowed": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return _receipt(unsigned)
+
+
+def validate_owner_result(
+    value: Any,
+    *,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_request = validate_owner_request(request)
+    fields = {
+        "schema",
+        "operation",
+        "request_sha256",
+        "target_revision",
+        "authority_sha256",
+        "preflight_receipt_sha256",
+        "terminal_receipt_sha256",
+        "authority_staged_at_fixed_path",
+        "preflight_staged_at_fixed_path",
+        "terminal_verified",
+        "caller_selected_paths_allowed",
+        "caller_selected_commands_allowed",
+        "caller_selected_targets_allowed",
+        "manual_json_allowed",
+        "semantic_decisions_allowed",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "receipt_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        _fail("upstream_sync_successor_owner_result_invalid")
+    result = copy.deepcopy(dict(value))
+    if (
+        result.get("schema") != OWNER_RESULT_SCHEMA
+        or result.get("operation") != OPERATION
+        or result.get("request_sha256") != expected_request["request_sha256"]
+        or result.get("target_revision") != expected_request["target_revision"]
+        or any(
+            _SHA256.fullmatch(str(result.get(name, ""))) is None
+            for name in (
+                "authority_sha256",
+                "preflight_receipt_sha256",
+                "terminal_receipt_sha256",
+                "receipt_sha256",
+            )
+        )
+        or any(
+            result.get(name) is not True
+            for name in (
+                "authority_staged_at_fixed_path",
+                "preflight_staged_at_fixed_path",
+                "terminal_verified",
+            )
+        )
+        or any(
+            result.get(name) is not False
+            for name in (
+                "caller_selected_paths_allowed",
+                "caller_selected_commands_allowed",
+                "caller_selected_targets_allowed",
+                "manual_json_allowed",
+                "semantic_decisions_allowed",
+                "secret_material_recorded",
+                "secret_digest_recorded",
+            )
+        )
+        or result["receipt_sha256"]
+        != activation._sha256(  # noqa: SLF001
+            activation._canonical(  # noqa: SLF001
+                {
+                    name: item
+                    for name, item in result.items()
+                    if name != "receipt_sha256"
+                }
+            )
+        )
+    ):
+        _fail("upstream_sync_successor_owner_result_invalid")
+    return result
+
+
+def _owner_apply(
+    request_value: Mapping[str, Any],
+    *,
+    staged_root: Path,
+    authority_path: Path,
+    preflight_path: Path,
+    runtime_path: Path,
+    systemd_root: Path,
+    evidence_root: Path,
+    release_trust_root: Path,
+    host_artifact_manifest_path: Path,
+    release_update_publication_path: Path,
+    root_owned: bool,
+    host: RebindHost,
+    require_root: bool,
+    activation_lock_factory: Callable[[], Any] | None,
+) -> dict[str, Any]:
+    """Author, stage, rebind, and verify one exact successor transaction."""
+
+    request = validate_owner_request(request_value)
+    if require_root and activation._effective_uid() != 0:  # noqa: SLF001
+        _fail("upstream_sync_successor_root_required")
+    if (
+        authority_path != staged_root / AUTHORITY_PATH.name
+        or preflight_path != staged_root / PREFLIGHT_PATH.name
+    ):
+        _fail("upstream_sync_successor_owner_fixed_path_invalid")
+    authority_exists = os.path.lexists(authority_path)
+    preflight_exists = os.path.lexists(preflight_path)
+    if preflight_exists and not authority_exists:
+        _fail("upstream_sync_successor_owner_partial_stage_invalid")
+    if not authority_exists:
+        _validate_stage_c_public_artifacts(
+            request=request,
+            host_artifact_manifest_path=host_artifact_manifest_path,
+            release_update_publication_path=release_update_publication_path,
+            root_owned=root_owned,
+        )
+    try:
+        activation._validate_trusted_parent_chain(  # noqa: SLF001
+            runtime_path,
+            boundary=release_trust_root,
+            root_owned=root_owned,
+        )
+        runtime_raw, _runtime_metadata = activation._read_regular(  # noqa: SLF001
+            runtime_path,
+            maximum=2 * 1024 * 1024,
+            root_owned=root_owned,
+        )
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_runtime_invalid"
+        ) from exc
+    if activation._sha256(runtime_raw) != request["rebind_runtime_sha256"]:  # noqa: SLF001
+        _fail("upstream_sync_successor_runtime_invalid")
+    package = activation._validate_package_context(  # noqa: SLF001
+        staged_root=staged_root,
+        release_revision=request["target_revision"],
+        sender_revision=request["target_revision"],
+        expected_manifest_sha256=request["target_package_manifest_sha256"],
+        root_owned=root_owned,
+        staged_trust_root=(activation.STAGED_TRUST_ROOT if root_owned else staged_root),
+        release_trust_root=release_trust_root,
+    )
+
+    authority: dict[str, Any]
+    preflight_value: dict[str, Any]
+    if authority_exists:
+        provisional = activation._read_canonical_json(  # noqa: SLF001
+            authority_path,
+            root_owned=root_owned,
+            modes=frozenset({0o444}),
+        )
+        authority_digest = str(provisional.get("authority_sha256", ""))
+        authority = validate_authority(
+            provisional,
+            expected_sha256=authority_digest,
+        )
+        _authority_matches_owner_request(authority, request)
+        _load_context(
+            expected_authority_sha256=authority_digest,
+            staged_root=staged_root,
+            authority_path=authority_path,
+            runtime_path=runtime_path,
+            root_owned=root_owned,
+            release_trust_root=release_trust_root,
+        )
+        if preflight_exists:
+            provisional_preflight = activation._read_canonical_json(  # noqa: SLF001
+                preflight_path,
+                root_owned=root_owned,
+                modes=frozenset({0o444}),
+            )
+            preflight_digest = str(
+                provisional_preflight.get("receipt_sha256", "")
+            )
+            preflight_value = _validate_preflight(
+                provisional_preflight,
+                authority=authority,
+                expected_sha256=preflight_digest,
+            )
+        else:
+            predecessor_units = _unit_bytes(
+                systemd_root=systemd_root,
+                root_owned=root_owned,
+            )
+            rebuilt = build_authority(
+                package=package,
+                predecessor_revision=request["predecessor_revision"],
+                predecessor_sender_revision=request[
+                    "predecessor_sender_revision"
+                ],
+                predecessor_units=predecessor_units,
+                stage_c_host_artifact_manifest_sha256=request[
+                    "stage_c_host_artifact_manifest_sha256"
+                ],
+                stage_c_release_update_publication_sha256=request[
+                    "stage_c_release_update_publication_sha256"
+                ],
+                rebind_runtime_sha256=request["rebind_runtime_sha256"],
+            )
+            if rebuilt != authority:
+                _fail("upstream_sync_successor_owner_authority_drifted")
+            preflight_value = _build_preflight_receipt(
+                authority=authority,
+                package=package,
+                systemd_root=systemd_root,
+                root_owned=root_owned,
+                host=host,
+            )
+            _stage_create_only(
+                preflight_value,
+                path=preflight_path,
+                root_owned=root_owned,
+            )
+    else:
+        predecessor_units = _unit_bytes(
+            systemd_root=systemd_root,
+            root_owned=root_owned,
+        )
+        authority = build_authority(
+            package=package,
+            predecessor_revision=request["predecessor_revision"],
+            predecessor_sender_revision=request["predecessor_sender_revision"],
+            predecessor_units=predecessor_units,
+            stage_c_host_artifact_manifest_sha256=request[
+                "stage_c_host_artifact_manifest_sha256"
+            ],
+            stage_c_release_update_publication_sha256=request[
+                "stage_c_release_update_publication_sha256"
+            ],
+            rebind_runtime_sha256=request["rebind_runtime_sha256"],
+        )
+        preflight_value = _build_preflight_receipt(
+            authority=authority,
+            package=package,
+            systemd_root=systemd_root,
+            root_owned=root_owned,
+            host=host,
+        )
+        # No staged or runtime mutation is permitted until the complete exact
+        # predecessor preflight above has passed in memory.
+        _stage_create_only(
+            authority,
+            path=authority_path,
+            root_owned=root_owned,
+        )
+        _stage_create_only(
+            preflight_value,
+            path=preflight_path,
+            root_owned=root_owned,
+        )
+
+    terminal = _rebind(
+        expected_authority_sha256=authority["authority_sha256"],
+        expected_preflight_sha256=preflight_value["receipt_sha256"],
+        staged_root=staged_root,
+        authority_path=authority_path,
+        preflight_path=preflight_path,
+        runtime_path=runtime_path,
+        systemd_root=systemd_root,
+        evidence_root=evidence_root,
+        root_owned=root_owned,
+        release_trust_root=release_trust_root,
+        host=host,
+        require_root=require_root,
+        activation_lock_factory=activation_lock_factory,
+        progress_hook=None,
+    )
+    verified = _verify(
+        expected_authority_sha256=authority["authority_sha256"],
+        expected_preflight_sha256=preflight_value["receipt_sha256"],
+        staged_root=staged_root,
+        authority_path=authority_path,
+        preflight_path=preflight_path,
+        runtime_path=runtime_path,
+        systemd_root=systemd_root,
+        evidence_root=evidence_root,
+        root_owned=root_owned,
+        release_trust_root=release_trust_root,
+        host=host,
+    )
+    if terminal != verified:
+        _fail("upstream_sync_successor_owner_terminal_drifted")
+    return _owner_result(
+        request=request,
+        authority=authority,
+        preflight_value=preflight_value,
+        terminal=verified,
+    )
+
+
+def owner_apply(request: Mapping[str, Any]) -> dict[str, Any]:
+    checked = validate_owner_request(request)
+    runtime_path = rail.release_root(checked["target_revision"]) / RUNTIME_RELATIVE
+    return _owner_apply(
+        checked,
+        staged_root=STAGED_ROOT,
+        authority_path=AUTHORITY_PATH,
+        preflight_path=PREFLIGHT_PATH,
+        runtime_path=runtime_path,
+        systemd_root=SYSTEMD_ROOT,
+        evidence_root=EVIDENCE_ROOT,
+        release_trust_root=rail.RELEASES_ROOT,
+        host_artifact_manifest_path=STAGE_C_HOST_ARTIFACT_MANIFEST_PATH,
+        release_update_publication_path=STAGE_C_RELEASE_UPDATE_PUBLICATION_PATH,
+        root_owned=True,
+        host=_SystemdHost(),
+        require_root=True,
+        activation_lock_factory=None,
+    )
+
+
+class OwnerRebindTransport(Protocol):
+    """One fixed IAP edge; callers cannot provide argv, paths, or targets."""
+
+    def invoke_successor_rebind(
+        self,
+        *,
+        target_revision: str,
+        request_frame: bytes,
+    ) -> bytes: ...
+
+
+class _ProductionOwnerRebindTransport:
+    def __init__(self, target_revision: str) -> None:
+        from scripts.canary import production_cutover_owner_launcher as owner
+
+        identity, trusted, configuration = (
+            owner.build_production_cutover_owner_identity(target_revision)
+        )
+        self._target_revision = target_revision
+        self._identity = identity
+        self._transport = owner.ProductionCutoverTransport(
+            identity,
+            gcloud_executable=trusted,
+            gcloud_configuration=configuration,
+        )
+
+    def invoke_successor_rebind(
+        self,
+        *,
+        target_revision: str,
+        request_frame: bytes,
+    ) -> bytes:
+        if target_revision != self._target_revision:
+            _fail("upstream_sync_successor_owner_target_changed")
+        account = self._identity.account_for_read_only_preflight()
+        release = rail.release_root(target_revision)
+        python = release / ".venv/bin/python"
+        completed = self._transport._run_remote_input(  # noqa: SLF001
+            (
+                *self._transport._fixed_remote_environment(  # noqa: SLF001
+                    chdir=str(release)
+                ),
+                str(python),
+                "-B",
+                "-m",
+                "scripts.canary.upstream_sync_rail_successor_rebind",
+                "owner-apply-fixed",
+            ),
+            account=account,
+            input_bytes=request_frame,
+            maximum_input_bytes=_OWNER_FRAME_MAX_BYTES + 8,
+            maximum_output_bytes=64 * 1024,
+            timeout_seconds=2_400.0,
+        )
+        return completed.stdout
+
+
+def owner_run(
+    request_value: Mapping[str, Any],
+    *,
+    transport: OwnerRebindTransport | None = None,
+) -> dict[str, Any]:
+    request = validate_owner_request(request_value)
+    selected = transport or _ProductionOwnerRebindTransport(
+        request["target_revision"]
+    )
+    try:
+        raw = selected.invoke_successor_rebind(
+            target_revision=request["target_revision"],
+            request_frame=encode_owner_request(request),
+        )
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except Exception as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_owner_transport_failed"
+        ) from exc
+    if (
+        not isinstance(raw, bytes)
+        or not raw.endswith(b"\n")
+        or len(raw) > 64 * 1024
+    ):
+        _fail("upstream_sync_successor_owner_transport_failed")
+    try:
+        value = activation._decode(raw[:-1])  # noqa: SLF001
+    except activation.UpstreamSyncRailCutoverError as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_owner_transport_failed"
+        ) from exc
+    return validate_owner_result(value, request=request)
+
+
 def _verify(
     *,
     expected_authority_sha256: str,
@@ -1696,14 +2666,81 @@ def _write_stdout(value: Mapping[str, Any]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("preflight", "rebind", "verify"))
-    parser.add_argument("--expected-authority-sha256", required=True)
+    parser.add_argument(
+        "operation",
+        choices=(
+            "owner-run",
+            "owner-apply-fixed",
+            "preflight",
+            "rebind",
+            "verify",
+        ),
+    )
+    parser.add_argument("--expected-authority-sha256")
     parser.add_argument("--expected-preflight-sha256")
+    parser.add_argument("--target-revision")
+    parser.add_argument("--target-package-manifest-sha256")
+    parser.add_argument("--predecessor-revision")
+    parser.add_argument("--predecessor-sender-revision")
+    parser.add_argument("--stage-c-host-artifact-manifest-sha256")
+    parser.add_argument("--stage-c-release-update-publication-sha256")
+    parser.add_argument("--rebind-runtime-sha256")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    owner_fields = (
+        arguments.target_revision,
+        arguments.target_package_manifest_sha256,
+        arguments.predecessor_revision,
+        arguments.predecessor_sender_revision,
+        arguments.stage_c_host_artifact_manifest_sha256,
+        arguments.stage_c_release_update_publication_sha256,
+        arguments.rebind_runtime_sha256,
+    )
+    if arguments.operation == "owner-run":
+        if (
+            arguments.expected_authority_sha256 is not None
+            or arguments.expected_preflight_sha256 is not None
+            or any(item is None for item in owner_fields)
+        ):
+            _fail("upstream_sync_successor_owner_cli_invalid")
+        _write_stdout(
+            owner_run(
+                build_owner_request(
+                    target_revision=arguments.target_revision,
+                    target_package_manifest_sha256=(
+                        arguments.target_package_manifest_sha256
+                    ),
+                    predecessor_revision=arguments.predecessor_revision,
+                    predecessor_sender_revision=(
+                        arguments.predecessor_sender_revision
+                    ),
+                    stage_c_host_artifact_manifest_sha256=(
+                        arguments.stage_c_host_artifact_manifest_sha256
+                    ),
+                    stage_c_release_update_publication_sha256=(
+                        arguments.stage_c_release_update_publication_sha256
+                    ),
+                    rebind_runtime_sha256=arguments.rebind_runtime_sha256,
+                )
+            )
+        )
+        return 0
+    if arguments.operation == "owner-apply-fixed":
+        if (
+            arguments.expected_authority_sha256 is not None
+            or arguments.expected_preflight_sha256 is not None
+            or any(item is not None for item in owner_fields)
+            or sys.stdin.isatty()
+        ):
+            _fail("upstream_sync_successor_owner_cli_invalid")
+        frame = sys.stdin.buffer.read(_OWNER_FRAME_MAX_BYTES + 9)
+        _write_stdout(owner_apply(decode_owner_request(frame)))
+        return 0
+    if any(item is not None for item in owner_fields):
+        _fail("upstream_sync_successor_owner_cli_invalid")
     if _SHA256.fullmatch(arguments.expected_authority_sha256 or "") is None:
         _fail("upstream_sync_successor_authority_identity_invalid")
     if arguments.operation == "preflight":
@@ -1741,15 +2778,24 @@ __all__ = [
     "ROLLBACK_INTENT_SCHEMA",
     "STARTED_SCHEMA",
     "TERMINAL_SCHEMA",
+    "OWNER_REQUEST_SCHEMA",
+    "OWNER_RESULT_SCHEMA",
     "UNIT_NAMES",
     "TIMER_NAMES",
     "SERVICE_NAMES",
     "UnitState",
     "UpstreamSyncRailSuccessorRebindError",
     "build_authority",
+    "build_owner_request",
+    "decode_owner_request",
+    "encode_owner_request",
     "main",
+    "owner_apply",
+    "owner_run",
     "preflight",
     "rebind",
     "validate_authority",
+    "validate_owner_request",
+    "validate_owner_result",
     "verify",
 ]

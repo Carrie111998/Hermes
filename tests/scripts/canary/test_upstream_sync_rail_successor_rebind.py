@@ -11,6 +11,7 @@ import pytest
 
 from ops.muncho.runtime import upstream_sync_job_rail as rail
 from scripts.canary import package_production_cutover_artifacts as host_package
+from scripts.canary import production_release_update_contract as release_contract
 from scripts.canary import production_release_consumer_inventory as inventory
 from scripts.canary import upstream_sync_rail_cutover as activation
 from scripts.canary import upstream_sync_rail_successor_rebind as successor
@@ -197,6 +198,110 @@ class Harness:
             activation_lock_factory=lambda: nullcontext(),
             progress_hook=progress_hook,
         )
+
+
+@dataclass
+class OwnerHarness:
+    harness: Harness
+    request: dict[str, Any]
+    host_manifest_path: Path
+    publication_path: Path
+
+    def apply(self) -> dict[str, Any]:
+        item = self.harness
+        return successor._owner_apply(  # noqa: SLF001
+            self.request,
+            staged_root=item.staged_root,
+            authority_path=item.authority_path,
+            preflight_path=item.preflight_path,
+            runtime_path=item.runtime_path,
+            systemd_root=item.systemd_root,
+            evidence_root=item.evidence_root,
+            release_trust_root=item.releases,
+            host_artifact_manifest_path=self.host_manifest_path,
+            release_update_publication_path=self.publication_path,
+            root_owned=False,
+            host=item.host,
+            require_root=False,
+            activation_lock_factory=lambda: nullcontext(),
+        )
+
+
+def _self_hashed(
+    unsigned: dict[str, Any],
+    digest_field: str,
+) -> dict[str, Any]:
+    return {
+        **unsigned,
+        digest_field: hashlib.sha256(
+            activation._canonical(unsigned)  # noqa: SLF001
+        ).hexdigest(),
+    }
+
+
+def _build_owner_harness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> OwnerHarness:
+    harness = _build_harness(tmp_path, monkeypatch)
+    release_runtime = rail.release_root(TARGET) / successor.RUNTIME_RELATIVE
+    release_runtime.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ROOT / successor.RUNTIME_RELATIVE, release_runtime)
+    harness.runtime_path = release_runtime
+    harness.authority_path.unlink()
+    harness.preflight_path.unlink()
+    host_manifest = _self_hashed(
+        {
+            "schema": host_package.MANIFEST_SCHEMA,
+            "release_revision": TARGET,
+            "secret_material_recorded": False,
+        },
+        "manifest_sha256",
+    )
+    publication = _self_hashed(
+        {
+            "schema": release_contract.PUBLICATION_SCHEMA,
+            "action": release_contract.PUBLICATION_ACTION,
+            "release_revision": TARGET,
+            "plan": {
+                "release_revision": TARGET,
+                "host_artifact_manifest_sha256": host_manifest[
+                    "manifest_sha256"
+                ],
+            },
+            "secret_material_recorded": False,
+            "secret_digest_recorded": False,
+        },
+        "publication_sha256",
+    )
+    stage_c = tmp_path / "stage-c"
+    host_manifest_path = stage_c / "host-artifact-manifest.json"
+    publication_path = stage_c / "release-update-publication.json"
+    _write_canonical(host_manifest_path, host_manifest)
+    _write_canonical(publication_path, publication)
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256=harness.package.manifest[
+            "manifest_sha256"
+        ],
+        predecessor_revision=PREDECESSOR,
+        predecessor_sender_revision=PREDECESSOR_SENDER,
+        stage_c_host_artifact_manifest_sha256=host_manifest[
+            "manifest_sha256"
+        ],
+        stage_c_release_update_publication_sha256=publication[
+            "publication_sha256"
+        ],
+        rebind_runtime_sha256=hashlib.sha256(
+            harness.runtime_path.read_bytes()
+        ).hexdigest(),
+    )
+    return OwnerHarness(
+        harness=harness,
+        request=request,
+        host_manifest_path=host_manifest_path,
+        publication_path=publication_path,
+    )
 
 
 def _build_harness(
@@ -653,3 +758,273 @@ def test_systemd_observer_rejects_duplicate_property_output(
             unit,
             systemd_root=systemd_root,
         )
+
+
+def test_owner_path_authors_stages_rebinds_and_replays_without_new_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+
+    first = owner.apply()
+    calls_after_first = list(owner.harness.host.calls)
+    owner.host_manifest_path.unlink()
+    owner.publication_path.unlink()
+    second = owner.apply()
+
+    assert first == second
+    assert first["terminal_verified"] is True
+    staged_authority = activation._read_canonical_json(  # noqa: SLF001
+        owner.harness.authority_path,
+        root_owned=False,
+        modes=frozenset({0o444}),
+    )
+    assert first["authority_sha256"] == staged_authority["authority_sha256"]
+    assert owner.harness.authority_path.stat().st_mode & 0o777 == 0o444
+    assert owner.harness.preflight_path.stat().st_mode & 0o777 == 0o444
+    assert owner.harness.host.calls == calls_after_first
+
+
+def test_owner_path_recovers_crash_between_exact_authority_and_preflight_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    real_stage = successor._stage_create_only  # noqa: SLF001
+    calls = 0
+
+    def crash_before_preflight(
+        value: dict[str, Any],
+        *,
+        path: Path,
+        root_owned: bool,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        real_stage(value, path=path, root_owned=root_owned)
+
+    monkeypatch.setattr(successor, "_stage_create_only", crash_before_preflight)
+    with pytest.raises(KeyboardInterrupt):
+        owner.apply()
+    assert owner.harness.authority_path.exists()
+    assert not owner.harness.preflight_path.exists()
+    assert owner.harness.host.calls == []
+
+    monkeypatch.setattr(successor, "_stage_create_only", real_stage)
+    result = owner.apply()
+
+    assert result["terminal_verified"] is True
+    assert owner.harness.preflight_path.exists()
+
+
+def test_owner_path_foreign_unit_drift_has_no_stage_or_runtime_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    _write(
+        owner.harness.systemd_root / rail.SYNC_SERVICE_UNIT,
+        b"foreign-before-owner-preflight\n",
+        mode=0o644,
+    )
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="predecessor_unit_invalid",
+    ):
+        owner.apply()
+
+    assert not owner.harness.authority_path.exists()
+    assert not owner.harness.preflight_path.exists()
+    assert owner.harness.host.calls == []
+
+
+@pytest.mark.parametrize("kind", ("symlink", "mode"))
+def test_owner_path_rejects_stage_c_public_file_identity_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    if kind == "symlink":
+        raw = owner.host_manifest_path.read_bytes()
+        foreign = owner.host_manifest_path.with_name("foreign-manifest.json")
+        _write(foreign, raw, mode=0o444)
+        owner.host_manifest_path.unlink()
+        owner.host_manifest_path.symlink_to(foreign)
+    else:
+        owner.host_manifest_path.chmod(0o600)
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage_c_artifact_invalid",
+    ):
+        owner.apply()
+
+    assert not owner.harness.authority_path.exists()
+    assert not owner.harness.preflight_path.exists()
+    assert owner.harness.host.calls == []
+
+
+def test_owner_path_rejects_runtime_digest_drift_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _build_owner_harness(tmp_path, monkeypatch)
+    owner.harness.runtime_path.write_bytes(b"foreign-runtime\n")
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="runtime_invalid",
+    ):
+        owner.apply()
+
+    assert not owner.harness.authority_path.exists()
+    assert not owner.harness.preflight_path.exists()
+    assert owner.harness.host.calls == []
+
+
+@pytest.mark.parametrize("kind", ("symlink", "hardlink", "mode"))
+def test_create_only_stage_rejects_foreign_file_identity(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    foreign = parent / "foreign"
+    foreign.write_bytes(raw)
+    foreign.chmod(0o444)
+    if kind == "symlink":
+        target.symlink_to(foreign)
+    elif kind == "hardlink":
+        target.hardlink_to(foreign)
+    else:
+        target.write_bytes(raw)
+        target.chmod(0o600)
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage_(invalid|hardlink_invalid)",
+    ):
+        successor._stage_create_only(  # noqa: SLF001
+            value,
+            path=target,
+            root_owned=False,
+        )
+
+    assert target.exists() or target.is_symlink()
+
+
+def test_create_only_stage_rejects_non_root_owner_when_root_is_required(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    _write_canonical(target, value)
+    monkeypatch.setattr(
+        activation,
+        "_validate_trusted_parent_chain",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="stage_invalid",
+    ):
+        successor._stage_create_only(  # noqa: SLF001
+            value,
+            path=target,
+            root_owned=True,
+        )
+
+
+@pytest.mark.parametrize("after_link", (False, True))
+def test_create_only_stage_recovers_its_exact_pending_inode(
+    tmp_path: Path,
+    after_link: bool,
+) -> None:
+    parent = tmp_path / "stage"
+    parent.mkdir(mode=0o700)
+    target = parent / "authority.json"
+    value = {"schema": "exact.test.v1", "secret_material_recorded": False}
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    digest = hashlib.sha256(raw).hexdigest()
+    pending = successor._stage_pending_path(target, digest)  # noqa: SLF001
+    pending.write_bytes(raw)
+    pending.chmod(0o444)
+    if after_link:
+        target.hardlink_to(pending)
+
+    successor._stage_create_only(  # noqa: SLF001
+        value,
+        path=target,
+        root_owned=False,
+    )
+
+    assert target.read_bytes() == raw
+    assert target.stat().st_nlink == 1
+    assert not pending.exists()
+
+
+def test_owner_request_frame_and_transport_are_closed_to_manual_fields() -> None:
+    request = successor.build_owner_request(
+        target_revision=TARGET,
+        target_package_manifest_sha256="1" * 64,
+        predecessor_revision=PREDECESSOR,
+        predecessor_sender_revision=PREDECESSOR_SENDER,
+        stage_c_host_artifact_manifest_sha256="2" * 64,
+        stage_c_release_update_publication_sha256="3" * 64,
+        rebind_runtime_sha256="4" * 64,
+    )
+    assert successor.decode_owner_request(
+        successor.encode_owner_request(request)
+    ) == request
+    foreign = dict(request)
+    foreign["command"] = "systemctl restart anything"
+    with pytest.raises(
+        successor.UpstreamSyncRailSuccessorRebindError,
+        match="owner_request_invalid",
+    ):
+        successor.encode_owner_request(foreign)
+
+    class FakeTransport:
+        def invoke_successor_rebind(
+            self,
+            *,
+            target_revision: str,
+            request_frame: bytes,
+        ) -> bytes:
+            checked = successor.decode_owner_request(request_frame)
+            assert target_revision == TARGET
+            result = successor._owner_result(  # noqa: SLF001
+                request=checked,
+                authority={"authority_sha256": "5" * 64},
+                preflight_value={"receipt_sha256": "6" * 64},
+                terminal={"receipt_sha256": "7" * 64},
+            )
+            return activation._canonical(result) + b"\n"  # noqa: SLF001
+
+    result = successor.owner_run(request, transport=FakeTransport())
+    assert result["request_sha256"] == request["request_sha256"]
+    assert result["caller_selected_commands_allowed"] is False
+
+
+def test_owner_cli_has_no_path_command_json_or_secret_input() -> None:
+    help_text = successor._parser().format_help()  # noqa: SLF001
+    for option in (
+        "--path",
+        "--output",
+        "--command",
+        "--json",
+        "--secret",
+        "--ssh",
+    ):
+        assert option not in help_text
