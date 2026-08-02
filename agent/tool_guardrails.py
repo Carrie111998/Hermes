@@ -134,6 +134,10 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# File discovery is intentionally opt-in at the core level. Gateway normal
+# mode sets a tighter cap while CLI/deep-diagnostic sessions retain the legacy
+# unlimited behavior unless a user configures one explicitly.
+_DEFAULT_MAX_FILE_SEARCHES_PER_TURN = 0
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,7 @@ class LoopCapConfig:
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_file_searches: int = _DEFAULT_MAX_FILE_SEARCHES_PER_TURN
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -169,6 +174,9 @@ class LoopCapConfig:
             ),
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
+            ),
+            max_file_searches=_non_negative_int(
+                data.get("max_file_searches"), defaults.max_file_searches
             ),
         )
 
@@ -287,6 +295,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_file_search_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -502,6 +511,27 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
             self._turn_subagent_count += spawn_count
+            return None
+
+        if tool_name == "search_files":
+            cap = caps.max_file_searches
+            if cap and self._turn_file_search_count >= cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_file_search_cap",
+                    message=(
+                        f"Blocked search_files: this turn has already made {cap} "
+                        "file searches, the per-turn limit. Use the results already "
+                        "available, narrow the investigation, or ask the user to enter "
+                        "deep diagnostic mode."
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_file_search_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_file_search_count += 1
             return None
 
         return None
