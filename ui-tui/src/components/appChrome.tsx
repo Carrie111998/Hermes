@@ -4,7 +4,7 @@ import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } 
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
-import type { BatteryInfo, IndicatorStyle, Notice, SpeculativeCompressionState } from '../app/interfaces.js'
+import type { BatteryInfo, IndicatorStyle, Notice } from '../app/interfaces.js'
 import { $isStatusRuleOccluded } from '../app/overlayStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import { DEV_CREDITS_MODE } from '../config/env.js'
@@ -436,78 +436,7 @@ const shortModelLabel = (model: string) =>
     .trim()
 
 const modelLabel = (model: string, effort?: string, fast?: boolean) =>
-  [shortModelLabel(model), effortLabel(effort) || 'standard', fast ? 'fast' : ''].filter(Boolean).join(' ')
-
-// A full Braille water body is always exactly 25 terminal cells wide. Keeping
-// it mounted while idle lets the final active frame freeze in place instead of
-// replacing the indicator with a shorter "ready" label that shifts the model
-// and context readout.
-export const WATER_CELL_COUNT = 25
-// 16 FPS is quick enough to read as fluid in Ink while staying well below a
-// terminal-wide 60 FPS repaint loop. The phase step keeps the original wave
-// velocity, but exposes twice as many intermediate surface positions.
-const WATER_FRAME_MS = 60
-
-const BRAILLE_DOTS = [
-  [0x01, 0x08],
-  [0x02, 0x10],
-  [0x04, 0x20],
-  [0x40, 0x80]
-] as const
-
-export const waterFrame = (frame: number): string => {
-  const pixelCount = WATER_CELL_COUNT * 2
-  const phase = frame * 0.105
-  const surface: number[] = []
-
-  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
-    const x = pixel / (pixelCount - 1)
-    const source = 0.52 + 0.18 * Math.sin(phase * 0.31)
-    const distance = Math.abs(x - source)
-
-    const height =
-      2.4 +
-      0.9 * Math.sin(x * Math.PI * 2 * 1.25 + phase) +
-      0.45 * Math.sin(x * Math.PI * 2 * 3.7 - phase * 0.73) +
-      0.85 * Math.sin(distance * 30 - phase * 2.1) * Math.exp(-distance * 5.5)
-
-    // Row 4 leaves both dot columns empty. Letting troughs reach it creates
-    // a genuine dry gap instead of flattening every low point to ⣤.
-    surface.push(Math.max(0, Math.min(4, Math.round(height))))
-  }
-
-  return Array.from({ length: WATER_CELL_COUNT }, (_, cell) => {
-    let dots = 0
-
-    for (let column = 0; column < 2; column += 1) {
-      const fillFrom = surface[cell * 2 + column] ?? 4
-
-      for (let row = fillFrom; row < 4; row += 1) {
-        dots |= BRAILLE_DOTS[row]![column]!
-      }
-    }
-
-    return String.fromCodePoint(0x2800 + dots)
-  }).join('')
-}
-
-function WaterTicker({ busy, color }: { busy: boolean; color: string }) {
-  // Do not reset the frame when a turn ends: pausing on the last frame makes
-  // the status rule visually stable between turns while preserving its width.
-  const [frame, setFrame] = useState(0)
-
-  useEffect(() => {
-    if (!busy) {
-      return
-    }
-
-    const id = setInterval(() => setFrame(current => current + 1), WATER_FRAME_MS)
-
-    return () => clearInterval(id)
-  }, [busy])
-
-  return <Text color={color}>{waterFrame(frame)}</Text>
-}
+  [shortModelLabel(model), effortLabel(effort), fast ? 'fast' : ''].filter(Boolean).join(' ')
 
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   const [active, setActive] = useState(false)
@@ -552,7 +481,6 @@ export function StatusRule({
   lastTurnEndedAt,
   liveSessionCount,
   sessionStartedAt,
-  speculativeCompressionState,
   turnStartedAt,
   voiceLabel,
   onSessionCountClick,
@@ -574,57 +502,6 @@ export function StatusRule({
 
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
-
-  // The Pi status rule deliberately owns a fixed footprint: the water raster
-  // remains mounted in both states and is the only animated element. This keeps
-  // model and context columns stationary when a permission/turn completes.
-  // Keep the legacy renderer below available for upstream feature work, but do
-  // not render it in the Pi layout.
-  const useFixedWaterStatus = true
-
-  if (useFixedWaterStatus) {
-    const speculativePending =
-      speculativeCompressionState === 'queued' ||
-      speculativeCompressionState === 'preparing' ||
-      speculativeCompressionState === 'active'
-
-    const speculativeWaterColor =
-      speculativeCompressionState === 'queued'
-        ? t.color.warn
-        : speculativeCompressionState === 'preparing'
-          ? t.color.accent
-          : speculativeCompressionState === 'active'
-            ? t.color.error
-            : null
-    const compressionCount =
-      cols >= 80 && typeof usage.compressions === 'number' && usage.compressions > 0
-        ? usage.compressions
-        : 0
-
-    return (
-      <Box height={1}>
-        <Box flexDirection="row" flexShrink={1} overflow="hidden" width={Math.max(1, cols)}>
-          <Box flexShrink={0} width={WATER_CELL_COUNT}>
-            <WaterTicker
-              busy={busy || speculativePending}
-              color={speculativeWaterColor ?? (busy ? statusColor : t.color.muted)}
-            />
-          </Box>
-          <Text color={t.color.border}>{' │ '}</Text>
-          <Text color={t.color.label} wrap="truncate-end">
-            {modelText}
-          </Text>
-          <Text color={t.color.border}>{' │ '}</Text>
-          <Text color={t.color.muted} wrap="truncate-end">
-            {usage.context_max
-              ? `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-              : `${fmtK(usage.total)}/—`}
-            {compressionCount ? ` · cmp ${compressionCount}` : ''}
-          </Text>
-        </Box>
-      </Box>
-    )
-  }
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null
@@ -991,7 +868,6 @@ interface StatusRuleProps {
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
   sessionStartedAt?: null | number
-  speculativeCompressionState: SpeculativeCompressionState
   status: string
   statusColor: string
   t: Theme

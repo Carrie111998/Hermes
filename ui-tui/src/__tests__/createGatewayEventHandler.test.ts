@@ -195,34 +195,6 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
-  it('tracks speculative compaction state separately from ordinary status text', () => {
-    const ctx = buildCtx([])
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({
-      payload: {
-        kind: 'speculative',
-        state: 'queued',
-        text: 'Speculative compaction queued — estimated ~123,400 tokens'
-      },
-      type: 'status.update'
-    } as any)
-
-    expect(getUiState().speculativeCompressionState).toBe('queued')
-    expect(getUiState().status).toContain('estimated ~123,400 tokens')
-
-    onEvent({
-      payload: {
-        kind: 'speculative',
-        state: 'active',
-        text: 'Speculative compaction active — installing candidate'
-      },
-      type: 'status.update'
-    } as any)
-
-    expect(getUiState().speculativeCompressionState).toBe('active')
-  })
-
   it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

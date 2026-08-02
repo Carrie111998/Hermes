@@ -29,7 +29,6 @@ const buildUiState = (): UiState => ({
   sessionTitle: '',
   showReasoning: false,
   sid: null,
-  speculativeCompressionState: 'idle',
   status: 'summoning hermes…',
   statusBar: 'top',
   streaming: true,

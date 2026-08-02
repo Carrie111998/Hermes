@@ -88,65 +88,6 @@ const findElementWithText = (node: ReactNodeLike, needle: string): React.ReactEl
   return textContent(node).includes(needle) ? node : null
 }
 
-const findWaterTicker = (node: ReactNodeLike): React.ReactElement<{ busy?: boolean }> | null => {
-  if (node === null || node === undefined || typeof node === 'boolean') {
-    return null
-  }
-
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      const found = findWaterTicker(child)
-
-      if (found) {
-        return found
-      }
-    }
-
-    return null
-  }
-
-  if (!React.isValidElement(node)) {
-    return null
-  }
-
-  const element = node as React.ReactElement<{ busy?: boolean; children?: ReactNodeLike }>
-
-  if (typeof element.type === 'function' && element.type.name === 'WaterTicker') {
-    return element
-  }
-
-  return findWaterTicker(element.props.children)
-}
-
-const baseProps: Parameters<typeof StatusRule>[0] = {
-  bgCount: 3,
-  busy: false,
-  cols: 100,
-  cwdLabel: '~/repo',
-  liveSessionCount: 2,
-  model: 'openai/gpt-5.6-terra',
-  modelReasoningEffort: 'high',
-  notice: { key: 'credits.90', kind: 'sticky', level: 'warn', text: '⚠ 90% used' },
-  sessionStartedAt: Date.now() - 60_000,
-  speculativeCompressionState: 'idle',
-  status: 'ready',
-  statusColor: DEFAULT_THEME.color.ok,
-  t: DEFAULT_THEME,
-  turnStartedAt: null,
-  usage: {
-    active_subagents: 2,
-    calls: 0,
-    compressions: 3,
-    context_max: 260_000,
-    context_percent: 25,
-    context_used: 65_000,
-    input: 0,
-    output: 0,
-    total: 65_000
-  },
-  voiceLabel: 'voice off'
-}
-
 const baseProps = {
   bgCount: 0,
   busy: false,
@@ -155,8 +96,6 @@ const baseProps = {
   liveSessionCount: 0,
   model: 'opus-4.8',
   sessionStartedAt: null,
-  modelReasoningEffort: 'high',
-  speculativeCompressionState: 'idle',
   status: 'ready',
   statusColor: DEFAULT_THEME.color.ok,
   t: DEFAULT_THEME,
@@ -328,37 +267,6 @@ describe('StatusRule credits notice render priority', () => {
       notice: { key: 'credits.90', kind: 'sticky', level: 'warn', text: '⚠ 90% used' },
       turnStartedAt: Date.now()
     })
-
-describe('StatusRule', () => {
-  it('shows compression count alongside Pi context after a compaction', () => {
-    const rendered = textContent(StatusRule({ ...baseProps, usage: { ...baseProps.usage, compressions: 3 } }))
-
-    expect(rendered).toContain('opus 4.8 high')
-    expect(rendered).toContain('50k/200k')
-    expect(rendered).toContain('cmp 3')
-    expect(rendered).not.toContain('ready')
-    expect(rendered).not.toContain('~/repo')
-    expect(rendered).not.toContain('90% used')
-    expect(rendered).not.toContain('background')
-    expect(rendered).not.toContain('[')
-  })
-
-  it('hides the Pi compression count before the first compaction', () => {
-    const rendered = textContent(StatusRule({ ...baseProps, usage: { ...baseProps.usage, compressions: 0 } }))
-
-    expect(rendered).not.toContain('cmp ')
-  })
-
-  it('drops the Pi compression count before it can truncate narrow context', () => {
-    const rendered = textContent(StatusRule({ ...baseProps, cols: 79 }))
-
-    expect(rendered).toContain('50k/200k')
-    expect(rendered).not.toContain('cmp 3')
-  })
-
-  it('keeps a WaterTicker mounted for both busy and idle states so idle freezes the last frame', () => {
-    const idle = findWaterTicker(StatusRule(baseProps))
-    const busy = findWaterTicker(StatusRule({ ...baseProps, busy: true }))
 
     const rendered = textContent(element)
 
@@ -557,20 +465,5 @@ describe('StatusRule idle-since read-out', () => {
     })
 
     expect(findComponentByName(element, 'IdleSince')).toBeNull()
-  })
-  it('uses warm water tones only while speculative compaction is pending or active', () => {
-    const queued = findWaterTicker(StatusRule({ ...baseProps, speculativeCompressionState: 'queued' }))
-    const active = findWaterTicker(StatusRule({ ...baseProps, speculativeCompressionState: 'active' }))
-    const installed = findWaterTicker(StatusRule({ ...baseProps, speculativeCompressionState: 'installed' }))
-
-    expect(queued?.props.color).toBe(DEFAULT_THEME.color.warn)
-    expect(active?.props.color).toBe(DEFAULT_THEME.color.error)
-    expect(installed?.props.color).toBe(DEFAULT_THEME.color.muted)
-  })
-
-  it('uses a stable effort label when the session has no explicit effort', () => {
-    const rendered = textContent(StatusRule({ ...baseProps, modelReasoningEffort: undefined }))
-
-    expect(rendered).toContain('gpt 5.6 terra standard')
   })
 })

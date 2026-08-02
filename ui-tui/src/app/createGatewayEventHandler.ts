@@ -26,7 +26,7 @@ import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, th
 import type { Msg, SubagentProgress, SubagentStatus } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
-import type { GatewayEventHandlerContext, SpeculativeCompressionState } from './interfaces.js'
+import type { GatewayEventHandlerContext } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
@@ -37,24 +37,6 @@ import { isWakeUserDisabled } from './wakeState.js'
 const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
 
 const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
-
-const speculativeStateOf = (value: unknown): SpeculativeCompressionState => {
-  switch (value) {
-    case 'queued':
-
-    case 'preparing':
-
-    case 'active':
-
-    case 'installed':
-
-    case 'fallback':
-      return value
-
-    default:
-      return 'idle'
-  }
-}
 
 // The last gateway skin, kept so the theme can be re-derived when the OSC-11
 // background answer arrives after (or without) gateway.ready.
@@ -788,30 +770,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'message.start':
         resetAgentsNudgeTurnState()
         turnController.startMessage()
-        patchUiState({ speculativeCompressionState: 'idle' })
 
         return
       case 'status.update': {
         const p = ev.payload
 
         if (!p?.text) {
-          return
-        }
-
-        if (p.kind === 'speculative') {
-          const state = speculativeStateOf(p.state)
-          patchUiState({ speculativeCompressionState: state })
-          setStatus(p.text)
-
-          if (turnController.lastStatusNote !== p.text) {
-            turnController.lastStatusNote = p.text
-            turnController.pushActivity(p.text, state === 'fallback' ? 'warn' : 'info')
-          }
-
-          if (state === 'installed' || state === 'fallback') {
-            restoreStatusAfter(4000)
-          }
-
           return
         }
 
@@ -1394,7 +1358,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         setStatus('ready')
-        patchUiState({ speculativeCompressionState: 'idle' })
 
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: { ...state.usage, ...ev.payload!.usage } }))

@@ -14,7 +14,6 @@ import { usePet } from '../app/usePet.js'
 import { INLINE_MODE, SHOW_FPS, TERMUX_TUI_MODE } from '../config/env.js'
 import { PLACEHOLDER } from '../content/placeholders.js'
 import { prevRenderedMsg } from '../domain/blockLayout.js'
-import { showStartupPanel } from '../domain/messages.js'
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -205,20 +204,18 @@ const TranscriptPane = memo(function TranscriptPane({
               )}
 
               {row.msg.kind === 'intro' ? (
-                showStartupPanel(row.msg.info) ? (
-                  <Box flexDirection="column" paddingTop={1}>
-                    <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
+                <Box flexDirection="column" paddingTop={1}>
+                  <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
 
-                    {row.msg.info && (
-                      <SessionPanel
-                        info={row.msg.info}
-                        maxWidth={Math.max(1, composer.cols - 2)}
-                        sid={ui.sid}
-                        t={ui.theme}
-                      />
-                    )}
-                  </Box>
-                ) : null
+                  {row.msg.info && (
+                    <SessionPanel
+                      info={row.msg.info}
+                      maxWidth={Math.max(1, composer.cols - 2)}
+                      sid={ui.sid}
+                      t={ui.theme}
+                    />
+                  )}
+                </Box>
               ) : row.msg.kind === 'panel' && row.msg.panelData ? (
                 <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
               ) : (
@@ -505,7 +502,6 @@ const StatusRulePane = memo(function StatusRulePane({
         notice={ui.notice}
         onSessionCountClick={() => patchOverlayState({ sessions: true })}
         sessionStartedAt={status.sessionStartedAt}
-        speculativeCompressionState={status.speculativeCompressionState}
         status={ui.status}
         statusColor={status.statusColor}
         t={ui.theme}

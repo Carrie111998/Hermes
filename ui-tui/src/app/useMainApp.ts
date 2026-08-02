@@ -63,22 +63,7 @@ const BRACKET_PASTE_ON = '\x1b[?2004h'
 const BRACKET_PASTE_OFF = '\x1b[?2004l'
 const MAX_HEIGHT_CACHE_BUCKETS = 12
 
-const statusColorOf = (
-  status: string,
-  speculativeState: string,
-  t: { accent: string; error: string; muted: string; ok: string; warn: string }
-) => {
-  if (speculativeState === 'queued') {
-    return t.warn
-  }
-
-  if (speculativeState === 'preparing') {
-    return t.accent
-  }
-
-  if (speculativeState === 'active') {
-    return t.error
-  }
+const statusColorOf = (status: string, t: { error: string; muted: string; ok: string; warn: string }) => {
   if (status === 'ready') {
     return t.ok
   }
@@ -1187,8 +1172,7 @@ export function useMainApp(gw: GatewayClient) {
       lastTurnEndedAt: ui.sid ? lastTurnEndedAt : null,
       sessionStartedAt: ui.sid ? sessionStartedAt : null,
       showStickyPrompt: !!stickyPrompt,
-      speculativeCompressionState: ui.speculativeCompressionState,
-      statusColor: statusColorOf(ui.status, ui.speculativeCompressionState, ui.theme.color),
+      statusColor: statusColorOf(ui.status, ui.theme.color),
       stickyPrompt,
       turnStartedAt: ui.sid ? turnStartedAt : null,
       // CLI parity: the classic prompt_toolkit status bar shows a red dot

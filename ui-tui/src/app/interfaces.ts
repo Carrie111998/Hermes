@@ -51,8 +51,6 @@ export interface BatteryInfo {
 
 export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
 
-export type SpeculativeCompressionState = 'active' | 'fallback' | 'idle' | 'installed' | 'preparing' | 'queued'
-
 export type NoticeLevel = 'error' | 'info' | 'success' | 'warn'
 
 // Credits/usage notice surfaced in the status bar. Shape is snake_case to
@@ -341,7 +339,6 @@ export interface UiState {
   sessionTitle: string
   showReasoning: boolean
   indicatorStyle: IndicatorStyle
-  speculativeCompressionState: SpeculativeCompressionState
   sid: null | string
   status: string
   statusBar: StatusBarMode
@@ -589,7 +586,6 @@ export interface AppLayoutStatusProps {
   lastTurnEndedAt: null | number
   sessionStartedAt: null | number
   showStickyPrompt: boolean
-  speculativeCompressionState: SpeculativeCompressionState
   statusColor: string
   stickyPrompt: string
   turnStartedAt: null | number
