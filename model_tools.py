@@ -332,17 +332,20 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
-        cache_key = (
-            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-            frozenset(disabled_toolsets) if disabled_toolsets else None,
-            registry._generation,
-            cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
-            bool(os.environ.get("HERMES_WORK_INBOX_INTAKE")),
-            bool(skip_tool_search_assembly),
-            _is_delegated_child_context(),
-        )
-        cached = _tool_defs_cache.get(cache_key)
+        profile_scope = check_fn_cache_scope()
+        if profile_scope != CHECK_FN_CACHE_BYPASS:
+            cache_key = (
+                frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+                frozenset(disabled_toolsets) if disabled_toolsets else None,
+                registry._generation,
+                cfg_fp,
+                bool(os.environ.get("HERMES_KANBAN_TASK")),
+                bool(os.environ.get("HERMES_WORK_INBOX_INTAKE")),
+                bool(skip_tool_search_assembly),
+                _is_delegated_child_context(),
+                profile_scope,
+            )
+        cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.

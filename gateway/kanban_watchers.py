@@ -239,6 +239,10 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _owns_kanban_dispatcher_lock(self) -> bool:
+        """Return whether this gateway currently owns the singleton lock."""
+        return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
+
     async def _kanban_override_instruction(
         self, event: Any, session_key: str
     ) -> Optional[str]:

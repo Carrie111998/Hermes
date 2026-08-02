@@ -209,7 +209,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     assert event.is_dir(), "missing top-level event/"
     # Darwin strips setgid from these test directories; Linux, where the s6
     # service runs, must retain the complete production mode.
-    expected_event_mode = 0o3730
+    expected_event_mode = 0o1730 if sys.platform == "darwin" else 0o3730
     assert stat.S_IMODE(event.stat().st_mode) == expected_event_mode, (
         f"event/ mode = {oct(event.stat().st_mode)}, want {oct(expected_event_mode)}"
     )
@@ -491,4 +491,3 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
