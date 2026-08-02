@@ -284,29 +284,35 @@ def create_scope(
     duplicate scope for the same conversation.
     """
     scope_id = compute_scope_id(identity)
-    existing = load_scope(scope_id, hermes_home)
-    if existing is not None:
-        return existing
+    # Hold the index lock across the existing-check + manifest write + index
+    # update so two concurrent create_scope() calls for the same identity
+    # can't both pass the existence check and race the index read-modify-
+    # write (a lost index entry would leave a valid manifest on disk that
+    # resolve_scope_id() could never find again).
+    with _FileLock(_index_lock_path(hermes_home)):
+        existing = load_scope(scope_id, hermes_home)
+        if existing is not None:
+            return existing
 
-    ts = _iso(now)
-    manifest = {
-        "scope_id": scope_id,
-        "identity": identity,
-        "goal": goal,
-        "included_topics": list(included_topics or []),
-        "excluded_topics": list(excluded_topics or []),
-        "lifecycle": "active",
-        "created_at": ts,
-        "updated_at": ts,
-        "owned": {category: [] for category in _OWNED_CATEGORIES},
-        "external_dependencies": [],
-    }
-    _write_manifest(manifest, hermes_home)
+        ts = _iso(now)
+        manifest = {
+            "scope_id": scope_id,
+            "identity": identity,
+            "goal": goal,
+            "included_topics": list(included_topics or []),
+            "excluded_topics": list(excluded_topics or []),
+            "lifecycle": "active",
+            "created_at": ts,
+            "updated_at": ts,
+            "owned": {category: [] for category in _OWNED_CATEGORIES},
+            "external_dependencies": [],
+        }
+        _write_manifest(manifest, hermes_home)
 
-    index = _load_index(hermes_home)
-    index[scope_id] = scope_id
-    _write_index(index, hermes_home)
-    return manifest
+        index = _load_index(hermes_home)
+        index[scope_id] = scope_id
+        _write_index(index, hermes_home)
+        return manifest
 
 
 def _iso(now: Optional[float] = None) -> str:
