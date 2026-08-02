@@ -1,0 +1,336 @@
+"""Pure outcome normalization for notification routing and presentation.
+
+Outcome is deliberately separate from attention and destination.  This module
+interprets stable evidence on an immutable Event and returns a verdict; it does
+not route, deliver, mutate, or inspect external state.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+from events.schema import Event, EventType, Priority
+
+
+class OutcomeState(Enum):
+    FAILED = "failed"
+    DEGRADED = "degraded"
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    RECOVERED = "recovered"
+    UNKNOWN = "unknown"
+
+
+class FailureKind(Enum):
+    TIMEOUT = "timeout"
+    EXCEPTION = "exception"
+    CONNECTION = "connection"
+    VALIDATION = "validation"
+    BROWSER = "browser"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class OutcomeEvidence:
+    code: str
+    path: str
+    value: object
+
+
+@dataclass(frozen=True)
+class OutcomeVerdict:
+    state: OutcomeState
+    priority_floor: Priority | None
+    evidence: tuple[OutcomeEvidence, ...]
+    failure_kind: FailureKind | None
+
+
+_FAILURE_EVENT_TYPES = frozenset(
+    {
+        EventType.CRON_FAILED,
+        EventType.CRON_FAILED_CONSECUTIVE,
+        EventType.APPLICATION_FAILED,
+        EventType.AGENT_ERROR,
+        EventType.AGENT_FAILURE_CLUSTER,
+        EventType.DEVFLOW_BUILD_FAILED,
+        EventType.NOTIFICATION_FAILED,
+        EventType.GATEWAY_STOPPED,
+        EventType.AGENT_LOOP_FAULT,
+    }
+)
+
+_DEGRADED_EVENT_TYPES = frozenset(
+    {
+        EventType.CRON_STALE,
+        EventType.RESOURCE_PRESSURE,
+        EventType.WATCHDOG_SELF_DEGRADED,
+    }
+)
+
+_PENDING_EVENT_TYPES = frozenset(
+    {
+        EventType.APPROVAL_REQUEST,
+        EventType.APPLICATION_READY,
+        EventType.APPLICATION_BLOCKED,
+        EventType.APPLY_PACKET,
+        EventType.DEVFLOW_APPROVAL_REQUESTED,
+        EventType.DEVFLOW_PR_REVIEW_REQUESTED,
+        EventType.TRACKER_PARTIAL_BACKLOG,
+    }
+)
+
+_SUCCESS_EVENT_TYPES = frozenset(
+    {
+        EventType.CRON_COMPLETED,
+        EventType.APPLICATION_SUBMITTED,
+        EventType.DEVFLOW_RUN_COMPLETED,
+        EventType.DEVFLOW_BUILD_SUCCEEDED,
+        EventType.NOTIFICATION_DELIVERED,
+    }
+)
+
+_RECOVERY_EVENT_TYPES = frozenset(
+    {
+        EventType.GATEWAY_STARTED,
+        EventType.WATCHDOG_RECOVERED,
+    }
+)
+
+_FAILED_VALUES = frozenset(
+    {
+        "error",
+        "failed",
+        "failure",
+        "fatal",
+        "timed_out",
+        "timeout",
+        "down",
+        "unhealthy",
+    }
+)
+_DEGRADED_VALUES = frozenset({"degraded", "partial", "impaired"})
+_PENDING_VALUES = frozenset(
+    {"pending", "awaiting_approval", "awaiting_decision", "blocked"}
+)
+_SUCCESS_VALUES = frozenset(
+    {"ok", "passed", "success", "succeeded", "complete", "completed", "healthy", "up"}
+)
+_RECOVERED_VALUES = frozenset({"recovered", "resolved", "restored"})
+_UNHEALTHY_VALUES = frozenset(
+    {"down", "unhealthy", "degraded", "failed", "failure", "error"}
+)
+_HEALTHY_VALUES = frozenset({"up", "healthy", "recovered", "resolved", "restored"})
+
+_VALUE_FIELDS = ("status", "reason", "outcome", "result", "conclusion", "message_type")
+_PREVIOUS_FIELDS = ("before", "previous_status", "previous", "from")
+
+_CRON_FAILURE_RE = re.compile(
+    r"(?:\b(?:RED|FAILED|FAILURE|CRITICAL)\b"
+    r"|\berrors?=[1-9]\d*\b"
+    r"|\bfirst error\b"
+    r"|\brc=[1-9]\d*\b)"
+)
+
+
+def _normalized(value: Any) -> str:
+    return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _exit_code_failure(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _evidence(code: str, path: str, value: object) -> OutcomeEvidence:
+    return OutcomeEvidence(code=code, path=path, value=value)
+
+
+def _failure_kind(payload: dict[str, Any], evidence: list[OutcomeEvidence]) -> FailureKind:
+    values = [item.value for item in evidence]
+    values.extend(
+        payload.get(field)
+        for field in ("error", "message", "detail", "phase", "failure_type", "error_code")
+        if payload.get(field) is not None
+    )
+    text = " ".join(str(value) for value in values).lower()
+    evidence_codes = {item.code for item in evidence}
+    if "timeout" in evidence_codes or re.search(
+        r"timed?[ _-]?out|timeout|deadline|\brc=124\b", text
+    ):
+        return FailureKind.TIMEOUT
+    if re.search(r"connection|connect(?:ion)? refused|econnrefused|network|socket", text):
+        return FailureKind.CONNECTION
+    if re.search(r"validation|invalid|duplicate|uniqueness|constraint", text):
+        return FailureKind.VALIDATION
+    if re.search(r"browser|playwright|captcha|navigation|workday|greenhouse", text):
+        return FailureKind.BROWSER
+    if re.search(r"exception|traceback|stack trace", text):
+        return FailureKind.EXCEPTION
+    return FailureKind.OTHER
+
+
+def _is_recovery_transition(event: Event, payload: dict[str, Any]) -> OutcomeEvidence | None:
+    if event.event_type in _RECOVERY_EVENT_TYPES:
+        return _evidence("recovery_event_type", "event.event_type", event.event_type.type_string)
+
+    status = _normalized(payload.get("status", ""))
+    after = _normalized(payload.get("after", ""))
+    previous = next(
+        (_normalized(payload.get(field)) for field in _PREVIOUS_FIELDS if payload.get(field) is not None),
+        "",
+    )
+    current = after or status
+
+    if current in _HEALTHY_VALUES and previous in _UNHEALTHY_VALUES:
+        path = "payload.after" if after else "payload.status"
+        return _evidence("healthy_transition", path, payload.get("after") if after else payload.get("status"))
+    if event.event_type is EventType.GATEWAY_HEALTH and status == "up":
+        return _evidence("gateway_recovered", "payload.status", payload.get("status"))
+    if event.event_type is EventType.CODE_DRIFT and status == "resolved":
+        return _evidence("drift_resolved", "payload.status", payload.get("status"))
+    if event.event_type is EventType.WATCHDOG_PROBE_TRANSITION and after == "healthy":
+        return _evidence("probe_recovered", "payload.after", payload.get("after"))
+    return None
+
+
+def evaluate_outcome(event: Event) -> OutcomeVerdict:
+    """Return a deterministic failure-wins verdict for *event*.
+
+    All recognized evidence is retained, but the first non-empty precedence
+    class determines the state: failed, degraded, pending, recovered, success,
+    then unknown.
+    """
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    failed: list[OutcomeEvidence] = []
+    degraded: list[OutcomeEvidence] = []
+    pending: list[OutcomeEvidence] = []
+    succeeded: list[OutcomeEvidence] = []
+
+    if event.event_type in _FAILURE_EVENT_TYPES:
+        failed.append(
+            _evidence("failure_event_type", "event.event_type", event.event_type.type_string)
+        )
+    if event.event_type in _DEGRADED_EVENT_TYPES:
+        degraded.append(
+            _evidence("degraded_event_type", "event.event_type", event.event_type.type_string)
+        )
+    if event.event_type in _PENDING_EVENT_TYPES:
+        pending.append(
+            _evidence("pending_event_type", "event.event_type", event.event_type.type_string)
+        )
+    if event.event_type in _SUCCESS_EVENT_TYPES:
+        succeeded.append(
+            _evidence("success_event_type", "event.event_type", event.event_type.type_string)
+        )
+
+    if _exit_code_failure(payload.get("exit_code")):
+        failed.append(_evidence("nonzero_exit_code", "payload.exit_code", payload["exit_code"]))
+    counters = payload.get("counters")
+    if isinstance(counters, dict) and _exit_code_failure(counters.get("exit_code")):
+        failed.append(
+            _evidence(
+                "nonzero_exit_code",
+                "payload.counters.exit_code",
+                counters["exit_code"],
+            )
+        )
+
+    if payload.get("timeout") is True:
+        failed.append(_evidence("timeout", "payload.timeout", True))
+
+    for field in _VALUE_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        normalized = _normalized(value)
+        path = f"payload.{field}"
+        if normalized in _FAILED_VALUES:
+            failed.append(_evidence("explicit_failure", path, value))
+        elif normalized in _DEGRADED_VALUES:
+            degraded.append(_evidence("explicit_degradation", path, value))
+        elif normalized in _PENDING_VALUES:
+            pending.append(_evidence("explicit_pending", path, value))
+        elif normalized in _RECOVERED_VALUES:
+            succeeded.append(_evidence("explicit_recovery", path, value))
+        elif normalized in _SUCCESS_VALUES:
+            succeeded.append(_evidence("explicit_success", path, value))
+
+    if event.event_type is EventType.CRON_COMPLETED:
+        output_summary = str(payload.get("output_summary", ""))[:400]
+        if _CRON_FAILURE_RE.search(output_summary):
+            failed.append(
+                _evidence("legacy_cron_failure", "payload.output_summary", output_summary)
+            )
+
+    if failed:
+        return OutcomeVerdict(
+            state=OutcomeState.FAILED,
+            priority_floor=Priority.HIGH,
+            evidence=tuple(failed + degraded + pending + succeeded),
+            failure_kind=_failure_kind(payload, failed),
+        )
+
+    if degraded:
+        return OutcomeVerdict(
+            state=OutcomeState.DEGRADED,
+            priority_floor=Priority.HIGH,
+            evidence=tuple(degraded + pending + succeeded),
+            failure_kind=None,
+        )
+
+    if pending or payload.get("action_required") is True or payload.get("decision_required") is True:
+        if payload.get("action_required") is True:
+            pending.append(_evidence("action_required", "payload.action_required", True))
+        if payload.get("decision_required") is True:
+            pending.append(_evidence("decision_required", "payload.decision_required", True))
+        return OutcomeVerdict(
+            state=OutcomeState.PENDING,
+            priority_floor=None,
+            evidence=tuple(pending + succeeded),
+            failure_kind=None,
+        )
+
+    recovery = _is_recovery_transition(event, payload)
+    if recovery is not None:
+        return OutcomeVerdict(
+            state=OutcomeState.RECOVERED,
+            priority_floor=None,
+            evidence=(recovery, *succeeded),
+            failure_kind=None,
+        )
+
+    if succeeded:
+        recovered = [item for item in succeeded if item.code == "explicit_recovery"]
+        return OutcomeVerdict(
+            state=OutcomeState.RECOVERED if recovered else OutcomeState.SUCCEEDED,
+            priority_floor=None,
+            evidence=tuple(succeeded),
+            failure_kind=None,
+        )
+
+    return OutcomeVerdict(
+        state=OutcomeState.UNKNOWN,
+        priority_floor=None,
+        evidence=(
+            _evidence("no_recognized_evidence", "event", event.event_type.type_string),
+        ),
+        failure_kind=None,
+    )
+
+
+def marker_for_verdict(verdict: OutcomeVerdict, effective_priority: Priority) -> str:
+    """Return the non-ambiguous status marker for a computed verdict."""
+    if verdict.state is OutcomeState.FAILED:
+        return "🔴" if effective_priority is Priority.CRITICAL else "🟠"
+    if verdict.state is OutcomeState.DEGRADED:
+        return "🟠"
+    if verdict.state in {OutcomeState.SUCCEEDED, OutcomeState.RECOVERED}:
+        return "🟢"
+    return "🟡"
