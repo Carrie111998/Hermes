@@ -86,9 +86,8 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
@@ -2993,7 +2992,7 @@ def _route_product_human_block_to_preflight(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
     human_escalation_assignee: Optional[str] = None,
-) -> Optional[tuple[bool, Optional[int]]]:
+) -> Optional[bool]:
     """Route the first product-board human block to Hermes instead of Slack.
 
     The next human block for the same unresolved preflight falls through to the
@@ -3021,7 +3020,7 @@ def _route_product_human_block_to_preflight(
             (task_id,),
         ).fetchone()
         if row is None:
-            return False, None
+            return False
         step_key = row["current_step_key"] or "backlog"
         if row["workflow_template_id"] != "product" and not step_key:
             return None
@@ -3056,7 +3055,7 @@ def _route_product_human_block_to_preflight(
         )
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
-            return False, None
+            return False
         # v2 flag maintenance: the worker that hit the obstacle has stopped,
         # but ``default`` hasn't given up yet -- clear ``running`` only.
         # ``blocked`` stays 0. Direct UPDATE (no _sync_legacy_status): the
@@ -3085,7 +3084,7 @@ def _route_product_human_block_to_preflight(
                 metadata=run_metadata or None,
                 step_key=step_key,
             )
-        transition_event_id = _append_event(
+        _append_event(
             conn,
             task_id,
             PRODUCT_WORKFLOW_PRECHECK_EVENT,
@@ -3100,7 +3099,7 @@ def _route_product_human_block_to_preflight(
             },
             run_id=run_id,
         )
-    return True, transition_event_id
+    return True
 
 
 # D4 operator re-entry is deliberately narrower than ``unblock_task`` or
@@ -10418,7 +10417,7 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        transition_event_id = _append_event(
+        _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
@@ -11105,15 +11104,12 @@ def block_task(
         human_escalation_assignee=human_escalation_assignee,
     )
     if product_preflight is not None:
-        return product_preflight[0]
+        return product_preflight
     meta = product_board_metadata(board)
     routed_to = "blocked"
     recurrences = 0
     attempts = [str(a).strip() for a in (attempted_resolutions or []) if str(a).strip()]
 
-    # Dependency waits have an early return of their own. Keep capture outside
-    # the transaction so advisory memory can never participate in the state
-    # transition or roll it back.
     if kind == "dependency":
         with write_txn(conn):
             if expected_run_id is None:
@@ -11165,7 +11161,7 @@ def block_task(
                     conn, task_id, outcome="blocked", summary=reason,
                     metadata=metadata,
                 )
-            transition_event_id = _append_event(
+            _append_event(
                 conn, task_id, "dependency_wait",
                 {
                     "reason": reason,
@@ -11249,7 +11245,7 @@ def block_task(
                     conn, task_id, outcome="blocked", summary=reason,
                     metadata=metadata,
                 )
-            transition_event_id = _append_event(
+            _append_event(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
@@ -11321,7 +11317,7 @@ def block_task(
                     summary=reason,
                     metadata=metadata,
                 )
-            transition_event_id = _append_event(
+            _append_event(
                 conn, task_id, "blocked",
                 {
                     "reason": reason,
@@ -14602,7 +14598,7 @@ def handoff(
             )
             if expected_run_id is not None and run_id is None:
                 raise RuntimeError("handoff run ownership changed")
-            transition_event_id = _append_event(
+            _append_event(
                 conn,
                 task_id,
                 "handoff",

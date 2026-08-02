@@ -103,8 +103,8 @@ def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp
     assert kanban == {
         "kanban_show", "kanban_heartbeat", "kanban_comment", "kanban_resolve",
     }, (
-        "resolver kanban surface must be inspect/heartbeat/comment/resolve plus "
-        f"the narrow Agent Memory handoff tools, got {kanban}"
+        "resolver kanban surface must be inspect/heartbeat/comment/resolve, "
+        f"got {kanban}"
     )
     for readonly in ("read_file", "search_files", "web_search", "web_extract"):
         assert readonly in names, f"resolver evidence tool missing: {readonly}"
