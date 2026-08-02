@@ -16,7 +16,10 @@ binds.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
+import time
 from typing import Awaitable, Callable
 
 from fastapi import Request
@@ -28,6 +31,7 @@ from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     ProviderError,
     RefreshExpiredError,
+    Session,
 )
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
@@ -40,6 +44,16 @@ from hermes_cli.dashboard_auth.cookies import (
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
+
+# Rotating refresh tokens are single-use. Several browser or native-app
+# requests can reach the gateway with the same token before the first response
+# persists the rotation. Cache successful rotations briefly so the rest of
+# that burst receives the same new token pair instead of replaying a revoked
+# token at the identity provider. Keys are one-way hashes; raw credentials are
+# never retained as dictionary keys or exposed in diagnostics.
+_REFRESH_COALESCE_SECONDS = 30.0
+_refresh_lock = threading.Lock()
+_refresh_results: dict[str, tuple[float, Session, str]] = {}
 
 # Prefixes that bypass the auth gate. Match via ``path == prefix`` or
 # ``path.startswith(prefix)`` — so ``/assets/`` (with trailing slash)
@@ -544,7 +558,7 @@ def _expires_in_seconds(session) -> int:
     return max(60, int(session.expires_at) - int(time.time()))
 
 
-def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | None = None):
+def _attempt_refresh_uncached(request: Request, *, refresh_token, provider_hint: str | None = None):
     """Try to rotate an expired session via the refresh token.
 
     The provider hint only changes candidate order. ``RefreshExpiredError``
@@ -589,3 +603,45 @@ def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | No
     if unavailable_provider is not None:
         raise ProviderError(unavailable_provider)
     return None
+
+
+def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | None = None):
+    """Coalesce requests that carry the same single-use refresh token.
+
+    Requests already in flight cannot observe the first response's rotated
+    credential. A short successful-result cache prevents those stale requests
+    from replaying the consumed token. Failures are never cached, so transient
+    provider recovery remains immediately observable.
+    """
+    if not refresh_token:
+        return None
+    refresh_key = hashlib.sha256(
+        f"{provider_hint or ''}\x00{refresh_token}".encode("utf-8")
+    ).hexdigest()
+    with _refresh_lock:
+        now = time.monotonic()
+        expired_keys = [
+            key for key, (expires_at, _, _) in _refresh_results.items()
+            if expires_at <= now
+        ]
+        for key in expired_keys:
+            del _refresh_results[key]
+
+        cached = _refresh_results.get(refresh_key)
+        if cached is not None:
+            _, session, provider_name = cached
+            return session, provider_name
+
+        refreshed = _attempt_refresh_uncached(
+            request,
+            refresh_token=refresh_token,
+            provider_hint=provider_hint,
+        )
+        if refreshed is not None:
+            session, provider_name = refreshed
+            _refresh_results[refresh_key] = (
+                time.monotonic() + _REFRESH_COALESCE_SECONDS,
+                session,
+                provider_name,
+            )
+        return refreshed

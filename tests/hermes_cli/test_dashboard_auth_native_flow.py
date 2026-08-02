@@ -244,3 +244,44 @@ def test_native_refresh_dead_token_returns_401(gated_client):
     )
     assert r.status_code == 401
     assert r.json()["error"] == "session_expired"
+
+
+def test_native_refresh_reuses_rotated_result_for_same_single_use_token(gated_client):
+    class SingleUseRefreshProvider(StubAuthProvider):
+        name = "single-use"
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.valid_refresh_token = "rt-old"
+
+        def refresh_session(self, *, refresh_token: str) -> Session:
+            self.calls += 1
+            if refresh_token != self.valid_refresh_token:
+                from hermes_cli.dashboard_auth.base import RefreshExpiredError
+
+                raise RefreshExpiredError("refresh token was already rotated")
+            self.valid_refresh_token = "rt-new"
+            return Session(
+                user_id="single-use-user",
+                email="single-use@example.test",
+                display_name="Single Use",
+                org_id="",
+                provider=self.name,
+                expires_at=int(time.time()) + 600,
+                access_token="at-new",
+                refresh_token="rt-new",
+            )
+
+    provider = SingleUseRefreshProvider()
+    clear_providers()
+    register_provider(provider)
+
+    payload = {"refresh_token": "rt-old", "provider": provider.name}
+    first = gated_client.post("/auth/native/refresh", json=payload)
+    replay = gated_client.post("/auth/native/refresh", json=payload)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert provider.calls == 1
