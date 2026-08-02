@@ -8,6 +8,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
+  // Play the OS alert sound from main. Unlike renderer WebAudio, this is not
+  // subject to autoplay policy, so it works while the window is unfocused.
+  playSystemBeep: () => ipcRenderer.invoke('hermes:beep'),
   petOverlay: {
     // Main renderer → main process: window lifecycle + drag. `request` is
     // `{ bounds, screen }`; resolves with the screen bounds it actually used.

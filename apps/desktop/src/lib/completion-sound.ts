@@ -486,7 +486,13 @@ export function playApprovalSound(dedupeKey?: string) {
   const play = () => {
     const ac = getCtx()
 
-    if (!ac) {
+    // Renderer WebAudio is subject to autoplay policy: with the window
+    // unfocused (user in another app/session — exactly when an approval alert
+    // matters) the context stays suspended and resume() without a user gesture
+    // does not start it, so the cue would be inaudible. Fall back to the OS
+    // alert sound from the main process, which plays regardless of focus.
+    if (!ac || ac.state === 'suspended') {
+      void window.hermesDesktop?.playSystemBeep?.()
       return
     }
 

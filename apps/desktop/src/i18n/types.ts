@@ -208,6 +208,7 @@ export interface Translations {
       approvalTitle: string
       approveAction: string
       rejectAction: string
+      runAction: string
       inputTitle: string
       inputBody: string
       turnDoneTitle: string

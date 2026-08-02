@@ -40,7 +40,7 @@ import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
-import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import { clearAllPrompts, clearApprovalRequest, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import { recordAgentReaction } from '@/store/reactions-local'
 import {
   $currentCwd,
@@ -947,6 +947,19 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // native notification is still dispatched for builds where it works.
         playApprovalSound(sessionId ?? undefined)
         notify({
+          action: {
+            label: translateNow('notifications.native.runAction'),
+            onClick: () => {
+              // Resolve straight from the toast (like the inline bar's Run):
+              // the renderer might be showing another session, so the inline
+              // approve button may be nowhere on screen.
+              void $gateway.get()?.request<{ resolved?: boolean }>('approval.respond', {
+                choice: 'once',
+                session_id: sessionId ?? undefined
+              })
+              clearApprovalRequest(sessionId)
+            }
+          },
           durationMs: 0,
           kind: 'warning',
           message: command || description,

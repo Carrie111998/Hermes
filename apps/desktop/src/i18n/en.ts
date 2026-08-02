@@ -165,6 +165,7 @@ export const en: Translations = {
       approvalTitle: 'Approval needed',
       approveAction: 'Approve',
       rejectAction: 'Reject',
+      runAction: 'Run',
       inputTitle: 'Input needed',
       inputBody: 'Hermes is waiting for your response.',
       turnDoneTitle: 'Hermes finished',

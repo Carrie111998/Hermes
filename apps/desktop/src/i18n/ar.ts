@@ -148,6 +148,7 @@ export const ar = defineLocale({
       approvalTitle: 'مطلوب موافقة',
       approveAction: 'موافقة',
       rejectAction: 'رفض',
+      runAction: 'تشغيل',
       inputTitle: 'مطلوب إدخال',
       inputBody: 'ينتظر Hermes ردّك.',
       turnDoneTitle: 'أنهى Hermes',

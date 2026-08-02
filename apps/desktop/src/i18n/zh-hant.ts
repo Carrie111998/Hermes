@@ -161,6 +161,7 @@ export const zhHant = defineLocale({
       approvalTitle: '需要核准',
       approveAction: '核准',
       rejectAction: '拒絕',
+      runAction: '執行',
       inputTitle: '需要輸入',
       inputBody: 'Hermes 正在等待你的回應。',
       turnDoneTitle: 'Hermes 已完成',
