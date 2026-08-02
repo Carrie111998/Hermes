@@ -9,7 +9,7 @@ name: Skills Index Freshness Check
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 6 * * *'   # daily — was every 4h; freshness alerting does not need 6 checks/day
   workflow_dispatch:
 
 permissions:
