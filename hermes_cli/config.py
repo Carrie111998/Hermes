@@ -1155,17 +1155,17 @@ def _unset_nested(config, dotted_key: str) -> bool:
     return removed
 
 
-def _drop_empty_platform_toolset_overrides(config: Dict[str, Any]) -> bool:
-    """Remove empty platform_toolsets overrides so defaults apply again."""
+def _drop_empty_platform_toolset_override(config: Dict[str, Any], platform: str) -> bool:
+    """Remove one empty platform_toolsets override so defaults apply again."""
     platform_toolsets = config.get("platform_toolsets")
     if not isinstance(platform_toolsets, dict):
         return False
 
-    cleaned = {
-        platform: raw for platform, raw in platform_toolsets.items() if raw != []
-    }
-    if cleaned == platform_toolsets:
+    if platform_toolsets.get(platform) != []:
         return False
+
+    cleaned = dict(platform_toolsets)
+    cleaned.pop(platform, None)
     if cleaned:
         config["platform_toolsets"] = cleaned
     else:
@@ -2284,9 +2284,17 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             clean_platform_toolsets,
             validate_platform_toolsets,
         )
+        configured_mcp_toolsets = {
+            f"mcp-{name}"
+            for name in (config.get("mcp_servers") or {})
+            if isinstance(name, str) and name
+        }
 
         cleaned_toolsets, ts_warnings, ts_changed = clean_platform_toolsets(
-            config.get("platform_toolsets"), validate_toolset
+            config.get("platform_toolsets"),
+            validate_toolset,
+            extra_valid_names=configured_mcp_toolsets,
+            removable_names={"messaging"},
         )
         if ts_changed:
             if cleaned_toolsets:
@@ -2297,7 +2305,9 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
 
         ts_warnings.extend(
             validate_platform_toolsets(
-                config.get("platform_toolsets"), validate_toolset
+                config.get("platform_toolsets"),
+                validate_toolset,
+                extra_valid_names=configured_mcp_toolsets,
             )
         )
         for w in ts_warnings:
@@ -5158,7 +5168,9 @@ def unset_config_value(key: str):
         sys.exit(1)
 
     if key.startswith("platform_toolsets."):
-        _drop_empty_platform_toolset_overrides(user_config)
+        parts = key.split(".", 2)
+        if len(parts) >= 3:
+            _drop_empty_platform_toolset_override(user_config, parts[1])
 
     ensure_hermes_home()
     from utils import atomic_yaml_write

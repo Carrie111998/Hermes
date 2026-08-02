@@ -12,7 +12,7 @@ significant debugging to find. Surfacing invalid toolset names (and the
 zero-tools end state) loudly turns that silent failure into an actionable one.
 """
 
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Collection, Dict, List, Tuple
 
 
 def _unknown_toolset_warning(
@@ -33,9 +33,21 @@ def _unknown_toolset_warning(
     )
 
 
+def _is_known_toolset(
+    name: str,
+    is_valid_toolset: Callable[[str], bool],
+    extra_valid_names: Collection[str] | None = None,
+) -> bool:
+    """Return whether a toolset name is known in the current environment."""
+    return is_valid_toolset(name) or name in (extra_valid_names or ())
+
+
 def clean_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
+    *,
+    extra_valid_names: Collection[str] | None = None,
+    removable_names: Collection[str] | None = None,
 ) -> Tuple[object, List[str], bool]:
     """Drop invalid toolset names while preserving all valid entries.
 
@@ -49,19 +61,25 @@ def clean_platform_toolsets(
     cleaned: Dict[str, Any] = {}
     warnings: List[str] = []
     changed = False
+    removable = set(removable_names or ())
 
     for platform, raw in platform_toolsets.items():
         if isinstance(raw, list):
             kept = []
             removed_invalid = False
             for entry in raw:
-                if isinstance(entry, str) and entry and not is_valid_toolset(entry):
+                if isinstance(entry, str) and entry and not _is_known_toolset(
+                    entry,
+                    is_valid_toolset,
+                    extra_valid_names,
+                ):
                     warnings.append(
                         _unknown_toolset_warning(platform, entry, is_valid_toolset)
                     )
-                    changed = True
-                    removed_invalid = True
-                    continue
+                    if not removable or entry in removable:
+                        changed = True
+                        removed_invalid = True
+                        continue
                 kept.append(entry)
             if kept:
                 cleaned[platform] = kept
@@ -71,10 +89,15 @@ def clean_platform_toolsets(
                 cleaned[platform] = raw
             continue
 
-        if isinstance(raw, str) and raw and not is_valid_toolset(raw):
+        if isinstance(raw, str) and raw and not _is_known_toolset(
+            raw,
+            is_valid_toolset,
+            extra_valid_names,
+        ):
             warnings.append(_unknown_toolset_warning(platform, raw, is_valid_toolset))
-            changed = True
-            continue
+            if not removable or raw in removable:
+                changed = True
+                continue
 
         cleaned[platform] = raw
 
@@ -86,6 +109,8 @@ def clean_platform_toolsets(
 def validate_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
+    *,
+    extra_valid_names: Collection[str] | None = None,
 ) -> List[str]:
     """Return human-readable warnings for a ``platform_toolsets`` mapping.
 
@@ -120,7 +145,7 @@ def validate_platform_toolsets(
         for name in names:
             if not isinstance(name, str) or not name:
                 continue
-            if is_valid_toolset(name):
+            if _is_known_toolset(name, is_valid_toolset, extra_valid_names):
                 valid_count += 1
                 continue
             warnings.append(_unknown_toolset_warning(platform, name, is_valid_toolset))

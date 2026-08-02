@@ -61,3 +61,29 @@ def test_clean_platform_toolsets_drops_invalid_entries_and_empty_overrides():
     assert any("platform 'discord'" in warning for warning in warnings)
 
 
+def test_clean_platform_toolsets_can_preserve_dynamic_and_non_removable_names():
+    cfg = {"cli": ["mcp-github", "messaging", "future-toolset"]}
+
+    cleaned, warnings, changed = clean_platform_toolsets(
+        cfg,
+        _is_valid,
+        extra_valid_names={"mcp-github"},
+        removable_names={"messaging"},
+    )
+
+    assert changed is True
+    assert cleaned == {"cli": ["mcp-github", "future-toolset"]}
+    assert len(warnings) == 2
+    assert any("unknown toolset 'messaging'" in warning for warning in warnings)
+    assert any("unknown toolset 'future-toolset'" in warning for warning in warnings)
+
+
+def test_validate_platform_toolsets_accepts_dynamic_valid_names():
+    warnings = validate_platform_toolsets(
+        {"cli": ["mcp-github"]},
+        _is_valid,
+        extra_valid_names={"mcp-github"},
+    )
+
+    assert warnings == []
+
