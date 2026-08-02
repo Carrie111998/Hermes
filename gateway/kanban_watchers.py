@@ -25,6 +25,15 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _kanban_identity_tag(platform: str, assignee: str | None) -> str:
+    """Format worker attribution without creating false platform mentions."""
+    if not assignee:
+        return ""
+    if platform.lower() == "buzz":
+        return f"[{assignee}] "
+    return f"@{assignee} "
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -409,7 +418,7 @@ class GatewayKanbanWatchersMixin:
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
+                        tag = _kanban_identity_tag(platform_str, who)
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried

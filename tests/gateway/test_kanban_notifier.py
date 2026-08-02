@@ -9,6 +9,7 @@ from gateway.kanban_watchers import (
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
+from gateway.kanban_watchers import _kanban_identity_tag
 from hermes_cli import kanban_db as kb
 
 
@@ -165,6 +166,13 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     message = adapter.sent[0]["text"]
     assert tid in message
     assert "blocked" in message
+
+
+def test_buzz_notification_does_not_treat_worker_profile_as_member_mention():
+    """Hermes profile names are attribution, not Buzz member mentions."""
+    assert _kanban_identity_tag("buzz", "default") == "[default] "
+    assert _kanban_identity_tag("telegram", "default") == "@default "
+    assert _kanban_identity_tag("buzz", None) == ""
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
