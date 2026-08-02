@@ -7066,11 +7066,21 @@ def _gateway_command_inner(args):
         stop_all = getattr(args, "all", False)
         system = getattr(args, "system", False)
         stop_for_restart = getattr(args, "for_restart", False)
+        restart_intent_written = False
+
+        def rollback_restart_intent() -> None:
+            if not restart_intent_written:
+                return
+            from gateway.status import clear_restart_after_stop_marker
+
+            clear_restart_after_stop_marker()
 
         if stop_for_restart:
             if stop_all:
                 print_error("--for-restart cannot be combined with --all")
                 sys.exit(2)
+            if system:
+                _sync_hermes_home_from_systemd_unit(system=True)
             from gateway.status import (
                 get_running_pid,
                 write_restart_after_stop_marker,
@@ -7083,6 +7093,7 @@ def _gateway_command_inner(args):
             if not write_restart_after_stop_marker(running_pid):
                 print_error("Could not persist the gateway restart intent; stop aborted")
                 sys.exit(1)
+            restart_intent_written = True
 
         # Phase 4: inside a container with s6, dispatch via the service
         # manager. ``--all`` iterates every registered profile gateway
@@ -7090,8 +7101,13 @@ def _gateway_command_inner(args):
         # which s6-supervise observes as a crash and immediately restarts).
         if stop_all and _dispatch_all_via_service_manager_if_s6("stop"):
             return
-        if not stop_all and _dispatch_via_service_manager_if_s6("stop"):
-            return
+        if not stop_all:
+            try:
+                if _dispatch_via_service_manager_if_s6("stop"):
+                    return
+            except BaseException:
+                rollback_restart_intent()
+                raise
 
         if stop_all:
             # --all: kill every gateway process on the machine
@@ -7157,11 +7173,15 @@ def _gateway_command_inner(args):
             if not service_available:
                 # No systemd/launchd/schtasks service — use profile-scoped PID file
                 if stop_profile_gateway():
+                    service_available = True
                     print("✓ Stopped gateway for this profile")
                 else:
                     print("✗ No gateway running for this profile")
             else:
                 print(f"✓ Stopped {get_service_name()} service")
+
+            if not service_available:
+                rollback_restart_intent()
 
     elif subcmd == "restart":
         # Defense: refuse self-targeting gateway restart from inside the gateway.

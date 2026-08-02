@@ -260,6 +260,102 @@ class TestGatewayStopCleanup:
 
         assert calls == [4242]
 
+    def test_stop_for_restart_system_syncs_home_before_pid_lookup(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_sync_hermes_home_from_systemd_unit",
+            lambda system: calls.append(("sync", system)),
+        )
+        monkeypatch.setattr(
+            status,
+            "get_running_pid",
+            lambda: calls.append(("pid", os.environ.get("HERMES_HOME"))) or 4242,
+        )
+        monkeypatch.setattr(
+            status,
+            "write_restart_after_stop_marker",
+            lambda pid: calls.append(("marker", pid)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_dispatch_via_service_manager_if_s6",
+            lambda action: True,
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="stop",
+                all=False,
+                system=True,
+                for_restart=True,
+            )
+        )
+
+        assert calls == [("sync", True), ("pid", os.environ.get("HERMES_HOME")), ("marker", 4242)]
+
+    def test_stop_for_restart_clears_intent_when_no_stop_occurs(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(status, "get_running_pid", lambda: 4242)
+        monkeypatch.setattr(status, "write_restart_after_stop_marker", lambda pid: True)
+        monkeypatch.setattr(
+            status,
+            "clear_restart_after_stop_marker",
+            lambda: calls.append("clear"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_dispatch_via_service_manager_if_s6",
+            lambda action: False,
+        )
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "stop_profile_gateway", lambda: False)
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="stop",
+                all=False,
+                system=False,
+                for_restart=True,
+            )
+        )
+
+        assert calls == ["clear"]
+
+    def test_stop_for_restart_clears_intent_when_dispatch_fails(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(status, "get_running_pid", lambda: 4242)
+        monkeypatch.setattr(status, "write_restart_after_stop_marker", lambda pid: True)
+        monkeypatch.setattr(
+            status,
+            "clear_restart_after_stop_marker",
+            lambda: calls.append("clear"),
+        )
+
+        def fail_dispatch(action):
+            raise RuntimeError("s6 stop failed")
+
+        monkeypatch.setattr(
+            gateway_cli,
+            "_dispatch_via_service_manager_if_s6",
+            fail_dispatch,
+        )
+
+        with pytest.raises(RuntimeError, match="s6 stop failed"):
+            gateway_cli.gateway_command(
+                SimpleNamespace(
+                    gateway_command="stop",
+                    all=False,
+                    system=False,
+                    for_restart=True,
+                )
+            )
+
+        assert calls == ["clear"]
+
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):
         """Without --all, stop uses systemd (if available) and does NOT call
         the global kill_gateway_processes()."""

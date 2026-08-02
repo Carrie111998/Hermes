@@ -2113,6 +2113,14 @@ def consume_restart_after_stop_marker_for_self() -> bool:
     )
 
 
+def clear_restart_after_stop_marker() -> None:
+    """Remove an explicit restart intent when the requested stop did not occur."""
+    try:
+        _get_restart_after_stop_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def consume_planned_stop_marker_for_self() -> bool:
     """Return True when the current process is being intentionally stopped."""
     return _consume_pid_marker_for_self(
