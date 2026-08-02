@@ -168,7 +168,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     aliases: ['/fork'],
     surface: action('branch')
   },
-  { name: '/yolo', description: 'Toggle YOLO — auto-approve dangerous commands', surface: action('yolo') },
+  { name: '/yolo', description: 'Toggle terminal/code execution authority', surface: action('yolo') },
   {
     name: '/wake',
     description: 'Control the desktop wake-word listener [on|off|status]',

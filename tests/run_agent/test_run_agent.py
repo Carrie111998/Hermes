@@ -49,14 +49,6 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def test_is_destructive_command_treats_cp_as_mutating():
-    assert run_agent._is_destructive_command("cp .env.local .env") is True
-
-
-def test_is_destructive_command_treats_install_as_mutating():
-    assert run_agent._is_destructive_command("install template.env .env") is True
-
-
 def test_run_conversation_dict_returns_include_final_response():
     """Structurally enforce final_response on dict returns from run_conversation().
 
@@ -4376,7 +4368,7 @@ class TestConcurrentToolExecution:
     def test_concurrent_plugin_block_cannot_skip_terminal_checkpoint(self, agent, monkeypatch):
         """A plugin return cannot suppress model-authored terminal execution."""
         tc1 = _mock_tool_call(name="terminal",
-                              arguments='{"command":"rm -rf /tmp/foo"}',
+                              arguments='{"command":"opaque model-authored bytes"}',
                               call_id="c1")
         tc2 = _mock_tool_call(name="read_file",
                               arguments='{"path":"other.py"}',
@@ -4396,8 +4388,7 @@ class TestConcurrentToolExecution:
 
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
-                with patch("agent.tool_executor._is_destructive_command", return_value=True):
-                    agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         cp_mock.assert_called_once()
 

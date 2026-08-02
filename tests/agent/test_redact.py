@@ -702,37 +702,28 @@ class TestDbConnstrCodeOutput:
 
 
 class TestTerminalOutputRedaction:
-    """is_env_dump_command + redact_terminal_output — issue #43025.
+    """Uniform terminal-output redaction — issue #43025.
 
     Terminal/process stdout must be redacted on every surface (foreground
-    `terminal` AND background `process(poll/log/wait)`). Env-dump commands get
-    the ENV-assignment pass so opaque tokens (no vendor prefix) are masked;
-    other commands stay on the code_file path to avoid false positives.
+    `terminal` AND background `process(poll/log/wait)`). Command bytes are not
+    semantic authority: identical output receives identical treatment.
     """
 
-    def test_is_env_dump_command_detection(self):
-        from agent.redact import is_env_dump_command
-        assert is_env_dump_command("printenv")
-        assert is_env_dump_command("env")
-        assert is_env_dump_command("env | grep API")
-        assert is_env_dump_command("set")
-        assert is_env_dump_command("export")
-        assert is_env_dump_command("declare -x")
-        assert is_env_dump_command("cat /tmp/x && printenv")
-        assert not is_env_dump_command("python app.py")
-        assert not is_env_dump_command("cat config.py")
-        assert not is_env_dump_command("printf 'TOKEN=x'")
-        assert not is_env_dump_command("")
-        assert not is_env_dump_command(None)
+    def test_command_text_never_changes_redaction_policy(self):
+        from agent.redact import redact_terminal_output
 
+        out = "CUSTOM_TOKEN=zzzopaque1234567890abcdef"
+        from_env = redact_terminal_output(out, force=True)
+        from_file = redact_terminal_output(out, force=True)
 
-
+        assert from_env == from_file
+        assert "zzzopaque1234567890abcdef" not in from_env
 
     def test_disabled_passes_through(self, monkeypatch):
         from agent.redact import redact_terminal_output
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         out = "CUSTOM_TOKEN=zzzopaque1234567890abcdef"
-        red = redact_terminal_output(out, "printenv")
+        red = redact_terminal_output(out)
         assert "zzzopaque1234567890abcdef" in red
 
 
@@ -857,5 +848,3 @@ class TestKeywordWordBoundary:
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
-
-

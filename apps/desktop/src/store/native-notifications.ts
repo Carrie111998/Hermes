@@ -4,7 +4,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest, sessionApprovalRequest } from './prompts'
+import { clearApprovalRequest, isExactApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -186,12 +186,6 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
 export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
-  const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
-
-  if (!choice) {
-    return
-  }
-
   const gateway = $gateway.get()
 
   if (!gateway) {
@@ -200,8 +194,24 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
 
   try {
     const request = sessionApprovalRequest(sessionId).get()
+    if (!request) {
+      return
+    }
+
+    // Defense in depth: even a stale/forged native notification action cannot
+    // authorize exact bytes without opening the in-app review gate.
+    if (actionId === 'approve' && isExactApprovalRequest(request)) {
+      return
+    }
+
+    const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
+
+    if (!choice) {
+      return
+    }
+
     await gateway.request('approval.respond', {
-      ...(request?.approvalId ? { approval_id: request.approvalId } : {}),
+      ...(request.approvalId ? { approval_id: request.approvalId } : {}),
       choice,
       session_id: sessionId ?? undefined
     })

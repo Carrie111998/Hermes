@@ -94,7 +94,7 @@ hermes-agent/
 │
 ├── tools/                    # Tool implementations (one file per tool)
 │   ├── registry.py           # Central tool registry
-│   ├── approval.py           # Dangerous command detection
+│   ├── approval.py           # Exact terminal-capability enforcement
 │   ├── terminal_tool.py      # Terminal orchestration
 │   ├── process_registry.py   # Background process management
 │   ├── file_tools.py         # read_file, write_file, patch, search_files

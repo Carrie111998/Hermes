@@ -181,7 +181,7 @@ By default, messaging sessions never auto-reset — context lives until you `/re
 
 ### Use Docker for Untrusted Code
 
-When working with untrusted repositories or running unfamiliar code, use Docker or Daytona as your terminal backend. Set `TERMINAL_ENV=docker` in your `.env`. Destructive commands inside a container can't harm your host system.
+When working with untrusted repositories or running unfamiliar code, use Docker or Daytona as your terminal backend. Set `TERMINAL_ENV=docker` in your `.env`. The container provides a structural isolation boundary from the host.
 
 ```bash
 # In your .env:
@@ -208,16 +208,16 @@ $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 This keeps PowerShell and child processes on UTF-8 and helps avoid Windows-only failures.
 
-### Review Before Choosing "Always"
+### Authorize Exact Operations, Not Command Patterns
 
-When the agent triggers a dangerous command approval (`rm -rf`, `DROP TABLE`, etc.), you get four options: **once**, **session**, **always**, **deny**. Think carefully before choosing "always" — it permanently allowlists that pattern. Start with "session" until you're comfortable.
+Owner approval authorizes only the exact pending terminal operation once. Hermes does not create session or permanent command-text grants. The active LLM interprets intent; the runtime verifies the opaque capability's exact bytes, use count, expiry, and session epoch.
 
-### Command Approval Is Your Safety Net
+### Structural Isolation Is a Separate Boundary
 
-Hermes checks every command against a curated list of dangerous patterns before execution. This includes recursive deletes, SQL drops, piping curl to shell, and more. Don't disable this in production — it exists for good reasons.
+Prefer an isolated backend for production workloads. Container and sandbox safety comes from the execution boundary, not from keyword classification of command prose.
 
 :::warning
-When running in a container backend (Docker, Singularity, Modal, Daytona), dangerous command checks are **skipped** because the container is the security boundary. Make sure your container images are properly locked down.
+In a container backend (Docker, Singularity, Modal, Daytona), the isolated execution surface is the structural authority boundary. Make sure your container images are properly locked down.
 :::
 
 ### Use Allowlists for Messaging Bots

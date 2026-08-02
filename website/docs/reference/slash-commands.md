@@ -83,8 +83,8 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/statusbar` (alias: `/sb`) | Toggle the context/model status bar on or off |
 | `/battery [on\|off\|status]` | Toggle a color-coded battery read-out as the first status-bar element (off by default; no-op without a battery). |
 | `/voice [on\|off\|tts\|status]` | Toggle CLI voice mode and spoken playback. Recording uses `voice.record_key` (default: `Ctrl+B`). |
-| `/yolo` | Toggle YOLO mode — skip all dangerous command approval prompts. |
-| `/approvals [manual\|off]` | Show or set the persistent dangerous-command approval mode. |
+| `/yolo` | Toggle owner prompts for exact terminal calls. Authorization remains invocation-bound and non-replayable. |
+| `/approvals [manual\|off]` | Show or set the persistent owner-prompt mode for exact terminal operations. |
 | `/footer [on\|off\|status]` | Toggle the gateway runtime-metadata footer on final replies (shows model, context %, and cwd). |
 | `/busy [queue\|steer\|interrupt\|status]` | CLI-only: control what pressing Enter does while Hermes is working — queue the new message, steer mid-turn, or interrupt immediately. |
 | `/indicator [kaomoji\|emoji\|unicode\|ascii]` | CLI-only: pick the TUI busy-indicator style. |
@@ -269,10 +269,10 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/platform <list\|pause\|resume> [name]` | Operate a running gateway platform right from chat. `/platform list` shows every adapter and its state (running, paused-by-breaker, manually-paused); `/platform pause <name>` stops dispatching new messages to that adapter without unloading it; `/platform resume <name>` re-enables it and clears a tripped circuit breaker once the upstream is healthy. |
 | `/reload-mcp` (alias: `/reload_mcp`) | Reload MCP servers from config. |
 | `/verbose` | Cycle tool progress display. **Off by default on messaging** — enable with `display.tool_progress_command: true` in `config.yaml`. |
-| `/yolo` | Toggle YOLO mode — skip all dangerous command approval prompts. |
+| `/yolo` | Toggle owner prompts for exact terminal calls. Authorization remains invocation-bound and non-replayable. |
 | `/commands [page]` | Browse all commands and skills (paginated). |
-| `/approve [session\|always]` | Approve and execute a pending dangerous command. `session` approves for this session only; `always` adds to permanent allowlist. |
-| `/deny` | Reject a pending dangerous command. |
+| `/approve` | Authorize the exact pending terminal invocation once and resume the agent. |
+| `/deny` | Reject the exact pending terminal invocation. |
 | `/update` | Update Hermes Agent to the latest version. |
 | `/restart` | Gracefully restart the gateway after draining active runs. When the gateway comes back online, it sends a confirmation to the requester's chat/thread. |
 | `/debug` | Upload debug report (system info + logs) and get shareable links. |
@@ -290,9 +290,9 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 - `/voice join`, `/voice channel`, and `/voice leave` are only meaningful on Discord.
 - In the TUI, `/sessions` shows live sessions in the current TUI process. Use `/resume [name]` or `hermes --tui --resume <id-or-title>` for saved or closed transcripts.
 
-## Confirmation prompts for destructive commands
+## Confirmation prompts for state-discarding slash commands
 
-The CLI prompts before running slash commands that throw away unsaved session state. The current destructive set is:
+The CLI prompts before running slash commands that throw away unsaved session state. The current state-discarding set is:
 
 | Command | What it destroys |
 |---------|------------------|
@@ -301,8 +301,8 @@ The CLI prompts before running slash commands that throw away unsaved session st
 | `/undo` | Removes the last user/assistant exchange from history. |
 | `/exit --delete` / `/quit --delete` | Exits **and** permanently deletes the current session's SQLite history and on-disk transcripts. |
 
-For each of these the CLI opens a three-choice modal: **Approve Once** (proceed this time), **Always Approve** (proceed and persist `approvals.destructive_slash_confirm: false` so future destructive commands run without prompting), or **Cancel**.
+For each of these the CLI opens a three-choice modal: **Approve Once** (proceed this time), **Always Approve** (proceed and persist the compatibility-named `approvals.destructive_slash_confirm: false` so these state-discarding slash commands run without prompting), or **Cancel**.
 
 **Inline skip:** append `now`, `--yes`, or `-y` to bypass the modal for a single invocation — e.g. `/reset now`, `/new --yes my-session`, `/clear -y`, `/undo -y`. Useful when the modal doesn't render correctly on your terminal (see [issue #30768](https://github.com/NousResearch/hermes-agent/issues/30768) for native Windows PowerShell) or when scripting against the CLI.
 
-Set `approvals.destructive_slash_confirm: false` in `~/.hermes/config.yaml` to disable the prompts globally; set it back to `true` to re-enable. See [Security — Destructive slash command confirmation](../user-guide/security.md#dangerous-command-approval) for context.
+Set `approvals.destructive_slash_confirm: false` in `~/.hermes/config.yaml` to disable the prompts globally; set it back to `true` to re-enable. This confirmation setting concerns session-state slash commands, not terminal command-pattern authority. See [Security](../user-guide/security.md#exact-terminal-authorization) for the separate terminal model.

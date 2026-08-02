@@ -6,10 +6,9 @@ assistant message, no tool result enters the conversation history, so a bang
 command costs zero tokens and cannot perturb role alternation or the prompt
 cache.
 
-A user-typed command still goes through the SAME dangerous-pattern approval
-gate the terminal tool uses (``tools.approval.check_all_command_guards``),
-reached here through ``tools.terminal_tool._check_all_guards`` so the CLI
-approval callback and Docker host-access handling behave identically.
+The leading ``!`` is itself an exact, local owner instruction. No model or
+classifier interprets the command and no agent approval policy is consulted;
+the exact bytes typed by the person at the interactive composer are executed.
 
 CLI-only by design: gateway/API/cron sessions have their own shells and no
 composer, so :func:`bang_shell_enabled` gates the feature off there.
@@ -99,30 +98,6 @@ def resolve_bang_cwd(session_key: Optional[str] = None) -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-def check_bang_approval(command: str) -> dict:
-    """Run *command* through the terminal tool's approval gate.
-
-    Reuses ``tools.terminal_tool._check_all_guards`` — the exact function
-    ``terminal_tool()`` calls before executing anything — so the hardline
-    blocklist, user deny rules, tirith findings, and the interactive
-    dangerous-command prompt all apply to user-typed bang commands too. A
-    command the agent would need approval for still needs approval when the
-    user types it; ``!`` is a latency/cost shortcut, not a security bypass.
-
-    Returns the gate's decision dict (``{"approved": bool, "message": ...}``).
-    Falls back to *approved* only when the gate itself cannot be imported,
-    which would mean a broken install rather than a policy decision.
-    """
-    try:
-        from tools.terminal_tool import _check_all_guards
-    except Exception:
-        return {"approved": True, "message": None}
-
-    # env_type mirrors the terminal tool: bang commands always run locally in
-    # the CLI process, never inside a remote/sandbox backend.
-    return _check_all_guards(command, "local", has_host_access=False)
 
 
 def _bang_env() -> dict:

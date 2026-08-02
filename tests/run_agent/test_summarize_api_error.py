@@ -38,6 +38,34 @@ def test_empty_body_falls_back_to_response_json_error_message():
     assert "model `foo` does not exist" in summary
 
 
+def test_structured_provider_error_redacts_secret_before_chat_conversion():
+    secret = "sk-proj-" + ("A" * 48)
+    err = Exception("provider request failed")
+    err.status_code = 401
+    err.body = {
+        "error": {
+            "message": f"Authorization: Bearer {secret}",
+        }
+    }
+
+    summary = AIAgent._summarize_api_error(err)
+
+    assert "HTTP 401" in summary
+    assert secret not in summary
+    assert "Authorization" in summary
+
+
+def test_fallback_provider_exception_redacts_secret_before_chat_conversion():
+    secret = "sk-proj-" + ("B" * 48)
+    err = RuntimeError(f"transport failed with x-api-key: {secret}")
+    err.status_code = 500
+
+    summary = AIAgent._summarize_api_error(err)
+
+    assert "HTTP 500" in summary
+    assert secret not in summary
+
+
 
 
 
@@ -62,4 +90,3 @@ def test_unread_streaming_response_does_not_crash_and_falls_back_to_exception_me
     summary = AIAgent._summarize_api_error(err)
     assert "HTTP 429" in summary
     assert "Gemini HTTP 429: quota exceeded" in summary
-

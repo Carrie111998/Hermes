@@ -943,7 +943,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     },
     "approvals.mode": {
         "type": "select",
-        "description": "Dangerous command approval mode",
+        "description": "Terminal/code-execution operation approval mode",
         "options": ["manual", "off"],
     },
     "context.engine": {

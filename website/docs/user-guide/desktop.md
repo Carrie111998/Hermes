@@ -52,7 +52,7 @@ The center of the app. You get:
 
 The bar along the bottom of the chat shows live session state and exposes quick controls without opening Settings:
 
-- **Per-session YOLO toggle** — flip YOLO on or off for just this session (matching the TUI). YOLO bypasses the dangerous-command approval prompts, so know what you're turning off — see [Security → YOLO Mode](./security.md#yolo-mode).
+- **Per-session YOLO toggle** — flip YOLO on or off for just this session (matching the TUI). YOLO skips owner prompts for exact terminal operations but does not create reusable command-pattern grants — see [Security → YOLO Mode](./security.md#yolo-mode).
 - **Context-usage meter** — a live "% full" meter of the session's context window. Click it to open the **Context Usage** popover with a token breakdown by category (system prompt, tool definitions, skills, memory, rules, MCP, subagent definitions, and the conversation itself) so you can see exactly what's eating the window before compression kicks in.
 - **Customizable items** — right-click the status bar (**Show in status bar**) to choose what appears: the context meter, workspace, model, approvals, turn/session timers, terminal, Command Center, backend version, and more — or hide the bar entirely (**Cmd/Ctrl+Shift+S** toggles it).
 

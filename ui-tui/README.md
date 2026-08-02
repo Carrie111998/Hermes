@@ -165,7 +165,7 @@ Notes:
 | Context                     | Keys                | Behavior                                          |
 | --------------------------- | ------------------- | ------------------------------------------------- |
 | approval prompt             | `Up/Down`, `Enter`  | Move and confirm the selected approval choice     |
-| approval prompt             | `o`, `s`, `a`, `d`  | Quick-pick `once`, `session`, `always`, `deny`    |
+| exact terminal approval     | `o`, `d`            | Authorize this exact invocation once, or deny     |
 | approval prompt             | `Esc`, `Ctrl+C`     | Deny                                              |
 | clarify prompt with choices | `Up/Down`, `Enter`  | Move and confirm the selected choice              |
 | clarify prompt with choices | single-digit number | Quick-pick the matching numbered choice           |
@@ -211,7 +211,7 @@ Tool/status activity is shown in a live activity lane. Transcript rows stay focu
 
 The Python gateway can pause the main loop and request structured input:
 
-- `approval.request`: allow once, allow for session, allow always, or deny
+- `approval.request`: authorize the exact pending terminal invocation once, or deny
 - `clarify.request`: pick from choices or type a custom answer
 - `sudo.request`: masked password entry
 - `secret.request`: masked value entry for a named env var
@@ -285,7 +285,7 @@ Primary event types the client handles today:
 | `tool.progress`            | `{ name, preview }`                                                         |
 | `tool.complete`            | `{ tool_id, name, error?, summary?, duration_s?, inline_diff?, todos? }`    |
 | `clarify.request`          | `{ question, choices?, request_id }`                                        |
-| `approval.request`         | `{ command, description, allow_permanent? }`                                |
+| `approval.request`         | `{ command, description, approval_id, exact_execution? }`                    |
 | `sudo.request`             | `{ request_id }`                                                            |
 | `sudo.expire`              | `{ request_id }` clears a timed-out sudo prompt                             |
 | `secret.request`           | `{ prompt, env_var, request_id }`                                           |

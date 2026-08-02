@@ -24,6 +24,7 @@ except ModuleNotFoundError:
     pass
 
 import logging
+import hashlib
 import copy
 import os
 import shutil
@@ -4587,7 +4588,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Agent will be initialized on first use
         self.agent: Optional[Any] = None
         self._tool_callbacks_installed = False
-        self._tirith_security_checked = False
         self._app = None  # prompt_toolkit Application (set in run())
         
         # Conversation state
@@ -7192,27 +7192,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             pass
         self._tool_callbacks_installed = True
 
-    def _ensure_tirith_security(self) -> None:
-        """Check tirith availability once before tools can run terminal commands."""
-        if getattr(self, "_tirith_security_checked", False):
-            return
-        self._tirith_security_checked = True
-        try:
-            from tools.tirith_security import ensure_installed, is_platform_supported
-
-            tirith_path = ensure_installed(log_failures=False)
-            if tirith_path is None and is_platform_supported():
-                security_cfg = self.config.get("security", {}) or {}
-                tirith_enabled = security_cfg.get("tirith_enabled", True)
-                if tirith_enabled:
-                    _cprint(
-                        f"  {_DIM}⚠ tirith security scanner enabled but not available "
-                        f"— command scanning will use pattern matching only{_RST}"
-                    )
-        except Exception:
-            pass
-
-
     def _show_security_advisories(self):
         """Show a startup banner if any unacked security advisories match.
 
@@ -9806,7 +9785,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_cli.bang_shell import (
             USAGE_HINT,
             bang_shell_enabled,
-            check_bang_approval,
             is_bang_command,
             parse_bang_command,
             resolve_bang_cwd,
@@ -9826,14 +9804,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Bare `!` — show what the feature does instead of running an
             # empty shell or sending "!" to the model.
             self._console_print(f"[dim]{USAGE_HINT}[/]")
-            return True
-
-        approval = check_bang_approval(command)
-        if not approval.get("approved"):
-            message = approval.get("message") or (
-                f"Command denied: {approval.get('description', 'flagged as dangerous')}"
-            )
-            self._console_print(f"[bold red]{_escape(str(message))}[/]")
             return True
 
         cwd = resolve_bang_cwd(getattr(self, "session_id", None))
@@ -11305,7 +11275,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return is_session_yolo_enabled(session_key)
 
     def _toggle_yolo(self):
-        """Toggle YOLO mode — skip all dangerous command approval prompts.
+        """Toggle YOLO mode — bypass exact operation approval prompts.
 
         Per-session toggle that mirrors the gateway and TUI ``/yolo`` handlers
         (see ``gateway/run.py:_handle_yolo_command`` and
@@ -11318,7 +11288,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         the other surfaces have. ``run_conversation`` binds
         ``self.session_id`` as the active approval session key via
         ``set_current_session_key`` so the bypass takes effect on the very
-        next dangerous command in this run.
+        next terminal or code-execution operation in this run.
         """
         from hermes_cli.colors import Colors as _Colors
         from tools.approval import (
@@ -11332,7 +11302,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             disable_session_yolo(session_key)
             _cprint(
                 f"  ⚠ YOLO mode {_Colors.BOLD}{_Colors.RED}OFF{_Colors.RESET}"
-                " — dangerous commands will require approval."
+                " — terminal and code-execution operations require authority."
             )
         else:
             enable_session_yolo(session_key)
@@ -13618,12 +13588,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                            approval_id: str = "",
                            exact_execution: bool = False) -> str:
         """
-        Prompt for dangerous command approval through the prompt_toolkit UI.
+        Prompt for exact operation approval through the prompt_toolkit UI.
 
         Called from the agent thread. Shows a selection UI similar to clarify
         with choices: once / session / always / deny. When
-        ``allow_permanent`` is false (for example after a Tirith finding),
-        only the persistent ``always`` choice is hidden.
+        ``allow_permanent`` is false, only the persistent ``always`` choice
+        is hidden.
         Long commands also get a 'view' option so the full command can be
         expanded before deciding.
 
@@ -13644,6 +13614,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     command,
                     allow_permanent=allow_permanent,
                     allow_session=allow_session,
+                    exact_execution=exact_execution,
                 ),
                 "approval_id": approval_id,
                 "exact_execution": exact_execution,
@@ -13668,8 +13639,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._paint_now()
                     _outcome_labels = {
                         "once": "allowed once",
-                        "session": "allowed for session",
-                        "always": "added to allowlist",
+                        "session": "allowed for this action scope",
+                        "always": "saved this action scope",
                         "deny": "denied",
                     }
                     self._persist_prompt_summary(
@@ -13689,7 +13660,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._approval_state = None
             self._approval_deadline = 0
             self._paint_now()
-            _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+            _cprint(f"\n{_DIM}  ⏱ Timeout — denying operation{_RST}")
             return "deny"
 
     def _approval_choices(
@@ -13698,8 +13669,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         *,
         allow_permanent: bool = True,
         allow_session: bool = True,
+        exact_execution: bool = False,
     ) -> list[str]:
-        """Return approval choices for a dangerous command prompt."""
+        """Return choices for an operation approval prompt."""
+        if exact_execution:
+            return ["view", "deny"]
         if not allow_session:
             choices = ["once", "deny"]
         else:
@@ -13734,7 +13708,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }.get(verdict, "deny")
 
     def _handle_approval_selection(self) -> None:
-        """Process the currently selected dangerous-command approval choice."""
+        """Process the currently selected operation-approval choice."""
         state = self._approval_state
         if not state:
             return
@@ -13748,6 +13722,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         chosen = choices[selected]
         if chosen == "view":
+            if state.get("exact_execution") is True:
+                command = str(state.get("command", ""))
+                canonical_json = json.dumps(command, ensure_ascii=False)
+                digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+                _cprint(
+                    "\nExact operation review (canonical UTF-8 JSON string):\n"
+                    f"{canonical_json}\n"
+                    f"SHA-256: {digest}\n"
+                )
+                state["exact_reviewed"] = True
+                state["show_full"] = False
+                state["choices"] = ["once", "deny"]
+                state["selected"] = 0
+                self._invalidate()
+                return
             state["show_full"] = True
             state["choices"] = [choice for choice in choices if choice != "view"]
             if state["selected"] >= len(state["choices"]):
@@ -13760,13 +13749,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._invalidate()
 
     def _get_approval_display_fragments(self):
-        """Render the dangerous-command approval panel for the prompt_toolkit UI.
+        """Render the operation approval panel for the prompt_toolkit UI.
 
         Layout priority: title + command + choices must always render, even if
         the terminal is short or the description is long. Description is placed
         at the bottom of the panel and gets truncated to fit the remaining row
         budget. This prevents HSplit from clipping approve/deny off-screen when
-        tirith findings produce multi-paragraph descriptions or when the user
+        an integration produces multi-paragraph descriptions or when the user
         runs in a compact terminal pane.
         """
         state = self._approval_state
@@ -13803,15 +13792,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         choices = state["choices"]
         selected = state.get("selected", 0)
         show_full = state.get("show_full", False)
+        exact_execution = state.get("exact_execution") is True
 
-        title = "⚠️  Dangerous Command"
-        cmd_display = command
+        title = "⚠️  Operation Approval"
+        if exact_execution:
+            digest = hashlib.sha256(str(command).encode("utf-8")).hexdigest()
+            if state.get("exact_reviewed"):
+                cmd_display = (
+                    "Exact UTF-8 JSON was printed to terminal scrollback. "
+                    f"SHA-256: {digest}"
+                )
+            else:
+                cmd_display = (
+                    "Review the complete canonical UTF-8 JSON before approval. "
+                    f"SHA-256: {digest}"
+                )
+        else:
+            cmd_display = command
         choice_labels = {
             "once": "Allow once",
             "session": "Allow for this session",
-            "always": "Add to permanent allowlist",
+            "always": "Always allow this action scope",
             "deny": "Deny",
-            "view": "Show full command",
+            "view": "Show full operation",
         }
 
         preview_lines = _wrap_panel_text(description, 60)
@@ -15583,7 +15586,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._sudo_deadline = 0
         self._modal_input_snapshot = None
 
-        # Dangerous command approval state (similar mechanism to clarify)
+        # Operation approval state (similar mechanism to clarify)
         self._approval_state = None     # dict with command, description, choices, selected, response_queue
         self._approval_deadline = 0
         self._approval_lock = threading.Lock()  # serialize concurrent approval prompts (delegation race fix)
@@ -15624,9 +15627,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
 
-        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
-            self._ensure_tirith_security()
-        
         # Key bindings for the input area
         kb = KeyBindings()
 
@@ -16172,7 +16172,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _idx = 9 if _num == 0 else _num - 1
             kb.add(str(_num), filter=Condition(lambda: bool(self._clarify_state) and not self._clarify_freetext))(_make_clarify_number_handler(_idx))
 
-        # --- Dangerous command approval: arrow-key navigation ---
+        # --- Operation approval: arrow-key navigation ---
 
         @kb.add('up', filter=Condition(lambda: bool(self._approval_state)))
         def approval_up(event):
@@ -17360,7 +17360,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             filter=Condition(lambda: cli_ref._secret_state is not None),
         )
 
-        # --- Dangerous command approval: display widget ---
+        # --- Operation approval: display widget ---
 
         def _get_approval_display():
             return cli_ref._get_approval_display_fragments()
@@ -17614,7 +17614,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'sudo-border': '#CD7F32',
             'sudo-title': '#FF6B6B bold',
             'sudo-text': '#FFF8DC',
-            # Dangerous command approval panel
+            # Operation approval panel
             'approval-border': '#CD7F32',
             'approval-title': '#FF8C00 bold',
             'approval-desc': '#FFF8DC bold',

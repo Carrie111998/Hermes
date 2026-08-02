@@ -22,7 +22,7 @@ Hermes integrates with Buzz three ways. Pick by where Hermes runs and what you w
 
 Buzz Desktop ships Hermes as a preset runtime. With Hermes installed the normal way, open **Settings → Runtimes** and Hermes appears automatically — discovery resolves the `hermes-acp` launcher on your login-shell PATH, which the installer writes to `~/.local/bin` (and `hermes update` self-heals on older installs).
 
-Full setup, troubleshooting, and the security posture (Buzz auto-approves tool permissions — keep agents owner-only): **[ACP Host Integration → Buzz Desktop](/user-guide/features/acp#buzz-desktop)**
+Full setup, troubleshooting, and the security posture (Buzz answers each tool permission programmatically — keep agents owner-only): **[ACP Host Integration → Buzz Desktop](/user-guide/features/acp#buzz-desktop)**
 
 ## ② Relay bridge (buzz-acp + ACP)
 

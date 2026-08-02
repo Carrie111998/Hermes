@@ -224,15 +224,15 @@ class TestPluginEngineDefault:
 
 
 # ---------------------------------------------------------------------------
-# Gateway noise filter: the warning is FAILURE-CLASS and must survive
+# Gateway delivery: the warning is FAILURE-CLASS and must survive
 # ---------------------------------------------------------------------------
 
-class TestWarningSurvivesNoiseFilter:
-    """The blocked-overflow warning is a deliberate carve-out from
-    routine-compression silence (#16775 class). The gateway noise regex
-    (#69550 just widened it) must NOT swallow it, or the fix is dead on
-    every chat platform. Executes the REAL compiled regex — never eyeball
-    a regex (noise-regex salvage rule).
+class TestWarningDelivery:
+    """The blocked-overflow warning must reach every chat platform.
+
+    Gateway status text is model-authored content.  Delivery is therefore
+    exercised through the real structural preparer instead of asserting an
+    obsolete semantic noise-regex contract.
     """
 
     def _emitted_warning(self, reason: str) -> str:
@@ -243,14 +243,6 @@ class TestWarningSurvivesNoiseFilter:
         return CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
             tokens=85_000, threshold=72_000, reason=reason
         )
-
-    def test_cooldown_warning_not_matched_by_noise_regex(self):
-        from gateway.run import _TELEGRAM_NOISY_STATUS_RE
-
-        assert not _TELEGRAM_NOISY_STATUS_RE.search(
-            self._emitted_warning("cooldown:30")
-        )
-
 
     def test_warning_delivered_on_chat_platform(self):
         """End-to-end through the fail-closed gateway status preparer."""

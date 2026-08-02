@@ -23,6 +23,7 @@ import { notifyError } from '@/store/notifications'
 import {
   type ApprovalRequest,
   clearApprovalRequest,
+  isExactApprovalRequest,
   registerApprovalInlineAnchor,
   sessionApprovalInlineVisible,
   sessionApprovalRequest
@@ -116,13 +117,18 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
   // it inline instead — "expand, Run" (2 clicks) rather than the modal dance.
   const [showCommand, setShowCommand] = useState(false)
   const busy = submitting !== null
-  // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
+  const exactRequest = isExactApprovalRequest(request)
+  // false when the exact request does not expose a persistent scope.
   const allowPermanent = request.allowPermanent !== false
   const choices = request.choices
-  const allowSession = choices ? choices.includes('session') : true
-  const allowAlways = choices ? choices.includes('always') : allowPermanent
+  // A malformed/incomplete transport event must not widen an exact request
+  // back into the legacy session/permanent scopes. The opaque identity is the
+  // fail-closed authority signal even when `choices` is absent.
+  const allowSession = !exactRequest && (choices ? choices.includes('session') : true)
+  const allowAlways = !exactRequest && (choices ? choices.includes('always') : allowPermanent)
   const hasMoreOptions = allowSession || allowAlways
-  const hasCommand = request.command.trim().length > 0
+  const hasCommand = request.command.length > 0
+  const canApprove = !exactRequest || showCommand
 
   const respond = useCallback(
     async (choice: ApprovalChoice) => {
@@ -166,7 +172,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && canApprove) {
         event.preventDefault()
         void respond('once')
       } else if (event.key === 'Escape') {
@@ -178,7 +184,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
     window.addEventListener('keydown', onKeyDown, true)
 
     return () => window.removeEventListener('keydown', onKeyDown, true)
-  }, [confirmAlways, respond])
+  }, [canApprove, confirmAlways, respond])
 
   return (
     <div
@@ -189,7 +195,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         <div className="inline-flex h-6 items-stretch overflow-hidden rounded-md border border-primary/25 bg-primary/10 text-primary">
           <Button
             className="h-full gap-1 rounded-none px-2 text-xs font-medium text-primary hover:bg-primary/15 hover:text-primary"
-            disabled={busy}
+            disabled={busy || !canApprove}
             onClick={() => void respond('once')}
             size="xs"
             variant="ghost"
@@ -262,7 +268,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
 
       {showCommand && hasCommand && (
         <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-2.5 py-1.5 font-mono text-xs leading-snug text-foreground">
-          {request.command.trim()}
+          {exactRequest ? JSON.stringify(request.command) : request.command}
         </pre>
       )}
 
@@ -273,9 +279,9 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
             <DialogDescription>{copy.alwaysDescription(request.description)}</DialogDescription>
           </DialogHeader>
 
-          {request.command.trim() && (
+          {request.command.length > 0 && (
             <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-2.5 py-1.5 font-mono text-xs leading-snug text-foreground">
-              {request.command.trim()}
+              {exactRequest ? JSON.stringify(request.command) : request.command}
             </pre>
           )}
 

@@ -40,7 +40,13 @@ import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
-import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import {
+  clearAllPrompts,
+  isExactApprovalId,
+  setApprovalRequest,
+  setSecretRequest,
+  setSudoRequest
+} from '@/store/prompts'
 import { recordAgentReaction } from '@/store/reactions-local'
 import {
   $currentCwd,
@@ -914,24 +920,27 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'approval.request') {
-        // Dangerous-command / execute_code approval. The Python side is blocked
+        // Exact terminal / execute_code approval. The Python side is blocked
         // in _await_gateway_decision() until approval.respond lands; without
         // this the agent stalls until its 5-min timeout and the tool is BLOCKED.
         // Park it per-session (like clarify) so a *background* profile's turn can
         // raise it and wait — the sidebar flags "needs input" and the inline bar
         // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
-        const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+        const description = typeof payload?.description === 'string' ? payload.description : 'terminal operation'
+        const approvalId = typeof payload?.approval_id === 'string' ? payload.approval_id : undefined
+        const exactExecution = payload?.exact_execution === true || isExactApprovalId(approvalId)
 
         setApprovalRequest({
-          approvalId: typeof payload?.approval_id === 'string' ? payload.approval_id : undefined,
-          // false only when a tirith warning forbids it; backend omits the field otherwise.
+          approvalId,
+          // false when the exact request does not expose a persistent scope.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
             ? payload.choices.filter(choice => typeof choice === 'string')
             : undefined,
           command,
           description,
+          exactExecution,
           sessionId: sessionId ?? null
         })
 
@@ -940,10 +949,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         dispatchNativeNotification({
-          actions: [
-            { id: 'approve', text: translateNow('notifications.native.approveAction') },
-            { id: 'reject', text: translateNow('notifications.native.rejectAction') }
-          ],
+          // Exact execution authority requires the in-app byte review gate.
+          // The notification body click focuses that review; direct approval
+          // is intentionally absent. Denial is safe without disclosure.
+          actions: exactExecution
+            ? [{ id: 'reject', text: translateNow('notifications.native.rejectAction') }]
+            : [
+                { id: 'approve', text: translateNow('notifications.native.approveAction') },
+                { id: 'reject', text: translateNow('notifications.native.rejectAction') }
+              ],
           body: command || description,
           kind: 'approval',
           sessionId,

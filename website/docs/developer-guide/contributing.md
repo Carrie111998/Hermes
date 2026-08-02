@@ -209,7 +209,7 @@ Hermes has terminal access. Security matters.
 | Layer                           | Implementation                                                              |
 | ------------------------------- | --------------------------------------------------------------------------- |
 | **Sudo password piping**        | Uses `shlex.quote()` to prevent shell injection                             |
-| **Dangerous command detection** | Regex patterns in `tools/approval.py` with user approval flow               |
+| **Exact terminal authority** | `tools/approval.py` verifies structural capabilities without parsing command text |
 | **Cron prompt injection**       | Scanner blocks instruction-override patterns                                |
 | **Write deny list**             | Protected paths resolved via `os.path.realpath()` to prevent symlink bypass |
 | **Skills guard**                | Security scanner for hub-installed skills                                   |

@@ -72,12 +72,13 @@ export type GatewayEventPayload = {
   request_id?: string
   question?: string
   choices?: string[] | null
-  // approval.request (dangerous command / execute_code) — session-keyed
+  // approval.request (exact terminal / execute_code operation) — session-keyed
   approval_id?: string
   command?: string
   description?: string
-  // False when a tirith content-security warning forbids a permanent allow.
+  // False when the exact request does not expose a persistent scope.
   allow_permanent?: boolean
+  exact_execution?: boolean
   // secret.request (skill credential capture)
   env_var?: string
   prompt?: string

@@ -87,13 +87,14 @@ asyncio.run_coroutine_threadsafe(...)
 
 ### 权限桥接
 
-`acp_adapter/permissions.py` 将危险终端审批 prompt 适配为 ACP 权限请求。
+`acp_adapter/permissions.py` 将精确终端授权 prompt 适配为 ACP 权限请求。
 
 映射关系：
 
-- `allow_once` -> Hermes `once`
-- `allow_always` -> Hermes `always`
+- 任意肯定响应 -> Hermes 对当前精确调用的一次性 capability
 - 拒绝选项 -> Hermes `deny`
+
+即使 ACP 宿主提供 `allow_session` 或 `allow_always` 标签，Hermes 也会将它们收窄为当前精确调用一次。协议标签不会在 Hermes 内创建更广泛或持久的命令模式权限。
 
 超时和桥接失败默认拒绝。
 

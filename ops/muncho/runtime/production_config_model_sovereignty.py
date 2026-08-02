@@ -81,8 +81,9 @@ MUTATIONS = (
     "tools.tool_search={enabled:off}",
     "approvals.owner_authority=exact_discord_id",
     "approvals.gateway_owner_escalation=guild_acl_receipted_control_tower",
+    "approvals.deny=absent",
     "goals.max_turns=0",
-    "command_allowlist=[]",
+    "command_allowlist=absent",
     "plugins={enabled:[],disabled:[]}",
     "hooks={};hooks_auto_accept=false",
     "display.busy_input_mode=steer",
@@ -400,6 +401,7 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     approvals = target.setdefault("approvals", {})
     if not isinstance(approvals, dict):
         raise ConfigGateError("config_approvals_surface_drifted")
+    approvals.pop("deny", None)
     approvals["plan_owner_user_ids"] = [PRODUCTION_OWNER_DISCORD_USER_ID]
     approvals["gateway_authorized_user_ids"] = [
         PRODUCTION_OWNER_DISCORD_USER_ID
@@ -419,7 +421,7 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     # Zero removes only the arbitrary cross-turn pause. Per-turn model/tool
     # budgets, exact permission boundaries, and explicit pause/clear remain.
     goals["max_turns"] = 0
-    target["command_allowlist"] = []
+    target.pop("command_allowlist", None)
     plugins = target.get("plugins")
     if plugins is not None and plugins != {} and plugins != {
         "enabled": [],

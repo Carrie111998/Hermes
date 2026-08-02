@@ -1,7 +1,7 @@
 """Tests for `!<command>` shell mode in the interactive CLI.
 
-Covers bang detection/parsing, that the terminal tool's approval gate is
-invoked for a dangerous command, that non-zero exit codes surface, and the
+Covers bang detection/parsing, that exact owner-typed bytes execute without
+model or semantic-policy interpretation, that non-zero exit codes surface, and the
 load-bearing invariant: a bang command leaves conversation_history
 byte-identical because it never becomes a turn.
 """
@@ -122,7 +122,7 @@ class TestBangExecution:
         assert "ok" in lines
 
 
-# ── CLI handler: approval gate, usage hint, exit codes ─────────────────────
+# ── CLI handler: exact owner command, usage hint, exit codes ───────────────
 
 def _make_cli(history=None):
     """Build a HermesCLI shell with only what handle_bang_shell touches."""
@@ -186,46 +186,18 @@ class TestBangHandlerDispatch:
         runner.assert_not_called()
 
 
-class TestBangApprovalGate:
-    """A user-typed command still goes through the terminal tool's gate."""
+class TestBangExactOwnerAuthority:
+    """The interactive owner's leading ``!`` is the complete authority."""
 
-    def test_approval_gate_is_invoked_for_a_dangerous_command(self):
+    def test_exact_bytes_reach_runner_without_terminal_policy(self):
         cli = _make_cli()
-        gate = MagicMock(return_value={"approved": True, "message": None})
-        with patch("tools.terminal_tool._check_all_guards", gate), \
-             patch("hermes_cli.bang_shell.run_bang_command", return_value=0):
-            cli.handle_bang_shell("!rm -rf ./build")
+        command = "printf '%s' 'opaque bytes && $(literal)'"
+        with patch("hermes_cli.bang_shell.run_bang_command", return_value=0) as runner, \
+             patch("tools.terminal_tool._check_all_guards") as guard:
+            assert cli.handle_bang_shell(f"!{command}") is True
 
-        gate.assert_called_once()
-        assert gate.call_args.args[0] == "rm -rf ./build"
-
-    def test_gate_is_invoked_for_every_command_not_just_dangerous_ones(self):
-        cli = _make_cli()
-        gate = MagicMock(return_value={"approved": True, "message": None})
-        with patch("tools.terminal_tool._check_all_guards", gate), \
-             patch("hermes_cli.bang_shell.run_bang_command", return_value=0):
-            cli.handle_bang_shell("!ls")
-        gate.assert_called_once()
-
-    def test_denied_command_is_not_executed(self):
-        cli = _make_cli()
-        gate = MagicMock(return_value={
-            "approved": False,
-            "message": "Command denied: recursive delete",
-        })
-        with patch("tools.terminal_tool._check_all_guards", gate), \
-             patch("hermes_cli.bang_shell.run_bang_command") as runner:
-            assert cli.handle_bang_shell("!rm -rf /important") is True
-
-        runner.assert_not_called()
-        assert any("denied" in line.lower() for line in _printed(cli))
-
-    def test_real_gate_blocks_a_hardline_command(self):
-        """End-to-end through the real approval module — no execution."""
-        cli = _make_cli()
-        with patch("hermes_cli.bang_shell.run_bang_command") as runner:
-            assert cli.handle_bang_shell("!rm -rf /") is True
-        runner.assert_not_called()
+        guard.assert_not_called()
+        assert runner.call_args.args[0] == command
 
 
 # ── THE load-bearing invariant ─────────────────────────────────────────────
@@ -273,16 +245,6 @@ class TestBangLeavesHistoryByteIdentical:
             f"bang command {submission!r} mutated conversation history"
         )
         assert len(cli.conversation_history) == len(_SEED_HISTORY)
-
-    def test_history_unchanged_when_command_is_denied(self):
-        cli = _make_cli(history=copy.deepcopy(_SEED_HISTORY))
-        before = json.dumps(cli.conversation_history, sort_keys=True)
-
-        gate = MagicMock(return_value={"approved": False, "message": "nope"})
-        with patch("tools.terminal_tool._check_all_guards", gate):
-            cli.handle_bang_shell("!rm -rf /important")
-
-        assert json.dumps(cli.conversation_history, sort_keys=True) == before
 
     def test_agent_is_never_invoked(self):
         """No model turn: the agent object is not touched at all."""

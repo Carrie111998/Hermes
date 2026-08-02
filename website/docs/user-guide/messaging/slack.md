@@ -323,10 +323,10 @@ casual messages like `!nice work` pass through to the agent unchanged.
 The bang form also works behind a mention (`@Hermes !stop`) and with
 leading whitespace — both dispatch as commands in threads.
 
-Approval prompts (dangerous command / `execute_code` approval) normally
+Exact terminal/`execute_code` authorization prompts normally
 render as interactive buttons. When buttons can't be delivered and
 Hermes falls back to a text prompt, the prompt instructs you to reply
-with `!approve` / `!deny` — the form that works inside threads.
+with `!approve <approval-id>` / `!deny <approval-id>` — the form that works inside threads and resolves only that exact operation.
 
 ### Slash replies are ephemeral
 

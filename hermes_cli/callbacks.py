@@ -195,7 +195,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
 
 
 def approval_callback(cli, command: str, description: str) -> str:
-    """Prompt for dangerous command approval through the TUI.
+    """Prompt for operation approval through the TUI.
 
     Shows a selection UI with choices: once / session / always / deny.
     When the command is longer than 70 characters, a "view" option is

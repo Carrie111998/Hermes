@@ -1761,12 +1761,7 @@ def _send_compute_host_control(
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
-    """Emit an ``approval.request`` event to the TUI client with the command
-    redacted. The approval payload is built from the RAW command string, so a
-    credential-shaped value Tirith flagged would otherwise be echoed verbatim
-    to the TUI client (#48456 — third egress transport alongside the chat
-    platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
-    seam so all approval transports redact consistently."""
+    """Emit an exact ``approval.request`` event to the TUI client."""
     payload = dict(data or {})
     if "choices" not in payload:
         if payload.get("allow_session") is False:
@@ -1775,10 +1770,6 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
             payload["choices"] = ["once", "session", "deny"]
         elif "allow_permanent" in payload:
             payload["choices"] = ["once", "session", "always", "deny"]
-    if "command" in payload:
-        from gateway.run import _redact_approval_command
-
-        payload["command"] = _redact_approval_command(payload.get("command"))
     _emit("approval.request", sid, payload)
 
 
@@ -2178,16 +2169,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # fleets accumulate until the OS refuses new process spawns.
 
             try:
-                from tools.approval import (
-                    register_gateway_notify,
-                    load_permanent_allowlist,
-                )
+                from tools.approval import register_gateway_notify
 
                 register_gateway_notify(
                     key, lambda data: _emit_approval_request(sid, data)
                 )
                 notify_registered = True
-                load_permanent_allowlist()
             except Exception:
                 pass
 
@@ -5089,7 +5076,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     # (approvals.mode=off), the process-scoped --yolo env, and the
     # per-session flag. Reporting only the per-session flag here would lie to
     # the desktop status bar (it would show YOLO "off" while approvals.mode=off
-    # silently auto-approves every dangerous command).
+    # silently authorizes every terminal/code-execution operation).
     yolo = False
     approval_mode = "manual"
     try:
@@ -6699,10 +6686,9 @@ def _init_session(
     # deferred-build path in _start_agent_build for the full rationale
     # (per-worker MCP fleets accumulating across retained sessions).
     try:
-        from tools.approval import register_gateway_notify, load_permanent_allowlist
+        from tools.approval import register_gateway_notify
 
         register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
-        load_permanent_allowlist()
     except Exception:
         pass
     # Surface the self-improvement background review's "💾 …" summary as a

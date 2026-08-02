@@ -2,8 +2,6 @@
 
 Pure module-level utilities extracted from ``run_agent.py``:
 
-* ``_is_destructive_command`` — terminal-command heuristic used to gate
-  parallel batch dispatch.
 * ``_should_parallelize_tool_batch`` / ``_extract_parallel_scope_paths`` /
   ``_extract_parallel_scope_path`` / ``_paths_overlap`` — the rules engine
   deciding when a multi-tool batch can run concurrently (V4A patch scope
@@ -67,35 +65,6 @@ _PATH_SCOPED_WRITERS = frozenset({"write_file", "patch"})
 
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS
-
-# Patterns that indicate a terminal command may modify/delete files.
-_DESTRUCTIVE_PATTERNS = re.compile(
-    r"""(?:^|\s|&&|\|\||;|`)(?:
-        rm\s|rmdir\s|
-        cp\s|install\s|
-        mv\s|
-        sed\s+-i|
-        truncate\s|
-        dd\s|
-        shred\s|
-        git\s+(?:reset|clean|checkout)\s
-    )""",
-    re.VERBOSE,
-)
-# Output redirects that overwrite files (> but not >>)
-_REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
-
-
-def _is_destructive_command(cmd: str) -> bool:
-    """Heuristic: does this terminal command look like it modifies/deletes files?"""
-    if not cmd:
-        return False
-    if _DESTRUCTIVE_PATTERNS.search(cmd):
-        return True
-    if _REDIRECT_OVERWRITE.search(cmd):
-        return True
-    return False
-
 
 def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     """Check if an MCP tool comes from a server with parallel tool calls enabled.
@@ -660,9 +629,6 @@ __all__ = [
     "_PATH_SCOPED_TOOLS",
     "_PATH_SCOPED_READERS",
     "_PATH_SCOPED_WRITERS",
-    "_DESTRUCTIVE_PATTERNS",
-    "_REDIRECT_OVERWRITE",
-    "_is_destructive_command",
     "_plan_tool_batch_segments",
     "_should_parallelize_tool_batch",
     "_canonical_path",

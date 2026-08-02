@@ -2254,7 +2254,7 @@ class MatrixAdapter(BasePlatformAdapter):
     # Template attrs for the shared _format_exec_approval core. Matrix keeps
     # the scope wording in its local tail (reaction legend), so the core is
     # used for the header + fence + reason head only.
-    _EA_HEADER = "⚠️ **Dangerous command requires approval**\n"
+    _EA_HEADER = "⚠️ **Exact operation requires approval**\n"
     _EA_CMD_BUDGET = 2000
 
     async def send_exec_approval(

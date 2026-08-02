@@ -218,7 +218,7 @@ describe('respondToApprovalAction', () => {
     expect($approvalRequest.get()).toBeNull()
   })
 
-  it('includes an exact approval id in notification responses', async () => {
+  it('never approves a valid exact id when the compatibility flag is absent', async () => {
     const approvalId = 'b'.repeat(32)
     setActiveSessionId('bg')
     setApprovalRequest({
@@ -230,16 +230,31 @@ describe('respondToApprovalAction', () => {
 
     await respondToApprovalAction('bg', 'approve')
 
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()).not.toBeNull()
+
+    await respondToApprovalAction('bg', 'reject')
+
     expect(request).toHaveBeenCalledWith('approval.respond', {
       approval_id: approvalId,
-      choice: 'once',
+      choice: 'deny',
       session_id: 'bg'
     })
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'legacy command', description: 'legacy', sessionId: 'bg' })
+
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+  })
+
+  it('ignores stale approval actions when no request is parked', async () => {
+    await respondToApprovalAction('missing', 'approve')
+    await respondToApprovalAction('missing', 'reject')
+
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('ignores unknown action ids', async () => {

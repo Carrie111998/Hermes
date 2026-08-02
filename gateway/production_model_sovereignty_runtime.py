@@ -636,9 +636,8 @@ def overlay_production_gateway_config(
     # process.  Production keeps this surface empty until it is backed by an
     # isolated, identity-bound worker.
     target["quick_commands"] = {}
-    # Persistent command text/glob allowlists bypass per-plan capability and
-    # owner approval checks. Production admits no blanket command authority.
-    target["command_allowlist"] = []
+    # Retired command-text policy must not survive into the effective profile.
+    target.pop("command_allowlist", None)
     skills = target.setdefault("skills", {})
     if not isinstance(skills, dict):
         raise ProductionContractError("production_skills_config_invalid")
@@ -656,8 +655,13 @@ def overlay_production_gateway_config(
     approvals = target.setdefault("approvals", {})
     if not isinstance(approvals, dict):
         raise ProductionContractError("production_approvals_invalid")
-    approvals["mode"] = "manual"
-    approvals["cron_mode"] = "deny"
+    # The trusted model is the semantic authority for owner-authenticated
+    # work. Terminal bytes are opaque to the runtime; no regex/keyword policy
+    # may turn a long task into micro-approvals. Privileged/paid mutations keep
+    # their separate exact capability/passkey boundaries.
+    approvals["mode"] = "off"
+    approvals["cron_mode"] = "approve"
+    approvals.pop("deny", None)
     approvals["plan_owner_user_ids"] = [PRODUCTION_OWNER_DISCORD_USER_ID]
     approvals["gateway_authorized_user_ids"] = [
         PRODUCTION_OWNER_DISCORD_USER_ID
@@ -876,8 +880,8 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
         raise ProductionContractError("production_access_policy_not_exact")
     if raw.get("quick_commands") != {}:
         raise ProductionContractError("production_quick_commands_not_empty")
-    if raw.get("command_allowlist") != []:
-        raise ProductionContractError("production_command_allowlist_not_empty")
+    if "command_allowlist" in raw:
+        raise ProductionContractError("production_command_allowlist_not_absent")
     skills = raw.get("skills")
     if not isinstance(skills, Mapping) or skills.get("inline_shell") is not False:
         raise ProductionContractError("production_skills_inline_shell_not_disabled")
@@ -901,8 +905,9 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
     approvals = raw.get("approvals")
     if (
         not isinstance(approvals, Mapping)
-        or approvals.get("mode") != "manual"
-        or approvals.get("cron_mode") != "deny"
+        or approvals.get("mode") != "off"
+        or approvals.get("cron_mode") != "approve"
+        or "deny" in approvals
         or approvals.get("plan_owner_user_ids")
         != [PRODUCTION_OWNER_DISCORD_USER_ID]
         or approvals.get("gateway_authorized_user_ids")

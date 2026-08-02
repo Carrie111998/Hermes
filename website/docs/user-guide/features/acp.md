@@ -262,16 +262,16 @@ Leave it there when the runtime is Hermes.
 Two behaviors combine on this path. The `hermes-acp` toolset includes `terminal`
 and `execute_code`, and Buzz's ACP bridge answers Hermes' permission requests
 itself with `allow_once` rather than surfacing them. A Hermes agent in Buzz
-therefore runs shell commands on the host without prompting. I asked one to run
-`rm -rf` against a scratch directory and it deleted it, no prompt anywhere.
+therefore runs shell commands on the host without prompting. A host-mutating
+scratch-directory deletion completed without any prompt.
 
 Selecting `Anyone` hands that same shell access to every author who can reach
 the channel. Buzz does not warn when you pick it.
 
 Neither of the obvious mitigations works today:
 
-- `approvals.mode: manual` does make Hermes raise the permission request, but
-  Buzz auto-approves it and the command still runs.
+- `approvals.mode: manual` does make Hermes raise the exact permission request,
+  but Buzz answers it programmatically and the operation still runs.
 - `platform_toolsets.acp` does not narrow the ACP toolset, so it cannot be used
   to drop `terminal`.
 
@@ -329,35 +329,13 @@ The underlying `AIAgent` still uses Hermes' normal persistence/logging paths, bu
 
 ACP sessions bind the editor's cwd to the Hermes task ID so file and terminal tools run relative to the editor workspace, not the server process cwd.
 
-## Approvals
+## Exact terminal authorization
 
-Dangerous terminal commands can be routed back to the editor as approval prompts. ACP approval options are simpler than the CLI flow:
+Hermes does not classify terminal text with keywords, regular expressions, or command routers. The model remains the sole semantic authority. The runtime only verifies structural authority for the exact pending terminal invocation.
 
-- allow once
-- allow always
-- deny
+When approval is required, ACP routes that exact invocation back to the editor. A positive response creates an opaque, once-only capability bound to the exact command bytes, session epoch, and use count. It cannot authorize a similar command, be replayed, or become a session-wide or permanent command-pattern grant. A denial, timeout, capability mismatch, or bridge error fails closed.
 
-Whether you actually see a prompt is up to the host. A host is free to answer the
-request programmatically instead of showing it to you, in which case these
-options exist on the wire but never reach a human. Buzz Desktop does this, so
-treat that path as unattended execution regardless of your `approvals` setting.
-
-On timeout or error, the approval bridge denies the request.
-
-### Session-scoped edit auto-approval
-
-ACP exposes a third tier between *allow once* and *allow always*: **Allow for session**. Picking it from the editor's permission prompt records the approval inside the current ACP session only — every subsequent matching command in that session goes through without prompting, but a new ACP session (or restarting the editor) resets the slate and re-prompts the first time.
-
-| Option | Editor label | Scope | Persisted across restarts |
-|---|---|---|---|
-| `allow_once` | Allow once | This one tool call | No |
-| `allow_session` | Allow for session | All matching calls in this ACP session | No — cleared when the session ends |
-| `allow_always` | Allow always | All future sessions | Yes (written to the Hermes permanent allowlist) |
-| `deny` | Deny | This one tool call | No |
-
-`allow_session` is the right default for an editor workflow where you trust an agent for the duration of a task but don't want to grant a long-lived allowlist entry. The safety trade-off is straightforward: the broader the scope, the less the editor will interrupt you, and the more damage a misbehaving agent (or prompt injection) can do before you notice. Start with `allow_once` for unfamiliar commands; promote to `allow_session` once you've seen the agent run the same pattern correctly a few times; reserve `allow_always` for truly idempotent commands you trust forever (e.g. `git status`).
-
-The ACP bridge maps these options onto Hermes' internal approval semantics — `allow_always` writes a permanent allowlist entry the same way the CLI does, while `allow_session` only affects the in-process approval cache for the current ACP session.
+Some ACP hosts expose protocol choices named `allow_session` or `allow_always`. Hermes deliberately narrows any affirmative host response to **this exact invocation once**; those labels do not create broader authority inside Hermes. Hosts may also answer requests programmatically instead of showing a human prompt. Treat such hosts as unattended execution and rely on structural isolation appropriate to the workload.
 
 ## Troubleshooting
 

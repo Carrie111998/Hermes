@@ -17,20 +17,17 @@ def test_exact_visible_terminal_status_is_suppressed():
     )
 
 
-def test_equality_is_checked_after_normal_secret_redaction(monkeypatch):
+def test_distinct_authored_bytes_do_not_collapse_through_regex_redaction(monkeypatch):
     monkeypatch.setattr(
         "agent.redact.redact_sensitive_text",
         lambda _text, *, force: "Rejected [REDACTED]",
     )
 
-    assert (
-        _final_mirror_statuses_to_deliver(
-            Platform.DISCORD,
-            ["Rejected first-secret"],
-            "Rejected second-secret",
-        )
-        == ()
-    )
+    assert _final_mirror_statuses_to_deliver(
+        Platform.DISCORD,
+        ["Rejected first-secret"],
+        "Rejected second-secret",
+    ) == ("Rejected first-secret",)
 
 
 def test_distinct_terminal_status_is_preserved():

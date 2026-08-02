@@ -1600,6 +1600,32 @@ class RelayAdapter(BasePlatformAdapter):
             **kwargs,
         )
 
+    async def _send_exact_exec_approval_document(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        caption: str,
+        file_name: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Fail closed when the relay connector cannot upload the attachment."""
+        result = await self._send_media(
+            chat_id,
+            media_kind="document",
+            source=file_path,
+            source_is_path=True,
+            caption=caption,
+            filename=file_name,
+            metadata=metadata,
+        )
+        if result is None:
+            return SendResult(
+                success=False,
+                error="relay has no byte-preserving exact approval transport",
+            )
+        return result
+
     # ── Phase 3 interactive: prompt + react ──────────────────────────────
 
     def _mint_prompt(

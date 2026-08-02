@@ -168,12 +168,12 @@ platforms:
 
 ### Interactive Approval Cards
 
-When the agent needs to run a potentially dangerous command, it sends an Adaptive Card with four buttons instead of asking you to type `/approve`:
+When an exact terminal operation lacks structural authority, the agent sends an Adaptive Card instead of asking you to type `/approve`:
 
-- **Allow Once** — approve this specific command
-- **Allow Session** — approve this pattern for the rest of the session
-- **Always Allow** — permanently approve this pattern
-- **Deny** — reject the command
+- **Allow Once** — authorize this exact operation once
+- **Deny** — reject this exact operation
+
+If Teams or an older card still displays session/always labels, Hermes narrows any affirmative response to the current exact operation once; it does not create command-pattern authority.
 
 Clicking a button resolves the approval inline and replaces the card with the decision.
 

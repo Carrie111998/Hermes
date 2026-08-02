@@ -10,6 +10,8 @@ import {
   clearApprovalRequest,
   clearSecretRequest,
   clearSudoRequest,
+  isExactApprovalId,
+  isExactApprovalRequest,
   setApprovalRequest,
   setSecretRequest,
   setSudoRequest
@@ -29,6 +31,15 @@ afterEach(() => {
 })
 
 describe('approval prompt store', () => {
+  it('derives exact authority structurally from a 32-hex id or explicit flag', () => {
+    expect(isExactApprovalId('a'.repeat(32))).toBe(true)
+    expect(isExactApprovalId('not-an-exact-id')).toBe(false)
+    expect(isExactApprovalRequest({ approvalId: 'b'.repeat(32) })).toBe(true)
+    expect(isExactApprovalRequest({ approvalId: 'legacy-id' })).toBe(false)
+    expect(isExactApprovalRequest({ exactExecution: true })).toBe(true)
+    expect(isExactApprovalRequest(null)).toBe(false)
+  })
+
   it('holds the active session-keyed approval request', () => {
     setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'recursive delete', sessionId: 's1' })
 

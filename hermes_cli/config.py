@@ -3781,8 +3781,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
                 # one). Falling through to DEFAULT_CONFIG here drops EVERY user
-                # override — including security-critical ``approvals.deny``
-                # rules, which are supposed to block commands even under yolo.
+                # override — including authentication and runtime-boundary
+                # settings that must remain stable while a file is repaired.
                 # A long-running gateway whose user mid-edits config.yaml into
                 # broken YAML would silently lose those rules on the next load.
                 # Within a running process we still have the last successfully
@@ -3860,20 +3860,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
 _SECURITY_COMMENT = """
 # ── Security ──────────────────────────────────────────────────────────
-# Secret redaction is ON by default — strings that look like API keys,
-# tokens, and passwords are masked in tool output, logs, and chat
-# responses before the model or user ever sees them. Set redact_secrets
-# to false to disable (e.g. when developing the redactor itself).
-# tirith pre-exec scanning is enabled by default when the tirith binary
-# is available. Configure via security.tirith_* keys or env vars
-# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+# Secret redaction is ON by default for storage and tool-input boundaries.
+# Model-authored responses are not semantically classified or rewritten.
+# Set redact_secrets to false when developing the redactor itself.
 #
 # security:
 #   redact_secrets: true
-#   tirith_enabled: true
-#   tirith_path: "tirith"
-#   tirith_timeout: 5
-#   tirith_fail_open: true
 """
 
 _FALLBACK_COMMENT = """
@@ -5091,7 +5083,6 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "hooks",
     "quick_commands",
     "personalities",
-    "command_allowlist",
     "model_catalog",
     "channel_prompts",
     "server_actions",

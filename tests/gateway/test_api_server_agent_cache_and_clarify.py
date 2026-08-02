@@ -545,9 +545,9 @@ async def test_chat_nonstream_approval_is_authenticated_exact_and_session_scoped
         approval = await _wait_for_approval(client, "approval-chat")
 
         assert re.fullmatch(r"[0-9a-f]{32}", approval["id"])
-        assert approval["choices"] == ["once", "session", "always", "deny"]
+        assert approval["choices"] == ["once", "deny"]
         assert approval["session_id"] == "approval-chat"
-        assert "super-secret-value" not in approval["command"]
+        assert "super-secret-value" in approval["command"]
 
         other_session = await client.get(
             "/v1/approvals?session_id=approval-other",

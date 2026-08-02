@@ -49,6 +49,5 @@ hermes config set auxiliary.vision.provider <your_provider>
 hermes config set auxiliary.vision.model <model_name>
 ```
 
-### "Reset permissions" / auto-approving everything
-See `references/security-privacy.md` — wipe the "Always allow" stores, don't touch yolo mode.
-
+### "Reset permissions" / owner prompts are being skipped
+See `references/security-privacy.md`. There is no terminal command-pattern store to wipe; restore manual mode and start a fresh session to invalidate pending exact capabilities.

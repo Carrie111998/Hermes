@@ -203,17 +203,16 @@ Hermes 的后台自我改进在计数器达到阈值时触发：
 
 ## 审批流程
 
-Codex 在执行命令或应用 patch 之前会请求审批。这些请求会被转换为 Hermes 标准的"危险命令"提示：
+Codex 在执行命令或应用 patch 之前会请求审批。这些请求会被转换为 Hermes 对当前精确调用的一次性授权提示：
 
 ```
 ╭───────────────────────────────────────╮
-│ Dangerous Command                     │
+│ Exact Terminal Approval               │
 │                                       │
 │ /bin/bash -lc 'echo hello > foo.txt'  │
 │                                       │
 │ ❯ 1. Allow once                       │
-│   2. Allow for this session           │
-│   3. Deny                             │
+│   2. Deny                             │
 │                                       │
 │ Codex requests exec in /your/cwd      │
 ╰───────────────────────────────────────╯

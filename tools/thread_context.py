@@ -7,8 +7,8 @@ Tool dispatch inside such a thread therefore silently loses:
 
   * the approval *session/platform* ContextVars (``tools.approval`` /
     ``gateway.session_context``) — so gateway sessions fall into
-    ``check_dangerous_command``'s non-interactive auto-approve branch and
-    dangerous commands run without prompting (#33057, #30882);
+    the non-interactive execution-authority branch and protected actions run
+    without prompting (#33057, #30882);
   * the thread-local CLI approval/sudo callbacks (``tools.terminal_tool``) —
     so ``prompt_dangerous_approval`` cannot reach the user
     (GHSA-qg5c-hvr5-hjgr, #15216).
@@ -71,7 +71,7 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
     Fail-closed: if callback installation raises, the callbacks are left
     unset (``None``).  That is the safe outcome — ``prompt_dangerous_approval``
-    denies dangerous commands when no callback is registered in an interactive
+    denies non-exact operation requests when no callback is registered in an interactive
     context, and the gateway approval queue blocks when its notify callback is
     absent.
     """
@@ -98,7 +98,7 @@ def propagate_context_to_thread(target: Callable) -> Callable:
                 except Exception:
                     logger.debug(
                         "Failed to install propagated approval/sudo callbacks; "
-                        "dangerous-command approval will fail closed",
+                        "non-exact operation approval will fail closed",
                         exc_info=True,
                     )
             try:

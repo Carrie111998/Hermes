@@ -3013,7 +3013,6 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     import tools.approval as approval
 
     monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: None)
-    monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
 
     try:
         # eager_build: asserts the synchronous build receives the profile's db
@@ -3915,7 +3914,6 @@ def test_init_session_fires_reset_hook(monkeypatch):
     import tools.approval as _approval
 
     monkeypatch.setattr(_approval, "register_gateway_notify", lambda key, cb: None)
-    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
     sid = "sid"
     try:
@@ -10432,7 +10430,6 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
         "unregister_gateway_notify",
         lambda key: unregistered_keys.append(key),
     )
-    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
     # Start: session.create spawns _build thread, returns synchronously
     resp = server.handle_request(
@@ -10539,7 +10536,6 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         "unregister_gateway_notify",
         lambda key: unregistered_keys.append(key),
     )
-    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
     # Isolate from sibling-test leakage: daemon build threads from prior
     # session.create tests in the same shard process mutate the shared
@@ -10638,7 +10634,6 @@ def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
     import tools.approval as _approval
 
     monkeypatch.setattr(_approval, "register_gateway_notify", lambda key, cb: None)
-    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
     resp = server.handle_request(
         {"id": "1", "method": "session.create", "params": {"cols": 80}}

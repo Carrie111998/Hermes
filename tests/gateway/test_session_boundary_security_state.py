@@ -20,9 +20,7 @@ from tools import approval as approval_mod
 from tools import slash_confirm as slash_confirm_mod
 from tools.approval import (
     _ApprovalEntry,
-    approve_session,
     enable_session_yolo,
-    is_approved,
     is_session_yolo_enabled,
 )
 
@@ -31,28 +29,20 @@ from tools.approval import (
 def _clear_approval_state():
     approval_mod._gateway_queues.clear()
     approval_mod._gateway_notify_cbs.clear()
-    approval_mod._session_approved.clear()
-    approval_mod._session_approved_generations.clear()
     approval_mod._session_yolo.clear()
     approval_mod._session_yolo_generations.clear()
     approval_mod._session_authority_generations.clear()
     approval_mod._retired_session_capability_epochs.clear()
     approval_mod._plan_capabilities.clear()
-    approval_mod._permanent_approved.clear()
-    approval_mod._pending.clear()
     slash_confirm_mod._pending.clear()
     yield
     approval_mod._gateway_queues.clear()
     approval_mod._gateway_notify_cbs.clear()
-    approval_mod._session_approved.clear()
-    approval_mod._session_approved_generations.clear()
     approval_mod._session_yolo.clear()
     approval_mod._session_yolo_generations.clear()
     approval_mod._session_authority_generations.clear()
     approval_mod._retired_session_capability_epochs.clear()
     approval_mod._plan_capabilities.clear()
-    approval_mod._permanent_approved.clear()
-    approval_mod._pending.clear()
     slash_confirm_mod._pending.clear()
 
 
@@ -173,8 +163,8 @@ async def test_resume_clears_session_scoped_approval_and_yolo_state():
         session_key: "[USER INITIATED SKILLS RELOAD: target]",
         other_key: "[USER INITIATED SKILLS RELOAD: other]",
     }
-    approve_session(session_key, "recursive delete")
-    approve_session(other_key, "recursive delete")
+    approval_mod._plan_capabilities[session_key] = {"target-plan": {}}
+    approval_mod._plan_capabilities[other_key] = {"other-plan": {}}
     enable_session_yolo(session_key)
     enable_session_yolo(other_key)
     runner._pending_approvals[session_key] = {"command": "rm -rf /tmp/demo"}
@@ -185,12 +175,12 @@ async def test_resume_clears_session_scoped_approval_and_yolo_state():
     result = await runner._handle_resume_command(_make_event("/resume Resumed Work"))
 
     assert "Resumed session" in result
-    assert is_approved(session_key, "recursive delete") is False
+    assert session_key not in approval_mod._plan_capabilities
     assert is_session_yolo_enabled(session_key) is False
     assert session_key not in runner._pending_approvals
     assert session_key not in runner._update_prompt_pending
     assert session_key not in runner._pending_skills_reload_notes
-    assert is_approved(other_key, "recursive delete") is True
+    assert other_key in approval_mod._plan_capabilities
     assert is_session_yolo_enabled(other_key) is True
     assert other_key in runner._pending_approvals
     assert other_key in runner._update_prompt_pending
@@ -211,8 +201,8 @@ async def test_branch_clears_session_scoped_approval_and_yolo_state():
         session_key: "[USER INITIATED SKILLS RELOAD: target]",
         other_key: "[USER INITIATED SKILLS RELOAD: other]",
     }
-    approve_session(session_key, "recursive delete")
-    approve_session(other_key, "recursive delete")
+    approval_mod._plan_capabilities[session_key] = {"target-plan": {}}
+    approval_mod._plan_capabilities[other_key] = {"other-plan": {}}
     enable_session_yolo(session_key)
     enable_session_yolo(other_key)
     runner._pending_approvals[session_key] = {"command": "rm -rf /tmp/demo"}
@@ -223,12 +213,12 @@ async def test_branch_clears_session_scoped_approval_and_yolo_state():
     result = await runner._handle_branch_command(_make_event("/branch"))
 
     assert "Branched to" in result
-    assert is_approved(session_key, "recursive delete") is False
+    assert session_key not in approval_mod._plan_capabilities
     assert is_session_yolo_enabled(session_key) is False
     assert session_key not in runner._pending_approvals
     assert session_key not in runner._update_prompt_pending
     assert session_key not in runner._pending_skills_reload_notes
-    assert is_approved(other_key, "recursive delete") is True
+    assert other_key in approval_mod._plan_capabilities
     assert is_session_yolo_enabled(other_key) is True
     assert other_key in runner._pending_approvals
     assert other_key in runner._update_prompt_pending
@@ -332,8 +322,8 @@ def test_clear_session_boundary_security_state_is_scoped():
     session_key = build_session_key(source)
     other_key = "agent:main:telegram:dm:other-chat"
 
-    approve_session(session_key, "recursive delete")
-    approve_session(other_key, "recursive delete")
+    approval_mod._plan_capabilities[session_key] = {"target-plan": {}}
+    approval_mod._plan_capabilities[other_key] = {"other-plan": {}}
     enable_session_yolo(session_key)
     enable_session_yolo(other_key)
     runner._pending_approvals[session_key] = {"command": "rm -rf /tmp/demo"}
@@ -359,14 +349,14 @@ def test_clear_session_boundary_security_state_is_scoped():
     runner._clear_session_boundary_security_state(session_key)
 
     # Target session cleared
-    assert is_approved(session_key, "recursive delete") is False
+    assert session_key not in approval_mod._plan_capabilities
     assert is_session_yolo_enabled(session_key) is False
     assert session_key not in runner._pending_approvals
     assert session_key not in runner._update_prompt_pending
     assert session_key not in runner._pending_skills_reload_notes
     assert slash_confirm_mod.get_pending(session_key) is None
     # Other session untouched
-    assert is_approved(other_key, "recursive delete") is True
+    assert other_key in approval_mod._plan_capabilities
     assert is_session_yolo_enabled(other_key) is True
     assert other_key in runner._pending_approvals
     assert other_key in runner._update_prompt_pending
@@ -375,7 +365,7 @@ def test_clear_session_boundary_security_state_is_scoped():
 
     # Empty session_key is a no-op
     runner._clear_session_boundary_security_state("")
-    assert is_approved(other_key, "recursive delete") is True
+    assert other_key in approval_mod._plan_capabilities
     assert other_key in runner._update_prompt_pending
     assert other_key in runner._pending_skills_reload_notes
     assert slash_confirm_mod.get_pending(other_key) is not None
@@ -457,7 +447,6 @@ def test_resolver_pop_race_cannot_reauthorize_after_boundary(monkeypatch):
     with approval_mod._lock:
         entry = approval_mod._gateway_queues[session_key][0]
         entry.event = _PausingEvent()
-        old_generation = entry.authority_generation
 
     resolver = threading.Thread(
         target=approval_mod.resolve_gateway_approval,
@@ -477,12 +466,7 @@ def test_resolver_pop_race_cannot_reauthorize_after_boundary(monkeypatch):
     decision = decision_holder["decision"]
     assert decision["authority_stale"] is True
     assert decision["choice"] == "deny"
-    assert approval_mod.approve_session(
-        session_key,
-        "recursive delete",
-        expected_generation=old_generation,
-    ) is False
-    assert approval_mod.is_approved(session_key, "recursive delete") is False
+    assert session_key not in approval_mod._plan_capabilities
 
 
 def test_retired_old_context_cannot_read_successor_authority_or_grant_local_plan(
@@ -495,7 +479,6 @@ def test_retired_old_context_cannot_read_successor_authority_or_grant_local_plan
     session_key = "agent:main:discord:thread:channel-2:thread-2"
     old_epoch = "a" * 64
     new_epoch = "b" * 64
-    pattern_key = "recursive delete"
     command = "rm -rf /tmp/demo"
     old_context = Context()
     new_context = Context()
@@ -526,31 +509,15 @@ def test_retired_old_context_cannot_read_successor_authority_or_grant_local_plan
     )
     assert new_generation != old_generation
     assert new_context.run(
-        approval_mod.approve_session,
-        session_key,
-        pattern_key,
-        expected_generation=new_generation,
-    ) is True
-    assert new_context.run(
         approval_mod.enable_session_yolo,
         session_key,
         expected_generation=new_generation,
-    ) is True
-    assert new_context.run(
-        approval_mod.is_approved,
-        session_key,
-        pattern_key,
     ) is True
     assert new_context.run(
         approval_mod.is_session_yolo_enabled,
         session_key,
     ) is True
 
-    assert old_context.run(
-        approval_mod.is_approved,
-        session_key,
-        pattern_key,
-    ) is False
     assert old_context.run(
         approval_mod.is_session_yolo_enabled,
         session_key,

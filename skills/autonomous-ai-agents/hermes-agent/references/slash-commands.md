@@ -77,8 +77,8 @@ it. New commands land often; `/help` in-session is always authoritative.
 
 ### Gateway
 ```
-/approve [session|always]  Approve a pending dangerous command (GW)
-/deny [all] [reason]       Deny a pending dangerous command (GW)
+/approve <approval-id>     Authorize the exact pending terminal operation once (GW)
+/deny <approval-id>        Deny the exact pending terminal operation (GW)
 /restart                   Restart gateway after draining active runs (GW)
 /sethome                   Set current chat as home channel (GW)
 /topic [off|help]          Telegram DM topic sessions (GW)

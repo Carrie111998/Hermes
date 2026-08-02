@@ -70,17 +70,6 @@ _REQUIRED_CANONICAL_IMPORT_QUARANTINE = (
     or "--require-production-model-sovereignty" in sys.argv[1:]
 )
 
-from agent.conversation_compression import (
-    COMPACTION_STATUS,
-    COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
-    IDLE_COMPACTION_STATUS_TEMPLATE,
-    PRE_API_COMPRESSION_STATUS_TEMPLATE,
-    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-)
-
 # Mark the process before configuration helpers are imported.
 os.environ["_HERMES_GATEWAY"] = "1"
 
@@ -102,7 +91,6 @@ def render_account_usage_lines(*args: Any, **kwargs: Any) -> Any:
 
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.terminal_outcome import TerminalOutcomeKind, normalize_terminal_outcome
 from hermes_cli.config import (
@@ -130,42 +118,6 @@ _COMPLETION_RETRY_MIN_SECONDS = 0.25
 _COMPLETION_RETRY_STORAGE_ERROR_SECONDS = 1.0
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
-_TELEGRAM_NOISY_STATUS_RE = re.compile(
-    r"("  # transient/auxiliary status that should stay in logs, not gateway chats
-    r"auxiliary\s+.+\s+failed"
-    r"|compression\s+summary\s+failed"
-    r"|fallback\s+context\s+marker"
-    r"|configured\s+compression\s+model\s+.+\s+failed"
-    r"|no\s+auxiliary\s+llm\s+provider\s+configured"
-    r"|auto-lowered\s+compression\s+threshold"
-    # #69332 reworded the auto-lower notice to "Auto-lowered this session's
-    # threshold to N tokens" — keep both generations covered.
-    r"|auto-lowered\s+(?:this\s+)?session'?s?\s+threshold"
-    r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
-    r"|skipping\s+concurrent\s+compression"
-    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
-    r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
-    r"|preflight\s+compression"
-    r"|pre[- ]api\s+compression"
-    # Buffered attempt/overflow retry chatter replayed through _emit_status
-    # when a turn exhausts retries. The ", retrying"/"— compressing" anchors
-    # keep manual /compress feedback ("Compressed: 30 → 12 messages") and
-    # failure notices out of the match.
-    r"|context\s+too\s+large\s+\(~[\d,]+\s+tokens\)\s+[—-]+\s+compressing"
-    r"|compressed\s+\d[\d,]*\s+(?:→|->)\s+\d[\d,]*\s+messages,\s+retrying"
-    r"|compressed\s+~[\d,]+\s+(?:→|->)\s+~[\d,]+\s+tokens,\s+retrying"
-    r"|context\s+reduced\s+to\s+[\d,]+\s+tokens\s+\(was\s+[\d,]+\),\s+retrying"
-    r"|session\s+compressed\s+\d+\s+times"
-    r"|rate\s+limited\.\s+waiting\s+\d"
-    r"|retrying\s+in\s+\d"
-    r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
-    r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
-    r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
-    r")",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
 def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
     """Persist a session-hygiene compression-failure cooldown to the state DB.
 
@@ -186,46 +138,6 @@ def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) 
         recorder(session_id, _time.time() + cooldown_seconds)
     except Exception as exc:
         logger.debug("session hygiene cooldown persist failed: %s", exc)
-
-
-def _status_template_to_regex(template: str) -> str:
-    """Compile a compression status template constant into a regex source.
-
-    Literal text is escaped verbatim (so wording drift in
-    agent/conversation_compression.py cannot silently diverge from this
-    matcher — the constants ARE the wording) and each ``{field}`` format
-    placeholder is replaced with a numeric-ish pattern covering every value
-    the emit sites format in (ints, ``{:,}`` thousands separators).
-    """
-    parts = re.split(r"\{[^{}]*\}", template)
-    return r"[\d,]+".join(re.escape(part) for part in parts)
-
-
-# ROUTINE compression progress statuses, derived from the SAME template
-# constants the emit sites format (agent/conversation_compression.py, #69550)
-# — never re-inlined wording. Used ONLY by the opt-in
-# ``compression.progress_notices`` gate below (#52995) to decide which of the
-# noisy statuses matched by _TELEGRAM_NOISY_STATUS_RE are compression
-# progress (deliverable when the user opted in) versus unrelated aux/retry
-# chatter (always suppressed on chat surfaces). Failure notices and manual
-# /compress feedback never match _TELEGRAM_NOISY_STATUS_RE in the first
-# place, so they are unaffected by this gate.
-_COMPRESSION_PROGRESS_STATUS_RE = re.compile(
-    "|".join(
-        _status_template_to_regex(_template)
-        for _template in (
-            COMPACTION_STATUS,
-            PRE_API_COMPRESSION_STATUS_TEMPLATE,
-            PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-            IDLE_COMPACTION_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-            COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
-        )
-    ),
-    re.IGNORECASE,
-)
 
 
 def _gateway_compression_progress_notices_enabled() -> bool:
@@ -708,10 +620,10 @@ def _production_slash_requests_config_mutation(
     return False
 
 # Surfaces that consume gateway text programmatically (CLI/TUI "local"
-# diagnostics, API JSON, webhook payloads) and therefore keep raw text.
-# Human-facing chat surfaces receive the same authored text with only the
-# credential-redaction safety boundary applied. Fail-closed: unknown/empty
-# platform is treated as chat, so secrets still cannot escape.
+# diagnostics, API JSON, webhook payloads).  The distinction is used only for
+# typed transport metadata such as the interrupt sentinel.  Model-authored
+# prose is byte-preserved on every surface; a regex redactor must never become
+# a post-model content authority.
 _GATEWAY_RAW_TEXT_PLATFORMS = frozenset({
     "local",
     "api_server",
@@ -731,15 +643,22 @@ def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
 
 
-_GATEWAY_SECRET_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bxapp-\d+-[A-Za-z0-9\-]{20,}\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{20,}\b"),
-    re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
-    re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
-    re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]{20,}\b"),
-)
+def _redact_gateway_user_facing_secrets(text: str) -> str:
+    """Redact text from a structurally known secret-bearing runtime field.
+
+    Callers must establish provenance from typed runtime state (for example a
+    terminal command/result or an exception), never merely from authored
+    wording.  Model-authored responses and statuses intentionally bypass this
+    helper.  Exact approval prompts also bypass it so the authenticated owner
+    sees the exact bytes they are being asked to authorize.
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(str(text or ""), force=True)
+    except Exception:
+        logger.exception("Gateway secret redaction failed; withholding chat text")
+        return "[Message withheld: credential redaction unavailable.]"
 
 
 def _ensure_windows_gateway_venv_imports() -> None:
@@ -916,119 +835,42 @@ def _gateway_loop_exception_handler(
     loop.default_exception_handler(context)
 
 
-def _redact_gateway_user_facing_secrets(text: str) -> str:
-    """Secret redaction before text can leave the gateway.
-
-    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` — the
-    same Tirith-grade redactor already applied to logs, tool output, and
-    approval-command prompts — so the outbound chat path masks the full
-    credential set the startup banner promises ("chat responses are scrubbed
-    before delivery"), not a divergent subset. ``force=True`` honors redaction
-    even when ``security.redact_secrets`` is off, matching the
-    ``_redact_approval_command`` reasoning (#23810).
-
-    The narrow ``_GATEWAY_SECRET_PATTERNS`` set runs as a belt-and-suspenders
-    second pass so nothing the gateway historically caught can regress, and so
-    redaction still degrades gracefully if the import ever fails.
-    """
-    redacted = str(text or "")
-    try:
-        from agent.redact import redact_sensitive_text
-
-        redacted = redact_sensitive_text(redacted, force=True)
-    except Exception:
-        # Fail-soft: fall back to the local pattern pass below rather than
-        # letting a redactor import/error leak the raw text to chat.
-        pass
-    for pattern in _GATEWAY_SECRET_PATTERNS:
-        redacted = pattern.sub(
-            lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", redacted
-        )
-    return redacted
-
-
-def _redact_approval_command(cmd: "str | None") -> str:
-    """Redact credentials from a command before it goes into an approval prompt.
-
-    Tirith's *findings* are already redacted, but the gateway approval prompt
-    is built from the raw command string, so a credential-shaped value Tirith
-    flagged would otherwise be echoed verbatim to the chat platform (#48456).
-    Uses ``redact_sensitive_text(force=True)`` — the same Tirith-grade redactor
-    — so the prompt honors redaction even when ``security.redact_secrets`` is
-    off. Module-level so the wiring is unit-testable (the call site is a deeply
-    nested gateway closure that cannot be driven directly).
-    """
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text(str(cmd or ""), force=True)
-
-
 def _format_exec_approval_fallback(
     command: str,
     description: str,
     command_prefix: str,
     *,
-    allow_permanent: bool = True,
-    allow_session: bool = True,
-    approval_id: str = "",
-    exact_execution: bool = False,
+    approval_id: str,
 ) -> str:
-    """Render a mechanical owner-approval prompt from declared capabilities."""
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
-    heading = "⚠️ **Dangerous command requires approval:**"
+    """Render one mechanical exact-operation owner-approval prompt."""
+    heading = "⚠️ **Exact operation requires approval:**"
 
-    if exact_execution:
-        if re.fullmatch(r"[0-9a-f]{32}", str(approval_id or "")) is None:
-            raise ValueError("exact approval fallback requires one opaque approval ID")
-        return (
-            f"{heading}\n"
-            f"```\n{cmd_preview}\n```\nReason: {description}\n\n"
-            f"Reply `{command_prefix}approve {approval_id}` to execute only "
-            f"this operation, or `{command_prefix}deny {approval_id}` to cancel it."
-        )
-
-    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
-    if allow_session:
-        choices.append(
-            f"`{command_prefix}approve session` to approve this pattern for the session"
-        )
-        if allow_permanent:
-            choices.append(
-                f"`{command_prefix}approve always` to approve permanently"
-            )
-    choices.append(f"`{command_prefix}deny` to cancel")
+    if re.fullmatch(r"[0-9a-f]{32}", str(approval_id or "")) is None:
+        raise ValueError("exact approval fallback requires one opaque approval ID")
     return (
         f"{heading}\n"
-        f"```\n{cmd_preview}\n```\nReason: {description}\n\n"
-        + ", ".join(choices[:-1])
-        + f", or {choices[-1]}."
+        f"```\n{command}\n```\nReason: {description}\n\n"
+        f"Reply `{command_prefix}approve {approval_id}` to execute only "
+        f"this operation, or `{command_prefix}deny {approval_id}` to cancel it."
     )
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Apply only protocol and secret-safety boundaries before chat delivery.
+    """Apply typed protocol boundaries before chat delivery.
 
-    Authored response meaning is never classified or rewritten. Provider and
-    task failures must arrive through structured runtime state; text itself is
-    not authority. Programmatic surfaces retain their existing raw contract.
+    Model-authored bytes are never classified or rewritten. Provider and task
+    failures must arrive through structured runtime state; text itself is not
+    authority. Programmatic surfaces retain their existing raw contract.
     """
     if not text:
         return text
-    if _gateway_surface_passes_raw_text(platform):
-        return text
-
-    # Cancellation metadata, not assistant prose. ACP/TUI already suppress
-    # this sentinel; chat surfaces should too (#7921).
-    if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
-        return ""
-
-    return _redact_gateway_user_facing_secrets(str(text))
+    return str(text)
 
 
 def _prepare_gateway_status_message(
     platform: Any, event_type: str, message: str
 ) -> Optional[str]:
-    """Apply structured delivery policy, then redact user-facing statuses.
+    """Apply structured delivery policy to statuses.
 
     Routine automatic-compression progress is the sole opt-in class here and
     is identified by its exact event type. Provider/model-authored wording is
@@ -1045,7 +887,7 @@ def _prepare_gateway_status_message(
     ):
         return None
 
-    return _redact_gateway_user_facing_secrets(text)
+    return text
 
 
 def _final_mirror_statuses_to_deliver(
@@ -1055,11 +897,12 @@ def _final_mirror_statuses_to_deliver(
 ) -> tuple[str, ...]:
     """Return deferred terminal statuses that are not the visible final text.
 
-    Both sides pass through their normal outbound safety boundary before the
+    Both sides pass through their typed outbound delivery policy before the
     equality check. This is deliberately exact and turn-local: no keywords,
-    error categories, or semantic inference participate. The final response
-    itself is never changed or marked as already sent, so it still travels the
-    ordinary final-delivery rail and retains that rail's receipt semantics.
+    regex redaction, error categories, or semantic inference participate. The
+    final response itself is never changed or marked as already sent, so it
+    still travels the ordinary final-delivery rail and retains that rail's
+    receipt semantics.
     """
 
     visible_final = _sanitize_gateway_final_response(platform, final_response or "")
@@ -2831,7 +2674,7 @@ if not _REQUIRED_CANONICAL_IMPORT_QUARANTINE:
 # Gateway runs in quiet mode - suppress debug output and use cwd directly (no temp dirs)
 os.environ["HERMES_QUIET"] = "1"
 
-# Enable interactive exec approval for dangerous commands on messaging platforms
+# Enable exact-operation approval transport on messaging platforms.
 os.environ["HERMES_EXEC_ASK"] = "1"
 
 # Set terminal working directory for messaging platforms.
@@ -6624,81 +6467,58 @@ class TurnRunner:
                 )
 
             cmd = approval_data.get("command", "")
-            desc = approval_data.get("description", "dangerous command")
-
-            # Redact credentials from the command before displaying it in
-            # the approval prompt — Tirith's findings are already redacted,
-            # but the raw command string still leaks secrets to the chat
-            # platform (#48456). Applied here so BOTH the button-based
-            # (send_exec_approval) and plain-text fallback paths below use
-            # the redacted value.
-            cmd = _redact_approval_command(cmd)
-
-            # Prefer button-based approval when the adapter supports it.
-            # Check the *class* for the method, not the instance — avoids
-            # false positives from MagicMock auto-attribute creation in tests.
+            _approval_id = str(approval_data.get("approval_id", "") or "")
             if (
-                getattr(type(ctx._status_adapter), "send_exec_approval", None)
-                is not None
-                and approval_data.get("allow_session", True)
+                approval_data.get("exact_execution") is not True
+                or re.fullmatch(r"[0-9a-f]{32}", _approval_id) is None
             ):
-                try:
-                    _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                        ),
-                        ctx._loop_for_step,
-                        logger=logger,
-                        log_message="send_exec_approval scheduling error",
-                    )
-                    if _approval_fut is None:
-                        raise RuntimeError("send_exec_approval: loop unavailable")
-                    _approval_result = _approval_fut.result(timeout=15)
-                    if _approval_result.success:
-                        return
-                    logger.warning(
-                        "Button-based approval failed (send returned error), falling back to text: %s",
-                        _approval_result.error,
-                    )
-                except Exception as _e:
-                    logger.warning(
-                        "Button-based approval failed, falling back to text: %s", _e
-                    )
+                raise ApprovalNotifyBoundaryError(
+                    "non_exact_gateway_approval_rejected",
+                    (
+                        "BLOCKED: The gateway received an approval request "
+                        "without one exact opaque operation capability."
+                    ),
+                )
 
-            # Fallback: plain text approval prompt.  Use the adapter's
-            # typed prefix so Slack/Matrix users are told the form they
-            # can actually type (`!approve`) — typed "/" is blocked in
-            # Slack threads and reserved by Matrix clients.
+            # Generic chat formatting/chunking is not byte-preserving.  Exact
+            # approvals therefore require a platform transport that explicitly
+            # attaches the original UTF-8 bytes and fails closed otherwise.
             _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
-            msg = _format_exec_approval_fallback(
-                cmd,
-                desc,
-                _p,
-                allow_permanent=approval_data.get("allow_permanent", True),
-                allow_session=approval_data.get("allow_session", True),
-                approval_id=str(approval_data.get("approval_id", "") or ""),
-                exact_execution=approval_data.get("exact_execution") is True,
-            )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
+                    ctx._status_adapter.send_exact_exec_approval(
                         ctx._status_chat_id,
-                        msg,
+                        cmd,
+                        approval_id=_approval_id,
+                        command_sha256=hashlib.sha256(
+                            str(cmd).encode("utf-8")
+                        ).hexdigest(),
+                        command_prefix=_p,
                         metadata=ctx._status_thread_metadata,
                     ),
                     ctx._loop_for_step,
                     logger=logger,
                     log_message="Approval text-send scheduling error",
                 )
-                if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                if _approval_send_fut is None:
+                    raise ApprovalNotifyBoundaryError(
+                        "exact_approval_transport_unavailable",
+                        "BLOCKED: exact approval transport could not be scheduled.",
+                    )
+                _approval_send_result = _approval_send_fut.result(timeout=15)
+                if not getattr(_approval_send_result, "success", False):
+                    raise ApprovalNotifyBoundaryError(
+                        "exact_approval_transport_failed",
+                        "BLOCKED: canonical operation bytes were not delivered.",
+                    )
+            except ApprovalNotifyBoundaryError:
+                raise
             except Exception as _e:
-                logger.error("Failed to send approval request: %s", _e)
+                logger.error("Failed to send exact approval request: %s", _e)
+                raise ApprovalNotifyBoundaryError(
+                    "exact_approval_transport_failed",
+                    "BLOCKED: canonical operation bytes were not delivered.",
+                ) from None
 
         # Capture whether this event carried a real user message before
         # any recovery snapshot is added. Canonical recovery snapshots are
@@ -8413,46 +8233,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
         # per-message AIAgent instances.
-
-        # Ensure the optional scanner is available for continuity runtimes.
-        # Its installer may perform network/package mutations, so a sealed
-        # single-task runtime never invokes it during construction.
-        if not self._isolated_runtime and not self._require_production_model_sovereignty:
-            try:
-                from tools.tirith_security import ensure_installed
-
-                ensure_installed(log_failures=False)
-            except Exception:
-                pass  # Non-fatal — fail-open at scan time if unavailable
-
-        # Startup heads-up: manual approval needs a live owner route.  Tirith is
-        # a deterministic scanner only; no auxiliary model may grant or deny
-        # authorization for the primary agent.
-        try:
-            from hermes_cli.config import load_config as _load_full_config
-
-            _appr_cfg = _load_full_config()
-            _appr_mode = (
-                str(
-                    cfg_get(_appr_cfg, "approvals", "mode", default="manual")
-                    or "manual"
-                )
-                .strip()
-                .lower()
-            )
-            _tirith_on = bool(
-                cfg_get(_appr_cfg, "security", "tirith_enabled", default=True)
-            )
-            if _appr_mode == "manual" and not _tirith_on:
-                logger.warning(
-                    "Gateway approvals.mode=manual with the deterministic "
-                    "scanner disabled: dangerous commands and "
-                    "execute_code scripts will BLOCK until a human approves "
-                    "them in chat. Enable security.tirith_enabled for scanning "
-                    "or keep a live owner approval route."
-                )
-        except Exception:
-            logger.debug("approvals.mode startup check skipped", exc_info=True)
 
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -17553,7 +17333,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # falls through to normal dispatch — a stale pending confirm does
         # NOT block other commands.
         #
-        # Important: if a dangerous-command approval is ALSO pending (agent
+        # Important: if an operation approval is ALSO pending (agent
         # blocked inside tools/approval.py), the tool approval takes
         # precedence — /approve there unblocks the waiting tool thread.
         # Slash-confirm only catches /approve when no tool approval is live.
@@ -18635,7 +18415,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
-        # execution of a dangerous command.
+        # execution of one pending operation.
 
         if not is_internal and await self._run_in_executor_with_context(
             self._is_telegram_topic_root_lobby, source
@@ -21054,7 +20834,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.debug("Watch queue drain error: %s", e)
 
-            # NOTE: Dangerous command approvals are now handled inline by the
+            # NOTE: Operation approvals are now handled inline by the
             # blocking gateway approval mechanism in tools/approval.py.  The agent
             # thread blocks until the user responds with /approve or /deny, so by
             # the time we reach here the approval has already been resolved.  The
@@ -26042,7 +25822,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return _reply_anchor_for_event(event)
 
     # ------------------------------------------------------------------
-    # /approve & /deny — explicit dangerous-command approval
+    # /approve & /deny — explicit exact-operation approval
     # ------------------------------------------------------------------
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
@@ -29216,7 +28996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if session.output_buffer
                         else ""
                     )
-                    _raw = redact_terminal_output(_raw, _command)
+                    _raw = redact_terminal_output(_raw)
                     _command = _redact_gateway_user_facing_secrets(_command)
                     # Truncate at line boundaries so notifications never start
                     # mid-line (fixes #23284). Keep the last ~2000 chars but
@@ -29289,9 +29069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if new_output:
                         from agent.redact import redact_terminal_output
 
-                        new_output = redact_terminal_output(
-                            new_output, getattr(session, "command", "") or ""
-                        )
+                        new_output = redact_terminal_output(new_output)
                     message_text = (
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
                         f"Here's the final output:\n{new_output}]"
@@ -29324,9 +29102,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if new_output:
                     from agent.redact import redact_terminal_output
 
-                    new_output = redact_terminal_output(
-                        new_output, getattr(session, "command", "") or ""
-                    )
+                    new_output = redact_terminal_output(new_output)
                 message_text = (
                     f"[Background process {session_id} is still running~ "
                     f"New output:\n{new_output}]"

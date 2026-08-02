@@ -344,7 +344,6 @@ class CLIAgentSetupMixin:
 
         _prepare_deferred_agent_startup()
         self._install_tool_callbacks()
-        self._ensure_tirith_security()
 
         if not self._ensure_runtime_credentials():
             return False

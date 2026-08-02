@@ -60,15 +60,26 @@ export function PromptZone({
   onApprovalChoice,
   onClarifyAnswer,
   onSecretSubmit,
-  onSudoSubmit
-}: Pick<AppOverlaysProps, 'cols' | 'onApprovalChoice' | 'onClarifyAnswer' | 'onSecretSubmit' | 'onSudoSubmit'>) {
+  onSudoSubmit,
+  pagerPageSize
+}: Pick<
+  AppOverlaysProps,
+  'cols' | 'onApprovalChoice' | 'onClarifyAnswer' | 'onSecretSubmit' | 'onSudoSubmit' | 'pagerPageSize'
+>) {
   const overlay = useStore($overlayState)
   const theme = useStore($uiTheme)
 
   if (overlay.approval) {
     return (
       <PromptCell cols={cols} id="approval">
-        <ApprovalPrompt cols={cols} onChoice={onApprovalChoice} req={overlay.approval} t={theme} />
+        <ApprovalPrompt
+          cols={cols}
+          key={overlay.approval.approvalId}
+          onChoice={onApprovalChoice}
+          pageSize={pagerPageSize}
+          req={overlay.approval}
+          t={theme}
+        />
       </PromptCell>
     )
   }

@@ -1093,9 +1093,9 @@ def my_callback(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `command` | `str` | Terminal command or `execute_code` script being assessed. Gateway payloads are redacted before observer dispatch. |
-| `description` | `str` | Human-readable reason(s) the command is flagged (combined when multiple patterns match) |
-| `pattern_key` | `str` | Primary pattern key that triggered the approval (e.g. `"rm_rf"`, `"sudo"`) |
-| `pattern_keys` | `list[str]` | All pattern keys that matched |
+| `description` | `str` | Human-readable description of the exact operation awaiting structural authority |
+| `pattern_key` | `str` | Compatibility-named exact execution-subject key (for example, `"exact:terminal:<sha256>"`); it is not a semantic pattern |
+| `pattern_keys` | `list[str]` | Compatibility list containing exact execution-subject identities, not keyword matches |
 | `session_key` | `str` | Session identifier, useful for scoping notifications per-chat |
 | `surface` | `str` | `"cli"` for interactive CLI/TUI prompts or `"gateway"` for async platform approvals |
 
@@ -1145,7 +1145,7 @@ Same kwargs as `pre_approval_request`, plus:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `choice` | `str` | `"once"`, `"session"`, `"always"`, `"deny"`, or `"timeout"` |
+| `choice` | `str` | `"once"`, `"deny"`, or `"timeout"` for exact terminal authorization |
 
 **Return value:** ignored.
 
@@ -1343,7 +1343,7 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 {
   "hook_event_name": "pre_tool_call",
   "tool_name":       "terminal",
-  "tool_input":      {"command": "rm -rf /"},
+  "tool_input":      {"command": "./project-maintenance --target /srv/project"},
   "session_id":      "sess_abc123",
   "cwd":             "/home/user/project",
   "extra":           {"task_id": "...", "tool_call_id": "..."}
@@ -1356,8 +1356,8 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 
 ```jsonc
 // Block a pre_tool_call (both shapes accepted; normalised internally):
-{"decision": "block", "reason":  "Forbidden: rm -rf"}   // Claude-Code style
-{"action":   "block", "message": "Forbidden: rm -rf"}   // Hermes-canonical
+{"decision": "block", "reason":  "This profile is read-only"}   // Claude-Code style
+{"action":   "block", "message": "This profile is read-only"}   // Hermes-canonical
 
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}
@@ -1394,27 +1394,24 @@ printf '{}\n'
 
 The agent's in-context view of the file is **not** re-read automatically — the reformat only affects the file on disk. Subsequent `read_file` calls pick up the formatted version.
 
-#### 2. Block destructive `terminal` commands
+#### 2. Make a profile structurally read-only
 
 ```yaml
 hooks:
   pre_tool_call:
     - matcher: "terminal"
-      command: "~/.hermes/agent-hooks/block-rm-rf.sh"
+      command: "~/.hermes/agent-hooks/read-only-profile.sh"
       timeout: 5
 ```
 
 ```bash
 #!/usr/bin/env bash
-# ~/.hermes/agent-hooks/block-rm-rf.sh
-payload="$(cat -)"
-cmd=$(echo "$payload" | jq -r '.tool_input.command // empty')
-if echo "$cmd" | grep -qE 'rm[[:space:]]+-rf?[[:space:]]+/'; then
-  printf '{"decision": "block", "reason": "blocked: rm -rf / is not permitted"}\n'
-else
-  printf '{}\n'
-fi
+# ~/.hermes/agent-hooks/read-only-profile.sh
+cat >/dev/null
+printf '{"decision": "block", "reason": "terminal is disabled for this read-only profile"}\n'
 ```
+
+This is a structural whole-surface policy: it does not inspect or classify command prose. For semantic decisions, keep the active LLM authoritative and use the exact terminal-capability flow.
 
 #### 3. Inject `git status` into every turn (Claude-Code `UserPromptSubmit` equivalent)
 

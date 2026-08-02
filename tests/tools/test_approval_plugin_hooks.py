@@ -20,8 +20,7 @@ from tools.approval import (
 
 @pytest.fixture
 def isolated_session(monkeypatch, tmp_path):
-    """Give each test a fresh session_key, clean approval-state, and isolated
-    HERMES_HOME so the real user's command_allowlist doesn't leak in."""
+    """Give each test a fresh exact-approval session boundary."""
     import tools.approval as _am
 
     session_key = "test:session:approval_hooks"
@@ -29,16 +28,9 @@ def isolated_session(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
     # Make sure we don't skip guards via yolo / approvals.mode=off
     monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
-    # Isolate from the real user's permanent allowlist + session state
-    _saved_permanent = _am._permanent_approved.copy()
-    _saved_session = {k: v.copy() for k, v in _am._session_approved.items()}
-    _am._permanent_approved.clear()
-    _am._session_approved.clear()
     try:
         yield session_key
     finally:
-        _am._permanent_approved.update(_saved_permanent)
-        _am._session_approved.update(_saved_session)
         try:
             _am._approval_session_key.reset(token)
         except Exception:
@@ -66,7 +58,19 @@ class TestCliPathFiresHooks:
             return []
 
         # Force the user to "approve once" via the approval_callback contract
-        def cb(command, description, *, allow_permanent=True):
+        def cb(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            allow_session=True,
+            approval_id="",
+            exact_execution=False,
+        ):
+            assert allow_permanent is False
+            assert allow_session is False
+            assert approval_id
+            assert exact_execution is True
             return "once"
 
         with patch("hermes_cli.plugins.invoke_hook", side_effect=fake_invoke_hook):
@@ -105,7 +109,15 @@ class TestCliPathFiresHooks:
             captured.append((hook_name, kwargs))
             return []
 
-        def cb(command, description, *, allow_permanent=True):
+        def cb(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            allow_session=True,
+            approval_id="",
+            exact_execution=False,
+        ):
             return "deny"
 
         with patch("hermes_cli.plugins.invoke_hook", side_effect=fake_invoke_hook):
@@ -131,7 +143,15 @@ class TestCliPathFiresHooks:
         def boom(hook_name, **kwargs):
             raise RuntimeError("plugin crashed")
 
-        def cb(command, description, *, allow_permanent=True):
+        def cb(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+            allow_session=True,
+            approval_id="",
+            exact_execution=False,
+        ):
             return "once"
 
         with patch("hermes_cli.plugins.invoke_hook", side_effect=boom):

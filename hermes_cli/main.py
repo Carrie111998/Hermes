@@ -449,7 +449,6 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
-from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -2654,7 +2653,7 @@ def cmd_chat(args):
     except Exception:
         pass
 
-    # --yolo: bypass all dangerous command approvals.
+    # --yolo: authorize terminal/code-execution surfaces for this process.
     # Also set in main() before _prepare_agent_startup() — that is the
     # authoritative site because it runs before tool imports freeze
     # _YOLO_MODE_FROZEN.  This redundant set is a safety net for callers
@@ -4862,16 +4861,6 @@ def cmd_security(args):
         sys.exit(int(code or 0))
     print(f"unknown security subcommand: {sub}", file=sys.stderr)
     sys.exit(2)
-
-
-def cmd_approvals(args):
-    """Dispatch `hermes approvals <subcmd>`."""
-    from hermes_cli.approvals_suggest import approvals_command
-
-    status = approvals_command(args)
-    if status:
-        sys.exit(status)
-    return status
 
 
 def cmd_dump(args):
@@ -11502,7 +11491,6 @@ def main():
     # =========================================================================
     # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
     # =========================================================================
-    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
 
     # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)

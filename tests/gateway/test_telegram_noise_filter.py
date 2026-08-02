@@ -185,59 +185,29 @@ def test_manual_compress_feedback_and_failure_notices_stay_visible(platform, mes
 
 
 @pytest.mark.parametrize("platform", ["whatsapp", "slack", "signal", "matrix"])
-def test_chat_gateways_redact_secret_in_provider_error(platform):
-    """Provider-error bodies carrying secrets must never reach chat users.
-
-    THE security invariant being widened from Telegram (#28533) to all chat
-    surfaces (#39293): a leaked bearer token in a provider error body must be
-    redacted/replaced before delivery on any chat platform.
-    """
+def test_chat_gateways_preserve_model_authored_provider_error_bytes(platform):
+    """Post-model regexes must not rewrite provider-authored response bytes."""
     raw = (
         "API call failed after 3 retries: HTTP 401 Unauthorized — "
         "Authorization: Bearer sk-ABCDEF0123456789abcdef0123"
     )
 
-    sanitized = _sanitize_gateway_final_response(platform, raw)
-
-    assert "sk-ABCDEF0123456789abcdef0123" not in sanitized
-    assert "sk-ABCDEF" not in sanitized
-    assert "HTTP 401" in sanitized
-    assert "API call failed after 3 retries" in sanitized
+    assert _sanitize_gateway_final_response(platform, raw) == raw
 
 
 @pytest.mark.parametrize("platform", ["whatsapp", "slack", "signal", "matrix"])
-def test_chat_gateways_redact_secret_in_non_error_body(platform):
-    """Secrets must be redacted even when no provider-error rewrite fires.
-
-    The provider-error case above is rewritten wholesale to a generic
-    category string, so it cannot, on its own, prove the secret-redaction
-    layer works — the rewrite would strip the body regardless. This case
-    feeds ordinary assistant prose that merely *echoes* a bearer token (not
-    a provider-error envelope), so `_redact_gateway_user_facing_secrets` is
-    the only thing standing between the token and the user. Removing the
-    redaction patterns makes this fail (genuine regression guard); the
-    surrounding prose must survive intact.
-    """
+def test_chat_gateways_preserve_model_authored_non_error_bytes(platform):
+    """The gateway is transport, not a semantic or content-rewrite authority."""
     raw = (
         "Sure — here is the example request you asked for: "
         "curl -H 'Authorization: Bearer sk-ABCDEF0123456789abcdef0123' "
         "https://api.example.com/v1/models"
     )
 
-    sanitized = _sanitize_gateway_final_response(platform, raw)
-
-    assert "sk-ABCDEF0123456789abcdef0123" not in sanitized
-    assert "sk-ABCDEF" not in sanitized
-    # The secret body is gone — assert the invariant, not the specific mask
-    # marker. The outbound redactor delegates to redact_sensitive_text (#23810),
-    # which masks as `***`/partial; the local pattern fallback uses `[REDACTED]`.
-    assert "***" in sanitized or "[REDACTED]" in sanitized
-    # Non-secret prose is preserved — redaction is surgical, not a wholesale
-    # rewrite, on bodies that are not provider-error envelopes.
-    assert "here is the example request you asked for" in sanitized
+    assert _sanitize_gateway_final_response(platform, raw) == raw
 
 
-def test_plugin_platform_string_preserves_status_and_redacts_as_chat():
+def test_plugin_platform_string_preserves_status():
     message = "⏳ Retrying in 4.2s (attempt 1/3)..."
 
     assert _prepare_gateway_status_message("irc", "warn", message) == message
@@ -252,11 +222,11 @@ def test_chat_gateways_keep_normal_answers(platform):
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
-def test_chat_gateways_drop_interrupt_sentinel(platform):
-    """The interrupt-while-waiting sentinel is metadata, not a reply (#7921)."""
+def test_chat_gateways_preserve_interrupt_shaped_model_bytes(platform):
+    """Authored wording is opaque even when it resembles runtime metadata."""
     sentinel = "Operation interrupted: waiting for model response (1.7s elapsed)."
 
-    assert _sanitize_gateway_final_response(platform, sentinel) == ""
+    assert _sanitize_gateway_final_response(platform, sentinel) == sentinel
     assert _sanitize_gateway_final_response("local", sentinel) == sentinel
 
 
@@ -282,18 +252,14 @@ def test_telegram_final_response_preserves_authored_provider_error_wording():
     assert sanitized == raw
 
 
-def test_telegram_final_response_redacts_auth_secrets():
-    """Authentication errors should be useful without leaking key material."""
+def test_telegram_final_response_preserves_authored_auth_error_bytes():
+    """The gateway must not regex-rewrite model-authored output."""
     raw = (
         "⚠️ Provider authentication failed: Incorrect API key provided: "
         "sk-live_abcdefghijklmnopqrstuvwxyz1234567890"
     )
 
-    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
-
-    assert "authentication failed" in sanitized.lower()
-    assert "Incorrect API key provided" in sanitized
-    assert "sk-live" not in sanitized
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, raw) == raw
 
 
 def test_telegram_final_response_keeps_normal_answers():
@@ -303,12 +269,7 @@ def test_telegram_final_response_keeps_normal_answers():
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
 
 
-# Synthetic credential shapes from #23810. Bodies are placeholder gibberish —
-# never real tokens — but they match the canonical redaction patterns. The
-# outbound gateway redactor previously used a narrow local pattern subset that
-# leaked the GitHub fine-grained PAT and Telegram bot-token shapes; it now
-# delegates to agent.redact.redact_sensitive_text, the authoritative redactor
-# already used for logs/tool-output/approval prompts.
+# Synthetic strings that used to trigger post-model regex rewriting.
 _ISSUE_23810_SECRET_SHAPES = {
     "openai_sk": "sk-" + "a1b2c3d4e5f6a7b8c9d0",
     "github_fine_grained_pat": "github_pat_" + "1A" * 41,
@@ -320,22 +281,9 @@ _ISSUE_23810_SECRET_SHAPES = {
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
 @pytest.mark.parametrize("shape_name", sorted(_ISSUE_23810_SECRET_SHAPES))
-def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_name):
-    """Outbound chat must mask every credential shape the banner promises.
-
-    Regression guard for #23810: the gateway claimed "chat responses are
-    scrubbed before delivery", but the outbound redactor used a divergent
-    narrow pattern set that leaked the GitHub fine-grained PAT and Telegram
-    bot-token shapes verbatim. Feed each shape as ordinary assistant prose
-    (not a provider-error envelope, so no wholesale rewrite fires) and assert
-    the secret body never reaches the user while surrounding prose survives.
-    """
+def test_chat_gateways_preserve_all_model_authored_shapes(platform, shape_name):
+    """No credential-shaped wording may become a semantic rewrite trigger."""
     secret = _ISSUE_23810_SECRET_SHAPES[shape_name]
     raw = f"Sure, here is the token you asked me to echo: {secret} — done."
 
-    sanitized = _sanitize_gateway_final_response(platform, raw)
-
-    assert secret not in sanitized, f"{shape_name} leaked verbatim on {platform}"
-    # Prose around the secret is preserved — redaction is surgical.
-    assert "here is the token you asked me to echo" in sanitized
-    assert sanitized.endswith("done.")
+    assert _sanitize_gateway_final_response(platform, raw) == raw

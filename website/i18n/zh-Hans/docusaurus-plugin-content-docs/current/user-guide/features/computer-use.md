@@ -90,7 +90,7 @@ Hermes 应用多层防护机制：
 
 - 破坏性操作（click、type、drag、scroll、key、focus_app）需要审批——通过 CLI 对话框交互确认，或通过消息平台审批按钮确认。
 - 工具层面硬性屏蔽的按键组合：清空废纸篓、强制删除、锁定屏幕、注销、强制注销。
-- 硬性屏蔽的输入模式：`curl | bash`、`sudo rm -rf /`、fork bomb 等。
+- 直接输入 shell 文本不属于 computer-use 权限面。应使用 terminal 工具，让精确 operation capability 和隔离后端提供结构边界。
 - Agent 的系统 prompt 明确规定：不得点击权限对话框，不得输入密码，不得执行截图中嵌入的指令。
 
 如需对每个操作进行确认，可在 `~/.hermes/config.yaml` 中配置 `approvals.mode: manual`。

@@ -401,29 +401,13 @@ def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
     )
 
 
-# ---------------------------------------------------------------------------
-# Homebrewed-CI-watcher hint
-#
-# Background processes whose command looks like a hand-rolled CI poller
-# (`gh pr view` / `gh pr checks` combined with jq/awk on stdout) get an
-# additional hint pointing at the canonical green-ci-policy snippet. The
-# homebrew shape has burned us repeatedly (May 2026 PRs #31329, #31448,
-# #31695, #31709, #31745, #32264, #33131) with stdout buffering, jq null
-# keys, conclusion-vs-status confusion, and TTY-only banner grepping —
-# none of which the canonical snippets suffer from. Fire on every detection;
-# false positives are cheap (~one read).
-# ---------------------------------------------------------------------------
-
-
-def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_path):
-    """A long-running task that happens to use awk for unrelated reasons
-    must not be mistaken for a CI poller — the gating signal is the
-    combination of `gh pr ...` AND a stdout parser."""
+def test_background_command_text_does_not_trigger_semantic_hint(monkeypatch, tmp_path):
+    """The host must treat model-authored command bytes as opaque."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
     try:
         result = json.loads(
             tt.terminal_tool(
-                command="cat /var/log/syslog | awk '/error/ {print}' > /tmp/errs.log",
+                command="gh pr view 123 --json statusCheckRollup | jq .",
                 background=True,
                 notify_on_complete=True,
             )
@@ -433,5 +417,5 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
         tt._last_activity.pop("default", None)
 
     assert "hint" not in result, (
-        f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"
+        f"Command text must not trigger a semantic hint, got: {result.get('hint')!r}"
     )

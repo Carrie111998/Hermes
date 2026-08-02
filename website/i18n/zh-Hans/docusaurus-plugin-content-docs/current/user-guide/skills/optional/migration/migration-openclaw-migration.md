@@ -8,7 +8,7 @@ description: "将用户的 OpenClaw 自定义配置迁移到 Hermes Agent"
 
 # Openclaw Migration
 
-将用户的 OpenClaw 自定义配置迁移到 Hermes Agent。从 `~/.openclaw` 导入 Hermes 兼容的记忆、`SOUL.md`、命令白名单、用户技能及所选工作区资产，并精确报告无法迁移的内容及原因。
+将用户的 OpenClaw 自定义配置迁移到 Hermes Agent。从 `~/.openclaw` 导入 Hermes 兼容的记忆、`SOUL.md`、用户技能及所选工作区资产，并报告无法迁移的内容。
 
 ## Skill 元数据
 
@@ -55,7 +55,6 @@ CLI 命令运行与下文所述相同的迁移脚本。当需要交互式、引�
 
 - 将 `SOUL.md` 导入 Hermes 主目录，保存为 `SOUL.md`
 - 将 OpenClaw 的 `MEMORY.md` 和 `USER.md` 转换为 Hermes 记忆条目
-- 将 OpenClaw 命令审批模式合并到 Hermes `command_allowlist`
 - 迁移 Hermes 兼容的消息设置，例如 `TELEGRAM_ALLOWED_USERS` 和 `MESSAGING_CWD`
 - 将 OpenClaw skill 复制到 `~/.hermes/skills/openclaw-imports/`
 - 可选地将 OpenClaw 工作区指令文件复制到所选 Hermes 工作区
@@ -231,7 +230,6 @@ Hermes CLI 支持 `clarify` 工具进行交互式提示，但有以下限制：
 - `memory`
 - `user-profile`
 - `messaging-settings`
-- `command-allowlist`
 - `skills`
 - `tts-assets`
 - `archive`

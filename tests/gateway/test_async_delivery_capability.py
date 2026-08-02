@@ -194,19 +194,21 @@ class TestTerminalNotifyGate:
         )
 
     def test_api_server_skips_watcher_and_notes(self):
+        from tools.approval import disable_session_yolo, enable_session_yolo
         from tools.process_registry import process_registry
 
         tokens = set_session_vars(
             platform="api_server", chat_id="s1", session_key="s1", async_delivery=False
         )
+        assert enable_session_yolo("s1") is True
         try:
             d = self._run_bg("sleep 30 && echo DONE")
         finally:
+            disable_session_yolo("s1")
             clear_session_vars(tokens)
 
         assert d.get("notify_on_complete") is False
         assert d.get("notify_unsupported"), "must explain the limitation"
         assert "poll" in d["notify_unsupported"].lower()
         assert len(process_registry.pending_watchers) == 0
-
 

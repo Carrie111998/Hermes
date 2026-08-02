@@ -183,7 +183,7 @@ Hermes 拥有终端访问权限，安全至关重要。
 | 层级 | 实现方式 |
 |-------|---------------|
 | **sudo 密码管道** | 使用 `shlex.quote()` 防止 shell 注入 |
-| **危险命令检测** | `tools/approval.py` 中的正则表达式模式，配合用户审批流程 |
+| **精确终端权限** | `tools/approval.py` 验证结构化 capability；不解析命令文本 |
 | **Cron prompt 注入** | 扫描器阻断指令覆盖模式 |
 | **写入拒绝列表** | 受保护路径通过 `os.path.realpath()` 解析，防止符号链接绕过 |
 | **Skill 守卫** | 对 hub 安装的 skill 进行安全扫描 |

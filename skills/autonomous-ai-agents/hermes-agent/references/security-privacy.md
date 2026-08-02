@@ -26,16 +26,18 @@ hermes config set privacy.redact_pii true    # enable
 hermes config set privacy.redact_pii false   # disable (default)
 ```
 
-### Command approval prompts
+### Exact terminal authorization
 
-By default (`approvals.mode: manual`), Hermes asks the owner to approve shell commands flagged as destructive (`rm -rf`, `git reset --hard`, etc.). The modes are:
+Hermes does not classify command text with keywords, regular expressions, or a semantic router. The model is the sole semantic authority. The runtime verifies only structural authority: an isolated backend, an exact once-only owner capability, an exact bounded-plan capability, an explicit whole-surface session/cron grant, or `approvals.mode: off`.
 
-- `manual` — always prompt the owner (default)
-- `off` — skip all approval prompts (equivalent to `--yolo`)
+By default (`approvals.mode: manual`), Hermes asks the owner before issuing an exact terminal capability. The modes are:
+
+- `manual` — require structural authority for each exact invocation (default)
+- `off` — skip the owner prompt while retaining invocation-bound, non-replayable capabilities (equivalent to `--yolo`)
 
 ```bash
-hermes config set approvals.mode manual      # owner-driven approval
-hermes config set approvals.mode off         # bypass everything (not recommended)
+hermes config set approvals.mode manual      # owner-driven exact authorization
+hermes config set approvals.mode off         # bypass the owner prompt (not recommended)
 ```
 
 Legacy `smart` values are migrated to `manual`; no auxiliary model can grant
@@ -49,15 +51,9 @@ Note: YOLO / `approvals.mode: off` does NOT turn off secret redaction. They are 
 
 ### "Reset permissions" / "make Hermes ask again"
 
-The user usually means: wipe the accumulated "Always allow" state — NOT yolo
-mode, and NOT a per-edit diff prompt (which doesn't exist; file writes never
-go through the approval prompt, only shell commands do). Two stores hold it:
+There is no accumulated terminal command-pattern grant to clear. Exact terminal capabilities are consumed after one use, expire, and are bound to their session epoch. To restore owner prompts, confirm `hermes config get approvals.mode` is `manual`, remove `--yolo` from the launch command, and start a fresh session to invalidate any still-pending capability.
 
-1. Shell-command allowlist: `hermes config set command_allowlist '[]'`
-2. Shell-hook consent (only if present): `rm -f ~/.hermes/shell-hooks-allowlist.json`
-
-Then sanity-check `hermes config get approvals.mode` (should not be `off`)
-and confirm `--yolo` isn't baked into their launch alias or systemd unit.
+Shell-hook consent is a separate integration state. If the user explicitly wants to reset that consent too, remove `~/.hermes/shell-hooks-allowlist.json`.
 
 ### Shell hooks allowlist
 

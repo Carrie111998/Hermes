@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import logging
@@ -4249,6 +4250,11 @@ class BasePlatformAdapter(ABC):
         file_path into chat, since it is a host filesystem path that
         would leak the Hermes home layout.
         """
+        if (metadata or {}).get("_hermes_exact_exec_approval") is True:
+            return SendResult(
+                success=False,
+                error=f"{self.name} has no byte-preserving exact approval transport",
+            )
         # See send_voice for the rationale: do not echo host paths into chat.
         logger.warning(
             "[%s] send_document fallback: native file send unavailable for %s",
@@ -4264,6 +4270,96 @@ class BasePlatformAdapter(ABC):
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+
+    async def send_exact_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        *,
+        approval_id: str,
+        command_sha256: str,
+        command_prefix: str = "/",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver canonical approval bytes as a downloadable attachment.
+
+        Generic chat rendering, escaping, and chunking are not byte-preserving.
+        A platform therefore qualifies for this shared path only when it has a
+        native ``send_document`` implementation.  The local attachment is
+        written in a private temporary directory, verified before and after the
+        upload, and removed immediately after the platform call returns.
+        """
+        approval_id = str(approval_id or "")
+        if re.fullmatch(r"[0-9a-f]{32}", approval_id) is None:
+            return SendResult(success=False, error="invalid opaque approval ID")
+
+        payload = str(command or "").encode("utf-8")
+        observed_sha256 = hashlib.sha256(payload).hexdigest()
+        if observed_sha256 != str(command_sha256 or ""):
+            return SendResult(success=False, error="exact operation digest mismatch")
+
+        filename = f"hermes-exact-operation-{approval_id}.txt"
+        caption = (
+            "⚠️ Exact operation requires approval\n"
+            f"Canonical UTF-8 bytes are attached as {filename}.\n"
+            f"SHA-256: {observed_sha256}\n"
+            f"Reply {command_prefix}approve {approval_id} to execute only "
+            f"these bytes, or {command_prefix}deny {approval_id} to cancel."
+        )
+
+        with tempfile.TemporaryDirectory(prefix="hermes-exact-approval-") as tmp_dir:
+            file_path = os.path.join(tmp_dir, filename)
+            with open(file_path, "xb") as exact_file:
+                exact_file.write(payload)
+                exact_file.flush()
+                os.fsync(exact_file.fileno())
+
+            exact_metadata = dict(metadata or {})
+            exact_metadata["_hermes_exact_exec_approval"] = True
+            result = await self._send_exact_exec_approval_document(
+                chat_id=chat_id,
+                file_path=file_path,
+                caption=caption,
+                file_name=filename,
+                metadata=exact_metadata,
+            )
+            try:
+                with open(file_path, "rb") as exact_file:
+                    delivered_source = exact_file.read()
+            except OSError:
+                return SendResult(
+                    success=False,
+                    error="exact operation attachment disappeared during delivery",
+                )
+            if hashlib.sha256(delivered_source).hexdigest() != observed_sha256:
+                return SendResult(
+                    success=False,
+                    error="exact operation attachment changed during delivery",
+                )
+            return result
+
+    async def _send_exact_exec_approval_document(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        caption: str,
+        file_name: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Upload an exact attachment only through a native document method."""
+        if type(self).send_document is BasePlatformAdapter.send_document:
+            return SendResult(
+                success=False,
+                error=f"{self.name} has no byte-preserving exact approval transport",
+            )
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            file_name=file_name,
+            metadata=metadata,
+        )
 
     async def _notify_media_delivery_failure(
         self,

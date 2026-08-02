@@ -142,7 +142,7 @@ The sealed YAML additionally pins `gateway.isolated_runtime: true`, literal
 `kanban.dispatch_in_gateway: false`. The generic gateway keeps its historical
 defaults; only explicit isolation suppresses shell/event hooks, process
 checkpoint recovery, prior-session mutation and synthetic auto-resume,
-Tirith installation, relay provisioning, MCP discovery, Nous keepalive,
+relay provisioning, MCP discovery, Nous keepalive,
 startup lifecycle notifications, housekeeping, and continuity/Kanban/handoff
 watchers. API-created agents mechanically receive `skip_memory=True` and
 `skip_context_files=True`. Cron and housekeeping never start, so the masked

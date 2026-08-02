@@ -166,7 +166,7 @@ computer_use(action="scroll", direction="down", amount=3, coordinate=[500, 400])
 - **"cua-driver not installed"**——运行 `hermes tools` 并启用 Computer Use；安装程序会通过上游脚本安装 cua-driver。需要 macOS + Accessibility + Screen Recording 权限。
 - **元素索引过期**——SOM 索引来自最后一次 `capture` 调用。如果 UI 发生变化（新标签页打开、对话框出现），点击前需重新截图。
 - **点击无效**——重新截图并验证。有时之前不可见的模态框现在正在阻挡输入。先关闭它（通常是 `escape` 或点击关闭按钮），再重试。
-- **"blocked pattern in type text"**——你尝试 `type` 的 shell 命令匹配了危险模式黑名单（`curl ... | bash`、`sudo rm -rf` 等）。请拆分命令或重新考虑方案。
+- **终端文本被拒绝**——直接输入 shell 文本不属于 computer-use 权限面。请使用 terminal 工具，让精确 operation capability 和隔离后端生效；不要拆分文本绕过边界。
 
 ## 何时不使用 `computer_use`
 

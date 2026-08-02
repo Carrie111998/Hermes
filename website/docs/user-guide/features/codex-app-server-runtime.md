@@ -222,25 +222,25 @@ Net effect: enable the codex runtime and your memory + skill nudges keep firing 
 
 ## How approvals work
 
-Codex requests approval before executing commands or applying patches. These get translated into Hermes' standard "Dangerous Command" prompt:
+Codex requests approval before executing commands or applying patches. Hermes translates the request into a once-only authorization prompt for the exact operation:
 
 ```
 ╭───────────────────────────────────────╮
-│ Dangerous Command                     │
+│ Exact Terminal Approval               │
 │                                       │
 │ /bin/bash -lc 'echo hello > foo.txt'  │
 │                                       │
 │ ❯ 1. Allow once                       │
-│   2. Allow for this session           │
-│   3. Deny                             │
+│   2. Deny                             │
 │                                       │
 │ Codex requests exec in /your/cwd      │
 ╰───────────────────────────────────────╯
 ```
 
-- **Allow once** → approve this single command.
-- **Allow for this session** → Codex won't re-prompt for similar commands.
-- **Deny** → command is rejected; Codex continues in read-only mode.
+- **Allow once** → issue a single-use capability bound to this exact operation.
+- **Deny** → reject this exact operation; Codex continues without that authority.
+
+If a Codex host exposes a broader-looking affirmative label, Hermes narrows it to the current exact operation once. It never creates a reusable command-pattern grant.
 
 For `apply_patch` (file edit) approvals, Hermes shows a summary of what changed (`1 add, 1 update: /tmp/new.py, /tmp/old.py`) when codex provides the data via the corresponding `fileChange` item.
 

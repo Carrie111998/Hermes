@@ -535,7 +535,7 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 |----------|-------------|
 | `HERMES_MAX_ITERATIONS` | 每次对话的最大工具调用迭代次数（默认：500） |
 | `HERMES_INFERENCE_MODEL` | 在进程级别覆盖模型名称（优先于本次会话的 `config.yaml`）。也可通过 `-m`/`--model` 标志设置。 |
-| `HERMES_YOLO_MODE` | 设为 `1` 可绕过危险命令审批提示。等同于 `--yolo`。 |
+| `HERMES_YOLO_MODE` | 设为 `1` 可绕过精确终端调用的所有者提示；权限仍绑定单次调用且不可重放。等同于 `--yolo`。 |
 | `HERMES_ACCEPT_HOOKS` | 无需 TTY 提示自动批准 `config.yaml` 中声明的任何未见过的 shell hook。等同于 `--accept-hooks` 或 `hooks_auto_accept: true`。 |
 | `HERMES_IGNORE_USER_CONFIG` | 跳过 `~/.hermes/config.yaml` 并使用内置默认值（`.env` 中的凭证仍会加载）。等同于 `--ignore-user-config`。 |
 | `HERMES_IGNORE_RULES` | 跳过 `AGENTS.md`、`SOUL.md`、`.cursorrules`、记忆和预加载技能的自动注入。等同于 `--ignore-rules`。 |
@@ -583,7 +583,7 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 
 ### HERMES_WRITE_SAFE_ROOT {#hermes_write_safe_root}
 
-设置此变量后，`write_file` 和 `patch` 只能写入列出的目录前缀内的路径。超出这些根目录的路径会被**立即拒绝**——不会进入危险命令审批流程，也没有聊天界面可以覆盖。
+设置此变量后，`write_file` 和 `patch` 只能写入列出的目录前缀内的路径。超出这些根目录的路径会被**立即拒绝**——不会创建终端授权覆盖，也没有聊天界面可以覆盖。
 
 官方 Docker 镜像会设置 `HERMES_WRITE_SAFE_ROOT=/opt/data` 与 `HERMES_HOME=/opt/data`，防止 agent 逃出挂载的数据卷。
 

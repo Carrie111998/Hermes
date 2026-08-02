@@ -35,7 +35,6 @@ from agent.display import (
 )
 from agent.tool_guardrails import classify_tool_failure
 from agent.tool_dispatch_helpers import (
-    _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
@@ -574,14 +573,12 @@ def _begin_tool_execution(
 
     if function_name == "terminal" and agent._checkpoint_mgr.enabled:
         try:
-            command = function_args.get("command", "")
-            if _is_destructive_command(command):
-                cwd = function_args.get("workdir") or os.getenv(
-                    "TERMINAL_CWD", os.getcwd()
-                )
-                agent._checkpoint_mgr.ensure_checkpoint(
-                    cwd, f"before terminal: {command[:60]}"
-                )
+            cwd = function_args.get("workdir") or os.getenv(
+                "TERMINAL_CWD", os.getcwd()
+            )
+            agent._checkpoint_mgr.ensure_checkpoint(
+                cwd, "before terminal operation"
+            )
         except Exception:
             pass
 

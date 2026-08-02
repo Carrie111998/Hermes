@@ -469,10 +469,6 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
-    # Tirith auto-installs from GitHub when enabled and missing. Unit tests
-    # should never perform that implicit network/bootstrap path; Tirith-specific
-    # tests opt back in by patching the security config directly.
-    monkeypatch.setenv("TIRITH_ENABLED", "false")
     # Lazy feature deps (tools/lazy_deps.py) pip-install on demand by design —
     # _allow_lazy_installs() fails open for users. Unit tests must never reach
     # pip/the network: with the SDK absent, any agent init whose tool checks
@@ -657,9 +653,7 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
 # in a fixture or split them across files.
 #
 # The skill ``test-suite-cascade-diagnosis`` documents the cascade patterns
-# this replaces; the running example was ``test_command_guards`` failing
-# 12/15 CI runs because ``tools.approval._session_approved`` carried
-# approvals from one test's session into another's.
+# this replaces.
 
 
 # ── tui_gateway.server shared-module state isolation ───────────────────────
@@ -781,7 +775,6 @@ def mock_config():
         },
         "compression": {"enabled": False},
         "memory": {"memory_enabled": False, "user_profile_enabled": False},
-        "command_allowlist": [],
     }
 
 
