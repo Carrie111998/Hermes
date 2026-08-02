@@ -370,7 +370,7 @@ def t(key: str, lang: str | None = None, *, register: str | None = None, **forma
     pre-register behaviour.
     """
     target = _normalize_lang(lang) if lang else get_language()
-    target_register = _normalize_register(register) if register else get_register()
+    target_register = _normalize_register(register) if register is not None else get_register()
     use_register_overlay = target_register != DEFAULT_REGISTER
 
     value: str | None = None

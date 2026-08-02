@@ -288,3 +288,42 @@ def test_t_explicit_register_overrides_config(monkeypatch):
     assert "Session reset" in result or "New session" in result
 
 
+def test_t_empty_register_string_resolves_to_technical(monkeypatch):
+    """t(key, register='') must normalize to 'technical', not defer to config.
+
+    Regression: the truthiness check `if register` treated an explicit
+    empty string as absent, falling through to get_register() which could
+    return 'friendly' from config.  The fix uses `register is not None`.
+    """
+    i18n.reset_language_cache()
+    monkeypatch.setattr(i18n, "_config_register_cached", lambda: "friendly")
+    monkeypatch.setattr(i18n, "_config_language_cached", lambda: None)
+    # Config says friendly, explicit register="" should resolve to technical.
+    result = i18n.t("gateway.reset.header_default", register="")
+    assert "Fresh start" not in result
+    assert "Session reset" in result or "New session" in result
+
+
+def test_config_propagation_with_temp_hermes_home(tmp_path, monkeypatch):
+    """E2E: display.message_register in config.yaml propagates to t().
+
+    Uses a real temp HERMES_HOME with a written config.yaml instead of
+    monkeypatching the cached reader, exercising the real config-load path.
+    """
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_file = hermes_home / "config.yaml"
+    config_file.write_text(
+        "display:\n  message_register: friendly\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    i18n.reset_language_cache()
+    try:
+        result = i18n.t("gateway.reset.header_default")
+        assert "Fresh start" in result
+    finally:
+        i18n.reset_language_cache()
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+
