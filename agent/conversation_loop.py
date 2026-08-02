@@ -4309,6 +4309,8 @@ def run_conversation(
                     # exact tool-call block that already executed.
                     agent._flush_messages_to_session_db(messages, conversation_history)
                 except Exception as exc:
+                    if getattr(agent, "_require_incremental_session_persistence", False):
+                        raise
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",
@@ -4818,6 +4820,13 @@ def run_conversation(
                 break
             
         except Exception as e:
+            if getattr(agent, "_runtime_persistence_failed", False):
+                failed = True
+                _turn_exit_reason = "required_session_persistence_failed"
+                logger.exception(
+                    "Required SessionDB persistence failed; stopping before further execution"
+                )
+                break
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
                 print(f"❌ {error_msg}")

@@ -31,6 +31,7 @@ from agent.display import (
 )
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
+    DeferredToolResult,
     _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
@@ -86,6 +87,8 @@ def _flush_session_db_after_tool_progress(
     try:
         agent._flush_messages_to_session_db(messages)
     except Exception as exc:
+        if getattr(agent, "_require_incremental_session_persistence", False):
+            raise
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
 
 
@@ -576,6 +579,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
+            if isinstance(result, DeferredToolResult):
+                results[index] = (
+                    function_name,
+                    function_args,
+                    result,
+                    duration,
+                    False,
+                    False,
+                    middleware_trace,
+                )
+                return
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
@@ -739,6 +753,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+
+            if isinstance(function_result, DeferredToolResult):
+                agent._runtime_deferred_tool_call_id = function_result.tool_call_id
+                continue
 
             if not blocked:
                 function_result = agent._append_guardrail_observation(
@@ -1369,6 +1387,34 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
+
+        if isinstance(function_result, DeferredToolResult):
+            agent._runtime_deferred_tool_call_id = function_result.tool_call_id
+            remaining_calls = assistant_message.tool_calls[i:]
+            for skipped_call in remaining_calls:
+                skipped_name = skipped_call.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    json.dumps({
+                        "error": {
+                            "code": "runtime_tool_call_deferred",
+                            "message": (
+                                "This tool call was not executed because the Runtime "
+                                "parked on an earlier delegated tool call."
+                            ),
+                            "retryable": False,
+                        },
+                    }, ensure_ascii=False, separators=(",", ":")),
+                    skipped_call.id,
+                ))
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"deferred sibling tool result {skipped_name}",
+                )
+            agent._current_tool = None
+            agent._touch_activity(f"tool deferred: {function_name}")
+            return
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

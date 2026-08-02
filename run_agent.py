@@ -1699,6 +1699,9 @@ class AIAgent:
                 flushed_ids.add(msg_id)
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
+            if getattr(self, "_require_incremental_session_persistence", False):
+                self._runtime_persistence_failed = True
+                raise
             logger.warning("Session DB append_message failed: %s", e)
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:

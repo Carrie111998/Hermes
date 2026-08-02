@@ -24,8 +24,10 @@ from gateway.api_server_runtime import (
     APIServerRuntimeMixin,
     RuntimeBridgeSession,
     _failed_tool_result_projection,
+    _merge_runtime_session_history,
     _pin_run_model,
     _resume_runtime_history,
+    _resume_session_db_history,
     _runtime_attachment_parts,
     _runtime_failure_code,
     _runtime_allowed_skill_digests,
@@ -35,6 +37,8 @@ from gateway.api_server_runtime import (
     _runtime_video_paths,
     _runtime_tool_middleware,
 )
+from agent.tool_dispatch_helpers import DeferredToolResult
+from hermes_state import SessionDB
 
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
@@ -2018,6 +2022,252 @@ async def test_interrupt_wakeup_reports_run_interrupted_not_deadline():
     result = json.loads(await call)
     assert result["error"]["code"] == "run_interrupted"
     assert result["error"]["message"] == "run was interrupted"
+
+
+@pytest.mark.asyncio
+async def test_park_interrupt_defers_tool_result_without_synthetic_error():
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_park",
+        asyncio.get_running_loop(),
+        queue,
+        [{"name": "media.generate_image", "input_schema": {"type": "object"}}],
+        10_000,
+        "thread_park",
+    )
+    session.agent_ref[0] = SimpleNamespace(
+        interrupt=lambda reason: None,
+        _runtime_checkpoint_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_park",
+                "function": {"name": "media.generate_image", "arguments": "{}"},
+            }],
+        },
+    )
+    call = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        "media.generate_image",
+        {},
+        "call_park",
+    ))
+    assert (await queue.get())["type"] == "checkpoint"
+    assert (await queue.get())["type"] == "tool_request"
+    session.interrupt("parked:tool_operation")
+
+    result = await call
+    assert result == DeferredToolResult("call_park")
+
+
+def test_session_db_resume_appends_real_result_once_and_accepts_redelivery():
+    class RecordingDB:
+        def __init__(self):
+            self.messages = [{
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_media",
+                    "function": {"name": "media.generate_image", "arguments": "{}"},
+                }],
+            }]
+            self.appended = []
+
+        def append_message(self, session_id, **message):
+            self.appended.append((session_id, message))
+            self.messages.append({"role": message["role"], **message})
+
+    result = {
+        "tool_call_id": "call_media",
+        "status": "succeeded",
+        "output": {"asset_id": "asset_1", "url": "asset://image/1"},
+    }
+    db = RecordingDB()
+    first = _resume_session_db_history(db, "thread_1", list(db.messages), [result])
+    redelivered = {
+        **result,
+        "output": {"url": "asset://image/1", "asset_id": "asset_1"},
+    }
+    second = _resume_session_db_history(
+        db,
+        "thread_1",
+        list(db.messages),
+        [redelivered],
+    )
+
+    assert first[-1]["role"] == "tool"
+    assert second == db.messages
+    assert len(db.appended) == 1
+
+
+def test_session_db_merge_retains_public_turns_after_private_history_tail():
+    caller = [
+        {"role": "user", "content": "Hermes turn"},
+        {"role": "assistant", "content": "Hermes answer"},
+        {"role": "user", "content": "Other runtime turn"},
+        {"role": "assistant", "content": "Other runtime answer"},
+    ]
+    session = [
+        {"role": "user", "content": "Hermes turn"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {"name": "web_search", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "result",
+        },
+        {"role": "assistant", "content": "Hermes answer"},
+    ]
+
+    merged = _merge_runtime_session_history(caller, session)
+
+    assert merged == [*session, *caller[2:]]
+
+
+def test_session_db_resume_survives_database_reopen(tmp_path):
+    db_path = tmp_path / "state.db"
+    session_id = "thread_restart"
+    db = SessionDB(db_path=db_path)
+    db.create_session(session_id, "api_server", model="test-model")
+    db.append_message(session_id, role="user", content="make an image")
+    db.append_message(
+        session_id,
+        role="assistant",
+        content=None,
+        tool_calls=[{
+            "id": "call_restart",
+            "type": "function",
+            "function": {
+                "name": "media.generate_image",
+                "arguments": "{}",
+            },
+        }],
+    )
+    db.close()
+
+    reopened = SessionDB(db_path=db_path)
+    history = reopened.get_messages_as_conversation(session_id)
+    result = {
+        "tool_call_id": "call_restart",
+        "status": "succeeded",
+        "output": {"asset_id": "asset_restart"},
+    }
+    resumed = _resume_session_db_history(reopened, session_id, history, [result])
+    assert [message["role"] for message in resumed] == ["user", "assistant", "tool"]
+    reopened.close()
+
+    verified = SessionDB(db_path=db_path)
+    persisted = verified.get_messages_as_conversation(session_id)
+    redelivered = _resume_session_db_history(verified, session_id, persisted, [result])
+    assert redelivered == persisted
+    assert [message["role"] for message in persisted] == ["user", "assistant", "tool"]
+    verified.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_db_resume_loads_private_history_without_checkpoint():
+    class RecordingDB:
+        def __init__(self):
+            self.messages = [
+                {"role": "user", "content": "make an image"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_media",
+                        "function": {"name": "media.generate_image", "arguments": "{}"},
+                    }],
+                },
+            ]
+
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def get_messages_as_conversation(self, session_id, include_ancestors=False):
+            assert session_id == "thread_session"
+            assert include_ancestors is True
+            return list(self.messages)
+
+        def append_message(self, session_id, **message):
+            self.messages.append({"role": message["role"], **message})
+
+    class SessionDBAdapter(APIServerRuntimeMixin):
+        _api_key = ""
+
+        def __init__(self):
+            self.db = RecordingDB()
+
+        def _check_auth(self, _request):
+            return None
+
+        def _ensure_session_db(self):
+            return self.db
+
+        async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(
+                tools=[],
+                valid_tool_names=set(),
+                model="configured-model",
+                _primary_runtime={
+                    "model": "configured-model",
+                    "compressor_model": "configured-model",
+                },
+                _fallback_chain=[],
+                _fallback_model=None,
+                _fallback_index=0,
+                _fallback_activated=False,
+            )
+            kwargs["agent_configurator"](agent)
+            assert agent._resume_from_tool_results is True
+            assert agent._require_incremental_session_persistence is True
+            assert kwargs["session_id"] == "thread_session"
+            assert kwargs["user_message"] == ""
+            assert [message["role"] for message in kwargs["conversation_history"]] == [
+                "user", "assistant", "user", "assistant", "tool",
+            ]
+            assert kwargs["conversation_history"][-1]["tool_call_id"] == "call_media"
+            return {"final_response": "done"}, {"total_tokens": 1}
+
+    adapter = SessionDBAdapter()
+    app = web.Application()
+    app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/runtime/runs", json=_run_body(
+            "run_session_resume",
+            context={"session_id": "thread_session", "history_mode": "session_db"},
+            messages=[
+                {"role": "user", "content": "older question"},
+                {"role": "assistant", "content": "older answer"},
+                {"role": "user", "content": "make an image"},
+            ],
+            tool_results=[{
+                "tool_call_id": "call_media",
+                "status": "succeeded",
+                "output": {"asset_id": "asset_1"},
+            }],
+            tools=[{
+                "name": "media.generate_image",
+                "description": "generate an image",
+                "input_schema": {"type": "object"},
+            }],
+        ))
+        assert response.status == 200
+        events = [json.loads(line) async for line in response.content]
+        assert events[-1]["type"] == "completed"
+        assert adapter.db.messages[-1]["tool_call_id"] == "call_media"
+    finally:
+        await client.close()
 
 
 def test_sweeper_evicts_only_stale_finished_sessions():

@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +37,18 @@ from agent.tool_result_classification import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DeferredToolResult:
+    """Control result for a delegated tool whose real result will arrive later.
+
+    The executor must not turn this into a model-visible ``tool`` message. The
+    assistant tool-call row already persisted in SessionDB remains the durable
+    continuation point until the platform submits the real result.
+    """
+
+    tool_call_id: str
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
@@ -428,6 +441,7 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
 
 
 __all__ = [
+    "DeferredToolResult",
     "_NEVER_PARALLEL_TOOLS",
     "_PARALLEL_SAFE_TOOLS",
     "_PATH_SCOPED_TOOLS",

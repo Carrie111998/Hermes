@@ -38,6 +38,16 @@ from gateway.api_server_shared import (
     web,
 )
 from gateway.runtime_contract import runtime_error_envelope
+from agent.tool_dispatch_helpers import DeferredToolResult
+from gateway.runtime_session_history import (
+    RuntimeSessionStateError as _RuntimeSessionStateError,
+    SESSION_DB_HISTORY_MODE as _SESSION_DB_HISTORY_MODE,
+    load_runtime_session_history as _load_runtime_session_history,
+    merge_runtime_session_history as _merge_runtime_session_history,
+    resume_runtime_history as _resume_runtime_history,
+    resume_session_db_history as _resume_session_db_history,
+    runtime_history_tool_names as _runtime_history_tool_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -687,52 +697,6 @@ def _run_state_prompt(run_state: Any) -> str:
     )
 
 
-def _resume_runtime_history(
-    messages: list[dict[str, Any]],
-    checkpoint: Any,
-    tool_results: Any,
-) -> list[dict[str, Any]]:
-    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("message"), dict):
-        raise ValueError("runtime_checkpoint.message is required for tool-result resume")
-    assistant = checkpoint["message"]
-    calls = assistant.get("tool_calls")
-    if assistant.get("role") != "assistant" or not isinstance(calls, list) or len(calls) != 1:
-        raise ValueError("runtime checkpoint must contain exactly one platform tool call")
-    call = calls[0]
-    function = call.get("function") if isinstance(call, dict) else None
-    call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
-    tool_name = str(function.get("name") or "") if isinstance(function, dict) else ""
-    if not call_id or not tool_name:
-        raise ValueError("runtime checkpoint tool call id and name are required")
-    if not isinstance(tool_results, list) or len(tool_results) != 1 or not isinstance(tool_results[0], dict):
-        raise ValueError("exactly one tool_result is required for runtime resume")
-    result = tool_results[0]
-    if str(result.get("tool_call_id") or "") != call_id:
-        raise ValueError("tool_result does not match runtime checkpoint")
-    status = str(result.get("status") or "")
-    if status == "succeeded":
-        content = result.get("output")
-        if content is None and result.get("output_ref") is not None:
-            # Externalized output arrives with only output_ref; mirror the
-            # online projection (hermesfork.go projectToolOutput) instead of
-            # silently degrading the tool message to "null".
-            content = {"status": "externalized", "output_ref": result["output_ref"]}
-    elif status == "failed" and isinstance(result.get("error"), dict):
-        content = {"error": result["error"]}
-    else:
-        raise ValueError("tool_result status must be succeeded or failed")
-    return [
-        *messages,
-        json.loads(json.dumps(assistant, ensure_ascii=False)),
-        {
-            "role": "tool",
-            "name": tool_name,
-            "tool_call_id": call_id,
-            "content": json.dumps(content, ensure_ascii=False, separators=(",", ":")),
-        },
-    ]
-
-
 def _runtime_checkpoint_activated_tool_names(checkpoint: Any) -> set[str]:
     if not isinstance(checkpoint, dict):
         raise ValueError("runtime_checkpoint must be an object")
@@ -913,6 +877,7 @@ class RuntimeBridgeSession:
         self.agent_ref: list[Any] = [None]
         self.lock = threading.RLock()
         self.interrupted = threading.Event()
+        self.interrupt_reason = ""
         self.finished = threading.Event()
         self.finished_async = asyncio.Event()
         self.finished_at: float | None = None
@@ -1097,7 +1062,7 @@ class RuntimeBridgeSession:
         name: str,
         args: dict[str, Any],
         call_id: str,
-    ) -> str:
+    ) -> str | DeferredToolResult:
         if not call_id:
             return json.dumps({"error": {"code": "invalid_tool_request", "message": "tool call id is required"}})
         signature_key = self._tool_signature_key(name, args)
@@ -1156,6 +1121,8 @@ class RuntimeBridgeSession:
                 self.pending.pop(call_id, None)
             # An interrupt wakes the same wait; attribute it before deadline.
             if self.interrupted.is_set():
+                if self.interrupt_reason.startswith("parked:"):
+                    return DeferredToolResult(call_id)
                 code, message = "run_interrupted", "run was interrupted"
             else:
                 code, message = "runtime_deadline_exceeded", "tool-result deadline exceeded"
@@ -1219,6 +1186,7 @@ class RuntimeBridgeSession:
         return True
 
     def interrupt(self, reason: str) -> None:
+        self.interrupt_reason = reason
         self.interrupted.set()
         agent = self.agent_ref[0]
         if agent is not None:
@@ -1289,15 +1257,25 @@ class APIServerRuntimeMixin:
             definitions = body.get("tools") or []
             tool_results = body.get("tool_results") or []
             runtime_checkpoint = body.get("runtime_checkpoint")
+            context = body.get("context") if isinstance(body.get("context"), dict) else {}
+            history_mode = str(context.get("history_mode") or "").strip()
+            if history_mode not in {"", _SESSION_DB_HISTORY_MODE}:
+                raise ValueError("context.history_mode must be session_db when provided")
+            session_db_mode = history_mode == _SESSION_DB_HISTORY_MODE
             if not run_id or not isinstance(messages, list) or not messages:
                 raise ValueError("run_id and messages are required")
             # Expose the run id to the audit middleware: its completion line
             # is logged after this handler returns, so the audit trail can
             # correlate the access log with the run it served.
             request["hermes_run_id"] = run_id
-            resuming = bool(tool_results or runtime_checkpoint)
-            if resuming and (not tool_results or runtime_checkpoint is None):
-                raise ValueError("runtime_checkpoint and tool_results are both required for resume")
+            if session_db_mode:
+                resuming = bool(tool_results)
+                if runtime_checkpoint is not None and not tool_results:
+                    raise ValueError("tool_results are required when a runtime_checkpoint is provided")
+            else:
+                resuming = bool(tool_results or runtime_checkpoint)
+                if resuming and (not tool_results or runtime_checkpoint is None):
+                    raise ValueError("runtime_checkpoint and tool_results are both required for resume")
             skill_manifest = (
                 body["skill_manifest"]
                 if "skill_manifest" in body
@@ -1356,7 +1334,39 @@ class APIServerRuntimeMixin:
                     {"type": "text", "text": text or "[Attached media]"},
                     *_public_runtime_attachment_parts(attachment_parts),
                 ]
-            if resuming:
+            requested_agent_session_id = str(context.get("session_id") or run_id).strip()
+            agent_session_id = requested_agent_session_id
+            if session_db_mode:
+                db, agent_session_id, session_history = _load_runtime_session_history(
+                    self,
+                    requested_agent_session_id,
+                    require_existing=resuming,
+                )
+                if resuming:
+                    history = _merge_runtime_session_history(
+                        normalized_messages,
+                        session_history,
+                    )
+                    history = _resume_session_db_history(
+                        db,
+                        agent_session_id,
+                        history,
+                        tool_results,
+                    )
+                    tool_exposure.activate_names(
+                        _runtime_history_tool_names(history),
+                    )
+                    user_message = ""
+                else:
+                    last = normalized_messages[-1]
+                    if last.get("role") != "user":
+                        raise ValueError("last message must be user")
+                    history = _merge_runtime_session_history(
+                        normalized_messages[:-1],
+                        session_history,
+                    )
+                    user_message = last.get("content")
+            elif resuming:
                 history = _resume_runtime_history(normalized_messages, runtime_checkpoint, tool_results)
                 activated_tool_names = _runtime_checkpoint_activated_tool_names(
                     runtime_checkpoint,
@@ -1380,6 +1390,13 @@ class APIServerRuntimeMixin:
                 if last.get("role") != "user":
                     raise ValueError("last message must be user")
                 user_message = last.get("content")
+        except _RuntimeSessionStateError as exc:
+            if media_temp_dir is not None:
+                media_temp_dir.cleanup()
+            return web.json_response(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status=exc.status,
+            )
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             if media_temp_dir is not None:
                 media_temp_dir.cleanup()
@@ -1391,8 +1408,6 @@ class APIServerRuntimeMixin:
         })
         await response.prepare(request)
         queue: "asyncio.Queue[dict[str, Any] | None]" = asyncio.Queue()
-        context = body.get("context") if isinstance(body.get("context"), dict) else {}
-        agent_session_id = str(context.get("session_id") or run_id).strip()
         session = RuntimeBridgeSession(
             run_id,
             asyncio.get_running_loop(),
@@ -1447,6 +1462,7 @@ class APIServerRuntimeMixin:
             agent._cached_system_prompt = instructions
             agent._build_system_prompt = lambda _system_message=None: instructions
             agent._resume_from_tool_results = resuming
+            agent._require_incremental_session_persistence = session_db_mode
             # The Orchestrator already validated and materialized these image
             # assets. Its model catalog can lag newly deployed multimodal
             # aliases, so do not replace trusted pixels with an auxiliary

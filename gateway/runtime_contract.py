@@ -20,6 +20,7 @@ RUNTIME_DRIVER_FRAME_TYPES = (
 RUNTIME_CAPABILITIES = (
     "delegated_tools",
     "interrupt",
+    "session_db_resume",
     "system_context.replace",
 )
 

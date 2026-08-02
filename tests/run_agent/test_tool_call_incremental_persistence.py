@@ -28,7 +28,9 @@ from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
 
-from agent.tool_dispatch_helpers import make_tool_result_message
+import pytest
+
+from agent.tool_dispatch_helpers import DeferredToolResult, make_tool_result_message
 from run_agent import AIAgent
 
 
@@ -142,6 +144,49 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     assert result["final_response"] == "done"
 
 
+def test_required_session_persistence_failure_stops_before_tool_execution():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="c1")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._require_incremental_session_persistence = True
+
+    def _fail_required_flush(*_args, **_kwargs):
+        agent._runtime_persistence_failed = True
+        raise RuntimeError("state.db unavailable")
+
+    with (
+        patch.object(agent, "_flush_messages_to_session_db", side_effect=_fail_required_flush),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls") as execute,
+    ):
+        result = agent.run_conversation("search something")
+
+    execute.assert_not_called()
+    assert result["failed"] is True
+    assert result["completed"] is False
+
+
+def test_required_session_db_append_error_is_not_swallowed():
+    agent = _make_agent()
+    agent.session_id = "thread_required"
+    agent._session_db_created = True
+    agent._require_incremental_session_persistence = True
+    agent._session_db = SimpleNamespace(
+        append_message=MagicMock(side_effect=RuntimeError("database is locked")),
+    )
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        agent._flush_messages_to_session_db([{"role": "user", "content": "hello"}])
+
+    assert agent._runtime_persistence_failed is True
+
+
 # ---------------------------------------------------------------------------
 # Contract 2: the SEQUENTIAL path flushes each tool result immediately, BEFORE
 # the next tool dispatches.  Dispatch goes through run_agent.handle_function_call
@@ -196,6 +241,58 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
         ("dispatch", "c2"),
         ("flush", "tool", "c2"),
     ]
+
+
+def test_execute_tool_calls_sequential_does_not_persist_deferred_runtime_result():
+    agent = _make_agent()
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call(name="media.generate_image", call_id="call_park")],
+    )
+    messages: list = []
+    agent._flush_messages_to_session_db = MagicMock()
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=DeferredToolResult("call_park"),
+    ):
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "thread_session",
+        )
+
+    assert messages == []
+    agent._flush_messages_to_session_db.assert_not_called()
+
+
+def test_deferred_runtime_call_closes_unexecuted_sibling_tool_calls():
+    agent = _make_agent()
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[
+            _mock_tool_call(name="media.generate_image", call_id="call_park"),
+            _mock_tool_call(name="media.generate_video", call_id="call_skipped"),
+        ],
+    )
+    messages: list = []
+    agent._flush_messages_to_session_db = MagicMock()
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=DeferredToolResult("call_park"),
+    ) as dispatch:
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "thread_session",
+        )
+
+    dispatch.assert_called_once()
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "call_skipped"
+    assert "runtime_tool_call_deferred" in messages[0]["content"]
+    agent._flush_messages_to_session_db.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
