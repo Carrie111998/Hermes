@@ -17,12 +17,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.plugin_llm import (
+    LlmExecutionMode,
     PluginLlm,
     PluginLlmCompleteResult,
     PluginLlmImageInput,
     PluginLlmStructuredResult,
     PluginLlmTextInput,
     PluginLlmTrustError,
+    StrictExecutionConfigurationError,
     _build_structured_messages,
     _check_overrides,
     _coerce_allowlist,
@@ -271,6 +273,107 @@ class TestJsonParsing:
 
 
 class TestPluginLlmFacade:
+    def test_strict_mode_requires_explicit_provider_and_model(self):
+        llm = make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_trusted_policy("strict-plugin"),
+            sync_caller=lambda **_: ("unused", "unused", _fake_response("unused")),
+        )
+
+        with pytest.raises(StrictExecutionConfigurationError, match="provider"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                model="test-model",
+                execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+            )
+        with pytest.raises(StrictExecutionConfigurationError, match="model"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                provider="test-provider",
+                execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+            )
+
+    @pytest.mark.parametrize("provider", ["auto", "main", " AUTO "])
+    def test_strict_mode_rejects_implicit_provider_names(self, provider):
+        llm = make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_trusted_policy("strict-plugin"),
+            sync_caller=lambda **_: ("unused", "unused", _fake_response("unused")),
+        )
+
+        with pytest.raises(StrictExecutionConfigurationError, match="explicit provider"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                provider=provider,
+                model="test-model",
+                execution_mode="strict_single_attempt",
+            )
+
+    def test_strict_mode_obeys_existing_trust_gate_before_call(self):
+        calls = []
+
+        def fake_caller(**kwargs):
+            calls.append(kwargs)
+            return "test-provider", "test-model", _fake_response("unused")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="locked-plugin",
+            policy=_TrustPolicy(plugin_id="locked-plugin"),
+            sync_caller=fake_caller,
+        )
+
+        with pytest.raises(PluginLlmTrustError, match="provider"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                provider="test-provider",
+                model="test-model",
+                execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+            )
+        assert calls == []
+
+    def test_strict_mode_populates_audit_and_preserves_structured_parsing(self):
+        captured = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "test-provider", "test-model", _fake_response('{"ok": true}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_trusted_policy("strict-plugin"),
+            sync_caller=fake_caller,
+        )
+        result = llm.complete_structured(
+            instructions="Return one result",
+            input=[{"type": "text", "text": "input"}],
+            json_mode=True,
+            provider="test-provider",
+            model="test-model",
+            execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+        )
+
+        assert result.parsed == {"ok": True}
+        assert captured["execution_mode"] is LlmExecutionMode.STRICT_SINGLE_ATTEMPT
+        assert result.audit == {
+            "plugin_id": "strict-plugin",
+            "purpose": "",
+            "profile": "",
+            "schema_name": "",
+            "execution_mode": "strict_single_attempt",
+            "requested_provider": "test-provider",
+            "requested_model": "test-model",
+            "dispatched_provider": "test-provider",
+            "dispatched_model": "test-model",
+            "response_provider": "test-provider",
+            "response_model": "test-model",
+            "attempt_count": 1,
+            "fallback_used": False,
+            "credential_rotation_used": False,
+            "route_changed": False,
+            "delivery_ambiguous": False,
+            "strict_contract_satisfied": True,
+        }
+
     def test_complete_uses_active_model_by_default(self):
         captured: dict = {}
 
@@ -388,6 +491,30 @@ class TestPluginLlmFacade:
 
 
 class TestAsyncSurface:
+    def test_acomplete_passes_strict_mode_and_populates_audit(self):
+        captured = {}
+
+        async def fake_async(**kwargs):
+            captured.update(kwargs)
+            return "test-provider", "test-model", _fake_response("async strict")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_trusted_policy("strict-plugin"),
+            async_caller=fake_async,
+        )
+
+        result = asyncio.run(llm.acomplete(
+            [{"role": "user", "content": "hi"}],
+            provider="test-provider",
+            model="test-model",
+            execution_mode="strict_single_attempt",
+        ))
+
+        assert captured["execution_mode"] == "strict_single_attempt"
+        assert result.audit["attempt_count"] == 1
+        assert result.audit["strict_contract_satisfied"] is True
+
     def test_acomplete_uses_async_caller(self):
         async def fake_async(**_kwargs):
             return "openai", "gpt-4o", _fake_response("async hello")
