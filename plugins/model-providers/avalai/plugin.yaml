@@ -1,0 +1,5 @@
+name: avalai-provider
+kind: model-provider
+version: 1.0.0
+description: AvalAI — OpenAI-compatible gateway for OpenAI, Anthropic, Gemini and open models
+author: Rick Sanchez

@@ -23,6 +23,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Fireworks AI** | `FIREWORKS_API_KEY` in `~/.hermes/.env` (provider: `fireworks`; aliases: `fireworks-ai`, `fw`) |
 | **NovitaAI** | `NOVITA_API_KEY` in `~/.hermes/.env` (provider: `novita`, 200+ models, Model API, Agent Sandbox, GPU Cloud) |
 | **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
+| **AvalAI** | `AVALAI_API_KEY` in `~/.hermes/.env` (provider: `avalai`; aliases: `aval-ai`, `avalai-ir`; OpenAI-compatible gateway for OpenAI, Anthropic, Gemini and open models) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
 | **Kimi / Moonshot (China)** | `KIMI_CN_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding-cn`; aliases: `kimi-cn`, `moonshot-cn`) |
@@ -324,6 +325,29 @@ model:
 ```
 
 Get your API key at [novita.ai/settings/key-management](https://novita.ai/settings/key-management). The base URL can be overridden with `NOVITA_BASE_URL`.
+
+### AvalAI
+
+[AvalAI](https://avalai.ir) is an OpenAI-compatible AI gateway that fronts models from OpenAI, Anthropic, Google, DeepSeek and other vendors behind a single API key and endpoint. Hermes discovers the available models live from the gateway's `/models` catalog.
+
+```bash
+# Use any available model
+hermes chat --provider avalai --model gpt-4o-mini
+# Requires: AVALAI_API_KEY in ~/.hermes/.env
+
+# Short alias
+hermes chat --provider aval-ai --model gemini-2.5-flash
+```
+
+Or set it permanently in `config.yaml`:
+```yaml
+model:
+  provider: "avalai"
+  default: "gpt-4o-mini"
+  base_url: "https://api.avalai.ir/v1"
+```
+
+Get your API key at [chat.avalai.ir/platform/api-keys](https://chat.avalai.ir/platform/api-keys). The base URL can be overridden with `AVALAI_BASE_URL`.
 
 ### Ollama Cloud — Managed Ollama Models, OAuth + API Key
 
