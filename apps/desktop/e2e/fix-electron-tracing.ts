@@ -24,7 +24,7 @@
  *
  * Pinned dependency: this file reaches into Playwright internals (_playwright,
  * _allContexts, _context) that have no public contract. @playwright/test is
- * pinned exact (=1.58.2 in package.json) so a bump can't silently break the
+ * pinned exact (=1.61.1 in package.json) so a bump can't silently break the
  * monkeypatch. When bumping, re-verify these private symbols still exist on
  * the Electron / PlaywrightInternal classes and that tracing still merges.
  */
