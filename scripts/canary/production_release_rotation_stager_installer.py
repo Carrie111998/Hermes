@@ -190,6 +190,25 @@ SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_SCHEMA = (
     "muncho-successor-runtime-controller-manifest.v1"
 )
 SUCCESSOR_RUNTIME_CONTROLLER_MANIFEST_NAME = "controller-manifest.json"
+_RECOVERABLE_GIT_DIRECTORIES = frozenset({
+    "branches",
+    "hooks",
+    "info",
+    "logs",
+    "objects",
+    "refs",
+})
+_RECOVERABLE_GIT_FILES = frozenset({
+    "COMMIT_EDITMSG",
+    "FETCH_HEAD",
+    "HEAD",
+    "ORIG_HEAD",
+    "config",
+    "description",
+    "index",
+    "packed-refs",
+    "shallow",
+})
 
 
 class RotationStagerInstallerError(RuntimeError):
@@ -241,6 +260,18 @@ class InstallerRoots:
     job_root: Path = phase.PRODUCTION_JOB_ROOT
     promotion_lock: Path = Path("/run/lock/muncho-release-builder-promotion.lock")
     library_releases: Path = Path("/usr/lib/muncho-release-updater-releases")
+
+
+@dataclass(frozen=True)
+class _RecoverableSnapshotEntry:
+    kind: Literal["regular", "symlink", "gitlink"]
+    symlink_target: bytes | None = None
+
+
+@dataclass(frozen=True)
+class _RecoverableSnapshotLayout:
+    entries: Mapping[str, _RecoverableSnapshotEntry]
+    directories: frozenset[str]
 
 
 def _target(roots: InstallerRoots, relative: str) -> Path:
@@ -339,6 +370,10 @@ def _install_exact_source_snapshot(
     quarantine = destination.with_name(
         f".{destination.name}.{intent_sha256}.quarantine"
     )
+    recoverable_layout = _recoverable_snapshot_layout(
+        source_root=source_root,
+        release_revision=release_revision,
+    )
 
     def validate(selected: Path, *, preserve_fd: int) -> None:
         try:
@@ -373,6 +408,12 @@ def _install_exact_source_snapshot(
             _fail("rotation_stager_installer_source_snapshot_invalid")
         _validate_local_snapshot_tree(
             selected,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        _validate_recoverable_snapshot_tree(
+            selected,
+            layout=recoverable_layout,
             expected_uid=expected_uid,
             expected_gid=expected_gid,
         )
@@ -425,16 +466,27 @@ def _install_exact_source_snapshot(
         if os.path.lexists(quarantine):
             _remove_quarantined_source_snapshot(
                 quarantine,
+                layout=recoverable_layout,
                 expected_uid=expected_uid,
                 expected_gid=expected_gid,
             )
         if os.path.lexists(incomplete):
-            _quarantine_and_remove_incomplete_source_snapshot(
-                incomplete,
-                quarantine,
-                expected_uid=expected_uid,
-                expected_gid=expected_gid,
-            )
+            try:
+                validate(incomplete, preserve_fd=lock_descriptor)
+            except RotationStagerInstallerError:
+                _quarantine_and_remove_incomplete_source_snapshot(
+                    incomplete,
+                    quarantine,
+                    layout=recoverable_layout,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                )
+            else:
+                _fsync_snapshot_tree(incomplete)
+                _rename_directory_noreplace(incomplete, destination)
+                _fsync_directory(destination.parent)
+                validate(destination, preserve_fd=lock_descriptor)
+                return True
 
         if not os.path.lexists(incomplete):
             try:
@@ -467,6 +519,7 @@ def _install_exact_source_snapshot(
                     _quarantine_and_remove_incomplete_source_snapshot(
                         incomplete,
                         quarantine,
+                        layout=recoverable_layout,
                         expected_uid=expected_uid,
                         expected_gid=expected_gid,
                     )
@@ -671,10 +724,9 @@ def _publish_clone_intent_exact(
             final_state.st_dev == staged_state.st_dev
             and final_state.st_ino == staged_state.st_ino
         )
-        if same_inode:
-            if final_state.st_nlink != 2 or staged_state.st_nlink != 2:
-                _fail("rotation_stager_installer_source_snapshot_intent_invalid")
-        elif final_state.st_nlink != 1 or staged_state.st_nlink != 1:
+        if not same_inode:
+            _fail("rotation_stager_installer_source_snapshot_intent_conflict")
+        if final_state.st_nlink != 2 or staged_state.st_nlink != 2:
             _fail("rotation_stager_installer_source_snapshot_intent_invalid")
         try:
             os.unlink(pending)
@@ -811,15 +863,169 @@ def _validate_local_snapshot_tree(
         _fail("rotation_stager_installer_source_snapshot_invalid", exc)
 
 
-def _quarantine_and_remove_incomplete_source_snapshot(
-    incomplete: Path,
-    quarantine: Path,
+def _recoverable_snapshot_layout(
     *,
+    source_root: Path,
+    release_revision: str,
+) -> _RecoverableSnapshotLayout:
+    raw = _git(
+        source_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        release_revision,
+    )
+    entries: dict[str, _RecoverableSnapshotEntry] = {}
+    directories: set[str] = set()
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, path_raw = record.split(b"\t", 1)
+            mode_raw, type_raw, oid_raw = metadata.split(b" ", 2)
+            mode = mode_raw.decode("ascii", errors="strict")
+            object_type = type_raw.decode("ascii", errors="strict")
+            oid = oid_raw.decode("ascii", errors="strict")
+            relative = os.fsdecode(path_raw)
+        except (UnicodeError, ValueError) as exc:
+            _fail("rotation_stager_installer_source_snapshot_layout_invalid", exc)
+        parts = Path(relative).parts
+        if (
+            not relative
+            or relative.startswith("/")
+            or not parts
+            or any(part in {"", ".", "..", ".git"} for part in parts)
+            or relative in entries
+        ):
+            _fail("rotation_stager_installer_source_snapshot_layout_invalid")
+        if mode in {"100644", "100755"} and object_type == "blob":
+            selected = _RecoverableSnapshotEntry(kind="regular")
+        elif mode == "120000" and object_type == "blob":
+            target = _git(source_root, "cat-file", "blob", oid, maximum=64 * 1024)
+            if not target or b"\x00" in target:
+                _fail("rotation_stager_installer_source_snapshot_layout_invalid")
+            selected = _RecoverableSnapshotEntry(
+                kind="symlink",
+                symlink_target=target,
+            )
+        elif mode == "160000" and object_type == "commit":
+            selected = _RecoverableSnapshotEntry(kind="gitlink")
+        else:
+            _fail("rotation_stager_installer_source_snapshot_layout_invalid")
+        entries[relative] = selected
+        parent = Path(relative).parent
+        while parent != Path("."):
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return _RecoverableSnapshotLayout(
+        entries=entries,
+        directories=frozenset(directories),
+    )
+
+
+def _validate_recoverable_snapshot_tree(
+    root: Path,
+    *,
+    layout: _RecoverableSnapshotLayout,
     expected_uid: int,
     expected_gid: int,
 ) -> None:
     _validate_owned_snapshot_directory(
+        root,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+
+    def walk_error(cause: OSError) -> Never:
+        _fail("rotation_stager_installer_source_snapshot_conflict", cause)
+
+    try:
+        for current, names, files in os.walk(
+            root,
+            followlinks=False,
+            onerror=walk_error,
+        ):
+            selected_root = Path(current)
+            for name in (*names, *files):
+                selected = selected_root / name
+                relative = selected.relative_to(root).as_posix()
+                state = os.lstat(selected)
+                if state.st_uid != expected_uid or state.st_gid != expected_gid:
+                    _fail("rotation_stager_installer_source_snapshot_conflict")
+                if relative == ".git" or relative.startswith(".git/"):
+                    parts = relative.split("/")
+                    if len(parts) == 1:
+                        known_git_entry = stat.S_ISDIR(state.st_mode)
+                    elif parts[1] in _RECOVERABLE_GIT_DIRECTORIES:
+                        known_git_entry = len(parts) >= 2
+                    else:
+                        root_name = parts[1]
+                        lock_base = root_name.removesuffix(".lock")
+                        known_git_entry = len(parts) == 2 and (
+                            root_name in _RECOVERABLE_GIT_FILES
+                            or (
+                                root_name.endswith(".lock")
+                                and lock_base in _RECOVERABLE_GIT_FILES
+                            )
+                        )
+                    if not known_git_entry:
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                    if stat.S_ISREG(state.st_mode):
+                        if state.st_nlink != 1 or stat.S_IMODE(state.st_mode) & 0o022:
+                            _fail("rotation_stager_installer_source_snapshot_conflict")
+                    elif stat.S_ISDIR(state.st_mode):
+                        if stat.S_IMODE(state.st_mode) & 0o022:
+                            _fail("rotation_stager_installer_source_snapshot_conflict")
+                    else:
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                    continue
+                expected = layout.entries.get(relative)
+                if expected is None:
+                    if relative not in layout.directories or not stat.S_ISDIR(
+                        state.st_mode
+                    ):
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                    if stat.S_IMODE(state.st_mode) & 0o022:
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                    continue
+                if expected.kind == "regular":
+                    if (
+                        not stat.S_ISREG(state.st_mode)
+                        or state.st_nlink != 1
+                        or stat.S_IMODE(state.st_mode) & 0o022
+                    ):
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                elif expected.kind == "symlink":
+                    if not stat.S_ISLNK(state.st_mode):
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                    target = os.fsencode(os.readlink(selected))
+                    if target != expected.symlink_target:
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                elif expected.kind == "gitlink":
+                    if not stat.S_ISDIR(state.st_mode) or (
+                        stat.S_IMODE(state.st_mode) & 0o022
+                    ):
+                        _fail("rotation_stager_installer_source_snapshot_conflict")
+                else:
+                    _fail("rotation_stager_installer_source_snapshot_conflict")
+    except RotationStagerInstallerError:
+        raise
+    except (OSError, ValueError) as exc:
+        _fail("rotation_stager_installer_source_snapshot_conflict", exc)
+
+
+def _quarantine_and_remove_incomplete_source_snapshot(
+    incomplete: Path,
+    quarantine: Path,
+    *,
+    layout: _RecoverableSnapshotLayout,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    _validate_recoverable_snapshot_tree(
         incomplete,
+        layout=layout,
         expected_uid=expected_uid,
         expected_gid=expected_gid,
     )
@@ -829,6 +1035,7 @@ def _quarantine_and_remove_incomplete_source_snapshot(
     _fsync_directory(incomplete.parent)
     _remove_quarantined_source_snapshot(
         quarantine,
+        layout=layout,
         expected_uid=expected_uid,
         expected_gid=expected_gid,
     )
@@ -857,11 +1064,13 @@ def _validate_owned_snapshot_directory(
 def _remove_quarantined_source_snapshot(
     quarantine: Path,
     *,
+    layout: _RecoverableSnapshotLayout,
     expected_uid: int,
     expected_gid: int,
 ) -> None:
-    _validate_owned_snapshot_directory(
+    _validate_recoverable_snapshot_tree(
         quarantine,
+        layout=layout,
         expected_uid=expected_uid,
         expected_gid=expected_gid,
     )
@@ -940,8 +1149,14 @@ def _clear_owned_directory_fd(
                 if child is not None:
                     os.close(child)
             os.rmdir(entry.name, dir_fd=descriptor)
-        else:
+        elif stat.S_ISREG(state.st_mode):
+            if state.st_nlink != 1:
+                _fail("rotation_stager_installer_source_snapshot_conflict")
             os.unlink(entry.name, dir_fd=descriptor)
+        elif stat.S_ISLNK(state.st_mode):
+            os.unlink(entry.name, dir_fd=descriptor)
+        else:
+            _fail("rotation_stager_installer_source_snapshot_conflict")
     try:
         os.fsync(descriptor)
     except OSError as exc:
