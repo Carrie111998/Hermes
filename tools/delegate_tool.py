@@ -3079,6 +3079,10 @@ def _run_single_child(
                     else "after_llm_calls" if is_timeout
                     else None
                 ),
+                # Same per-subagent toolsets guarantee as the success/exception
+                # entries above — a timed-out/errored child still surfaces which
+                # capabilities it held so the parent can catch a mismatch (#63887).
+                "toolsets": sorted(child_toolsets),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -4213,6 +4217,12 @@ def delegate_task(
                                         "error": str(exc),
                                         "api_calls": 0,
                                         "duration_seconds": 0,
+                                        # Resolved toolsets guarantee also holds for
+                                        # fabricated entries: read them off the stashed
+                                        # child so the parent still sees them (#63887).
+                                        "toolsets": sorted(
+                                            getattr(_child_by_index.get(idx), "_delegate_child_toolsets", None) or []
+                                        ),
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
@@ -4225,6 +4235,9 @@ def delegate_task(
                                     "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
                                     "duration_seconds": 0,
+                                    "toolsets": sorted(
+                                        getattr(_child_by_index.get(idx), "_delegate_child_toolsets", None) or []
+                                    ),
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
@@ -4250,6 +4263,9 @@ def delegate_task(
                                 "error": str(exc),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
+                                "toolsets": sorted(
+                                    getattr(_child_by_index.get(idx), "_delegate_child_toolsets", None) or []
+                                ),
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
