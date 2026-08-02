@@ -1583,6 +1583,11 @@ class BuzzAdapter(BasePlatformAdapter):
         except Exception:
             state["seen"] = previous_seen
             state["last_ts"] = previous_last_ts
+            # The lifecycle wrapper logs and swallows hook failures. Keeping
+            # this event pending would therefore block _poll_channel forever;
+            # release only the failed event so the unchanged durable cursor
+            # causes the next poll to retry it.
+            previous_pending.discard(event_id)
             state["pending"] = previous_pending
             raise
 

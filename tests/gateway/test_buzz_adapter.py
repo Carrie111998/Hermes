@@ -721,7 +721,7 @@ class TestDurableCursor:
         assert "e1" not in adapter._channel_state[CHANNEL]["pending"]
         assert adapter._cursor_path.exists()
 
-    def test_persistence_failure_leaves_event_retryable(self):
+    def test_persistence_failure_releases_event_for_retry(self):
         adapter = _make_adapter({"observer_mode": True})
         adapter._channel_state[CHANNEL] = {
             "chat_type": "group",
@@ -737,11 +737,13 @@ class TestDurableCursor:
         state = adapter._channel_state[CHANNEL]
         assert state["last_ts"] == 5
         assert list(state["seen"]) == ["old"]
-        assert state["pending"] == {"e1"}
+        assert state["pending"] == set()
 
     @pytest.mark.asyncio
-    async def test_completion_persistence_failure_leaves_event_retryable(self):
-        adapter = _make_adapter({"observer_mode": True})
+    async def test_completion_persistence_failure_retries_through_lifecycle(self):
+        adapter = _make_adapter(
+            {"observer_mode": True, "response_authority": True}
+        )
         adapter._channel_state[CHANNEL] = {
             "chat_type": "group",
             "last_ts": 5,
@@ -769,12 +771,32 @@ class TestDurableCursor:
             },
         )
 
-        with pytest.raises(OSError, match="disk full"):
-            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        # Production invokes the hook through this exception-swallowing
+        # lifecycle wrapper, so the retry contract must survive that boundary.
+        await adapter._run_processing_hook(
+            "on_processing_complete", event, ProcessingOutcome.SUCCESS
+        )
 
         state = adapter._channel_state[CHANNEL]
         assert state["last_ts"] == 5
         assert state["seen"] == OrderedDict()
+        assert state["pending"] == set()
+
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "get",
+            [_event("e1", content="retry me", created_at=10)],
+        )
+        adapter._run_cli = cli
+        adapter._resolve_user_name = AsyncMock(return_value="Other")
+        adapter._dispatch_message = AsyncMock(return_value=True)
+
+        await adapter._poll_channel(CHANNEL)
+
+        adapter._dispatch_message.assert_awaited_once()
+        assert adapter._dispatch_message.await_args is not None
+        assert adapter._dispatch_message.await_args.kwargs["message_id"] == "e1"
         assert state["pending"] == {"e1"}
 
     @pytest.mark.asyncio
