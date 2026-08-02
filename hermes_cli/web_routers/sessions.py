@@ -13,6 +13,7 @@ the late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 """
 
 import asyncio  # noqa: F401 — used by handlers
+import inspect
 import logging
 import time  # noqa: F401
 from typing import Any, Dict, List, Optional  # noqa: F401
@@ -332,8 +333,17 @@ def _search_sessions_payload(
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
+            search_by_id = db.search_sessions_by_id
             try:
-                id_matches = db.search_sessions_by_id(
+                parameters = inspect.signature(search_by_id).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            supports_source_filters = not parameters or any(
+                name in parameters
+                for name in ("source", "sources", "exclude_sources")
+            )
+            if supports_source_filters:
+                id_matches = search_by_id(
                     q,
                     limit=safe_limit,
                     include_archived=True,
@@ -341,13 +351,18 @@ def _search_sessions_payload(
                     sources=source_list or None,
                     exclude_sources=exclude_list or None,
                 )
-            except TypeError:
-                # Keep compatibility with older/fork test doubles and
-                # SessionDB implementations that predate source filters.
-                id_matches = db.search_sessions_by_id(
-                    q, limit=safe_limit, include_archived=True
-                )
+            else:
+                # Older/fork SessionDB implementations predate source filters;
+                # apply the requested scope after their unfiltered ID search.
+                id_matches = search_by_id(q, limit=safe_limit, include_archived=True)
             for row in id_matches:
+                row_source = row.get("source")
+                if source_filter and row_source != source_filter:
+                    continue
+                if source_list and row_source not in source_list:
+                    continue
+                if exclude_list and row_source in exclude_list:
+                    continue
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"

@@ -442,7 +442,6 @@ export function ModelCatalogMenu({
                     return (
                       <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
                         <DropdownMenuSubTrigger
-                          className={dropdownMenuRow}
                           disabled={!providerReady}
                           hideChevron
                           onClick={activate}
