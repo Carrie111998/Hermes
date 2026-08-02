@@ -5380,6 +5380,35 @@ class TestMatrixInviteAllowlist:
         self.adapter._schedule_invite_join.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_accepts_self_invite_with_different_casing(self, monkeypatch):
+        """Homeservers normalize localpart case differently across API
+        surfaces, so the self-invite check must use the adapter's usual
+        trim+lowercase MXID normalization rather than byte equality."""
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+
+        await self.adapter._on_invite(self._invite_event(" @Bot:Example.org "))
+
+        self.adapter._schedule_invite_join.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unresolved_own_user_id_does_not_bypass_allowlist(
+        self, caplog, monkeypatch
+    ):
+        """_is_self_sender() fails OPEN when our own mxid is unresolved, which
+        is right for echo-loop suppression but would be an allowlist bypass
+        here. With _user_id empty, an unauthorized inviter must still be
+        rejected."""
+        import logging
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        self.adapter._user_id = ""
+
+        with caplog.at_level(logging.WARNING):
+            await self.adapter._on_invite(self._invite_event("@eve:evil.example"))
+
+        self.adapter._schedule_invite_join.assert_not_called()
+        assert "rejecting invite" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_allow_all_env_accepts_any_inviter(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
 
