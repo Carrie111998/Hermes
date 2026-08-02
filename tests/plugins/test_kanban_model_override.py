@@ -102,6 +102,37 @@ def test_provider_without_model_rejected(conn):
         )
 
 
+def test_set_model_override_events(conn):
+    tid = kb.create_task(conn, title="t", assignee="worker")
+    kb.set_model_override(conn, tid, "sonnet-x", provider="anthropic")
+    events = kb.list_events(conn, tid)
+    ev = next(e for e in events if e.kind == "model_override_set")
+    assert ev.payload["model"] == "sonnet-x"
+    assert ev.payload["provider"] == "anthropic"
+
+
+def test_set_model_override_unknown_task(conn):
+    assert kb.set_model_override(conn, "t_nope", "some-model") is False
+
+
+def test_set_model_override_archived_task_rejected(conn):
+    tid = kb.create_task(conn, title="t", assignee="worker")
+    assert kb.archive_task(conn, tid)
+    with pytest.raises(RuntimeError):
+        kb.set_model_override(conn, tid, "some-model")
+
+
+def test_set_model_override_allowed_on_running(conn):
+    tid = kb.create_task(conn, title="t", assignee="worker")
+    claimed = kb.claim_task(conn, tid, claimer="worker")
+    assert claimed is not None
+    assert kb.set_model_override(conn, tid, "fallback-model", provider="nous")
+    t = kb.get_task(conn, tid)
+    assert t.status == "running"
+    assert t.model_override == "fallback-model"
+    assert t.provider_override == "nous"
+
+
 def test_create_task_with_model_and_provider(conn):
     tid = kb.create_task(
         conn, title="t", assignee="worker",
@@ -159,6 +190,22 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
     assert cmd[j + 1] == "openrouter"
 
 
+def test_spawn_model_only_omits_provider_flag(monkeypatch, tmp_path, conn):
+    tid = kb.create_task(conn, title="t", assignee="elias", model_override="glm-5")
+    task = kb.get_task(conn, tid)
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
+    assert "-m" in cmd
+    assert "--provider" not in cmd
+
+
+def test_spawn_no_override_omits_both_flags(monkeypatch, tmp_path, conn):
+    tid = kb.create_task(conn, title="t", assignee="elias")
+    task = kb.get_task(conn, tid)
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
+    assert "-m" not in cmd
+    assert "--provider" not in cmd
+
+
 # ---------------------------------------------------------------------------
 # Dashboard API — PATCH / bulk / create / model-options
 # ---------------------------------------------------------------------------
@@ -170,6 +217,37 @@ def _create(client, **kwargs):
     r = client.post("/api/plugins/kanban/tasks", json=body)
     assert r.status_code == 200, r.text
     return r.json()["task"]
+
+
+def test_patch_clears_model_override(client):
+    task = _create(client, model_override="gpt-5.6-sol", provider_override="openai")
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"clear_model_override": True, **_expected_snapshot(task)},
+    )
+    assert r.status_code == 200, r.text
+    updated = r.json()["task"]
+    assert updated["model_override"] is None
+    assert updated["provider_override"] is None
+
+
+def test_patch_provider_without_model_is_400(client):
+    task = _create(client)
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "model_override": "",
+            "provider_override": "openai",
+            **_expected_snapshot(task),
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_create_task_with_override_via_api(client):
+    task = _create(client, model_override="qwen-max", provider_override="openrouter")
+    assert task["model_override"] == "qwen-max"
+    assert task["provider_override"] == "openrouter"
 
 
 def _expected_snapshot(task):

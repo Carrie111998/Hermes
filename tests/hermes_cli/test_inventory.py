@@ -371,6 +371,78 @@ def _aggregator_row(slug: str, models: list[str]) -> dict:
     }
 
 
+def test_load_picker_context_full_dict():
+    cfg = _cfg(
+        model={
+            "default": "anthropic/claude-sonnet-4.6",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        providers={"openrouter": {}},
+        custom_providers=[{"name": "Ollama", "base_url": "http://localhost:11434/v1"}],
+    )
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        ctx = load_picker_context()
+    assert ctx.current_model == "anthropic/claude-sonnet-4.6"
+    assert ctx.current_provider == "openrouter"
+    assert ctx.current_base_url == "https://openrouter.ai/api/v1"
+    assert "openrouter" in ctx.user_providers
+    assert isinstance(ctx.custom_providers, list)
+
+
+def test_load_picker_context_normalizes_list_of_dict_models():
+    cfg = _cfg(
+        providers={
+            "static-gateway": {
+                "name": "Static Gateway",
+                "api": "https://router.example.com/v1",
+                "default_model": "claude-3-7-sonnet",
+                "models": [
+                    {"id": "claude-3-7-sonnet"},
+                    {"id": "claude-sonnet-4", "context_length": 200000},
+                ],
+                "discover_models": False,
+            }
+        },
+    )
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        ctx = load_picker_context()
+    assert len(ctx.custom_providers) == 1
+    assert ctx.custom_providers[0]["models"] == {
+        "claude-3-7-sonnet": {},
+        "claude-sonnet-4": {"context_length": 200000},
+    }
+    assert ctx.custom_providers[0]["discover_models"] is False
+
+
+def test_load_picker_context_falls_back_to_name_when_default_missing():
+    cfg = _cfg(model={"name": "gpt-5.4", "provider": "openai"})
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        ctx = load_picker_context()
+    assert ctx.current_model == "gpt-5.4"
+    assert ctx.current_provider == "openai"
+
+
+def test_load_picker_context_string_model_legacy_shape():
+    cfg = {"model": "some-model", "providers": {}, "custom_providers": []}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        ctx = load_picker_context()
+    assert ctx.current_model == "some-model"
+    assert ctx.current_provider == ""
+    assert ctx.current_base_url == ""
+
+
+def test_load_picker_context_empty_config():
+    cfg = _cfg()
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        ctx = load_picker_context()
+    assert ctx.current_provider == ""
+    assert ctx.current_model == ""
+    assert ctx.current_base_url == ""
+    assert ctx.user_providers == {}
+    assert ctx.custom_providers == []
+
+
 def test_aggregator_dedup_removes_overlapping_models():
     """Models served by a user-defined provider are removed from
     aggregator rows so the picker doesn't show them under the wrong
@@ -512,6 +584,86 @@ def test_list_authenticated_providers_refresh_busts_cache():
         assert clear.call_count == 1
 
 
+def test_explicit_only_keeps_unauthenticated_current_provider_visible():
+    ctx = _empty_ctx(provider="deepseek", model="deepseek-v4-pro")
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx, explicit_only=True, picker_hints=True)
+    row = payload["providers"][0]
+    assert row["slug"] == "deepseek"
+    assert row["source"] == "configured-current"
+    assert row["authenticated"] is False
+    assert row["models"] == ["deepseek-v4-pro"]
+    assert "DEEPSEEK_API_KEY" in row["warning"]
+
+
+def test_include_unconfigured_keeps_current_provider_visible_without_credentials():
+    ctx = _empty_ctx(provider="deepseek", model="deepseek-v4-pro")
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx, include_unconfigured=True, picker_hints=True)
+    deepseek = next(r for r in payload["providers"] if r["slug"] == "deepseek")
+    assert deepseek["source"] == "configured-current"
+    assert deepseek["is_current"] is True
+    assert deepseek["authenticated"] is False
+    assert deepseek["models"] == ["deepseek-v4-pro"]
+    assert deepseek["total_models"] == 1
+    assert "DEEPSEEK_API_KEY" in deepseek["warning"]
+
+
+def test_default_catalog_keeps_unavailable_local_agents_visible():
+    ctx = _empty_ctx()
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx, picker_hints=True)
+    assert [row["slug"] for row in payload["providers"]] == [
+        "moa", "claude-cli", "codex-cli", "cowork",
+    ]
+    local_rows = [
+        row for row in payload["providers"]
+        if row["slug"] in {"claude-cli", "codex-cli", "cowork"}
+    ]
+    assert all(row["authenticated"] is False for row in local_rows)
+    assert all("no API key" in row["warning"] for row in local_rows)
+
+
+def test_aggregator_dedup_case_insensitive():
+    rows = [
+        _user_provider_row("my-proxy", ["NVIDIA/NIM/MiniMax-M3"]),
+        _aggregator_row("openrouter", ["nvidia/nim/minimax-m3", "other/model"]),
+    ]
+    with _list_auth_returning(rows):
+        payload = build_models_payload(_empty_ctx())
+    or_row = next(r for r in payload["providers"] if r["slug"] == "openrouter")
+    assert "nvidia/nim/minimax-m3" not in or_row["models"]
+    assert or_row["total_models"] == 1
+
+
+def test_aggregator_dedup_does_not_empty_user_defined_custom_provider():
+    rows = [
+        _user_provider_row("custom:my-proxy", ["my-model-a", "my-model-b"]),
+        _aggregator_row("openrouter", ["my-model-a", "other/model"]),
+    ]
+    with _list_auth_returning(rows):
+        payload = build_models_payload(_empty_ctx())
+    proxy_row = next(r for r in payload["providers"] if r["slug"] == "custom:my-proxy")
+    or_row = next(r for r in payload["providers"] if r["slug"] == "openrouter")
+    assert proxy_row["models"] == ["my-model-a", "my-model-b"]
+    assert proxy_row["total_models"] == 2
+    assert "my-model-a" not in or_row["models"]
+    assert or_row["total_models"] == 1
+
+
+def test_two_custom_providers_with_overlap_both_survive():
+    rows = [
+        _user_provider_row("custom:proxy-a", ["shared/model", "a/only"]),
+        _user_provider_row("custom:proxy-b", ["shared/model", "b/only"]),
+    ]
+    with _list_auth_returning(rows):
+        payload = build_models_payload(_empty_ctx())
+    a_row = next(r for r in payload["providers"] if r["slug"] == "custom:proxy-a")
+    b_row = next(r for r in payload["providers"] if r["slug"] == "custom:proxy-b")
+    assert a_row["models"] == ["shared/model", "a/only"]
+    assert b_row["models"] == ["shared/model", "b/only"]
+
+
 # ─── _apply_featured (one-flagship-per-lab shortlist) ──────────────────
 
 
@@ -529,5 +681,3 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
-

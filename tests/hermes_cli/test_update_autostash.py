@@ -103,6 +103,173 @@ def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(mon
     assert callable(hermes_constants.apply_subprocess_home_env)
 
 
+def test_restore_keeps_stash_when_durable_ref_cannot_be_created(
+    monkeypatch, tmp_path, capsys
+):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="ref write failed\n", returncode=1)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    restored = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abcdef1", prompt_user=False
+    )
+
+    assert restored is True
+    assert [call[0][1] for call in calls] == ["stash", "diff", "update-ref"]
+    out = capsys.readouterr().out
+    assert "durable recovery ref" in out
+    assert "git update-ref refs/hermes/autostash/abcdef1 abcdef1" in out
+    assert "stash was left in place" in out
+
+
+def test_restore_stashed_changes_always_resets_on_conflict(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="conflict output\n", stderr="conflict stderr\n", returncode=1)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="hermes_cli/main.py\n", stderr="", returncode=0)
+        if cmd[1:3] == ["reset", "--hard"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr("builtins.input", lambda: "y")
+
+    result = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abc123", prompt_user=True
+    )
+
+    assert result is False
+    out = capsys.readouterr().out
+    assert "Conflicted files:" in out
+    assert "hermes_cli/main.py" in out
+    assert "stashed changes are preserved" in out
+    assert "Working tree reset to clean state" in out
+    assert sum(c[1:3] == ["reset", "--hard"] for c, _ in calls) == 1
+
+
+def test_restore_stashed_changes_auto_resets_non_interactive(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="cli.py\n", stderr="", returncode=0)
+        if cmd[1:3] == ["reset", "--hard"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    result = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abc123", prompt_user=False
+    )
+
+    assert result is False
+    assert "Working tree reset to clean state" in capsys.readouterr().out
+    assert sum(c[1:3] == ["reset", "--hard"] for c, _ in calls) == 1
+
+
+def test_stash_local_changes_if_needed_raises_when_stash_ref_missing(monkeypatch, tmp_path):
+    def fake_run(cmd, **kwargs):
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return SimpleNamespace(stdout=" M hermes_cli/main.py\n", returncode=0)
+        if cmd[-2:] == ["ls-files", "--unmerged"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        if cmd[1:4] == ["stash", "push", "--include-untracked"]:
+            return SimpleNamespace(stdout="Saved working directory\n", returncode=0)
+        if cmd[-3:] == ["rev-parse", "--verify", "refs/stash"]:
+            raise CalledProcessError(returncode=128, cmd=cmd)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    with pytest.raises(CalledProcessError):
+        hermes_main._stash_local_changes_if_needed(["git"], Path(tmp_path))
+
+
+def test_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return SimpleNamespace(stdout="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    hermes_main._stash_local_changes_if_needed(["git"], Path(tmp_path))
+    assert commands == [["git", "status", "--porcelain"]]
+
+
+def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+    hermes_main.cmd_update(SimpleNamespace())
+    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    assert reset_calls == [["git", "reset", "--hard", "origin/main"]]
+    assert "Fast-forward not possible" in capsys.readouterr().out
+
+
+def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, capsys):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, recorded = _make_update_side_effect(current_branch="HEAD")
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+    hermes_main.cmd_update(SimpleNamespace())
+    assert [c for c in recorded if "checkout" in c and "main" in c]
+    assert "detached HEAD" in capsys.readouterr().out
+
+
+def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, recorded = _make_update_side_effect()
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+    hermes_main.cmd_update(SimpleNamespace())
+    assert [c for c in recorded if "fetch" in c] == [["git", "fetch", "origin", "main"]]
+
+
+def test_restore_stashed_changes_keeps_stash_when_durable_ref_cannot_be_created_against_main(
+    monkeypatch, tmp_path
+):
+    """The exact-SHA recovery path remains reachable through main's canonical helper."""
+    monkeypatch.setattr(
+        hermes_main,
+        "_preserve_stash_commit",
+        lambda *args, **kwargs: False,
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    assert hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abcdef1", prompt_user=False
+    ) is True
+
+
 
 
 

@@ -5544,3 +5544,24 @@ def _service_restart_sec(
                     pass
                 break
     return total if matched else default
+
+
+# The autostash implementation is canonically owned by ``main.py``.  Keep
+# this module's historical import surface as lazy delegators so direct callers
+# cannot accidentally bind the mechanically extracted, pre-fix copy above.
+def _stash_local_changes_if_needed(git_cmd, cwd):
+    return _m()._stash_local_changes_if_needed(git_cmd, cwd)
+
+
+def _resolve_stash_selector(git_cmd, cwd, stash_ref):
+    return _m()._resolve_stash_selector(git_cmd, cwd, stash_ref)
+
+
+def _restore_stashed_changes(git_cmd, cwd, stash_ref, prompt_user=False, input_fn=None):
+    return _m()._restore_stashed_changes(
+        git_cmd, cwd, stash_ref, prompt_user=prompt_user, input_fn=input_fn
+    )
+
+
+def _discard_stashed_changes(git_cmd, cwd, stash_ref):
+    return _m()._discard_stashed_changes(git_cmd, cwd, stash_ref)
