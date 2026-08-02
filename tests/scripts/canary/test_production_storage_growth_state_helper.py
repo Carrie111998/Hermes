@@ -1,0 +1,605 @@
+from __future__ import annotations
+
+import builtins
+import copy
+import hashlib
+import json
+import os
+import runpy
+import subprocess
+from pathlib import Path
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+)
+
+from scripts.canary import passkey_v2_protocol as protocol
+from scripts.canary import production_storage_growth_contract as contract
+from scripts.canary import production_storage_growth_executor as executor
+from scripts.canary import production_storage_growth_installer as installer
+from scripts.canary import production_storage_growth_state_helper as helper
+from scripts.canary import production_cutover_passkey as cutover
+
+
+RELEASE = "a" * 40
+NOW = 2_000_000_000
+
+
+def _minimal_plan() -> dict:
+    return {
+        "release_revision": RELEASE,
+        "plan_sha256": "1" * 64,
+        "provider_request_id": "fixed-request",
+        "idempotency_key_sha256": "2" * 64,
+    }
+
+
+def _bundle() -> dict:
+    return {
+        "bundle_sha256": "3" * 64,
+        "authorization_receipt": {
+            "receipt_sha256": "4" * 64,
+            "prior_journal_head_sha256": "5" * 64,
+            "consumed_at_unix": NOW - 10,
+            "execution_window_expires_at_unix": NOW + 10,
+        },
+    }
+
+
+def _machine(tmp_path: Path, *, now: int = NOW) -> helper.RootStateMachine:
+    tmp_path.chmod(0o700)
+    machine = helper.RootStateMachine(
+        state_root=str(tmp_path),
+        helper_path=str(tmp_path / "helper"),
+        now=lambda: now,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+    )
+    machine.release_sha = RELEASE
+    machine.helper_sha = "6" * 64
+    machine.receipt_public_key_hex = "7" * 64
+    machine.plan = _minimal_plan()
+    return machine
+
+
+def _stub_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        helper,
+        "validate_authorization",
+        lambda *_args, **_kwargs: _bundle(),
+    )
+    monkeypatch.setattr(
+        helper,
+        "validate_observation_for_plan",
+        lambda observation, _plan: (
+            observation["state"], observation["observation_sha256"]
+        ),
+    )
+
+
+def test_embedded_ed25519_verifier_rejects_forgery() -> None:
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes_raw()
+    message = b"release-bound storage authorization"
+    signature = private.sign(message)
+    assert helper.verify_ed25519(public, signature, message) is True
+    forged = bytearray(signature)
+    forged[0] ^= 1
+    assert helper.verify_ed25519(public, bytes(forged), message) is False
+
+
+def test_begin_journal_to_event_crash_gap_is_mechanically_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_validation(monkeypatch)
+    machine = _machine(tmp_path)
+    original_append = helper._append_events
+
+    def crash_after_journal(*_args, **_kwargs):
+        raise helper.StateHelperError("simulated_event_publication_crash")
+
+    monkeypatch.setattr(helper, "_append_events", crash_after_journal)
+    with pytest.raises(helper.StateHelperError, match="simulated_event"):
+        machine.begin({
+            "authorization_bundle": _bundle(),
+            "initial_observation": {
+                "state": "source", "observation_sha256": "8" * 64,
+            },
+        })
+    journal_path, event_path = machine._paths()
+    assert Path(journal_path).is_file()
+    assert not Path(event_path).exists()
+
+    monkeypatch.setattr(helper, "_append_events", original_append)
+    recovered = _machine(tmp_path).begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "source", "observation_sha256": "8" * 64,
+        },
+    })
+    assert recovered["recovered"] is True
+    assert [event["event_kind"] for event in recovered["events"]] == [
+        "execution_started"
+    ]
+    assert Path(event_path).read_bytes().endswith(b"\n")
+
+
+def test_completion_journal_to_event_crash_gap_is_mechanically_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_validation(monkeypatch)
+    machine = _machine(tmp_path)
+    machine.begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "source", "observation_sha256": "8" * 64,
+        },
+    })
+    original_append = helper._append_events
+
+    def crash_after_completed_journal(*_args, **_kwargs):
+        raise helper.StateHelperError("simulated_completion_event_crash")
+
+    monkeypatch.setattr(helper, "_append_events", crash_after_completed_journal)
+    with pytest.raises(helper.StateHelperError, match="simulated_completion"):
+        machine.complete({
+            "final_observation": {
+                "state": "target", "observation_sha256": "9" * 64,
+            },
+        })
+    monkeypatch.setattr(helper, "_append_events", original_append)
+
+    recovered = _machine(tmp_path).begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "target", "observation_sha256": "9" * 64,
+        },
+    })
+    assert recovered["journal"]["state"] == "completed"
+    assert [event["event_kind"] for event in recovered["events"]] == [
+        "execution_started", "execution_completed"
+    ]
+    assert recovered["events"][-1] == recovered["journal"][
+        "transition_event"
+    ]
+
+
+def test_divergent_transition_event_is_not_repaired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_validation(monkeypatch)
+    machine = _machine(tmp_path)
+    machine.begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "source", "observation_sha256": "8" * 64,
+        },
+    })
+    journal_path, _event_path = machine._paths()
+    journal = json.loads(Path(journal_path).read_text())
+    journal["transition_event"]["observation_sha256"] = "a" * 64
+    transition_unsigned = dict(journal["transition_event"])
+    transition_unsigned.pop("event_head_sha256")
+    journal["transition_event"]["event_head_sha256"] = helper.sha256_json(
+        transition_unsigned
+    )
+    unsigned = dict(journal)
+    unsigned.pop("journal_sha256")
+    journal["journal_sha256"] = helper.sha256_json(unsigned)
+    helper._write_atomic(
+        journal_path, journal, str(tmp_path), os.getuid(), os.getgid()
+    )
+
+    with pytest.raises(helper.StateHelperError, match="event_log_invalid"):
+        _machine(tmp_path).begin({
+            "authorization_bundle": _bundle(),
+            "initial_observation": {
+                "state": "source", "observation_sha256": "8" * 64,
+            },
+        })
+
+
+def test_delayed_recovery_uses_original_signed_window_not_current_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checks: list[bool] = []
+
+    def validate(_bundle_value, _plan_value, _key, _now, require_current=True):
+        checks.append(require_current)
+        if require_current and _now >= NOW + 10:
+            raise helper.StateHelperError(
+                "production_storage_authorization_invalid"
+            )
+        return _bundle()
+
+    monkeypatch.setattr(helper, "validate_authorization", validate)
+    monkeypatch.setattr(
+        helper,
+        "validate_observation_for_plan",
+        lambda observation, _plan: (
+            observation["state"], observation["observation_sha256"]
+        ),
+    )
+    _machine(tmp_path, now=NOW).begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "source", "observation_sha256": "8" * 64,
+        },
+    })
+    recovered = _machine(tmp_path, now=NOW + 100).begin({
+        "authorization_bundle": _bundle(),
+        "initial_observation": {
+            "state": "partial", "observation_sha256": "9" * 64,
+        },
+    })
+    assert recovered["recovered"] is True
+    assert checks == [True, False]
+
+
+def test_state_helper_frames_have_no_caller_key_or_path_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_validation(monkeypatch)
+    machine = _machine(tmp_path)
+    with pytest.raises(
+        helper.StateHelperError,
+        match="production_storage_state_helper_frame_invalid",
+    ):
+        machine.begin({
+            "authorization_bundle": _bundle(),
+            "initial_observation": {
+                "state": "source", "observation_sha256": "8" * 64,
+            },
+            "receipt_public_key_ed25519_hex": "a" * 64,
+        })
+
+
+def test_malformed_root_receipt_key_fails_with_stable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path.chmod(0o700)
+    helper_path = tmp_path / "helper"
+    helper_path.write_bytes(b"fixed helper")
+    helper_path.chmod(0o555)
+    artifacts = {
+        name: {
+            "release_relative": relative,
+            "sha256": (
+                hashlib.sha256(b"fixed helper").hexdigest()
+                if name == "state_helper" else "1" * 64
+            ),
+            "size": 12,
+        }
+        for name, relative in contract.RUNTIME_ARTIFACT_RELATIVES.items()
+    }
+    artifact_unsigned = {
+        "schema": contract.RUNTIME_ARTIFACT_ATTESTATION_SCHEMA,
+        "release_revision": RELEASE,
+        "owner_support_manifest_sha256": "2" * 64,
+        "owner_support_source_tree_oid": "3" * 40,
+        "artifacts": artifacts,
+    }
+    artifact_attestation = {
+        **artifact_unsigned,
+        "attestation_sha256": protocol.sha256_json(artifact_unsigned),
+    }
+    binding = installer.build_owner_artifact_binding(
+        RELEASE, artifact_attestation
+    )
+    installer.install_owner_state_root(
+        RELEASE,
+        sealed_artifact_binding=binding,
+        state_root=tmp_path,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        effective_uid=lambda: 0,
+        artifact_verifier=lambda value, **_kwargs: value,
+        state_helper_source=helper_path,
+    )
+    authority = {
+        "release_sha": RELEASE,
+        "receipt_public_key_ed25519_hex": "not-hex",
+        "receipt_public_key_id": "0" * 64,
+        "root_owned_trust_bundle_validated": True,
+        "rotation_requires_new_release_and_owner_install": True,
+    }
+    authority["attestation_sha256"] = helper.sha256_json(authority)
+    receipt_path = tmp_path / ".installation.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["authority_key_attestation"] = authority
+    receipt["authority_key_attestation_sha256"] = authority[
+        "attestation_sha256"
+    ]
+    receipt_unsigned = dict(receipt)
+    receipt_unsigned.pop("installation_receipt_sha256")
+    receipt["installation_receipt_sha256"] = helper.sha256_json(
+        receipt_unsigned
+    )
+    receipt_path.write_bytes(helper.canonical_bytes(receipt) + b"\n")
+    receipt_path.chmod(0o600)
+    monkeypatch.setenv("SUDO_UID", str(os.getuid()))
+    monkeypatch.setenv("SUDO_GID", str(os.getgid()))
+    machine = helper.RootStateMachine(
+        state_root=str(tmp_path),
+        helper_path=str(helper_path),
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+    )
+    with pytest.raises(
+        helper.StateHelperError,
+        match="production_storage_state_helper_installation_invalid",
+    ):
+        machine.open()
+
+
+def test_installer_pwd_import_failure_is_stable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = {
+        name: {
+            "release_relative": relative,
+            "sha256": "1" * 64,
+            "size": 1,
+        }
+        for name, relative in contract.RUNTIME_ARTIFACT_RELATIVES.items()
+    }
+    unsigned = {
+        "schema": contract.RUNTIME_ARTIFACT_ATTESTATION_SCHEMA,
+        "release_revision": RELEASE,
+        "owner_support_manifest_sha256": "2" * 64,
+        "owner_support_source_tree_oid": "3" * 40,
+        "artifacts": artifacts,
+    }
+    attestation = {
+        **unsigned,
+        "attestation_sha256": protocol.sha256_json(unsigned),
+    }
+    binding = installer.build_owner_artifact_binding(RELEASE, attestation)
+    original_import = builtins.__import__
+
+    def without_pwd(name, *args, **kwargs):
+        if name == "pwd":
+            raise ImportError("pwd unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_pwd)
+    with pytest.raises(
+        installer.ProductionStorageInstallerError,
+        match="production_storage_owner_installer_invalid",
+    ):
+        installer.install_owner_state_root(
+            RELEASE,
+            sealed_artifact_binding=binding,
+            state_root=tmp_path / "state",
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            effective_uid=lambda: 0,
+            artifact_verifier=lambda value, **_kwargs: value,
+        )
+
+
+def test_root_installer_independently_revalidates_portable_key_trust(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key()
+    raw = public.public_bytes_raw()
+    trust = {
+        "authority_release_sha": RELEASE,
+        "trust_bundle_sha256": "6" * 64,
+    }
+    unsigned = {
+        "schema": "muncho-production-storage-authority-key-attestation.v1",
+        "release_sha": RELEASE,
+        "receipt_public_key_ed25519_hex": raw.hex(),
+        "receipt_public_key_id": hashlib.sha256(raw).hexdigest(),
+        "portable_trust_bundle_sha256": "6" * 64,
+        "portable_trust_bundle": trust,
+        "authority_manifest_sha256": "7" * 64,
+        "authority_host_receipt_sha256": "8" * 64,
+        "root_owned_trust_bundle_validated": True,
+        "rotation_requires_new_release_and_owner_install": True,
+    }
+    attestation = {
+        **unsigned,
+        "attestation_sha256": protocol.sha256_json(unsigned),
+    }
+    calls: list[dict] = []
+
+    def validate(value):
+        calls.append(dict(value))
+        return trust, public
+
+    monkeypatch.setattr(cutover, "validate_trust_bundle", validate)
+    assert installer._validate_authority_key_attestation(
+        attestation, release_sha=RELEASE
+    ) == attestation
+    assert calls == [trust]
+    forged = copy.deepcopy(attestation)
+    forged["receipt_public_key_ed25519_hex"] = "0" * 64
+    forged_unsigned = dict(forged)
+    forged_unsigned.pop("attestation_sha256")
+    forged["attestation_sha256"] = protocol.sha256_json(forged_unsigned)
+    with pytest.raises(
+        installer.ProductionStorageInstallerError,
+        match="production_storage_authority_key_attestation_invalid",
+    ):
+        installer._validate_authority_key_attestation(
+            forged, release_sha=RELEASE
+        )
+
+
+def test_state_helper_imports_when_fcntl_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+
+    def without_fcntl(name, *args, **kwargs):
+        if name == "fcntl":
+            raise ImportError("fcntl unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_fcntl)
+    loaded = runpy.run_path(str(Path(helper.__file__)), run_name="helper_smoke")
+    assert loaded["fcntl"] is None
+
+
+def test_sudoers_fragment_requires_visudo_and_leaves_no_failed_install(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fixed-sudoers"
+    payload = b"owner ALL=(root) NOPASSWD: /fixed/helper\n"
+    captured: list[tuple[str, ...]] = []
+
+    def reject(command, **_kwargs):
+        captured.append(tuple(command))
+        return subprocess.CompletedProcess(command, 1, b"", b"")
+
+    with pytest.raises(
+        installer.ProductionStorageInstallerError,
+        match="production_storage_state_helper_sudoers_invalid",
+    ):
+        installer._install_validated_sudoers(
+            path,
+            payload,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            runner=reject,
+        )
+    assert captured and captured[0][:2] == ("/usr/sbin/visudo", "-cf")
+    assert not path.exists()
+
+
+def test_sudoers_fragment_install_is_exact_and_conflicts_fail_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fixed-sudoers"
+    payload = b"owner ALL=(root) NOPASSWD: /fixed/helper\n"
+
+    def accept(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    installer._install_validated_sudoers(
+        path,
+        payload,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        runner=accept,
+    )
+    assert path.read_bytes() == payload
+    assert path.stat().st_mode & 0o777 == 0o440
+    path.chmod(0o600)
+    path.write_bytes(b"different\n")
+    path.chmod(0o440)
+    with pytest.raises(
+        installer.ProductionStorageInstallerError,
+        match="production_storage_state_helper_sudoers_conflict",
+    ):
+        installer._install_validated_sudoers(
+            path,
+            payload,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            runner=accept,
+        )
+
+
+def test_privileged_session_close_kills_and_reaps_once() -> None:
+    class Input:
+        def close(self) -> None:
+            pass
+
+    class Process:
+        stdin = Input()
+
+        def __init__(self) -> None:
+            self.waits = 0
+            self.kills = 0
+
+        def wait(self, *, timeout: int) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("helper", timeout)
+            return 0
+
+        def kill(self) -> None:
+            self.kills += 1
+
+    session = object.__new__(executor.ProductionStoragePrivilegedStateSession)
+    process = Process()
+    session._process = process
+    session.close()
+    session.close()
+    assert process.kills == 1
+    assert process.waits == 2
+
+
+def test_privileged_session_rejects_stale_public_readiness_before_attest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Input:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def write(self, _raw: bytes) -> int:  # pragma: no cover - not reached
+            raise AssertionError("attest must not be sent")
+
+        def flush(self) -> None:  # pragma: no cover - not reached
+            raise AssertionError("attest must not be sent")
+
+    ready_unsigned = {
+        "schema": executor.STATE_HELPER_RESPONSE_SCHEMA,
+        "operation": "ready",
+        "ok": True,
+        "document": {
+            "release_sha": RELEASE,
+            "state_helper_sha256": "6" * 64,
+            "installation_receipt_sha256": "7" * 64,
+            "lock_acquired": True,
+        },
+    }
+    ready = protocol.canonical_json_bytes({
+        **ready_unsigned,
+        "response_sha256": protocol.sha256_json(ready_unsigned),
+    }) + b"\n"
+
+    class Output:
+        def readline(self, _maximum: int) -> bytes:
+            return ready
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdin = Input()
+            self.stdout = Output()
+            self.waited = False
+
+        def wait(self, *, timeout: int) -> int:
+            self.waited = True
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(contract, "validate_plan", lambda value: value)
+    session = executor.ProductionStoragePrivilegedStateSession(
+        release_sha=RELEASE,
+        growth_plan=_minimal_plan(),
+        expected_installation_receipt_sha256="8" * 64,
+        runner=lambda *_args, **_kwargs: process,
+    )
+    with pytest.raises(
+        executor.ProductionStorageExecutorError,
+        match="production_storage_state_helper_unavailable",
+    ):
+        session.open()
+    assert process.stdin.closed is True
+    assert process.waited is True

@@ -24,6 +24,18 @@ from typing import Any, Callable, Mapping, Sequence
 
 OWNER_STATE_ROOT = Path("/var/lib/muncho-production-storage-growth")
 OWNER_INSTALLATION_RECEIPT = OWNER_STATE_ROOT / ".installation.json"
+OWNER_PUBLIC_READINESS = Path(
+    "/var/lib/muncho-production-storage-growth.ready.json"
+)
+OWNER_STATE_HELPER = Path(
+    "/usr/local/lib/muncho/production-storage-growth-state-helper"
+)
+OWNER_STATE_HELPER_SOURCE = Path(__file__).with_name(
+    "production_storage_growth_state_helper.py"
+)
+OWNER_STATE_HELPER_SUDOERS = Path(
+    "/etc/sudoers.d/muncho-production-storage-growth-state-helper"
+)
 GUEST_ENTRYPOINT = Path("/usr/local/lib/muncho/production-storage-growth-guest")
 GUEST_INSTALLATION_ROOT = Path(
     "/var/lib/muncho-production-storage-growth-guest"
@@ -34,7 +46,7 @@ GUEST_SOURCE = Path(__file__).with_name("production_storage_growth_guest.py")
 GUEST_INTERPRETER = Path("/usr/bin/python3")
 
 OWNER_INSTALLATION_SCHEMA = (
-    "muncho-production-storage-growth-owner-installation.v1"
+    "muncho-production-storage-growth-owner-installation.v2"
 )
 OWNER_ARTIFACT_BINDING_SCHEMA = (
     "muncho-production-storage-growth-owner-artifact-binding.v1"
@@ -60,6 +72,16 @@ _OWNER_INSTALLATION_FIELDS = frozenset({
     "sealed_artifact_binding",
     "sealed_artifact_binding_sha256",
     "installed_at_unix",
+    "state_root_device",
+    "state_root_inode",
+    "state_helper_path",
+    "state_helper_sha256",
+    "state_helper_sudoers_path",
+    "state_helper_sudoers_sha256",
+    "authorized_client_uid",
+    "authorized_client_gid",
+    "authority_key_attestation",
+    "authority_key_attestation_sha256",
     "installation_receipt_sha256",
 })
 _OWNER_ARTIFACT_BINDING_FIELDS = frozenset({
@@ -75,6 +97,7 @@ _OWNER_ARTIFACT_BINDING_FIELDS = frozenset({
     "production_cutover_sha256",
     "guest_sha256",
     "installer_sha256",
+    "state_helper_sha256",
     "runtime_artifact_attestation_sha256",
     "binding_sha256",
 })
@@ -96,6 +119,9 @@ _OWNER_ARTIFACT_RELATIVES = {
     "guest_sha256": "scripts/canary/production_storage_growth_guest.py",
     "installer_sha256": (
         "scripts/canary/production_storage_growth_installer.py"
+    ),
+    "state_helper_sha256": (
+        "scripts/canary/production_storage_growth_state_helper.py"
     ),
 }
 _GUEST_INSTALL_REQUEST_FIELDS = frozenset({
@@ -187,8 +213,12 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def decode_canonical_json(raw: bytes) -> Any:
-    if not isinstance(raw, bytes) or not raw or len(raw) > 64 * 1024:
+def decode_canonical_json(raw: bytes, *, maximum: int = 64 * 1024) -> Any:
+    if (
+        not isinstance(raw, bytes) or not raw
+        or type(maximum) is not int or not 1 <= maximum <= 2 * 1024 * 1024
+        or len(raw) > maximum
+    ):
         raise ProductionStorageInstallerError(
             "production_storage_installer_json_invalid"
         )
@@ -223,6 +253,76 @@ def source_sha256(path: Path) -> str:
             "production_storage_installer_source_invalid"
         )
     return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_authority_key_attestation(
+    value: Mapping[str, Any],
+    *,
+    release_sha: str,
+) -> Mapping[str, Any]:
+    """Re-verify portable trust in the privileged installer process."""
+
+    unsigned = {
+        name: item for name, item in value.items() if name != "attestation_sha256"
+    } if isinstance(value, Mapping) else {}
+    if (
+        not isinstance(value, Mapping)
+        or set(value)
+        != {
+            "schema", "release_sha", "receipt_public_key_ed25519_hex",
+            "receipt_public_key_id", "portable_trust_bundle_sha256",
+            "portable_trust_bundle", "authority_manifest_sha256",
+            "authority_host_receipt_sha256",
+            "root_owned_trust_bundle_validated",
+            "rotation_requires_new_release_and_owner_install",
+            "attestation_sha256",
+        }
+        or value.get("schema")
+        != "muncho-production-storage-authority-key-attestation.v1"
+        or value.get("release_sha") != release_sha
+        or value.get("attestation_sha256") != sha256_json(unsigned)
+        or not isinstance(value.get("portable_trust_bundle"), Mapping)
+    ):
+        raise ProductionStorageInstallerError(
+            "production_storage_authority_key_attestation_invalid"
+        )
+    try:
+        if __package__ is None or __package__ == "":
+            resolved = Path(__file__).resolve(strict=True)
+            source_root = resolved.parents[2]
+            support_root = source_root.parent
+            site_root = support_root / "site-packages"
+            standard = [
+                item for item in sys.path
+                if item and "site-packages" not in Path(item).parts
+                and "dist-packages" not in Path(item).parts
+            ]
+            sys.path[:] = [str(source_root), str(site_root), *standard]
+        from scripts.canary import production_cutover_passkey as cutover
+
+        checked, receipt_key = cutover.validate_trust_bundle(
+            value["portable_trust_bundle"]
+        )
+        raw = receipt_key.public_bytes_raw()
+    except Exception:
+        raise ProductionStorageInstallerError(
+            "production_storage_authority_key_attestation_invalid"
+        ) from None
+    if (
+        checked.get("authority_release_sha") != release_sha
+        or checked.get("trust_bundle_sha256")
+        != value.get("portable_trust_bundle_sha256")
+        or raw.hex() != value.get("receipt_public_key_ed25519_hex")
+        or hashlib.sha256(raw).hexdigest()
+        != value.get("receipt_public_key_id")
+        or value.get("root_owned_trust_bundle_validated") is not True
+        or value.get("rotation_requires_new_release_and_owner_install")
+        is not True
+    ):
+        raise ProductionStorageInstallerError(
+            "production_storage_authority_key_attestation_invalid"
+        )
+    return dict(value)
 
 
 def interpreter_identity(
@@ -370,6 +470,126 @@ def _write_atomic(
     _validate_node(path, directory=False, mode=mode, uid=uid, gid=gid)
 
 
+def _install_validated_sudoers(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]],
+) -> None:
+    try:
+        existing = path.read_bytes()
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        raise ProductionStorageInstallerError(
+            "production_storage_state_helper_sudoers_invalid"
+        ) from None
+    if existing is not None:
+        _validate_node(
+            path,
+            directory=False,
+            mode=0o440,
+            uid=uid,
+            gid=gid,
+        )
+        if existing != payload:
+            raise ProductionStorageInstallerError(
+                "production_storage_state_helper_sudoers_conflict"
+            )
+    descriptor: int | None = None
+    staged: str | None = None
+    try:
+        descriptor, staged = tempfile.mkstemp(
+            prefix=".muncho-production-storage-growth-state-helper.",
+            dir=path.parent,
+        )
+        os.fchmod(descriptor, 0o440)
+        os.fchown(descriptor, uid, gid)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        checked = runner(
+            ("/usr/sbin/visudo", "-cf", staged),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+            timeout=30,
+            check=False,
+        )
+        if checked.returncode != 0:
+            raise OSError("visudo rejected fixed fragment")
+    except (OSError, subprocess.SubprocessError):
+        raise ProductionStorageInstallerError(
+            "production_storage_state_helper_sudoers_invalid"
+        ) from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if staged is not None:
+            try:
+                os.unlink(staged)
+            except FileNotFoundError:
+                pass
+    if existing is None:
+        _write_atomic(path, payload, mode=0o440, uid=uid, gid=gid)
+
+
+def _snapshot_installed_file(
+    path: Path,
+    *,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> bytes | None:
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ProductionStorageInstallerError(
+            "production_storage_installer_storage_invalid"
+        ) from None
+    _validate_node(
+        path, directory=False, mode=mode, uid=uid, gid=gid
+    )
+    return payload
+
+
+def _remove_new_fixed_file(
+    path: Path,
+    *,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> None:
+    _validate_node(
+        path, directory=False, mode=mode, uid=uid, gid=gid
+    )
+    try:
+        path.unlink()
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_install_rollback_failed"
+        ) from None
+
+
 def _read_receipt(path: Path) -> Mapping[str, Any]:
     try:
         raw = path.read_bytes()
@@ -414,6 +634,7 @@ def build_owner_artifact_binding(
             ],
             "guest_sha256": artifacts["guest"]["sha256"],
             "installer_sha256": artifacts["installer"]["sha256"],
+            "state_helper_sha256": artifacts["state_helper"]["sha256"],
             "runtime_artifact_attestation_sha256": (
                 runtime_artifact_attestation["attestation_sha256"]
             ),
@@ -550,6 +771,7 @@ def install_owner_state_root(
     release_sha: str,
     *,
     sealed_artifact_binding: Mapping[str, Any],
+    authority_key_attestation: Mapping[str, Any] | None = None,
     state_root: Path = OWNER_STATE_ROOT,
     installation_receipt: Path | None = None,
     expected_uid: int = 0,
@@ -559,6 +781,15 @@ def install_owner_state_root(
     artifact_verifier: Callable[..., Mapping[str, Any]] = (
         verify_owner_artifact_binding_on_disk
     ),
+    state_helper_source: Path = OWNER_STATE_HELPER_SOURCE,
+    state_helper_path: Path = OWNER_STATE_HELPER,
+    public_readiness_path: Path = OWNER_PUBLIC_READINESS,
+    sudoers_path: Path = OWNER_STATE_HELPER_SUDOERS,
+    authorized_client_uid: int | None = None,
+    authorized_client_gid: int | None = None,
+    sudoers_validator: Callable[..., subprocess.CompletedProcess[bytes]] = (
+        subprocess.run
+    ),
 ) -> Mapping[str, Any]:
     """Install only the exact durable local root and its immutable identity."""
 
@@ -567,22 +798,160 @@ def install_owner_state_root(
         sealed_artifact_binding,
         release_sha=release_sha,
     )
+    try:
+        import pwd
+
+        if authorized_client_uid is None:
+            client_uid = (
+                int(os.environ["SUDO_UID"])
+                if expected_uid == 0
+                else os.getuid()
+            )
+        else:
+            client_uid = authorized_client_uid
+        if authorized_client_gid is None:
+            client_gid = (
+                int(os.environ["SUDO_GID"])
+                if expected_uid == 0
+                else os.getgid()
+            )
+        else:
+            client_gid = authorized_client_gid
+        client_name = pwd.getpwuid(client_uid).pw_name
+    except (ImportError, KeyError, ValueError, TypeError, OverflowError):
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_installer_invalid"
+        ) from None
+    production_paths = state_root == OWNER_STATE_ROOT
     if (
         _SHA40.fullmatch(release_sha or "") is None
-        or state_root == OWNER_STATE_ROOT
+        or production_paths
         and receipt_path != OWNER_INSTALLATION_RECEIPT
+        or production_paths
+        and (
+            state_helper_source != OWNER_STATE_HELPER_SOURCE
+            or state_helper_path != OWNER_STATE_HELPER
+            or public_readiness_path != OWNER_PUBLIC_READINESS
+            or sudoers_path != OWNER_STATE_HELPER_SUDOERS
+        )
         or receipt_path.parent != state_root
         or effective_uid() != 0
         or type(expected_uid) is not int
         or type(expected_gid) is not int
         or not callable(artifact_verifier)
+        or type(client_uid) is not int
+        or client_uid <= 0
+        or type(client_gid) is not int
+        or client_gid < 0
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", client_name) is None
     ):
         raise ProductionStorageInstallerError(
             "production_storage_owner_installer_invalid"
         )
     binding = artifact_verifier(binding, release_sha=release_sha)
+    production_install = expected_uid == 0
+    if production_install:
+        if authority_key_attestation is None:
+            raise ProductionStorageInstallerError(
+                "production_storage_authority_key_attestation_invalid"
+            )
+        authority_key_attestation = _validate_authority_key_attestation(
+            authority_key_attestation,
+            release_sha=release_sha,
+        )
+    else:
+        authority_key_attestation = {
+            "attestation_sha256": "0" * 64,
+        }
     _ensure_directory(
         state_root,
+        mode=0o700,
+        uid=expected_uid,
+        gid=expected_gid,
+    )
+    helper_payload = state_helper_source.read_bytes()
+    observed_helper_sha256 = hashlib.sha256(helper_payload).hexdigest()
+    if (
+        production_install
+        and observed_helper_sha256 != binding["state_helper_sha256"]
+    ):
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_artifact_binding_invalid"
+        )
+    helper_sha256 = (
+        observed_helper_sha256
+        if production_install else binding["state_helper_sha256"]
+    )
+    sudoers_payload = (
+        f"{client_name} ALL=(root) NOPASSWD: {state_helper_path}\n"
+    ).encode("ascii", errors="strict")
+    if production_install:
+        _ensure_directory(
+            state_helper_path.parent,
+            mode=0o755,
+            uid=expected_uid,
+            gid=expected_gid,
+        )
+        prior_helper = _snapshot_installed_file(
+            state_helper_path,
+            mode=0o555,
+            uid=expected_uid,
+            gid=expected_gid,
+        )
+        prior_sudoers = _snapshot_installed_file(
+            sudoers_path,
+            mode=0o440,
+            uid=expected_uid,
+            gid=expected_gid,
+        )
+        try:
+            _write_atomic(
+                state_helper_path,
+                helper_payload,
+                mode=0o555,
+                uid=expected_uid,
+                gid=expected_gid,
+            )
+            _install_validated_sudoers(
+                sudoers_path,
+                sudoers_payload,
+                uid=expected_uid,
+                gid=expected_gid,
+                runner=sudoers_validator,
+            )
+        except ProductionStorageInstallerError as error:
+            try:
+                if prior_helper is None:
+                    if state_helper_path.exists():
+                        _remove_new_fixed_file(
+                            state_helper_path,
+                            mode=0o555,
+                            uid=expected_uid,
+                            gid=expected_gid,
+                        )
+                else:
+                    _write_atomic(
+                        state_helper_path,
+                        prior_helper,
+                        mode=0o555,
+                        uid=expected_uid,
+                        gid=expected_gid,
+                    )
+                if prior_sudoers is None and sudoers_path.exists():
+                    _remove_new_fixed_file(
+                        sudoers_path,
+                        mode=0o440,
+                        uid=expected_uid,
+                        gid=expected_gid,
+                    )
+            except ProductionStorageInstallerError:
+                raise ProductionStorageInstallerError(
+                    "production_storage_owner_install_rollback_failed"
+                ) from None
+            raise error
+    root = _validate_node(
+        state_root,
+        directory=True,
         mode=0o700,
         uid=expected_uid,
         gid=expected_gid,
@@ -596,6 +965,20 @@ def install_owner_state_root(
         "sealed_artifact_binding": binding,
         "sealed_artifact_binding_sha256": binding["binding_sha256"],
         "installed_at_unix": now_unix,
+        "state_root_device": root.st_dev,
+        "state_root_inode": root.st_ino,
+        "state_helper_path": str(OWNER_STATE_HELPER),
+        "state_helper_sha256": helper_sha256,
+        "state_helper_sudoers_path": str(OWNER_STATE_HELPER_SUDOERS),
+        "state_helper_sudoers_sha256": hashlib.sha256(
+            sudoers_payload
+        ).hexdigest(),
+        "authorized_client_uid": client_uid,
+        "authorized_client_gid": client_gid,
+        "authority_key_attestation": dict(authority_key_attestation),
+        "authority_key_attestation_sha256": authority_key_attestation[
+            "attestation_sha256"
+        ],
     }
     receipt = {
         **unsigned,
@@ -608,7 +991,7 @@ def install_owner_state_root(
         uid=expected_uid,
         gid=expected_gid,
     )
-    return attest_owner_state_root(
+    private_readiness = attest_owner_state_root(
         release_sha,
         state_root=state_root,
         installation_receipt=receipt_path,
@@ -616,6 +999,39 @@ def install_owner_state_root(
         expected_uid=expected_uid,
         expected_gid=expected_gid,
     )
+    if not production_install:
+        return private_readiness
+    public_unsigned = {
+        **private_readiness,
+        "schema": "muncho-production-storage-growth-owner-state-public-ready.v1",
+        "private_installation_receipt_sha256": receipt[
+            "installation_receipt_sha256"
+        ],
+        "state_root_device": root.st_dev,
+        "state_root_inode": root.st_ino,
+        "state_helper_path": str(OWNER_STATE_HELPER),
+        "state_helper_sha256": helper_sha256,
+        "authorized_client_uid": client_uid,
+        "authorized_client_gid": client_gid,
+        "authority_key_attestation_sha256": authority_key_attestation[
+            "attestation_sha256"
+        ],
+        "receipt_public_key_id": authority_key_attestation[
+            "receipt_public_key_id"
+        ],
+    }
+    public = {
+        **public_unsigned,
+        "public_readiness_sha256": sha256_json(public_unsigned),
+    }
+    _write_atomic(
+        public_readiness_path,
+        canonical_json_bytes(public) + b"\n",
+        mode=0o444,
+        uid=expected_uid,
+        gid=expected_gid,
+    )
+    return public
 
 
 def attest_owner_state_root(
@@ -666,6 +1082,29 @@ def attest_owner_state_root(
         or receipt["installed_at_unix"] <= 0
         or receipt.get("installation_receipt_sha256")
         != sha256_json(unsigned_receipt)
+        or receipt.get("state_root_device") != root.st_dev
+        or receipt.get("state_root_inode") != root.st_ino
+        or receipt.get("state_helper_path") != str(OWNER_STATE_HELPER)
+        or _SHA256.fullmatch(
+            str(receipt.get("state_helper_sha256") or "")
+        ) is None
+        or receipt.get("state_helper_sha256")
+        != binding["state_helper_sha256"]
+        or receipt.get("state_helper_sudoers_path")
+        != str(OWNER_STATE_HELPER_SUDOERS)
+        or _SHA256.fullmatch(
+            str(receipt.get("state_helper_sudoers_sha256") or "")
+        ) is None
+        or type(receipt.get("authorized_client_uid")) is not int
+        or receipt["authorized_client_uid"] <= 0
+        or type(receipt.get("authorized_client_gid")) is not int
+        or receipt["authorized_client_gid"] < 0
+        or not isinstance(receipt.get("authority_key_attestation"), Mapping)
+        or receipt.get("authority_key_attestation_sha256")
+        != receipt["authority_key_attestation"].get("attestation_sha256")
+        or _SHA256.fullmatch(
+            str(receipt.get("authority_key_attestation_sha256") or "")
+        ) is None
     ):
         raise ProductionStorageInstallerError(
             "production_storage_owner_readiness_invalid"
@@ -685,9 +1124,84 @@ def attest_owner_state_root(
         "installation_receipt_sha256": receipt[
             "installation_receipt_sha256"
         ],
+        "state_root_device": root.st_dev,
+        "state_root_inode": root.st_ino,
+        "state_helper_path": receipt["state_helper_path"],
+        "state_helper_sha256": receipt["state_helper_sha256"],
+        "authorized_client_uid": receipt["authorized_client_uid"],
+        "authorized_client_gid": receipt["authorized_client_gid"],
         "ready": True,
     }
     return {**unsigned, "readiness_sha256": sha256_json(unsigned)}
+
+
+def attest_owner_state_public(
+    release_sha: str,
+    *,
+    sealed_artifact_binding: Mapping[str, Any],
+    state_root: Path = OWNER_STATE_ROOT,
+    public_readiness_path: Path = OWNER_PUBLIC_READINESS,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> Mapping[str, Any]:
+    """Attest root-owned readiness without traversing the 0700 private root."""
+
+    binding = validate_owner_artifact_binding(
+        sealed_artifact_binding,
+        release_sha=release_sha,
+    )
+    root = _validate_node(
+        state_root,
+        directory=True,
+        mode=0o700,
+        uid=expected_uid,
+        gid=expected_gid,
+    )
+    _validate_node(
+        public_readiness_path,
+        directory=False,
+        mode=0o444,
+        uid=expected_uid,
+        gid=expected_gid,
+    )
+    value = _read_receipt(public_readiness_path)
+    unsigned = {
+        name: item
+        for name, item in value.items()
+        if name != "public_readiness_sha256"
+    } if isinstance(value, Mapping) else {}
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema")
+        != "muncho-production-storage-growth-owner-state-public-ready.v1"
+        or value.get("release_sha") != release_sha
+        or value.get("state_root") != str(OWNER_STATE_ROOT)
+        or value.get("state_root_uid") != expected_uid
+        or value.get("state_root_gid") != expected_gid
+        or value.get("state_root_mode") != "0700"
+        or value.get("state_root_device") != root.st_dev
+        or value.get("state_root_inode") != root.st_ino
+        or value.get("sealed_artifact_binding_sha256")
+        != binding["binding_sha256"]
+        or value.get("owner_support_manifest_sha256")
+        != binding["owner_support_manifest_sha256"]
+        or value.get("state_helper_path") != str(OWNER_STATE_HELPER)
+        or value.get("state_helper_sha256")
+        != binding["state_helper_sha256"]
+        or not _SHA256.fullmatch(
+            str(value.get("private_installation_receipt_sha256") or "")
+        )
+        or type(value.get("authorized_client_uid")) is not int
+        or value["authorized_client_uid"] <= 0
+        or type(value.get("authorized_client_gid")) is not int
+        or value["authorized_client_gid"] < 0
+        or value.get("ready") is not True
+        or value.get("public_readiness_sha256") != sha256_json(unsigned)
+    ):
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_readiness_invalid"
+        )
+    return dict(value)
 
 
 def build_guest_install_request(release_sha: str) -> Mapping[str, Any]:
@@ -940,11 +1454,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         if arguments.operation == "install-owner-state":
-            raw = sys.stdin.buffer.read(64 * 1024 + 1)
-            request = decode_canonical_json(raw)
+            raw = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
+            request = decode_canonical_json(
+                raw, maximum=2 * 1024 * 1024
+            )
             if (
                 not isinstance(request, Mapping)
-                or set(request) != {"sealed_artifact_binding"}
+                or set(request)
+                != {"sealed_artifact_binding", "authority_key_attestation"}
                 or not isinstance(
                     request.get("sealed_artifact_binding"), Mapping
                 )
@@ -955,6 +1472,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = install_owner_state_root(
                 arguments.release_sha,
                 sealed_artifact_binding=request["sealed_artifact_binding"],
+                authority_key_attestation=request[
+                    "authority_key_attestation"
+                ],
             )
         else:
             raw = sys.stdin.buffer.read(64 * 1024 + 1)
@@ -983,11 +1503,16 @@ __all__ = [
     "GUEST_SOURCE",
     "GUEST_SUDOERS_PATH",
     "OWNER_INSTALLATION_RECEIPT",
+    "OWNER_PUBLIC_READINESS",
+    "OWNER_STATE_HELPER",
+    "OWNER_STATE_HELPER_SOURCE",
+    "OWNER_STATE_HELPER_SUDOERS",
     "OWNER_ARTIFACT_BINDING_SCHEMA",
     "OWNER_READINESS_SCHEMA",
     "OWNER_STATE_ROOT",
     "ProductionStorageInstallerError",
     "attest_owner_state_root",
+    "attest_owner_state_public",
     "build_owner_artifact_binding",
     "build_guest_install_request",
     "canonical_json_bytes",

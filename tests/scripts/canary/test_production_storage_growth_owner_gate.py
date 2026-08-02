@@ -24,6 +24,7 @@ from scripts.canary import owner_gate_package
 from scripts.canary import production_storage_growth_contract as contract
 from scripts.canary import production_storage_growth_executor as executor
 from scripts.canary import production_storage_growth_installer as installer
+from scripts.canary import production_storage_growth_state_helper as state_helper
 from scripts.canary.passkey_v2_signer import ReceiptSigner
 
 
@@ -714,6 +715,35 @@ def _runner(
     )
 
 
+def test_root_state_helper_independently_validates_exact_authorization() -> None:
+    bundle, plan, signer = _signed_bundle()
+    public_hex = signer.public_key.public_bytes_raw().hex()
+    checked = state_helper.validate_authorization(
+        bundle,
+        plan,
+        public_hex,
+        NOW + 4,
+        require_current=True,
+    )
+    assert checked["bundle_sha256"] == bundle["bundle_sha256"]
+    forged = copy.deepcopy(bundle)
+    forged["authorization_receipt"]["caller_public_key"] = public_hex
+    forged_unsigned = dict(forged)
+    forged_unsigned.pop("bundle_sha256")
+    forged["bundle_sha256"] = protocol.sha256_json(forged_unsigned)
+    with pytest.raises(
+        state_helper.StateHelperError,
+        match="production_storage_authorization_invalid",
+    ):
+        state_helper.validate_authorization(
+            forged,
+            plan,
+            public_hex,
+            NOW + 4,
+            require_current=True,
+        )
+
+
 def test_exact_plan_is_production_specific_and_has_no_shrink_fiction() -> None:
     plan = _plan()
     assert plan["project"] == "adventico-ai-platform"
@@ -1284,6 +1314,69 @@ def test_service_routes_exact_production_storage_request_and_consume(
     assert passkey.FACTS_SCHEMA.encode("ascii") in service._APPROVAL_JS
 
 
+def test_service_and_owner_boundary_attest_release_bound_storage_key() -> None:
+    raw_key = bytes(range(32))
+    trust = {"trust_bundle_sha256": "6" * 64}
+    unsigned = {
+        "schema": "muncho-production-storage-authority-key-attestation.v1",
+        "release_sha": RELEASE,
+        "receipt_public_key_ed25519_hex": raw_key.hex(),
+        "receipt_public_key_id": hashlib.sha256(raw_key).hexdigest(),
+        "portable_trust_bundle_sha256": "6" * 64,
+        "portable_trust_bundle": trust,
+        "authority_manifest_sha256": "7" * 64,
+        "authority_host_receipt_sha256": "8" * 64,
+        "root_owned_trust_bundle_validated": True,
+        "rotation_requires_new_release_and_owner_install": True,
+    }
+    attestation = {
+        **unsigned,
+        "attestation_sha256": protocol.sha256_json(unsigned),
+    }
+    response = service.handle_intake_frame(
+        _intake_frame("attest_production_storage_authority", {}),
+        authority_client=_AuthorityClient(
+            ReceiptSigner(Ed25519PrivateKey.generate())
+        ),
+        executor_client=_UnusedExecutor(),
+        release_revision=RELEASE,
+        now_unix=NOW,
+        production_storage_authority_attestor=(
+            lambda release: attestation if release == RELEASE else {}
+        ),
+    )
+    assert response["document"] == attestation
+
+    class Transport:
+        def invoke_owner_gate(self, canonical_frame: bytes) -> bytes:
+            frame = protocol.decode_canonical_json(canonical_frame)
+            assert frame["operation"] == (
+                "attest_production_storage_authority"
+            )
+            response_unsigned = {
+                "schema": passkey.REMOTE_RESPONSE_SCHEMA,
+                "operation": frame["operation"],
+                "release_sha": RELEASE,
+                "ok": True,
+                "document": attestation,
+            }
+            return protocol.canonical_json_bytes({
+                **response_unsigned,
+                "response_sha256": protocol.sha256_json(response_unsigned),
+            })
+
+    boundary = passkey.ProductionStoragePasskeyBoundary(
+        RELEASE, Transport()
+    )
+    assert boundary.attest_authority() == attestation
+    attestation["receipt_public_key_id"] = "0" * 64
+    with pytest.raises(
+        passkey.ProductionStoragePasskeyError,
+        match="production_storage_authority_key_attestation_invalid",
+    ):
+        boundary.attest_authority()
+
+
 def test_owner_route_preflights_requests_then_applies_locally(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1539,6 +1632,155 @@ def test_owner_route_recaptures_and_revalidates_time_after_slow_preflight(
     )
     assert requested["passkey_request"]["request_id"] == "b" * 64
     assert observed_validation_times == [NOW + 300]
+
+
+def test_privileged_state_helper_must_open_before_passkey_consume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    calls: list[str] = []
+
+    class Boundary:
+        def request(self, **_kwargs):  # pragma: no cover - constructor gate
+            return {}
+
+        def consume(self, **_kwargs):
+            calls.append("consume")
+            raise AssertionError("consume must not run")
+
+    class Transport:
+        def _run_remote_input(self, *_args, **_kwargs):
+            raise AssertionError("transport must not run")
+
+    class Session:
+        def open(self):
+            calls.append("open")
+            raise executor.ProductionStorageExecutorError(
+                "production_storage_state_helper_unavailable"
+            )
+
+        def close(self):
+            calls.append("close")
+
+    route = owner_launcher.ProductionStorageGrowthOwnerRoute(
+        release_sha=RELEASE,
+        owner_identity=object(),
+        passkey_boundary=Boundary(),
+        production_transport=Transport(),
+        runtime_artifact_attestor=lambda: plan[
+            "runtime_artifact_attestation"
+        ],
+        state_root=executor.PRODUCTION_STATE_ROOT,
+        wall_clock=lambda: NOW,
+        expected_state_uid=0,
+        expected_state_gid=0,
+        state_session_factory=lambda **_kwargs: Session(),
+    )
+    monkeypatch.setattr(
+        route,
+        "_attest_runtime_artifacts",
+        lambda **_kwargs: plan["runtime_artifact_attestation"],
+    )
+    monkeypatch.setattr(
+        route,
+        "_attest_owner_state",
+        lambda _binding: {
+            "private_installation_receipt_sha256": "4" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        passkey,
+        "validate_external_iam_receipt",
+        lambda value, **_kwargs: value,
+    )
+    with pytest.raises(
+        executor.ProductionStorageExecutorError,
+        match="production_storage_state_helper_unavailable",
+    ):
+        route.apply_or_recover(
+            growth_plan=plan,
+            request_id="1" * 64,
+            consume_attempt_id="2" * 64,
+            external_iam_receipt={"receipt_sha256": "3" * 64},
+        )
+    assert calls == ["open", "close"]
+
+
+def test_privileged_state_helper_closes_after_consume_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    calls: list[str] = []
+
+    class Boundary:
+        def request(self, **_kwargs):  # pragma: no cover - constructor gate
+            return {}
+
+        def consume(self, **_kwargs):
+            calls.append("consume")
+            raise owner_launcher.OwnerLauncherError("consume_failed")
+
+    class Transport:
+        def _run_remote_input(self, *_args, **_kwargs):
+            raise AssertionError("transport must not run")
+
+    class Session:
+        def open(self):
+            calls.append("open")
+            return {"lock_acquired": True}
+
+        def close(self):
+            calls.append("close")
+
+    boundary = Boundary()
+    route = owner_launcher.ProductionStorageGrowthOwnerRoute(
+        release_sha=RELEASE,
+        owner_identity=object(),
+        passkey_boundary=boundary,
+        production_transport=Transport(),
+        runtime_artifact_attestor=lambda: plan[
+            "runtime_artifact_attestation"
+        ],
+        state_root=executor.PRODUCTION_STATE_ROOT,
+        wall_clock=lambda: NOW,
+        expected_state_uid=0,
+        expected_state_gid=0,
+        state_session_factory=lambda **_kwargs: Session(),
+    )
+    monkeypatch.setattr(
+        route,
+        "_attest_runtime_artifacts",
+        lambda **_kwargs: plan["runtime_artifact_attestation"],
+    )
+    monkeypatch.setattr(
+        route,
+        "_attest_owner_state",
+        lambda _binding: {
+            "private_installation_receipt_sha256": "4" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        passkey,
+        "validate_external_iam_receipt",
+        lambda value, **_kwargs: value,
+    )
+
+    def consume_then_fail(**kwargs):
+        boundary.consume(
+            growth_plan=kwargs["plan"],
+            request_id=kwargs["request_id"],
+            consume_attempt_id=kwargs["consume_attempt_id"],
+        )
+
+    monkeypatch.setattr(route, "_apply_after_state_ready", consume_then_fail)
+    with pytest.raises(owner_launcher.OwnerLauncherError, match="consume_failed"):
+        route.apply_or_recover(
+            growth_plan=plan,
+            request_id="1" * 64,
+            consume_attempt_id="2" * 64,
+            external_iam_receipt={"receipt_sha256": "3" * 64},
+        )
+    assert calls == ["open", "consume", "close"]
 
 
 def test_owner_route_runs_real_adapter_and_executor_end_to_end(

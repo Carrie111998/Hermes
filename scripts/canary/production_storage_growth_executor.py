@@ -13,6 +13,7 @@ import copy
 import fcntl
 import os
 import stat
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -28,6 +29,15 @@ JOURNAL_SCHEMA = "muncho-production-storage-growth-journal.v1"
 RESULT_SCHEMA = "muncho-production-storage-growth-result.v1"
 EVENT_SCHEMA = "muncho-production-storage-growth-event.v1"
 PRODUCTION_STATE_ROOT = Path("/var/lib/muncho-production-storage-growth")
+PRODUCTION_STATE_HELPER = Path(
+    "/usr/local/lib/muncho/production-storage-growth-state-helper"
+)
+STATE_HELPER_FRAME_SCHEMA = (
+    "muncho-production-storage-growth-state-helper-frame.v1"
+)
+STATE_HELPER_RESPONSE_SCHEMA = (
+    "muncho-production-storage-growth-state-helper-response.v1"
+)
 
 _JOURNAL_FIELDS = frozenset({
     "schema",
@@ -41,6 +51,7 @@ _JOURNAL_FIELDS = frozenset({
     "completed_at_unix",
     "final_observation",
     "prior_journal_head_sha256",
+    "transition_event",
     "journal_sha256",
 })
 _EVENT_FIELDS = frozenset({
@@ -76,6 +87,195 @@ class ProductionStorageExecutorError(RuntimeError):
     """Stable, secret-free execution failure."""
 
 
+class ProductionStoragePrivilegedStateSession:
+    """One exact root helper process whose lifetime holds the execution lock."""
+
+    def __init__(
+        self,
+        *,
+        release_sha: str,
+        growth_plan: Mapping[str, Any],
+        expected_installation_receipt_sha256: str,
+        runner: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    ) -> None:
+        if (
+            not isinstance(release_sha, str)
+            or len(release_sha) != 40
+            or not isinstance(growth_plan, Mapping)
+            or not _is_sha256(expected_installation_receipt_sha256)
+            or not callable(runner)
+        ):
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_configuration_invalid"
+            )
+        self._release_sha = release_sha
+        self._plan = contract.validate_plan(growth_plan)
+        self._expected_installation_receipt_sha256 = (
+            expected_installation_receipt_sha256
+        )
+        self._runner = runner
+        self._process: subprocess.Popen[bytes] | None = None
+
+    @staticmethod
+    def _validate_response(
+        raw: bytes,
+        *,
+        operation: str,
+    ) -> Mapping[str, Any]:
+        try:
+            value = protocol.decode_canonical_json(raw)
+        except protocol.PasskeyV2ProtocolError:
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_response_invalid"
+            ) from None
+        unsigned = {
+            name: item
+            for name, item in value.items()
+            if name != "response_sha256"
+        } if isinstance(value, Mapping) else {}
+        if (
+            not isinstance(value, Mapping)
+            or set(value)
+            != {
+                "schema", "operation", "ok", "document", "response_sha256"
+            }
+            or value.get("schema") != STATE_HELPER_RESPONSE_SCHEMA
+            or value.get("operation") != operation
+            or value.get("ok") is not True
+            or not isinstance(value.get("document"), Mapping)
+            or value.get("response_sha256") != protocol.sha256_json(unsigned)
+        ):
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_response_invalid"
+            )
+        return copy.deepcopy(dict(value["document"]))
+
+    def _receive(self, operation: str) -> Mapping[str, Any]:
+        process = self._process
+        if process is None or process.stdout is None:
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_unavailable"
+            )
+        raw = process.stdout.readline(2 * 1024 * 1024 + 2)
+        if not raw.endswith(b"\n") or len(raw) > 2 * 1024 * 1024 + 1:
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_unavailable"
+            )
+        return self._validate_response(raw[:-1], operation=operation)
+
+    def open(self) -> Mapping[str, Any]:
+        if self._process is not None:
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_sequence_invalid"
+            )
+        try:
+            self._process = self._runner(
+                (
+                    "/usr/bin/sudo", "--non-interactive", "--",
+                    str(PRODUCTION_STATE_HELPER),
+                ),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={
+                    "HOME": os.path.expanduser("~"),
+                    "LANG": "C", "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                },
+            )
+            ready = self._receive("ready")
+            if (
+                ready.get("release_sha") != self._release_sha
+                or ready.get("lock_acquired") is not True
+                or not _is_sha256(ready.get("state_helper_sha256"))
+                or ready.get("installation_receipt_sha256")
+                != self._expected_installation_receipt_sha256
+            ):
+                raise ProductionStorageExecutorError(
+                    "production_storage_state_helper_unavailable"
+                )
+            attested = self.call("attest", {
+                "release_sha": self._release_sha,
+                "growth_plan": self._plan,
+            })
+            if (
+                attested.get("release_sha") != self._release_sha
+                or attested.get("plan_sha256") != self._plan["plan_sha256"]
+                or attested.get("lock_acquired") is not True
+            ):
+                raise ProductionStorageExecutorError(
+                    "production_storage_state_helper_unavailable"
+                )
+            return attested
+        except ProductionStorageExecutorError:
+            self.close()
+            raise
+        except (OSError, subprocess.SubprocessError):
+            self.close()
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_unavailable"
+            ) from None
+
+    def call(
+        self,
+        operation: str,
+        document: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if operation not in {
+            "attest", "begin-or-recover", "append-failure", "complete"
+        } or not isinstance(document, Mapping):
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_sequence_invalid"
+            )
+        process = self._process
+        if process is None or process.stdin is None:
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_unavailable"
+            )
+        unsigned = {
+            "schema": STATE_HELPER_FRAME_SCHEMA,
+            "operation": operation,
+            "document": copy.deepcopy(dict(document)),
+        }
+        raw = protocol.canonical_json_bytes({
+            **unsigned,
+            "frame_sha256": protocol.sha256_json(unsigned),
+        }) + b"\n"
+        try:
+            process.stdin.write(raw)
+            process.stdin.flush()
+        except (OSError, BrokenPipeError):
+            raise ProductionStorageExecutorError(
+                "production_storage_state_helper_unavailable"
+            ) from None
+        return self._receive(operation)
+
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    def __del__(self) -> None:
+        self.close()
+
+
 def _is_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -100,6 +300,7 @@ def _validate_journal(
     bundle_sha = authorization_bundle["bundle_sha256"]
     receipt_sha = authorization_bundle["authorization_receipt"]["receipt_sha256"]
     state = journal.get("state")
+    transition = journal.get("transition_event")
     if (
         journal.get("schema") != JOURNAL_SCHEMA
         or state not in {"started", "completed"}
@@ -114,12 +315,26 @@ def _validate_journal(
         != authorization_bundle["authorization_receipt"]["prior_journal_head_sha256"]
         or journal.get("journal_sha256")
         != protocol.sha256_json(_journal_unsigned(journal))
+        or not isinstance(transition, Mapping)
+        or set(transition) != _EVENT_FIELDS
+        or transition.get("plan_sha256") != plan["plan_sha256"]
+        or transition.get("authorization_receipt_sha256") != receipt_sha
+        or transition.get("event_head_sha256")
+        != protocol.sha256_json({
+            name: item for name, item in transition.items()
+            if name != "event_head_sha256"
+        })
     ):
         raise ProductionStorageExecutorError("production_storage_journal_invalid")
     if state == "started":
         if (
             journal["completed_at_unix"] is not None
             or journal["final_observation"] is not None
+            or transition.get("event_kind") != "execution_started"
+            or transition.get("sequence") != 1
+            or transition.get("journal_state") != "started"
+            or transition.get("occurred_at_unix")
+            != journal["started_at_unix"]
         ):
             raise ProductionStorageExecutorError("production_storage_journal_invalid")
     else:
@@ -127,6 +342,12 @@ def _validate_journal(
             type(journal["completed_at_unix"]) is not int
             or journal["completed_at_unix"] < journal["started_at_unix"]
             or not isinstance(journal["final_observation"], Mapping)
+            or transition.get("event_kind") != "execution_completed"
+            or transition.get("journal_state") != "completed"
+            or transition.get("occurred_at_unix")
+            != journal["completed_at_unix"]
+            or transition.get("observation_sha256")
+            != journal["final_observation"].get("observation_sha256")
         ):
             raise ProductionStorageExecutorError("production_storage_journal_invalid")
         final = contract.validate_observation(
@@ -535,6 +756,8 @@ class ProductionStorageGrowthExecutor:
         journal_state: str,
         observation_sha256: str | None,
         failure_code: str | None,
+        occurred_at_unix: int | None = None,
+        expected_event: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         prior = (
             events[-1]["event_head_sha256"]
@@ -554,10 +777,16 @@ class ProductionStorageGrowthExecutor:
             "journal_state": journal_state,
             "observation_sha256": observation_sha256,
             "failure_code": failure_code,
-            "occurred_at_unix": self._now(),
+            "occurred_at_unix": (
+                self._now() if occurred_at_unix is None else occurred_at_unix
+            ),
             "prior_event_head_sha256": prior,
         }
         event = {**unsigned, "event_head_sha256": protocol.sha256_json(unsigned)}
+        if expected_event is not None and event != expected_event:
+            raise ProductionStorageExecutorError(
+                "production_storage_event_log_invalid"
+            )
         try:
             self._validate_state_node(
                 path,
@@ -604,6 +833,7 @@ class ProductionStorageGrowthExecutor:
         *,
         growth_plan: Mapping[str, Any],
         authorization_bundle: Mapping[str, Any],
+        privileged_state_session: ProductionStoragePrivilegedStateSession | None = None,
     ) -> Mapping[str, Any]:
         plan = contract.validate_plan(growth_plan)
         try:
@@ -633,6 +863,19 @@ class ProductionStorageGrowthExecutor:
             raise ProductionStorageExecutorError(
                 "production_storage_runtime_binding_invalid"
             )
+        if self._expected_state_uid == 0:
+            if not isinstance(
+                privileged_state_session,
+                ProductionStoragePrivilegedStateSession,
+            ):
+                raise ProductionStorageExecutorError(
+                    "production_storage_state_helper_unavailable"
+                )
+            return self._execute_privileged(
+                plan=plan,
+                authorization_bundle=authorization_bundle,
+                session=privileged_state_session,
+            )
         lock_fd = self._lock()
         try:
             return self._execute_locked(
@@ -644,6 +887,177 @@ class ProductionStorageGrowthExecutor:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             finally:
                 os.close(lock_fd)
+
+    def _execute_privileged(
+        self,
+        *,
+        plan: Mapping[str, Any],
+        authorization_bundle: Mapping[str, Any],
+        session: ProductionStoragePrivilegedStateSession,
+    ) -> Mapping[str, Any]:
+        attempt_now = self._now()
+        try:
+            bundle = passkey.validate_authorization_bundle(
+                authorization_bundle,
+                growth_plan=plan,
+                receipt_public_key=self._receipt_public_key,
+                now_unix=attempt_now,
+                # The root helper distinguishes a new transaction from an
+                # exact durable recovery.  New requires a current window;
+                # recovery proves started_at was inside the signed window.
+                require_current=False,
+            )
+        except passkey.ProductionStoragePasskeyError:
+            raise ProductionStorageExecutorError(
+                "production_storage_authorization_invalid"
+            ) from None
+        observation: Mapping[str, Any] | None = None
+        mutations: list[str] = []
+        began = False
+        try:
+            observation = self._transport.observe_exact_target()
+            state = self._classify(
+                observation,
+                now_unix=self._now(),
+                plan=plan,
+            )
+            begun = session.call("begin-or-recover", {
+                "authorization_bundle": bundle,
+                "initial_observation": observation,
+            })
+            journal = _validate_journal(
+                begun.get("journal"),
+                plan=plan,
+                authorization_bundle=bundle,
+            )
+            events = begun.get("events")
+            if not isinstance(events, list) or not events:
+                raise ProductionStorageExecutorError(
+                    "production_storage_event_log_invalid"
+                )
+            prior = bundle["authorization_receipt"][
+                "prior_journal_head_sha256"
+            ]
+            for sequence, event in enumerate(events, start=1):
+                unsigned = {
+                    name: item
+                    for name, item in event.items()
+                    if name != "event_head_sha256"
+                } if isinstance(event, Mapping) else {}
+                if (
+                    not isinstance(event, Mapping)
+                    or set(event) != _EVENT_FIELDS
+                    or event.get("sequence") != sequence
+                    or event.get("plan_sha256") != plan["plan_sha256"]
+                    or event.get("authorization_receipt_sha256")
+                    != bundle["authorization_receipt"]["receipt_sha256"]
+                    or event.get("prior_event_head_sha256") != prior
+                    or event.get("event_head_sha256")
+                    != protocol.sha256_json(unsigned)
+                ):
+                    raise ProductionStorageExecutorError(
+                        "production_storage_event_log_invalid"
+                    )
+                prior = event["event_head_sha256"]
+            began = True
+            recovered = begun.get("recovered") is True
+            if journal["state"] == "completed":
+                return _result(
+                    journal=journal,
+                    recovered=True,
+                    mutations=[],
+                    event_head_sha256=events[-1]["event_head_sha256"],
+                )
+            # Recovery always re-observes actual state under the same held
+            # root lock; the helper never tells the cloud client what to do.
+            if recovered:
+                observation = self._transport.observe_exact_target()
+                state = self._classify(
+                    observation,
+                    now_unix=self._now(),
+                    plan=plan,
+                )
+            if state == "source":
+                self._transport.resize_exact_disk_once(
+                    provider_request_id=plan["provider_request_id"]
+                )
+                mutations.append("provider_disk_resize_50_to_100")
+                observation = self._transport.observe_exact_target()
+                state = self._classify(
+                    observation,
+                    now_unix=self._now(),
+                    plan=plan,
+                )
+                if state == "source":
+                    raise ProductionStorageExecutorError(
+                        "production_storage_provider_resize_not_visible"
+                    )
+            if state == "partial":
+                self._transport.grow_exact_root_online(
+                    idempotency_key_sha256=plan["idempotency_key_sha256"]
+                )
+                mutations.append("online_partition_and_ext4_growth")
+                observation = self._transport.observe_exact_target()
+                state = self._classify(
+                    observation,
+                    now_unix=self._now(),
+                    plan=plan,
+                )
+            if state != "target":
+                raise ProductionStorageExecutorError(
+                    "production_storage_postflight_threshold_not_met"
+                )
+            final = contract.validate_observation(
+                observation,
+                now_unix=self._now(),
+            )
+            completed = session.call("complete", {
+                "final_observation": final,
+            })
+            terminal = _validate_journal(
+                completed.get("journal"),
+                plan=plan,
+                authorization_bundle=bundle,
+            )
+            event = completed.get("event")
+            if (
+                terminal["state"] != "completed"
+                or not isinstance(event, Mapping)
+                or event.get("event_kind") != "execution_completed"
+                or event.get("event_head_sha256")
+                != protocol.sha256_json({
+                    name: item
+                    for name, item in event.items()
+                    if name != "event_head_sha256"
+                })
+            ):
+                raise ProductionStorageExecutorError(
+                    "production_storage_state_helper_response_invalid"
+                )
+            return _result(
+                journal=terminal,
+                recovered=recovered,
+                mutations=mutations,
+                event_head_sha256=event["event_head_sha256"],
+            )
+        except BaseException as error:
+            if began:
+                observation_sha = (
+                    observation.get("observation_sha256")
+                    if isinstance(observation, Mapping)
+                    and _is_sha256(observation.get("observation_sha256"))
+                    else None
+                )
+                try:
+                    session.call("append-failure", {
+                        "observation_sha256": observation_sha,
+                        "failure_code": _stable_failure_code(error),
+                    })
+                except ProductionStorageExecutorError:
+                    raise ProductionStorageExecutorError(
+                        "production_storage_event_log_write_failed"
+                    ) from error
+            raise
 
     def _execute_locked(
         self,
@@ -686,6 +1100,8 @@ class ProductionStorageGrowthExecutor:
                             "observation_sha256"
                         ],
                         failure_code=None,
+                        occurred_at_unix=journal["completed_at_unix"],
+                        expected_event=journal["transition_event"],
                     )
                 return _result(
                     journal=journal,
@@ -706,6 +1122,31 @@ class ProductionStorageGrowthExecutor:
                 raise ProductionStorageExecutorError(
                     "production_storage_unowned_partial_state"
                 )
+            started_at_unix = self._now()
+            start_event_unsigned = {
+                "schema": EVENT_SCHEMA,
+                "sequence": 1,
+                "event_kind": "execution_started",
+                "plan_sha256": plan["plan_sha256"],
+                "authorization_receipt_sha256": bundle[
+                    "authorization_receipt"
+                ]["receipt_sha256"],
+                "journal_state": "started",
+                "observation_sha256": initial_observation[
+                    "observation_sha256"
+                ],
+                "failure_code": None,
+                "occurred_at_unix": started_at_unix,
+                "prior_event_head_sha256": bundle[
+                    "authorization_receipt"
+                ]["prior_journal_head_sha256"],
+            }
+            start_event = {
+                **start_event_unsigned,
+                "event_head_sha256": protocol.sha256_json(
+                    start_event_unsigned
+                ),
+            }
             journal_unsigned = {
                 "schema": JOURNAL_SCHEMA,
                 "state": "started",
@@ -716,12 +1157,13 @@ class ProductionStorageGrowthExecutor:
                 ],
                 "provider_request_id": plan["provider_request_id"],
                 "idempotency_key_sha256": plan["idempotency_key_sha256"],
-                "started_at_unix": self._now(),
+                "started_at_unix": started_at_unix,
                 "completed_at_unix": None,
                 "final_observation": None,
                 "prior_journal_head_sha256": bundle["authorization_receipt"][
                     "prior_journal_head_sha256"
                 ],
+                "transition_event": start_event,
             }
             journal = {
                 **journal_unsigned,
@@ -737,6 +1179,8 @@ class ProductionStorageGrowthExecutor:
                 journal_state="started",
                 observation_sha256=initial_observation["observation_sha256"],
                 failure_code=None,
+                occurred_at_unix=started_at_unix,
+                expected_event=start_event,
             )
 
         if not events:
@@ -750,8 +1194,12 @@ class ProductionStorageGrowthExecutor:
                 events=events,
                 event_kind="execution_started",
                 journal_state="started",
-                observation_sha256=None,
+                observation_sha256=journal["transition_event"][
+                    "observation_sha256"
+                ],
                 failure_code=None,
+                occurred_at_unix=journal["started_at_unix"],
+                expected_event=journal["transition_event"],
             )
         elif events[0]["event_kind"] != "execution_started":
             raise ProductionStorageExecutorError("production_storage_event_log_invalid")
@@ -810,11 +1258,32 @@ class ProductionStorageGrowthExecutor:
                 failure_code=_stable_failure_code(error),
             )
             raise
+        completion_event_unsigned = {
+            "schema": EVENT_SCHEMA,
+            "sequence": len(events) + 1,
+            "event_kind": "execution_completed",
+            "plan_sha256": plan["plan_sha256"],
+            "authorization_receipt_sha256": bundle[
+                "authorization_receipt"
+            ]["receipt_sha256"],
+            "journal_state": "completed",
+            "observation_sha256": final["observation_sha256"],
+            "failure_code": None,
+            "occurred_at_unix": completed_at_unix,
+            "prior_event_head_sha256": events[-1]["event_head_sha256"],
+        }
+        completion_event = {
+            **completion_event_unsigned,
+            "event_head_sha256": protocol.sha256_json(
+                completion_event_unsigned
+            ),
+        }
         completed_unsigned = {
             **_journal_unsigned(journal),
             "state": "completed",
             "completed_at_unix": completed_at_unix,
             "final_observation": final,
+            "transition_event": completion_event,
         }
         completed = {
             **completed_unsigned,
@@ -830,6 +1299,8 @@ class ProductionStorageGrowthExecutor:
             journal_state="completed",
             observation_sha256=final["observation_sha256"],
             failure_code=None,
+            occurred_at_unix=completed_at_unix,
+            expected_event=completion_event,
         )
         return _result(
             journal=completed,
@@ -843,8 +1314,10 @@ __all__ = [
     "ExactProductionStorageTransport",
     "EVENT_SCHEMA",
     "JOURNAL_SCHEMA",
+    "PRODUCTION_STATE_HELPER",
     "ProductionStorageExecutorError",
     "ProductionStorageGrowthExecutor",
+    "ProductionStoragePrivilegedStateSession",
     "PRODUCTION_STATE_ROOT",
     "RESULT_SCHEMA",
 ]

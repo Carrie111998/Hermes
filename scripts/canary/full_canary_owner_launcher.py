@@ -19046,6 +19046,7 @@ class OwnerGateIapTransport:
     })
     _FULL_IAM_RESPONSE_OPERATIONS = frozenset({
         "attest_cloud_observation",
+        "attest_production_storage_authority",
     })
     _ENVIRONMENT_KEYS = frozenset({
         "HOME",
@@ -20112,6 +20113,7 @@ class ProductionStorageGrowthOwnerRoute:
         expected_state_gid: int = 0,
         compute_urlopen: Callable[..., Any] = urllib.request.urlopen,
         compute_sleep: Callable[[float], None] = time.sleep,
+        state_session_factory: Callable[..., Any] | None = None,
     ) -> None:
         from scripts.canary import production_storage_growth_executor as executor
 
@@ -20128,6 +20130,8 @@ class ProductionStorageGrowthOwnerRoute:
             or expected_state_gid < 0
             or not callable(compute_urlopen)
             or not callable(compute_sleep)
+            or state_session_factory is not None
+            and not callable(state_session_factory)
         ):
             raise OwnerLauncherError("production_storage_owner_route_invalid")
         self._release_sha = release_sha
@@ -20142,6 +20146,25 @@ class ProductionStorageGrowthOwnerRoute:
         self._expected_state_gid = expected_state_gid
         self._compute_urlopen = compute_urlopen
         self._compute_sleep = compute_sleep
+        self._state_session_factory = (
+            state_session_factory
+            or executor.ProductionStoragePrivilegedStateSession
+        )
+
+    def attest_authority_key(self) -> Mapping[str, Any]:
+        """Read the release-bound receipt key over the pinned owner-gate edge."""
+
+        attest = getattr(self._boundary, "attest_authority", None)
+        if not callable(attest):
+            raise OwnerLauncherError(
+                "production_storage_authority_key_attestation_unavailable"
+            )
+        try:
+            return attest()
+        except Exception:
+            raise OwnerLauncherError(
+                "production_storage_authority_key_attestation_invalid"
+            ) from None
 
     def _fixed_guest_client(self, *, account: str) -> Any:
         from scripts.canary import production_storage_growth_adapter as adapter
@@ -20198,6 +20221,30 @@ class ProductionStorageGrowthOwnerRoute:
             self._attest_runtime_artifacts(),
         )
 
+    def _attest_owner_state(
+        self,
+        binding: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        from scripts.canary import production_storage_growth_installer as installer
+
+        if self._expected_state_uid == 0:
+            return installer.attest_owner_state_public(
+                self._release_sha,
+                sealed_artifact_binding=binding,
+                state_root=self._state_root,
+                public_readiness_path=installer.OWNER_PUBLIC_READINESS,
+                expected_uid=self._expected_state_uid,
+                expected_gid=self._expected_state_gid,
+            )
+        return installer.attest_owner_state_root(
+            self._release_sha,
+            sealed_artifact_binding=binding,
+            state_root=self._state_root,
+            installation_receipt=self._state_root / ".installation.json",
+            expected_uid=self._expected_state_uid,
+            expected_gid=self._expected_state_gid,
+        )
+
     def install_guest_prerequisite(self) -> Mapping[str, Any]:
         """Install only the fixed root guest entrypoint through cutover IAP."""
 
@@ -20205,14 +20252,7 @@ class ProductionStorageGrowthOwnerRoute:
 
         try:
             binding = self._owner_artifact_binding()
-            owner_readiness = installer.attest_owner_state_root(
-                self._release_sha,
-                sealed_artifact_binding=binding,
-                state_root=self._state_root,
-                installation_receipt=self._state_root / ".installation.json",
-                expected_uid=self._expected_state_uid,
-                expected_gid=self._expected_state_gid,
-            )
+            owner_readiness = self._attest_owner_state(binding)
         except installer.ProductionStorageInstallerError:
             raise OwnerLauncherError(
                 "production_storage_owner_state_not_installed"
@@ -20282,14 +20322,7 @@ class ProductionStorageGrowthOwnerRoute:
             artifacts,
         )
         try:
-            installer.attest_owner_state_root(
-                self._release_sha,
-                sealed_artifact_binding=binding,
-                state_root=self._state_root,
-                installation_receipt=self._state_root / ".installation.json",
-                expected_uid=self._expected_state_uid,
-                expected_gid=self._expected_state_gid,
-            )
+            self._attest_owner_state(binding)
         except installer.ProductionStorageInstallerError:
             raise OwnerLauncherError(
                 "production_storage_owner_state_not_installed"
@@ -20432,16 +20465,7 @@ class ProductionStorageGrowthOwnerRoute:
                 self._release_sha,
                 artifacts,
             )
-            owner_readiness = installer.attest_owner_state_root(
-                self._release_sha,
-                sealed_artifact_binding=binding,
-                state_root=self._state_root,
-                installation_receipt=(
-                    self._state_root / ".installation.json"
-                ),
-                expected_uid=self._expected_state_uid,
-                expected_gid=self._expected_state_gid,
-            )
+            owner_readiness = self._attest_owner_state(binding)
         except installer.ProductionStorageInstallerError:
             raise OwnerLauncherError(
                 "production_storage_owner_state_not_installed"
@@ -20558,11 +20582,69 @@ class ProductionStorageGrowthOwnerRoute:
         self._attest_runtime_artifacts(
             expected=plan["runtime_artifact_attestation"]
         )
+        binding = installer.build_owner_artifact_binding(
+            self._release_sha,
+            plan["runtime_artifact_attestation"],
+        )
+        try:
+            owner_readiness = self._attest_owner_state(binding)
+        except installer.ProductionStorageInstallerError:
+            raise OwnerLauncherError(
+                "production_storage_owner_state_not_installed"
+            ) from None
         authorized_iam = storage.validate_external_iam_receipt(
             external_iam_receipt,
             now_unix=now_unix,
             minimum_remaining_seconds=0,
         )
+        state_session = None
+        if self._expected_state_uid == 0:
+            if self._state_root != executor.PRODUCTION_STATE_ROOT:
+                raise OwnerLauncherError(
+                    "production_storage_state_root_invalid"
+                )
+            state_session = self._state_session_factory(
+                release_sha=self._release_sha,
+                growth_plan=plan,
+                expected_installation_receipt_sha256=owner_readiness[
+                    "private_installation_receipt_sha256"
+                ],
+            )
+        try:
+            if state_session is not None:
+                # The helper handshake and root lock deliberately precede
+                # passkey consume and every production mutation.
+                state_session.open()
+            return self._apply_after_state_ready(
+                plan=plan,
+                request_id=request_id,
+                consume_attempt_id=consume_attempt_id,
+                authorized_iam=authorized_iam,
+                now_unix=now_unix,
+                state_session=state_session,
+            )
+        finally:
+            if state_session is not None:
+                state_session.close()
+
+    def _apply_after_state_ready(
+        self,
+        *,
+        plan: Mapping[str, Any],
+        request_id: str,
+        consume_attempt_id: str,
+        authorized_iam: Mapping[str, Any],
+        now_unix: int,
+        state_session: Any | None,
+    ) -> Mapping[str, Any]:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+        from scripts.canary import production_storage_growth_adapter as adapter
+        from scripts.canary import production_storage_growth_contract as contract
+        from scripts.canary import production_storage_growth_executor as executor
+        from scripts.canary import production_storage_growth_installer as installer
+
         consumed = self._boundary.consume(
             growth_plan=plan,
             request_id=request_id,
@@ -20652,6 +20734,7 @@ class ProductionStorageGrowthOwnerRoute:
         ).execute(
             growth_plan=plan,
             authorization_bundle=authorization_bundle,
+            privileged_state_session=state_session,
         )
         self._owner_identity.require_stable()
         unsigned = {
