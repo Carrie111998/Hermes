@@ -1191,9 +1191,12 @@ class MatrixAdapter(BasePlatformAdapter):
                     "like Element. Replacing the keys would permanently "
                     "invalidate the cross-signing signature (the homeserver "
                     "never deletes the old one), so refusing. Use a session "
-                    "that has never been used by an encrypted client: set "
-                    "MATRIX_PASSWORD (and unset MATRIX_ACCESS_TOKEN) so the "
-                    "bot logs in itself.",
+                    "that has never been used by an encrypted client: either "
+                    "generate a fresh MATRIX_ACCESS_TOKEN, or set "
+                    "MATRIX_PASSWORD and unset MATRIX_ACCESS_TOKEN so the bot "
+                    "logs in itself. Either way MATRIX_DEVICE_ID must be unset "
+                    "— it is passed straight through to login and would reuse "
+                    "this same conflicting device.",
                     client.device_id,
                     ", ".join(foreign_sigs),
                 )

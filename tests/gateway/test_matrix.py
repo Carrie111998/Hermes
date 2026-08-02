@@ -5349,15 +5349,25 @@ class TestRefuseClobberingForeignDeviceKeys:
         client, olm = self._make_client_and_olm(
             {"ed25519:DEVICE1": "selfsig", "ed25519:sskpubkey": "crosssig"}
         )
+        # The unsafe path DELETEs the device before it ever reaches
+        # share_keys(), so asserting on share_keys() alone would still pass
+        # against a build that destroys the device. Assert on the request
+        # itself.
+        client.api = MagicMock()
+        client.api.request = AsyncMock()
         with patch.object(
             adapter, "_extract_server_ed25519", return_value="element-key"
         ), caplog.at_level(logging.ERROR):
             result = await adapter._verify_device_keys_on_server(client, olm)
 
         assert result is False
+        client.api.request.assert_not_awaited()
         olm.share_keys.assert_not_awaited()
         assert "cross-signed encryption keys" in caplog.text
-        assert "MATRIX_PASSWORD" in caplog.text
+        # Recovery guidance must not stop at MATRIX_PASSWORD: password login
+        # passes MATRIX_DEVICE_ID straight through and would reuse the same
+        # conflicting device.
+        assert "MATRIX_DEVICE_ID must be unset" in caplog.text
 
     @pytest.mark.asyncio
     async def test_reupload_proceeds_without_cross_signature(self):
