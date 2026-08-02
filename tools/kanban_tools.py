@@ -50,11 +50,19 @@ KANBAN_LIST_MAX_LIMIT = 200
 
 
 def _profile_has_kanban_toolset() -> bool:
-    """Return whether the active CLI profile explicitly enables Kanban."""
+    """Return whether the active profile explicitly enables Kanban.
+
+    ``platform_toolsets.cli`` is the current configuration path. Keep the
+    legacy top-level ``toolsets: [kanban]`` form working for existing
+    orchestrator profiles until they migrate.
+    """
     try:
         from hermes_cli.config import load_config
 
         cfg = load_config()
+        legacy = cfg.get("toolsets")
+        if isinstance(legacy, list) and "kanban" in legacy:
+            return True
         configured = (cfg.get("platform_toolsets") or {}).get("cli")
         return isinstance(configured, list) and "kanban" in configured
     except Exception:

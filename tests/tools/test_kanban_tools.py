@@ -130,6 +130,20 @@ def test_explicit_kanban_profile_routes_without_task_env(
     assert {"kanban_create", "kanban_list", "kanban_link"} <= names
 
 
+def test_legacy_toolsets_profile_routes(routing_worker_env):
+    """Existing profiles using top-level ``toolsets`` retain routing."""
+    from pathlib import Path
+    from tools.registry import invalidate_check_fn_cache
+
+    Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
+        "toolsets:\n"
+        "  - kanban\n"
+    )
+    invalidate_check_fn_cache()
+    names = _kanban_schema_names()
+    assert {"kanban_create", "kanban_list", "kanban_link", "kanban_unblock"} <= names
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})

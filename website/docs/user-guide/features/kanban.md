@@ -286,7 +286,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 
 ## How workers interact with the board
 
-**Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
+**Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in `platform_toolsets.cli` (or the legacy top-level `toolsets` list). These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the ...
 
 | Tool | Purpose | Required params |
 |---|---|---|
@@ -344,7 +344,7 @@ kanban_block(
 # On continuation: kanban_show(), inspect handoffs, then correct or complete.
 ```
 
-The routing tools — `kanban_list`, `kanban_create`, `kanban_link`, and `kanban_unblock` — require the active profile to explicitly enable `kanban` in `platform_toolsets.cli`. Ordinary dispatcher workers still receive their task lifecycle tools automatically, but cannot fan out or rewrite the graph.
+The routing tools — `kanban_list`, `kanban_create`, `kanban_link`, and `kanban_unblock` — require the active profile to explicitly enable `kanban` in `platform_toolsets.cli` or the legacy top-level `toolsets` list. Ordinary dispatcher workers still receive their task lifecycle tools automatically, but cannot fan out or rewrite the graph.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -354,7 +354,7 @@ Three reasons:
 2. **No shell-quoting fragility.** Passing `--metadata '{"files": [...]}'` through shlex + argparse is a latent footgun. Structured tool args skip it entirely.
 3. **Better errors.** Tool results are structured JSON the model can reason about, not stderr strings it has to parse.
 
-**Zero schema footprint on normal sessions.** A regular `hermes chat` session has zero `kanban_*` tools in its schema unless the active profile explicitly enables the `kanban` toolset for orchestrator work. Dispatcher-spawned task workers get task-scoped tools because `HERMES_KANBAN_TASK` is set; orchestrator profiles get the broader routing surface through config. No tool bloat for users who never touch kanban.
+**Zero schema footprint on normal sessions.** A regular `hermes chat` session has zero `kanban_*` tools in its schema unless the active profile explicitly enables the `kanban` toolset for orchestrator work (via `platform_toolsets.cli` or the legacy top-level `toolsets` list). Dispatcher-spawned task workers get task-scoped tools because `HERMES_KANBAN_TASK` is set; orchestrator profiles get the broader routing surface through config. No tool bloat for users who never touch kanban.
 
 The auto-injected kanban guidance teaches the model which tool to call when and in what order.
 
@@ -584,7 +584,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose` | `true` | Dispatcher auto-runs the decomposer every tick. |
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
-| `default_assignee` | `""` | Profile assigned to otherwise unassigned ready tasks. Empty leaves them unassigned for explicit routing. |
+| `default_assignee` | `""` | Profile assigned to otherwise unassigned ready tasks. Empty = fall back to the active profile, or `default` if no active profile is available. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
 
 And the two auxiliary LLM slots:
