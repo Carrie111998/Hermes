@@ -313,9 +313,12 @@ class DiscordStreamingKwsManager:
             self._stats[key] = self._stats.get(key, 0) + amount
 
     def snapshot_stats(self) -> Dict[str, Any]:
-        with self._stats_lock:
-            stats: Dict[str, Any] = dict(self._stats)
+        # Global lock order is lifecycle -> stats -> forced-end. Admission,
+        # close, and the worker all follow this order; diagnostics must not
+        # invert it or they can deadlock against an in-flight `_bump()`.
         with self._lifecycle_lock:
+            with self._stats_lock:
+                stats: Dict[str, Any] = dict(self._stats)
             stats["queue_depth"] = self._queue.qsize()
             with self._forced_end_lock:
                 stats["forced_end_depth"] = len(self._forced_ends)
@@ -391,6 +394,7 @@ class DiscordStreamingKwsManager:
             if not self._closed.is_set():
                 self._state = DiscordStreamingKwsState.CLOSING
                 self._closed.set()
+                self._ready.set()
                 # Shutdown is terminal: discard every queued PCM/control item
                 # before waking the worker. In-flight inference may finish, but
                 # it cannot resume stale queued audio after this boundary.
@@ -403,7 +407,11 @@ class DiscordStreamingKwsManager:
             # Native inference cannot be force-cancelled safely. Keep close
             # prompt and bounded; the worker observes _closed as soon as the
             # in-flight call returns and exits without consuming more PCM.
-            self._thread.join(timeout=0.25)
+            self._thread.join(timeout=0.01)
+        if not self._thread.is_alive():
+            with self._lifecycle_lock:
+                if self._state is DiscordStreamingKwsState.CLOSING:
+                    self._state = DiscordStreamingKwsState.CLOSED
 
     def _discard_queue(self) -> None:
         while True:
@@ -444,9 +452,11 @@ class DiscordStreamingKwsManager:
             keyword_index: int,
             observed_at: float,
         ) -> None:
-            # Callback delivery is a lifecycle side effect. Holding the
-            # re-entrant gate makes it linearize either wholly before close or
-            # not at all; callbacks may still call close() themselves.
+            # Reserve callback delivery under the lifecycle gate, then invoke
+            # user code outside every manager lock. The reservation is the
+            # linearization point: close either wins first (no callback) or the
+            # callback is admitted first, but a blocked callback can never hold
+            # close hostage.
             with self._lifecycle_lock:
                 token_key = stream_key[:2]
                 if (
@@ -478,14 +488,14 @@ class DiscordStreamingKwsManager:
                         (time.monotonic() - observed_at) * 1000
                     ),
                 }
-                try:
-                    self._on_detection(event)
-                except Exception as exc:
-                    self._bump("worker_errors")
-                    logger.info(
-                        "Discord streaming KWS callback failed type=%s",
-                        type(exc).__name__,
-                    )
+            try:
+                self._on_detection(event)
+            except Exception as exc:
+                self._bump("worker_errors")
+                logger.info(
+                    "Discord streaming KWS callback failed type=%s",
+                    type(exc).__name__,
+                )
 
         try:
             engine = self._engine_factory(self.config, self.phrases)
@@ -505,11 +515,25 @@ class DiscordStreamingKwsManager:
                     self._forced_ends.clear()
                 self._ready.set()
             return
+        exit_before_run = False
         with self._lifecycle_lock:
             if self._state is not DiscordStreamingKwsState.STARTING:
-                return
-            self._state = DiscordStreamingKwsState.RUNNING
-            self._ready.set()
+                exit_before_run = True
+            else:
+                self._state = DiscordStreamingKwsState.RUNNING
+                self._ready.set()
+        if exit_before_run:
+            # close() may win while native engine construction is still
+            # blocked. The constructor result must still be closed and the
+            # terminal state published once construction returns.
+            try:
+                engine.close()
+            except Exception:
+                pass
+            with self._lifecycle_lock:
+                if self._state is DiscordStreamingKwsState.CLOSING:
+                    self._state = DiscordStreamingKwsState.CLOSED
+            return
         try:
             while not self._closed.is_set():
                 _drain_forced_ends()

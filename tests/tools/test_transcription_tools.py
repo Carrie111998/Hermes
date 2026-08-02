@@ -1766,3 +1766,149 @@ class TestRunCommandSttIdleTimeout:
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")
+
+
+class TestFinalSttBoundaryAdversarial:
+    def test_marker_subclass_is_rebuilt_and_drops_untrusted_extra_fields(self):
+        from tools.transcription_tools import _STTFailure, normalize_stt_result
+
+        canary = "MARKER_PRIVATE_CANARY_75325"
+        unsafe = _STTFailure(
+            {
+                "success": False,
+                "transcript": canary,
+                "error": canary,
+                "error_code": "provider_api_error",
+                "provider": canary,
+                "stage": "request",
+                "error_type": "APIError",
+                "stdout": canary,
+                "stderr": canary,
+            }
+        )
+
+        result = normalize_stt_result(unsafe, provider="openai")
+
+        assert result == {
+            "success": False,
+            "transcript": "",
+            "error": "Speech transcription failed",
+            "error_code": "provider_failure",
+            "provider": "openai",
+            "stage": "transcribe",
+            "error_type": "ProviderError",
+        }
+        assert canary not in repr(result)
+        assert "stdout" not in result and "stderr" not in result
+
+    def test_untrusted_marker_is_rebuilt_again_at_public_dispatch(
+        self, sample_ogg
+    ):
+        from tools.transcription_tools import _STTFailure, transcribe_audio
+
+        canary = "PUBLIC_MARKER_PRIVATE_CANARY_75325"
+        unsafe = _STTFailure(
+            {
+                "success": False,
+                "transcript": canary,
+                "error": canary,
+                "error_code": canary,
+                "provider": canary,
+                "stage": canary,
+                "error_type": canary,
+                "stderr": canary,
+            }
+        )
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"provider": "local"},
+        ), patch(
+            "tools.transcription_tools._get_provider", return_value="local"
+        ), patch(
+            "tools.transcription_tools._transcribe_prepared_audio",
+            return_value=unsafe,
+        ):
+            result = transcribe_audio(sample_ogg)
+
+        assert result["error_code"] == "provider_result_failure"
+        assert result["provider"] == "local"
+        assert result["stage"] == "transcribe"
+        assert result["error_type"] == "ProviderError"
+        assert canary not in repr(result)
+        assert "stderr" not in result
+
+    def test_success_result_keeps_only_transcript_and_bounded_provider(self):
+        from tools.transcription_tools import normalize_stt_result
+
+        canary = "SUCCESS_EXTRA_PRIVATE_CANARY_75325"
+        result = normalize_stt_result(
+            {
+                "success": True,
+                "transcript": "intentional spoken text",
+                "provider": canary,
+                "stdout": canary,
+                "stderr": canary,
+                "response": {"body": canary},
+            },
+            provider="plugin-safe",
+        )
+
+        assert result == {
+            "success": True,
+            "transcript": "intentional spoken text",
+            "provider": "plugin-safe",
+        }
+        assert canary not in repr(result)
+
+    def test_provider_resolution_exception_is_caught_at_public_boundary(
+        self, sample_ogg, caplog
+    ):
+        from tools.transcription_tools import transcribe_audio
+
+        canary = "PROVIDER_RESOLUTION_PRIVATE_CANARY_75325"
+        caplog.set_level("INFO", logger="tools.transcription_tools")
+        with patch(
+            "tools.transcription_tools._get_provider",
+            side_effect=RuntimeError(canary),
+        ):
+            result = transcribe_audio(sample_ogg)
+
+        assert result["error_code"] == "provider_resolution_failed"
+        assert result["provider"] == "unknown"
+        assert result["error_type"] == "RuntimeError"
+        assert canary not in repr(result)
+        assert canary not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    def test_xai_untrusted_duration_cannot_trigger_logging_traceback(
+        self, monkeypatch, sample_ogg, caplog, capsys
+    ):
+        from tools.transcription_tools import _transcribe_xai
+
+        canary = "XAI_DURATION_PRIVATE_CANARY_75325"
+
+        class HostileDuration:
+            def __float__(self):
+                raise RuntimeError(canary)
+
+            def __str__(self):
+                return canary
+
+        monkeypatch.setenv("XAI_API_KEY", "test-key")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "text": "safe transcript",
+            "language": "en",
+            "duration": HostileDuration(),
+        }
+        caplog.set_level("INFO", logger="tools.transcription_tools")
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), patch(
+            "requests.post", return_value=response
+        ):
+            result = _transcribe_xai(sample_ogg, "grok-stt")
+
+        captured = capsys.readouterr()
+        assert result["success"] is True
+        assert canary not in caplog.text
+        assert canary not in captured.err
+        assert "Logging error" not in captured.err

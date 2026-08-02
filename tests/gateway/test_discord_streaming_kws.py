@@ -919,3 +919,105 @@ def test_worker_inference_and_idle_flush_errors_are_bounded(caplog):
         assert "sensitive flush data" not in caplog.text
     finally:
         manager.close()
+
+
+def test_close_during_blocked_startup_eventually_closes_engine_and_state():
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+    engine_holder = []
+
+    def slow_factory(*_args):
+        factory_entered.set()
+        assert release_factory.wait(timeout=2)
+        engine = _FakeEngine(None, None)
+        engine_holder.append(engine)
+        return engine
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True),
+        ("하나야 잠깐",),
+        lambda _event: None,
+        engine_factory=slow_factory,
+    )
+    assert factory_entered.wait(timeout=1)
+
+    started = time.monotonic()
+    manager.close()
+    assert time.monotonic() - started < 0.15
+    assert manager.snapshot_stats()["state"] == "CLOSING"
+    assert manager.begin_playback(1, 60) is False
+    assert manager.offer_pcm(1, 60, 42, b"pcm") is False
+
+    release_factory.set()
+    manager._thread.join(timeout=1)
+    assert not manager._thread.is_alive()
+    assert engine_holder and engine_holder[0].closed is True
+    assert manager.snapshot_stats()["state"] == "CLOSED"
+    assert manager.snapshot_stats()["queue_depth"] == 0
+
+
+def test_close_is_prompt_while_already_admitted_callback_is_blocked():
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def blocked_callback(_event):
+        callback_entered.set()
+        assert release_callback.wait(timeout=2)
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True),
+        ("하나야 잠깐",),
+        blocked_callback,
+        engine_factory=lambda *_args: _FakeEngine(None, None, fire_on=1),
+    )
+    manager.begin_playback(1, 70)
+    manager.offer_pcm(1, 70, 42, b"\x00" * 3840)
+    assert callback_entered.wait(timeout=1)
+
+    started = time.monotonic()
+    manager.close()
+    assert time.monotonic() - started < 0.15
+    assert manager.snapshot_stats()["state"] == "CLOSING"
+    assert manager.begin_playback(1, 71) is False
+
+    release_callback.set()
+    manager._thread.join(timeout=1)
+    assert not manager._thread.is_alive()
+    assert manager.snapshot_stats()["state"] == "CLOSED"
+
+
+def test_snapshot_and_admission_share_one_non_inverting_lock_order():
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=128),
+        ("하나야 잠깐",),
+        lambda _event: None,
+        engine_factory=lambda *_args: _FakeEngine(None, None, fire_on=100000),
+    )
+    manager.begin_playback(1, 80)
+    errors = []
+
+    def snapshots():
+        try:
+            for _ in range(500):
+                manager.snapshot_stats()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def offers():
+        try:
+            for _ in range(500):
+                manager.offer_pcm(1, 80, 42, b"\x00" * 384)
+        except BaseException as exc:
+            errors.append(exc)
+
+    snapshot_thread = threading.Thread(target=snapshots)
+    offer_thread = threading.Thread(target=offers)
+    snapshot_thread.start()
+    offer_thread.start()
+    snapshot_thread.join(timeout=1)
+    offer_thread.join(timeout=1)
+
+    assert not snapshot_thread.is_alive()
+    assert not offer_thread.is_alive()
+    assert errors == []
+    manager.close()

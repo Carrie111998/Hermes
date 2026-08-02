@@ -28,6 +28,7 @@ Usage::
 """
 
 import logging
+import math
 import os
 import platform
 import queue
@@ -128,15 +129,23 @@ LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
 STT_FAILURE_MESSAGE = "Speech transcription failed"
+_STT_FAILURE_TOKEN = object()
 
 
 class _STTFailure(dict):
     """Marker subclass for failures created by the privacy boundary."""
 
+    def __init__(self, values: Dict[str, Any], *, _token: object = None) -> None:
+        super().__init__(values)
+        self._trusted_boundary_value = _token is _STT_FAILURE_TOKEN
+
 
 def _safe_stt_metadata_token(value: Any, fallback: str) -> str:
     """Return a bounded identifier safe for result metadata and logs."""
-    token = str(value or "").strip()
+    try:
+        token = str(value or "").strip()
+    except Exception:  # untrusted provider metadata may define hostile __str__
+        return fallback
     if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", token):
         return token
     return fallback
@@ -165,15 +174,18 @@ def make_stt_failure(
     Dynamic exception messages, provider bodies, command output, transcripts,
     and paths are deliberately not accepted by this API.
     """
-    result: Dict[str, Any] = _STTFailure({
-        "success": False,
-        "transcript": "",
-        "error": STT_FAILURE_MESSAGE,
-        "error_code": _safe_stt_metadata_token(error_code, "stt_failed"),
-        "provider": _safe_stt_metadata_token(provider, "unknown"),
-        "stage": _safe_stt_metadata_token(stage, "unknown"),
-        "error_type": _safe_stt_metadata_token(error_type, "STTError"),
-    })
+    result: Dict[str, Any] = _STTFailure(
+        {
+            "success": False,
+            "transcript": "",
+            "error": STT_FAILURE_MESSAGE,
+            "error_code": _safe_stt_metadata_token(error_code, "stt_failed"),
+            "provider": _safe_stt_metadata_token(provider, "unknown"),
+            "stage": _safe_stt_metadata_token(stage, "unknown"),
+            "error_type": _safe_stt_metadata_token(error_type, "STTError"),
+        },
+        _token=_STT_FAILURE_TOKEN,
+    )
     if no_speech:
         result["no_speech"] = True
     return result
@@ -190,11 +202,40 @@ def normalize_stt_result(
     """Preserve successes and replace every untrusted failure with safe data."""
     safe_provider = _safe_stt_metadata_token(provider, "unknown")
     if isinstance(result, dict) and result.get("success") is True:
-        normalized = dict(result)
-        normalized.setdefault("provider", safe_provider)
-        return normalized
-    if isinstance(result, _STTFailure):
-        return result
+        transcript = result.get("transcript", "")
+        if not isinstance(transcript, str):
+            return make_stt_failure(
+                error_code="provider_invalid_result",
+                provider=safe_provider,
+                stage=stage,
+                error_type="InvalidResultError",
+            )
+        # Success crosses the same allowlist boundary as failure. Transcript is
+        # the one intentional content field; provider-controlled stderr,
+        # stdout, paths, response objects, and arbitrary extras are discarded.
+        return {
+            "success": True,
+            "transcript": transcript,
+            "provider": safe_provider,
+        }
+    if isinstance(result, _STTFailure) and getattr(
+        result, "_trusted_boundary_value", False
+    ):
+        # The marker is an implementation detail, not a trust capability.
+        # Rebuild it from the allowlisted schema so a plugin that imports the
+        # class cannot smuggle transcript/error bodies or arbitrary extra keys
+        # through the public boundary.
+        return make_stt_failure(
+            error_code=_safe_stt_metadata_token(
+                result.get("error_code"), error_code
+            ),
+            provider=safe_provider,
+            stage=_safe_stt_metadata_token(result.get("stage"), stage),
+            error_type=_safe_stt_metadata_token(
+                result.get("error_type"), error_type
+            ),
+            no_speech=bool(result.get("no_speech")),
+        )
     return make_stt_failure(
         error_code=error_code,
         provider=safe_provider,
@@ -2450,10 +2491,16 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
                 no_speech=True,
             )
 
+        try:
+            duration = float(result.get("duration", 0) or 0)
+        except Exception:
+            duration = 0.0
+        if not math.isfinite(duration) or duration < 0 or duration > 86400:
+            duration = 0.0
         logger.info(
             "Transcribed via xAI Grok STT (lang=%s, %.1fs audio, %d chars)",
             _safe_stt_metadata_token(result.get("language", language), "unknown"),
-            result.get("duration", 0),
+            duration,
             len(transcript_text),
         )
 
@@ -2851,10 +2898,22 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     # Resolve only bounded provider metadata for the final defensive envelope.
     # The actual provider dispatch remains owned by _transcribe_prepared_audio.
-    provider = _safe_stt_metadata_token(
-        _get_provider(_load_stt_config()),
-        "unknown",
-    )
+    try:
+        provider = _safe_stt_metadata_token(
+            _get_provider(_load_stt_config()),
+            "unknown",
+        )
+    except Exception as exc:  # noqa: BLE001 - public selection boundary
+        error_type = type(exc).__name__
+        log_stt_failure("unknown", "selection", error_type)
+        if cleanup_dir:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+        return make_stt_failure(
+            error_code="provider_resolution_failed",
+            provider="unknown",
+            stage="selection",
+            error_type=error_type,
+        )
     try:
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
