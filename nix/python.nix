@@ -7,6 +7,7 @@
   pyproject-nix,
   pyproject-build-systems,
   stdenv,
+  linuxHeaders,
   # Filtered Python source (see lib.nix pythonSrc) — keeps JS/docs/skills
   # edits from invalidating the venv derivation.
   pythonSrc,
@@ -58,9 +59,15 @@ let
           "alibabacloud-gateway-dingtalk"
           "alibabacloud-gateway-spi"
           "alibabacloud-tea"
-          "evdev"
         ] (_: null)
-      );
+      )
+      // {
+        evdev = prev.evdev.overrideAttrs (old: {
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+            final.setuptools
+          ] ++ lib.optionals stdenv.isLinux [ linuxHeaders ];
+        });
+      };
 
   pythonPackageOverrides =
     final: _prev:

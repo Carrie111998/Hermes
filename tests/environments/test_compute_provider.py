@@ -417,4 +417,13 @@ def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:
     from pathlib import Path
 
     python_nix = Path(__file__).parents[2] / "nix" / "python.nix"
-    assert '"evdev"' in python_nix.read_text()
+    assert "evdev = prev.evdev.overrideAttrs" in python_nix.read_text()
+
+
+def test_cua_fleet_nix_build_provides_evdev_kernel_headers() -> None:
+    from pathlib import Path
+
+    python_nix = Path(__file__).parents[2] / "nix" / "python.nix"
+    source = python_nix.read_text()
+    assert "linuxHeaders" in source
+    assert "evdev = prev.evdev.overrideAttrs" in source
