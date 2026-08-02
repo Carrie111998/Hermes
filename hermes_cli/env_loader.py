@@ -635,14 +635,43 @@ def _apply_external_secret_sources(home_path: Path) -> None:
                 file=sys.stderr,
             )
         if src.result.error:
-            print(f"  {src.label}: {src.result.error}", file=sys.stderr)
+            print(
+                f"  {src.label}: {_mask_secret_text(src.result.error)}",
+                file=sys.stderr,
+            )
             hint = _remediation_hint(src.name, src.result.error_kind, cfg)
             if hint:
-                print(f"  {src.label}: → {hint}", file=sys.stderr)
+                print(
+                    f"  {src.label}: → {_mask_secret_text(hint)}",
+                    file=sys.stderr,
+                )
         for warn in src.result.warnings:
-            print(f"  {src.label}: {warn}", file=sys.stderr)
+            print(f"  {src.label}: {_mask_secret_text(warn)}", file=sys.stderr)
     for conflict in report.conflicts:
-        print(f"  Secret sources: {conflict}", file=sys.stderr)
+        print(f"  Secret sources: {_mask_secret_text(conflict)}", file=sys.stderr)
+
+
+def _mask_secret_text(text: str) -> str:
+    """Mask known secret values out of status text before it reaches stderr.
+
+    Uses the exact values applied from external secret sources this process
+    (``_SECRET_SOURCE_VALUES_BY_HOME`` — the authoritative set for what the
+    status line is about) plus the generic credential-env scan in
+    ``agent.redact``.  Error, hint, warning, and conflict lines can carry a
+    secret *value* (a backend echoing it, a remediation hint quoting it);
+    names are already suppressed on the applied-count line.  Best-effort:
+    never raises, never blocks startup.
+    """
+    if not text:
+        return text
+    from agent.redact import mask_known_secret_values
+
+    masked = text
+    for snapshot in _SECRET_SOURCE_VALUES_BY_HOME.values():
+        for value in snapshot.values():
+            if value and len(value) >= 6 and value in masked:
+                masked = masked.replace(value, "***")
+    return mask_known_secret_values(masked)
 
 
 def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:

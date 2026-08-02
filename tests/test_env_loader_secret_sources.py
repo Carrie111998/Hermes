@@ -361,6 +361,81 @@ def test_apply_external_secret_sources_status_line_suppresses_secret_names(
     assert "LEAK_THIS_TOKEN" not in err
 
 
+def test_status_warning_with_secret_value_is_masked(tmp_path, monkeypatch, capsys):
+    """A source warning that echoes a secret VALUE must be masked in stderr —
+    the merged name-suppression fix covers names, but values are the
+    exfiltration risk."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.test-token")
+    monkeypatch.delenv("LEAK_THIS_API_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: test-project\n"
+        "    access_token_env: BWS_ACCESS_TOKEN\n",
+        encoding="utf-8",
+    )
+
+    import agent.secret_sources.bitwarden as bw_module
+
+    monkeypatch.setattr(bw_module, "find_bws", lambda **_kw: Path("/fake/bws"))
+    monkeypatch.setattr(
+        bw_module,
+        "fetch_bitwarden_secrets",
+        lambda **_kw: (
+            {"LEAK_THIS_API_KEY": "sk-super-secret-value-123"},
+            ["bws returned suspicious value sk-super-secret-value-123"],
+        ),
+    )
+
+    from agent.secret_sources import registry as reg_module
+
+    reg_module._reset_registry_for_tests()
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    err = capsys.readouterr().err
+    assert "applied 1 secret" in err
+    assert "sk-super-secret-value-123" not in err
+
+
+def test_status_error_with_secret_value_is_masked(tmp_path, monkeypatch, capsys):
+    """A source error that embeds a known secret VALUE must be masked."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.test-token")
+    # The value is known to Hermes (applied in a prior run / .env) and the
+    # backend error echoes it.
+    monkeypatch.setenv("LEAK_THIS_API_KEY", "sk-error-value-456")
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: test-project\n"
+        "    access_token_env: BWS_ACCESS_TOKEN\n",
+        encoding="utf-8",
+    )
+
+    import agent.secret_sources.bitwarden as bw_module
+
+    monkeypatch.setattr(bw_module, "find_bws", lambda **_kw: Path("/fake/bws"))
+
+    def _raise_with_value(**_kw):
+        raise RuntimeError("Bitwarden rejected token sk-error-value-456")
+
+    monkeypatch.setattr(bw_module, "fetch_bitwarden_secrets", _raise_with_value)
+
+    from agent.secret_sources import registry as reg_module
+
+    reg_module._reset_registry_for_tests()
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    err = capsys.readouterr().err
+    assert "Bitwarden rejected token" in err  # diagnostic preserved
+    assert "sk-error-value-456" not in err
+
+
 def test_external_secret_values_are_isolated_between_homes(tmp_path, monkeypatch):
     """A later apply for the same key must not mutate an earlier home snapshot."""
     from agent.secret_scope import build_profile_secret_scope
