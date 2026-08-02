@@ -206,6 +206,35 @@ class TestMcpAdd:
         assert "ink" in config.get("mcp_servers", {})
         assert config["mcp_servers"]["ink"]["url"] == "https://mcp.ml.ink/mcp"
 
+    def test_add_success_message_points_to_reload(self, tmp_path, capsys, monkeypatch):
+        """Regression (#76954): 'Start a new session' is misleading for desktop
+        users — a new desktop session does NOT re-read the MCP registry from
+        config (the backend builds it once at process start). The success
+        message must point at the real mechanism (/reload-mcp or a restart)."""
+        fake_tools = [FakeTool("create_service", "Deploy from repo")]
+
+        def mock_probe(name, config, **kw):
+            return [(t.name, t.description) for t in fake_tools]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+        inputs = iter(["n", ""])  # no auth needed, enable all
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+        from hermes_cli.mcp_config import cmd_mcp_add
+
+        cmd_mcp_add(_make_args(name="ctx", url="https://mcp.example.com/mcp"))
+        out = capsys.readouterr().out
+
+        assert "/reload-mcp" in out, "message must point at the hot-reload command"
+        assert "restart the desktop app" in out, (
+            "message must name the desktop restart path"
+        )
+        assert "Start a new session" not in out, (
+            "the old misleading 'new session' guidance must be gone"
+        )
+
 
     def test_add_stdio_server_with_env(self, tmp_path, capsys, monkeypatch):
         """Stdio servers can persist explicit environment variables."""
