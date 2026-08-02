@@ -1352,6 +1352,30 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 return False
 
+            signed = (
+                our_keys.serialize() if hasattr(our_keys, "serialize") else our_keys
+            )
+            sigs = (signed.get("signatures") or {}).get(str(client.mxid)) or {}
+            foreign_sigs = [k for k in sigs if k != f"ed25519:{client.device_id}"]
+            if foreign_sigs:
+                logger.error(
+                    "Matrix: device %s already has cross-signed encryption keys "
+                    "on the server (signed by %s) that this bot does not own — "
+                    "the session was probably created with a full Matrix client "
+                    "like Element. Replacing the keys would permanently "
+                    "invalidate the cross-signing signature (the homeserver "
+                    "never deletes the old one), so refusing. Use a session "
+                    "that has never been used by an encrypted client: either "
+                    "generate a fresh MATRIX_ACCESS_TOKEN, or set "
+                    "MATRIX_PASSWORD and unset MATRIX_ACCESS_TOKEN so the bot "
+                    "logs in itself. Either way MATRIX_DEVICE_ID must be unset "
+                    "— it is passed straight through to login and would reuse "
+                    "this same conflicting device.",
+                    client.device_id,
+                    ", ".join(foreign_sigs),
+                )
+                return False
+
             logger.warning(
                 "Matrix: server has stale keys for device %s — attempting re-upload",
                 client.device_id,

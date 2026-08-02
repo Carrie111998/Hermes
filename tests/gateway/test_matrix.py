@@ -2862,3 +2862,76 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+# ---------------------------------------------------------------------------
+# Refuse to clobber cross-signed device keys owned by another client
+# ---------------------------------------------------------------------------
+
+class TestRefuseClobberingForeignDeviceKeys:
+    def _make_client_and_olm(self, server_sigs):
+        client = MagicMock()
+        client.mxid = "@bot:example.org"
+        client.device_id = "DEVICE1"
+
+        device_keys = MagicMock()
+        device_keys.serialize.return_value = {
+            "device_id": "DEVICE1",
+            "user_id": "@bot:example.org",
+            "keys": {"ed25519:DEVICE1": "element-key"},
+            "signatures": {"@bot:example.org": server_sigs},
+        }
+        client.query_keys = AsyncMock(return_value=MagicMock(
+            device_keys={"@bot:example.org": {"DEVICE1": device_keys}},
+        ))
+
+        olm = MagicMock()
+        olm.account.identity_keys = {"ed25519": "local-different-key"}
+        olm.account.shared = False
+        olm.share_keys = AsyncMock()
+        return client, olm
+
+    @pytest.mark.asyncio
+    async def test_refuses_when_device_is_cross_signed(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        adapter._device_id_unverified = False
+        client, olm = self._make_client_and_olm(
+            {"ed25519:DEVICE1": "selfsig", "ed25519:sskpubkey": "crosssig"}
+        )
+        # The unsafe path DELETEs the device before it ever reaches
+        # share_keys(), so asserting on share_keys() alone would still pass
+        # against a build that destroys the device. Assert on the request
+        # itself.
+        client.api = MagicMock()
+        client.api.request = AsyncMock()
+        with patch.object(
+            adapter, "_extract_server_ed25519", return_value="element-key"
+        ), caplog.at_level(logging.ERROR):
+            result = await adapter._verify_device_keys_on_server(client, olm)
+
+        assert result is False
+        client.api.request.assert_not_awaited()
+        olm.share_keys.assert_not_awaited()
+        assert "cross-signed encryption keys" in caplog.text
+        # Recovery guidance must not stop at MATRIX_PASSWORD: password login
+        # passes MATRIX_DEVICE_ID straight through and would reuse the same
+        # conflicting device.
+        assert "MATRIX_DEVICE_ID must be unset" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reupload_proceeds_without_cross_signature(self):
+        adapter = _make_adapter()
+        adapter._device_id_unverified = False
+        client, olm = self._make_client_and_olm({"ed25519:DEVICE1": "selfsig"})
+        client.api = MagicMock()
+        client.api.request = AsyncMock()
+        with patch.object(
+            adapter, "_extract_server_ed25519", return_value="element-key"
+        ), patch.object(
+            adapter, "_reverify_keys_after_upload", AsyncMock(return_value=True)
+        ):
+            result = await adapter._verify_device_keys_on_server(client, olm)
+
+        assert result is True
+        olm.share_keys.assert_awaited_once()
