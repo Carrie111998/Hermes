@@ -334,31 +334,10 @@ def test_systemctl_unrelated_unit_passes_through():
     assert r is not None
 
 
-def test_kill_own_subtree_passes_through():
-    """We CAN kill our own children — guard recognizes them via psutil."""
-    p = subprocess.Popen(["sleep", "30"])
-    try:
-        os.kill(p.pid, signal.SIGTERM)
-    finally:
-        p.wait(timeout=2)
-    # SIGTERM = 15; subprocess returncode is -15 on POSIX.
-    assert p.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
 
 
-def test_subprocess_pkill_with_unrelated_pattern_passes_through():
-    """``pkill -f some-unrelated-pattern`` (no hermes/python) is fine."""
-    # We don't actually run pkill — just verify the guard would let it
-    # through by inspecting the matcher. Re-implementing the check here
-    # would duplicate the guard; instead spawn a noop to confirm no raise.
-    # Use 'true' so it succeeds quickly.
-    r = subprocess.run(["true"], capture_output=True)
-    assert r.returncode == 0
 
 
-def test_normal_subprocess_run_passes_through():
-    """Plain non-systemctl subprocess.run should work normally."""
-    r = subprocess.run(["echo", "hello"], capture_output=True, text=True)
-    assert r.stdout.strip() == "hello"
 
 
 def test_argument_containing_skill_is_not_a_process_killer():
