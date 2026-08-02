@@ -43,6 +43,12 @@ READINESS_SCHEMA = "muncho-trusted-signer-readiness.v1"
 PROJECTION_ROLLOVER_SCHEMA = (
     "muncho-trusted-signer-projection-rollover-intent.v1"
 )
+PRIVATE_KEY_ROLLOVER_SCHEMA = (
+    "muncho-trusted-signer-private-key-rollover-intent.v1"
+)
+PROJECTION_RECONCILIATION_SCHEMA = (
+    "muncho-trusted-signer-projection-reconciliation-intent.v1"
+)
 ENVELOPE_SCHEMAS = {
     "cloud": "muncho-cloud-trusted-signer-provisioning-envelope.v1",
     "host": "muncho-host-trusted-signer-provisioning-envelope.v1",
@@ -1302,12 +1308,440 @@ def _verify_private_matches(
     )
 
 
+def _private_public_raw(layout: SignerLayout) -> tuple[bytes, bytes]:
+    """Read one protected seed and return it with its derived public identity."""
+
+    seed = _read_regular(
+        layout.private_key,
+        maximum=32,
+        uid=layout.private_uid,
+        gid=layout.private_gid,
+        mode=0o400,
+    )
+    if len(seed) != 32:
+        _stable_error("trusted_signer_private_key_invalid")
+    try:
+        public_raw = (
+            Ed25519PrivateKey.from_private_bytes(seed)
+            .public_key()
+            .public_bytes_raw()
+        )
+    except ValueError as exc:
+        _stable_error("trusted_signer_private_key_invalid", exc)
+    return seed, public_raw
+
+
+def _private_key_identity(path: Path) -> tuple[int, ...]:
+    try:
+        state = path.lstat()
+    except OSError as exc:
+        _stable_error("trusted_signer_private_key_rollover_invalid", exc)
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISREG(state.st_mode)
+        or state.st_nlink != 1
+    ):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    return (
+        state.st_mode,
+        state.st_uid,
+        state.st_gid,
+        state.st_dev,
+        state.st_ino,
+        state.st_nlink,
+        state.st_size,
+        state.st_mtime_ns,
+        state.st_ctime_ns,
+    )
+
+
 def _projection_layout(revision: str, *, role: str) -> SignerLayout:
     if role == "cloud":
         return cloud_layout(revision)
     if role == "host":
         return host_layout(revision)
     _stable_error("trusted_signer_projection_rollover_invalid")
+
+
+def _same_fixed_signer_boundary(
+    current: SignerLayout,
+    candidate: SignerLayout,
+) -> bool:
+    return (
+        candidate.role == current.role
+        and candidate.release_base == current.release_base
+        and candidate.private_key == current.private_key
+        and candidate.installed_public_key == current.installed_public_key
+        and candidate.config == current.config
+        and candidate.replay_directory == current.replay_directory
+        and candidate.receipt.parent == current.receipt.parent
+        and candidate.activation_seal == current.activation_seal
+        and candidate.current_link == current.current_link
+        and candidate.private_uid == current.private_uid
+        and candidate.private_gid == current.private_gid
+        and candidate.config_uid == current.config_uid
+        and candidate.config_gid == current.config_gid
+        and candidate.replay_uid == current.replay_uid
+        and candidate.replay_gid == current.replay_gid
+        and candidate.receipt_uid == current.receipt_uid
+        and candidate.receipt_gid == current.receipt_gid
+        and candidate.sudoers == current.sudoers
+    )
+
+
+def _validated_historical_signer_receipt(
+    layout: SignerLayout,
+    *,
+    authority: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], bytes]:
+    """Validate one immutable historical signer receipt against its release."""
+
+    raw = _read_regular(
+        layout.receipt,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.receipt_uid,
+        gid=layout.receipt_gid,
+        mode=0o444,
+    )
+    receipt = _canonical_mapping(
+        raw,
+        code="trusted_signer_private_key_rollover_invalid",
+    )
+    public_raw = authority.get("public_raw")
+    if not isinstance(public_raw, bytes) or len(public_raw) != 32:
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    try:
+        checked = _verify_receipt(
+            receipt,
+            public_key=Ed25519PublicKey.from_public_bytes(public_raw),
+        )
+    except ValueError as exc:
+        _stable_error("trusted_signer_private_key_rollover_invalid", exc)
+    private_evidence = checked.get("private_key")
+    if (
+        checked.get("role") != layout.role
+        or checked.get("release_revision") != layout.release.name
+        or checked.get("package_sha256") != authority.get("package_sha256")
+        or checked.get("package_manifest_sha256")
+        != authority.get("manifest_sha256")
+        or checked.get("public_key_id") != authority.get("public_key_id")
+        or checked.get("runtime") != authority.get("runtime")
+        or not isinstance(private_evidence, Mapping)
+        or private_evidence.get("path") != str(layout.private_key)
+        or private_evidence.get("uid") != layout.private_uid
+        or private_evidence.get("gid") != layout.private_gid
+        or private_evidence.get("mode") != "0400"
+        or private_evidence.get("size") != 32
+        or foundation.canonical_json_bytes(checked) != raw
+    ):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    return checked, raw
+
+
+def _find_private_key_predecessor(
+    layout: SignerLayout,
+    *,
+    existing_public_raw: bytes,
+) -> tuple[SignerLayout, Mapping[str, Any], Mapping[str, Any], bytes]:
+    """Bind an installed old seed to exactly one signed predecessor release."""
+
+    if len(existing_public_raw) != 32:
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    pattern = re.compile(
+        rf"^{re.escape(layout.role)}-signer-([0-9a-f]{{40}})\.json$"
+    )
+    try:
+        entries = sorted(layout.receipt.parent.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        _stable_error("trusted_signer_private_key_rollover_invalid", exc)
+    matches: list[
+        tuple[SignerLayout, Mapping[str, Any], Mapping[str, Any], bytes]
+    ] = []
+    for path in entries:
+        matched = pattern.fullmatch(path.name)
+        if matched is None:
+            continue
+        revision = matched.group(1)
+        if revision == layout.release.name:
+            continue
+        candidate = _projection_layout(revision, role=layout.role)
+        if (
+            candidate.receipt != path
+            or not _same_fixed_signer_boundary(layout, candidate)
+        ):
+            _stable_error("trusted_signer_private_key_rollover_invalid")
+        authority = _validate_release_and_authority(candidate)
+        if authority.get("public_raw") != existing_public_raw:
+            continue
+        receipt, receipt_raw = _validated_historical_signer_receipt(
+            candidate,
+            authority=authority,
+        )
+        matches.append((candidate, authority, receipt, receipt_raw))
+    if len(matches) != 1:
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    return matches[0]
+
+
+def _private_key_rollover_intent_path(layout: SignerLayout) -> Path:
+    return layout.receipt.parent / (
+        f"{layout.role}-private-key-rollover-{layout.release.name}.json"
+    )
+
+
+def _private_key_rollover_stage_path(layout: SignerLayout) -> Path:
+    return layout.private_key.parent / (
+        f".{layout.private_key.name}.muncho-private-{layout.release.name}"
+    )
+
+
+def _build_private_key_rollover_intent(
+    *,
+    layout: SignerLayout,
+    previous_layout: SignerLayout,
+    previous_authority: Mapping[str, Any],
+    current_authority: Mapping[str, Any],
+    previous_receipt: Mapping[str, Any],
+    previous_receipt_raw: bytes,
+) -> Mapping[str, Any]:
+    previous_package_sha256 = previous_authority.get("package_sha256")
+    current_package_sha256 = current_authority.get("package_sha256")
+    previous_public_key_id = previous_authority.get("public_key_id")
+    current_public_key_id = current_authority.get("public_key_id")
+    if (
+        not _same_fixed_signer_boundary(layout, previous_layout)
+        or previous_layout.release.name == layout.release.name
+        or previous_receipt.get("release_revision")
+        != previous_layout.release.name
+        or previous_receipt.get("receipt_sha256") is None
+        or any(
+            not isinstance(item, str) or _SHA256.fullmatch(item) is None
+            for item in (
+                previous_package_sha256,
+                current_package_sha256,
+                previous_public_key_id,
+                current_public_key_id,
+                previous_receipt.get("receipt_sha256"),
+            )
+        )
+    ):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    unsigned = {
+        "schema": PRIVATE_KEY_ROLLOVER_SCHEMA,
+        "role": layout.role,
+        "release_revision": layout.release.name,
+        "previous_release_revision": previous_layout.release.name,
+        "previous_package_sha256": previous_package_sha256,
+        "package_sha256": current_package_sha256,
+        "previous_public_key_id": previous_public_key_id,
+        "public_key_id": current_public_key_id,
+        "previous_receipt_sha256": previous_receipt.get("receipt_sha256"),
+        "previous_receipt_file_sha256": hashlib.sha256(
+            previous_receipt_raw
+        ).hexdigest(),
+        "private_key": {
+            "path": str(layout.private_key),
+            "uid": layout.private_uid,
+            "gid": layout.private_gid,
+            "mode": "0400",
+            "size": 32,
+        },
+        "private_key_replacement_authorized": True,
+        "private_key_material_recorded": False,
+        "private_key_digest_recorded": False,
+        "activation_performed": False,
+        "iam_mutation_performed": False,
+        "cloud_mutation_performed": False,
+        "service_start_performed": False,
+        "network_fetch_performed": False,
+    }
+    return {**unsigned, "intent_sha256": foundation.sha256_json(unsigned)}
+
+
+def _load_private_key_rollover_intent(
+    path: Path,
+    *,
+    layout: SignerLayout,
+    current_authority: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], SignerLayout, Mapping[str, Any]]:
+    raw = _read_regular(
+        path,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.receipt_uid,
+        gid=layout.receipt_gid,
+        mode=0o444,
+    )
+    intent = _canonical_mapping(
+        raw,
+        code="trusted_signer_private_key_rollover_invalid",
+    )
+    previous_revision = intent.get("previous_release_revision")
+    if (
+        not isinstance(previous_revision, str)
+        or _REVISION.fullmatch(previous_revision) is None
+        or previous_revision == layout.release.name
+    ):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    previous_layout = _projection_layout(previous_revision, role=layout.role)
+    if not _same_fixed_signer_boundary(layout, previous_layout):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    previous_authority = _validate_release_and_authority(previous_layout)
+    previous_receipt, previous_receipt_raw = _validated_historical_signer_receipt(
+        previous_layout,
+        authority=previous_authority,
+    )
+    expected = _build_private_key_rollover_intent(
+        layout=layout,
+        previous_layout=previous_layout,
+        previous_authority=previous_authority,
+        current_authority=current_authority,
+        previous_receipt=previous_receipt,
+        previous_receipt_raw=previous_receipt_raw,
+    )
+    if intent != expected or raw != foundation.canonical_json_bytes(expected):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+    return intent, previous_layout, previous_authority
+
+
+def _recover_release_bound_private_key(
+    layout: SignerLayout,
+    *,
+    authority: Mapping[str, Any],
+    seed: bytes,
+    unit_probe: Callable[[str], Mapping[str, Any]] = _default_unit_probe,
+    after_stage: Callable[[], None] | None = None,
+    after_replace: Callable[[], None] | None = None,
+) -> Mapping[str, Any]:
+    """Crash-safely rotate a fixed signer seed from one proven release."""
+
+    def assert_inert() -> None:
+        _inert_evidence(layout, unit_probe=unit_probe)
+
+    assert_inert()
+    current_public_raw = authority.get("public_raw")
+    try:
+        input_public_raw = (
+            Ed25519PrivateKey.from_private_bytes(seed)
+            .public_key()
+            .public_bytes_raw()
+        )
+    except ValueError as exc:
+        _stable_error("trusted_signer_private_key_rollover_invalid", exc)
+    if (
+        not isinstance(current_public_raw, bytes)
+        or len(current_public_raw) != 32
+        or input_public_raw != current_public_raw
+    ):
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+
+    existing_seed, existing_public_raw = _private_public_raw(layout)
+    intent_path = _private_key_rollover_intent_path(layout)
+    stage = _private_key_rollover_stage_path(layout)
+    if existing_public_raw == current_public_raw:
+        if os.path.lexists(stage) and not os.path.lexists(intent_path):
+            _stable_error("trusted_signer_private_key_rollover_invalid")
+        if os.path.lexists(intent_path):
+            _load_private_key_rollover_intent(
+                intent_path,
+                layout=layout,
+                current_authority=authority,
+            )
+        if os.path.lexists(stage):
+            staged = _read_regular(
+                stage,
+                maximum=32,
+                uid=layout.private_uid,
+                gid=layout.private_gid,
+                mode=0o400,
+            )
+            if staged != seed:
+                _stable_error("trusted_signer_private_key_rollover_invalid")
+            try:
+                stage.unlink()
+                _fsync_directory(stage.parent)
+            except OSError as exc:
+                _stable_error("trusted_signer_private_key_rollover_failed", exc)
+        return _file_evidence(
+            layout.private_key,
+            uid=layout.private_uid,
+            gid=layout.private_gid,
+            mode=0o400,
+            include_digest=False,
+        )
+
+    if os.path.lexists(intent_path):
+        _intent, previous_layout, previous_authority = (
+            _load_private_key_rollover_intent(
+                intent_path,
+                layout=layout,
+                current_authority=authority,
+            )
+        )
+        if previous_authority.get("public_raw") != existing_public_raw:
+            _stable_error("trusted_signer_private_key_rollover_changed")
+    else:
+        (
+            previous_layout,
+            previous_authority,
+            previous_receipt,
+            previous_receipt_raw,
+        ) = _find_private_key_predecessor(
+            layout,
+            existing_public_raw=existing_public_raw,
+        )
+        intent = _build_private_key_rollover_intent(
+            layout=layout,
+            previous_layout=previous_layout,
+            previous_authority=previous_authority,
+            current_authority=authority,
+            previous_receipt=previous_receipt,
+            previous_receipt_raw=previous_receipt_raw,
+        )
+        _install_exclusive(
+            intent_path,
+            foundation.canonical_json_bytes(intent),
+            uid=layout.receipt_uid,
+            gid=layout.receipt_gid,
+            mode=0o444,
+            include_digest=True,
+        )
+    if previous_layout.release.name == layout.release.name:
+        _stable_error("trusted_signer_private_key_rollover_invalid")
+
+    identity = _private_key_identity(layout.private_key)
+    _install_exclusive(
+        stage,
+        seed,
+        uid=layout.private_uid,
+        gid=layout.private_gid,
+        mode=0o400,
+        include_digest=False,
+    )
+    if after_stage is not None:
+        after_stage()
+    assert_inert()
+    observed_seed, observed_public_raw = _private_public_raw(layout)
+    if (
+        observed_seed != existing_seed
+        or observed_public_raw != existing_public_raw
+        or _private_key_identity(layout.private_key) != identity
+    ):
+        _stable_error("trusted_signer_private_key_rollover_changed")
+    try:
+        os.replace(stage, layout.private_key)
+        _fsync_directory(layout.private_key.parent)
+    except OSError as exc:
+        _stable_error("trusted_signer_private_key_rollover_failed", exc)
+    if after_replace is not None:
+        after_replace()
+    assert_inert()
+    _private_key, evidence = _verify_private_matches(
+        layout,
+        expected_public_raw=current_public_raw,
+    )
+    if os.path.lexists(stage):
+        _stable_error("trusted_signer_private_key_rollover_failed")
+    return evidence
 
 
 def _projection_payloads(
@@ -1532,6 +1966,242 @@ def _load_projection_rollover_intent(
     )
 
 
+def _projection_reconciliation_intent_path(layout: SignerLayout) -> Path:
+    return layout.receipt.parent / (
+        f"{layout.role}-projection-reconciliation-{layout.release.name}.json"
+    )
+
+
+def _projection_source(
+    layout: SignerLayout,
+    *,
+    revision: str,
+) -> tuple[SignerLayout, Mapping[str, Any], Mapping[str, bytes]]:
+    if _REVISION.fullmatch(revision) is None:
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    candidate = _projection_layout(revision, role=layout.role)
+    if not _same_fixed_signer_boundary(layout, candidate):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    authority = _validate_release_and_authority(candidate)
+    payloads = _projection_payloads(candidate, authority=authority)
+    if set(payloads) != set(_projection_paths(layout)):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    return candidate, authority, payloads
+
+
+def _projection_source_candidates(
+    layout: SignerLayout,
+) -> Mapping[
+    str,
+    tuple[SignerLayout, Mapping[str, Any], Mapping[str, bytes]],
+]:
+    """Validate every exact immutable release that could own a projection."""
+
+    try:
+        entries = sorted(layout.release_base.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        _stable_error("trusted_signer_projection_reconciliation_invalid", exc)
+    sources: dict[
+        str,
+        tuple[SignerLayout, Mapping[str, Any], Mapping[str, bytes]],
+    ] = {}
+    for path in entries:
+        if _REVISION.fullmatch(path.name) is None:
+            continue
+        try:
+            state = path.lstat()
+        except OSError as exc:
+            _stable_error("trusted_signer_projection_reconciliation_invalid", exc)
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
+        candidate, authority, payloads = _projection_source(
+            layout,
+            revision=path.name,
+        )
+        if candidate.release != path or path.name in sources:
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
+        sources[path.name] = (candidate, authority, payloads)
+    if layout.release.name not in sources:
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    return sources
+
+
+def _build_projection_reconciliation_intent(
+    *,
+    layout: SignerLayout,
+    current_authority: Mapping[str, Any],
+    source_revisions: Mapping[str, str],
+    sources: Mapping[
+        str,
+        tuple[SignerLayout, Mapping[str, Any], Mapping[str, bytes]],
+    ],
+) -> Mapping[str, Any]:
+    paths = _projection_paths(layout)
+    current_payloads = _projection_payloads(layout, authority=current_authority)
+    if set(source_revisions) != set(paths) or set(current_payloads) != set(paths):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    source_projections: dict[str, Mapping[str, Any]] = {}
+    projections: dict[str, Mapping[str, Any]] = {}
+    for name, (path, uid, gid, mode) in paths.items():
+        revision = source_revisions[name]
+        source = sources.get(revision)
+        if source is None:
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
+        source_layout, source_authority, source_payloads = source
+        package_sha256 = source_authority.get("package_sha256")
+        public_key_id = source_authority.get("public_key_id")
+        if (
+            not _same_fixed_signer_boundary(layout, source_layout)
+            or name not in source_payloads
+            or not isinstance(package_sha256, str)
+            or _SHA256.fullmatch(package_sha256) is None
+            or not isinstance(public_key_id, str)
+            or _SHA256.fullmatch(public_key_id) is None
+        ):
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
+        source_projections[name] = {
+            "release_revision": revision,
+            "package_sha256": package_sha256,
+            "public_key_id": public_key_id,
+            "projection": _projection_descriptor(
+                path=path,
+                payload=source_payloads[name],
+                uid=uid,
+                gid=gid,
+                mode=mode,
+            ),
+        }
+        projections[name] = _projection_descriptor(
+            path=path,
+            payload=current_payloads[name],
+            uid=uid,
+            gid=gid,
+            mode=mode,
+        )
+    package_sha256 = current_authority.get("package_sha256")
+    public_key_id = current_authority.get("public_key_id")
+    if (
+        not isinstance(package_sha256, str)
+        or _SHA256.fullmatch(package_sha256) is None
+        or not isinstance(public_key_id, str)
+        or _SHA256.fullmatch(public_key_id) is None
+    ):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    unsigned = {
+        "schema": PROJECTION_RECONCILIATION_SCHEMA,
+        "role": layout.role,
+        "release_revision": layout.release.name,
+        "package_sha256": package_sha256,
+        "public_key_id": public_key_id,
+        "private_key_replaced": False,
+        "activation_performed": False,
+        "iam_mutation_performed": False,
+        "cloud_mutation_performed": False,
+        "service_start_performed": False,
+        "network_fetch_performed": False,
+        "source_projections": source_projections,
+        "projections": projections,
+    }
+    return {**unsigned, "intent_sha256": foundation.sha256_json(unsigned)}
+
+
+def _load_projection_reconciliation_intent(
+    path: Path,
+    *,
+    layout: SignerLayout,
+    current_authority: Mapping[str, Any],
+) -> tuple[Mapping[str, bytes], Mapping[str, bytes]]:
+    raw = _read_regular(
+        path,
+        maximum=MAX_JSON_BYTES,
+        uid=layout.receipt_uid,
+        gid=layout.receipt_gid,
+        mode=0o444,
+    )
+    intent = _canonical_mapping(
+        raw,
+        code="trusted_signer_projection_reconciliation_invalid",
+    )
+    source_records = intent.get("source_projections")
+    paths = _projection_paths(layout)
+    if not isinstance(source_records, Mapping) or set(source_records) != set(paths):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    source_revisions: dict[str, str] = {}
+    sources: dict[
+        str,
+        tuple[SignerLayout, Mapping[str, Any], Mapping[str, bytes]],
+    ] = {}
+    for name in paths:
+        record = source_records.get(name)
+        revision = record.get("release_revision") if isinstance(record, Mapping) else None
+        if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
+        source_revisions[name] = revision
+        if revision not in sources:
+            sources[revision] = _projection_source(layout, revision=revision)
+    expected = _build_projection_reconciliation_intent(
+        layout=layout,
+        current_authority=current_authority,
+        source_revisions=source_revisions,
+        sources=sources,
+    )
+    if intent != expected or raw != foundation.canonical_json_bytes(expected):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    source_payloads = {
+        name: sources[revision][2][name]
+        for name, revision in source_revisions.items()
+    }
+    current_payloads = _projection_payloads(
+        layout,
+        authority=current_authority,
+    )
+    return source_payloads, current_payloads
+
+
+def _discover_projection_fragments(
+    layout: SignerLayout,
+    *,
+    current_authority: Mapping[str, Any],
+    observed: Mapping[str, bytes | None],
+) -> tuple[Mapping[str, bytes], Mapping[str, bytes]]:
+    paths = _projection_paths(layout)
+    if set(observed) != set(paths) or any(raw is None for raw in observed.values()):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    sources = _projection_source_candidates(layout)
+    source_revisions: dict[str, str] = {}
+    for name, raw in observed.items():
+        matches = [
+            revision
+            for revision, (_candidate, _authority, payloads) in sources.items()
+            if payloads[name] == raw
+        ]
+        if len(matches) != 1:
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
+        source_revisions[name] = matches[0]
+    intent = _build_projection_reconciliation_intent(
+        layout=layout,
+        current_authority=current_authority,
+        source_revisions=source_revisions,
+        sources=sources,
+    )
+    intent_path = _projection_reconciliation_intent_path(layout)
+    _install_exclusive(
+        intent_path,
+        foundation.canonical_json_bytes(intent),
+        uid=layout.receipt_uid,
+        gid=layout.receipt_gid,
+        mode=0o444,
+        include_digest=True,
+    )
+    return (
+        {
+            name: sources[revision][2][name]
+            for name, revision in source_revisions.items()
+        },
+        _projection_payloads(layout, authority=current_authority),
+    )
+
+
 def _projection_identity(path: Path) -> tuple[int, ...]:
     try:
         state = path.lstat()
@@ -1655,7 +2325,7 @@ def _recover_release_bound_projections(
     after_stage: Callable[[str], None] | None = None,
     unit_probe: Callable[[str], Mapping[str, Any]] = _default_unit_probe,
 ) -> None:
-    """Recover only proven public/config/sudoers residue from one predecessor."""
+    """Recover exact public/config/sudoers residue from immutable releases."""
 
     def assert_inert() -> None:
         _inert_evidence(layout, unit_probe=unit_probe)
@@ -1688,6 +2358,10 @@ def _recover_release_bound_projections(
     ):
         return
     intent_path = _projection_intent_path(layout)
+    reconciliation_path = _projection_reconciliation_intent_path(layout)
+    if os.path.lexists(intent_path) and os.path.lexists(reconciliation_path):
+        _stable_error("trusted_signer_projection_reconciliation_invalid")
+    source_payloads: Mapping[str, bytes]
     if os.path.lexists(intent_path):
         (
             _intent,
@@ -1702,58 +2376,94 @@ def _recover_release_bound_projections(
         )
         if replay_current_payloads != current_payloads:
             _stable_error("trusted_signer_projection_rollover_invalid")
+        if (
+            previous_layout.release.name == layout.release.name
+            or previous_authority.get("public_raw")
+            != previous_payloads["installed_public_key"]
+        ):
+            _stable_error("trusted_signer_projection_rollover_invalid")
+        source_payloads = previous_payloads
+    elif os.path.lexists(reconciliation_path):
+        source_payloads, replay_current_payloads = (
+            _load_projection_reconciliation_intent(
+                reconciliation_path,
+                layout=layout,
+                current_authority=authority,
+            )
+        )
+        if replay_current_payloads != current_payloads:
+            _stable_error("trusted_signer_projection_reconciliation_invalid")
     else:
         if any(raw is None for raw in observed.values()):
             _stable_error("trusted_signer_projection_rollover_invalid")
         sudoers_raw = observed["sudoers"]
         if not isinstance(sudoers_raw, bytes):
             _stable_error("trusted_signer_projection_rollover_invalid")
-        previous_revision = _projection_revision_from_sudoers(
-            layout,
-            sudoers_raw,
-        )
-        previous_layout = _projection_layout(
-            previous_revision,
-            role=layout.role,
-        )
-        previous_authority = _validate_release_and_authority(previous_layout)
-        previous_payloads = _projection_payloads(
-            previous_layout,
-            authority=previous_authority,
-        )
-        if any(
-            observed[name] != previous_payloads[name]
-            for name in paths
-        ):
-            _stable_error("trusted_signer_projection_rollover_invalid")
-        intent = _build_projection_rollover_intent(
-            layout=layout,
-            previous_layout=previous_layout,
-            previous_authority=previous_authority,
-            current_authority=authority,
-            previous_payloads=previous_payloads,
-            current_payloads=current_payloads,
-        )
-        _install_exclusive(
-            intent_path,
-            foundation.canonical_json_bytes(intent),
-            uid=layout.receipt_uid,
-            gid=layout.receipt_gid,
-            mode=0o444,
-            include_digest=True,
-        )
-    if (
-        previous_layout.release.name == layout.release.name
-        or previous_authority.get("public_raw")
-        != previous_payloads["installed_public_key"]
-    ):
-        _stable_error("trusted_signer_projection_rollover_invalid")
+        legacy: tuple[
+            SignerLayout,
+            Mapping[str, Any],
+            Mapping[str, bytes],
+        ] | None = None
+        try:
+            previous_revision = _projection_revision_from_sudoers(
+                layout,
+                sudoers_raw,
+            )
+            previous_layout = _projection_layout(
+                previous_revision,
+                role=layout.role,
+            )
+            previous_authority = _validate_release_and_authority(previous_layout)
+            previous_payloads = _projection_payloads(
+                previous_layout,
+                authority=previous_authority,
+            )
+            if all(
+                observed[name] == previous_payloads[name]
+                for name in paths
+            ):
+                legacy = (
+                    previous_layout,
+                    previous_authority,
+                    previous_payloads,
+                )
+        except TrustedSignerProvisioningError:
+            legacy = None
+        if legacy is not None:
+            previous_layout, previous_authority, previous_payloads = legacy
+            intent = _build_projection_rollover_intent(
+                layout=layout,
+                previous_layout=previous_layout,
+                previous_authority=previous_authority,
+                current_authority=authority,
+                previous_payloads=previous_payloads,
+                current_payloads=current_payloads,
+            )
+            _install_exclusive(
+                intent_path,
+                foundation.canonical_json_bytes(intent),
+                uid=layout.receipt_uid,
+                gid=layout.receipt_gid,
+                mode=0o444,
+                include_digest=True,
+            )
+            source_payloads = previous_payloads
+        else:
+            source_payloads, replay_current_payloads = (
+                _discover_projection_fragments(
+                    layout,
+                    current_authority=authority,
+                    observed=observed,
+                )
+            )
+            if replay_current_payloads != current_payloads:
+                _stable_error("trusted_signer_projection_reconciliation_invalid")
     for name in ("installed_public_key", "config", "sudoers"):
         assert_inert()
         _replace_projection(
             layout=layout,
             name=name,
-            previous_payload=previous_payloads[name],
+            previous_payload=source_payloads[name],
             current_payload=current_payloads[name],
             after_stage=after_stage,
             inert_guard=assert_inert,
@@ -2290,8 +3000,15 @@ def provision_signer(
     ):
         inert = _inert_evidence(layout, unit_probe=unit_probe)
         if os.path.lexists(layout.private_key):
+            private_evidence = _recover_release_bound_private_key(
+                layout,
+                authority=authority,
+                seed=seed,
+                unit_probe=unit_probe,
+            )
             private_key, private_evidence = _verify_private_matches(
-                layout, expected_public_raw=authority["public_raw"]
+                layout,
+                expected_public_raw=authority["public_raw"],
             )
         else:
             private_evidence = _install_exclusive(
