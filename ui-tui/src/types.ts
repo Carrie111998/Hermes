@@ -178,6 +178,8 @@ export interface SessionInfo {
   tools: Record<string, string[]>
   /** Whether the initial TUI banner and session summary should render. */
   tui_startup_panel?: boolean
+  /** Speculative compression state: 'enabled' | 'installed' | null. */
+  speculative_compression?: 'enabled' | 'installed' | null
   update_behind?: number | null
   update_command?: string
   usage?: Usage

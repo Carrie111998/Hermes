@@ -5074,6 +5074,19 @@ def _session_info(agent, session: dict | None = None) -> dict:
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
         "tui_startup_panel": bool(display_cfg.get("tui_startup_panel", True)),
+        # Speculative compression observability for the TUI status bar:
+        # None = feature off; "enabled" = armed; "installed" = a speculative
+        # candidate was committed during this session.
+        "speculative_compression": (
+            "installed"
+            if bool(getattr(agent, "speculative_compression_enabled", False))
+            and getattr(agent, "_speculative_install_status", None) == "installed"
+            else (
+                "enabled"
+                if bool(getattr(agent, "speculative_compression_enabled", False))
+                else None
+            )
+        ),
     }
     try:
         from hermes_cli import __version__, __release_date__

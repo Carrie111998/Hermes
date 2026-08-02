@@ -43,7 +43,7 @@ from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -5267,6 +5267,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "session_total_tokens": 0,
             "session_api_calls": 0,
             "compressions": 0,
+            # Speculative compression observability: None = feature off;
+            # "enabled" = armed for this session; "installed" = a speculative
+            # candidate was committed (last compression attempt).
+            "speculative": None,
             "active_background_tasks": 0,
             "active_background_processes": 0,
             "active_background_subagents": 0,
@@ -5345,6 +5349,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot["goal_active"] = True
                 snapshot["goal_turns_used"] = int(getattr(goal_state, "turns_used", 0) or 0)
                 snapshot["goal_max_turns"] = int(getattr(goal_state, "max_turns", 0) or 0)
+        except Exception:
+            pass
+
+        # Speculative compression observability: the status bar shows
+        # "spec:on" when the feature is armed for this session and "spec:✓"
+        # after a speculative candidate was actually committed. Both states
+        # are cheap attribute reads (set once at agent init / per commit).
+        try:
+            if bool(getattr(agent, "speculative_compression_enabled", False)):
+                snapshot["speculative"] = (
+                    "installed"
+                    if getattr(agent, "_speculative_install_status", None)
+                    == "installed"
+                    else "enabled"
+                )
         except Exception:
             pass
 
@@ -5985,6 +6004,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
 
+    def _speculative_status_fragment(
+        self, snapshot: Dict[str, Any]
+    ) -> Optional[Tuple[str, str]]:
+        """Status-bar segment for speculative compression, or None when off."""
+        spec = snapshot.get("speculative")
+        if not spec:
+            return None
+        if spec == "installed":
+            return ("class:status-bar-good", "spec:✓")
+        return ("class:status-bar-dim", "spec:on")
+
     def _get_status_bar_fragments(self):
         if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
             return []
@@ -6037,6 +6067,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
+                    _spec_frag = self._speculative_status_fragment(snapshot)
+                    if _spec_frag:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(_spec_frag)
                     if bg_count:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", f"▶ {bg_count}"))
@@ -6086,6 +6120,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
+                    _spec_frag = self._speculative_status_fragment(snapshot)
+                    if _spec_frag:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(_spec_frag)
                     if bg_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"▶ {bg_count}"))
