@@ -13,11 +13,69 @@ hosted agents don't expose). It must:
     background, returning 202.
 """
 
+import json
+
 import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+
+
+def _write_profile_home(home, *, audience: str, job_id: str | None = None):
+    (home / "cron").mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "cron:",
+                "  chronos:",
+                f"    expected_audience: {audience}",
+                f"    nas_jwks_url: https://chronos.example/{audience}/jwks",
+                f"    portal_url: https://chronos.example/{audience}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    if job_id:
+        (home / "cron" / "jobs.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": job_id,
+                            "name": job_id,
+                            "enabled": True,
+                            "prompt": "run",
+                            "schedule": {
+                                "kind": "once",
+                                "run_at": "2026-07-25T00:00:00+00:00",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+def _isolate_profiles(tmp_path, monkeypatch):
+    from hermes_cli import profiles
+
+    default_home = tmp_path / ".hermes"
+    profiles_root = default_home / "profiles"
+    old_home = profiles_root / "old"
+    work_home = profiles_root / "work"
+    for home in (default_home, old_home, work_home):
+        home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+    return {
+        "default": default_home,
+        "old": old_home,
+        "work": work_home,
+    }
 
 
 def _client(auth_required: bool):
@@ -59,7 +117,16 @@ def test_bad_token_401(monkeypatch):
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **kw: None),  # verification fails
     )
-    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
+    monkeypatch.setattr(
+        web_server,
+        "_find_cron_job_profile",
+        lambda jid: pytest.fail("invalid fire tokens must not scan cron profiles"),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_call_cron_for_profile",
+        lambda *a, **k: pytest.fail("invalid fire tokens must not list profile jobs"),
+    )
     monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
                         lambda p, j: fired.append((p, j)))
 
@@ -111,3 +178,143 @@ def test_unknown_job_200_gone(monkeypatch):
         client.close()
 
 
+def test_valid_token_accepts_and_fires(monkeypatch):
+    """Valid token + known job -> 202 and fire_due invoked for the resolved
+    profile."""
+    fired = []
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire", "aud": "agent:x"}),
+    )
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
+    monkeypatch.setattr(web_server, "_fire_cron_job_for_profile",
+                        lambda p, j: fired.append((p, j)) or True)
+
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post("/api/cron/fire",
+                           headers={"Authorization": "Bearer good"},
+                           json={"job_id": "j1"})
+        assert resp.status_code == 202
+        assert resp.json()["job_id"] == "j1"
+    finally:
+        _restore(pa, ph)
+        client.close()
+    # background task ran the fire for the resolved profile
+    assert fired == [("default", "j1")]
+
+
+def test_profile_chronos_config_is_used_before_token_verification(monkeypatch):
+    """A managed fire token is verified against the job owner's profile."""
+    events = []
+    fired = []
+
+    monkeypatch.setattr(
+        web_server,
+        "_find_cron_job_profile",
+        lambda jid: pytest.fail("profile hint should avoid the pre-auth profile scan"),
+    )
+    monkeypatch.setattr(
+        "cron.jobs.resolve_cron_fire_profile_hint",
+        lambda jid: events.append(("hint", jid)) or "work",
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_load_cron_config_for_profile",
+        lambda profile: events.append(("config", profile)) or {
+            "cron": {
+                "chronos": {
+                    "expected_audience": "agent:work",
+                    "nas_jwks_url": "https://chronos.example/work/jwks",
+                    "portal_url": "https://chronos.example/work",
+                }
+            }
+        },
+    )
+
+    def verify(**kwargs):
+        events.append(("verify", kwargs))
+        return {"purpose": "cron_fire", "aud": "agent:work"}
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: verify,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_fire_cron_job_for_profile",
+        lambda profile, jid: fired.append((profile, jid)) or True,
+    )
+
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer work-token"},
+            json={"job_id": "work-job"},
+        )
+        assert resp.status_code == 202
+    finally:
+        _restore(pa, ph)
+        client.close()
+
+    assert [event[0] for event in events] == ["hint", "config", "verify"]
+    assert events[-1][1] == {
+        "token": "work-token",
+        "expected_audience": "agent:work",
+        "jwks_or_key": "https://chronos.example/work/jwks",
+        "issuer": "https://chronos.example/work",
+    }
+    assert fired == [("work", "work-job")]
+
+
+def test_stale_existing_profile_hint_falls_back_after_process_auth(
+    tmp_path,
+    monkeypatch,
+):
+    """A stale hint may name a real profile, but it must not be authoritative."""
+    homes = _isolate_profiles(tmp_path, monkeypatch)
+    _write_profile_home(homes["default"], audience="agent:default", job_id="job-live")
+    _write_profile_home(homes["old"], audience="agent:old")
+    _write_profile_home(homes["work"], audience="agent:work")
+
+    from cron.jobs import record_cron_fire_profile_hint
+
+    record_cron_fire_profile_hint("job-live", "old")
+
+    events = []
+    fired = []
+
+    def verify(**kwargs):
+        events.append(("verify", kwargs["expected_audience"]))
+        if kwargs["expected_audience"] == "agent:default":
+            return {"purpose": "cron_fire", "aud": "agent:default"}
+        return None
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: verify,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_fire_cron_job_for_profile",
+        lambda profile, jid: fired.append((profile, jid)) or True,
+    )
+
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer default-token"},
+            json={"job_id": "job-live"},
+        )
+        assert resp.status_code == 202
+    finally:
+        _restore(pa, ph)
+        client.close()
+
+    assert events == [
+        ("verify", "agent:old"),
+        ("verify", "agent:default"),
+    ]
+    assert fired == [("default", "job-live")]

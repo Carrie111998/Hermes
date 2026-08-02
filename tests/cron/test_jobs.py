@@ -1068,4 +1068,68 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["plainjob01"]
 
+    def test_load_jobs_bom_plus_bare_list_auto_repairs(self, tmp_cron_dir):
+        """BOM + bare list (hand-edited) must load and rewrap to dict envelope."""
+        import json
+        from cron.jobs import JOBS_FILE, load_jobs
 
+        bare = [
+            {
+                "id": "barebom01",
+                "name": "bare",
+                "enabled": True,
+                "prompt": "x",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+            }
+        ]
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(b"\xef\xbb\xbf" + json.dumps(bare).encode("utf-8"))
+
+        loaded = load_jobs()
+        assert [j["id"] for j in loaded] == ["barebom01"]
+        # Auto-repair rewrites via save_jobs (plain utf-8) — heals the BOM.
+        on_disk = JOBS_FILE.read_bytes()
+        assert not on_disk.startswith(b"\xef\xbb\xbf"), "save_jobs should rewrite without BOM"
+        rewritten = json.loads(on_disk.decode("utf-8"))
+        assert isinstance(rewritten, dict)
+        assert [j["id"] for j in rewritten["jobs"]] == ["barebom01"]
+
+    def test_load_jobs_bom_plus_control_char_uses_strict_false_arm(self, tmp_cron_dir):
+        """BOM + bare control char in a string value exercises the strict=False arm.
+
+        json.load (strict) rejects unescaped control chars; the retry path must
+        also open with utf-8-sig so the BOM does not re-crash the repair.
+        """
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        # Valid JSON structure but with a raw newline inside a string value
+        # (invalid under strict=True). Leading UTF-8 BOM.
+        raw = (
+            b'\xef\xbb\xbf{"jobs": [{"id": "ctrlbom01", "name": "has\nnewline",'
+            b' "enabled": true, "prompt": "x",'
+            b' "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"}}]}'
+        )
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(raw)
+
+        loaded = load_jobs()
+        assert [j["id"] for j in loaded] == ["ctrlbom01"]
+        assert "newline" in loaded[0]["name"]
+
+
+def test_cron_fire_profile_hints_are_per_job_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from cron import jobs as jobs_mod
+
+    jobs_mod.record_cron_fire_profile_hint("job-1", "work")
+
+    hint_path = tmp_path / "cron" / "fire_profile_index" / "job-1.profile"
+    assert hint_path.read_text(encoding="utf-8") == "work\n"
+    assert jobs_mod.resolve_cron_fire_profile_hint("job-1") == "work"
+
+    jobs_mod.record_cron_fire_profile_hint("../escape", "work")
+    assert not (tmp_path / "cron" / "fire_profile_index" / "../escape.profile").exists()
+
+    jobs_mod.forget_cron_fire_profile_hint("job-1")
+    assert jobs_mod.resolve_cron_fire_profile_hint("job-1") is None
