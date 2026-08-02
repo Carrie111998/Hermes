@@ -1190,6 +1190,639 @@ class TestAdapterBehavior(unittest.TestCase):
                 second = FeishuAdapter(PlatformConfig())
                 self.assertTrue(second._is_duplicate("om_same"))
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_group_message_keeps_group_type_when_chat_lookup_falls_back(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "oc_group", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            message_type="text",
+            content='{"text":"hello group"}',
+            message_id="om_group_text",
+        )
+        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+        sender = SimpleNamespace(sender_type="user", sender_id=sender_id)
+        data = SimpleNamespace(event=SimpleNamespace(message=message))
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender.sender_id,
+                chat_type="group",
+                message_id="om_group_text",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.chat_type, "group")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_fetches_reply_to_text(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "父消息内容")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_text_prefers_stored_body_over_cardkit_stub(self):
+        """CardKit OpenAPI get returns title + upgrade stub; use outbound store."""
+        from gateway.config import PlatformConfig
+        from gateway import rich_sent_store
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        full = (
+            "我是 **小 ad**，飞书里帮 adonis 和团队答疑、收问题、跟轻量改动的助手。\n\n"
+            "大改、重重构建议走正式开发流程；群里请 @ 我，需求/Bug 带上现象和页面链接就行。"
+        )
+        rich_sent_store.record("oc_chat", "om_card", full)
+
+        # Simulate OpenAPI body that only has title + client upgrade placeholder.
+        stub_content = json.dumps(
+            {
+                "title": "小 ad",
+                "elements": [
+                    [
+                        {"tag": "img", "image_key": "img_x"},
+                        {"tag": "text", "text": "请升级至最新版本客户端，以查看内容"},
+                        {"tag": "text", "text": ""},
+                    ]
+                ],
+            },
+            ensure_ascii=False,
+        )
+        body = SimpleNamespace(content=stub_content)
+        parent = SimpleNamespace(body=body, msg_type="interactive", mentions=None)
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(items=[parent]),
+            code=0,
+            msg="ok",
+        )
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(get=object())))
+        )
+        adapter._run_blocking = AsyncMock(return_value=response)
+        adapter._build_get_message_request = lambda message_id: message_id
+
+        text = asyncio.run(adapter._fetch_message_text("om_card", chat_id="oc_chat"))
+        self.assertEqual(text, full)
+        self.assertIn("轻量改动", text)
+        self.assertNotIn("请升级至最新版本客户端", text)
+        adapter._run_blocking.assert_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_text_title_only_uses_store(self):
+        from gateway.config import PlatformConfig
+        from gateway import rich_sent_store
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        rich_sent_store.record("oc_chat", "om_card", "完整介绍正文")
+        body = SimpleNamespace(content='{"title":"小 ad"}')
+        parent = SimpleNamespace(body=body, msg_type="interactive", mentions=None)
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(items=[parent]),
+            code=0,
+            msg="ok",
+        )
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(get=object())))
+        )
+        adapter._run_blocking = AsyncMock(return_value=response)
+        adapter._build_get_message_request = lambda message_id: message_id
+
+        text = asyncio.run(adapter._fetch_message_text("om_card", chat_id="oc_chat"))
+        self.assertEqual(text, "完整介绍正文")
+        adapter._run_blocking.assert_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_message_passes_chat_id_when_fetching_reply(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="stored body")
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"reply"}',
+            message_id="om_reply",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        adapter._fetch_message_text.assert_awaited_once_with(
+            "om_parent", chat_id="oc_chat"
+        )
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.reply_to_text, "stored body")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_group_top_level_auto_threads_on_message_id(self):
+        """First group @ with no native thread → synthetic thread root = message_id."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"auto_thread": True}))
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"hello group"}',
+            message_id="om_first_at",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="group",
+                message_id="om_first_at",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.thread_id, "om_first_at")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_dm_does_not_auto_thread(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"auto_thread": True}))
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_dm", "name": "DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_dm",
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"hi"}',
+            message_id="om_dm",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="p2p",
+                message_id="om_dm",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_dm_quote_stays_on_main_session(self):
+        """DM quote of a card/topic must not fork thread_id into session key."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"auto_thread": True}))
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_dm", "name": "DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="卡片全文")
+        message = SimpleNamespace(
+            chat_id="oc_dm",
+            thread_id="omt_topic",
+            root_id="om_root_card",
+            parent_id="om_root_card",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"引用看看"}',
+            message_id="om_user_quote",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_user_quote",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertEqual(event.reply_to_message_id, "om_root_card")
+        self.assertEqual(event.reply_to_text, "卡片全文")
+        adapter._fetch_message_text.assert_awaited_once_with(
+            "om_root_card", chat_id="oc_dm"
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_dm_does_not_use_root_id_as_reply_to(self):
+        """Thread membership root_id alone is not a user quote."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_dm", "name": "DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="should not fetch")
+        message = SimpleNamespace(
+            chat_id="oc_dm",
+            thread_id="omt_topic",
+            root_id="om_root",
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"plain followup"}',
+            message_id="om_follow",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_follow",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertIsNone(event.reply_to_message_id)
+        adapter._fetch_message_text.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_fetch_message_text_degraded_without_store_returns_marker(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        stub_content = json.dumps(
+            {
+                "title": "小 ad",
+                "elements": [
+                    [
+                        {"tag": "text", "text": "请升级至最新版本客户端，以查看内容"},
+                    ]
+                ],
+            },
+            ensure_ascii=False,
+        )
+        body = SimpleNamespace(content=stub_content)
+        parent = SimpleNamespace(body=body, msg_type="interactive", mentions=None)
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(items=[parent]),
+            code=0,
+            msg="ok",
+        )
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(get=object())))
+        )
+        adapter._run_blocking = AsyncMock(return_value=response)
+        adapter._build_get_message_request = lambda message_id: message_id
+
+        text = asyncio.run(adapter._fetch_message_text("om_missing", chat_id="oc_chat"))
+        self.assertIn("body unavailable", text)
+        self.assertIn("om_missing", text)
+        self.assertNotEqual(text, "小 ad")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_prefers_root_id_over_thread_id_for_session_continuity(self):
+        """Follow-ups keep the starter om_* root so auto-thread sessions do not split to omt_*."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"auto_thread": True}))
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="root body")
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id="omt_topic",
+            root_id="om_first_at",
+            parent_id="om_bot_reply",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"follow up"}',
+            message_id="om_user_follow",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="group",
+                message_id="om_user_follow",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.thread_id, "om_first_at")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_inbound_group_auto_thread_can_be_disabled(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"auto_thread": False}))
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            root_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"hello"}',
+            message_id="om_no_thread",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                chat_type="group",
+                message_id="om_no_thread",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_replies_in_thread_when_thread_metadata_present(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _ReplyAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_ReplyAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello",
+                    reply_to="om_parent",
+                    metadata={"thread_id": "omt-thread"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_reply")
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_metadata_reply_target_for_threaded_feishu_topic(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="status update",
+                    metadata={
+                        "thread_id": "omt-thread",
+                        "reply_to_message_id": "om_trigger",
+                    },
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].message_id, "om_trigger")
+        self.assertTrue(captured["request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_retries_transient_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"attempts": 0}
+        sleeps = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["attempts"] += 1
+                captured["request"] = request
+                if captured["attempts"] == 1:
+                    raise OSError("temporary send failure")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_retry"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct),
+            patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=_sleep),
+        ):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="hello retry"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_retry")
+        self.assertEqual(captured["attempts"], 2)
+        self.assertEqual(sleeps, [1])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_does_not_retry_deterministic_api_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"attempts": 0}
+        sleeps = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["attempts"] += 1
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=400,
+                    msg="bad request",
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct),
+            patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=_sleep),
+        ):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="bad payload"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "[400] bad request")
+        self.assertEqual(captured["attempts"], 1)
+        self.assertEqual(sleeps, [])
+
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):

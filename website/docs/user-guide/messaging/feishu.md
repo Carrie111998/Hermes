@@ -420,6 +420,27 @@ If the Feishu API rejects the post payload (e.g., due to unsupported markdown co
 
 Plain text messages (no markdown detected) are sent as the simple `text` message type.
 
+## Streaming Card Replies (CardKit)
+
+When streaming is enabled for Feishu, progressive assistant replies prefer **CardKit streaming cards** instead of editing a raw post/text bubble:
+
+1. Create a Card 2.0 entity with `streaming_mode: true`
+2. Send it as `msg_type=interactive` with `{"type":"card","data":{"card_id":...}}`
+3. Stream full markdown into the `md_body` element via CardKit content updates
+4. On finalize, set `streaming_mode: false`
+
+Requirements:
+
+- App scope: **Create and update cards** (`cardkit:card:write`)
+- Feishu client ≥ 7.20 for Card 2.0 streaming UI
+
+Config / env:
+
+- `platforms.feishu.extra.stream_card: true` (default: `false`)
+- or `FEISHU_STREAM_CARD=true|false`
+
+If CardKit create/send fails (missing scope, API error), the adapter falls back to the classic post/text path automatically.
+
 ## Processing Status Reactions
 
 While the agent is working, the bot shows a `Typing` reaction on your message. It's cleared when the reply arrives, or replaced with `CrossMark` if processing failed.

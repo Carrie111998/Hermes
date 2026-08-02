@@ -21,7 +21,8 @@ import time
 from typing import Optional
 
 _MAX_ENTRIES = 1000
-_MAX_TEXT_CHARS = 2000
+# Feishu classic outbound chunks at 8k; keep full reply bodies for quotes.
+_MAX_TEXT_CHARS = 8000
 
 
 def _store_path() -> str:
@@ -50,14 +51,18 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
                 data = {}
         except (FileNotFoundError, ValueError):
             data = {}
-        data[_key(chat_id, message_id)] = {
+        payload = {
             "t": text[:_MAX_TEXT_CHARS],
             "ts": int(time.time()),
+            "mid": str(message_id),
         }
+        data[_key(chat_id, message_id)] = payload
+        # Also index by bare message_id so inbound can recover if chat_id form differs.
+        data[f"mid:{message_id}"] = payload
         # Trim oldest by timestamp when over cap.
         if len(data) > _MAX_ENTRIES:
             for k, _ in sorted(
-                data.items(), key=lambda kv: kv[1].get("ts", 0)
+                data.items(), key=lambda kv: kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0
             )[: len(data) - _MAX_ENTRIES]:
                 data.pop(k, None)
         tmp = f"{path}.tmp.{os.getpid()}"
@@ -70,14 +75,32 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
 
 def lookup(chat_id, message_id) -> Optional[str]:
     """Return stored text for ``(chat_id, message_id)`` or ``None``."""
-    if message_id is None or chat_id is None:
+    if message_id is None:
         return None
     try:
         with open(_store_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        entry = data.get(_key(chat_id, message_id))
-        if isinstance(entry, dict):
-            return entry.get("t") or None
+        if chat_id is not None:
+            entry = data.get(_key(chat_id, message_id))
+            if isinstance(entry, dict) and entry.get("t"):
+                return entry.get("t")
+        # Fallback: bare message_id index (chat_id mismatch / missing).
+        entry = data.get(f"mid:{message_id}")
+        if isinstance(entry, dict) and entry.get("t"):
+            return entry.get("t")
+        # Last resort: scan values with matching mid field.
+        needle = str(message_id)
+        best = None
+        best_ts = -1
+        for key, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("mid") == needle or key.endswith(f":{needle}"):
+                ts = int(entry.get("ts") or 0)
+                if ts >= best_ts and entry.get("t"):
+                    best = entry.get("t")
+                    best_ts = ts
+        return best
     except (FileNotFoundError, ValueError, AttributeError):
         return None
     return None
