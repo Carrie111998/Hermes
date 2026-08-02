@@ -13613,7 +13613,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return ""
 
     def _approval_callback(self, command: str, description: str,
-                           *, allow_permanent: bool = True) -> str:
+                           *, allow_permanent: bool = True,
+                           allow_session: bool = True,
+                           approval_id: str = "",
+                           exact_execution: bool = False) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
@@ -13640,7 +13643,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "choices": self._approval_choices(
                     command,
                     allow_permanent=allow_permanent,
+                    allow_session=allow_session,
                 ),
+                "approval_id": approval_id,
+                "exact_execution": exact_execution,
                 "selected": 0,
                 "response_queue": response_queue,
             }
@@ -13686,13 +13692,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
 
-    def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
+    def _approval_choices(
+        self,
+        command: str,
+        *,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+    ) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        choices = (
-            ["once", "session", "always", "deny"]
-            if allow_permanent
-            else ["once", "session", "deny"]
-        )
+        if not allow_session:
+            choices = ["once", "deny"]
+        else:
+            choices = (
+                ["once", "session", "always", "deny"]
+                if allow_permanent
+                else ["once", "session", "deny"]
+            )
         if len(command) > 70:
             choices.append("view")
         return choices

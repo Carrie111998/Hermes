@@ -135,9 +135,6 @@ _PRODUCTION_DELEGATION_CONFIG = {
     "max_concurrent_children": 4,
     "orchestrator_enabled": True,
     "max_spawn_depth": 2,
-    # Dangerous mutations consume exact owner-approved plan capabilities;
-    # delegated threads never receive blanket approval.
-    "subagent_auto_approve": False,
 }
 
 _REVISION = re.compile(r"[0-9a-f]{40}")
@@ -598,10 +595,13 @@ def overlay_production_gateway_config(
         raise ProductionContractError("production_config_tools_invalid")
     tools["tool_search"] = {"enabled": "off"}
 
-    delegation = target.setdefault("delegation", {})
+    delegation = target.get("delegation")
     if not isinstance(delegation, dict):
         raise ProductionContractError("production_config_delegation_invalid")
-    delegation.update(copy.deepcopy(_PRODUCTION_DELEGATION_CONFIG))
+    # The production delegation route is an exact reviewed projection.  Replace
+    # the block so a retired broad-authority knob (or any other stale route
+    # override) cannot survive overlay and then fail or weaken validation.
+    target["delegation"] = copy.deepcopy(_PRODUCTION_DELEGATION_CONFIG)
 
     canonical = target.setdefault("canonical_brain", {})
     if not isinstance(canonical, dict):
@@ -839,9 +839,13 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
     ):
         raise ProductionContractError("production_tool_search_not_disabled")
     delegation = raw.get("delegation")
-    if not isinstance(delegation, Mapping) or any(
-        delegation.get(key) != expected
-        for key, expected in _PRODUCTION_DELEGATION_CONFIG.items()
+    if (
+        not isinstance(delegation, Mapping)
+        or set(delegation) != set(_PRODUCTION_DELEGATION_CONFIG)
+        or any(
+            delegation.get(key) != expected
+            for key, expected in _PRODUCTION_DELEGATION_CONFIG.items()
+        )
     ):
         raise ProductionContractError("production_delegation_route_not_exact")
 

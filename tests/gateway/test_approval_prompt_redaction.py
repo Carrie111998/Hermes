@@ -163,6 +163,26 @@ class TestApprovalCommandWiring:
 
 
 class TestApprovalTextFallbackContract:
+    def test_exact_prompt_exposes_only_opaque_id_once_and_deny(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        approval_id = "a" * 32
+        text = _format_exec_approval_fallback(
+            "printf exact",
+            "one operation",
+            "/",
+            allow_permanent=False,
+            allow_session=False,
+            approval_id=approval_id,
+            exact_execution=True,
+        )
+
+        assert f"`/approve {approval_id}`" in text
+        assert f"`/deny {approval_id}`" in text
+        assert "approve session" not in text
+        assert "approve always" not in text
+        assert "Reply `/approve`" not in text
+
     def test_restricted_prompt_preserves_session_choice(self):
         from gateway.run import _format_exec_approval_fallback
 

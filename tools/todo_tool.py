@@ -1738,7 +1738,8 @@ TODO_SCHEMA = {
                         "minItems": 0,
                         "maxItems": 64,
                         "description": (
-                            "Exact terminal command strings authorized by this plan."
+                            "Exact terminal input bytes authorized by this plan. The "
+                            "runtime also binds tool kind and the current backend/resource."
                         ),
                     },
                     "exact_code_scripts": {
@@ -1748,8 +1749,8 @@ TODO_SCHEMA = {
                         "maxItems": 64,
                         "description": (
                             "Exact Python source strings authorized for execute_code. "
-                            "The runtime domain-separates these from terminal commands "
-                            "without interpreting their content. At least one item total "
+                            "The runtime binds raw bytes, tool kind, and the current "
+                            "backend/resource without interpreting content. At least one item total "
                             "is required across exact_commands and exact_code_scripts."
                         ),
                     },

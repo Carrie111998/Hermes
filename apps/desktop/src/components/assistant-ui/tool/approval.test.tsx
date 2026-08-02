@@ -30,7 +30,11 @@ function part(toolName: string): ToolPart {
   return { toolName, type: `tool-${toolName}` } as unknown as ToolPart
 }
 
-function setRequest(command = 'rm -rf /tmp/x', allowPermanent?: boolean, extra: { choices?: string[] } = {}) {
+function setRequest(
+  command = 'rm -rf /tmp/x',
+  allowPermanent?: boolean,
+  extra: { approvalId?: string; choices?: string[] } = {}
+) {
   $activeSessionId.set('sess-1')
   setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
 }
@@ -82,6 +86,23 @@ describe('PendingToolApproval', () => {
       expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('binds exact approval responses to the opaque approval id', async () => {
+    const request = mockGateway()
+    const approvalId = 'a'.repeat(32)
+    setRequest('printf exact', false, { approvalId, choices: ['once', 'deny'] })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        approval_id: approvalId,
+        choice: 'once',
+        session_id: 'sess-1'
+      })
+    })
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {

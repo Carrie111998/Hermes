@@ -128,6 +128,56 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_exact_approval_response_requires_opaque_id(monkeypatch):
+    from tools import approval
+
+    session_key = "tui-exact-approval"
+    entry = approval._ApprovalEntry({
+        "command": "printf exact",
+        "allow_permanent": False,
+        "allow_session": False,
+        "exact_execution": True,
+    })
+    with approval._lock:
+        approval._gateway_queues[session_key] = [entry]
+    monkeypatch.setattr(
+        server,
+        "_sess",
+        lambda _params, _rid: ({"session_key": session_key}, None),
+    )
+
+    try:
+        missing = server._methods["approval.respond"](
+            "r1",
+            {"choice": "once", "session_id": "sid"},
+        )
+        broad = server._methods["approval.respond"](
+            "r2",
+            {
+                "approval_id": entry.approval_id,
+                "choice": "session",
+                "session_id": "sid",
+            },
+        )
+        accepted = server._methods["approval.respond"](
+            "r3",
+            {
+                "approval_id": entry.approval_id,
+                "choice": "once",
+                "session_id": "sid",
+            },
+        )
+
+        assert missing["result"]["resolved"] == 0
+        assert broad["result"]["resolved"] == 0
+        assert accepted["result"]["resolved"] == 1
+        assert entry.event.is_set()
+        assert entry.result == "once"
+    finally:
+        with approval._lock:
+            approval._gateway_queues.pop(session_key, None)
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):

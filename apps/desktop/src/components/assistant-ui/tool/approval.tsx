@@ -143,6 +143,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
 
       try {
         await gateway.request<{ resolved?: boolean }>('approval.respond', {
+          ...(request.approvalId ? { approval_id: request.approvalId } : {}),
           choice,
           session_id: request.sessionId ?? undefined
         })
@@ -153,7 +154,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.approvalId, request.sessionId]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.
