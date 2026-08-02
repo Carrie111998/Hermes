@@ -242,7 +242,9 @@ def file_ops(mock_env):
     return ShellFileOperations(mock_env)
 
 
-def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
+def make_real_subprocess_env(
+    cwd: str, include_stderr: bool = False, errors: str = "strict"
+) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.
 
     For tests that need the generated shell scripts to actually run
@@ -250,6 +252,7 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     intercepted by a bare MagicMock.  ``include_stderr`` folds stderr
     into ``output`` for tests that surface shell error text; leave it
     off for tests that parse structured stdout (e.g. find results).
+    ``errors`` mirrors the terminal backend's subprocess decoding policy.
     """
     env = MagicMock()
     env.cwd = cwd
@@ -261,6 +264,7 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
             text=True,
             capture_output=True,
             input=kwargs.get("stdin_data"),
+            errors=errors,
         )
         output = completed.stdout
         if include_stderr:
@@ -673,3 +677,49 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+
+class TestReadUtf8SampleBoundary:
+    """A byte sample must not split a valid UTF-8 character."""
+
+    def test_read_file_accepts_multibyte_character_at_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "boundary.md"
+        path.write_bytes(b"a" * 999 + "ç\ntext\n".encode("utf-8"))
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "ç" in result.content
+
+    def test_read_file_raw_accepts_multibyte_character_at_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "boundary.md"
+        path.write_bytes(b"a" * 999 + "ç\ntext\n".encode("utf-8"))
+
+        result = ops.read_file_raw(str(path))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "ç" in result.content
+
+    def test_invalid_bytes_at_sample_boundary_remain_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "invalid.bin"
+        path.write_bytes(b"a" * 999 + b"\xff\n")
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is True
+        assert result.error is not None
+
+    def test_invalid_boundary_byte_is_not_hidden_by_a_following_split_character(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
+        path = tmp_path / "invalid-with-boundary.md"
+        path.write_bytes(b"a" * 999 + b"\xff" + "🧪\ntext\n".encode("utf-8"))
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is True
+        assert result.error is not None

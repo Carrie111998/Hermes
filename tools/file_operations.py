@@ -887,6 +887,40 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
+    def _binary_sample(self, path: str, file_size: int) -> str:
+        """Return a UTF-8-safe sample for binary detection.
+
+        Terminal backends decode command output with ``errors="replace"``.
+        A byte sample that ends halfway through a valid multibyte character
+        therefore produces a trailing U+FFFD even though the file is valid
+        UTF-8. Only extend samples with that exact boundary signal. Any
+        replacement character that remains inside the extended sample still
+        represents undecodable input and remains fail-closed.
+        """
+        sample_limit = 1000
+        sample_cmd = f"head -c {sample_limit} {self._escape_shell_arg(path)} 2>/dev/null"
+        sample_result = self._exec(sample_cmd)
+        sample = _strip_terminal_fence_leaks(sample_result.stdout)
+
+        if not sample.endswith("\ufffd") or file_size <= sample_limit:
+            return sample
+
+        extended_limit = sample_limit + 4
+        extended_result = self._exec(
+            f"head -c {extended_limit} {self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        extended = _strip_terminal_fence_leaks(extended_result.stdout)
+        if not extended.endswith("\ufffd"):
+            return extended
+
+        # The extended probe can itself end in a newly split character. Do
+        # not let that second boundary hide an undecodable replacement from
+        # the original 1000-byte window. If the file ends within the probe,
+        # retain the replacement: it is truncated/invalid file content.
+        if file_size <= extended_limit or extended.count("\ufffd") != 1:
+            return extended
+        return extended[:-1]
+
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
@@ -1194,9 +1228,7 @@ class ShellFileOperations(FileOperations):
             )
         
         # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        sample_output = self._binary_sample(path, file_size)
         
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
@@ -1312,8 +1344,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        sample_output = self._binary_sample(path, file_size)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True, file_size=file_size,
