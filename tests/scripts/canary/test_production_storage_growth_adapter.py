@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -40,6 +41,41 @@ def _owner_binding() -> dict:
         "attestation_sha256": protocol.sha256_json(unsigned),
     }
     return dict(installer.build_owner_artifact_binding(RELEASE, attestation))
+
+
+@pytest.mark.parametrize(
+    ("attribute", "call", "error_type", "error_code"),
+    (
+        (
+            "getuid",
+            contract._posix_uid,
+            contract.ProductionStorageGrowthError,
+            "production_storage_runtime_artifact_observation_invalid",
+        ),
+        (
+            "getgid",
+            contract._posix_gid,
+            contract.ProductionStorageGrowthError,
+            "production_storage_runtime_artifact_observation_invalid",
+        ),
+        (
+            "geteuid",
+            installer._posix_effective_uid,
+            installer.ProductionStorageInstallerError,
+            "production_storage_owner_installer_invalid",
+        ),
+    ),
+)
+def test_posix_identity_helpers_fail_closed_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    call: Callable[[], int],
+    error_type: type[RuntimeError],
+    error_code: str,
+) -> None:
+    monkeypatch.delattr(os, attribute, raising=False)
+    with pytest.raises(error_type, match=error_code):
+        call()
 
 
 def test_owner_state_installer_attests_digest_and_rejects_wrong_owner(

@@ -193,6 +193,44 @@ class ProductionStorageGrowthError(RuntimeError):
     """Stable, secret-free contract failure."""
 
 
+def _posix_uid() -> int:
+    getter = getattr(os, "getuid", None)
+    if not callable(getter):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        ) from None
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        ) from None
+    if type(value) is not int or value < 0:
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        )
+    return value
+
+
+def _posix_gid() -> int:
+    getter = getattr(os, "getgid", None)
+    if not callable(getter):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        ) from None
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError):
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        ) from None
+    if type(value) is not int or value < 0:
+        raise ProductionStorageGrowthError(
+            "production_storage_runtime_artifact_observation_invalid"
+        )
+    return value
+
+
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
@@ -425,8 +463,8 @@ def observe_runtime_artifact_attestation(
 ) -> Mapping[str, Any]:
     """Hash the exact sealed owner-side release artifacts from disk."""
 
-    uid = os.getuid() if expected_uid is None else expected_uid
-    gid = os.getgid() if expected_gid is None else expected_gid
+    uid = _posix_uid() if expected_uid is None else expected_uid
+    gid = _posix_gid() if expected_gid is None else expected_gid
     if (
         not isinstance(source_root, Path)
         or not source_root.is_absolute()

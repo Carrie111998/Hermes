@@ -132,6 +132,25 @@ class ProductionStorageInstallerError(RuntimeError):
     """Stable, secret-free installer failure."""
 
 
+def _posix_effective_uid() -> int:
+    getter = getattr(os, "geteuid", None)
+    if not callable(getter):
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_installer_invalid"
+        ) from None
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError):
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_installer_invalid"
+        ) from None
+    if type(value) is not int or value < 0:
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_installer_invalid"
+        )
+    return value
+
+
 def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for name, item in pairs:
@@ -535,7 +554,7 @@ def install_owner_state_root(
     installation_receipt: Path | None = None,
     expected_uid: int = 0,
     expected_gid: int = 0,
-    effective_uid: Callable[[], int] = os.geteuid,
+    effective_uid: Callable[[], int] = _posix_effective_uid,
     wall_clock: Callable[[], int] = lambda: int(time.time()),
     artifact_verifier: Callable[..., Mapping[str, Any]] = (
         verify_owner_artifact_binding_on_disk
@@ -762,7 +781,7 @@ def install_guest(
     expected_gid: int = 0,
     expected_interpreter_uid: int = 0,
     expected_interpreter_gid: int = 0,
-    effective_uid: Callable[[], int] = os.geteuid,
+    effective_uid: Callable[[], int] = _posix_effective_uid,
     wall_clock: Callable[[], int] = lambda: int(time.time()),
     runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
 ) -> Mapping[str, Any]:
