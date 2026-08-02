@@ -191,11 +191,15 @@ _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
 
 def _computer_use_cfg() -> Dict[str, Any]:
-    """The ``computer_use`` config block, or ``{}`` when config is unreadable."""
+    """The ``computer_use`` config block, or ``{}`` when invalid/unreadable."""
     try:
         from hermes_cli.config import load_config
 
-        return (load_config() or {}).get("computer_use") or {}
+        cfg = load_config() or {}
+        if not isinstance(cfg, dict):
+            return {}
+        section = cfg.get("computer_use", {}) or {}
+        return section if isinstance(section, dict) else {}
     except Exception:
         return {}
 
@@ -689,12 +693,27 @@ def _has_path_separator(value: str) -> bool:
     return os.sep in value or (os.altsep is not None and os.altsep in value)
 
 
+def configured_cua_driver_path() -> str:
+    """Return the profile-configured cua-driver path when it is a string."""
+    value = _computer_use_cfg().get("driver_path", "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def configured_cua_driver_path_error() -> Optional[str]:
+    """Describe an explicitly invalid profile driver_path value, if present."""
+    value = _computer_use_cfg().get("driver_path", "")
+    if isinstance(value, str):
+        return None
+    return f"expected a string, got {type(value).__name__}"
+
+
 def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     """Return candidate cua-driver commands in resolution order.
 
-    ``override`` is authoritative when supplied. Otherwise a non-empty
-    ``HERMES_CUA_DRIVER_CMD`` is authoritative; only when neither is set do we
-    use PATH and canonical install locations.
+    ``override`` is authoritative when supplied. Otherwise the profile-safe
+    ``computer_use.driver_path`` setting wins, followed by the legacy
+    ``HERMES_CUA_DRIVER_CMD`` environment override. Only when none is set do
+    we use PATH and canonical install locations.
 
     Desktop apps launched from Finder/Dock often inherit a narrow PATH that
     omits user-local install directories. The upstream cua-driver installer
@@ -702,7 +721,24 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     Hermes Desktop/TUI session can otherwise filter out the `computer_use`
     tool even though `hermes computer-use doctor` succeeds from a login shell.
     """
-    configured = (override if override is not None else os.environ.get(_CUA_DRIVER_CMD_ENV, "")).strip()
+    if override is not None:
+        configured = override.strip()
+    else:
+        config_error = configured_cua_driver_path_error()
+        if config_error:
+            # The profile explicitly contains driver_path but its value cannot
+            # name an executable. Do not silently weaken the pin to env/PATH.
+            return []
+        configured = configured_cua_driver_path()
+        if configured:
+            expanded = os.path.expanduser(configured)
+            if not os.path.isabs(expanded):
+                from hermes_cli.config import get_config_path
+
+                expanded = str(get_config_path().parent / expanded)
+            configured = expanded
+        if not configured:
+            configured = os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip()
     if configured:
         # An explicit override is authoritative: if it is wrong, report the
         # driver missing instead of silently picking a different binary.
@@ -728,19 +764,21 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
 def resolve_cua_driver_cmd(override: Optional[str] = None) -> Optional[str]:
     """Resolve the cua-driver executable for every runtime/status surface.
 
-    A supplied override (or ``HERMES_CUA_DRIVER_CMD``) is never silently
-    replaced by another binary. Otherwise resolve PATH first, then canonical
-    user-local installation locations used by the official installer.
+    An explicit CLI override, profile path, or legacy environment override is
+    never silently replaced by another binary. Resolved executables are
+    returned as absolute canonical paths. Otherwise resolve PATH first, then
+    canonical user-local installation locations used by the installer.
     """
     for candidate in _candidate_cua_driver_commands(override):
         expanded = os.path.expanduser(candidate)
         if _has_path_separator(expanded):
-            if shutil.which(expanded):
-                return expanded
+            resolved = shutil.which(expanded)
+            if resolved:
+                return os.path.realpath(os.path.abspath(resolved))
         else:
             resolved = shutil.which(expanded)
             if resolved:
-                return resolved
+                return os.path.realpath(os.path.abspath(resolved))
     return None
 
 

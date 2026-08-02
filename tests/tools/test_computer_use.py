@@ -82,11 +82,127 @@ class TestRegistration:
         driver.write_text("#!/bin/sh\nexit 0\n")
         driver.chmod(0o755)
 
+        monkeypatch.setattr(cua_backend, "_computer_use_cfg", lambda: {})
         monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", str(driver))
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
         assert cua_backend.resolve_cua_driver_cmd() == str(driver)
         assert cua_backend.cua_driver_binary_available() is True
+
+    def test_profile_driver_path_wins_over_legacy_env(self, tmp_path, monkeypatch):
+        """A profile setting must select the runtime binary ahead of legacy env."""
+        from tools.computer_use import cua_backend
+
+        driver = tmp_path / "profile-cua-driver"
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        (tmp_path / "config.yaml").write_text(
+            f"computer_use:\n  driver_path: {driver}\n"
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", "/missing/legacy-driver")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        assert cua_backend.resolve_cua_driver_cmd() == str(driver.resolve())
+
+    def test_invalid_profile_driver_path_is_authoritative(self, tmp_path, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        fallback = tmp_path / "fallback-cua-driver"
+        fallback.write_text("#!/bin/sh\nexit 0\n")
+        fallback.chmod(0o755)
+        missing = tmp_path / "missing-profile-driver"
+        (tmp_path / "config.yaml").write_text(
+            f"computer_use:\n  driver_path: {missing}\n"
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", str(fallback))
+        monkeypatch.setenv("PATH", str(tmp_path))
+
+        assert cua_backend.resolve_cua_driver_cmd() is None
+        assert cua_backend.cua_driver_binary_available() is False
+
+    def test_profile_driver_path_is_returned_canonically(self, tmp_path, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        driver = tmp_path / "real-cua-driver"
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        link = tmp_path / "selected-cua-driver"
+        link.symlink_to(driver)
+        (tmp_path / "config.yaml").write_text(
+            f"computer_use:\n  driver_path: {link}\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+
+        assert cua_backend.resolve_cua_driver_cmd() == str(driver.resolve())
+
+    def test_malformed_profile_driver_config_falls_back_safely(self, tmp_path, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        fallback = tmp_path / "fallback-cua-driver"
+        fallback.write_text("#!/bin/sh\nexit 0\n")
+        fallback.chmod(0o755)
+        (tmp_path / "config.yaml").write_text("computer_use:\n  - malformed\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", str(fallback))
+
+        assert cua_backend.resolve_cua_driver_cmd() == str(fallback.resolve())
+
+    def test_nonscalar_profile_driver_path_fails_closed(self, tmp_path, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        fallback = tmp_path / "fallback-cua-driver"
+        fallback.write_text("#!/bin/sh\nexit 0\n")
+        fallback.chmod(0o755)
+        (tmp_path / "config.yaml").write_text(
+            "computer_use:\n  driver_path:\n    - not-a-path\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", str(fallback))
+
+        assert cua_backend.resolve_cua_driver_cmd() is None
+
+    def test_bare_profile_driver_name_is_anchored_to_profile(self, tmp_path, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        profile_driver = tmp_path / "cua-driver"
+        profile_driver.write_text("#!/bin/sh\nexit 0\n")
+        profile_driver.chmod(0o755)
+        path_dir = tmp_path / "path-bin"
+        path_dir.mkdir()
+        path_driver = path_dir / "cua-driver"
+        path_driver.write_text("#!/bin/sh\nexit 0\n")
+        path_driver.chmod(0o755)
+        (tmp_path / "config.yaml").write_text(
+            "computer_use:\n  driver_path: cua-driver\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("PATH", str(path_dir))
+
+        assert cua_backend.resolve_cua_driver_cmd() == str(profile_driver.resolve())
+
+    def test_relative_profile_driver_path_is_anchored_to_profile(self, tmp_path, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        profile = tmp_path / "profile"
+        workspace = tmp_path / "workspace"
+        driver = profile / "bin" / "cua-driver"
+        driver.parent.mkdir(parents=True)
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        workspace.mkdir()
+        (profile / "config.yaml").write_text(
+            "computer_use:\n  driver_path: bin/cua-driver\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+        monkeypatch.chdir(workspace)
+
+        assert cua_backend.resolve_cua_driver_cmd() == str(driver.resolve())
 
 
 # ---------------------------------------------------------------------------
