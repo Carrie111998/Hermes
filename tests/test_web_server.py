@@ -85,6 +85,14 @@ def test_start_server_applies_process_local_ssh_bootstrap_state(monkeypatch):
     assert captured["port"] == 0
 
 
+def test_format_url_host_escapes_ipv6_zone_identifier():
+    """An IPv6 zone delimiter must be percent-encoded inside URL authority."""
+    from hermes_cli.url_utils import format_url_host
+
+    assert format_url_host("fe80::1%eth0") == "[fe80::1%25eth0]"
+    assert format_url_host("[fe80::1%eth0]") == "[fe80::1%25eth0]"
+
+
 def test_maybe_open_browser_brackets_ipv6_loopback(monkeypatch):
     """A browser URL needs brackets around an IPv6 literal authority."""
     import webbrowser
