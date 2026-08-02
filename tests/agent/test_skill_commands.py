@@ -15,6 +15,57 @@ from agent.skill_commands import (
 )
 
 
+def test_concurrent_scan_no_duplicate_warnings():
+    """Concurrent startup scans must not race and log "already claimed".
+
+    Regression for the boot-time log spam where two threads called
+    scan_skill_commands() at once: seen_names is call-local while
+    _skill_commands is process-global and gets reset+repopulated, so the
+    second scanner saw the first's entries and warned for every skill.
+    The RLock in scan_skill_commands() / get_skill_commands() serializes
+    them; this test proves the warning is gone under contention.
+    """
+    import logging
+    import threading
+
+    from agent import skill_commands as sc
+
+    with patch.object(
+        sc, "_resolve_skill_commands_platform", return_value="cli"
+    ):
+        # Force a rescan path so each call re-runs the full scan.
+        sc._skill_commands = {}
+        sc._skill_commands_platform = None
+
+        warnings = []
+        handler = logging.Handler()
+        handler.emit = lambda record: warnings.append(record.getMessage())
+        logger = logging.getLogger("agent.skill_commands")
+        logger.addHandler(handler)
+        try:
+            barrier = threading.Barrier(6)
+
+            def worker():
+                barrier.wait()
+                sc.get_skill_commands()
+
+            threads = [threading.Thread(target=worker) for _ in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            logger.removeHandler(handler)
+
+        dup_warnings = [
+            w for w in warnings
+            if "already claimed" in w
+        ]
+        assert not dup_warnings, (
+            f"concurrent scan produced {len(dup_warnings)} duplicate warnings: "
+            f"{dup_warnings[:3]}"
+        )
+
 def _make_skill(
     skills_dir, name, frontmatter_extra="", body="Do the thing.", category=None
 ):
