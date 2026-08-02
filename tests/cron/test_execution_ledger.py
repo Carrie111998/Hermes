@@ -421,6 +421,64 @@ def test_execution_terminal_row_persists_confirmed_delivery_receipt(monkeypatch,
         )
 
 
+def test_delivery_terminal_evidence_requires_dispatch_and_success_coherence(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    requested = {"platform": "telegram", "chat_id": "-100123", "thread_id": None}
+
+    def claim_delivery(label):
+        artifact = tmp_path / f"{label}.txt"
+        artifact.write_bytes(label.encode())
+        producer = _create(executions, f"producer-{label}")
+        executions.finish_execution(producer["id"], success=True)
+        delivery = executions.create_delivery_execution(
+            producer_execution_id=producer["id"],
+            artifact_path=str(artifact),
+            artifact_sha256=f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
+            delivery_targets=[requested],
+        )
+        executions.mark_execution_running(delivery["id"])
+        return delivery
+
+    delivered_without_transport = {
+        "requested_target": requested,
+        "actual_target": requested,
+        "status": "delivered",
+        "transport": "none",
+        "error": None,
+        "provider_receipt_id": None,
+    }
+    with pytest.raises(ValueError, match="delivered receipt requires a dispatched transport"):
+        delivery = claim_delivery("no-transport")
+        executions.finish_execution(
+            delivery["id"], success=True, delivery_status="delivered",
+            delivery_targets=[requested], delivery_receipts=[delivered_without_transport],
+        )
+
+    delivered = {**delivered_without_transport, "transport": "live"}
+    with pytest.raises(ValueError, match="success must agree with delivered delivery status"):
+        delivery = claim_delivery("false-delivered")
+        executions.finish_execution(
+            delivery["id"], success=False, error="contradiction",
+            delivery_status="delivered", delivery_targets=[requested],
+            delivery_receipts=[delivered],
+        )
+
+    failed = {
+        "requested_target": requested,
+        "actual_target": requested,
+        "status": "failed",
+        "transport": "none",
+        "error": "failed before dispatch",
+        "provider_receipt_id": None,
+    }
+    with pytest.raises(ValueError, match="success must agree with failed delivery status"):
+        delivery = claim_delivery("true-failed")
+        executions.finish_execution(
+            delivery["id"], success=True, delivery_status="failed",
+            delivery_error="failed before dispatch", delivery_receipts=[failed],
+        )
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = _create(executions, "immutable")

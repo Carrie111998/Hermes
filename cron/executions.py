@@ -393,6 +393,8 @@ def _validate_delivery_evidence(
             raise ValueError("delivery receipt transport is invalid")
         if status == "delivered" and error is not None:
             raise ValueError("delivered receipt cannot carry an error")
+        if status == "delivered" and transport == "none":
+            raise ValueError("delivered receipt requires a dispatched transport")
         if status in ("failed", "ambiguous") and not error:
             raise ValueError(f"{status} receipt requires error evidence")
         if status == "ambiguous" and transport == "none":
@@ -476,6 +478,11 @@ def finish_execution(
         ).fetchone()
         if existing is not None and existing["kind"] == "delivery" and delivery_status is None:
             raise ValueError("delivery execution requires validated terminal evidence")
+        if existing is not None and existing["kind"] == "delivery":
+            if delivery_status == "delivered" and not success:
+                raise ValueError("success must agree with delivered delivery status")
+            if delivery_status == "failed" and success:
+                raise ValueError("success must agree with failed delivery status")
         normalized_targets: List[Dict[str, Any]] = []
         normalized_receipts: List[Dict[str, Any]] = []
         if delivery_status in ("delivered", "failed"):
