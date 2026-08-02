@@ -4,7 +4,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
 import { Tip } from '@/components/ui/tooltip'
 import type { DesktopAuthProvider, DesktopCloudAgent, DesktopCloudOrg, DesktopConnectionProbeResult } from '@/global'
 import { useI18n } from '@/i18n'
@@ -167,8 +166,6 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   const cloudConnectSeq = useRef(0)
   const contextSeq = useRef(0)
   const [connectedCloudUrl, setConnectedCloudUrl] = useState('')
-  const [loginItemOpenAtLogin, setLoginItemOpenAtLogin] = useState(false)
-  const [loginItemBusy, setLoginItemBusy] = useState(false)
 
   const acceptSavedConfig = (config: GatewaySettingsState) => {
     setState(config)
@@ -210,36 +207,6 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   useEffect(() => {
     void refreshActiveProfile()
   }, [])
-
-  useEffect(() => {
-    let cancelled = false
-
-    void window.hermesDesktop?.loginItem
-      ?.get()
-      .then(settings => {
-        if (!cancelled) {
-          setLoginItemOpenAtLogin(settings?.openAtLogin ?? false)
-        }
-      })
-      .catch(() => {
-        // The login-item API is unavailable outside a supported desktop build.
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  const handleLoginItemChange = async (checked: boolean) => {
-    setLoginItemBusy(true)
-
-    try {
-      await window.hermesDesktop?.loginItem?.set({ openAtLogin: checked })
-      setLoginItemOpenAtLogin(checked)
-    } finally {
-      setLoginItemBusy(false)
-    }
-  }
 
   // Auth-mode probe: as the user types a remote URL we ask the gateway (via
   // its public /api/status) whether it gates with OAuth or a static session
@@ -1537,18 +1504,6 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
       {embedded ? null : (
         <div className="mt-6 grid gap-1">
-          <ListRow
-            action={
-              <Switch
-                aria-label={t.settings.desktopLoginItem.title}
-                checked={loginItemOpenAtLogin}
-                disabled={loginItemBusy}
-                onCheckedChange={checked => void handleLoginItemChange(checked)}
-              />
-            }
-            description={t.settings.desktopLoginItem.description}
-            title={t.settings.desktopLoginItem.title}
-          />
           <ListRow
             action={
               <Button onClick={() => void window.hermesDesktop?.revealLogs()} size="sm" variant="textStrong">

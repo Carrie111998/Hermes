@@ -82,20 +82,6 @@ describe('GatewaySettings', () => {
     ).toBeNull()
   })
 
-  it('loads and updates the Desktop login-item toggle', async () => {
-    const { GatewaySettings } = await import('./gateway-settings')
-
-    render(<GatewaySettings />)
-
-    const toggle = await screen.findByRole('switch', { name: 'Launch Hermes Desktop at login' })
-    expect(toggle).toHaveAttribute('aria-checked', 'false')
-
-    fireEvent.click(toggle)
-
-    await waitFor(() => expect(loginItemSet).toHaveBeenCalledWith({ openAtLogin: true }))
-    expect(toggle).toHaveAttribute('aria-checked', 'true')
-  })
-
   it('shows and clears an SSH remote-profile mapping for a named Desktop profile', async () => {
     getConnectionConfig.mockImplementation(async profile =>
       profile === 'work'
