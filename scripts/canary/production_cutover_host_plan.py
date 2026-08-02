@@ -71,6 +71,7 @@ from gateway.support_ops_team_registry import (
     SKYVISION_GUILD_ID,
     SKYVISION_NASI_AI_OPS_CHANNEL_ID,
 )
+from ops.muncho.runtime import upstream_sync_job_rail as dual_sync_rail
 from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_host_authority as host_authority
 
@@ -111,6 +112,10 @@ OWNER_RUNTIME_ARTIFACT_NAMES = frozenset({
     "connector_config",
     "routeback_config",
     "mac_ops_config",
+    "dual_upstream_sync_service_unit",
+    "dual_upstream_sync_timer_unit",
+    "dual_upstream_sync_report_service_unit",
+    "dual_upstream_sync_report_timer_unit",
 })
 ROOT_VERIFIER_ARTIFACT_NAMES = frozenset({
     "api_bearer_verifier",
@@ -134,6 +139,49 @@ HOST_ARTIFACT_SOURCE_PARTITIONS = (
 
 class HostPlanProducerError(RuntimeError):
     """Stable, secret-free fixed producer failure."""
+
+
+def _dual_sync_host_payloads(
+    revision: str,
+    *,
+    package_builder: Callable[[str, str], dual_sync_rail.RailPackage],
+) -> dict[str, bytes]:
+    """Render the four exact release-addressed rail consumers."""
+
+    try:
+        rendered = package_builder(revision, revision)
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        raise HostPlanProducerError("host_plan_dual_sync_render_failed") from exc
+    if (
+        not isinstance(rendered, dual_sync_rail.RailPackage)
+        or rendered.revision != revision
+        or rendered.sender_revision != revision
+        or set(rendered.artifacts)
+        != {
+            dual_sync_rail.SYNC_SERVICE_UNIT,
+            dual_sync_rail.SYNC_TIMER_UNIT,
+            dual_sync_rail.REPORT_SERVICE_UNIT,
+            dual_sync_rail.REPORT_TIMER_UNIT,
+        }
+    ):
+        raise HostPlanProducerError("host_plan_dual_sync_render_failed")
+    payloads = {
+        "dual_upstream_sync_service_unit": rendered.artifacts[
+            dual_sync_rail.SYNC_SERVICE_UNIT
+        ],
+        "dual_upstream_sync_timer_unit": rendered.artifacts[
+            dual_sync_rail.SYNC_TIMER_UNIT
+        ],
+        "dual_upstream_sync_report_service_unit": rendered.artifacts[
+            dual_sync_rail.REPORT_SERVICE_UNIT
+        ],
+        "dual_upstream_sync_report_timer_unit": rendered.artifacts[
+            dual_sync_rail.REPORT_TIMER_UNIT
+        ],
+    }
+    if any(not isinstance(raw, bytes) or not raw for raw in payloads.values()):
+        raise HostPlanProducerError("host_plan_dual_sync_render_failed")
+    return payloads
 
 
 def _effective_identity() -> tuple[int, int] | None:
@@ -1082,6 +1130,9 @@ def _stage_fixed_host_artifacts_locked(
     secret_stager: Callable[..., Mapping[str, Any]] = (
         production_secret_stager.stage_production_secret_foundation
     ),
+    dual_sync_package_builder: Callable[[str, str], dual_sync_rail.RailPackage] = (
+        dual_sync_rail.build_package
+    ),
     require_root: bool = True,
 ) -> Mapping[str, Any]:
     """Create or exactly re-observe every fixed host artifact."""
@@ -1111,6 +1162,8 @@ def _stage_fixed_host_artifacts_locked(
         trusted_uid, trusted_gid = identity
     source_root_uid = 0 if require_root else trusted_uid
     source_root_gid = 0 if require_root else trusted_gid
+    if require_root and dual_sync_package_builder is not dual_sync_rail.build_package:
+        raise HostPlanProducerError("host_plan_dual_sync_builder_invalid")
     legacy_policy, target_policy = _validate_reconciliation_intent(
         inputs, revision=revision
     )
@@ -1212,6 +1265,10 @@ def _stage_fixed_host_artifacts_locked(
         raise HostPlanProducerError("host_plan_gateway_render_failed") from exc
     writer_config = _render_writer_config(writer_source, inputs=inputs)
     writer_unit = _render_writer_unit(revision=revision, inputs=inputs)
+    dual_sync_payloads = _dual_sync_host_payloads(
+        revision,
+        package_builder=dual_sync_package_builder,
+    )
 
     for directory in (
         package.CUTOVER_STAGED_ROOT.parent,
@@ -1249,6 +1306,7 @@ def _stage_fixed_host_artifacts_locked(
         "connector_config": connector_config,
         "routeback_config": routeback_config,
         "mac_ops_config": mac_ops_config,
+        **dual_sync_payloads,
     }
     if (
         set().union(*HOST_ARTIFACT_SOURCE_PARTITIONS)
@@ -1317,6 +1375,9 @@ def stage_fixed_host_artifacts(
     secret_stager: Callable[..., Mapping[str, Any]] = (
         production_secret_stager.stage_production_secret_foundation
     ),
+    dual_sync_package_builder: Callable[[str, str], dual_sync_rail.RailPackage] = (
+        dual_sync_rail.build_package
+    ),
     require_root: bool = True,
     lock_factory: Any | None = None,
 ) -> Mapping[str, Any]:
@@ -1335,6 +1396,7 @@ def stage_fixed_host_artifacts(
                 filesystem_root=filesystem_root,
                 unit_inputs=unit_inputs,
                 secret_stager=secret_stager,
+                dual_sync_package_builder=dual_sync_package_builder,
                 require_root=require_root,
             )
     except authority_lock.AuthorityActivationLockError as exc:

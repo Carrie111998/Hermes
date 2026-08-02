@@ -1837,6 +1837,10 @@ _HOST_TRANSITION_FILE_NAMES = (
     "api_bearer_verifier",
     "api_approval_verifier",
     "operational_edge_client_config",
+    "dual_upstream_sync_service_unit",
+    "dual_upstream_sync_timer_unit",
+    "dual_upstream_sync_report_service_unit",
+    "dual_upstream_sync_report_timer_unit",
     *(
         f"operational_edge_unit_{domain}"
         for domain in sorted(CREDENTIALS_BY_DOMAIN)
@@ -2522,6 +2526,18 @@ def _validate_host_transition(
         "operational_edge_client_config": str(
             OPERATIONAL_EDGE_CLIENT_CONFIG_PATH
         ),
+        "dual_upstream_sync_service_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync.service"
+        ),
+        "dual_upstream_sync_timer_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync.timer"
+        ),
+        "dual_upstream_sync_report_service_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync-report.service"
+        ),
+        "dual_upstream_sync_report_timer_unit": (
+            "/etc/systemd/system/muncho-dual-upstream-sync-report.timer"
+        ),
         **{
             f"operational_edge_unit_{domain}": (
                 f"/etc/systemd/system/{operational_edge_service_unit(domain)}"
@@ -2593,6 +2609,10 @@ def _validate_host_transition(
             "routeback_unit", "mac_ops_unit", "browser_unit",
             "isolated_worker_socket_unit", "isolated_worker_service_unit",
             "gateway_connector_drop_in",
+            "dual_upstream_sync_service_unit",
+            "dual_upstream_sync_timer_unit",
+            "dual_upstream_sync_report_service_unit",
+            "dual_upstream_sync_report_timer_unit",
         } | {
             f"operational_edge_unit_{domain}"
             for domain in CREDENTIALS_BY_DOMAIN
