@@ -539,6 +539,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Static counterpart for the registry-owned Matrix title tool.  Platform
+    # resolution reverse-maps composites through static toolsets, so leaving
+    # this registry-only makes hermes-matrix's extra impossible to recover.
+    "chat_title": {
+        "description": "Rename the current supported gateway chat",
+        "tools": ["set_chat_title"],
+        "includes": []
+    },
+
     "hermes-dingtalk": {
         "description": "DingTalk bot toolset - enterprise messaging platform (full access)",
         "tools": _HERMES_CORE_TOOLS,
