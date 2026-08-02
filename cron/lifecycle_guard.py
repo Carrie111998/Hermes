@@ -219,7 +219,13 @@ def _iter_referenced_shell_scripts(
                 yield _resolve_terminal_script_path(arguments[arg_index], cwd)
             continue
 
-        if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
+        # A standalone slash is a Python arithmetic operator in expressions
+        # such as ``Path.home() / ".hermes"``.  It is not an executable path;
+        # treating it as one makes the scanner resolve ``/`` and fail closed
+        # on every ordinary pathlib-based Python cron script.
+        if (executable != "/" and "/" in executable) or executable.endswith(
+            (".sh", ".bash", ".zsh")
+        ):
             yield _resolve_terminal_script_path(executable, cwd)
 
 

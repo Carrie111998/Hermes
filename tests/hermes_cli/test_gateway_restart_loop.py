@@ -628,6 +628,15 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("", str(script))
 
+    def test_python_pathlib_division_does_not_look_like_script(self, tmp_path):
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        script = tmp_path / "config.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            "ENV = Path.home() / '.hermes' / '.env'\n"
+        )
+        check_gateway_lifecycle("", str(script))
+
 
     def test_relative_script_resolved_under_scripts_dir(self, tmp_path, monkeypatch):
         """A bare/relative script name resolves under HERMES_HOME/scripts (the
