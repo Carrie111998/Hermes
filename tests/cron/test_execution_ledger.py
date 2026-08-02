@@ -289,6 +289,130 @@ def test_tampered_owned_media_fails_closed_before_dispatch(monkeypatch, tmp_path
         )
 
 
+def test_owned_media_mutated_during_setup_fails_before_first_provider_contact(
+    monkeypatch, tmp_path,
+):
+    import cron.scheduler as scheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    source = tmp_path / "before-contact.png"
+    source.write_bytes(b"validated bytes")
+    content = f"MEDIA:{source}"
+    producer = _create(executions, "before-contact")
+    executions.finish_execution(producer["id"], success=True)
+    artifact_path, artifact_sha256, media_artifacts = scheduler._materialize_delivery_artifact(
+        "before-contact", producer["id"], content,
+    )
+    target = {"platform": "telegram", "chat_id": "first", "thread_id": None}
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        media_artifacts=media_artifacts,
+        delivery_targets=[target],
+    )
+    bound = scheduler._bind_delivery_content_to_execution_artifact(
+        content,
+        source_artifact_path=artifact_path,
+        delivery_execution=delivery,
+    )
+    owned = Path(json.loads(delivery["artifact_manifest"])["media"][0]["path"])
+    provider_bytes = []
+
+    async def send(*_args, on_provider_contact=None, media_files=None, **_kwargs):
+        on_provider_contact()
+        provider_bytes.append(Path(media_files[0][0]).read_bytes())
+        return {"success": True, "message_id": "unexpected"}
+
+    def mutate_during_setup(*_args, **_kwargs):
+        owned.chmod(0o600)
+        owned.write_bytes(b"tampered bytes!")
+        return None
+
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+    )
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setattr("gateway.delivery.resolve_delivery_transport", mutate_during_setup)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+
+    outcome = scheduler._deliver_result(
+        {"id": "before-contact", "deliver": "telegram:first"},
+        bound,
+        targets=[target],
+        delivery_execution_id=delivery["id"],
+    )
+
+    assert provider_bytes == []
+    assert outcome.state is scheduler.DeliveryState.FAILED
+    assert outcome.receipts[0]["status"] == "failed"
+    assert outcome.receipts[0]["transport"] == "none"
+
+
+def test_owned_media_is_revalidated_between_delivery_targets(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    source = tmp_path / "between-targets.png"
+    source.write_bytes(b"validated bytes")
+    content = f"MEDIA:{source}"
+    producer = _create(executions, "between-targets")
+    executions.finish_execution(producer["id"], success=True)
+    artifact_path, artifact_sha256, media_artifacts = scheduler._materialize_delivery_artifact(
+        "between-targets", producer["id"], content,
+    )
+    targets = [
+        {"platform": "telegram", "chat_id": "first", "thread_id": None},
+        {"platform": "telegram", "chat_id": "second", "thread_id": None},
+    ]
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        media_artifacts=media_artifacts,
+        delivery_targets=targets,
+    )
+    bound = scheduler._bind_delivery_content_to_execution_artifact(
+        content,
+        source_artifact_path=artifact_path,
+        delivery_execution=delivery,
+    )
+    owned = Path(json.loads(delivery["artifact_manifest"])["media"][0]["path"])
+    provider_bytes = []
+
+    async def send(*_args, on_provider_contact=None, media_files=None, **_kwargs):
+        on_provider_contact()
+        provider_bytes.append(Path(media_files[0][0]).read_bytes())
+        if len(provider_bytes) == 1:
+            owned.chmod(0o600)
+            owned.write_bytes(b"tampered bytes!")
+        return {"success": True, "message_id": f"message-{len(provider_bytes)}"}
+
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+    )
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+
+    outcome = scheduler._deliver_result(
+        {"id": "between-targets", "deliver": "telegram:first"},
+        bound,
+        targets=targets,
+        delivery_execution_id=delivery["id"],
+    )
+
+    assert provider_bytes == [b"validated bytes"]
+    assert outcome.state is scheduler.DeliveryState.FAILED
+    assert [receipt["status"] for receipt in outcome.receipts] == ["delivered", "failed"]
+    assert [receipt["transport"] for receipt in outcome.receipts] == ["standalone", "none"]
+
+
 def _patch_real_delivery_run(
     monkeypatch, tmp_path, scheduler, target, *, final_response="delivery payload",
 ):
@@ -909,6 +1033,33 @@ def test_delivery_terminal_evidence_requires_dispatch_and_success_coherence(monk
             delivery["id"], success=True, delivery_status="delivered",
             delivery_targets=[requested, second_target],
             delivery_receipts=duplicate_receipts,
+        )
+
+    artifact = tmp_path / "reordered-provider.txt"
+    artifact.write_bytes(b"reordered provider evidence")
+    producer = _create(executions, "producer-reordered-provider")
+    executions.finish_execution(producer["id"], success=True)
+    delivery = executions.create_delivery_execution(
+        producer_execution_id=producer["id"],
+        artifact_path=str(artifact),
+        artifact_sha256=f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
+        delivery_targets=[requested, second_target],
+    )
+    executions.mark_execution_running(delivery["id"])
+    reordered_receipts = [
+        {
+            **delivered,
+            "requested_target": second_target,
+            "actual_target": second_target,
+            "provider_receipt_id": "provider-message-2",
+        },
+        {**delivered, "provider_receipt_id": "provider-message-1"},
+    ]
+    with pytest.raises(ValueError, match="requested target order"):
+        executions.finish_execution(
+            delivery["id"], success=True, delivery_status="delivered",
+            delivery_targets=[second_target, requested],
+            delivery_receipts=reordered_receipts,
         )
 
 

@@ -71,8 +71,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
 
     def fake_deliver(
         job, content, adapters=None, loop=None, targets=None, receipts=None,
-        provider_contacts=None,
+        provider_contacts=None, delivery_execution_id=None,
     ):
+        assert delivery_execution_id == "d" * 32
         calls.append(("deliver", job["id"]))
         receipts.append({
             "requested_target": targets[0], "actual_target": targets[0],
@@ -294,7 +295,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
 
     def fake_deliver(
         job, content, adapters=None, loop=None, targets=None, receipts=None,
-        provider_contacts=None,
+        provider_contacts=None, delivery_execution_id=None,
     ):
         order.append("deliver")
         receipts.append({
@@ -339,7 +340,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
 
     def boom_deliver(
         job, content, adapters=None, loop=None, targets=None, receipts=None,
-        provider_contacts=None,
+        provider_contacts=None, delivery_execution_id=None,
     ):
         order.append("deliver-raise")
         raise RuntimeError("send blew up")

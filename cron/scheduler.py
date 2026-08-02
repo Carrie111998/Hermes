@@ -1672,6 +1672,7 @@ def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, targets: Optional[List[dict]] = None,
     receipts: Optional[List[dict]] = None,
     provider_contacts: Optional[dict] = None,
+    delivery_execution_id: Optional[str] = None,
 ) -> DeliveryOutcome:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1789,6 +1790,8 @@ def _deliver_result(
         target_key = _delivery_target_key(target)
 
         def mark_provider_contact(transport_name: str) -> None:
+            if delivery_execution_id is not None:
+                read_delivery_artifacts(delivery_execution_id)
             contact_evidence.setdefault(target_key, transport_name)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
@@ -2339,7 +2342,16 @@ def _deliver_result(
                 record_outcome(target, thread_id, "failed", "none", msg)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            standalone_contact = lambda: mark_provider_contact("standalone")
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                on_provider_contact=standalone_contact,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2348,6 +2360,13 @@ def _deliver_result(
                 # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
                 # fresh thread that has no running loop.
                 coro.close()
+                if contact_evidence.get(target_key) == "standalone":
+                    msg = f"delivery to {platform_name}:{chat_id} failed after provider contact: {run_err}"
+                    logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    record_outcome(target, thread_id, "ambiguous", "standalone", msg)
+                    continue
                 # If the RuntimeError is the interpreter-finalization signal,
                 # the fresh-thread fallback would fail identically — skip
                 # gracefully instead of logging a shutdown-race traceback.
@@ -2372,6 +2391,7 @@ def _deliver_result(
                         fallback_coro = _send_to_platform(
                             platform, pconfig, chat_id, cleaned_delivery_content,
                             thread_id=thread_id, media_files=media_files,
+                            on_provider_contact=standalone_contact,
                         )
                         try:
                             future = pool.submit(asyncio.run, fallback_coro)
@@ -2392,23 +2412,37 @@ def _deliver_result(
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
                         delivery_errors.extend(target_errors)
-                        record_outcome(target, thread_id, "failed", "standalone", msg)
+                        record_outcome(target, thread_id, "failed", "none", msg)
                         continue
+                    contacted = contact_evidence.get(target_key) == "standalone"
                     msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
                     delivery_errors.extend(target_errors)
-                    record_outcome(target, thread_id, "failed", "standalone", msg)
+                    record_outcome(
+                        target,
+                        thread_id,
+                        "ambiguous" if contacted else "failed",
+                        "standalone" if contacted else "none",
+                        msg,
+                    )
                     continue
             except Exception as e:
                 # A mocked or pre-loop asyncio.run failure may not consume the
                 # coroutine. Closing is idempotent after a completed run.
                 coro.close()
+                contacted = contact_evidence.get(target_key) == "standalone"
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
-                record_outcome(target, thread_id, "failed", "standalone", msg)
+                record_outcome(
+                    target,
+                    thread_id,
+                    "ambiguous" if contacted else "failed",
+                    "standalone" if contacted else "none",
+                    msg,
+                )
                 continue
             except BaseException:
                 coro.close()
@@ -2431,7 +2465,14 @@ def _deliver_result(
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
-                record_outcome(target, thread_id, "failed", "standalone", msg)
+                contacted = contact_evidence.get(target_key) == "standalone"
+                record_outcome(
+                    target,
+                    thread_id,
+                    "ambiguous" if contacted else "failed",
+                    "standalone" if contacted else "none",
+                    msg,
+                )
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
@@ -5054,6 +5095,7 @@ def run_one_job(
                             targets=delivery_targets,
                             receipts=delivery_receipts,
                             provider_contacts=delivery_provider_contacts,
+                            delivery_execution_id=delivery_execution_id,
                         )
                     except Exception as de:
                         detail = f"delivery raised: {de}"

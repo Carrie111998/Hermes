@@ -180,11 +180,24 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     return None
 
 
-async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
+async def _call_provider(on_provider_contact, call, /, *args, **kwargs):
+    """Invoke one external sender, marking only at its exact call boundary."""
+    if on_provider_contact is not None:
+        on_provider_contact()
+    return await call(*args, **kwargs)
+
+
+async def _send_telegram_message_with_retry(
+    bot, *, attempts: int = 3, on_provider_contact=None, **kwargs,
+):
     for attempt in range(attempts):
         try:
-            return await bot.send_message(**kwargs)
+            return await _call_provider(
+                on_provider_contact, bot.send_message, **kwargs,
+            )
         except Exception as exc:
+            if on_provider_contact is not None:
+                raise
             delay = _telegram_retry_delay(exc, attempt)
             if delay is None or attempt >= attempts - 1:
                 raise
@@ -694,6 +707,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -728,7 +742,13 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                result = await _call_provider(
+                    on_provider_contact,
+                    adapter.send,
+                    chat_id=chat_id,
+                    content=chunk,
+                    metadata=metadata,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -746,7 +766,9 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
-            result = await entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 chunk,
@@ -780,7 +802,10 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform, pconfig, chat_id, message, thread_id=None, media_files=None,
+    force_document=False, on_provider_contact=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -796,7 +821,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # so a Weixin send is not blocked by unrelated optional dependencies (for
     # example lark-oapi's heavy Feishu import path).
     if platform == Platform.WEIXIN:
-        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+        return await _send_weixin(
+            pconfig, chat_id, message, media_files=media_files,
+            on_provider_contact=on_provider_contact,
+        )
 
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
 
@@ -860,6 +888,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            on_provider_contact=on_provider_contact,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -883,7 +912,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _dc_caption is not None:
-            result = await entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 "",
@@ -897,7 +928,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 chunk,
@@ -924,6 +957,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -940,6 +974,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else [],
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -955,6 +990,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else None,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -973,7 +1009,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _feishu_entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                _feishu_entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 chunk,
@@ -1001,7 +1039,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _sl_caption is not None:
-            result = await _slack_entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                _slack_entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 "",
@@ -1015,7 +1055,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _slack_entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                _slack_entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 chunk,
@@ -1050,7 +1092,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         if _wa_caption is not None:
             # Single-file captioned send: no separate text chunk, caption on
             # the media itself.
-            result = await _wa_entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                _wa_entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 "",
@@ -1064,13 +1108,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             return result
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _wa_entry.standalone_sender_fn(
+            result = await _call_provider(
+                on_provider_contact,
+                _wa_entry.standalone_sender_fn,
                 pconfig,
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else None,
                 thread_id=thread_id,
                 force_document=force_document,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1121,25 +1168,54 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.WHATSAPP:
-            result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send(
+                "whatsapp", pconfig, chat_id, chunk, thread_id,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.SIGNAL:
-            result = await _send_signal(pconfig.extra, chat_id, chunk)
+            result = await _send_signal(
+                pconfig.extra, chat_id, chunk,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.EMAIL:
-            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send(
+                "email", pconfig, chat_id, chunk, thread_id,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.SMS:
-            result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send(
+                "sms", pconfig, chat_id, chunk, thread_id,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.DINGTALK:
-            result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send(
+                "dingtalk", pconfig, chat_id, chunk, thread_id,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.FEISHU:
-            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send(
+                "feishu", pconfig, chat_id, chunk, thread_id,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.WECOM:
-            result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send(
+                "wecom", pconfig, chat_id, chunk, thread_id,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.BLUEBUBBLES:
-            result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
+            result = await _send_bluebubbles(
+                pconfig.extra, chat_id, chunk,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.QQBOT:
-            result = await _send_qqbot(pconfig, chat_id, chunk)
+            result = await _send_qqbot(
+                pconfig, chat_id, chunk,
+                on_provider_contact=on_provider_contact,
+            )
         elif platform == Platform.YUANBAO:
-            result = await _send_yuanbao(chat_id, chunk)
+            result = await _send_yuanbao(
+                chat_id, chunk, on_provider_contact=on_provider_contact,
+            )
         else:
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
@@ -1151,6 +1227,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                on_provider_contact=on_provider_contact,
             )
 
         if isinstance(result, dict) and result.get("error"):
@@ -1173,7 +1250,10 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token, chat_id, message, media_files=None, thread_id=None,
+    disable_link_previews=False, force_document=False, on_provider_contact=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1302,9 +1382,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode,
+                        on_provider_contact=on_provider_contact,
+                        **text_kwargs,
                     )
                 except Exception as md_error:
+                    if on_provider_contact is not None:
+                        raise
                     # Thread not found — retry without message_thread_id so the
                     # message still delivers (matching the gateway adapter's
                     # fallback behaviour, issue #27012).
@@ -1317,7 +1401,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            on_provider_contact=on_provider_contact,
+                            **text_kwargs,
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1336,7 +1422,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None,
+                            on_provider_contact=on_provider_contact,
+                            **text_kwargs,
                         )
                     else:
                         raise
@@ -1353,10 +1441,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     try:
                         last_msg = await _send_telegram_message_with_retry(
                             bot, chat_id=int_chat_id, text=_tg_caption,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            on_provider_contact=on_provider_contact,
+                            **text_kwargs,
                         )
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
+                        if on_provider_contact is not None:
+                            raise
                         logger.warning(
                             "Telegram caption-fallback send failed for missing media: %s",
                             _sanitize_error_text(_cap_err),
@@ -1384,26 +1476,33 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             pass
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
-                            last_msg = await bot.send_photo(
-                                chat_id=int_chat_id, photo=f, **media_kwargs
+                            last_msg = await _call_provider(
+                                on_provider_contact, bot.send_photo,
+                                chat_id=int_chat_id, photo=f, **media_kwargs,
                             )
                         elif ext in _VIDEO_EXTS:
-                            last_msg = await bot.send_video(
-                                chat_id=int_chat_id, video=f, **media_kwargs
+                            last_msg = await _call_provider(
+                                on_provider_contact, bot.send_video,
+                                chat_id=int_chat_id, video=f, **media_kwargs,
                             )
                         elif ext in _VOICE_EXTS and is_voice:
-                            last_msg = await bot.send_voice(
-                                chat_id=int_chat_id, voice=f, **media_kwargs
+                            last_msg = await _call_provider(
+                                on_provider_contact, bot.send_voice,
+                                chat_id=int_chat_id, voice=f, **media_kwargs,
                             )
                         elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                            last_msg = await bot.send_audio(
-                                chat_id=int_chat_id, audio=f, **media_kwargs
+                            last_msg = await _call_provider(
+                                on_provider_contact, bot.send_audio,
+                                chat_id=int_chat_id, audio=f, **media_kwargs,
                             )
                         else:
-                            last_msg = await bot.send_document(
-                                chat_id=int_chat_id, document=f, **media_kwargs
+                            last_msg = await _call_provider(
+                                on_provider_contact, bot.send_document,
+                                chat_id=int_chat_id, document=f, **media_kwargs,
                             )
                     except Exception as media_err:
+                        if on_provider_contact is not None:
+                            raise
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
                             # Thread not found for media — retry without
                             # message_thread_id (issue #27012).
@@ -1415,24 +1514,29 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             f.seek(0)
                             media_kwargs.pop("message_thread_id", None)
                             if ext in _IMAGE_EXTS and not force_document:
-                                last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_photo,
+                                    chat_id=int_chat_id, photo=f, **media_kwargs,
                                 )
                             elif ext in _VIDEO_EXTS:
-                                last_msg = await bot.send_video(
-                                    chat_id=int_chat_id, video=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_video,
+                                    chat_id=int_chat_id, video=f, **media_kwargs,
                                 )
                             elif ext in _VOICE_EXTS and is_voice:
-                                last_msg = await bot.send_voice(
-                                    chat_id=int_chat_id, voice=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_voice,
+                                    chat_id=int_chat_id, voice=f, **media_kwargs,
                                 )
                             elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                                last_msg = await bot.send_audio(
-                                    chat_id=int_chat_id, audio=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_audio,
+                                    chat_id=int_chat_id, audio=f, **media_kwargs,
                                 )
                             else:
-                                last_msg = await bot.send_document(
-                                    chat_id=int_chat_id, document=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_document,
+                                    chat_id=int_chat_id, document=f, **media_kwargs,
                                 )
                         elif media_kwargs.get("parse_mode") and (
                             "parse" in str(media_err).lower()
@@ -1454,20 +1558,25 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 except Exception:
                                     pass
                             if ext in _IMAGE_EXTS and not force_document:
-                                last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_photo,
+                                    chat_id=int_chat_id, photo=f, **media_kwargs,
                                 )
                             elif ext in _VIDEO_EXTS:
-                                last_msg = await bot.send_video(
-                                    chat_id=int_chat_id, video=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_video,
+                                    chat_id=int_chat_id, video=f, **media_kwargs,
                                 )
                             else:
-                                last_msg = await bot.send_document(
-                                    chat_id=int_chat_id, document=f, **media_kwargs
+                                last_msg = await _call_provider(
+                                    on_provider_contact, bot.send_document,
+                                    chat_id=int_chat_id, document=f, **media_kwargs,
                                 )
                         else:
                             raise
             except Exception as e:
+                if on_provider_contact is not None:
+                    raise
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
                 warnings.append(warning)
@@ -1497,7 +1606,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
 
 
-async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
+async def _registry_standalone_send(
+    platform_name, pconfig, chat_id, message, thread_id=None,
+    on_provider_contact=None,
+):
     """Dispatch a one-shot send through a migrated platform plugin's
     standalone_sender_fn (registry hook).  Used for platforms whose adapter
     moved out of gateway/platforms/ into plugins/platforms/<name>/ (#41112):
@@ -1510,7 +1622,14 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
-    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
+    return await _call_provider(
+        on_provider_contact,
+        entry.standalone_sender_fn,
+        pconfig,
+        chat_id,
+        message,
+        thread_id=thread_id,
+    )
 
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,
@@ -1595,7 +1714,9 @@ async def _resolve_slack_user_target(token, chat_id):
         return None, _error(f"Slack DM resolution failed: {e}")
 
 
-async def _send_signal(extra, chat_id, message, media_files=None):
+async def _send_signal(
+    extra, chat_id, message, media_files=None, on_provider_contact=None,
+):
     """Send via signal-cli JSON-RPC API.
 
     Supports both text-only and text-with-attachments (images/audio/documents).
@@ -1670,7 +1791,12 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             }
             timeout = _signal_send_timeout(len(batch_attachments) if batch_attachments else 0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(f"{http_url}/api/v1/rpc", json=payload)
+                resp = await _call_provider(
+                    on_provider_contact,
+                    client.post,
+                    f"{http_url}/api/v1/rpc",
+                    json=payload,
+                )
                 resp.raise_for_status()
                 return resp.json()
 
@@ -1683,7 +1809,9 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 notice_params["recipient"] = [chat_id]
             try:
                 async with httpx.AsyncClient(timeout=30.0) as _client:
-                    await _client.post(
+                    await _call_provider(
+                        on_provider_contact,
+                        _client.post,
                         f"{http_url}/api/v1/rpc",
                         json={
                             "jsonrpc": "2.0",
@@ -1693,6 +1821,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                         },
                     )
             except Exception as _e:
+                if on_provider_contact is not None:
+                    raise
                 logger.warning("Signal: inline notice failed: %s", _e)
 
         scheduler = get_scheduler()
@@ -1725,6 +1855,11 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
                     err = data["error"]
 
+                    if on_provider_contact is not None:
+                        return _error(
+                            f"Signal RPC error on batch {idx + 1}/{len(att_batches)}: {err}"
+                        )
+
                     if not _is_signal_rate_limit_error(err):
                         return _error(f"Signal RPC error on batch {idx + 1}/{len(att_batches)}: {err}")
 
@@ -1749,6 +1884,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                         f"{server_retry_after:.0f}s" if server_retry_after else "unknown",
                     )
                 except Exception as e:
+                    if on_provider_contact is not None:
+                        raise
                     if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
                         failed_batches.append(idx + 1)
                         logger.error(
@@ -1794,7 +1931,10 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 # (_send_matrix_via_adapter below stays — it's the native-media upload path.)
 
 
-async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
+async def _send_matrix_via_adapter(
+    pconfig, chat_id, message, media_files=None, thread_id=None,
+    on_provider_contact=None,
+):
     """Send via the Matrix adapter so native Matrix media uploads are preserved.
 
     When a live gateway adapter is available (i.e. the tool runs inside a
@@ -1842,7 +1982,8 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         # before the ephemeral ``adapter`` is constructed below, so the
         # ephemeral ``finally`` disconnect never touches the live session.
         return await _matrix_send_core(
-            live_adapter, chat_id, message, media_files, metadata
+            live_adapter, chat_id, message, media_files, metadata,
+            on_provider_contact=on_provider_contact,
         )
 
     # --- Fallback: ephemeral adapter (standalone / cron context) ---
@@ -1857,7 +1998,8 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         if not connected:
             return _error("Matrix connect failed")
         return await _matrix_send_core(
-            adapter, chat_id, message, media_files, metadata
+            adapter, chat_id, message, media_files, metadata,
+            on_provider_contact=on_provider_contact,
         )
     except Exception as e:
         return _error(f"Matrix send failed: {e}")
@@ -1868,12 +2010,16 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
             pass
 
 
-async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
+async def _matrix_send_core(
+    adapter, chat_id, message, media_files, metadata, *, on_provider_contact=None,
+):
     """Core send logic shared by live and ephemeral Matrix adapters."""
     last_result = None
 
     if message.strip():
-        last_result = await adapter.send(chat_id, message, metadata=metadata)
+        last_result = await _call_provider(
+            on_provider_contact, adapter.send, chat_id, message, metadata=metadata,
+        )
         if not last_result.success:
             return _error(f"Matrix send failed: {last_result.error}")
 
@@ -1883,15 +2029,30 @@ async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
 
         ext = os.path.splitext(media_path)[1].lower()
         if ext in _IMAGE_EXTS:
-            last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
+            last_result = await _call_provider(
+                on_provider_contact, adapter.send_image_file,
+                chat_id, media_path, metadata=metadata,
+            )
         elif ext in _VIDEO_EXTS:
-            last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
+            last_result = await _call_provider(
+                on_provider_contact, adapter.send_video,
+                chat_id, media_path, metadata=metadata,
+            )
         elif ext in _VOICE_EXTS and is_voice:
-            last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+            last_result = await _call_provider(
+                on_provider_contact, adapter.send_voice,
+                chat_id, media_path, metadata=metadata,
+            )
         elif ext in _AUDIO_EXTS:
-            last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+            last_result = await _call_provider(
+                on_provider_contact, adapter.send_voice,
+                chat_id, media_path, metadata=metadata,
+            )
         else:
-            last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
+            last_result = await _call_provider(
+                on_provider_contact, adapter.send_document,
+                chat_id, media_path, metadata=metadata,
+            )
 
         if not last_result.success:
             return _error(f"Matrix media send failed: {last_result.error}")
@@ -1915,7 +2076,9 @@ async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
 # wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
 
 
-async def _send_weixin(pconfig, chat_id, message, media_files=None):
+async def _send_weixin(
+    pconfig, chat_id, message, media_files=None, on_provider_contact=None,
+):
     """Send via Weixin iLink using the native adapter helper."""
     try:
         from gateway.platforms.weixin import check_weixin_requirements, send_weixin_direct
@@ -1931,12 +2094,13 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
             chat_id=chat_id,
             message=message,
             media_files=media_files,
+            on_provider_contact=on_provider_contact,
         )
     except Exception as e:
         return _error(f"Weixin send failed: {e}")
 
 
-async def _send_bluebubbles(extra, chat_id, message):
+async def _send_bluebubbles(extra, chat_id, message, on_provider_contact=None):
     """Send via BlueBubbles iMessage server using the adapter's REST API."""
     try:
         from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
@@ -1953,7 +2117,9 @@ async def _send_bluebubbles(extra, chat_id, message):
         if not connected:
             return _error("BlueBubbles: failed to connect to server")
         try:
-            result = await adapter.send(chat_id, message)
+            result = await _call_provider(
+                on_provider_contact, adapter.send, chat_id, message,
+            )
             if not result.success:
                 return _error(f"BlueBubbles send failed: {result.error}")
             return {"success": True, "platform": "bluebubbles", "chat_id": chat_id, "message_id": result.message_id}
@@ -1994,7 +2160,7 @@ def _check_send_message():
         return False
 
 
-async def _send_qqbot(pconfig, chat_id, message):
+async def _send_qqbot(pconfig, chat_id, message, on_provider_contact=None):
     """Send via QQBot using the REST API directly (no WebSocket needed).
 
     Uses the QQ Bot Open Platform REST endpoints to get an access token
@@ -2043,7 +2209,9 @@ async def _send_qqbot(pconfig, chat_id, message):
 
             # Try channel endpoint first (works for guild channels)
             url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
-            resp = await client.post(url, json=payload, headers=headers)
+            resp = await _call_provider(
+                on_provider_contact, client.post, url, json=payload, headers=headers,
+            )
             if resp.status_code in {200, 201}:
                 data = resp.json()
                 return {"success": True, "platform": "qqbot", "chat_id": chat_id,
@@ -2051,7 +2219,10 @@ async def _send_qqbot(pconfig, chat_id, message):
 
             # If channel endpoint failed (likely "频道不存在"), try C2C endpoint
             url_c2c = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
-            resp_c2c = await client.post(url_c2c, json=payload, headers=headers)
+            resp_c2c = await _call_provider(
+                on_provider_contact, client.post, url_c2c,
+                json=payload, headers=headers,
+            )
             if resp_c2c.status_code in {200, 201}:
                 data = resp_c2c.json()
                 return {"success": True, "platform": "qqbot", "chat_id": chat_id,
@@ -2059,7 +2230,10 @@ async def _send_qqbot(pconfig, chat_id, message):
 
             # If C2C also failed, try group endpoint
             url_group = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
-            resp_group = await client.post(url_group, json=payload, headers=headers)
+            resp_group = await _call_provider(
+                on_provider_contact, client.post, url_group,
+                json=payload, headers=headers,
+            )
             if resp_group.status_code in {200, 201}:
                 data = resp_group.json()
                 return {"success": True, "platform": "qqbot", "chat_id": chat_id,
@@ -2071,7 +2245,9 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error(f"QQBot send failed: {e}")
 
 
-async def _send_yuanbao(chat_id, message, media_files=None):
+async def _send_yuanbao(
+    chat_id, message, media_files=None, on_provider_contact=None,
+):
     """Send via Yuanbao using the running gateway adapter's WebSocket connection.
 
     Yuanbao uses a persistent WebSocket — unlike HTTP-based platforms, we
@@ -2095,7 +2271,13 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         )
 
     try:
-        return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
+        return await send_yuanbao_direct(
+            adapter,
+            chat_id,
+            message,
+            media_files=media_files,
+            on_provider_contact=on_provider_contact,
+        )
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
 

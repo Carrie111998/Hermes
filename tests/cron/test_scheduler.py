@@ -554,6 +554,67 @@ class TestDeliverResultErrorReturns:
         },)
         assert contacts == {}
 
+    def test_standalone_setup_exception_is_failed_without_contact(self):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+        )
+        target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+        contacts = {}
+
+        async def fail_before_contact(*_args, **_kwargs):
+            raise ValueError("formatting failed")
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("tools.send_message_tool._send_to_platform", side_effect=fail_before_contact) as send,
+        ):
+            result = _deliver_result(
+                {"id": "standalone-setup", "deliver": "telegram:123"},
+                "payload",
+                targets=[target],
+                provider_contacts=contacts,
+            )
+
+        assert send.await_count == 1
+        assert contacts == {}
+        assert result.state is DeliveryState.FAILED
+        assert result.receipts[0]["status"] == "failed"
+        assert result.receipts[0]["transport"] == "none"
+
+    def test_standalone_exception_after_contact_is_ambiguous_without_retry(self):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)},
+        )
+        target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+        contacts = {}
+
+        async def fail_after_contact(*_args, on_provider_contact=None, **_kwargs):
+            on_provider_contact()
+            raise ConnectionError("first chunk accepted; second confirmation lost")
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("tools.send_message_tool._send_to_platform", side_effect=fail_after_contact) as send,
+        ):
+            result = _deliver_result(
+                {"id": "standalone-contact", "deliver": "telegram:123"},
+                "payload",
+                targets=[target],
+                provider_contacts=contacts,
+            )
+
+        assert send.await_count == 1
+        assert contacts == {json.dumps(target, sort_keys=True): "standalone"}
+        assert result.state is DeliveryState.AMBIGUOUS
+        assert result.receipts[0]["status"] == "ambiguous"
+        assert result.receipts[0]["transport"] == "standalone"
+
     def test_media_scheduling_failure_before_contact_safely_falls_back(
         self, monkeypatch, tmp_path,
     ):

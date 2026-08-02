@@ -503,10 +503,8 @@ def _validate_delivery_evidence(
         })
 
     requested_evidence = [receipt["requested_target"] for receipt in normalized_receipts]
-    if len(requested_evidence) != len(authorized) or any(
-        requested_evidence.count(target) != authorized.count(target) for target in authorized
-    ):
-        raise ValueError("delivery receipts do not match authorized targets")
+    if requested_evidence != authorized:
+        raise ValueError("delivery receipts must preserve authorized requested target order")
     confirmed_actual = [
         receipt["actual_target"] for receipt in normalized_receipts
         if receipt["status"] == "delivered"

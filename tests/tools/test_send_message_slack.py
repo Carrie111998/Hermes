@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from tools.send_message_tool import _send_to_platform
+from tools.send_message_tool import _send_to_platform, _send_via_adapter
 
 
 def _ensure_slack_mock(monkeypatch):
@@ -65,6 +65,62 @@ def test_slack_send_to_platform_routes_through_send_via_adapter(monkeypatch):
     assert call.args[0] == Platform.SLACK
     assert call.args[2] == "C123"
     assert call.kwargs["thread_id"] == "171.1"
+
+
+def test_registry_fallback_marks_each_chunk_only_at_sender_boundary(monkeypatch):
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    events = []
+
+    async def sender(*_args, **_kwargs):
+        events.append("send")
+        if events.count("send") == 2:
+            raise ConnectionError("second chunk confirmation lost")
+        return {"success": True, "message_id": "first"}
+
+    entry = PlatformEntry(
+        name="contactprobe",
+        label="Contact probe",
+        adapter_factory=lambda _config: None,
+        check_fn=lambda: True,
+        standalone_sender_fn=sender,
+        max_message_length=12,
+    )
+    platform_registry.register(entry)
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    try:
+        result = asyncio.run(
+            _send_to_platform(
+                Platform("contactprobe"),
+                SimpleNamespace(enabled=True, token="***", extra={}),
+                "channel",
+                "one two three four five six",
+                on_provider_contact=lambda: events.append("contact"),
+            )
+        )
+    finally:
+        platform_registry.unregister("contactprobe")
+
+    assert result == {"error": "Plugin standalone send failed: second chunk confirmation lost"}
+    assert events == ["contact", "send", "contact", "send"]
+
+
+def test_registry_resolution_failure_does_not_mark_provider_contact(monkeypatch):
+    contacts = []
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    result = asyncio.run(
+        _send_via_adapter(
+            SimpleNamespace(value="missingcontactprobe"),
+            SimpleNamespace(enabled=True, token="***", extra={}),
+            "channel",
+            "payload",
+            on_provider_contact=lambda: contacts.append("contact"),
+        )
+    )
+
+    assert "No live adapter" in result["error"]
+    assert contacts == []
 
 
 class _SlackResponse:

@@ -484,6 +484,30 @@ class TestSendToPlatformChunking:
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
 
+    def test_provider_contact_callback_runs_immediately_before_each_chunk(self):
+        events = []
+
+        async def send(*_args, **_kwargs):
+            events.append("send")
+            if events.count("send") == 2:
+                raise ConnectionError("confirmation lost after second chunk")
+            return {"success": True, "message_id": "first"}
+
+        long_msg = "word " * 1000
+        with _patch_discord_sender(send):
+            with pytest.raises(ConnectionError, match="confirmation lost"):
+                asyncio.run(
+                    _send_to_platform(
+                        Platform.DISCORD,
+                        SimpleNamespace(enabled=True, token="***", extra={}),
+                        "ch",
+                        long_msg,
+                        on_provider_contact=lambda: events.append("contact"),
+                    )
+                )
+
+        assert events == ["contact", "send", "contact", "send"]
+
 
     def test_slack_pre_escaped_entities_not_double_escaped(self, monkeypatch):
         """Pre-escaped HTML entities survive tool-layer formatting without double-escaping."""
