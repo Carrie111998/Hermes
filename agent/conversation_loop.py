@@ -115,6 +115,24 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+def _schedule_speculative_tool_wait(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    active_system_prompt: str | None,
+) -> str:
+    """Estimate and schedule tool-wait speculation only when enabled."""
+    if not getattr(agent, "speculative_compression_enabled", False):
+        return "disabled"
+    from agent.speculative_compression import schedule_tool_wait_candidate
+
+    request_tokens = estimate_request_tokens_rough(
+        messages,
+        system_prompt=active_system_prompt or "",
+        tools=agent.tools or None,
+    )
+    return schedule_tool_wait_candidate(agent, messages, request_tokens)
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
@@ -6281,17 +6299,8 @@ def run_conversation(
                 # an immutable snapshot after the assistant tool-call row is
                 # durable and before any external tool can append results.
                 try:
-                    from agent.speculative_compression import (
-                        schedule_tool_wait_candidate,
-                    )
-
-                    _tool_wait_tokens = estimate_request_tokens_rough(
-                        messages,
-                        system_prompt=system_message or "",
-                        tools=agent.tools or None,
-                    )
-                    schedule_tool_wait_candidate(
-                        agent, messages, _tool_wait_tokens
+                    _schedule_speculative_tool_wait(
+                        agent, messages, active_system_prompt
                     )
                 except Exception:
                     logger.debug(
