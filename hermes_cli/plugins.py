@@ -1264,10 +1264,54 @@ class PluginContext:
 # Hook callback timeout (non-blocking abandon)
 # ---------------------------------------------------------------------------
 
-# Wall-clock cap for a single Python plugin hook callback. Shell hooks already
-# enforce their own subprocess timeout; this bounds in-process callbacks so a
-# blocking plugin cannot wedge the agent loop indefinitely.
+# Default wall-clock cap for a single Python plugin hook callback. Overridden
+# by ``plugins.hook_callback_timeout`` in config.yaml (see DEFAULT_CONFIG).
+# Shell hooks already enforce their own subprocess timeout.
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
+_MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
+
+
+def _resolve_hook_callback_timeout() -> float:
+    """Return the effective hook-callback timeout in seconds.
+
+    Reads ``plugins.hook_callback_timeout`` via the cached readonly config
+    loader. Falls back to ``_HOOK_CALLBACK_TIMEOUT_SECS``. Values ``<= 0``
+    disable the threaded timeout (sync call). Values above
+    ``_MAX_HOOK_CALLBACK_TIMEOUT_SECS`` are clamped.
+    """
+    timeout = _HOOK_CALLBACK_TIMEOUT_SECS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        plugins_cfg = (load_config_readonly() or {}).get("plugins")
+        if isinstance(plugins_cfg, dict) and "hook_callback_timeout" in plugins_cfg:
+            raw = plugins_cfg.get("hook_callback_timeout")
+            if raw is not None:
+                timeout = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "plugins.hook_callback_timeout is not a number; using default %gs",
+            _HOOK_CALLBACK_TIMEOUT_SECS,
+        )
+        timeout = _HOOK_CALLBACK_TIMEOUT_SECS
+    except Exception:
+        timeout = _HOOK_CALLBACK_TIMEOUT_SECS
+
+    if timeout < 0:
+        logger.warning(
+            "plugins.hook_callback_timeout=%g is negative; using default %gs",
+            timeout,
+            _HOOK_CALLBACK_TIMEOUT_SECS,
+        )
+        return _HOOK_CALLBACK_TIMEOUT_SECS
+    if timeout > _MAX_HOOK_CALLBACK_TIMEOUT_SECS:
+        logger.warning(
+            "plugins.hook_callback_timeout=%g exceeds max %gs; clamping",
+            timeout,
+            _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+        )
+        return _MAX_HOOK_CALLBACK_TIMEOUT_SECS
+    return timeout
 
 
 def _call_hook_callback(cb: Callable[..., Any], timeout: float, **kwargs: Any) -> Any:
@@ -1965,8 +2009,9 @@ class PluginManager:
 
         Each callback is wrapped in its own try/except so a misbehaving
         plugin cannot break the core agent loop. Callbacks that exceed
-        ``_HOOK_CALLBACK_TIMEOUT_SECS`` are skipped without waiting for the
-        abandoned worker thread (see :func:`_call_hook_callback`).
+        ``plugins.hook_callback_timeout`` (default 30s) are skipped without
+        waiting for the abandoned worker thread (see
+        :func:`_call_hook_callback`).
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -1985,11 +2030,10 @@ class PluginManager:
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
+        timeout = _resolve_hook_callback_timeout()
         for cb in callbacks:
             try:
-                ret = _call_hook_callback(
-                    cb, _HOOK_CALLBACK_TIMEOUT_SECS, **kwargs
-                )
+                ret = _call_hook_callback(cb, timeout, **kwargs)
                 if ret is not None:
                     results.append(ret)
             except TimeoutError:
@@ -1997,7 +2041,7 @@ class PluginManager:
                     "Hook '%s' callback %s timed out after %gs — skipping",
                     hook_name,
                     getattr(cb, "__name__", repr(cb)),
-                    _HOOK_CALLBACK_TIMEOUT_SECS,
+                    timeout,
                 )
             except Exception as exc:
                 logger.warning(

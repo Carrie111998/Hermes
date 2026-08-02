@@ -377,7 +377,7 @@ class TestPluginHooks:
         import time
 
         monkeypatch.setattr(
-            "hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 0.15
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.15
         )
 
         hold = threading.Event()
@@ -410,7 +410,7 @@ class TestPluginHooks:
 
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 1.0
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
         )
         mgr = PluginManager()
         mgr._hooks["pre_llm_call"] = [lambda **_kw: {"context": "hi"}]
@@ -420,7 +420,7 @@ class TestPluginHooks:
 
     def test_hook_exception_still_isolated_under_timeout_path(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins._HOOK_CALLBACK_TIMEOUT_SECS", 1.0
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
         )
 
         def boom(**_kwargs):
@@ -429,6 +429,23 @@ class TestPluginHooks:
         mgr = PluginManager()
         mgr._hooks["post_tool_call"] = [boom, lambda **_kw: "survived"]
         assert mgr.invoke_hook("post_tool_call") == ["survived"]
+
+    def test_hook_callback_timeout_reads_config(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"hook_callback_timeout": 0.12}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        import hermes_cli.config as config_mod
+
+        config_mod._LOAD_CONFIG_CACHE.clear()
+        config_mod._RAW_CONFIG_CACHE.clear()
+
+        import hermes_cli.plugins as plugins_mod
+
+        assert plugins_mod._resolve_hook_callback_timeout() == 0.12
 
 
 class TestPreToolCallBlocking:
