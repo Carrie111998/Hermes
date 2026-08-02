@@ -2862,3 +2862,371 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+# ---------------------------------------------------------------------------
+# Auto re-authentication on matrix.org MAS token expiry
+# ---------------------------------------------------------------------------
+
+class TestTokenExpiryDetection:
+    @pytest.mark.parametrize("msg", [
+        "Token is not active",
+        "TOKEN IS NOT ACTIVE",
+        "Unable to introspect the access token",
+        "M_UNKNOWN_TOKEN",
+        "unknown_token: no such token",
+        "soft_logout required",
+    ])
+    def test_recognizes_expiry_markers(self, msg):
+        adapter = _make_adapter()
+        assert adapter._is_token_expiry(msg) is True
+
+    @pytest.mark.parametrize("msg", [
+        "M_FORBIDDEN: you are not in this room",
+        "connection reset by peer",
+        "",
+        None,
+    ])
+    def test_ignores_unrelated_errors(self, msg):
+        adapter = _make_adapter()
+        assert adapter._is_token_expiry(msg) is False
+
+
+class TestTriggerReauth:
+    @pytest.mark.asyncio
+    async def test_schedules_reauth_task(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_reauthenticate", AsyncMock(return_value=None)) as mock_reauth:
+            adapter._trigger_reauth("Token is not active")
+            assert adapter._reauth_task is not None
+            await adapter._reauth_task
+        mock_reauth.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_logs_the_expiry_reason(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        with patch.object(adapter, "_reauthenticate", AsyncMock(return_value=None)):
+            with caplog.at_level(logging.WARNING):
+                adapter._trigger_reauth("Token is not active")
+            await adapter._reauth_task
+        assert "access token expired" in caplog.text
+        assert "Token is not active" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_does_not_stack_overlapping_reauth_attempts(self):
+        """A second _trigger_reauth call while one is already in flight must
+        not spawn a competing task — connect(is_reconnect=True) disconnects
+        the client, so two concurrent re-auth attempts would race each other."""
+        adapter = _make_adapter()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_reauth():
+            started.set()
+            await release.wait()
+
+        with patch.object(adapter, "_reauthenticate", _slow_reauth):
+            adapter._trigger_reauth("Token is not active")
+            await started.wait()
+            first_task = adapter._reauth_task
+
+            adapter._trigger_reauth("Token is not active")
+            assert adapter._reauth_task is first_task
+
+            release.set()
+            await first_task
+
+    @pytest.mark.asyncio
+    async def test_allows_a_new_attempt_once_the_previous_one_finished(self):
+        adapter = _make_adapter()
+        with patch.object(adapter, "_reauthenticate", AsyncMock(return_value=None)):
+            adapter._trigger_reauth("Token is not active")
+            first_task = adapter._reauth_task
+            await first_task
+
+            adapter._trigger_reauth("Token is not active")
+            second_task = adapter._reauth_task
+            await second_task
+
+        assert second_task is not first_task
+
+
+class TestReauthenticate:
+    @staticmethod
+    def _reauth_adapter():
+        """Adapter with password credentials.
+
+        _reauthenticate() requires them: connect() prefers _access_token, so
+        without a password there is nothing to re-authenticate with.
+        """
+        adapter = _make_adapter()
+        adapter._password = "hunter2"
+        adapter._user_id = "@bot:example.org"
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_succeeds_on_first_attempt_without_delay(self):
+        adapter = self._reauth_adapter()
+        adapter.connect = AsyncMock(return_value=True)
+        with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+            await adapter._reauthenticate()
+
+        adapter.connect.assert_awaited_once_with(is_reconnect=True)
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retries_with_exponential_backoff_until_success(self):
+        adapter = self._reauth_adapter()
+        adapter.connect = AsyncMock(side_effect=[False, False, True])
+        delays = []
+
+        async def _record_sleep(seconds):
+            delays.append(seconds)
+
+        with patch("asyncio.sleep", _record_sleep):
+            await adapter._reauthenticate()
+
+        assert adapter.connect.await_count == 3
+        assert delays == [5, 10]
+
+    @pytest.mark.asyncio
+    async def test_survives_connect_exceptions_and_keeps_retrying(self):
+        adapter = self._reauth_adapter()
+        adapter.connect = AsyncMock(side_effect=[RuntimeError("network down"), True])
+        with patch("asyncio.sleep", AsyncMock()):
+            await adapter._reauthenticate()
+
+        assert adapter.connect.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stops_retrying_once_the_adapter_is_closing(self):
+        adapter = self._reauth_adapter()
+        adapter._shutdown_requested = True
+        adapter.connect = AsyncMock(return_value=False)
+
+        await adapter._reauthenticate()
+
+        adapter.connect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_backoff_caps_at_300_seconds(self):
+        adapter = self._reauth_adapter()
+        adapter.connect = AsyncMock(side_effect=[False] * 8 + [True])
+        delays = []
+
+        async def _record_sleep(seconds):
+            delays.append(seconds)
+
+        with patch("asyncio.sleep", _record_sleep):
+            await adapter._reauthenticate()
+
+        assert delays == [5, 10, 20, 40, 80, 160, 300, 300]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_instead_of_being_swallowed(self):
+        adapter = self._reauth_adapter()
+        adapter.connect = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._reauthenticate()
+
+
+class TestSyncLoopTriggersReauthOnTokenExpiry:
+    @pytest.mark.asyncio
+    async def test_sync_message_field_triggers_reauth_and_returns(self):
+        """nio surfaces auth failures like MAS token expiry as SyncError
+        objects (not exceptions) carrying a `.message` string."""
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        sync_error = MagicMock()
+        sync_error.message = "M_UNKNOWN_TOKEN: Token is not active"
+        client.sync = AsyncMock(return_value=sync_error)
+        adapter._client = client
+        adapter._closing = False
+
+        with patch.object(adapter, "_trigger_reauth") as mock_trigger:
+            await adapter._sync_loop()
+
+        mock_trigger.assert_called_once_with("M_UNKNOWN_TOKEN: Token is not active")
+        client.sync.assert_awaited_once()  # loop returned, no retry
+
+    @pytest.mark.asyncio
+    async def test_sync_exception_triggers_reauth_and_returns(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        client.sync = AsyncMock(side_effect=RuntimeError("Unable to introspect the access token"))
+        adapter._client = client
+        adapter._closing = False
+
+        with patch.object(adapter, "_trigger_reauth") as mock_trigger:
+            await adapter._sync_loop()
+
+        mock_trigger.assert_called_once_with("Unable to introspect the access token")
+        client.sync.assert_awaited_once()  # loop returned, no retry
+
+    @pytest.mark.asyncio
+    async def test_unrelated_sync_exception_does_not_trigger_reauth(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.sync_store.get_next_batch = AsyncMock(return_value=None)
+        client.sync = AsyncMock(side_effect=[RuntimeError("boom"), asyncio.CancelledError()])
+        adapter._client = client
+        adapter._closing = False
+
+        with patch.object(adapter, "_trigger_reauth") as mock_trigger, \
+                patch("asyncio.sleep", AsyncMock()):
+            await adapter._sync_loop()
+
+        mock_trigger.assert_not_called()
+
+
+class TestReauthConnectLifecycle:
+    """Re-auth against the real connect()/disconnect() lifecycle.
+
+    Mocking connect() hides the two failure modes that actually broke this:
+    connect() calls disconnect() (raising _closing) before it can fail, and
+    connect() prefers _access_token over password login.
+    """
+
+    def _adapter(self, *, password=True):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_expired_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                },
+            )
+        )
+        if password:
+            adapter._password = "hunter2"
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_real_failed_connect_does_not_look_like_a_shutdown(self):
+        """The regression, driven through the real connect().
+
+        connect() tears down the old session via disconnect(), which raises
+        _closing. _closing was only lowered again much later, just before the
+        initial sync, so a connect failing before that point left it raised —
+        and the re-auth loop read that as "the adapter was shut down" and
+        gave up after one failed attempt.
+
+        An empty homeserver makes the real connect() return False right after
+        the teardown, which is exactly the window that was broken.
+        """
+        adapter = self._adapter()
+        adapter._client = MagicMock()  # forces the disconnect() teardown path
+        adapter._homeserver = ""
+
+        with patch.dict("sys.modules", _make_fake_mautrix()):
+            assert await adapter.connect(is_reconnect=True) is False
+
+        assert adapter._closing is False
+        assert adapter._shutdown_requested is False
+
+    @pytest.mark.asyncio
+    async def test_retry_loop_continues_after_a_failed_attempt(self):
+        adapter = self._adapter()
+        attempts = {"n": 0}
+
+        async def flaky_connect(*, is_reconnect=False):
+            attempts["n"] += 1
+            return attempts["n"] >= 2  # first attempt fails, second succeeds
+
+        adapter.connect = flaky_connect
+
+        with patch("asyncio.sleep", AsyncMock()):
+            await adapter._reauthenticate()
+
+        assert attempts["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_external_disconnect_stops_the_retry_loop(self):
+        """The other half: a real shutdown must still end the loop."""
+        adapter = self._adapter()
+        attempts = {"n": 0}
+
+        async def failing_connect(*, is_reconnect=False):
+            attempts["n"] += 1
+            if attempts["n"] == 2:
+                await adapter.disconnect()  # external shutdown
+            return False
+
+        adapter.connect = failing_connect
+
+        with patch("asyncio.sleep", AsyncMock()):
+            await adapter._reauthenticate()
+
+        assert attempts["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_expired_token_is_dropped_so_password_login_is_selected(self):
+        """connect() gives _access_token priority, so retrying with the dead
+        token would fail whoami() forever instead of logging in again."""
+        adapter = self._adapter()
+        assert adapter._access_token == "syt_expired_token"
+        seen = {}
+
+        async def capture_connect(*, is_reconnect=False):
+            seen["token"] = adapter._access_token
+            seen["password"] = adapter._password
+            return True
+
+        adapter.connect = capture_connect
+        await adapter._reauthenticate()
+
+        assert seen["token"] == ""
+        assert seen["password"] == "hunter2"
+
+    @pytest.mark.asyncio
+    async def test_token_only_config_reports_manual_reauth_required(self, caplog):
+        """With no password there is nothing to log in with; say so once
+        rather than spinning."""
+        import logging
+        adapter = self._adapter(password=False)
+        adapter.connect = AsyncMock(return_value=True)
+
+        with caplog.at_level(logging.ERROR):
+            await adapter._reauthenticate()
+
+        adapter.connect.assert_not_awaited()
+        assert "no MATRIX_PASSWORD is configured" in caplog.text
+        # The token must survive so the failure stays diagnosable.
+        assert adapter._access_token == "syt_expired_token"
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_a_running_reauth_task(self):
+        adapter = self._adapter()
+        started = asyncio.Event()
+
+        async def hang(*, is_reconnect=False):
+            started.set()
+            await asyncio.sleep(3600)
+            return True
+
+        adapter.connect = hang
+        adapter._trigger_reauth("token is not active")
+        await started.wait()
+
+        await adapter.disconnect()
+
+        assert adapter._reauth_task.cancelled() or adapter._reauth_task.done()
+        assert adapter._shutdown_requested is True
+
+    @pytest.mark.asyncio
+    async def test_reconnect_teardown_does_not_cancel_the_reauth_task(self):
+        """connect() calls disconnect() internally; if that counted as a
+        shutdown the re-auth task would cancel itself mid-flight."""
+        adapter = self._adapter()
+        adapter._client = MagicMock()
+
+        await adapter.disconnect(_for_reconnect=True)
+
+        assert adapter._shutdown_requested is False
