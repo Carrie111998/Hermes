@@ -417,10 +417,14 @@ _OAUTH_TOOL_NAME_REVERSE_ALIASES = {
 # Aliases that are ALSO safe to substitute in free-form prose (system prompt
 # text, tool descriptions). Only unambiguous snake_case tool tokens qualify:
 # "memory" is ordinary English throughout the system prompt ("persistent
-# memory across sessions", "OS, CPU, memory, disk"), so rewriting it in prose
-# would corrupt guidance the model has to follow. Renaming a tool is a
-# different operation from rewriting the vocabulary that describes it — keep
-# the two sets separate so the next alias can't silently mangle prose.
+# memory across sessions", "OS, CPU, memory, disk") and inside the memory
+# tool's own description and parameter docs, so rewriting it in prose would
+# corrupt guidance the model has to follow — including the ``target`` enum
+# values it must emit. Renaming a tool is a different operation from
+# rewriting the vocabulary that describes it; keeping the sets separate is
+# what lets the next alias be name-only. A model that follows unaliased
+# prose and calls ``memory`` still dispatches: normalize_response resolves
+# the bare name through the registry.
 _OAUTH_PROSE_ALIAS_NAMES = frozenset({"session_search"})
 
 # Word-boundary matchers so a prose substitution can't corrupt a longer
@@ -431,6 +435,11 @@ _OAUTH_PROSE_ALIAS_NAMES = frozenset({"session_search"})
 # has no reverse mapping. ``\b`` treats ``_`` as a word char, so the longer
 # identifier is skipped while ``session_search``, `` `session_search` `` and
 # ``session_search(`` still match.
+#
+# sorted() is load-bearing, not decoration: iterating a frozenset directly
+# yields hash-seed-dependent order, so with two or more prose aliases the
+# rewritten system bytes would differ between processes and silently break
+# prompt caching in a way that is very hard to reproduce. Do not "simplify".
 _OAUTH_PROSE_ALIAS_PATTERNS = tuple(
     (re.compile(rf"\b{re.escape(name)}\b"), _OAUTH_TOOL_NAME_ALIASES[name])
     for name in sorted(_OAUTH_PROSE_ALIAS_NAMES)
@@ -2858,8 +2867,14 @@ def build_anthropic_kwargs(
         #    so any session with an MCP server configured still tripped the
         #    classifier. normalize_response reverses both forms via registry
         #    lookup so the dispatcher still sees the original name. GH-25255.
-        def _to_oauth_wire_name(name: str) -> str:
-            name = _OAUTH_TOOL_NAME_ALIASES.get(name, name)
+        def _to_oauth_wire_name(name: str, *, allow_alias: bool = True) -> str:
+            if allow_alias and name in _OAUTH_TOOL_NAME_ALIASES:
+                aliased = _OAUTH_TOOL_NAME_ALIASES[name]
+                # Skip the alias when a real tool already owns that wire name
+                # (see _claimed_wire_names below) — a duplicate name is a hard
+                # 400 that would break every request.
+                if _MCP_TOOL_PREFIX + aliased not in _claimed_wire_names:
+                    name = aliased
             if name.startswith("mcp__"):
                 return name  # already correct, don't double-prefix
             if name.startswith("mcp_"):
@@ -2867,19 +2882,26 @@ def build_anthropic_kwargs(
                 return "mcp__" + name[len("mcp_"):]
             return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
 
+        # Wire names owned by tools that are NOT alias sources. An alias must
+        # never collide with one: two identical tool names in a single request
+        # is a hard 400 from Anthropic, which would break every call —
+        # strictly worse than the bug being fixed. This mirrors the inbound
+        # "registered tool wins" rule in normalize_response, so the outbound
+        # and inbound sides agree on who owns a contested name.
+        _claimed_wire_names = {
+            _to_oauth_wire_name(tool["name"], allow_alias=False)
+            for tool in (anthropic_tools or [])
+            if isinstance(tool.get("name"), str)
+            and tool["name"] not in _OAUTH_TOOL_NAME_ALIASES
+        }
+
         if anthropic_tools:
             for tool in anthropic_tools:
                 if "name" in tool:
                     tool["name"] = _to_oauth_wire_name(tool["name"])
                 description = tool.get("description")
                 if isinstance(description, str):
-                    # Prose-safe aliases only. The ``memory`` tool's own
-                    # description is dense ordinary prose about memory
-                    # ("save durable facts to persistent memory"); rewriting
-                    # every occurrence would leave the model with mangled
-                    # instructions for a tool it still has to use correctly.
-                    # Its NAME is aliased above, which is the part of the
-                    # schema the classifier keys on per #65365's repro.
+                    # Prose-safe aliases only — see _OAUTH_PROSE_ALIAS_NAMES.
                     tool["description"] = _apply_oauth_prose_aliases(description)
 
         # 4. Apply the same normalization to tool names in message history

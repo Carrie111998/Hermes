@@ -122,6 +122,26 @@ class TestAnthropicMcpPrefixStrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "memory"
 
+    def test_bare_tool_name_from_prose_still_dispatches(self):
+        """The model may follow the prose and emit the canonical name.
+
+        ``memory``'s NAME is aliased on the wire but the system prompt still
+        says "use the memory tool", so the model can emit ``mcp__memory``.
+        The bare-name registry fallback must resolve it — this is the
+        invariant that makes leaving memory's prose intact safe.
+        """
+        transport = self._get_transport()
+        registry = _FakeRegistry({"memory", "session_search"})
+
+        for wire, expected in (
+            ("mcp__memory", "memory"),
+            ("mcp__session_search", "session_search"),
+        ):
+            response = _make_response(_make_tool_use_block(wire))
+            with patch("tools.registry.registry", registry):
+                result = transport.normalize_response(response, strip_tool_prefix=True)
+            assert result.tool_calls[0].name == expected, wire
+
     def test_registered_tool_wins_over_oauth_alias(self):
         """A real tool registered under the wire name keeps GH-25255 precedence.
 
@@ -225,6 +245,57 @@ class TestAnthropicOAuthOutgoingPrefix:
         system_text = " ".join(block["text"] for block in kwargs["system"])
         assert "session_search" not in system_text
         assert "chat_history_lookup" in system_text
+
+    def test_oauth_alias_yields_to_a_tool_that_owns_the_wire_name(self):
+        """An alias must never produce a duplicate tool name.
+
+        Two identical names in one request is a hard 400 from Anthropic, which
+        would break every call — strictly worse than the classifier bug. If a
+        real tool already maps onto the alias's wire name, that tool keeps it
+        and the aliased tool stays un-aliased. Mirrors the inbound
+        "registered tool wins" rule.
+        """
+        from agent.anthropic_adapter import _OAUTH_TOOL_NAME_ALIASES
+
+        def _tool(name):
+            return {"type": "function", "function": {
+                "name": name, "description": "d", "parameters": {}}}
+
+        kwargs = self._build([
+            _tool("session_search"),
+            _tool("mcp_chat_history_lookup"),   # real MCP tool owning the alias
+            _tool("memory"),
+            _tool("mcp_context_notes"),         # real MCP tool owning the alias
+        ])
+
+        names = [t["name"] for t in kwargs["tools"]]
+        assert len(names) == len(set(names)), f"duplicate wire names: {names}"
+        # The genuine tools keep the contested names...
+        assert "mcp__chat_history_lookup" in names
+        assert "mcp__context_notes" in names
+        # ...and the alias sources fall back to their own prefixed names.
+        for canonical in _OAUTH_TOOL_NAME_ALIASES:
+            assert f"mcp__{canonical}" in names
+
+    def test_prose_alias_names_are_a_subset_of_the_alias_map(self):
+        """The prose set must only name tools that actually have an alias.
+
+        Violating this raises KeyError at import; assert the contract by name
+        so the failure is legible instead of a stack trace in a 3000-line
+        module.
+        """
+        from agent.anthropic_adapter import (
+            _OAUTH_PROSE_ALIAS_NAMES,
+            _OAUTH_TOOL_NAME_ALIASES,
+        )
+
+        assert _OAUTH_PROSE_ALIAS_NAMES <= set(_OAUTH_TOOL_NAME_ALIASES)
+        # An alias's wire name must not be another alias's canonical name, or
+        # sequential prose substitution would chain-rewrite.
+        assert not (
+            set(_OAUTH_TOOL_NAME_ALIASES.values())
+            & set(_OAUTH_TOOL_NAME_ALIASES)
+        )
 
     def test_non_oauth_keeps_session_search_request_shape(self):
         """API-key requests retain the public tool name and prompt vocabulary."""
