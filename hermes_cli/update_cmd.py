@@ -29,6 +29,7 @@ import logging
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time as _time
@@ -3459,38 +3460,162 @@ def _normalize_managed_eol(git_cmd, repo_root):
     verified clean under it, and a checkout we cannot fully normalize is left
     exactly as it was. Best-effort: never blocks an update.
     """
-    # -c, not config: evaluate the tree as it WOULD look pinned, without
-    # persisting anything we might not be able to follow through on.
-    probe = git_cmd + ["-c", "core.autocrlf=false"]
+    def _hash_worktree_paths(paths, autocrlf):
+        """Hash tracked regular files without consulting the index stat cache."""
+        hashes = {}
+        safe_paths = [path for path in paths if b"\n" not in path]
+        if safe_paths:
+            out = subprocess.run(
+                git_cmd
+                + ["-c", f"core.autocrlf={autocrlf}", "hash-object", "--stdin-paths"],
+                cwd=repo_root,
+                input=b"\n".join(safe_paths) + b"\n",
+                capture_output=True,
+            )
+            values = out.stdout.splitlines()
+            if out.returncode != 0 or len(values) != len(safe_paths):
+                return None
+            hashes.update(zip(safe_paths, values))
 
-    def _dirty(*extra):
-        # A just-checked-out CRLF file can look stat-clean even after changing
-        # the effective filter to ``autocrlf=false``. Force Git to compare
-        # content before asking for the diff so a large checkout is not only
-        # partially discovered according to timestamp/cache coincidence.
-        subprocess.run(
-            probe + ["update-index", "--really-refresh"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        out = subprocess.run(
-            probe + ["diff", "-z", "--name-only", *extra],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if out.returncode != 0:
-            return None
-        return {p for p in out.stdout.split("\0") if p}
+        # ``--stdin-paths`` is newline-delimited. Preserve the rare legal Git
+        # path containing a newline by hashing it through a single argv entry.
+        for path in paths:
+            if b"\n" not in path:
+                continue
+            path_text = os.fsdecode(path)
+            out = subprocess.run(
+                git_cmd
+                + [
+                    "-c",
+                    f"core.autocrlf={autocrlf}",
+                    "hash-object",
+                    f"--path={path_text}",
+                    "--",
+                    path_text,
+                ],
+                cwd=repo_root,
+                capture_output=True,
+            )
+            value = out.stdout.strip()
+            if out.returncode != 0 or not value:
+                return None
+            hashes[path] = value
+        return hashes
 
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
-        if all_dirty is None or real_dirty is None:
+        # ``git diff`` and ``update-index --really-refresh`` may both trust the
+        # checkout's cached size/mtime and miss an arbitrary prefix of a large
+        # CRLF tree. Hash the worktree directly under both filter settings and
+        # compare with HEAD. This is content-based, preserves the real index and
+        # staged state, and remains one batched stdin operation for normal paths.
+        tree = subprocess.run(
+            git_cmd + ["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+        )
+        if tree.returncode != 0:
             return None
-        return all_dirty - real_dirty
+
+        index = subprocess.run(
+            git_cmd + ["ls-files", "-s", "-z"],
+            cwd=repo_root,
+            capture_output=True,
+        )
+        if index.returncode != 0:
+            return None
+        index_entries = {}
+        for record in index.stdout.split(b"\0"):
+            if not record:
+                continue
+            try:
+                metadata, path = record.split(b"\t", 1)
+                mode, object_id, stage = metadata.split(b" ", 2)
+            except ValueError:
+                return None
+            if stage == b"0":
+                index_entries[path] = (mode, object_id)
+
+        candidates = {}
+        for record in tree.stdout.split(b"\0"):
+            if not record:
+                continue
+            try:
+                metadata, path = record.split(b"\t", 1)
+                mode, object_type, object_id = metadata.split(b" ", 2)
+            except ValueError:
+                return None
+            if object_type != b"blob" or mode not in {b"100644", b"100755"}:
+                continue
+            worktree_path = Path(repo_root) / os.fsdecode(path)
+            try:
+                worktree_mode = worktree_path.lstat().st_mode
+            except OSError:
+                continue
+            if not stat.S_ISREG(worktree_mode):
+                continue
+            # Never overwrite staged content or mode changes. Only a stage-0
+            # index entry byte-identical to HEAD is eligible for EOL repair.
+            if index_entries.get(path) != (mode, object_id):
+                continue
+            candidates[path] = object_id
+
+        raw_hashes = _hash_worktree_paths(candidates, "false")
+        normalized_hashes = _hash_worktree_paths(candidates, "input")
+        if raw_hashes is None or normalized_hashes is None:
+            return None
+        return {
+            path: (head_hash, raw_hashes[path])
+            for path, head_hash in candidates.items()
+            if raw_hashes[path] != head_hash and normalized_hashes[path] == head_hash
+        }
+
+    def _restore_head_blobs(blobs):
+        """Replace proven EOL-only files with their exact HEAD blob content."""
+        items = list(blobs.items())
+        current_hashes = _hash_worktree_paths(blobs, "false")
+        if current_hashes is None or any(
+            current_hashes[path] != observed_hash
+            for path, (_head_hash, observed_hash) in items
+        ):
+            return False
+        batch = subprocess.run(
+            git_cmd + ["cat-file", "--batch"],
+            cwd=repo_root,
+            input=b"\n".join(head_hash for _path, (head_hash, _raw_hash) in items)
+            + b"\n",
+            capture_output=True,
+        )
+        if batch.returncode != 0:
+            return False
+
+        cursor = 0
+        restored = []
+        for path, (expected_id, _raw_hash) in items:
+            header_end = batch.stdout.find(b"\n", cursor)
+            if header_end < 0:
+                return False
+            header = batch.stdout[cursor:header_end].split(b" ")
+            if len(header) != 3 or header[0] != expected_id or header[1] != b"blob":
+                return False
+            try:
+                size = int(header[2])
+            except ValueError:
+                return False
+            content_start = header_end + 1
+            content_end = content_start + size
+            if content_end >= len(batch.stdout) or batch.stdout[content_end] != 10:
+                return False
+            restored.append((path, batch.stdout[content_start:content_end]))
+            cursor = content_end + 1
+        if cursor != len(batch.stdout):
+            return False
+
+        for path, content in restored:
+            try:
+                (Path(repo_root) / os.fsdecode(path)).write_bytes(content)
+            except OSError:
+                return False
+        return True
 
     try:
         effective = subprocess.run(
@@ -3508,17 +3633,11 @@ def _normalize_managed_eol(git_cmd, repo_root):
         if eol_only is None:
             return
         if eol_only:
-            # Pathspec over stdin, not argv: a fully renormalized checkout is
-            # thousands of paths, well past the Windows command-line limit.
-            subprocess.run(
-                probe
-                + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
-                cwd=repo_root,
-                input="\0".join(sorted(eol_only)),
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                check=False,
-            )
+            # ``git checkout`` can trust the same stale stat cache and return
+            # success without rewriting every path. Read all proven-safe HEAD
+            # blobs in one batch and write those exact bytes instead.
+            if not _restore_head_blobs(eol_only):
+                return
             if _eol_only():
                 # Still dirty — persisting the pin here would only surface churn
                 # we failed to clear. Leave the checkout as we found it.

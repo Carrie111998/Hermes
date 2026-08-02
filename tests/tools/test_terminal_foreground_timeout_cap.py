@@ -47,6 +47,28 @@ class TestForegroundTimeoutCap:
         assert str(FOREGROUND_MAX_TIMEOUT) in result["error"]
         assert "background=true" in result["error"]
 
+    def test_zero_timeout_rejected(self):
+        """timeout=0 must be rejected, not silently coerced to the default."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+            result = json.loads(terminal_tool(command="echo hi", timeout=0))
+
+        assert result.get("error")
+        assert "positive" in result["error"]
+
+    def test_negative_timeout_rejected(self):
+        """timeout=-1 must be rejected, not fire an immediate '-1s' timeout."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+            result = json.loads(terminal_tool(command="echo hi", timeout=-1))
+
+        assert result.get("error")
+        assert "positive" in result["error"]
+
     def test_foreground_command_text_never_routes_execution(self):
         """The model, not command keywords, chooses foreground/background mode."""
         import tools.terminal_tool as terminal_module
@@ -74,6 +96,25 @@ class TestForegroundTimeoutCap:
                 result = json.loads(terminal_module.terminal_tool(command=command))
                 assert result["error"] is None
                 assert mock_env.execute.call_args[0][0] == command
+
+    def test_foreground_allows_help_variant_for_server_command(self):
+        """Informational variants like '--help' should not be blocked."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+
+            mock_env = MagicMock()
+            mock_env.execute.return_value = {"output": "usage", "returncode": 0}
+
+            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+                 patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+                result = json.loads(terminal_tool(command="pnpm dev --help"))
+
+        assert result["error"] is None
+        call_kwargs = mock_env.execute.call_args
+        assert call_kwargs[0][0] == "pnpm dev --help"
 
     def test_foreground_timeout_within_max_executes(self):
         """When model requests timeout <= FOREGROUND_MAX_TIMEOUT, execute normally."""

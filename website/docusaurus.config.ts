@@ -87,11 +87,21 @@ const config: Config = {
             // Moved when the Plugins subcategory was created under
             // Developer Guide > Extending (docs restructure, July 2026)
             from: '/guides/build-a-hermes-plugin',
-            to: '/developer-guide/plugins'
-          }
-        ]
-      }
-    ]
+            to: '/developer-guide/plugins',
+          },
+          {
+            // Users guess these short paths from abbreviated links and hit
+            // raw 404s (consumer-onboarding audit finding #1, Aug 2026).
+            from: '/quickstart',
+            to: '/getting-started/quickstart',
+          },
+          {
+            from: '/installation',
+            to: '/getting-started/installation',
+          },
+         ],
+       },
+     ],
   ],
 
   presets: [

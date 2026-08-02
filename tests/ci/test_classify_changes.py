@@ -20,9 +20,11 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
 ci_review_files = _mod.ci_review_files
+compare_changed_paths = _mod.compare_changed_paths
 
 DEFAULT = {
     "python": True,
+    "python_prod": True,
     "frontend": True,
     "docker_meta": True,
     "site": True,
@@ -35,9 +37,24 @@ DEFAULT = {
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm_lock=False, mcp_catalog=False, owner_gate=False, docker_meta=False, ci_review=False) -> dict[str, bool]:
+def _lanes(
+    python=False,
+    frontend=False,
+    site=False,
+    scan=False,
+    deps=False,
+    npm_lock=False,
+    mcp_catalog=False,
+    owner_gate=False,
+    docker_meta=False,
+    ci_review=False,
+    python_prod=None,
+) -> dict[str, bool]:
+    # python_prod tracks python except for tests-only diffs; default it to
+    # python so the majority of cases don't need to spell it out.
     return {
         "python": python,
+        "python_prod": python if python_prod is None else python_prod,
         "frontend": frontend,
         "docker_meta": docker_meta,
         "site": site,
@@ -79,7 +96,12 @@ CASES = {
     ),
     "canary tests → owner_gate": (
         ["tests/scripts/canary/test_passkey_v2_security.py"],
-        _lanes(python=True, scan=True, owner_gate=True),
+        _lanes(
+            python=True,
+            python_prod=False,
+            scan=True,
+            owner_gate=True,
+        ),
     ),
     "canonical runner → owner_gate": (
         ["scripts/run_tests.sh"],
@@ -89,6 +111,26 @@ CASES = {
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
     "mixed docs+python → python": (["README.md", "agent/x.py"], _lanes(python=True, scan=True)),
     "mixed docs+frontend → frontend": (["README.md", "apps/x.tsx"], _lanes(frontend=True)),
+    # tests-only diffs: pytest lanes stay ON, product jobs (Desktop E2E,
+    # Docker) gate on python_prod and skip.
+    "tests-only → python without python_prod": (
+        ["tests/agent/test_foo.py", "tests/conftest.py"],
+        _lanes(python=True, python_prod=False, scan=True),
+    ),
+    "tests + prod source → both lanes": (
+        ["tests/agent/test_foo.py", "agent/x.py"],
+        _lanes(python=True, scan=True),
+    ),
+    # Runner infrastructure is NOT tests-only — a bad runner edit can mask
+    # real failures, so it keeps the conservative full lane set.
+    "test runner script → python_prod stays on": (
+        ["scripts/run_tests_parallel.py"],
+        _lanes(python=True, scan=True),
+    ),
+    "renamed production source remains python_prod": (
+        ["tests/agent/test_x.py", "agent/x.py"],
+        _lanes(python=True, scan=True),
+    ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
     "setup.py → scan": (["setup.py"], _lanes(python=True, scan=True)),
@@ -129,6 +171,10 @@ CASES = {
         [".prettierrc"],
         _lanes(python=True, ci_review=True),
     ),
+    "classifier source → ci_review": (
+        ["scripts/ci/classify_changes.py"],
+        _lanes(python=True, scan=True, ci_review=True),
+    ),
     "workflow yml → ci_review (also fail-open all)": (
         [".github/workflows/typecheck.yml"],
         DEFAULT,
@@ -160,8 +206,45 @@ def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
         "apps/desktop/src/app.tsx",
         ".github/workflows/ci.yml",
         "apps/desktop/eslint.config.mjs",
+        "scripts/ci/classify_changes.py",
         ".github/workflows/ci.yml",
     ]) == [
         ".github/workflows/ci.yml",
         "apps/desktop/eslint.config.mjs",
+        "scripts/ci/classify_changes.py",
     ]
+
+
+def test_compare_changed_paths_includes_exact_rename_predecessor():
+    payload = [
+        {
+            "files": [
+                {
+                    "status": "renamed",
+                    "filename": "tests/agent/test_x.py",
+                    "previous_filename": "agent/x.py",
+                },
+                {"status": "modified", "filename": "README.md"},
+            ]
+        },
+        {"files": None},
+    ]
+
+    assert compare_changed_paths(payload) == [
+        "tests/agent/test_x.py",
+        "agent/x.py",
+        "README.md",
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        [{"files": [{"status": "renamed", "filename": "tests/x.py"}]}],
+        [{"files": "not-a-list"}],
+        ["not-a-page"],
+    ),
+)
+def test_compare_changed_paths_rejects_malformed_payload(payload):
+    with pytest.raises(ValueError, match="compare_file_payload_invalid"):
+        compare_changed_paths(payload)
