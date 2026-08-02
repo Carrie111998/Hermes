@@ -42,6 +42,7 @@ from agent.tool_dispatch_helpers import DeferredToolResult
 from gateway.runtime_session_history import (
     RuntimeSessionStateError as _RuntimeSessionStateError,
     SESSION_DB_HISTORY_MODE as _SESSION_DB_HISTORY_MODE,
+    _inject_runtime_attachment_context,
     load_runtime_session_history as _load_runtime_session_history,
     merge_runtime_session_history as _merge_runtime_session_history,
     resume_runtime_history as _resume_runtime_history,
@@ -1318,7 +1319,7 @@ class APIServerRuntimeMixin:
             )
             runtime_image_paths = _runtime_image_paths(attachment_parts)
             runtime_video_paths = _runtime_video_paths(attachment_parts)
-            if attachment_parts:
+            if attachment_parts and not (session_db_mode and resuming):
                 last_user_index = next(
                     (
                         index
@@ -1352,6 +1353,10 @@ class APIServerRuntimeMixin:
                         agent_session_id,
                         history,
                         tool_results,
+                    )
+                    history = _inject_runtime_attachment_context(
+                        history,
+                        attachment_parts,
                     )
                     tool_exposure.activate_names(
                         _runtime_history_tool_names(history),

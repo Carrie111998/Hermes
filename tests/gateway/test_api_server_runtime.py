@@ -2130,6 +2130,27 @@ def test_session_db_merge_retains_public_turns_after_private_history_tail():
     assert merged == [*session, *caller[2:]]
 
 
+def test_session_db_merge_ignores_private_runtime_attachment_descriptors():
+    caller = [{"role": "user", "content": "describe the uploaded image"}]
+    session = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe the uploaded image"},
+            {
+                "type": "text",
+                "text": (
+                    "[Attached image: reference.png; role=user_upload; "
+                    "asset_id=asset_1. When pixel analysis is required, call "
+                    "image_analyze with image_url=/tmp/runtime/reference.png.]"
+                ),
+            },
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+        ],
+    }]
+
+    assert _merge_runtime_session_history(caller, session) == session
+
+
 def test_session_db_resume_survives_database_reopen(tmp_path):
     db_path = tmp_path / "state.db"
     session_id = "thread_restart"
@@ -2266,6 +2287,129 @@ async def test_runtime_session_db_resume_loads_private_history_without_checkpoin
         events = [json.loads(line) async for line in response.content]
         assert events[-1]["type"] == "completed"
         assert adapter.db.messages[-1]["tool_call_id"] == "call_media"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_db_resume_injects_generated_output_after_history_merge():
+    captured = {}
+
+    class RecordingDB:
+        def __init__(self):
+            self.messages = [
+                {"role": "user", "content": "make an image"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_media",
+                        "function": {"name": "media.generate_image", "arguments": "{}"},
+                    }],
+                },
+            ]
+
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def get_messages_as_conversation(self, session_id, include_ancestors=False):
+            assert session_id == "thread_generated_output"
+            assert include_ancestors is True
+            return list(self.messages)
+
+        def append_message(self, session_id, **message):
+            self.messages.append({"role": message["role"], **message})
+
+    class GeneratedOutputAdapter(APIServerRuntimeMixin):
+        _api_key = ""
+
+        def __init__(self):
+            self.db = RecordingDB()
+
+        def _check_auth(self, _request):
+            return None
+
+        def _ensure_session_db(self):
+            return self.db
+
+        async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(
+                tools=[],
+                valid_tool_names=set(),
+                model="configured-model",
+                _primary_runtime={
+                    "model": "configured-model",
+                    "compressor_model": "configured-model",
+                },
+                _fallback_chain=[],
+                _fallback_model=None,
+                _fallback_index=0,
+                _fallback_activated=False,
+            )
+            kwargs["agent_configurator"](agent)
+            history = kwargs["conversation_history"]
+            assert kwargs["user_message"] == ""
+            assert [message["role"] for message in history] == [
+                "user", "assistant", "tool",
+            ]
+            assert history[0]["content"] == "make an image"
+            persisted_result = self.db.messages[-1]["content"]
+            assert "runtime_generated_media_context" not in persisted_result
+            assert history[-1]["content"].startswith(persisted_result)
+            assert "runtime_generated_media_context" in history[-1]["content"]
+            marker = history[-1]["content"].split("image_url=", 1)[1]
+            image_path = marker.split(". Keep", 1)[0]
+            captured["image_path"] = image_path
+            assert Path(image_path).read_bytes() == b"generated-pixels"
+            analyzed = _runtime_tool_middleware(
+                tool_name="image_analyze",
+                args={"image_url": image_path, "question": "Inspect the output"},
+                session_id=kwargs["session_id"],
+                tool_call_id="inspect_generated_output",
+                next_call=lambda _args: '{"success":true,"analysis":"one image"}',
+            )
+            assert json.loads(analyzed)["analysis"] == "one image"
+            return {"final_response": "one image ready"}, {"total_tokens": 1}
+
+    adapter = GeneratedOutputAdapter()
+    app = web.Application()
+    app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/runtime/runs", json=_run_body(
+            "run_generated_output_resume",
+            context={
+                "session_id": "thread_generated_output",
+                "history_mode": "session_db",
+            },
+            messages=[{"role": "user", "content": "make an image"}],
+            tool_results=[{
+                "tool_call_id": "call_media",
+                "status": "succeeded",
+                "output": {"asset_id": "asset_1", "output_id": "output_1"},
+            }],
+            tools=[{
+                "name": "media.generate_image",
+                "description": "generate an image",
+                "input_schema": {"type": "object"},
+            }],
+            attachments=[{
+                "role": "generated_output",
+                "reference_id": "output_1",
+                "filename": "output_1.png",
+                "media_type": "image",
+                "mime_type": "image/png",
+                "data": base64.b64encode(b"generated-pixels").decode(),
+            }],
+        ))
+        assert response.status == 200
+        events = [json.loads(line) async for line in response.content]
+        assert events[-1]["type"] == "completed"
+        assert not Path(captured["image_path"]).exists()
     finally:
         await client.close()
 

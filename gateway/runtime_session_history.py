@@ -6,6 +6,9 @@ import json
 from typing import Any
 
 SESSION_DB_HISTORY_MODE = "session_db"
+_RUNTIME_ATTACHMENT_TEXT_PREFIXES = ("[Attached image:", "[Attached video:")
+_RUNTIME_MEDIA_CONTEXT_OPEN = "<runtime_generated_media_context>"
+_RUNTIME_MEDIA_CONTEXT_CLOSE = "</runtime_generated_media_context>"
 
 
 class RuntimeSessionStateError(RuntimeError):
@@ -82,7 +85,13 @@ def _anchor_content(content: Any) -> str:
         text = "\n".join(
             str(part.get("text") or "")
             for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and not str(part.get("text") or "").startswith(
+                    _RUNTIME_ATTACHMENT_TEXT_PREFIXES,
+                )
+            )
         )
     else:
         text = _message_text(content)
@@ -91,6 +100,42 @@ def _anchor_content(content: Any) -> str:
         for line in text.splitlines()
         if line.strip() not in {"[screenshot]", "[Attached media]"}
     ).strip()
+
+
+def _inject_runtime_attachment_context(
+    history: list[dict[str, Any]],
+    attachment_parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose ephemeral generated media on the new tool-result tail only."""
+    context_lines = [
+        str(part.get("text") or "").strip()
+        for part in attachment_parts
+        if isinstance(part, dict)
+        and (part.get("_runtime_image_path") or part.get("_runtime_video_path"))
+        and str(part.get("text") or "").strip()
+    ]
+    if not context_lines:
+        return history
+    if not history or history[-1].get("role") != "tool":
+        raise RuntimeSessionStateError(
+            "runtime_history_conflict",
+            "generated output attachments require a resumed tool result",
+            status=409,
+        )
+    result = list(history)
+    tail = dict(result[-1])
+    content = str(tail.get("content") or "")
+    tail["content"] = (
+        content
+        + "\n\n"
+        + _RUNTIME_MEDIA_CONTEXT_OPEN
+        + "\n"
+        + "\n".join(context_lines)
+        + "\n"
+        + _RUNTIME_MEDIA_CONTEXT_CLOSE
+    )
+    result[-1] = tail
+    return result
 
 
 def _public_message_key(message: Any) -> tuple[str, str] | None:
