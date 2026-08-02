@@ -54,10 +54,11 @@ def _make_codex_agent(**kwargs):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
+    provider = kwargs.pop("provider", "openai")
     return run_agent.AIAgent(
         api_key="stub",
         base_url="https://stub.invalid",
-        provider="openai",
+        provider=provider,
         api_mode="codex_app_server",
         quiet_mode=True,
         skip_context_files=True,
@@ -357,6 +358,7 @@ class TestRunConversationCodexPath:
 
         def fake_init(self, **kwargs):
             captured["cwd"] = kwargs["cwd"]
+            captured["provider"] = kwargs["provider"]
             self._thread_id = "thread-stub-1"
 
         def fake_run_turn(self, user_input: str, **kwargs):
@@ -371,12 +373,13 @@ class TestRunConversationCodexPath:
         monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
 
-        agent = _make_codex_agent()
+        agent = _make_codex_agent(provider="openai-codex")
         assert not hasattr(agent, "session_cwd")
         with patch.object(agent, "_spawn_background_review", return_value=None):
             agent.run_conversation("hi")
 
         assert captured["cwd"] == str(tmp_path)
+        assert captured["provider"] == "openai-codex"
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures

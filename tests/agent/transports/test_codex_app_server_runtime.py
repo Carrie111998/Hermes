@@ -340,3 +340,162 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+
+
+class TestHostManagedChatGptAuth:
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+            self.responses = []
+            self.errors = []
+
+        def initialize(self, **kwargs):
+            self.calls.append(("initialize", kwargs))
+            return {}
+
+        def request(self, method, params, timeout=None):
+            self.calls.append((method, params))
+            if method == "thread/start":
+                return {"thread": {"id": "thread-test"}}
+            return {}
+
+        def respond(self, request_id, result):
+            self.responses.append((request_id, result))
+
+        def respond_error(self, request_id, code, message, data=None):
+            self.errors.append((request_id, code, message))
+
+    def test_initialize_enables_experimental_api_and_logs_in_before_thread(
+        self, monkeypatch
+    ):
+        from agent.transports import codex_app_server_session as session_module
+
+        client = self.FakeClient()
+        monkeypatch.setattr(
+            session_module,
+            "_resolve_chatgpt_auth_tokens",
+            lambda **kwargs: {
+                "accessToken": "access-test",
+                "chatgptAccountId": "account-test",
+                "chatgptPlanType": None,
+            },
+        )
+        session = session_module.CodexAppServerSession(
+            provider="openai-codex",
+            client_factory=lambda **kwargs: client
+        )
+
+        assert session.ensure_started() == "thread-test"
+        assert client.calls[0][0] == "initialize"
+        assert client.calls[0][1]["capabilities"] == {"experimentalApi": True}
+        assert client.calls[1] == (
+            "account/login/start",
+            {
+                "type": "chatgptAuthTokens",
+                "accessToken": "access-test",
+                "chatgptAccountId": "account-test",
+                "chatgptPlanType": None,
+            },
+        )
+        assert client.calls[2][0] == "thread/start"
+
+    def test_openai_api_key_path_does_not_request_hermes_chatgpt_auth(
+        self, monkeypatch
+    ):
+        from agent.transports import codex_app_server_session as session_module
+
+        client = self.FakeClient()
+
+        def unexpected_oauth_resolution(**kwargs):
+            raise AssertionError("openai API-key path must not resolve ChatGPT OAuth")
+
+        monkeypatch.setattr(
+            session_module,
+            "_resolve_chatgpt_auth_tokens",
+            unexpected_oauth_resolution,
+        )
+        session = session_module.CodexAppServerSession(
+            provider="openai",
+            client_factory=lambda **kwargs: client,
+        )
+
+        assert session.ensure_started() == "thread-test"
+        assert client.calls[0][0] == "initialize"
+        assert "capabilities" not in client.calls[0][1]
+        assert client.calls[1] == ("thread/start", {"cwd": session._cwd})
+        assert len(client.calls) == 2
+
+    def test_refresh_uses_forced_hermes_resolution_and_exact_response_fields(
+        self, monkeypatch
+    ):
+        from agent.transports import codex_app_server_session as session_module
+
+        client = self.FakeClient()
+        force_refresh_values = []
+
+        def resolve_tokens(*, force_refresh=False):
+            force_refresh_values.append(force_refresh)
+            return {
+                "accessToken": "rotated-access-test",
+                "chatgptAccountId": "rotated-account-test",
+                "chatgptPlanType": None,
+            }
+
+        monkeypatch.setattr(session_module, "_resolve_chatgpt_auth_tokens", resolve_tokens)
+        session = session_module.CodexAppServerSession(
+            provider="openai-codex",
+            client_factory=lambda **kwargs: client
+        )
+        session._client = client
+
+        session._handle_server_request(
+            {"id": 17, "method": "account/chatgptAuthTokens/refresh", "params": {}}
+        )
+
+        assert force_refresh_values == [True]
+        assert client.responses == [
+            (
+                17,
+                {
+                    "accessToken": "rotated-access-test",
+                    "chatgptAccountId": "rotated-account-test",
+                    "chatgptPlanType": None,
+                },
+            )
+        ]
+        assert client.errors == []
+
+    def test_protocol_tokens_come_from_hermes_resolver_without_refresh_token(
+        self, monkeypatch
+    ):
+        from agent.transports import codex_app_server_session as session_module
+        import hermes_cli.auth as auth_module
+
+        resolver_calls = []
+
+        def resolve_credentials(**kwargs):
+            resolver_calls.append(kwargs)
+            return {
+                "api_key": "resolver-access-test",
+                "refresh_token": "must-not-cross-bridge",
+            }
+
+        monkeypatch.setattr(
+            auth_module, "resolve_codex_runtime_credentials", resolve_credentials
+        )
+        monkeypatch.setattr(
+            session_module,
+            "_extract_chatgpt_account_id",
+            lambda token: "resolver-account-test",
+        )
+
+        result = session_module._resolve_chatgpt_auth_tokens(force_refresh=True)
+
+        assert resolver_calls == [{"force_refresh": True}]
+        assert result == {
+            "accessToken": "resolver-access-test",
+            "chatgptAccountId": "resolver-account-test",
+            "chatgptPlanType": None,
+        }
+        assert "refreshToken" not in result
+        assert "refresh_token" not in result

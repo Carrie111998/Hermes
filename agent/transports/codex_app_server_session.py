@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
+from agent.model_metadata import _extract_chatgpt_account_id
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
@@ -47,6 +48,40 @@ logger = logging.getLogger(__name__)
 # wedge watchdog, etc.). Small enough to keep error messages legible, large
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
+
+
+def _resolve_chatgpt_auth_tokens(*, force_refresh: bool = False) -> dict[str, Any]:
+    """Resolve Hermes-owned Codex auth into the host-auth protocol shape.
+
+    The refresh token remains inside ``hermes_cli.auth`` and is never returned
+    from this bridge or sent to the codex subprocess.
+    """
+    from hermes_cli.auth import AuthError, resolve_codex_runtime_credentials
+
+    try:
+        credentials = resolve_codex_runtime_credentials(force_refresh=force_refresh)
+    except AuthError as exc:
+        raise CodexAppServerError(
+            code=-32001,
+            message=f"Hermes Codex authentication unavailable: {exc}",
+        ) from exc
+
+    access_token = str(credentials.get("api_key") or "").strip()
+    account_id = _extract_chatgpt_account_id(access_token) if access_token else None
+    if not access_token or not account_id:
+        raise CodexAppServerError(
+            code=-32001,
+            message=(
+                "Hermes Codex authentication unavailable: the current access "
+                "token or ChatGPT account ID is missing. Run `hermes auth` to "
+                "authenticate."
+            ),
+        )
+    return {
+        "accessToken": access_token,
+        "chatgptAccountId": account_id,
+        "chatgptPlanType": None,
+    }
 
 
 # Permission profile mapping mirrors the docstring in PR proposal:
@@ -277,6 +312,7 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        provider: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -286,6 +322,7 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._provider = (provider or "").strip().lower()
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -322,11 +359,21 @@ class CodexAppServerSession:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
-        self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
-            client_version=_get_hermes_version(),
-        )
+        initialize_kwargs: dict[str, Any] = {
+            "client_name": "hermes",
+            "client_title": "Hermes Agent",
+            "client_version": _get_hermes_version(),
+        }
+        if self._provider == "openai-codex":
+            initialize_kwargs["capabilities"] = {"experimentalApi": True}
+        self._client.initialize(**initialize_kwargs)
+        if self._provider == "openai-codex":
+            auth_tokens = _resolve_chatgpt_auth_tokens()
+            self._client.request(
+                "account/login/start",
+                {"type": "chatgptAuthTokens", **auth_tokens},
+                timeout=15,
+            )
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi
@@ -1013,7 +1060,17 @@ class CodexAppServerSession:
         rid = req.get("id")
         params = req.get("params") or {}
 
-        if method == "item/commandExecution/requestApproval":
+        if (
+            method == "account/chatgptAuthTokens/refresh"
+            and self._provider == "openai-codex"
+        ):
+            try:
+                self._client.respond(
+                    rid, _resolve_chatgpt_auth_tokens(force_refresh=True)
+                )
+            except CodexAppServerError as exc:
+                self._client.respond_error(rid, code=exc.code, message=exc.message)
+        elif method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
         elif method == "item/fileChange/requestApproval":
