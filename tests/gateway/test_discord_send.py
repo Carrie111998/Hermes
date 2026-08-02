@@ -89,8 +89,13 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
             )
         return sent_msgs[len(send_calls) - 2]
 
+    async def fake_fetch(message_id):
+        if message_id == 99:
+            return ref_msg
+        return next(msg for msg in sent_msgs if msg.id == message_id)
+
     channel = SimpleNamespace(
-        fetch_message=AsyncMock(return_value=ref_msg),
+        fetch_message=AsyncMock(side_effect=fake_fetch),
         send=AsyncMock(side_effect=fake_send),
     )
     adapter._client = SimpleNamespace(
@@ -103,7 +108,7 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
 
     assert result.success is True
     assert result.message_id == "1001"
-    assert channel.fetch_message.await_count == 1
+    assert channel.fetch_message.await_count == 3
     assert channel.send.await_count == 3
     ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
     assert send_calls[0]["reference"] is reference_obj
