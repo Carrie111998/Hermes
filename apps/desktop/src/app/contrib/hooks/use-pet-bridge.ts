@@ -4,6 +4,7 @@ import { respondToApprovalAction } from '@/store/native-notifications'
 import { setPetActivity } from '@/store/pet'
 import { setPetScale } from '@/store/pet-gallery'
 import {
+  pushPetOverlayStateNow,
   setPetOverlayApprovalHandler,
   setPetOverlayOpenAppHandler,
   setPetOverlayScaleHandler,
@@ -43,7 +44,7 @@ export function usePetBridge({ requestGateway, resumeSession, submitText }: PetB
 
     setPetOverlaySubmitHandler(text => void submitTextRef.current(text))
     setPetOverlayApprovalHandler((choice, sessionId) => {
-      void respondToApprovalAction(sessionId, choice === 'once' ? 'approve' : 'reject')
+      void respondToApprovalAction(sessionId, choice === 'once' ? 'approve' : 'reject').finally(pushPetOverlayStateNow)
     })
     // Alt+wheel resize from the popped-out pet — persist through this window's
     // gateway (the overlay has none) so it survives restart.

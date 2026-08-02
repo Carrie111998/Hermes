@@ -159,8 +159,12 @@ function currentPayload(): PetOverlayStatePayload {
   }
 }
 
-function pushNow(): void {
+export function pushPetOverlayStateNow(): void {
   window.hermesDesktop?.petOverlay?.pushState(currentPayload())
+}
+
+function pushNow(): void {
+  pushPetOverlayStateNow()
 }
 
 /**
