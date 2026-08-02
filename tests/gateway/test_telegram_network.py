@@ -442,9 +442,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips[0] == "149.154.167.220"
-        assert ips.count("149.154.167.220") == 1
-        assert set(tnet._SEED_FALLBACK_IPS).issubset(ips)
+        assert ips == ["149.154.167.220", "149.154.166.110"]
 
 
     @pytest.mark.asyncio
@@ -460,8 +458,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips[0] == "149.154.166.110"
-        assert set(tnet._SEED_FALLBACK_IPS).issubset(ips)
+        assert ips == ["149.154.166.110", "149.154.167.220"]
 
 
     @pytest.mark.asyncio
@@ -487,6 +484,5 @@ class TestDiscoverFallbackIps:
         ips = await tnet.discover_fallback_ips()
         elapsed = _time.monotonic() - start
 
-        assert ips[0] == "149.154.167.220"
-        assert set(tnet._SEED_FALLBACK_IPS).issubset(ips)
+        assert ips == ["149.154.167.220", "149.154.166.110"]
         assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
