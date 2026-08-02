@@ -307,6 +307,7 @@ export {
   DATA_URL_READ_MAX_BYTES,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
+  rejectSensitiveFilePath,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,
   resolveReadableFileForIpc,

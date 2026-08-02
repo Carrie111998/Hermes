@@ -330,6 +330,25 @@ class TestStaleCronEntryMigration:
 
 
 class TestTrackForgetQuick:
+    def test_quick_revalidates_tampered_tracked_path(self, _isolate_env, tmp_path):
+        """A forged registry entry must never delete outside HERMES_HOME."""
+        dg = _load_lib()
+        victim = tmp_path / "outside-victim.txt"
+        victim.write_text("keep me", encoding="utf-8")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(victim),
+            "category": "test",
+            "timestamp": "2020-01-01T00:00:00+00:00",
+            "size": victim.stat().st_size,
+        }]), encoding="utf-8")
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.exists()
+
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_a.py"

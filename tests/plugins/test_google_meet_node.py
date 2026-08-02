@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -144,6 +145,15 @@ def test_registry_add_get_roundtrip_persists(tmp_path):
     assert entry["url"] == "ws://mac.local:18789"
     assert entry["token"] == "deadbeef"
     assert "added_at" in entry
+
+
+def test_registry_file_is_private(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    p = tmp_path / "nodes.json"
+    NodeRegistry(path=p).add("mac", "ws://mac.local:18789", "secret")
+    if os.name == "posix":
+        assert p.stat().st_mode & 0o077 == 0
 
 
 def test_registry_get_returns_none_when_missing(tmp_path):

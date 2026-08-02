@@ -690,8 +690,11 @@ class MemoryStore:
             return []
         try:
             raw = path.read_text(encoding="utf-8")
-        except (OSError, IOError):
-            return []
+        except (OSError, IOError) as exc:
+            # A present-but-unreadable file is not an empty store.  Treating
+            # transient I/O failures as [] lets the next mutation overwrite
+            # the user's entire memory file with only the new entry.
+            raise RuntimeError(f"Unable to read memory file {path}: {exc}") from exc
 
         if not raw.strip():
             return []

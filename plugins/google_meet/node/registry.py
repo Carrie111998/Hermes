@@ -20,6 +20,8 @@ Schema
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -53,9 +55,30 @@ class NodeRegistry:
 
     def _save(self, data: Dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        # The registry contains bearer tokens.  Create the temporary file
+        # atomically with restrictive permissions instead of using a fixed
+        # ``.json.tmp`` name, which is raceable and initially mode 0666.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+        )
+        tmp = Path(tmp_name)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            else:
+                os.chmod(tmp, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp.replace(self.path)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            tmp.unlink(missing_ok=True)
+            raise
 
     # ----- public API ---------------------------------------------------
 

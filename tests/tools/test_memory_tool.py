@@ -504,6 +504,24 @@ class TestMemoryStorePersistence:
 
 
 class TestMemoryStoreSnapshot:
+    def test_load_from_disk_preserves_failure_for_unreadable_memory_file(self, tmp_path, monkeypatch):
+        """An I/O error must not be treated as an empty store before a write."""
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        path.write_text("existing fact", encoding="utf-8")
+
+        original_read_text = Path.read_text
+
+        def fail_for_memory_file(self, *args, **kwargs):
+            if self == path:
+                raise OSError("simulated transient read failure")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fail_for_memory_file)
+        store = MemoryStore()
+        with pytest.raises(RuntimeError, match="Unable to read memory file"):
+            store.load_from_disk()
+
     def test_snapshot_frozen_at_load(self, store):
         store.add("memory", "loaded at start")
         store.load_from_disk()  # Re-load to capture snapshot
