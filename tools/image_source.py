@@ -281,6 +281,28 @@ def _get_active_env(task_id: Optional[str]):
         return None
 
 
+async def _wait_for_env_registration(task_id: Optional[str], timeout: float = 5.0):
+    """Wait briefly for the sandbox session to register.
+
+    The sandbox environment is created lazily on first terminal activity.
+    When the very first ``vision_analyze`` fires before any terminal
+    command ran, ``_get_active_env`` returns None even though the
+    environment is about to be (or is being) registered — the identical
+    call succeeds on retry (#76566). Poll for a short window so the
+    first call does not deterministically fail.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        env = _get_active_env(task_id)
+        if env is not None:
+            return env
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.25)
+
+
 async def _resolve_container_fallback(
     p: Path, ctx: ResolveContext, src: str, permitted: tuple = ("image",)
 ) -> ResolvedImage:
@@ -300,6 +322,11 @@ async def _resolve_container_fallback(
     import shlex
 
     env = _get_active_env(ctx.task_id)
+    if env is None:
+        # First-use race (#76566): the sandbox may still be initializing
+        # when the first vision_analyze fires (no terminal activity yet).
+        # Wait briefly for registration; still fail-closed on timeout.
+        env = await _wait_for_env_registration(ctx.task_id)
     if env is None:
         raise SourceNotFound(
             f"'{p}' is not reachable inside the sandbox and no active sandbox "

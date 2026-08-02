@@ -10,7 +10,7 @@ import base64
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -147,7 +147,9 @@ class TestNonLocalBackendConfinement:
         secret = tmp_path / "id_rsa"
         secret.write_bytes(b"HOST-PRIVATE-KEY")
 
-        with patch("tools.image_source._get_active_env", return_value=None):
+        with patch("tools.image_source._get_active_env", return_value=None), \
+                patch("tools.image_source._wait_for_env_registration",
+                      new=AsyncMock(return_value=None)):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(str(secret), isrc.ResolveContext(task_id="t1"))
 
@@ -248,3 +250,45 @@ class TestSvgNormalization:
             path, mime, err = vt._normalize_to_supported_image(svg, "image/svg+xml")
         assert path is None
         assert "rasterizer" in err
+
+
+class TestFirstUseSandboxRegistration:
+    """#76566: the very first vision_analyze can fire before the sandbox
+    session is registered (envs are created lazily on first terminal
+    activity). The resolver must wait briefly for registration instead of
+    failing the first call deterministically."""
+
+    @pytest.mark.asyncio
+    async def test_first_use_waits_for_env_registration(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        secret = tmp_path / "id_rsa"
+        secret.write_bytes(b"HOST-PRIVATE-KEY")
+
+        container_png_b64 = base64.b64encode(PNG).decode()
+        env = SimpleNamespace(
+            execute=lambda cmd, **kw: {"returncode": 0, "output": container_png_b64}
+        )
+
+        # First lookup: not registered yet. Second lookup (after the wait
+        # loop) — registered. The wait must bridge the gap.
+        lookups = {"n": 0}
+
+        def flaky_lookup(task_id):
+            lookups["n"] += 1
+            return None if lookups["n"] == 1 else env
+
+        with patch("tools.image_source._get_active_env", side_effect=flaky_lookup):
+            res = await isrc.resolve_image_source(str(secret), isrc.ResolveContext(task_id="t1"))
+
+        assert res.origin == "container"
+        assert res.data == PNG
+        assert lookups["n"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_wait_times_out_and_still_fails_closed(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        with patch("tools.image_source._get_active_env", return_value=None):
+            env = await isrc._wait_for_env_registration("t1", timeout=0.1)
+        assert env is None
