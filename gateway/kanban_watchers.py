@@ -243,6 +243,12 @@ class GatewayKanbanWatchersMixin:
         """Return whether this gateway currently owns the singleton lock."""
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
 
+    def _release_kanban_dispatcher_lock(self) -> None:
+        """Clear notifier-visible ownership before releasing the OS lock."""
+        handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
+        self._kanban_dispatcher_lock_handle = None
+        _release_singleton_lock(handle)
+
     async def _kanban_override_instruction(
         self, event: Any, session_key: str
     ) -> Optional[str]:
@@ -1732,8 +1738,7 @@ class GatewayKanbanWatchersMixin:
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 _kanban_intake._unregister_intake_waker(_wake_qualification)
-                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-                self._kanban_dispatcher_lock_handle = None
+                self._release_kanban_dispatcher_lock()
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
@@ -1749,8 +1754,7 @@ class GatewayKanbanWatchersMixin:
                     )
                 except asyncio.CancelledError:
                     _kanban_intake._unregister_intake_waker(_wake_qualification)
-                    _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-                    self._kanban_dispatcher_lock_handle = None
+                    self._release_kanban_dispatcher_lock()
                     raise
                 except asyncio.TimeoutError:
                     slept += wait_for
@@ -1759,5 +1763,4 @@ class GatewayKanbanWatchersMixin:
                 break
 
         _kanban_intake._unregister_intake_waker(_wake_qualification)
-        _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-        self._kanban_dispatcher_lock_handle = None
+        self._release_kanban_dispatcher_lock()
