@@ -11492,7 +11492,8 @@ def cmd_tools(args):
 
         sys.exit(run_post_setup_command(args))
     else:
-        _require_tty("tools")
+        if not getattr(args, "summary", False):
+            _require_tty("tools")
         from hermes_cli.tools_config import tools_command
 
         tools_command(args)
