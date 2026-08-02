@@ -335,6 +335,11 @@ export const en: Translations = {
     resetConfirm: 'Reset all settings to Hermes defaults?',
     exportFailed: 'Export failed',
     resetFailed: 'Reset failed',
+    desktopLoginItem: {
+      title: 'Launch Hermes Desktop at login',
+      description:
+        'Open the Hermes Desktop app when you sign in to Windows. This is separate from the background gateway autostart (hermes gateway install --start-on-login).'
+    },
     nav: {
       providers: 'Providers',
       providerAccounts: 'Accounts',

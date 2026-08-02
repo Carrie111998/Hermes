@@ -287,6 +287,10 @@ export interface Translations {
     resetConfirm: string
     exportFailed: string
     resetFailed: string
+    desktopLoginItem: {
+      title: string
+      description: string
+    }
     nav: {
       providers: string
       providerAccounts: string

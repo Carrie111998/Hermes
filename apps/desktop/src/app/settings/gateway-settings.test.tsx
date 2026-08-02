@@ -6,6 +6,8 @@ import type { ProfileInfo } from '@/types/hermes'
 
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
+const loginItemGet = vi.fn()
+const loginItemSet = vi.fn()
 const profiles = atom<ProfileInfo[]>([])
 
 vi.mock('@/store/profile', () => ({
@@ -47,9 +49,11 @@ beforeEach(() => {
   ])
   getConnectionConfig.mockResolvedValue(localConnection)
   saveConnectionConfig.mockResolvedValue(localConnection)
+  loginItemGet.mockResolvedValue({ openAtLogin: false })
+  loginItemSet.mockResolvedValue({ openAtLogin: true })
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
-    value: { getConnectionConfig, saveConnectionConfig }
+    value: { getConnectionConfig, saveConnectionConfig, loginItem: { get: loginItemGet, set: loginItemSet } }
   })
 })
 
@@ -76,6 +80,20 @@ describe('GatewaySettings', () => {
     expect(
       screen.queryByText('Start a private Hermes backend on localhost. This is the default and works offline.')
     ).toBeNull()
+  })
+
+  it('loads and updates the Desktop login-item toggle', async () => {
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+
+    const toggle = await screen.findByRole('switch', { name: 'Launch Hermes Desktop at login' })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+
+    fireEvent.click(toggle)
+
+    await waitFor(() => expect(loginItemSet).toHaveBeenCalledWith({ openAtLogin: true }))
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
   })
 
   it('shows and clears an SSH remote-profile mapping for a named Desktop profile', async () => {

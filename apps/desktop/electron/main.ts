@@ -97,6 +97,7 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
+import { registerLoginItemHandlers } from './login-item'
 import {
   fileDiffVsHead,
   repoStatus,
@@ -9458,6 +9459,8 @@ function createWindow() {
     sendWindowStateChanged()
   })
 }
+
+registerLoginItemHandlers(app, ipcMain)
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
