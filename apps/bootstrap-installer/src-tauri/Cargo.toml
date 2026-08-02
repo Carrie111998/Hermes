@@ -17,9 +17,15 @@ path = "src/main.rs"
 # The library target name MUST match the `withGlobalTauri` binding name that
 # tauri.conf.json's `app.windows[].label` references. We don't ship a separate
 # lib for now; everything is in src/.
+#
+# NOTE (local build fix): `cdylib` removed — the desktop binary is a plain
+# rlib consumer (main.rs calls hermes_bootstrap_lib::run()), and on the GNU
+# toolchain the cdylib's default export-all-symbols overflows the PE export
+# ordinal limit (65535). MSVC's link.exe only exports marked symbols, which
+# is why upstream CI never hit this. Kept staticlib/rlib for testability.
 [lib]
 name = "hermes_bootstrap_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

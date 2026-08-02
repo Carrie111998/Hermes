@@ -168,6 +168,27 @@ class UpdateHolder:
     age_seconds: float
 
 
+def _pid_is_updater(pid: int) -> bool:
+    """True when the marker holder is the Tauri updater (hermes-setup.exe).
+
+    The desktop hands the update off to that process, and it spawns this
+    ``hermes update`` as its child — so a marker owned by it is the same
+    update chain, not a foreign concurrent update. The marker contract
+    (update.rs UpdateMarkerGuard + update_lock.py UpdateLock) intends the
+    child to take ownership (overwrite the marker with its own pid); this
+    exemption is what lets the hand-off actually proceed.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        name = psutil.Process(pid).name().lower()
+    except Exception:
+        return False
+    return name in ("hermes-setup.exe", "hermes-setup")
+
+
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
@@ -191,6 +212,23 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
         started_at = float(lines[1].strip())
     except (IndexError, ValueError):
         started_at = float("-inf")
+
+    # Self-owned marker: this process (or its hand-off partner — the desktop
+    # pre-writes the marker with the *updater's own pid* before spawning it,
+    # see electron/update-marker.ts writeUpdateMarker) already owns the lock.
+    # A marker whose pid is ours must never read as a foreign holder, or a
+    # desktop-initiated update would immediately refuse itself with
+    # "Another Hermes update is already running (PID <our own pid>)".
+    if pid == os.getpid():
+        return None
+
+    # Hand-off partner marker: the Tauri updater (hermes-setup.exe) wrote the
+    # marker with ITS pid before spawning this `hermes update` (see
+    # apps/bootstrap-installer/src-tauri/src/update.rs UpdateMarkerGuard).
+    # Same update chain — take over the marker instead of refusing ourselves
+    # with "Another Hermes update is already running (PID <updater's pid>)".
+    if _pid_is_updater(pid):
+        return None
 
     age = time.time() - started_at
     if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:

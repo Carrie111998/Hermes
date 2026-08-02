@@ -150,6 +150,17 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
     let mut lines = raw.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
     let started_at: u64 = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+
+    // Self-owned marker: the desktop pre-writes the marker with OUR pid before
+    // spawning us (see electron/update-marker.ts writeUpdateMarker) to close
+    // the #73822 window. A marker whose pid is this very process must never
+    // read as a foreign holder, or a desktop-initiated update immediately
+    // refuses itself with "Another Hermes update is already running
+    // (PID <our own pid>, started 2s ago)" and fails on every click.
+    if pid == std::process::id() {
+        return None;
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -383,6 +394,16 @@ async fn run_update(app: AppHandle) -> Result<()> {
     update_args.push("--force".into());
     update_args.push("--branch".into());
     update_args.push(update_branch);
+
+    // Hand the marker over to `hermes update` before spawning it: the CLI's
+    // UpdateLock.acquire() refuses any live marker it does not own, and with
+    // OUR pid still in the file that would make the updater refuse its own
+    // child ("Another Hermes update is already running (PID <our pid>)"),
+    // dead-ending every desktop-initiated update. complete() is idempotent
+    // (Drop tolerates an already-removed marker), and the CLI takes over by
+    // writing its own pid, so mutual exclusion is preserved across the whole
+    // chain: desktop pre-write -> our guard -> `hermes update`'s lock.
+    _update_marker.complete();
 
     emit_stage(&app, "update", StageState::Running, None, None);
     let started = Instant::now();
