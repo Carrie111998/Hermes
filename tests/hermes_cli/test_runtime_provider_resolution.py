@@ -87,20 +87,35 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
 
 
 def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
-    """When requested_provider is 'auto' and Qwen creds fail, fall through."""
+    """When requested_provider is 'auto' and Qwen creds fail, fall through.
+
+    Must mock ``load_pool`` too: resolve_runtime_provider() checks the
+    credential pool before it ever reaches the qwen-oauth singleton block, so
+    on a machine with a real qwen-oauth pool entry the unmocked pool path
+    would return early with the *real* credentials and this test would pass
+    or fail based on the local auth profile instead of exercising the
+    fallthrough logic under test. See #HPA-03.
+    """
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    fallback_creds_calls = []
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(AuthError("stale", provider="qwen-oauth", code="qwen_auth_missing")),
+        lambda **kw: fallback_creds_calls.append(kw) or (_ for _ in ()).throw(
+            AuthError("stale", provider="qwen-oauth", code="qwen_auth_missing")
+        ),
     )
     monkeypatch.setattr(rp, "_get_model_config", lambda: {})
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
 
     # Should NOT raise — falls through to OpenRouter
     resolved = rp.resolve_runtime_provider(requested="auto")
+    # The mock actually ran — proves the fallthrough branch under test
+    # executed, not just that the final provider happens to differ.
+    assert len(fallback_creds_calls) == 1
     # The fallthrough means it won't be qwen-oauth
     assert resolved["provider"] != "qwen-oauth"
 
