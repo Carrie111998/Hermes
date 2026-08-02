@@ -12,11 +12,14 @@ import queue
 import subprocess
 import sys
 import threading
+import asyncio
 import time
 import uuid
 from datetime import datetime
+from gateway.hooks import HookRegistry
+from hermes_cli.config import get_hermes_home
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -151,6 +154,41 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+
+# Per-profile-home cache: keyed by resolved HERMES_HOME path string so that
+# TUI sessions running under a non-default profile discover hooks from that
+# profile's hooks/ dir, not the module-import-time default.
+_tui_hook_registries: Dict[str, HookRegistry] = {}
+_tui_hooks_lock = threading.Lock()
+
+
+def _get_tui_hook_registry(hermes_home: Optional[str] = None) -> HookRegistry:
+    """Return the HookRegistry for *hermes_home* (or the active home if None).
+
+    Registries are cached by resolved home path so repeated calls within a
+    profile are cheap (single dict lookup) while each profile gets its own
+    registry that points at ``<profile_home>/hooks/``.
+
+    Args:
+        hermes_home: Absolute path to the profile home whose hooks to use.
+            ``None`` resolves the current active home via
+            :func:`~hermes_constants.get_hermes_home` at call-time, which
+            respects the context-local override set by
+            :func:`~hermes_constants.set_hermes_home_override`.
+    """
+    from pathlib import Path as _Path
+    resolved = str(_Path(hermes_home).resolve()) if hermes_home else str(get_hermes_home().resolve())
+    if resolved not in _tui_hook_registries:
+        with _tui_hooks_lock:
+            if resolved not in _tui_hook_registries:
+                hooks_dir = _Path(resolved) / "hooks"
+                registry = HookRegistry(hooks_dir=hooks_dir)
+                try:
+                    registry.discover_and_load()
+                except Exception as e:
+                    logger.error("Failed to discover and load hooks: %s", e)
+                _tui_hook_registries[resolved] = registry
+    return _tui_hook_registries[resolved]
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -9477,6 +9515,33 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            # ── message:pre_route — hook-driven session redirect ──────────
+            try:
+                _pre_route_ctx = {
+                    "platform": "desktop",
+                    "user_id": "",
+                    "chat_id": session.get("session_key", sid),
+                    "thread_id": None,
+                    "chat_type": "",
+                    "session_id": session.get("session_key", sid),
+                    "session_key": session.get("session_key", sid),
+                    "message": text if isinstance(text, str) else "",
+                }
+                _registry = _get_tui_hook_registry()
+                _pre_route_results = asyncio.run(
+                    asyncio.wait_for(
+                        _registry.emit_collect("message:pre_route", _pre_route_ctx),
+                        timeout=5.0,
+                    )
+                )
+                for _pr in _pre_route_results:
+                    if not isinstance(_pr, dict):
+                        continue
+                    if _pr.get("decision") == "switch_session" and _pr.get("session_id"):
+                        logger.warning("Session switching is not yet supported in TUI path (switch_session target: %s)", _pr.get("session_id"))
+            except Exception as _hook_err:
+                logger.warning("Failed to fire message:pre_route hook in TUI path: %s", _hook_err)
+
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)

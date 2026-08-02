@@ -59,10 +59,22 @@ class HookRegistry:
         await registry.emit("agent:start", {"platform": "telegram", ...})
     """
 
-    def __init__(self):
+    def __init__(self, hooks_dir: Optional["Path"] = None):
+        """Create a registry.
+
+        Args:
+            hooks_dir: Directory to scan for hook sub-directories.  Defaults
+                to ``get_hermes_home() / "hooks"`` resolved at call-time so
+                that a context-local :func:`~hermes_constants.set_hermes_home_override`
+                or a non-default profile path is respected.  Pass an explicit
+                path to pin the registry to a specific profile home (e.g. in
+                the TUI gateway, where profile selection happens after module
+                import).
+        """
         # event_type -> [handler_fn, ...]
         self._handlers: Dict[str, List[Callable]] = {}
         self._loaded_hooks: List[dict] = []  # metadata for listing
+        self._hooks_dir = hooks_dir
 
     @property
     def loaded_hooks(self) -> List[dict]:
@@ -90,10 +102,15 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        if not HOOKS_DIR.exists():
+        hooks_dir = (
+            self._hooks_dir
+            if self._hooks_dir is not None
+            else get_hermes_home() / "hooks"
+        )
+        if not hooks_dir.is_dir():
             return
 
-        for hook_dir in sorted(HOOKS_DIR.iterdir()):
+        for hook_dir in sorted(hooks_dir.iterdir()):
             if not hook_dir.is_dir():
                 continue
 
