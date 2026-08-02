@@ -27,7 +27,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 import nodePty from 'node-pty'
 
@@ -49,6 +50,7 @@ import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from '
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { shouldHideMainWindowOnClose } from './close-to-background'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -189,6 +191,7 @@ import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
+import { isUpdateOperationBusy, updateHandoffExitMode } from './update-handoff-state'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
 import {
@@ -206,7 +209,12 @@ import {
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker
 } from './updater-process'
-import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
+import {
+  formatBlockerMessage,
+  formatProbeFailedMessage,
+  partitionDesktopUpdateBlockers,
+  scanVenvBlockers
+} from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import {
@@ -1048,6 +1056,9 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let backgroundTray = null
+let closeToBackgroundEnabled = false
+let appQuitRequested = false
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -1768,7 +1779,12 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 function updateGateDeps() {
   return {
     hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)),
-    isUpdateInFlight: () => updateInFlight
+    // Keep the backend parked for the whole detached hand-off. Older staged
+    // installers do not write their marker until several seconds after spawn,
+    // so updateInFlight alone leaves a window where a reconnect can relaunch
+    // the backend and re-lock the venv before the updater reaches Rust.
+    isUpdateInFlight: () =>
+      isUpdateOperationBusy({ updateInFlight, handoffInFlight: updateHandoffInFlight })
   }
 }
 
@@ -2598,6 +2614,11 @@ async function readCommitLog(cwd, branch) {
 }
 
 let updateInFlight = false
+// Unlike updateInFlight, this latch stays set after the detached updater has
+// spawned. It must remain true until this Electron process exits: older staged
+// installers do not write the on-disk marker immediately, and a renderer
+// reconnect in that gap must not start another backend or a second updater.
+let updateHandoffInFlight = false
 
 // Set to true when the desktop is about to quit so a detached swap/install/
 // uninstall script can take over. On macOS, app.quit() closes windows but
@@ -2608,6 +2629,18 @@ let updateInFlight = false
 // set, window-all-closed calls app.quit() on every platform so the process
 // actually dies and the hand-off script can proceed immediately.
 let isQuittingForHandoff = false
+
+// Windows update handoff already stopped every backend owned by this process
+// and waited for the venv shim to unlock. Use a hard Electron exit so tray,
+// window-all-closed, SSH teardown, or other quit hooks cannot keep the process
+// alive while the detached updater is waiting for its PID to disappear.
+function exitAfterUpdateHandoff() {
+  if (updateHandoffExitMode(IS_WINDOWS) === 'hard') {
+    app.exit(0)
+  } else {
+    app.quit()
+  }
+}
 
 // Quit-guard latches: one while the confirmation is on screen (a second
 // Cmd-Q must not stack dialogs), one after the user has said "quit anyway"
@@ -2840,7 +2873,7 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
-  if (updateInFlight) {
+  if (updateInFlight || updateHandoffInFlight) {
     throw new Error('An update is already in progress.')
   }
 
@@ -2967,13 +3000,29 @@ async function applyUpdates(opts = {}) {
       const scanOutcome = await scanVenvBlockers(updateRoot)
 
       if (scanOutcome.kind === 'blocked') {
-        const message = formatBlockerMessage(scanOutcome.result)
+        // `hermes update` itself pauses and resumes installed Windows Gateway
+        // runners. Do not abort the desktop handoff for that known managed
+        // holder; retain the hard stop for every other process, which the CLI
+        // cannot safely assume it owns.
+        const { blockingProcesses, deferredGatewayProcesses } = partitionDesktopUpdateBlockers(
+          scanOutcome.result.processes
+        )
 
-        rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
+        if (deferredGatewayProcesses.length > 0) {
+          rememberLog(
+            `[updates] deferring ${deferredGatewayProcesses.length} managed gateway process(es) to CLI updater pause/resume`
+          )
+        }
 
-        return { ok: false, error: 'venv-blocked', message }
+        if (blockingProcesses.length > 0) {
+          const message = formatBlockerMessage({ blocked: true, processes: blockingProcesses })
+
+          rememberLog(`[updates] venv-blocked: ${blockingProcesses.length} process(es) hold the install`)
+          emitUpdateProgress({ stage: 'error', message, percent: null })
+          startHermes().catch(() => {})
+
+          return { ok: false, error: 'venv-blocked', message }
+        }
       }
 
       if (scanOutcome.kind === 'probe-failure') {
@@ -2999,6 +3048,11 @@ async function applyUpdates(opts = {}) {
       detached: true,
       stdio: 'ignore'
     })
+
+    // The updater now owns the handoff. Keep both the backend gate and the
+    // duplicate-click guard closed until this process exits, rather than
+    // clearing everything in the finally block below.
+    updateHandoffInFlight = true
 
     // Write the update-in-progress marker IMMEDIATELY — before the 2.5s
     // quit dwell. The Tauri updater won't write its own marker for several
@@ -3032,7 +3086,7 @@ async function applyUpdates(opts = {}) {
     // and lured users into the #50238 relaunch loop.)
     isQuittingForHandoff = true
     setTimeout(() => {
-      app.quit()
+      exitAfterUpdateHandoff()
     }, UPDATE_HANDOFF_DWELL_MS)
 
     return { ok: true, handedOff: true, updater }
@@ -3044,6 +3098,10 @@ async function applyUpdates(opts = {}) {
 async function handOffWindowsBootstrapRecovery(reason) {
   if (!IS_WINDOWS || !IS_PACKAGED) {
     return false
+  }
+
+  if (updateHandoffInFlight) {
+    return true
   }
 
   const updater = resolveUpdaterBinary()
@@ -3062,9 +3120,10 @@ async function handOffWindowsBootstrapRecovery(reason) {
     // it finishes, so treat this the same as a successful hand-off instead
     // of clobbering it with our own.
     rememberLog(`[bootstrap] refusing recovery hand-off: ${handoffConflict.message}`)
+    updateHandoffInFlight = true
     isQuittingForHandoff = true
     setTimeout(() => {
-      app.quit()
+      exitAfterUpdateHandoff()
     }, UPDATE_HANDOFF_DWELL_MS)
 
     return true
@@ -3105,6 +3164,8 @@ async function handOffWindowsBootstrapRecovery(reason) {
     stdio: 'ignore'
   })
 
+  updateHandoffInFlight = true
+
   // Same marker pre-write as applyUpdates — see comment there. The recovery
   // hand-off has the same window where the renderer can respawn a backend
   // before the updater writes its own marker, and the same stale-updater
@@ -3126,7 +3187,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   // a crash and provoke a mid-recovery relaunch.
   isQuittingForHandoff = true
   setTimeout(() => {
-    app.quit()
+    exitAfterUpdateHandoff()
   }, UPDATE_HANDOFF_DWELL_MS)
 
   return true
@@ -5304,6 +5365,80 @@ function registerPowerResumeListeners() {
 
 function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
+}
+
+const CLOSE_TO_BACKGROUND_CONFIG_PATH = path.join(app.getPath('userData'), 'close-to-background.json')
+
+function readCloseToBackgroundEnabled() {
+  try {
+    return JSON.parse(fs.readFileSync(CLOSE_TO_BACKGROUND_CONFIG_PATH, 'utf8'))?.enabled === true
+  } catch {
+    return false
+  }
+}
+
+function writeCloseToBackgroundEnabled(enabled) {
+  try {
+    fs.mkdirSync(path.dirname(CLOSE_TO_BACKGROUND_CONFIG_PATH), { recursive: true })
+    writeFileAtomic(CLOSE_TO_BACKGROUND_CONFIG_PATH, JSON.stringify({ enabled }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[background] preference write failed: ${error?.message || error}`)
+  }
+}
+
+function showMainWindowFromBackground() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+
+    return
+  }
+
+  focusWindow(mainWindow)
+}
+
+function refreshBackgroundTrayMenu() {
+  if (!backgroundTray || backgroundTray.isDestroyed()) {
+    return
+  }
+
+  backgroundTray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        label: 'Open Hermes',
+        click: showMainWindowFromBackground
+      },
+      { type: 'separator' },
+      {
+        label: 'Keep running when the main window closes',
+        type: 'checkbox',
+        checked: closeToBackgroundEnabled,
+        click: menuItem => {
+          closeToBackgroundEnabled = menuItem.checked
+          writeCloseToBackgroundEnabled(closeToBackgroundEnabled)
+          refreshBackgroundTrayMenu()
+        }
+      },
+      { type: 'separator' },
+      {
+        label: 'Quit Hermes',
+        click: () => app.quit()
+      }
+    ])
+  )
+}
+
+function createBackgroundTray() {
+  if (process.platform === 'darwin' || backgroundTray) {
+    return
+  }
+
+  const icon = getAppIconPath()
+
+  backgroundTray = new Tray(icon || nativeImage.createEmpty())
+  backgroundTray.setToolTip('Hermes')
+  backgroundTray.on('click', showMainWindowFromBackground)
+  backgroundTray.on('double-click', showMainWindowFromBackground)
+  refreshBackgroundTrayMenu()
 }
 
 function sendOpenUpdatesRequested() {
@@ -9338,7 +9473,21 @@ function createWindow() {
   mainWindow.on('moved', schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', event => {
+    schedulePersistWindowState.flush()
+
+    if (
+      shouldHideMainWindowOnClose({
+        enabled: closeToBackgroundEnabled,
+        quitRequested: appQuitRequested,
+        updateHandoff: isQuittingForHandoff
+      })
+    ) {
+      event.preventDefault()
+      mainWindow?.hide()
+      rememberLog('[background] main window hidden; desktop backend remains running')
+    }
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   const createdMainWindow = mainWindow
@@ -11824,6 +11973,8 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
+  closeToBackgroundEnabled = readCloseToBackgroundEnabled()
+  createBackgroundTray()
   // Quick Entry's global chord — registered on ready so a cold launch restores
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
@@ -11934,6 +12085,10 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
+
+  // A real app quit (tray menu, OS shutdown, updater handoff, Cmd/Ctrl+Q)
+  // must bypass the main-window close-to-background handler below.
+  appQuitRequested = true
 
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
     event.preventDefault()

@@ -18,6 +18,7 @@ import {
   formatBlockerMessage,
   formatProbeFailedMessage,
   parseVenvBlockerScanOutput,
+  partitionDesktopUpdateBlockers,
   resolveVenvPython,
   scanVenvBlockers
 } from './venv-blocker-scan'
@@ -65,6 +66,44 @@ describe('formatBlockerMessage', () => {
     assert.ok(msg.includes('remote backend'))
     assert.ok(msg.includes('retry'))
     assert.ok(!msg.includes('force-venv'))
+  })
+})
+
+describe('partitionDesktopUpdateBlockers', () => {
+  it('defers only managed gateway runners to the detached updater', () => {
+    const result = partitionDesktopUpdateBlockers([
+      {
+        pid: 12016,
+        name: 'python.exe',
+        cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main gateway run'
+      },
+      {
+        pid: 9804,
+        name: 'python.exe',
+        cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main serve --host 127.0.0.1 --port 0'
+      }
+    ])
+
+    assert.deepEqual(result.deferredGatewayProcesses.map(proc => proc.pid), [12016])
+    assert.deepEqual(result.blockingProcesses.map(proc => proc.pid), [9804])
+  })
+
+  it('keeps quoted gateway text and non-Python lookalikes as blockers', () => {
+    const result = partitionDesktopUpdateBlockers([
+      {
+        pid: 12017,
+        name: 'python.exe',
+        cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main serve --label "gateway run"'
+      },
+      {
+        pid: 12018,
+        name: 'node.exe',
+        cmdline: 'node -m hermes_cli.main gateway run'
+      }
+    ])
+
+    assert.deepEqual(result.deferredGatewayProcesses, [])
+    assert.deepEqual(result.blockingProcesses.map(proc => proc.pid), [12017, 12018])
   })
 })
 

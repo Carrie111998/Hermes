@@ -29,6 +29,65 @@ export interface VenvBlockerScanResult {
   processes: VenvBlockerProcess[]
 }
 
+/**
+ * The CLI updater has a Windows-specific pause/resume path for its installed
+ * Gateway. Desktop must let that updater own these runners; otherwise its
+ * preflight rejects the very gateway that the detached updater will stop.
+ */
+export interface DesktopUpdateBlockerPartition {
+  blockingProcesses: VenvBlockerProcess[]
+  deferredGatewayProcesses: VenvBlockerProcess[]
+}
+
+const PYTHON_PROCESS_NAMES = new Set(['python', 'python.exe', 'python3', 'python3.exe'])
+
+function commandLineTokens(cmdline: string): string[] {
+  const tokens = cmdline.match(/"[^"]*"|'[^']*'|[^\s]+/g) || []
+
+  return tokens.map(token => token.replace(/^(?:"|')|(?:"|')$/g, ''))
+}
+
+function isManagedGatewayRunner(process: VenvBlockerProcess): boolean {
+  if (!PYTHON_PROCESS_NAMES.has(process.name.trim().toLowerCase())) {
+    return false
+  }
+
+  const tokens = commandLineTokens(process.cmdline)
+
+  const moduleIndex = tokens.findIndex(
+    (token, index) => token === '-m' && tokens[index + 1]?.toLowerCase() === 'hermes_cli.main'
+  )
+
+  // Fail closed: only the exact long-lived CLI command is deferred to the
+  // detached updater. Arguments or quoted text that merely resemble it stay
+  // in the blocker list.
+  return (
+    moduleIndex > 0 &&
+    tokens.length === moduleIndex + 4 &&
+    tokens[moduleIndex + 2]?.toLowerCase() === 'gateway' &&
+    tokens[moduleIndex + 3]?.toLowerCase() === 'run'
+  )
+}
+
+export function partitionDesktopUpdateBlockers(
+  processes: VenvBlockerProcess[]
+): DesktopUpdateBlockerPartition {
+  const blockingProcesses: VenvBlockerProcess[] = []
+  const deferredGatewayProcesses: VenvBlockerProcess[] = []
+
+  for (const process of processes) {
+    // Require both the Hermes module and the exact long-lived gateway command;
+    // unrelated programs that merely contain the word "gateway" remain blockers.
+    if (isManagedGatewayRunner(process)) {
+      deferredGatewayProcesses.push(process)
+    } else {
+      blockingProcesses.push(process)
+    }
+  }
+
+  return { blockingProcesses, deferredGatewayProcesses }
+}
+
 export type ScanOutcome =
   | { kind: 'clear'; result: VenvBlockerScanResult }
   | { kind: 'blocked'; result: VenvBlockerScanResult }
