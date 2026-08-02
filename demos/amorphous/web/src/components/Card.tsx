@@ -119,7 +119,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
             </TabsList>
           </div>
           <TabsContent value="view" className="flex-1 min-h-0 overflow-auto px-5 py-4 data-[state=inactive]:hidden">
-            <div className="h-full min-h-[420px]">
+            <div className="h-full min-h-[280px] flex flex-col [&>*]:flex-1 [&>*]:min-h-0">
               <DataView c={c} data={data} err={err} />
             </div>
           </TabsContent>

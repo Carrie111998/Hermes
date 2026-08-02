@@ -203,8 +203,13 @@ def src_git_heatmap(props: dict) -> dict:
     while d <= today:
         days.append({"date": d.isoformat(), "count": counts.get(d.isoformat(), 0)})
         d += _dt.timedelta(days=1)
+    busiest = max(counts.items(), key=lambda kv: kv[1]) if counts else None
     return {"kind": "heatmap", "days": days,
-            "total": sum(counts.values()), "repo": Path(repo).name}
+            "total": sum(counts.values()), "repo": Path(repo).name,
+            "weeks": weeks,
+            "range": {"start": days[0]["date"] if days else None,
+                      "end": days[-1]["date"] if days else None},
+            "busiest": {"date": busiest[0], "count": busiest[1]} if busiest else None}
 
 
 def src_log_tail(props: dict) -> dict:

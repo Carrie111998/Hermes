@@ -452,7 +452,7 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
 }
 
 
-/* ---------- GitHub-style activity heatmap (fills its box) ---------- */
+/* ---------- GitHub-style activity heatmap (fills its box, full chrome) ---------- */
 function HeatmapView({ data }: { data: any }) {
   const { ref, w, h } = useSize();
   const days: { date: string; count: number }[] = data.days || [];
@@ -462,33 +462,105 @@ function HeatmapView({ data }: { data: any }) {
   const shade = (c: number) =>
     c === 0 ? "rgba(255,255,255,0.045)"
       : `rgba(59,130,246,${0.25 + 0.75 * Math.min(c / max, 1)})`;
-  // cell size derived from the actual box: fit weeks across, 7 rows down
+
+  const fmt = (iso?: string | null) =>
+    iso ? new Date(iso + "T00:00:00").toLocaleDateString([], { month: "short", day: "numeric" }) : "";
+  const rangeLabel = data.range?.start
+    ? `${fmt(data.range.start)} – ${fmt(data.range.end)}`
+    : "";
+  const perWeek = weeks.length ? Math.round(data.total / weeks.length) : 0;
+
+  // reserve chrome space: header ~20, footer ~18, month row ~14, weekday rail ~26
+  const monthH = 14, railW = 26, footH = 18;
   const gap = Math.max(2, Math.min(4, Math.floor(w / 220)));
+  const availW = Math.max(0, w - railW);
+  const availH = Math.max(0, h - monthH - footH - 24);
   const cell = Math.max(6, Math.min(
-    Math.floor((w - gap * (weeks.length - 1)) / Math.max(weeks.length, 1)),
-    Math.floor((h - gap * 6) / 7),
+    Math.floor((availW - gap * (weeks.length - 1)) / Math.max(weeks.length, 1)),
+    Math.floor((availH - gap * 6) / 7),
     26));
   const radius = cell >= 14 ? 4 : 2.5;
+
+  // month labels: mark the first week of each new month
+  const monthMarks: { idx: number; label: string }[] = [];
+  let lastMonth = -1;
+  weeks.forEach((wk, i) => {
+    const d = new Date(wk[0].date + "T00:00:00");
+    if (d.getMonth() !== lastMonth) {
+      monthMarks.push({ idx: i, label: d.toLocaleDateString([], { month: "short" }) });
+      lastMonth = d.getMonth();
+    }
+  });
+  const colW = cell + gap;
+  const showWeekdays = cell >= 9 && h > 130;
+  const weekdayFor = (row: number) =>
+    ["Mon", "", "Wed", "", "Fri", "", ""][row];
+
   return (
     <div className="flex flex-col h-full">
-      <div className="text-[12px] text-ink-3 mb-2 shrink-0">
-        <span className="text-ink w510 tabular-nums">{data.total}</span> commits ·{" "}
-        <span className="font-mono text-[11px]">{data.repo}</span>
+      <div className="flex items-baseline justify-between gap-3 mb-1.5 shrink-0">
+        <div className="text-[12px] text-ink-3 truncate">
+          <span className="text-ink w510 tabular-nums">{data.total?.toLocaleString()}</span> commits
+          <span className="text-ink-4"> · last {data.weeks ?? weeks.length} weeks</span>
+          <span className="text-ink-4 hidden sm:inline"> · {rangeLabel}</span>
+        </div>
+        <span className="font-mono text-[10.5px] text-ink-4 truncate shrink-0">{data.repo}</span>
       </div>
-      <div ref={ref} className="flex-1 min-h-0 flex items-center justify-center overflow-hidden">
+      <div ref={ref} className="flex-1 min-h-0 flex flex-col items-center justify-center overflow-hidden" style={{ contain: "strict" }}>
         {w > 0 && (
-          <div className="flex" style={{ gap }}>
-            {weeks.map((wk, i) => (
-              <div key={i} className="flex flex-col" style={{ gap }}>
-                {wk.map((d) => (
-                  <div key={d.date} title={`${d.date}: ${d.count} commit${d.count === 1 ? "" : "s"}`}
-                       className="transition-colors hover:ring-1 hover:ring-blue-2"
-                       style={{ width: cell, height: cell, borderRadius: radius, background: shade(d.count) }} />
+          <div>
+            {/* month labels */}
+            <div className="relative" style={{ height: monthH, marginLeft: showWeekdays ? railW : 0 }}>
+              {monthMarks.map((m) => (
+                <span key={m.idx} className="absolute text-[9.5px] text-ink-4"
+                      style={{ left: m.idx * colW }}>
+                  {m.label}
+                </span>
+              ))}
+            </div>
+            <div className="flex">
+              {/* weekday rail */}
+              {showWeekdays && (
+                <div className="flex flex-col shrink-0" style={{ gap, width: railW }}>
+                  {[0, 1, 2, 3, 4, 5, 6].map((r) => (
+                    <span key={r} className="text-[9px] text-ink-4 leading-none flex items-center"
+                          style={{ height: cell }}>
+                      {weekdayFor(r)}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {/* grid */}
+              <div className="flex" style={{ gap }}>
+                {weeks.map((wk, i) => (
+                  <div key={i} className="flex flex-col" style={{ gap }}>
+                    {wk.map((d) => (
+                      <div key={d.date}
+                           title={`${new Date(d.date + "T00:00:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}: ${d.count} commit${d.count === 1 ? "" : "s"}`}
+                           className="transition-colors hover:ring-1 hover:ring-blue-2"
+                           style={{ width: cell, height: cell, borderRadius: radius, background: shade(d.count) }} />
+                    ))}
+                  </div>
                 ))}
               </div>
-            ))}
+            </div>
           </div>
         )}
+      </div>
+      {/* footer: stats + legend */}
+      <div className="flex items-center justify-between gap-3 pt-1.5 shrink-0 text-[10px] text-ink-4">
+        <span className="truncate tabular-nums">
+          ~{perWeek}/week{data.busiest ? ` · peak ${data.busiest.count} on ${fmt(data.busiest.date)}` : ""}
+        </span>
+        <span className="inline-flex items-center gap-1 shrink-0">
+          less
+          {[0, 0.25, 0.5, 0.75, 1].map((t) => (
+            <span key={t} className="inline-block rounded-[2px]"
+                  style={{ width: 8, height: 8,
+                           background: t === 0 ? "rgba(255,255,255,0.045)" : `rgba(59,130,246,${0.25 + 0.75 * t})` }} />
+          ))}
+          more
+        </span>
       </div>
     </div>
   );
