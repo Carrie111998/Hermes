@@ -151,14 +151,48 @@ def test_import_writes_native_session(tmp_path):
 
 
 def test_import_dry_run_writes_nothing(tmp_path):
+    import hermes_state
+
     projects = tmp_path / "projects"
     projects.mkdir()
     _write_session(projects)
 
+    # No --db override: exercises the default-db path, which the
+    # `_hermetic_environment` fixture repoints at `hermes_state.DEFAULT_DB_PATH`
+    # for this test (NOT tmp_path/"state.db" directly).
     report = import_claude_sessions(str(projects), host="testhost", dry_run=True)
     assert report.imported == 1  # counted as would-import
-    # no db was created at the default path by dry-run
-    assert not (tmp_path / "state.db").exists()
+    # no db was created at the actual default path by dry-run
+    assert not hermes_state.DEFAULT_DB_PATH.exists()
+
+
+def test_import_dry_run_against_existing_db_writes_nothing(tmp_path):
+    """--dry-run against an ALREADY-EXISTING default db must not mutate it.
+
+    Regression: opening it via the normal writable SessionDB() path (even
+    read-only-in-intent) still runs schema reconciliation — a write. This
+    exercises the read-only open of the default db path.
+    """
+    import hermes_state
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    _write_session(projects)
+
+    db_path = hermes_state.DEFAULT_DB_PATH
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    SessionDB(db_path=db_path).close()
+    mtime_before = db_path.stat().st_mtime_ns
+
+    report = import_claude_sessions(str(projects), host="testhost", dry_run=True)
+    assert report.imported == 1
+    assert db_path.stat().st_mtime_ns == mtime_before
+
+    db = SessionDB(db_path=db_path)
+    try:
+        assert db.get_session("claude_testhost_session-uuid-1234") is None
+    finally:
+        db.close()
 
 
 def test_parse_tolerates_torn_tail(tmp_path):
@@ -221,5 +255,107 @@ def test_import_replace_on_source_growth(tmp_path):
         assert len(stored) == 5
         row = db.get_session(sid)
         assert row is not None and row["message_count"] == 5
+    finally:
+        db.close()
+
+
+def test_import_backfills_title_and_end_after_summary_only_change(tmp_path):
+    """A trailing `summary`/`ai-title` record appended later must still be
+    picked up even though it doesn't change the message count."""
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    lines = [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "check the podman services"},
+            "timestamp": "2026-08-01T10:00:00Z",
+        },
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "All good."}]},
+            "timestamp": "2026-08-01T10:00:07Z",
+        },
+    ]
+    p = _write_session(projects, lines=lines)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        first = import_claude_sessions(str(projects), host="testhost", db=db)
+        assert first.imported == 1
+        sid = "claude_testhost_session-uuid-1234"
+        row = db.get_session(sid)
+        assert row is not None
+        assert row["title"] is None
+        assert row["ended_at"] is None
+        assert row["message_count"] == 2
+
+        # Claude closes the session: a `summary` line is appended, message
+        # count is unchanged.
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "type": "summary",
+                "summary": "Checked podman services",
+                "timestamp": "2026-08-01T10:01:00Z",
+            }) + "\n")
+
+        second = import_claude_sessions(str(projects), host="testhost", db=db)
+        assert second.updated == 1
+        assert second.skipped == 0
+
+        row = db.get_session(sid)
+        assert row is not None
+        assert row["title"] == "Checked podman services"
+        assert row["ended_at"] is not None
+        assert row["message_count"] == 2  # unchanged — no replace needed
+
+        third = import_claude_sessions(str(projects), host="testhost", db=db)
+        assert third.skipped == 1
+        assert third.updated == 0
+    finally:
+        db.close()
+
+
+def test_import_preserves_original_message_timestamps(tmp_path):
+    """Message timestamps must come from the transcript, not from import time.
+
+    Regression: the atomic create path feeds messages straight into
+    SessionDB._insert_message_rows, which only accepts a float/epoch value
+    and silently falls back to "now" for anything else (Claude's JSONL
+    stores ISO-8601 strings) — a value close to `time.time()` here would
+    mean that fallback fired instead of the parsed transcript timestamp.
+    """
+    import time as _time
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    _write_session(projects)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        import_claude_sessions(str(projects), host="testhost", db=db)
+        sid = "claude_testhost_session-uuid-1234"
+        msgs = db.get_messages(sid)
+        first_ts = msgs[0]["timestamp"]
+        # "2026-08-01T10:00:00Z" — far from "now" and from each other.
+        assert abs(first_ts - _time.time()) > 3600
+        assert msgs[1]["timestamp"] > first_ts
+    finally:
+        db.close()
+
+
+def test_import_does_not_use_profile_name_for_host(tmp_path):
+    """--host is metadata, not Hermes profile ownership (profile_name)."""
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    _write_session(projects)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        import_claude_sessions(str(projects), host="testhost", db=db)
+        row = db.get_session("claude_testhost_session-uuid-1234")
+        assert row is not None
+        assert row["profile_name"] is None
+        model_config = json.loads(row["model_config"] or "{}")
+        assert model_config.get("_import_host") == "testhost"
     finally:
         db.close()

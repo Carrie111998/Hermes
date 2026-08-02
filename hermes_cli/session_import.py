@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_state import SessionDB
+from hermes_state import SessionDB, _default_db_path
 
 # Safety caps (mirror SessionDB._IMPORT_* limits).
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -188,12 +188,66 @@ def _block_text(content: Any) -> str:
     return str(content)
 
 
-def _message_count(db: SessionDB, session_id: str) -> int:
+def _open_dry_run_db() -> Optional[SessionDB]:
+    """Open the default state.db for ``--dry-run`` without writing to it.
+
+    A normal ``SessionDB()`` open runs schema migrations/reconciliation
+    against whatever db it's pointed at — fine for a real import, but that's
+    a write, which breaks --dry-run's "parse and report only" contract when
+    no --db override is given. If the default db already exists we open it
+    read-only (SELECT-only, no DDL). If it doesn't exist yet, there is
+    nothing to compare against and nothing to create: every session in this
+    run is reported as a fresh import.
+    """
+    path = _default_db_path()
     try:
-        msgs = db.get_messages(session_id)
-        return len(msgs) if msgs else 0
-    except Exception:  # noqa: BLE001 — count is a hint, not a gate
-        return 0
+        exists = path.exists() and path.stat().st_size > 0
+    except OSError:
+        exists = False
+    if not exists:
+        return None
+    return SessionDB(db_path=path, read_only=True)
+
+
+def _create_session_atomic(
+    db: SessionDB,
+    session_id: str,
+    host: str,
+    fpath: Path,
+    messages: List[Dict[str, Any]],
+) -> None:
+    """Create the session row and insert its messages in one write transaction.
+
+    ``create_session`` + a loop of ``append_message`` calls is N+1 separate
+    writes; a crash partway through leaves a session with a truncated
+    transcript. This reuses the same atomic primitives ``replace_messages``
+    and ``import_sessions`` are built on (``_execute_write`` +
+    ``_insert_message_rows``) so the whole session commits or nothing does.
+
+    The ``--host`` label is stashed in ``model_config`` (matching existing
+    self-describing markers like ``_branched_from``) rather than
+    ``profile_name``, which denotes real Hermes profile ownership.
+    """
+    def _do(conn):
+        conn.execute(
+            """INSERT INTO sessions (id, source, model, model_config, cwd, started_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                "claude_code",
+                "claude-code",
+                json.dumps({"_import_host": host}),
+                str(fpath.parent),
+                time.time(),
+            ),
+        )
+        total_messages, total_tool_calls = db._insert_message_rows(conn, session_id, messages)
+        conn.execute(
+            "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+            (total_messages, total_tool_calls, session_id),
+        )
+
+    db._execute_write(_do)
 
 
 def _ts_to_float(ts: Any) -> Optional[float]:
@@ -220,9 +274,12 @@ def import_claude_sessions(
     """Import every Claude Code session under ``projects_dir``.
 
     Session ids are deterministic (``claude_<host>_<session-uuid>``) so
-    re-runs dedupe. When a stored session's message count differs from the
-    source file (the JSONL grew), the transcript is atomically replaced via
-    ``replace_messages``.
+    re-runs dedupe. A session is re-touched when the message count differs
+    from the source file (JSONL grew — atomically replaced via
+    ``replace_messages``), a title parsed later (a `summary`/`ai-title`
+    record) hasn't been backfilled yet, or the session ended but that
+    hasn't been recorded — each checked independently so a title/end-only
+    change isn't missed just because the message count is unchanged.
     """
     report = ImportReport(host)
     root = Path(projects_dir).expanduser()
@@ -242,9 +299,8 @@ def import_claude_sessions(
 
     own_db = False
     if db is None:
-        db = SessionDB()
+        db = _open_dry_run_db() if dry_run else SessionDB()
         own_db = True
-    assert db is not None
 
     try:
         for fpath in files:
@@ -272,53 +328,61 @@ def import_claude_sessions(
                 continue
             if len(messages) > MAX_MESSAGES_PER_SESSION:
                 messages = messages[:MAX_MESSAGES_PER_SESSION]
+            # Normalize Claude's ISO-8601 timestamp strings to floats up
+            # front: SessionDB._insert_message_rows (used by both
+            # replace_messages and _create_session_atomic below) only
+            # accepts a float/epoch-like value and silently falls back to
+            # "now" for anything else, which would otherwise drop the
+            # original turn-by-turn timing on every import.
+            for m in messages:
+                m["timestamp"] = _ts_to_float(m.get("timestamp"))
 
-            existing = db.get_session(session_id)
-            existing_count = _message_count(db, session_id) if existing else 0
-
-            if existing and existing_count == len(messages):
-                report.skipped += 1
-                continue
-
-            if dry_run:
-                action = "UPDATE" if existing else "IMPORT"
-                print(f"  [{action}] {session_id}  {len(messages)} msgs")
-                report.imported += 1
-                continue
+            existing = db.get_session(session_id) if db is not None else None
 
             if existing:
-                # JSONL grew while Claude was still running: atomic replace.
-                db.replace_messages(session_id, messages)
+                # Message count alone misses a later title/end-of-session
+                # record that arrives with the count unchanged (e.g. a
+                # trailing `summary` line appended after the last turn), so
+                # each kind of change is checked independently.
+                needs_replace = (existing.get("message_count") or 0) != len(messages)
+                needs_title = bool(title) and not existing.get("title")
+                needs_end = ended and existing.get("ended_at") is None
+                if not (needs_replace or needs_title or needs_end):
+                    report.skipped += 1
+                    continue
+                if dry_run:
+                    print(f"  [UPDATE] {session_id}  {len(messages)} msgs")
+                    report.imported += 1
+                    continue
+                if needs_replace:
+                    # JSONL grew while Claude was still running: atomic replace.
+                    db.replace_messages(session_id, messages)
+                if needs_title:
+                    try:
+                        db.set_auto_title_if_empty(session_id, title)
+                    except ValueError:
+                        pass
+                if needs_end:
+                    db.end_session(session_id, "ended")
                 report.updated += 1
                 continue
 
-            db.create_session(
-                session_id,
-                source="claude_code",
-                model="claude-code",
-                cwd=str(fpath.parent),
-                profile_name=host,
-            )
-            for m in messages:
-                db.append_message(
-                    session_id,
-                    role=m["role"],
-                    content=m.get("content"),
-                    tool_calls=m.get("tool_calls"),
-                    tool_call_id=m.get("tool_call_id"),
-                    reasoning=m.get("reasoning"),
-                    timestamp=_ts_to_float(m.get("timestamp")) or None,
-                )
+            if dry_run:
+                print(f"  [IMPORT] {session_id}  {len(messages)} msgs")
+                report.imported += 1
+                continue
+
+            _create_session_atomic(db, session_id, host, fpath, messages)
             if title:
                 try:
-                    db.set_session_title(session_id, title)
+                    db.set_auto_title_if_empty(session_id, title)
                 except ValueError:
                     pass
             if ended:
                 db.end_session(session_id, "ended")
             report.imported += 1
     finally:
-        if own_db:
+        if own_db and db is not None:
             db.close()
 
     return report
