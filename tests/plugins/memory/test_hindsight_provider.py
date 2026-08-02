@@ -337,6 +337,13 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        # Stub out the lazy install guard so the embedded client can be built
+        # even when security.allow_lazy_installs=false in the test environment.
+        try:
+            import tools.lazy_deps as _lazy_deps_mod
+            monkeypatch.setattr(_lazy_deps_mod, "ensure", lambda *a, **kw: None)
+        except Exception:
+            pass
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"

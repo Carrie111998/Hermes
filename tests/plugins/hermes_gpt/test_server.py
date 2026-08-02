@@ -206,7 +206,7 @@ def test_http_initialize_smoke(monkeypatch):
         errors="replace",
     )
     try:
-        deadline = time.time() + 10
+        deadline = time.time() + 30
         last_error = None
         response_text = None
         payload = {

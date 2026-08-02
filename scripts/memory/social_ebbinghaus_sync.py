@@ -16,6 +16,7 @@ import math
 import re
 import sqlite3
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -298,6 +299,29 @@ class SocialMemorySync:
             )
         return candidates
 
+    def _parse_ts(self, value) -> float:
+        """Best-effort parse of a timestamp stored as either a unix float or an
+        ISO-8601 string (SQLite is dynamically typed, so external writers such
+        as the Ebbinghaus plugin can insert ``2026-08-01T20:22:09+00:00`` into
+        a ``REAL`` column). Returns ``time.time()`` for null/garbage input."""
+        if value is None:
+            return time.time()
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            s = value.strip()
+            # Pure numeric string → unix epoch seconds.
+            try:
+                return float(s)
+            except ValueError:
+                pass
+            # ISO-8601 string → epoch seconds.
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        return time.time()
+
     def _sleep(self, conn: sqlite3.Connection) -> dict[str, int]:
         now = time.time()
         rows = conn.execute(
@@ -305,7 +329,7 @@ class SocialMemorySync:
         ).fetchall()
         rehearsed = forgotten = 0
         for memory_id, salience, strength, anchor in rows:
-            elapsed_days = max(0.0, (now - float(anchor or now)) / 86400.0)
+            elapsed_days = max(0.0, (now - self._parse_ts(anchor)) / 86400.0)
             stability = 3.0 * max(0.1, float(strength or 1.0))
             retention = math.exp(-elapsed_days / stability)
             if retention < 0.45 and float(salience or 0.0) >= 0.7:

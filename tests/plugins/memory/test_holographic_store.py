@@ -12,11 +12,31 @@ a failed write.
 """
 
 import sqlite3
+import sys
+import tempfile
 import threading
+from pathlib import Path
 
 import pytest
 
 from plugins.memory.holographic.store import MemoryStore
+
+
+def _can_symlink() -> bool:
+    """Return True if the current platform/process can create symlinks.
+
+    On Windows without Developer Mode or admin privileges, ``os.symlink``
+    (and ``pathlib.Path.symlink_to``) raises ``OSError: [WinError 1314]``.
+    Probe with a throwaway temp dir so tests that require symlinks can skip
+    gracefully instead of erroring.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "real").mkdir()
+            (Path(td) / "link").symlink_to(Path(td) / "real")
+        return True
+    except (OSError, NotImplementedError):
+        return False
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +88,10 @@ class TestSharedConnection:
             a.close()
             b.close()
 
+    @pytest.mark.skipif(
+        not _can_symlink(),
+        reason="symlinks not available on this platform (Windows WinError 1314 without Developer Mode/admin)",
+    )
     def test_symlinked_path_shares_connection(self, tmp_path):
         """A symlink to the same DB file must hit the same registry entry —
         otherwise two connections to one file silently reintroduce the
