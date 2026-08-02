@@ -19,7 +19,8 @@ State JSON shape (failure_cluster_state.json):
       "scout": [
         {"ts": "2026-04-26T10:00:00+00:00", "type": "captcha"},
         {"ts": "2026-04-26T10:05:00+00:00", "type": "captcha"},
-        {"ts": "2026-04-26T10:10:00+00:00", "type": "captcha"}
+        {"ts": "2026-04-26T10:10:00+00:00", "type": "captcha",
+         "details": {"error_code": "CAPTCHA_BLOCKED", "phase": "login"}}
       ],
       "matcher": [...]
     }
@@ -32,8 +33,9 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+from agent.redact import redact_sensitive_text
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,45 @@ _CLASSIFIER_PATTERNS: List = [
 THRESHOLD = 3
 WINDOW_SIZE = 5  # keep this many recent entries per source
 
+# Optional diagnostics that producers can prove at the failure boundary. Unknown
+# keys are discarded rather than becoming an open-ended persistence channel.
+_DETAIL_FIELDS = frozenset({
+    "exception_type",
+    "error_code",
+    "phase",
+    "deadline_seconds",
+    "latest_cause",
+})
+
+
+def _json_safe_details(details: Optional[dict]) -> Dict[str, Any]:
+    """Return allowlisted, JSON-serializable diagnostics only."""
+    if not isinstance(details, dict):
+        return {}
+    safe: Dict[str, Any] = {}
+    for key in _DETAIL_FIELDS:
+        value = details.get(key)
+        if value is None:
+            continue
+        if key == "deadline_seconds":
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+        elif not isinstance(value, str):
+            continue
+        if isinstance(value, str):
+            try:
+                value = redact_sensitive_text(
+                    value,
+                    force=True,
+                    redact_url_credentials=True,
+                )
+            except Exception:
+                # This state is later emitted to notification surfaces. Fail
+                # closed rather than persisting an unredacted diagnostic.
+                continue
+        safe[key] = value
+    return safe
+
 
 def classify_failure_type(error_text: Optional[str]) -> str:
     """Normalize a free-form error string into one of:
@@ -79,6 +120,7 @@ class ClusterInfo:
     count: int
     first_seen: str  # ISO8601
     last_seen: str   # ISO8601
+    last_details: Dict[str, Any]
 
 
 class FailureClusterDetector:
@@ -97,11 +139,18 @@ class FailureClusterDetector:
         self.window_size = window_size
         self._lock = threading.Lock()
 
-    def record(self, source: str, success: bool,
-               error_text: Optional[str] = None) -> Optional[ClusterInfo]:
+    def record(
+        self,
+        source: str,
+        success: bool,
+        error_text: Optional[str] = None,
+        *,
+        details: Optional[dict] = None,
+    ) -> Optional[ClusterInfo]:
         """Record one outcome for an agent.  Returns ClusterInfo iff the
         last `threshold` entries for `source` share the same failure_type.
 
+        Optional details are allowlisted and JSON-checked before persistence.
         On success, the source's window is cleared (any prior cluster is
         considered resolved).  Returns None on success.
         """
@@ -115,7 +164,11 @@ class FailureClusterDetector:
             failure_type = classify_failure_type(error_text)
             now = datetime.now(timezone.utc).isoformat()
             entries = state.get(source, [])
-            entries.append({"ts": now, "type": failure_type})
+            entry: Dict[str, Any] = {"ts": now, "type": failure_type}
+            safe_details = _json_safe_details(details)
+            if safe_details:
+                entry["details"] = safe_details
+            entries.append(entry)
             entries = entries[-self.window_size:]
             state[source] = entries
             self._save(state)
@@ -132,9 +185,10 @@ class FailureClusterDetector:
                 count=self.threshold,
                 first_seen=recent[0]["ts"],
                 last_seen=recent[-1]["ts"],
+                last_details=dict(recent[-1].get("details") or {}),
             )
 
-    def _load(self) -> Dict[str, List[Dict[str, str]]]:
+    def _load(self) -> Dict[str, List[Dict[str, Any]]]:
         if not self.state_path.exists():
             return {}
         try:
@@ -148,7 +202,7 @@ class FailureClusterDetector:
             logger.warning("failure_cluster_state read failed (%s); resetting", e)
             return {}
 
-    def _save(self, state: Dict[str, List[Dict[str, str]]]) -> None:
+    def _save(self, state: Dict[str, List[Dict[str, Any]]]) -> None:
         try:
             atomic_json_write(self.state_path, state)
         except OSError:

@@ -99,6 +99,92 @@ class TestFailureClusterDetector:
         assert result.failure_type == "timeout"
         assert result.count == 3
 
+    def test_cluster_preserves_latest_structured_details(self, detector):
+        first = {
+            "error_code": "OLD_CODE",
+            "phase": "startup",
+            "deadline_seconds": 60,
+            "exception_type": "ConnectionError",
+        }
+        latest = {
+            "error_code": "PG_CONNECT_REFUSED",
+            "phase": "postgres_sync",
+            "deadline_seconds": 1800,
+            "exception_type": "OperationalError",
+        }
+        detector.record(
+            "tracker", success=False, error_text="connection refused",
+            details=first,
+        )
+        detector.record(
+            "tracker", success=False, error_text="connection refused",
+            details=first,
+        )
+        cluster = detector.record(
+            "tracker", success=False, error_text="connection refused",
+            details=latest,
+        )
+
+        assert cluster is not None
+        assert cluster.count == 3
+        assert cluster.last_details == latest
+
+    def test_details_are_json_safe_and_unknown_fields_are_omitted(
+        self, detector,
+    ):
+        details = {
+            "error_code": "PG_CONNECT_REFUSED",
+            "phase": "postgres_sync",
+            "deadline_seconds": 1800,
+            "exception_type": "OperationalError",
+            "latest_cause": "connection refused",
+            "unknown_field": "do not persist",
+            "not_json_safe": object(),
+        }
+        for _ in range(2):
+            detector.record(
+                "tracker", success=False, error_text="connection refused",
+                details=details,
+            )
+        cluster = detector.record(
+            "tracker", success=False, error_text="connection refused",
+            details=details,
+        )
+
+        assert cluster is not None
+        assert cluster.last_details == {
+            "error_code": "PG_CONNECT_REFUSED",
+            "phase": "postgres_sync",
+            "deadline_seconds": 1800,
+            "exception_type": "OperationalError",
+            "latest_cause": "connection refused",
+        }
+        json.loads(detector.state_path.read_text(encoding="utf-8"))
+
+    def test_nested_or_wrong_type_details_are_omitted(self, detector):
+        details = {
+            "error_code": {"token": "sk-testabcdefghijklmnop"},
+            "phase": ["postgres_sync"],
+            "deadline_seconds": [1800],
+            "exception_type": {"name": "OperationalError"},
+            "latest_cause": {"password": "super-secret-value"},
+        }
+        for _ in range(2):
+            detector.record(
+                "tracker", success=False, error_text="connection refused",
+                details=details,
+            )
+        cluster = detector.record(
+            "tracker", success=False, error_text="connection refused",
+            details=details,
+        )
+
+        assert cluster is not None
+        assert cluster.last_details == {}
+        persisted = detector.state_path.read_text(encoding="utf-8")
+        assert "sk-testabcdefghijklmnop" not in persisted
+        assert "super-secret-value" not in persisted
+
     def test_three_different_types_returns_none(self, detector):
         detector.record("scout", success=False, error_text="timeout")
         detector.record("scout", success=False, error_text="captcha")

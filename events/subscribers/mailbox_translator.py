@@ -22,6 +22,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.redact import redact_sensitive_text
 from events.bus import EventBus
 from events.cluster_detector import FailureClusterDetector
 from events.paths import failure_cluster_state_path
@@ -48,6 +49,69 @@ HIGH_SCORE_THRESHOLD = 8.75
 SCORE_DEDUP_WINDOW_SECONDS = 1800.0
 _SCORE_DEDUP_MAX_ENTRIES = 512
 _SCORE_EVENT_TYPES = (EventType.JOB_SCORED, EventType.JOB_HIGH_SCORE)
+_FAILURE_DETAIL_FIELDS = (
+    "error_code",
+    "phase",
+    "deadline_seconds",
+    "exception_type",
+)
+
+
+def _safe_failure_text(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return redact_sensitive_text(
+            value,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return None
+
+
+def _safe_failure_field(field: str, value: Any) -> Any:
+    if field == "deadline_seconds":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        return None
+    return _safe_failure_text(value)
+
+
+def _failure_details(inner: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract only producer-provided diagnostics, without inference."""
+    context = inner.get("context")
+    context = context if isinstance(context, dict) else {}
+    details: Dict[str, Any] = {}
+    for field in _FAILURE_DETAIL_FIELDS:
+        value = inner.get(field)
+        if value is None:
+            value = context.get(field)
+        safe = _safe_failure_field(field, value)
+        if safe is not None:
+            details[field] = safe
+    cause = (
+        inner.get("latest_cause")
+        or context.get("latest_cause")
+        or inner.get("message")
+        or inner.get("error")
+    )
+    safe_cause = _safe_failure_text(cause)
+    if safe_cause:
+        details["latest_cause"] = safe_cause
+    return details
+
+
+def _agent_error_payload(inner: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a diagnostic-preserving, secret-safe AGENT_ERROR payload."""
+    payload: Dict[str, Any] = {}
+    for field in ("message", "source_agent", "traceback"):
+        safe = _safe_failure_text(inner.get(field))
+        if safe is not None:
+            payload[field] = safe
+    payload.update(_failure_details(inner))
+    return payload
+
 
 _INTERVIEW_PATTERNS = [
     re.compile(r"\binterview\s+(?:scheduled|invitation|request|invite)", re.I),
@@ -269,23 +333,26 @@ class MailboxTranslator(BaseSubscriber):
             # 'applier', defeating dedup.  See
             # profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md.
             source_agent = canonical_agent_source(raw_source_agent)
-            error_text = inner.get("message") or ""
+            error_text = inner.get("message") or inner.get("error") or ""
             cluster = self._cluster_detector.record(
                 source=source_agent,
                 success=False,
                 error_text=error_text,
+                details=_failure_details(inner),
             )
             if cluster is not None:
+                payload = {
+                    "source": cluster.source,
+                    "failure_type": cluster.failure_type,
+                    "count": cluster.count,
+                    "first_seen": cluster.first_seen,
+                    "last_seen": cluster.last_seen,
+                }
+                payload.update(cluster.last_details)
                 self.bus.emit(
                     event_type=EventType.AGENT_FAILURE_CLUSTER,
                     source=cluster.source,
-                    payload={
-                        "source": cluster.source,
-                        "failure_type": cluster.failure_type,
-                        "count": cluster.count,
-                        "first_seen": cluster.first_seen,
-                        "last_seen": cluster.last_seen,
-                    },
+                    payload=payload,
                     correlation_id=correlation_id,
                 )
         except Exception:
@@ -369,8 +436,7 @@ class MailboxTranslator(BaseSubscriber):
             results.append((EventType.JOB_HIGH_SCORE, _score_payload(inner), None))
 
         elif message_type == "ERROR":
-            results.append((EventType.AGENT_ERROR, _copy_fields(
-                inner, ["message", "source_agent", "traceback"]), None))
+            results.append((EventType.AGENT_ERROR, _agent_error_payload(inner), None))
 
         elif message_type == "NOTIFICATION":
             body = str(inner.get("body", "")) + " " + str(inner.get("summary", ""))

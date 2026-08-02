@@ -99,6 +99,76 @@ class TestEmitterClusterEmission:
             "source", "failure_type", "count", "first_seen", "last_seen",
         }
 
+    def test_cluster_payload_preserves_available_failure_details(
+        self, bus, emitter,
+    ):
+        details = {
+            "error_code": "PG_CONNECT_REFUSED",
+            "phase": "postgres_sync",
+            "deadline_seconds": 1800,
+            "exception_type": "OperationalError",
+        }
+        for consecutive in range(1, 4):
+            emitter.on_job_completed(
+                job_id="job-postgres-sync",
+                job_name="postgres-sync",
+                success=False,
+                duration=1.0,
+                error="connection refused",
+                consecutive_errors=consecutive,
+                failure_details=details,
+            )
+
+        payload = bus.query(
+            event_type=EventType.AGENT_FAILURE_CLUSTER,
+        )[0].payload
+        assert payload["failure_type"] == "network"
+        assert payload["count"] == 3
+        assert payload["error_code"] == "PG_CONNECT_REFUSED"
+        assert payload["phase"] == "postgres_sync"
+        assert payload["deadline_seconds"] == 1800
+        assert payload["exception_type"] == "OperationalError"
+
+    def test_cluster_payload_sanitizes_latest_cause(self, bus, emitter):
+        secret = "sk-testabcdefghijklmnop"
+        for consecutive in range(1, 4):
+            emitter.on_job_completed(
+                job_id="job-postgres-sync",
+                job_name="postgres-sync",
+                success=False,
+                duration=1.0,
+                error=f"connection refused Authorization: Bearer {secret}",
+                consecutive_errors=consecutive,
+            )
+
+        payload = bus.query(
+            event_type=EventType.AGENT_FAILURE_CLUSTER,
+        )[0].payload
+        assert "latest_cause" in payload
+        assert "connection refused" in payload["latest_cause"]
+        assert secret not in payload["latest_cause"]
+        assert secret not in bus.query(event_type=EventType.CRON_FAILED)[0].payload["error"]
+        assert secret not in bus.query(
+            event_type=EventType.CRON_FAILED_CONSECUTIVE,
+        )[0].payload["error"]
+
+    def test_explicit_latest_cause_wins_over_generic_error(self, bus, emitter):
+        for consecutive in range(1, 4):
+            emitter.on_job_completed(
+                job_id="job-postgres-sync",
+                job_name="postgres-sync",
+                success=False,
+                duration=1.0,
+                error="wrapper failed",
+                consecutive_errors=consecutive,
+                failure_details={"latest_cause": "connection refused"},
+            )
+
+        payload = bus.query(
+            event_type=EventType.AGENT_FAILURE_CLUSTER,
+        )[0].payload
+        assert payload["latest_cause"] == "connection refused"
+
 
 class TestEmitterCanonicalSource:
     """The cron emitter feeds the FailureClusterDetector with the canonical

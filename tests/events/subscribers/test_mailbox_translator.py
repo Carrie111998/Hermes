@@ -382,6 +382,85 @@ class TestMailboxErrorFeedsClusterDetector:
         agent_errors = isolated_bus.query(event_type=EventType.AGENT_ERROR)
         assert len(agent_errors) == 1
 
+    def test_error_and_cluster_preserve_structured_diagnostics(
+        self, isolated_bus,
+    ):
+        secret = "sk-testabcdefghijklmnop"
+        inner = {
+            "message": f"connection refused Authorization: Bearer {secret}",
+            "source_agent": "tracker",
+            "error_code": "PG_CONNECT_REFUSED",
+            "phase": "postgres_sync",
+            "deadline_seconds": 1800,
+            "exception_type": "OperationalError",
+        }
+        for _ in range(3):
+            isolated_bus.emit(
+                event_type=EventType.MAILBOX_MESSAGE,
+                source="test",
+                payload={
+                    "message_type": "ERROR",
+                    "from": "tracker",
+                    "to": "main",
+                    "file": "fake_error_tracker.json",
+                    "summary": "",
+                    "inner_payload": inner,
+                },
+            )
+        _translate(isolated_bus)
+
+        agent_error = isolated_bus.query(event_type=EventType.AGENT_ERROR)[0]
+        assert agent_error.payload["error_code"] == "PG_CONNECT_REFUSED"
+        assert agent_error.payload["phase"] == "postgres_sync"
+        assert agent_error.payload["deadline_seconds"] == 1800
+        assert agent_error.payload["exception_type"] == "OperationalError"
+        assert secret not in json.dumps(agent_error.payload)
+
+        cluster = isolated_bus.query(
+            event_type=EventType.AGENT_FAILURE_CLUSTER,
+        )[0]
+        assert cluster.payload["failure_type"] == "network"
+        assert cluster.payload["count"] == 3
+        assert cluster.payload["error_code"] == "PG_CONNECT_REFUSED"
+        assert cluster.payload["phase"] == "postgres_sync"
+        assert cluster.payload["deadline_seconds"] == 1800
+        assert cluster.payload["exception_type"] == "OperationalError"
+        assert secret not in cluster.payload["latest_cause"]
+
+    def test_error_omits_nested_diagnostics_and_preserves_explicit_cause(
+        self, isolated_bus,
+    ):
+        secret = "sk-testabcdefghijklmnop"
+        inner = {
+            "message": "wrapper failed",
+            "latest_cause": f"connection refused Authorization: Bearer {secret}",
+            "source_agent": "tracker",
+            "error_code": {"token": secret},
+            "phase": ["postgres_sync"],
+            "deadline_seconds": [1800],
+            "exception_type": {"name": "OperationalError"},
+        }
+        translator = MailboxTranslator(isolated_bus)
+        for _ in range(3):
+            translator._record_error_for_clustering(
+                outer_payload={"from": "tracker", "to": "main"},
+                inner=inner,
+                correlation_id=None,
+            )
+        error_payload = translator._translate("ERROR", inner)[0][1]
+
+        assert set(error_payload) == {"message", "source_agent", "latest_cause"}
+        assert error_payload["message"] == "wrapper failed"
+        assert "connection refused" in error_payload["latest_cause"]
+        assert secret not in json.dumps(error_payload)
+
+        cluster = isolated_bus.query(
+            event_type=EventType.AGENT_FAILURE_CLUSTER,
+        )[0].payload
+        assert "connection refused" in cluster["latest_cause"]
+        assert "wrapper failed" not in cluster["latest_cause"]
+        assert secret not in json.dumps(cluster)
+
     def _record(self, translator, source_agent, message):
         """Drive _record_error_for_clustering directly so the test does
         NOT depend on the bus subscribe/poll path.

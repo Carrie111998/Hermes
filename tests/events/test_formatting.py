@@ -461,6 +461,56 @@ class TestPlainLanguageBodies:
         assert "4 times in a row" in body
         assert "cron_failed" in body
 
+    def test_failure_cluster_body_prefers_canonical_diagnostics(self):
+        from events.formatting import failure_cluster_body
+        body = failure_cluster_body({
+            "source": "tracker",
+            "failure_type": "network",
+            "count": 3,
+            "last_seen": "2026-08-02T18:03:00+00:00",
+            "exception_type": "OperationalError",
+            "error_code": "PG_CONNECT_REFUSED",
+            "phase": "postgres_sync",
+            "deadline_seconds": 1800,
+            "latest_cause": "connection refused at 127.0.0.1:5434",
+        })
+
+        assert "?" not in body
+        assert "tracker has failed 3 times in a row" in body
+        assert "network" in body
+        assert "OperationalError" in body
+        assert body.index("network") < body.index("OperationalError")
+        assert "PG_CONNECT_REFUSED" in body
+        assert "postgres_sync" in body
+        assert "30m" in body
+        assert "connection refused at 127.0.0.1:5434" in body
+        assert "18:03 UTC" in body
+
+    def test_failure_cluster_body_does_not_invent_optional_details(self):
+        from events.formatting import failure_cluster_body
+        body = failure_cluster_body({
+            "source": "scout",
+            "failure_type": "timeout",
+            "count": 3,
+            "first_seen": "2026-08-02T17:55:00+00:00",
+            "last_seen": "2026-08-02T18:03:00+00:00",
+        })
+
+        assert "?" not in body
+        assert "timeout" in body
+        assert "error code" not in body.lower()
+        assert "phase" not in body.lower()
+        assert "deadline" not in body.lower()
+        assert "cause" not in body.lower()
+
+    def test_failure_cluster_body_omits_missing_required_values(self):
+        from events.formatting import failure_cluster_body
+        body = failure_cluster_body({"source": "scout"})
+
+        assert body == "scout has failed repeatedly.\nSomething is stuck — needs a look."
+        assert "multiple" not in body
+        assert "failure)" not in body
+
     def test_partial_backlog_body_explains_and_advises(self):
         from events.formatting import partial_backlog_body
         body = partial_backlog_body({

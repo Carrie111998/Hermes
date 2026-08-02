@@ -14,8 +14,9 @@ consuming mailbox_message events — see events/subscribers/mailbox_translator.p
 
 import json
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
+from agent.redact import redact_sensitive_text
 from events.bus import EventBus
 from events.cluster_detector import FailureClusterDetector
 from events.paths import failure_cluster_state_path
@@ -160,12 +161,27 @@ class CronEventEmitter:
         output_summary: Optional[str] = None,
         error: Optional[str] = None,
         consecutive_errors: int = 0,
+        *,
+        failure_details: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Emit cron_completed or cron_failed event after job execution.
 
         If consecutive_errors >= CONSECUTIVE_FAILURE_THRESHOLD, also emits
         cron_failed_consecutive as a separate critical event.
         """
+        safe_error = error
+        if error:
+            try:
+                safe_error = redact_sensitive_text(
+                    error,
+                    force=True,
+                    redact_url_credentials=True,
+                )
+            except Exception:
+                # Error text crosses persistence + notification boundaries.
+                # If mandatory redaction fails, retain only a safe sentinel.
+                safe_error = "Error details unavailable (redaction failed)"
+
         if success:
             # Boost priority when the output is substantive so it isn't
             # silently gated by system-topic digest_only verbosity. Keeps
@@ -194,7 +210,7 @@ class CronEventEmitter:
                     "job_id": job_id,
                     "job_name": job_name,
                     "duration": duration,
-                    "error": error or "Unknown error",
+                    "error": safe_error or "Unknown error",
                     "consecutive_errors": consecutive_errors,
                 },
             )
@@ -207,7 +223,7 @@ class CronEventEmitter:
                         "job_id": job_id,
                         "job_name": job_name,
                         "consecutive_errors": consecutive_errors,
-                        "error": error or "Unknown error",
+                        "error": safe_error or "Unknown error",
                     },
                 )
 
@@ -224,22 +240,28 @@ class CronEventEmitter:
         # emissions.  See profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md.
         try:
             canonical_source = canonical_agent_source(job_name)
+            details = dict(failure_details or {})
+            if safe_error:
+                details.setdefault("latest_cause", safe_error)
             cluster = self._cluster_detector.record(
                 source=canonical_source,
                 success=success,
-                error_text=error,
+                error_text=safe_error,
+                details=details,
             )
             if cluster is not None:
+                payload = {
+                    "source": cluster.source,
+                    "failure_type": cluster.failure_type,
+                    "count": cluster.count,
+                    "first_seen": cluster.first_seen,
+                    "last_seen": cluster.last_seen,
+                }
+                payload.update(cluster.last_details)
                 self.bus.emit(
                     event_type=EventType.AGENT_FAILURE_CLUSTER,
                     source=cluster.source,
-                    payload={
-                        "source": cluster.source,
-                        "failure_type": cluster.failure_type,
-                        "count": cluster.count,
-                        "first_seen": cluster.first_seen,
-                        "last_seen": cluster.last_seen,
-                    },
+                    payload=payload,
                 )
         except Exception:
             logger.exception("FailureClusterDetector record failed for %s", job_name)

@@ -544,14 +544,43 @@ def silence_alert_body(payload: dict) -> str:
 
 
 def failure_cluster_body(payload: dict) -> str:
-    """An agent failed repeatedly in a row — say who and how many times."""
-    source = payload.get("source", "?")
-    size = payload.get("cluster_size", "?")
-    last_type = payload.get("last_event_type", "?")
-    last_ts = payload.get("last_timestamp")
-    when = f" at {_short_time(last_ts)}" if last_ts else ""
-    return (f"{source} has failed {size} times in a row "
-            f"(latest: {last_type}{when}). Something is stuck — needs a look.")
+    """Render canonical cluster diagnostics with legacy payload fallbacks."""
+    source = payload.get("source")
+    size = payload.get("count", payload.get("cluster_size"))
+    last_type = (
+        payload.get("failure_type")
+        or payload.get("last_event_type")
+        or payload.get("exception_type")
+    )
+    last_ts = payload.get("last_seen") or payload.get("last_timestamp")
+    subject = f"{source} has" if source else "An agent has"
+    if size is not None:
+        headline = f"{subject} failed {size} times in a row"
+    else:
+        headline = f"{subject} failed repeatedly"
+    if last_type:
+        when = f" at {_short_time(last_ts)}" if last_ts else ""
+        headline += f" (latest: {last_type}{when})"
+    lines = [headline + "."]
+
+    qualifiers = []
+    exception_type = payload.get("exception_type")
+    if exception_type and exception_type != last_type:
+        qualifiers.append(f"exception {exception_type}")
+    if payload.get("error_code"):
+        qualifiers.append(f"error code {payload['error_code']}")
+    if payload.get("phase"):
+        qualifiers.append(f"phase {payload['phase']}")
+    if payload.get("deadline_seconds") is not None:
+        qualifiers.append(
+            f"deadline {format_duration(payload['deadline_seconds'])}"
+        )
+    if qualifiers:
+        lines.append(" · ".join(qualifiers) + ".")
+    if payload.get("latest_cause"):
+        lines.append(f"Latest cause: {payload['latest_cause']}")
+    lines.append("Something is stuck — needs a look.")
+    return "\n".join(lines)
 
 
 def partial_backlog_body(payload: dict, *, max_ids: int = 10) -> str:
