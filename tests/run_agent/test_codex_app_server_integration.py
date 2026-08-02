@@ -73,6 +73,34 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_configured_provider_timeout_reaches_app_server(self, monkeypatch):
+        observed = {}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            observed.update(kwargs)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-timeout-1",
+                thread_id="thread-timeout-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-timeout-1"
+        )
+        monkeypatch.setattr(
+            "hermes_cli.timeouts.get_provider_request_timeout",
+            lambda provider, model: 900.0,
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert observed["turn_timeout"] == 900.0
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

@@ -724,8 +724,24 @@ def run_codex_app_server_turn(
     if callable(touch):
         touch("codex app-server turn started")
 
+    # The app-server transport has its own wall-clock deadline, separate from
+    # the cron inactivity watchdog. Honor the same supported per-provider /
+    # per-model request timeout used by the other inference transports so a
+    # configured long-reasoning allowance is not silently capped at the
+    # transport's 600-second default.
+    from hermes_cli.timeouts import get_provider_request_timeout
+
+    turn_timeout = get_provider_request_timeout(
+        getattr(agent, "provider", ""),
+        getattr(agent, "model", None),
+    )
+    turn_kwargs = {"turn_timeout": turn_timeout} if turn_timeout is not None else {}
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            **turn_kwargs,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
