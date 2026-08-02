@@ -874,7 +874,10 @@ function getTitleBarOverlayOptions() {
 // title bar + native WCO on Windows/Linux, traffic lights on macOS. 'app-drawn'
 // mode (non-macOS only) drops the OS chrome entirely (`frame: false`) so the
 // renderer paints min/max/close itself — see src/app/shell/window-controls.
-function computeWindowChromeOptions(): Electron.BrowserWindowConstructorOptions {
+// Compact session windows pass appDrawn: false: their slim shell trims the
+// titlebar controls (no WindowControls to fall back on), so they keep the
+// native overlay.
+function computeWindowChromeOptions({ appDrawn = true } = {}): Electron.BrowserWindowConstructorOptions {
   const base: Electron.BrowserWindowConstructorOptions = {
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
@@ -883,7 +886,7 @@ function computeWindowChromeOptions(): Electron.BrowserWindowConstructorOptions 
   }
 
   // macOS is already app-drawn in both modes (hidden titlebar + native lights).
-  if (IS_MAC || windowChromeMode !== 'app-drawn') {
+  if (IS_MAC || !appDrawn || windowChromeMode !== 'app-drawn') {
     return {
       ...base,
       titleBarStyle: 'hidden',
@@ -8796,7 +8799,10 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     minWidth: SESSION_WINDOW_MIN_WIDTH,
     minHeight: SESSION_WINDOW_MIN_HEIGHT,
     title: 'Hermes',
-    ...computeWindowChromeOptions(),
+    // Session windows keep the native overlay chrome even in app-drawn mode:
+    // their slim shell trims the titlebar controls, so there is no
+    // WindowControls cluster to fall back on.
+    ...computeWindowChromeOptions({ appDrawn: false }),
     icon,
     // Don't show until the renderer's first themed paint is ready. macOS
     // `vibrancy` ignores `backgroundColor` and paints a translucent OS
