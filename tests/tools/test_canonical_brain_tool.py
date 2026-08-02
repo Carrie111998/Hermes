@@ -2594,7 +2594,7 @@ def test_check_requirements_false_when_boundary_policy_absent(monkeypatch, reque
     request.addfinalizer(
         writer_boundary._reset_frozen_writer_boundary_config_for_tests
     )
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
 
     assert cbt.check_canonical_brain_requirements() is False
 
@@ -2606,15 +2606,15 @@ def test_check_requirements_requires_explicit_writer_boundary(monkeypatch, reque
     request.addfinalizer(
         writer_boundary._reset_frozen_writer_boundary_config_for_tests
     )
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"canonical_brain": {"audit_bridge": {"enabled": False}}})
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"canonical_brain": {"audit_bridge": {"enabled": False}}})
 
     assert cbt.check_canonical_brain_requirements() is False
 
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"canonical_brain": {"tools_enabled": True}})
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"canonical_brain": {"tools_enabled": True}})
     assert cbt.check_canonical_brain_requirements() is False
 
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {
             "canonical_brain": {
                 "tools_enabled": True,

@@ -529,7 +529,7 @@ def test_retired_old_context_cannot_read_successor_authority_or_grant_local_plan
         )
 
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     with pytest.raises(PermissionError, match="retired"):

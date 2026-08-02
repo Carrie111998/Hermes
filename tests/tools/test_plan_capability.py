@@ -29,7 +29,7 @@ def _inserted_receipt() -> str:
 
 def test_exact_plan_capability_is_owner_bound_expiring_and_consumed(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     approval.clear_session("session-1")
@@ -48,7 +48,7 @@ def test_exact_plan_capability_is_owner_bound_expiring_and_consumed(monkeypatch)
 
 def test_execute_code_capability_is_exact_and_domain_separated(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     approval.clear_session("session-code")
@@ -77,7 +77,7 @@ def test_execute_code_capability_is_exact_and_domain_separated(monkeypatch):
 
 def test_plan_capability_rejects_non_owner(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     with pytest.raises(PermissionError):
@@ -141,7 +141,7 @@ def test_todo_schema_and_registry_expose_plan_approval_to_model(monkeypatch):
     }.isdisjoint(properties["plan_approval"]["properties"])
 
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     approval.clear_session("session-registry")
@@ -300,7 +300,7 @@ def test_todo_registry_rejects_goal_write_without_exact_authority(
 
 def test_runtime_observed_user_must_match_approved_owner(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "teammate")
@@ -317,7 +317,7 @@ def test_runtime_observed_user_must_match_approved_owner(monkeypatch):
 
 def test_explicit_canonical_config_fails_closed_when_helper_is_unavailable(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {
             "approvals": {"plan_owner_user_ids": ["owner-canonical-policy"]},
             "canonical_brain": {"tools_enabled": True},
@@ -360,7 +360,7 @@ def test_explicit_canonical_config_fails_closed_when_helper_is_unavailable(monke
 
 def test_gateway_owner_is_discord_bound_and_requires_current_observed_message(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["discord-owner"]}},
     )
     monkeypatch.setattr(
@@ -435,7 +435,7 @@ def test_existing_capability_cannot_be_consumed_by_same_id_on_another_platform(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["discord-consume-owner"]}},
     )
     session_key = "session-consume-platform-binding"
@@ -491,7 +491,7 @@ def test_observed_approval_message_cannot_mint_fresh_authority_after_restart_or_
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["discord-replay-owner"]}},
     )
     monkeypatch.setattr(
@@ -582,7 +582,7 @@ def test_observed_approval_message_cannot_mint_fresh_authority_after_restart_or_
 
 def test_canonical_runtime_requires_observed_owner_case_and_active_exact_plan(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     monkeypatch.setattr(approval, "_canonical_brain_required", lambda: True)
@@ -660,7 +660,7 @@ def test_canonical_runtime_requires_observed_owner_case_and_active_exact_plan(mo
 
 def test_canonical_grant_requires_new_insert_and_verified_readback(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")
@@ -716,7 +716,7 @@ def test_canonical_grant_requires_new_insert_and_verified_readback(monkeypatch):
 
 def test_canonical_consume_revalidates_active_plan_and_rejects_deduped_receipt(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")
@@ -799,7 +799,7 @@ def test_local_canonical_capability_survives_same_plan_progress_only_for_exact_c
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-progress"]}},
     )
     monkeypatch.setattr(
@@ -845,7 +845,7 @@ def test_local_canonical_capability_survives_same_plan_progress_only_for_exact_c
 
 def test_concurrent_canonical_receipt_failure_cannot_overcredit_counter(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
     )
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")

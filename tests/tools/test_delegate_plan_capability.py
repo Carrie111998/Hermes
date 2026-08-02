@@ -32,7 +32,7 @@ def _isolated_local_capability_runtime(monkeypatch):
     monkeypatch.setattr(approval, "_writer_boundary_policy_required", lambda: False)
     monkeypatch.setattr(approval, "_canonical_brain_required", lambda: False)
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": [OWNER_ID]}},
     )
     delegation_config = {
