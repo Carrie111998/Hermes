@@ -422,8 +422,10 @@ don't have to:
 * **Timeout.** Honours your `timeout=` argument, falling back to
   `auxiliary.<task>.timeout` config or the global aux default.
 * **Reasoning control.** Validates `reasoning_effort=` through Hermes' shared
-  provider-neutral policy and records the normalized effective request in the
-  result audit mapping.
+  provider-neutral policy and records the normalized request in the result
+  audit mapping. The audit proves the request that entered provider translation,
+  not the provider-specific wire payload or what a remote provider chose to do
+  internally.
 * **JSON shaping.** Sends `response_format` to the provider when
   you ask for JSON, then re-parses locally from a code-fenced
   response if the provider returned one.

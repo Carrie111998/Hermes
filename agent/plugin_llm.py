@@ -25,10 +25,12 @@ The plugin gets ``ctx.llm`` exposed on its
 * async siblings ``acomplete()`` / ``acomplete_structured()`` for
   plugins running on asyncio loops (gateway adapters, hooks).
 
-Provider/model/agent_id/profile and reasoning effort are explicit keyword
-arguments — no embedded slugs, no shorthands. This mirrors Hermes' main config
-shape (``model.provider`` + ``model.model``) so plugin authors who
-already understand the host config don't have to learn anything new.
+Provider/model/agent_id/profile are explicit keyword arguments — no embedded
+slugs, no shorthands — and retain their existing independent trust gates.
+Reasoning effort is an explicit provider-neutral per-call bound, like timeout
+or output budget. This mirrors Hermes' main config shape (``model.provider`` +
+``model.model``) so plugin authors who already understand the host config don't
+have to learn anything new.
 
 The host owns provider routing, auth resolution, timeouts, and
 fallback. The plugin never sees raw OAuth tokens or API keys. All
