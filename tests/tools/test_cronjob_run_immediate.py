@@ -32,6 +32,35 @@ class TestCronjobRunExecutesImmediately:
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
         m_run.assert_called_once()                       # fired via the shared body
 
+    def test_run_reports_success_when_completed_oneshot_self_deletes(self):
+        """A successful finite one-shot is removed before the tool re-reads it.
+
+        The execution ledger remains authoritative after the job row is gone.
+        """
+        oneshot = {
+            **_JOB,
+            "schedule": {"kind": "once", "at": "2026-08-02T17:13:53+07:00"},
+            "repeat": {"times": 1, "completed": 0},
+        }
+        completed = {
+            "job_id": "job-run-1",
+            "status": "completed",
+            "error": None,
+        }
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=oneshot), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True), \
+             patch("tools.cronjob_tools.get_job", return_value=None), \
+             patch("cron.executions.latest_execution", return_value=completed):
+            out = json.loads(cronjob(action="run", job_id="job-run-1"))
+
+        assert out["success"] is True
+        assert out["job"]["executed"] is True
+        assert out["job"]["execution_success"] is True
+        assert out["job"]["name"] == "manual run"
+        assert out["job"]["repeat"] == "once"
+        assert "execution_error" not in out["job"]
+
     def test_run_reconciles_external_provider_after_claimed_execution(self):
         """A direct run must re-arm Chronos after it advances next_run_at.
 
