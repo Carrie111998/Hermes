@@ -19307,7 +19307,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
         generation: Optional[int] = None,
     ) -> None:
-        """Best-effort title propagation through an adapter's optional hook."""
+        """Best-effort title propagation through an adapter's optional hook.
+
+        Production callers must enter through
+        ``_schedule_adapter_session_title_propagation`` so all per-session
+        apply locks are created and acquired on the canonical gateway loop.
+        Direct awaits are reserved for partial runners/tests without a live
+        gateway loop.
+        """
         if not title or not self._adapter_supports_session_title_propagation(source):
             return
         owns_generation = generation is None
@@ -19385,10 +19392,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Schedule an optional adapter title hook from any caller thread."""
         if not title or not self._adapter_supports_session_title_propagation(source):
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = getattr(self, "_gateway_loop", None)
+        gateway_loop = getattr(self, "_gateway_loop", None)
+        if (
+            gateway_loop is not None
+            and gateway_loop.is_running()
+            and not gateway_loop.is_closed()
+        ):
+            # Adapter instances and their per-session apply locks belong to
+            # the canonical gateway loop, even when this callback arrives
+            # from another running loop/thread.
+            loop = gateway_loop
+        else:
+            # Partial runners and startup tests may not have established the
+            # canonical loop yet.  In that case only, use the caller's loop.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
         if loop is None or loop.is_closed():
             return
         generation = self._reserve_adapter_title_generation(session_id)

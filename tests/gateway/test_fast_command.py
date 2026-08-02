@@ -374,6 +374,60 @@ async def test_adapter_title_propagation_invokes_optional_hook():
 
 
 @pytest.mark.asyncio
+async def test_adapter_title_propagation_schedules_foreign_callback_on_gateway_loop():
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="session-1")
+        ),
+    )
+    runner._session_db = SimpleNamespace(
+        get_session_title=AsyncMock(return_value="Current Session Title")
+    )
+    callback_loops = []
+
+    async def on_session_title_changed(_source, _title):
+        callback_loops.append(asyncio.get_running_loop())
+
+    adapter = SimpleNamespace(on_session_title_changed=on_session_title_changed)
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+
+    gateway_loop = asyncio.new_event_loop()
+    gateway_ready = threading.Event()
+
+    def run_gateway_loop():
+        asyncio.set_event_loop(gateway_loop)
+        gateway_ready.set()
+        gateway_loop.run_forever()
+
+    gateway_thread = threading.Thread(target=run_gateway_loop)
+    gateway_thread.start()
+    assert gateway_ready.wait(timeout=2)
+    runner._gateway_loop = gateway_loop
+    foreign_loop = asyncio.get_running_loop()
+
+    try:
+        runner._schedule_adapter_session_title_propagation(
+            _make_source(), "session-1", "Current Session Title"
+        )
+        for _ in range(200):
+            if callback_loops and not runner._adapter_title_apply_locks:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+        gateway_thread.join(timeout=2)
+        gateway_loop.close()
+
+    assert callback_loops == [gateway_loop]
+    assert callback_loops[0] is not foreign_loop
+    assert runner._adapter_title_apply_locks == {}
+    assert runner._adapter_title_generations == {}
+    assert runner._adapter_title_pending == {}
+
+
+@pytest.mark.asyncio
 async def test_adapter_title_propagation_does_not_overwrite_newer_manual_title(tmp_path):
     from hermes_state import AsyncSessionDB, SessionDB
 
