@@ -7,12 +7,14 @@ and the assignee-fallback logic.
 
 from __future__ import annotations
 
+import argparse
 import json as jsonlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
 
@@ -173,28 +175,48 @@ def test_blocked_triage_tasks_are_not_decomposed_until_a_human_clears_the_block(
     assert task_id not in decomp.list_triage_ids()
     with patch("agent.auxiliary_client.call_llm") as call_llm:
         outcome = decomp.decompose_task(task_id, author="me")
-    assert outcome.ok is False
-    assert "waiting on human input" in outcome.reason
-    call_llm.assert_not_called()
+        assert outcome.ok is False
+        assert "waiting on human input" in outcome.reason
+        call_llm.assert_not_called()
 
-    with kb.connect_closing() as conn:
-        task = kb.get_task(conn, task_id)
+        parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+        subparsers = parser.add_subparsers(dest="command")
+        kc.build_parser(subparsers)
+        args = parser.parse_args(
+            [
+                "kanban",
+                "unblock",
+                "--recover-escalated",
+                "--reason",
+                "operator retry approved",
+                task_id,
+            ]
+        )
+        assert kc.kanban_command(args) == 0
+
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, task_id)
+            events = kb.list_events(conn, task_id)
+            comments = kb.list_comments(conn, task_id)
         assert task.status == "triage"
-        assert task.block_kind == "capability"
-        assert kb.recover_escalated_triage_task(conn, task_id) is True
+        assert task.block_kind is None
+        assert task.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+        assert any(event.kind == "triage_escalation_recovered" for event in events)
+        assert any(comment.body == "UNBLOCK: operator retry approved" for comment in comments)
+        assert task_id in decomp.list_triage_ids()
 
-    assert task_id in decomp.list_triage_ids()
-
-    patches = _patch_list_profiles(["orchestrator"])
-    for profile_patch in patches:
-        profile_patch.start()
-    try:
-        with _patch_aux_client(
-            jsonlib.dumps({"fanout": False, "title": "respecified", "body": "ready to retry"})
-        ), _patch_extra_body():
-            outcome = decomp.decompose_task(task_id, author="me")
-    finally:
+        patches = _patch_list_profiles(["orchestrator"])
         for profile_patch in patches:
-            profile_patch.stop()
+            profile_patch.start()
+        try:
+            call_llm.return_value = _fake_aux_response(
+                jsonlib.dumps({"fanout": False, "title": "respecified", "body": "ready to retry"})
+            )
+            with _patch_extra_body():
+                outcome = decomp.decompose_task(task_id, author="me")
+        finally:
+            for profile_patch in patches:
+                profile_patch.stop()
 
-    assert outcome.ok is True
+        assert outcome.ok is True
+        call_llm.assert_called_once()
