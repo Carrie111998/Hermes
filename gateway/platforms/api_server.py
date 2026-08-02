@@ -1026,6 +1026,31 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _count_tool_calls_in_result(result: dict) -> int | None:
+    """Count the number of assistant-to-tool-call batches in a run result.
+
+    Walks ``result['messages']`` and counts assistant messages whose
+    ``tool_calls`` field is a non-empty list. Returns ``None`` when
+    the result has no ``messages`` field (preventing a 0-vs-None
+    ambiguity in the API response — a missing messages field means
+    the counting is not applicable, whereas a zero count means the
+    turn explicitly used no tools).
+    """
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not isinstance(messages, list):
+        return None
+    count = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list) and tcs:
+            count += 1
+    return count
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -4088,6 +4113,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
+        # Count tool calls in the result messages — expose whether this
+        # completion involved any tool invocations so downstream consumers
+        # (automated pipelines, security triage, etc.) can tell at a glance
+        # whether the response was built on tool-enriched evidence or from
+        # the prompt alone. (#73389)
+        _tool_calls_count = _count_tool_calls_in_result(result)
+        if _tool_calls_count is not None:
+            usage["tool_calls_count"] = _tool_calls_count
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
@@ -4300,6 +4333,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
+
+            # Count tool calls in the result messages for the streaming finish chunk
+            _tool_calls_count = _count_tool_calls_in_result(result) if result else None
+            if _tool_calls_count is not None:
+                usage["tool_calls_count"] = _tool_calls_count
 
             # Finish chunk
             finish_chunk = {
