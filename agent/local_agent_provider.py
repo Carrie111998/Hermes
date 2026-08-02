@@ -78,7 +78,6 @@ _ACTING_BACKENDS: dict[str, dict[str, Any]] = {
 
 _CLAUDE_TASK_REQUIRED_ENV = (
     "HERMES_HOME",
-    "HERMES_AGENT_MEMORY_OUTBOX",
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
@@ -89,7 +88,6 @@ _CLAUDE_TASK_REQUIRED_ENV = (
 )
 _CLAUDE_INTAKE_REQUIRED_ENV = (
     "HERMES_HOME",
-    "HERMES_AGENT_MEMORY_OUTBOX",
     "HERMES_WORK_INBOX_INTAKE",
     "HERMES_WORK_INBOX_RUN_ID",
     "HERMES_WORK_INBOX_CLAIM_LOCK",
@@ -192,7 +190,7 @@ def _task_scoped_claude_options(
         ],
         "HERMES_PROFILE": profile,
         "HERMES_MCP_CAPABILITY_SET": capability_set,
-        "HERMES_AGENT_MEMORY_OUTBOX": os.environ["HERMES_AGENT_MEMORY_OUTBOX"],
+
         "HERMES_INFERENCE_PROVIDER": provider,
         "HERMES_INFERENCE_MODEL": model,
         "HERMES_INFERENCE_EFFORT": effort or "default",
@@ -221,9 +219,7 @@ def _task_scoped_claude_options(
                 ],
             }
         )
-    memory_vault = os.environ.get("HERMES_AGENT_MEMORY_VAULT")
-    if memory_vault:
-        child_env["HERMES_AGENT_MEMORY_VAULT"] = memory_vault
+
     for key in ("PATH", "SYSTEMROOT", "COMSPEC", "PATHEXT"):
         value = os.environ.get(key)
         if value:

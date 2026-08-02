@@ -551,8 +551,6 @@ def _set_task_claude_env(
     workspaces.mkdir()
     values = {
         "HERMES_HOME": str(profile_home),
-        "HERMES_AGENT_MEMORY_VAULT": str(tmp_path / "Agent Memory"),
-        "HERMES_AGENT_MEMORY_OUTBOX": str(tmp_path / "agent-memory-outbox"),
         "HERMES_KANBAN_TASK": "t_reviewed",
         "HERMES_KANBAN_RUN_ID": "41",
         "HERMES_KANBAN_CLAIM_LOCK": "host:worker",
@@ -564,6 +562,16 @@ def _set_task_claude_env(
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     return values
+
+
+def test_task_scoped_claude_requires_no_governed_memory_env():
+    from agent.local_agent_provider import (
+        _CLAUDE_INTAKE_REQUIRED_ENV,
+        _CLAUDE_TASK_REQUIRED_ENV,
+    )
+
+    for required in (_CLAUDE_TASK_REQUIRED_ENV, _CLAUDE_INTAKE_REQUIRED_ENV):
+        assert not [key for key in required if key.startswith("HERMES_" + "AGENT_MEMORY_")]
 
 
 @pytest.mark.parametrize(
@@ -640,8 +648,7 @@ def test_task_scoped_claude_uses_strict_role_mcp_session(
     allowed = set(argv[argv.index("--allowedTools") + 1].split(","))
     assert {"Read", "Grep", "Glob", "ToolSearch"} <= allowed
     assert required_tool in allowed
-    assert "mcp__hermes-tools__kanban_agent_memory_recall" in allowed
-    assert "mcp__hermes-tools__kanban_agent_memory_write" in allowed
+
     if profile == "productowner":
         assert "mcp__hermes-tools__kanban_link" not in allowed
     assert forbidden_tool not in allowed
@@ -652,8 +659,6 @@ def test_task_scoped_claude_uses_strict_role_mcp_session(
     assert server["env"]["HERMES_MCP_CAPABILITY_SET"] == capability_set
     expected_child_env = {
         "HERMES_HOME",
-        "HERMES_AGENT_MEMORY_VAULT",
-        "HERMES_AGENT_MEMORY_OUTBOX",
         "HERMES_INFERENCE_PROVIDER",
         "HERMES_INFERENCE_MODEL",
         "HERMES_INFERENCE_EFFORT",
@@ -733,7 +738,6 @@ def test_work_inbox_claude_selects_intake_only_mcp_capability(
 
     values = {
         "HERMES_HOME": str(tmp_path / "profile"),
-        "HERMES_AGENT_MEMORY_OUTBOX": str(tmp_path / "outbox"),
         "HERMES_WORK_INBOX_INTAKE": "qi_one",
         "HERMES_WORK_INBOX_RUN_ID": "7",
         "HERMES_WORK_INBOX_CLAIM_LOCK": "claim",

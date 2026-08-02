@@ -161,17 +161,6 @@ def _spawn_product_owner_intake(
     env["HERMES_KANBAN_BOARD"] = board
     env.pop("HERMES_TUI", None)
 
-    try:
-        from hermes_cli.agent_memory_protocol import configured_outbox_path
-        from hermes_cli.agent_memory_vault import configured_vault_path
-
-        vault = configured_vault_path()
-        if vault is not None:
-            env["HERMES_AGENT_MEMORY_VAULT"] = str(vault)
-        env["HERMES_AGENT_MEMORY_OUTBOX"] = str(configured_outbox_path())
-    except Exception:
-        pass
-
     cwd: Optional[str] = None
     metadata = kanban_db.product_board_metadata(board) or {}
     candidate = str(metadata.get("default_workdir") or "").strip()

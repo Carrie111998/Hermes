@@ -140,13 +140,6 @@ terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ```
 
-## Hermes Agent Memory contract
-
-When a Hermes Kanban task includes Required actual-worker memory protocol,
-forward that block verbatim. The CLI worker, not the Hermes orchestrator, runs
-recall before the bounded task and write after it, then returns both receipts.
-unavailable recall and queued write mean continue. Never edit the vault or
-outbox directly.
 
 ## Rules
 

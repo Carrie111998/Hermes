@@ -246,7 +246,6 @@ def _show_bounded_preflight(payload: dict[str, Any], budget: int) -> dict[str, A
             "hermes_assignee",
             "step_key",
             "resume_status",
-            "memory_capture_id",
             "reason",
             "attempted_resolutions",
             "metadata",
@@ -342,25 +341,6 @@ def _check_resolver_mode() -> bool:
     """Expose the Resolver mutation only to a task-scoped Resolver run."""
     return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
         os.environ.get("HERMES_PROFILE") == "resolver"
-    )
-
-
-def _check_agent_memory_worker_mode() -> bool:
-    """Expose memory tools only to a trusted governed worker runtime."""
-    if _check_resolver_mode():
-        return True
-    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
-    from agent.transports.hermes_tools_mcp_server import (
-        CLAUDE_TASK_CAPABILITY_BY_PROFILE,
-    )
-
-    expected_capability = CLAUDE_TASK_CAPABILITY_BY_PROFILE.get(profile)
-    return bool(os.environ.get("HERMES_KANBAN_TASK")) and bool(
-        expected_capability
-    ) and (
-        os.environ.get("HERMES_MCP_CAPABILITY_SET") == expected_capability
-    ) and (
-        os.environ.get("HERMES_INFERENCE_PROVIDER") == "claude-cli"
     )
 
 
@@ -1736,51 +1716,6 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
-def _agent_memory_receipt_class():
-    from hermes_cli.agent_memory_protocol import MemoryReceipt
-
-    return MemoryReceipt
-
-
-def _canonical_agent_memory_metadata(metadata: object) -> dict | None:
-    if metadata is None:
-        return None
-    if not isinstance(metadata, dict):
-        raise ValueError("metadata must be an object/dict")
-    if not metadata:
-        return None
-    if set(metadata) != {"agent_memory"}:
-        raise ValueError("metadata must contain only agent_memory")
-    agent_memory = metadata.get("agent_memory")
-    if not isinstance(agent_memory, dict):
-        return {"agent_memory": {}}
-    try:
-        MemoryReceipt = _agent_memory_receipt_class()
-    except Exception:
-        return {
-            "agent_memory": {
-                name: {}
-                for name in ("recall", "write")
-                if name in agent_memory
-            }
-        }
-
-    canonical: dict[str, dict] = {}
-    for name in ("recall", "write"):
-        if name not in agent_memory:
-            continue
-        try:
-            canonical[name] = MemoryReceipt.from_mapping(
-                agent_memory[name]
-            ).to_mapping()
-        except Exception:
-            # The Kanban database records a bounded advisory and continues the
-            # functional Resolver transition. Invalid worker evidence is never
-            # passed through this boundary as trusted metadata.
-            canonical[name] = {}
-    return {"agent_memory": canonical}
-
-
 def _handle_resolve(args: dict, **kw) -> str:
     """Apply one audited Resolver decision to the current preflight."""
     from hermes_cli import kanban_db as kb_module
@@ -1799,7 +1734,7 @@ def _handle_resolve(args: dict, **kw) -> str:
 
     allowed_fields = {
         "task_id", "board", "decision", "fault_domain", "diagnosis",
-        "reason", "expected", "repair", "metadata",
+        "reason", "expected", "repair",
     }
     unexpected = sorted(set(args) - allowed_fields)
     if unexpected:
@@ -1813,11 +1748,6 @@ def _handle_resolve(args: dict, **kw) -> str:
         "repair",
     )
     request = {field: args[field] for field in request_fields if field in args}
-    metadata = args.get("metadata")
-    try:
-        metadata = _canonical_agent_memory_metadata(metadata)
-    except ValueError as exc:
-        return tool_error(f"kanban_resolve: {exc}")
     resolver_model = (
         os.environ.get("HERMES_INFERENCE_MODEL")
         or os.environ.get("HERMES_MODEL")
@@ -1831,7 +1761,6 @@ def _handle_resolve(args: dict, **kw) -> str:
                 tid,
                 board=board or os.environ.get("HERMES_KANBAN_BOARD"),
                 request=request,
-                metadata=metadata,
                 resolver_profile=resolver_profile,
                 resolver_model=resolver_model,
             )
@@ -1849,279 +1778,6 @@ def _handle_resolve(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_resolve failed")
         return tool_error(f"kanban_resolve: {e}")
-
-
-def _agent_memory_worker_identity(board_arg: Optional[str]):
-    """Resolve the governed Agent Memory identity for the active worker run.
-
-    These narrow tools stand in for the unavailable Agent Memory CLI. Every
-    identity field is derived from the active task/run/DB and trusted runtime
-    environment — never from the caller — so a worker can only produce receipts
-    bound to its own run.
-
-    Returns ``(kb, conn, tid, board, run_id, function_id, title, query,
-    delegation_id, executor)`` on success (the caller owns closing ``conn``), or
-    a ``tool_error`` string the caller should return verbatim.
-    """
-    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
-    if not _check_agent_memory_worker_mode():
-        return tool_error(
-            "restricted to an active Resolver or direct Claude worker with "
-            "its exact profile capability set"
-        )
-    tid = _default_task_id(None)
-    if not tid:
-        return tool_error("task_id is required (set HERMES_KANBAN_TASK in the env)")
-    ownership_err = _enforce_worker_task_ownership(tid)
-    if ownership_err:
-        return ownership_err
-
-    # Board identity is derived/pinned from the env, never trusted from the
-    # caller. An explicit board is only honoured when it matches the pinned
-    # HERMES_KANBAN_BOARD; otherwise we refuse *before* connecting so a foreign
-    # board is never opened or operated on.
-    env_board = os.environ.get("HERMES_KANBAN_BOARD")
-    if board_arg is not None and board_arg != env_board:
-        return tool_error(
-            f"explicit board {board_arg!r} differs from the pinned board "
-            f"{env_board!r}: board identity is derived/pinned and a foreign "
-            "board is refused (board mismatch)"
-        )
-
-    # The dispatcher pins the active run so a stale resolver process can be told
-    # it is out of date. Require the pin to exist and parse as an int before we
-    # touch the DB; equality with task.current_run_id is enforced below.
-    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
-    try:
-        pinned_run_id = int(raw_run_id) if raw_run_id is not None else None
-    except (TypeError, ValueError):
-        pinned_run_id = None
-    if pinned_run_id is None:
-        return tool_error(
-            "the dispatcher run pin HERMES_KANBAN_RUN_ID is missing or invalid; "
-            "refusing to mint receipts (run pin required)"
-        )
-
-    kb, conn = _connect(board=env_board)
-    try:
-        board = env_board or kb._board_slug_for_connection(conn)
-        task = kb.get_task(conn, tid)
-        if task is None or task.current_run_id is None:
-            conn.close()
-            return tool_error("no active run for this Agent Memory task")
-        if pinned_run_id != task.current_run_id:
-            conn.close()
-            return tool_error(
-                f"pinned run id {pinned_run_id} is stale: the current run is "
-                f"{task.current_run_id} (run mismatch — refusing to mint "
-                "receipts)"
-            )
-        run = kb.get_run(conn, task.current_run_id)
-        if run is None or run.ended_at is not None or run.profile != profile:
-            conn.close()
-            return tool_error("the active run profile does not match this worker")
-        is_resolver = profile == "resolver"
-        if not is_resolver:
-            pinned_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            if (
-                not pinned_lock
-                or pinned_lock != task.claim_lock
-                or pinned_lock != run.claim_lock
-            ):
-                conn.close()
-                return tool_error(
-                    "the dispatcher claim lock is missing or stale; refusing "
-                    "to mint Agent Memory receipts"
-                )
-        identity = kb._agent_memory_governed_identity(conn, tid, board=board)
-        if identity is None:
-            conn.close()
-            return tool_error(
-                "Agent Memory handoff is not required for this board/task"
-            )
-        function_id, title, query = identity
-        run_id = run.id
-        delegation_id = kb._agent_memory_delegation_id(board, tid, run_id)
-        role = kb._agent_memory_hermes_role(task, run)
-        responsibility = "reviewer" if run.step_key == "review" else "writer"
-        model = os.environ.get("HERMES_INFERENCE_MODEL")
-        if is_resolver:
-            model = model or os.environ.get("HERMES_MODEL") or "resolver"
-        elif not model:
-            conn.close()
-            return tool_error(
-                "the direct Claude inference model is missing; refusing to "
-                "mint Agent Memory receipts"
-            )
-        from hermes_cli.agent_memory_vault import ExecutorIdentity
-
-        if is_resolver:
-            executor = ExecutorIdentity(
-                agent_id="hermes",
-                model=model,
-                surface="hermes-child",
-                hermes_role=role,
-                execution_id=f"resolver-{delegation_id.split(':', 1)[-1]}",
-                responsibility=responsibility,
-            )
-        else:
-            executor = ExecutorIdentity(
-                agent_id="claude-cli",
-                model=model,
-                surface="claude-cli",
-                hermes_role=role,
-                execution_id=f"claude-cli-{profile}-{run_id}",
-                responsibility=responsibility,
-            )
-        return (
-            kb, conn, tid, board, run_id, function_id, title, query,
-            delegation_id, executor,
-        )
-    except Exception:
-        conn.close()
-        raise
-
-
-def _handle_agent_memory_recall(args: dict, **kw) -> str:
-    """Run canonical Agent Memory recall for the active governed worker."""
-    unexpected = sorted(set(args) - {"board"})
-    if unexpected:
-        return tool_error(
-            "kanban_agent_memory_recall: unexpected fields: " + ", ".join(unexpected)
-        )
-    resolved = _agent_memory_worker_identity(args.get("board"))
-    if isinstance(resolved, str):
-        return resolved
-    (kb, conn, tid, board, run_id, function_id, title, query,
-     delegation_id, executor) = resolved
-    try:
-        from hermes_cli.agent_memory_protocol import (
-            WorkerRecallRequest,
-            recall_for_worker,
-        )
-
-        matches, receipt = recall_for_worker(
-            WorkerRecallRequest(
-                operation_id=kb._agent_memory_operation_id(
-                    "recall", delegation_id, function_id
-                ),
-                task_id=tid,
-                run_id=run_id,
-                delegation_id=delegation_id,
-                function_id=function_id,
-                title=title,
-                query=query,
-                executor=executor,
-            )
-        )
-        return _ok(
-            matches=[
-                {
-                    "function_id": match.function_id,
-                    "title": match.title,
-                    "evidence": match.evidence,
-                    "note": match.snippet,
-                }
-                for match in matches
-            ],
-            receipt=receipt.to_mapping(),
-        )
-    except Exception as e:
-        logger.exception("kanban_agent_memory_recall failed")
-        return tool_error(f"kanban_agent_memory_recall: {e}")
-    finally:
-        conn.close()
-
-
-def _handle_agent_memory_write(args: dict, **kw) -> str:
-    """Store one bounded gist for the active governed worker."""
-    content_fields = {
-        "summary", "result", "evidence", "reused", "maturity", "behavior",
-        "decisions", "open_loops",
-    }
-    unexpected = sorted(set(args) - (content_fields | {"board"}))
-    if unexpected:
-        return tool_error(
-            "kanban_agent_memory_write: unexpected fields: " + ", ".join(unexpected)
-        )
-    for name in ("summary", "result", "evidence"):
-        value = args.get(name)
-        if not isinstance(value, str) or not value.strip():
-            return tool_error(
-                f"kanban_agent_memory_write: {name} is required bounded text"
-            )
-    from hermes_cli.agent_memory_vault import _ALLOWED_MATURITY
-
-    maturity = args.get("maturity") or "planned"
-    if maturity not in _ALLOWED_MATURITY:
-        return tool_error(
-            "kanban_agent_memory_write: maturity must be one of "
-            + ", ".join(sorted(_ALLOWED_MATURITY))
-        )
-
-    resolved = _agent_memory_worker_identity(args.get("board"))
-    if isinstance(resolved, str):
-        return resolved
-    (kb, conn, tid, board, run_id, function_id, title, query,
-     delegation_id, executor) = resolved
-    try:
-        import hashlib
-        from datetime import datetime, timezone
-
-        from hermes_cli.agent_memory_protocol import (
-            WorkerWriteRequest,
-            write_worker_gist,
-        )
-
-        def _optional(name: str) -> str:
-            value = args.get(name)
-            return str(value) if isinstance(value, str) and value.strip() else "none"
-
-        # Deterministic, non-caller-supplied gist identity: one durable gist per
-        # (board, task, run, function) worker handoff. Retries dedupe on the
-        # stable operation_id inside the protocol.
-        executor_kind = (
-            "resolver" if executor.surface == "hermes-child" else "claude-cli"
-        )
-        gist_seed = json.dumps(
-            [board, tid, run_id, function_id, executor_kind],
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        gist_id = f"kanban-{executor_kind}-" + hashlib.sha256(
-            gist_seed.encode("utf-8")
-        ).hexdigest()[:32]
-
-        receipt = write_worker_gist(
-            WorkerWriteRequest(
-                operation_id=kb._agent_memory_operation_id(
-                    "write", delegation_id, function_id
-                ),
-                task_id=tid,
-                run_id=run_id,
-                delegation_id=delegation_id,
-                gist_id=gist_id,
-                occurred_at=datetime.now(timezone.utc),
-                function_id=function_id,
-                title=title,
-                context=f"board={board}; task={tid}; run={run_id}",
-                summary=str(args["summary"]),
-                reused=_optional("reused"),
-                result=str(args["result"]),
-                maturity=maturity,
-                evidence=str(args["evidence"]),
-                behavior=_optional("behavior"),
-                decisions=_optional("decisions"),
-                open_loops=_optional("open_loops"),
-                executor=executor,
-            )
-        )
-        return _ok(receipt=receipt.to_mapping())
-    except Exception as e:
-        logger.exception("kanban_agent_memory_write failed")
-        return tool_error(f"kanban_agent_memory_write: {e}")
-    finally:
-        conn.close()
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -2151,14 +1807,7 @@ def _handle_block(args: dict, **kw) -> str:
             "what you already tried before asking for human input"
         )
     attempted_resolutions = _normalize_attempted_resolutions(attempted_resolutions_raw)
-    metadata = args.get("metadata")
-    if metadata is not None:
-        try:
-            metadata = _canonical_agent_memory_metadata(metadata)
-        except ValueError as exc:
-            return tool_error(f"kanban_block: {exc}")
-    else:
-        metadata = _stamp_worker_session_metadata(tid, None)
+    metadata = _stamp_worker_session_metadata(tid, None)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -2363,131 +2012,6 @@ def _handle_work_inbox_decide(args: dict, **kw) -> str:
             conn.close()
     except Exception as exc:
         return tool_error(f"work_inbox_decide: {exc}")
-
-
-def _work_inbox_memory_identity():
-    from hermes_cli import kanban_po_intake
-    from hermes_cli.agent_memory_vault import ExecutorIdentity
-
-    kb, conn = _connect(board=os.environ.get("HERMES_KANBAN_BOARD"))
-    try:
-        intake_id, run, _claim = kanban_po_intake.active_intake_scope(conn)
-        intake = kb.get_qualification_intake(conn, intake_id)
-        board = os.environ["HERMES_KANBAN_BOARD"]
-        delegation_id = f"{board}:{intake_id}:{run['id']}"
-        executor = ExecutorIdentity(
-            agent_id=str(run.get("provider") or "hermes"),
-            model=str(run.get("model") or "unknown"),
-            surface="work_inbox_intake",
-            hermes_role="productowner",
-            execution_id=f"work-inbox-{run['id']}",
-            responsibility="writer",
-        )
-        return (
-            kb,
-            conn,
-            intake_id,
-            int(run["id"]),
-            delegation_id,
-            "product-owner-intake",
-            "Product Owner Work Inbox assessment",
-            str(intake["raw_request"]),
-            executor,
-        )
-    except Exception:
-        conn.close()
-        raise
-
-
-def _handle_work_inbox_memory_recall(args: dict, **kw) -> str:
-    try:
-        from hermes_cli.agent_memory_protocol import (
-            WorkerRecallRequest,
-            recall_for_worker,
-        )
-
-        (kb, conn, intake_id, run_id, delegation_id, function_id,
-         title, query, executor) = _work_inbox_memory_identity()
-        try:
-            matches, receipt = recall_for_worker(
-                WorkerRecallRequest(
-                    operation_id=kb._agent_memory_operation_id(
-                        "recall", delegation_id, function_id
-                    ),
-                    task_id=intake_id,
-                    run_id=run_id,
-                    delegation_id=delegation_id,
-                    function_id=function_id,
-                    title=title,
-                    query=query,
-                    executor=executor,
-                )
-            )
-            return _ok(
-                matches=[
-                    {
-                        "function_id": item.function_id,
-                        "title": item.title,
-                        "evidence": item.evidence,
-                        "note": item.snippet,
-                    }
-                    for item in matches
-                ],
-                receipt=receipt.to_mapping(),
-            )
-        finally:
-            conn.close()
-    except Exception as exc:
-        return tool_error(f"work_inbox_agent_memory_recall: {exc}")
-
-
-def _handle_work_inbox_memory_write(args: dict, **kw) -> str:
-    content = str(args.get("content") or "").strip()
-    if not content:
-        return tool_error("work_inbox_agent_memory_write: content is required")
-    try:
-        import hashlib
-        from datetime import datetime, timezone
-        from hermes_cli.agent_memory_protocol import (
-            WorkerWriteRequest,
-            write_worker_gist,
-        )
-
-        (kb, conn, intake_id, run_id, delegation_id, function_id,
-         title, _query, executor) = _work_inbox_memory_identity()
-        try:
-            gist_id = "work-inbox-" + hashlib.sha256(
-                delegation_id.encode("utf-8")
-            ).hexdigest()[:32]
-            receipt = write_worker_gist(
-                WorkerWriteRequest(
-                    operation_id=kb._agent_memory_operation_id(
-                        "write", delegation_id, function_id
-                    ),
-                    task_id=intake_id,
-                    run_id=run_id,
-                    delegation_id=delegation_id,
-                    gist_id=gist_id,
-                    occurred_at=datetime.now(timezone.utc),
-                    function_id=function_id,
-                    title=title,
-                    context=f"board={os.environ['HERMES_KANBAN_BOARD']}; intake={intake_id}",
-                    summary=content,
-                    reused="none",
-                    result="Product Owner intake continuity recorded",
-                    maturity="planned",
-                    evidence=f"intake_run={run_id}",
-                    behavior="none",
-                    decisions=content,
-                    open_loops="none",
-                    executor=executor,
-                )
-            )
-            return _ok(receipt=receipt.to_mapping())
-        finally:
-            conn.close()
-    except Exception as exc:
-        return tool_error(f"work_inbox_agent_memory_write: {exc}")
 
 
 def _handle_comment(args: dict, **kw) -> str:
@@ -3399,79 +2923,6 @@ KANBAN_COMPLETE_SCHEMA = {
 }
 
 
-def _agent_memory_receipt_schema(operation: str) -> dict:
-    statuses = (
-        ["matched", "empty", "unavailable"]
-        if operation == "recall"
-        else ["stored", "already_stored", "queued"]
-    )
-    executor = {
-        "type": "object",
-        "properties": {
-            "agent_id": {"type": "string"},
-            "execution_id": {"type": "string"},
-            "hermes_role": {"type": "string"},
-            "model": {"type": "string"},
-            "responsibility": {"type": "string"},
-            "surface": {"type": "string"},
-            "version": {"type": "integer", "enum": [1]},
-        },
-        "required": [
-            "agent_id", "execution_id", "hermes_role", "model",
-            "responsibility", "surface", "version",
-        ],
-        "additionalProperties": False,
-    }
-    return {
-        "type": "object",
-        "properties": {
-            "continue_work": {"type": "boolean", "enum": [True]},
-            "delegation_id": {"type": "string"},
-            "executor": executor,
-            "gist_id": (
-                {"type": "null"}
-                if operation == "recall"
-                else {"type": "string"}
-            ),
-            "occurred_at": {"type": "string"},
-            "operation": {"type": "string", "enum": [operation]},
-            "operation_id": {"type": "string"},
-            "run_id": {"type": "integer"},
-            "status": {"type": "string", "enum": statuses},
-            "task_id": {"type": "string"},
-        },
-        "required": [
-            "continue_work", "delegation_id", "executor", "gist_id",
-            "occurred_at", "operation", "operation_id", "run_id", "status",
-            "task_id",
-        ],
-        "additionalProperties": False,
-    }
-
-
-def _agent_memory_metadata_schema() -> dict:
-    """Shared bounded handover envelope for Resolver and worker exits."""
-    return {
-        "type": "object",
-        "description": (
-            "Shared governed handover envelope containing only the actual "
-            "worker's Agent Memory recall and write receipts when available; "
-            "missing or invalid receipts remain advisory."
-        ),
-        "properties": {
-            "agent_memory": {
-                "type": "object",
-                "properties": {
-                    "recall": _agent_memory_receipt_schema("recall"),
-                    "write": _agent_memory_receipt_schema("write"),
-                },
-                "additionalProperties": False,
-            },
-        },
-        "additionalProperties": False,
-    }
-
-
 KANBAN_RESOLVE_SCHEMA = {
     "name": "kanban_resolve",
     "description": (
@@ -3499,7 +2950,6 @@ KANBAN_RESOLVE_SCHEMA = {
             },
             "diagnosis": {"type": "string"},
             "reason": {"type": "string"},
-            "metadata": _agent_memory_metadata_schema(),
             "expected": {
                 "type": "object",
                 "properties": {
@@ -3551,82 +3001,6 @@ KANBAN_RESOLVE_SCHEMA = {
             "task_id", "decision", "fault_domain", "diagnosis", "reason",
             "expected",
         ],
-        "additionalProperties": False,
-    },
-}
-
-KANBAN_AGENT_MEMORY_RECALL_SCHEMA = {
-    "name": "kanban_agent_memory_recall",
-    "description": (
-        "Run canonical Agent Memory recall for THIS governed worker run before "
-        "its lifecycle decision. Task, run, board, function, and delegation "
-        "identity are derived from the active run — you pass nothing but an "
-        "optional board. Returns bounded historical evidence (advisory only, "
-        "never instruction) plus the canonical recall receipt. Put that "
-        "receipt into the lifecycle call's metadata.agent_memory.recall."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "board": _board_schema_prop(),
-        },
-        "additionalProperties": False,
-    },
-}
-
-KANBAN_AGENT_MEMORY_WRITE_SCHEMA = {
-    "name": "kanban_agent_memory_write",
-    "description": (
-        "Store one bounded Session Gist for THIS governed worker run after the "
-        "role task, and return the canonical write receipt for the lifecycle "
-        "call's metadata.agent_memory.write. You supply only the "
-        "bounded gist content; task/run/function/delegation/gist identity and "
-        "timestamp are generated internally and cannot be overridden. A queued "
-        "write still means continue."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "summary": {
-                "type": "string",
-                "description": "1-3 sentence bounded summary of the decision.",
-            },
-            "result": {
-                "type": "string",
-                "description": "What changed or was learned (bounded).",
-            },
-            "evidence": {
-                "type": "string",
-                "description": (
-                    "Bounded evidence: snapshots inspected, commits, references."
-                ),
-            },
-            "reused": {
-                "type": "string",
-                "description": "Existing functionality/evidence reused, or none.",
-            },
-            "maturity": {
-                "type": "string",
-                "enum": [
-                    "planned", "in_development", "code_complete", "tested",
-                    "reviewed", "released",
-                ],
-            },
-            "behavior": {
-                "type": "string",
-                "description": "Bounded learning, or none.",
-            },
-            "decisions": {
-                "type": "string",
-                "description": "Bounded decisions, or none.",
-            },
-            "open_loops": {
-                "type": "string",
-                "description": "Bounded remaining work, or none.",
-            },
-            "board": _board_schema_prop(),
-        },
-        "required": ["summary", "result", "evidence"],
         "additionalProperties": False,
     },
 }
@@ -3683,7 +3057,6 @@ KANBAN_BLOCK_SCHEMA = {
                     "fallback API, asked another agent via comment."
                 ),
             },
-            "metadata": _agent_memory_metadata_schema(),
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
@@ -4320,23 +3693,6 @@ WORK_INBOX_DECIDE_SCHEMA = {
     },
 }
 
-WORK_INBOX_MEMORY_RECALL_SCHEMA = {
-    "name": "work_inbox_agent_memory_recall",
-    "description": "Recall advisory history for this intake when available.",
-    "parameters": {"type": "object", "properties": {}},
-}
-
-WORK_INBOX_MEMORY_WRITE_SCHEMA = {
-    "name": "work_inbox_agent_memory_write",
-    "description": "Record advisory continuity for this intake when available.",
-    "parameters": {
-        "type": "object",
-        "properties": {"content": {"type": "string"}},
-        "required": ["content"],
-    },
-}
-
-
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -4366,24 +3722,6 @@ registry.register(
     handler=_handle_work_inbox_heartbeat,
     check_fn=_check_work_inbox_mode,
     emoji="💓",
-)
-
-registry.register(
-    name="work_inbox_agent_memory_recall",
-    toolset="kanban",
-    schema=WORK_INBOX_MEMORY_RECALL_SCHEMA,
-    handler=_handle_work_inbox_memory_recall,
-    check_fn=_check_work_inbox_mode,
-    emoji="🧠",
-)
-
-registry.register(
-    name="work_inbox_agent_memory_write",
-    toolset="kanban",
-    schema=WORK_INBOX_MEMORY_WRITE_SCHEMA,
-    handler=_handle_work_inbox_memory_write,
-    check_fn=_check_work_inbox_mode,
-    emoji="🧠",
 )
 
 registry.register(
@@ -4429,24 +3767,6 @@ registry.register(
     handler=_handle_resolve,
     check_fn=_check_resolver_mode,
     emoji="🧭",
-)
-
-registry.register(
-    name="kanban_agent_memory_recall",
-    toolset="kanban",
-    schema=KANBAN_AGENT_MEMORY_RECALL_SCHEMA,
-    handler=_handle_agent_memory_recall,
-    check_fn=_check_agent_memory_worker_mode,
-    emoji="🧠",
-)
-
-registry.register(
-    name="kanban_agent_memory_write",
-    toolset="kanban",
-    schema=KANBAN_AGENT_MEMORY_WRITE_SCHEMA,
-    handler=_handle_agent_memory_write,
-    check_fn=_check_agent_memory_worker_mode,
-    emoji="🧠",
 )
 
 registry.register(

@@ -55,14 +55,14 @@ class TestGuidanceConstants:
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
-    def test_resolver_memory_receipts_are_advisory_when_unavailable(self):
-        assert "receipts when available" in RESOLVER_KANBAN_GUIDANCE
-        assert "Missing or failed memory is advisory" in RESOLVER_KANBAN_GUIDANCE
-        assert (
-            "still call `kanban_resolve` without replaying diagnosis"
-            in RESOLVER_KANBAN_GUIDANCE
-        )
-        assert "pass both receipts" not in RESOLVER_KANBAN_GUIDANCE
+    def test_resolver_guidance_has_no_governed_agent_memory_protocol(self):
+        assert "Agent Memory" not in RESOLVER_KANBAN_GUIDANCE
+        assert "memory receipt" not in RESOLVER_KANBAN_GUIDANCE.lower()
+
+    def test_native_memory_guidance_survives_governed_memory_removal(self):
+        assert "durable facts" in MEMORY_GUIDANCE
+        assert "Do NOT save task progress" in MEMORY_GUIDANCE
+        assert "session_search" in MEMORY_GUIDANCE
 
 
 # =========================================================================

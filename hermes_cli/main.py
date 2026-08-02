@@ -11252,7 +11252,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "agent-memory", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
@@ -12138,16 +12138,6 @@ def main():
     # =========================================================================
     from hermes_cli.portal_cli import add_parser as _add_portal_parser
     _add_portal_parser(subparsers)
-
-    # =========================================================================
-    # agent-memory command — worker protocol for vault jobs
-    # =========================================================================
-    from hermes_cli.subcommands.agent_memory import (
-        build_agent_memory_parser,
-        cmd_agent_memory,
-    )
-
-    build_agent_memory_parser(subparsers, cmd_agent_memory=cmd_agent_memory)
 
     # =========================================================================
     # kanban command — multi-profile collaboration board

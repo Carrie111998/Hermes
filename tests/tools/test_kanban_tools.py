@@ -102,10 +102,9 @@ def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp
     kanban = {n for n in names if n and n.startswith("kanban_")}
     assert kanban == {
         "kanban_show", "kanban_heartbeat", "kanban_comment", "kanban_resolve",
-        "kanban_agent_memory_recall", "kanban_agent_memory_write",
     }, (
-        "resolver kanban surface must be inspect/heartbeat/comment/resolve plus "
-        f"the narrow Agent Memory handoff tools, got {kanban}"
+        "resolver kanban surface must be inspect/heartbeat/comment/resolve, "
+        f"got {kanban}"
     )
     for readonly in ("read_file", "search_files", "web_search", "web_extract"):
         assert readonly in names, f"resolver evidence tool missing: {readonly}"
@@ -116,75 +115,6 @@ def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp
     }
     leaked = forbidden & names
     assert not leaked, f"mutation tools leaked into resolver surface: {leaked}"
-
-
-def test_ordinary_developer_worker_hides_resolver_memory_tools(monkeypatch, tmp_path):
-    """The narrow Agent Memory handoff tools are resolver-only.
-
-    An ordinary dispatcher-spawned worker (developer profile) must never see
-    ``kanban_agent_memory_recall`` / ``kanban_agent_memory_write`` — those exist
-    solely so the read-only Resolver can produce canonical receipts. Ordinary
-    workers use the ``hermes agent-memory`` CLI instead.
-    """
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_dev")
-    monkeypatch.setenv("HERMES_PROFILE", "developer")
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    import tools.kanban_tools  # ensure registered
-    from model_tools import _clear_tool_defs_cache, get_tool_definitions
-    from tools.registry import invalidate_check_fn_cache
-
-    invalidate_check_fn_cache()
-    _clear_tool_defs_cache()
-    schema = get_tool_definitions(
-        enabled_toolsets=["terminal"],
-        quiet_mode=True,
-    )
-    names = {s["function"].get("name") for s in schema if "function" in s}
-    assert "kanban_complete" in names
-    assert "kanban_agent_memory_recall" not in names
-    assert "kanban_agent_memory_write" not in names
-
-
-@pytest.mark.parametrize(
-    ("profile", "capability_set"),
-    [
-        ("productowner", "product-owner"),
-        ("reviewer", "reviewer"),
-    ],
-)
-def test_task_scoped_claude_roles_expose_both_agent_memory_tools(
-    monkeypatch, tmp_path, profile, capability_set
-):
-    """The MCP schema must expose the same recall/write pair as its capability set."""
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_claude")
-    monkeypatch.setenv("HERMES_PROFILE", profile)
-    monkeypatch.setenv("HERMES_MCP_CAPABILITY_SET", capability_set)
-    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "claude-cli")
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    from model_tools import _clear_tool_defs_cache, get_tool_definitions
-    from tools.registry import invalidate_check_fn_cache
-
-    invalidate_check_fn_cache()
-    _clear_tool_defs_cache()
-    names = {
-        item["function"]["name"]
-        for item in get_tool_definitions(
-            enabled_toolsets=["kanban"],
-            quiet_mode=True,
-        )
-        if item.get("type") == "function"
-    }
-    assert {
-        "kanban_agent_memory_recall",
-        "kanban_agent_memory_write",
-    } <= names
-    assert "kanban_resolve" not in names
 
 
 def test_model_tool_cache_separates_task_and_work_inbox_surfaces(
@@ -951,158 +881,12 @@ def test_resolve_schema_is_strict_and_bounded():
     assert "fix_task_id" not in params["properties"]
     assert set(params["properties"]) == {
         "task_id", "board", "decision", "fault_domain", "diagnosis",
-        "reason", "expected", "repair", "metadata",
+        "reason", "expected", "repair",
     }
-    metadata = params["properties"]["metadata"]
-    assert metadata["type"] == "object"
-    assert metadata.get("required", []) == []
-    assert metadata["additionalProperties"] is False
-    assert set(metadata["properties"]) == {"agent_memory"}
-    agent_memory = metadata["properties"]["agent_memory"]
-    assert agent_memory.get("required", []) == []
-    assert agent_memory["additionalProperties"] is False
-    assert set(agent_memory["properties"]) == {"recall", "write"}
-    receipt_keys = {
-        "continue_work", "delegation_id", "executor", "gist_id",
-        "occurred_at", "operation", "operation_id", "run_id", "status",
-        "task_id",
-    }
-    executor_keys = {
-        "agent_id", "execution_id", "hermes_role", "model",
-        "responsibility", "surface", "version",
-    }
-    for operation in ("recall", "write"):
-        receipt = agent_memory["properties"][operation]
-        assert receipt["additionalProperties"] is False
-        assert set(receipt["properties"]) == receipt_keys
-        assert set(receipt["required"]) == receipt_keys
-        executor = receipt["properties"]["executor"]
-        assert executor["additionalProperties"] is False
-        assert set(executor["properties"]) == executor_keys
-        assert set(executor["required"]) == executor_keys
 
     block_params = kt.KANBAN_BLOCK_SCHEMA["parameters"]
     assert block_params["additionalProperties"] is False
-    assert block_params["properties"]["metadata"] == metadata
-
-
-def _canonical_memory_metadata_for_tools(task_id="t_owned", run_id=7):
-    from hermes_cli.agent_memory_protocol import MemoryReceipt
-    from hermes_cli.agent_memory_vault import ExecutorIdentity
-
-    executor = ExecutorIdentity(
-        agent_id="codex",
-        model="test-model",
-        surface="codex-cli",
-        hermes_role="developer",
-        execution_id=f"exec-{run_id}",
-        responsibility="writer",
-    )
-    return {
-        "agent_memory": {
-            "recall": MemoryReceipt.for_gist(
-                operation_id=f"recall-{run_id}",
-                operation="recall",
-                status="empty",
-                continue_work=True,
-                task_id=task_id,
-                run_id=run_id,
-                delegation_id=f"delegation-{run_id}",
-                gist_id=None,
-                executor=executor,
-            ).to_mapping(),
-            "write": MemoryReceipt.for_gist(
-                operation_id=f"write-{run_id}",
-                operation="write",
-                status="stored",
-                continue_work=True,
-                task_id=task_id,
-                run_id=run_id,
-                delegation_id=f"delegation-{run_id}",
-                gist_id=f"gist-{run_id}",
-                executor=executor,
-            ).to_mapping(),
-        }
-    }
-
-
-def test_block_rejects_nonmemory_metadata_before_database_access(monkeypatch):
-    from tools import kanban_tools as kt
-
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
-    metadata = _canonical_memory_metadata_for_tools()
-    metadata["private"] = True
-    monkeypatch.setattr(
-        kt,
-        "_connect",
-        lambda **_kwargs: pytest.fail("nonmemory metadata reached the database"),
-    )
-
-    result = json.loads(
-        kt._handle_block({"reason": "blocked", "metadata": metadata})
-    )
-
-    assert result["error"] == (
-        "kanban_block: metadata must contain only agent_memory"
-    )
-    assert "canonical recall and write receipts" not in result["error"]
-
-
-@pytest.mark.parametrize("extra_level", ("agent_memory", "receipt", "executor"))
-def test_memory_metadata_sanitizer_omits_untrusted_fields(extra_level):
-    from tools import kanban_tools as kt
-
-    metadata = _canonical_memory_metadata_for_tools()
-    if extra_level == "agent_memory":
-        metadata["agent_memory"]["private"] = True
-    elif extra_level == "receipt":
-        metadata["agent_memory"]["write"]["private"] = True
-    else:
-        metadata["agent_memory"]["write"]["executor"]["private"] = True
-    canonical = kt._canonical_agent_memory_metadata(metadata)
-
-    assert canonical is not None
-    assert set(canonical) == {"agent_memory"}
-    assert "recall" in canonical["agent_memory"]
-    if extra_level == "agent_memory":
-        assert "write" in canonical["agent_memory"]
-    else:
-        assert canonical["agent_memory"]["write"] == {}
-    assert "private" not in json.dumps(canonical)
-
-
-def test_memory_metadata_sanitizer_fails_open_when_receipt_module_unavailable(
-    monkeypatch,
-):
-    from tools import kanban_tools as kt
-
-    def broken_receipt_class():
-        raise ImportError("optional Agent Memory module unavailable")
-
-    monkeypatch.setattr(kt, "_agent_memory_receipt_class", broken_receipt_class)
-
-    assert kt._canonical_agent_memory_metadata(
-        _canonical_memory_metadata_for_tools()
-    ) == {"agent_memory": {"recall": {}, "write": {}}}
-
-
-def test_block_sanitizes_malformed_memory_before_persistence(
-    monkeypatch, worker_env
-):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    metadata = {"agent_memory": {"write": {"not": "a receipt"}}}
-
-    result = json.loads(
-        kt._handle_block({"reason": "blocked", "metadata": metadata})
-    )
-
-    assert result["ok"] is True
-    with kb.connect() as conn:
-        run = kb.latest_run(conn, worker_env)
-    assert run is not None
-    assert "write" not in run.metadata.get("agent_memory", {})
+    assert "metadata" not in block_params["properties"]
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
@@ -1559,66 +1343,6 @@ def _make_product_worker_env(monkeypatch, tmp_path):
         )
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     return tid
-
-
-def _make_product_memory_worker_env(monkeypatch, tmp_path):
-    from hermes_cli import kanban_db as kb
-
-    tid = _make_product_worker_env(monkeypatch, tmp_path)
-    kb.ensure_product_board_defaults("prod")
-    vault = tmp_path / "Agent Memory"
-    vault.mkdir()
-    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
-    with kb.connect(board="prod") as conn:
-        with kb.authorized_governance_write(), kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET idempotency_key=? WHERE id=?",
-                (f"memory-{tid}", tid),
-            )
-        claimed = kb.claim_task(conn, tid, board="prod")
-        assert claimed is not None and claimed.current_run_id is not None
-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
-    return tid
-
-
-@pytest.mark.parametrize("malformed_field", ("recall", "write"))
-def test_block_classifies_malformed_memory_without_replay(
-    monkeypatch, tmp_path, malformed_field
-):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    tid = _make_product_memory_worker_env(monkeypatch, tmp_path)
-    with kb.connect(board="prod") as conn:
-        before = [run.id for run in kb.list_runs(conn, tid, include_active=True)]
-
-    result = json.loads(kt._handle_block({
-        "reason": "waiting for a bounded decision",
-        "kind": "dependency",
-        "metadata": {
-            "agent_memory": {
-                malformed_field: {"untrusted": "payload"},
-            }
-        },
-    }))
-
-    assert result["ok"] is True
-    serialized = json.dumps(result).lower()
-    assert "retry" not in serialized
-    assert "replay" not in serialized
-    with kb.connect(board="prod") as conn:
-        task = kb.get_task(conn, tid)
-        after = [run.id for run in kb.list_runs(conn, tid, include_active=True)]
-        run = kb.latest_run(conn, tid)
-
-    assert task is not None and task.status == "todo"
-    assert after == before
-    assert run is not None
-    memory = run.metadata["agent_memory"]
-    assert memory["advisory"]["continue_work"] is True
-    assert memory["advisory"]["invalid"] == [malformed_field]
-    assert malformed_field not in memory
-    assert "untrusted" not in json.dumps(memory)
 
 
 def test_product_block_requires_attempted_resolutions(monkeypatch, tmp_path):
@@ -2490,7 +2214,6 @@ def test_bounded_preflight_keeps_normal_values_exact_with_oversized_metadata():
         "hermes_assignee": "resolver",
         "step_key": "development",
         "resume_status": "ready",
-        "memory_capture_id": "capture-1",
         "reason": reason,
         "attempted_resolutions": attempts,
         "metadata": {
@@ -2778,60 +2501,6 @@ def test_resolver_tool_resumes_release_preflight(
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
-    from hermes_cli.agent_memory_protocol import MemoryReceipt
-    from hermes_cli.agent_memory_vault import ExecutorIdentity
-
-    executor = ExecutorIdentity(
-        agent_id="hermes",
-        model="resolver-test-model",
-        surface="hermes-direct",
-        hermes_role="resolver",
-        execution_id=f"resolver-{resolver.current_run_id}",
-        responsibility="writer",
-    )
-    delegation_id = f"kanban:resolver-{resolver.current_run_id}"
-    memory_metadata = {
-        "agent_memory": {
-            "recall": MemoryReceipt.for_gist(
-                operation_id=f"recall-{resolver.current_run_id}",
-                operation="recall",
-                status="empty",
-                continue_work=True,
-                task_id=tid,
-                run_id=resolver.current_run_id,
-                delegation_id=delegation_id,
-                gist_id=None,
-                executor=executor,
-            ).to_mapping(),
-            "write": MemoryReceipt.for_gist(
-                operation_id=f"write-{resolver.current_run_id}",
-                operation="write",
-                status="stored",
-                continue_work=True,
-                task_id=tid,
-                run_id=resolver.current_run_id,
-                delegation_id=delegation_id,
-                gist_id=f"gist-{resolver.current_run_id}",
-                executor=executor,
-            ).to_mapping(),
-        }
-    }
-
-    rejected = json.loads(kt._handle_resolve({
-        "task_id": tid,
-        "decision": "resume",
-        "fault_domain": "task_state",
-        "diagnosis": "The release confirmation already exists.",
-        "reason": "Use the recorded release approval.",
-        "expected": expected,
-        "metadata": {
-            **memory_metadata,
-            "private_notes": "must not cross the Resolver boundary",
-        },
-    }))
-    assert "metadata must contain only agent_memory" in rejected["error"]
-    with kb.connect(board=board) as conn:
-        assert kb.get_task(conn, tid).current_run_id == resolver.current_run_id
 
     out = json.loads(kt._handle_resolve({
         "task_id": tid,
@@ -2840,7 +2509,6 @@ def test_resolver_tool_resumes_release_preflight(
         "diagnosis": "The release confirmation already exists.",
         "reason": "Use the recorded release approval.",
         "expected": expected,
-        "metadata": memory_metadata,
     }))
     assert out["ok"] is True
 
@@ -2852,7 +2520,7 @@ def test_resolver_tool_resumes_release_preflight(
     assert task.assignee == "productowner"
     assert task.current_step_key == "release_measure"
     assert event_kinds.count("human_input_preflight_resolved") == 1
-    assert resolver_run.metadata["agent_memory"] == memory_metadata["agent_memory"]
+    assert isinstance(resolver_run.metadata, dict)
 
 
 def test_resolver_tool_rejects_foreign_task(monkeypatch):
@@ -2893,54 +2561,6 @@ def test_resolver_tool_rejects_legacy_fields_before_database_call(monkeypatch):
     }))
 
     assert "unexpected fields: fix_task_id" in out["error"]
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        {
-            "agent_memory": {"recall": {}, "write": {}},
-            "private_notes": "must not cross the Resolver boundary",
-        },
-    ],
-)
-def test_resolver_tool_rejects_unbounded_metadata_before_database_call(
-    monkeypatch, metadata
-):
-    from tools import kanban_tools as kt
-
-    monkeypatch.setenv("HERMES_PROFILE", "resolver")
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
-    monkeypatch.setattr(
-        kt,
-        "_connect",
-        lambda **_kwargs: pytest.fail("unbounded metadata reached the database"),
-    )
-
-    out = json.loads(kt._handle_resolve({
-        "task_id": "t_owned",
-        "decision": "resume",
-        "fault_domain": "task_state",
-        "diagnosis": "recoverable",
-        "reason": "resume",
-        "expected": {},
-        "metadata": metadata,
-    }))
-
-    assert "metadata must contain only agent_memory" in out["error"]
-
-
-def test_resolver_memory_metadata_sanitizer_drops_forged_hermes_recall():
-    from tools import kanban_tools as kt
-
-    metadata = _canonical_memory_metadata_for_tools()
-    metadata["agent_memory"]["hermes_recall"] = {"forged": True}
-
-    canonical = kt._canonical_agent_memory_metadata(metadata)
-
-    assert canonical is not None
-    assert "hermes_recall" not in canonical["agent_memory"]
-    assert set(canonical["agent_memory"]) == {"recall", "write"}
 
 
 def test_product_block_prefers_board_resolver_profile(monkeypatch, tmp_path):
@@ -3677,6 +3297,38 @@ def test_board_param_rejects_invalid_slug(multi_board_env):
     assert "invalid board slug" in err, f"got {err!r}"
 
 
+
+def test_resolve_and_block_schemas_have_no_caller_metadata():
+    from tools import kanban_tools as kt
+
+    for schema in (kt.KANBAN_RESOLVE_SCHEMA, kt.KANBAN_BLOCK_SCHEMA):
+        assert "metadata" not in schema["parameters"]["properties"]
+
+
+def test_complete_schema_still_accepts_metadata():
+    from tools import kanban_tools as kt
+
+    metadata = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]["metadata"]
+    assert metadata["type"] == "object"
+
+
+
+def test_block_stamps_trusted_worker_session_without_caller_metadata(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-trusted")
+    result = json.loads(kt._handle_block({"reason": "need clarification"}))
+    assert result["ok"] is True
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+    assert run is not None
+    assert run.metadata["worker_session_id"] == "session-trusted"
+
+
 def test_board_param_in_all_schemas():
     """Every kanban_* tool schema must expose an optional ``board``
     parameter. This pins the contract surfaced to the LLM — adding a
@@ -3693,8 +3345,6 @@ def test_board_param_in_all_schemas():
         kt.KANBAN_CREATE_SCHEMA,
         kt.KANBAN_UNBLOCK_SCHEMA,
         kt.KANBAN_LINK_SCHEMA,
-        kt.KANBAN_AGENT_MEMORY_RECALL_SCHEMA,
-        kt.KANBAN_AGENT_MEMORY_WRITE_SCHEMA,
         kt.KANBAN_ATTACH_SCHEMA,
         kt.KANBAN_ATTACH_URL_SCHEMA,
         kt.KANBAN_ATTACHMENTS_SCHEMA,

@@ -124,7 +124,7 @@ def test_runner_replaces_home_and_hermes_home_before_test_process(tmp_path):
         'if [ "${1:-}" = "-c" ]; then exit 0; fi\n'
         'printf "TEST_HOME=%s\\n" "$HOME"\n'
         'printf "TEST_HERMES_HOME=%s\\n" "$HERMES_HOME"\n'
-        'printf "TEST_MEMORY_VAULT=%s\\n" "${HERMES_AGENT_MEMORY_VAULT:-}"\n',
+        'printf "TEST_LIVE_STATE=%s\\n" "${HERMES_LIVE_STATE_SENTINEL:-}"\n',
         encoding="utf-8",
     )
     python.chmod(0o755)
@@ -134,7 +134,7 @@ def test_runner_replaces_home_and_hermes_home_before_test_process(tmp_path):
     env = {
         "HOME": str(operator_home),
         "PATH": os.environ["PATH"],
-        "HERMES_AGENT_MEMORY_VAULT": str(operator_home / "live-memory"),
+        "HERMES_LIVE_STATE_SENTINEL": str(operator_home / "live-state"),
     }
     result = subprocess.run(
         ["bash", str(scripts / "run_tests.sh")],
@@ -154,4 +154,4 @@ def test_runner_replaces_home_and_hermes_home_before_test_process(tmp_path):
     assert Path(lines["TEST_HOME"]) != operator_home
     assert Path(lines["TEST_HOME"]).resolve() == Path(lines["TEST_HOME"])
     assert Path(lines["TEST_HERMES_HOME"]) == Path(lines["TEST_HOME"]) / ".hermes"
-    assert lines["TEST_MEMORY_VAULT"] == ""
+    assert lines["TEST_LIVE_STATE"] == ""

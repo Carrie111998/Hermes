@@ -148,7 +148,7 @@ cleanup_test_home() {
 trap cleanup_test_home EXIT
 
 # env -i: start with empty environment, opt-in only what we need.
-# No credential or live Agent Memory path can leak — it would have to be
+# No credential or live operator-state path can leak — it would have to be
 # explicitly added here.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (isolated HOME/HERMES_HOME; TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
