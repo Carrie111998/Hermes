@@ -1,0 +1,38 @@
+manifest_version: 1
+
+name: shinka-osint
+description: MILSPEC-grade OSINT intelligence and evolutionary scenario analysis via ShinkaEvolve-OSINT.
+source: https://github.com/zapabob/ShinkaEvolve-OSINT
+
+transport:
+  type: stdio
+  command: "python"
+  args:
+    - "${INSTALL_DIR}/shinka_mcp_server.py"
+
+install:
+  type: git
+  url: https://github.com/zapabob/ShinkaEvolve-OSINT.git
+  ref: da6eae82c4d392d2ee4b5d4c52adc73e3daa12f4
+
+auth:
+  type: none
+  env:
+    - name: SHINKA_OSINT_ROOT
+      prompt: "Path to ShinkaEvolve-OSINT repository"
+      default: "${INSTALL_DIR}"
+      required: false
+      secret: false
+
+tools:
+  default_enabled:
+    - shinka_osint_status
+    - shinka_osint_list_scenarios
+    - shinka_osint_analyze
+    - shinka_osint_briefing
+    - shinka_osint_verify
+    - shinka_osint_audit
+
+post_install: |
+  ShinkaEvolve-OSINT MCP server is installed!
+  It provides MILSPEC-grade OSINT intelligence, threat analysis, and scenario briefings.

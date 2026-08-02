@@ -5,3 +5,7 @@ author: zapabob + Hermes Agent
 kind: backend
 provides_web_providers:
   - cloakbrowser
+mcp_servers:
+  - name: cloakbrowser
+    module: plugins.web.cloakbrowser.mcp_server
+

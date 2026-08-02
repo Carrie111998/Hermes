@@ -1,0 +1,35 @@
+manifest_version: 1
+
+name: cloakbrowser
+description: Stealth Chromium web search + page extraction MCP server powered by CloakBrowser.
+source: https://github.com/CloakHQ/cloakbrowser
+
+transport:
+  type: stdio
+  command: "python"
+  args:
+    - "-m"
+    - "plugins.web.cloakbrowser.mcp_server"
+
+auth:
+  type: none
+  env:
+    - name: CLOAKBROWSER_PROXY
+      prompt: "Optional HTTP/S proxy URL (e.g. http://proxy.example.com:8080)"
+      required: false
+      secret: true
+    - name: CLOAKBROWSER_HEADLESS
+      prompt: "Headless mode ('true' or 'false')"
+      default: "true"
+      required: false
+      secret: false
+
+tools:
+  default_enabled:
+    - cloakbrowser_search
+    - cloakbrowser_extract
+    - cloakbrowser_navigate
+
+post_install: |
+  CloakBrowser MCP server is installed!
+  It provides stealth Chromium web search and page text extraction without API keys.

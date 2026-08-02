@@ -14,3 +14,9 @@ provides_tools:
   - shinka_osint_briefing
   - shinka_osint_verify
   - shinka_osint_audit
+mcp_servers:
+  - name: shinka-osint
+    command: "python"
+    args:
+      - "vendor/shinka-osint/shinka_mcp_server.py"
+
