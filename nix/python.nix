@@ -66,6 +66,9 @@ let
           nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
             final.setuptools
           ] ++ lib.optionals stdenv.isLinux [ linuxHeaders ];
+          preBuild = (old.preBuild or "") + ''
+            export CPATH=${linuxHeaders}/include''${CPATH:+:$CPATH}
+          '';
         });
       };
 

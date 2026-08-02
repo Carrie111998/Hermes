@@ -427,3 +427,10 @@ def test_cua_fleet_nix_build_provides_evdev_kernel_headers() -> None:
     source = python_nix.read_text()
     assert "linuxHeaders" in source
     assert "evdev = prev.evdev.overrideAttrs" in source
+
+
+def test_cua_fleet_nix_build_sets_evdev_header_search_path() -> None:
+    from pathlib import Path
+
+    python_nix = Path(__file__).parents[2] / "nix" / "python.nix"
+    assert "export CPATH=${linuxHeaders}/include" in python_nix.read_text()
