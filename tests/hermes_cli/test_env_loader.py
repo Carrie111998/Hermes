@@ -454,11 +454,13 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
 
 
 def test_desktop_injected_session_token_survives_dotenv_load(tmp_path, monkeypatch):
-    """An env-injected HERMES_DASHBOARD_SESSION_TOKEN must win over a .env value.
+    """An Electron-injected HERMES_DASHBOARD_SESSION_TOKEN must win over .env.
 
     The .env contains a stale persisted token from a previous update; the
     spawn-time injected token is fresh and per-launch, so it must survive
-    the override=True .env load.
+    the override=True .env load. Electron always pairs the token with
+    HERMES_DESKTOP='1' (apps/desktop/electron/main.ts), which is the
+    discriminator that authorizes the save/restore.
     """
     home = tmp_path / "hermes"
     home.mkdir()
@@ -469,6 +471,7 @@ def test_desktop_injected_session_token_survives_dotenv_load(tmp_path, monkeypat
     )
 
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", injected)
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
 
     load_hermes_dotenv(hermes_home=home)
 
@@ -490,10 +493,35 @@ def test_session_token_from_dotenv_when_not_injected(tmp_path, monkeypatch):
     )
 
     monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
 
     load_hermes_dotenv(hermes_home=home)
 
     assert os.getenv("HERMES_DASHBOARD_SESSION_TOKEN") == "persisted-token"
+
+
+def test_unmarked_inherited_token_is_overridden_by_dotenv(tmp_path, monkeypatch):
+    """A shell-exported token WITHOUT HERMES_DESKTOP keeps documented semantics.
+
+    The loader rule is that a profile .env overrides stale shell exports.
+    Only Electron-spawned processes (HERMES_DESKTOP='1') get the injected
+    token preserved; an unmarked inherited token must still be overridden
+    by the .env value so the documented rule is not silently changed for
+    non-desktop runs.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_DASHBOARD_SESSION_TOKEN=dotenv-wins\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "shell-exported-token")
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("HERMES_DASHBOARD_SESSION_TOKEN") == "dotenv-wins"
 
 
 def test_desktop_token_preservation_does_not_affect_other_keys(tmp_path, monkeypatch):
@@ -512,6 +540,7 @@ def test_desktop_token_preservation_does_not_affect_other_keys(tmp_path, monkeyp
 
     monkeypatch.setenv("OPENAI_BASE_URL", "https://stale.example/v1")
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "injected-fresh-token")
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
 
     load_hermes_dotenv(hermes_home=home)
 

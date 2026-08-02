@@ -486,14 +486,18 @@ def load_hermes_dotenv(
 
     if user_env.exists():
         # HERMES_DASHBOARD_SESSION_TOKEN is injected by the desktop shell at
-        # process spawn time. The user .env may contain a *stale* persisted
-        # value from a previous update. Loading with override=True would
-        # clobber the injected token, breaking the desktop↔gateway WebSocket
-        # auth handshake. Save/restore it around the .env load so the injected
-        # value (if present) always wins.
+        # process spawn time, always paired with HERMES_DESKTOP='1' (both
+        # spawn paths in apps/desktop/electron/main.ts). The user .env may
+        # contain a *stale* persisted value from a previous update. Loading
+        # with override=True would clobber the injected token, breaking the
+        # desktop↔gateway WebSocket auth handshake. Save/restore it around
+        # the .env load, gated on the desktop marker so an unmarked token
+        # (plain shell export) keeps the documented ".env overrides stale
+        # shell exports" rule.
         _desktop_session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
+        _is_desktop_spawn = os.environ.get("HERMES_DESKTOP") == "1"
         _load_dotenv_with_fallback(user_env, override=True)
-        if _desktop_session_token is not None:
+        if _is_desktop_spawn and _desktop_session_token is not None:
             os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] = _desktop_session_token
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
