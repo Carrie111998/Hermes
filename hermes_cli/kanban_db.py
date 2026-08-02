@@ -5835,6 +5835,24 @@ def promote_task(
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
+        # Vacuous-satisfaction guard (t_4f14b90d), sibling to the one in
+        # recompute_ready. ``unsatisfied`` is computed as [] when ``parents``
+        # is empty, which reads as "nothing to refuse" — correct for a
+        # genuinely standalone task, but wrong for a task that only landed
+        # in todo/blocked because it declared a dependency wait
+        # (kanban_block(kind="dependency")) whose parent link is now
+        # transiently or permanently missing (link churn). Silently
+        # promoting that case defeats the exact safety check this
+        # function's docstring promises ("refuses to promote if any parent
+        # dep is not in a terminal state"). Refuse it the same way an
+        # explicit unsatisfied parent would be refused; --force still
+        # overrides, same as any other refusal path here.
+        if not parents and _is_dependency_wait(conn, task_id):
+            return False, (
+                f"task {task_id} is a dependency wait with no live parent "
+                f"link (link missing/dropped, not satisfied) "
+                f"(use --force to override)"
+            )
         unsatisfied = [
             p["id"] for p in parents
             if p["status"] not in ("done", "archived")

@@ -194,6 +194,42 @@ def test_standalone_todo_still_promotes_on_empty_parents(kanban_home: Path) -> N
         assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_promote_task_refuses_dependency_wait_with_missing_parent(
+    kanban_home: Path,
+) -> None:
+    """``promote_task`` (the manual/CLI promotion path) shares the same
+    vacuous-emptyset shape as ``recompute_ready``: it computes
+    ``unsatisfied`` from the live parent-link query, and an empty parent
+    set produces an empty ``unsatisfied`` list, which reads as "nothing to
+    refuse." For a dependency-waiting card whose parent link was dropped,
+    that must NOT translate into an unforced promotion — its docstring
+    promises to refuse promotion while any parent dep is unsatisfied, and
+    a missing link is not a satisfied dependency. This is the sibling
+    promotion trigger named in the t_4f545e24 audit requirement."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.block_task(conn, child, reason="wait", kind="dependency")
+        assert kb.get_task(conn, child).status == "todo"
+
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM task_links WHERE child_id=?", (child,))
+
+        ok, reason = kb.promote_task(conn, child, actor="operator")
+        assert ok is False, (
+            "a dependency wait with a dropped parent link must be refused, "
+            "not silently promoted on an empty (vacuously satisfied) set"
+        )
+        assert reason is not None
+        assert kb.get_task(conn, child).status == "todo"
+
+        # --force still overrides, same as any other refusal on this path.
+        ok, reason = kb.promote_task(conn, child, actor="operator", force=True)
+        assert ok is True
+        assert kb.get_task(conn, child).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------
