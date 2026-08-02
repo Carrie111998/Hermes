@@ -277,3 +277,49 @@ def test_config_optional_env_registry_resolves_providers_only_on_first_read() ->
         "before": {"discovered": False, "registry": []},
         "after": {"discovered": True, "category": "provider", "password": True},
     }
+
+
+def test_conversation_compression_import_keeps_provider_discovery_lazy() -> None:
+    program = textwrap.dedent(
+        f"""
+        import json
+        import sys
+
+        sys.path.insert(0, {str(PROJECT_ROOT)!r})
+        import providers
+        import agent.conversation_compression
+
+        result = {{
+            "auxiliary_client_imported": "agent.auxiliary_client" in sys.modules,
+            "providers_discovered": providers._discovered,
+            "provider_registry": sorted(providers._REGISTRY),
+            "provider_aliases": sorted(providers._ALIASES),
+        }}
+        print({RESULT_PREFIX!r} + json.dumps(result, sort_keys=True))
+        """
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONHOME", "PYTHONPATH"}
+    }
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", program],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result_line = next(
+        line for line in completed.stdout.splitlines() if line.startswith(RESULT_PREFIX)
+    )
+    result = json.loads(result_line.removeprefix(RESULT_PREFIX))
+    assert result == {
+        "auxiliary_client_imported": False,
+        "provider_aliases": [],
+        "provider_registry": [],
+        "providers_discovered": False,
+    }

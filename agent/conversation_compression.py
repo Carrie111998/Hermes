@@ -43,7 +43,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
@@ -1853,6 +1852,12 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # Keep this import at the execution boundary. ``conversation_compression``
+    # is imported by replay/turn helpers during privileged gateway bootstrap;
+    # importing the auxiliary runtime at module scope reaches credential_pool
+    # and provider discovery before canonical config validation.
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
