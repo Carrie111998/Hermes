@@ -135,7 +135,6 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
     _configure_mode(monkeypatch, tmp_path, "delete")
     _disable_vulnerable_gate(monkeypatch)
 
-    from agent import verification_evidence
     from cron import executions
     from gateway import delivery_ledger
     from gateway.platforms.api_server import ResponseStore
@@ -150,7 +149,6 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
     for name, connect in (
         ("async_delegation", async_delegation._connect),
         ("delivery_ledger", delivery_ledger._connect),
-        ("verification_evidence", verification_evidence._connect),
     ):
         conn = connect()
         try:
@@ -217,7 +215,6 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
     assert observed == {
         "async_delegation": "delete",
         "delivery_ledger": "delete",
-        "verification_evidence": "delete",
         "cron_executions": "delete",
         "discord_recovery": "delete",
         "session_db": "delete",
