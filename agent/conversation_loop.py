@@ -1045,8 +1045,14 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
         effective = sp
+        _ephemeral_parts = []
+        _ts = getattr(agent, "_current_turn_timestamp", "") or ""
+        if _ts:
+            _ephemeral_parts.append(_ts)
         if agent.ephemeral_system_prompt:
-            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+            _ephemeral_parts.append(agent.ephemeral_system_prompt)
+        if _ephemeral_parts:
+            effective = (effective + "\n\n" + "\n\n".join(_ephemeral_parts)).strip()
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1477,6 +1483,23 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # ── Per-turn clock ──
+    # Stamp the current time ONCE per turn as a transient attribute (never
+    # persisted, never cached). The system prompt itself must stay
+    # byte-stable for the provider prefix cache, so the timestamp rides on
+    # the ephemeral system prompt (appended AFTER the cached prefix at
+    # API-call time). Dedicated attribute — do NOT mutate
+    # agent.ephemeral_system_prompt: on a cached gateway agent that would
+    # stack "ts2\nts1\nbase" across turns.
+    try:
+        from hermes_time import now as _hermes_now
+        _ts = _hermes_now()
+        agent._current_turn_timestamp = (
+            f"Current time: {_ts.strftime('%A %Y-%m-%d %H:%M %Z')}"
+        )
+    except Exception:
+        agent._current_turn_timestamp = ""
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -1777,8 +1800,19 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
+        # Per-turn timestamp + persistent ephemeral prompt, both appended
+        # AFTER the cached prefix so the byte-stable system prompt is
+        # untouched. The timestamp is a transient per-turn attribute set in
+        # run_conversation (never persisted, never stacked on the persistent
+        # ephemeral prompt).
+        _ephemeral_parts = []
+        _ts = getattr(agent, "_current_turn_timestamp", "") or ""
+        if _ts:
+            _ephemeral_parts.append(_ts)
         if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+            _ephemeral_parts.append(agent.ephemeral_system_prompt)
+        if _ephemeral_parts:
+            effective_system = (effective_system + "\n\n" + "\n\n".join(_ephemeral_parts)).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
