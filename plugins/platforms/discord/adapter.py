@@ -168,8 +168,10 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 try:
     from .ffmpeg_utils import resolve_ffmpeg_executable
+    from .voice_interruption import AckGrant, VoiceInterruptionArbiter
 except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
+    from voice_interruption import AckGrant, VoiceInterruptionArbiter
 
 from gateway.config import Platform, PlatformConfig
 
@@ -1292,11 +1294,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_streaming_kws_cfg = self._load_voice_streaming_kws_config()
         self._voice_streaming_kws_manager = None
         self._voice_streaming_kws_loop = None
-        self._voice_streaming_kws_live_tokens: Dict[Tuple[int, int], float] = {}
         self._voice_playback_locks: Dict[int, asyncio.Lock] = {}
         self._voice_playback_states: Dict[int, _VoicePlaybackState] = {}
         self._voice_playback_serial = 0
-        self._voice_barge_in_claims: set[Tuple[int, int]] = set()
+        self._voice_interruption_arbiter = VoiceInterruptionArbiter()
         self._voice_barge_in_ack_indices: Dict[str, int] = {
             "stop": 0,
             "follow_up": 0,
@@ -4226,7 +4227,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 "follow_up_ack_phrases": _ack_phrases("follow_up_ack_phrases"),
             }
         except Exception as e:
-            logger.debug("Could not load discord.voice_barge_in config: %s", e)
+            logger.debug(
+                "Could not load discord.voice_barge_in config type=%s",
+                type(e).__name__,
+            )
             return defaults
 
     def _load_voice_streaming_kws_config(self):
@@ -4250,7 +4254,10 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return StreamingKwsConfig.from_mapping(raw)
         except Exception as exc:
-            logger.debug("Could not load Discord streaming KWS config: %s", exc)
+            logger.debug(
+                "Could not load Discord streaming KWS config type=%s",
+                type(exc).__name__,
+            )
             return StreamingKwsConfig()
 
     def _voice_barge_in_enabled(self) -> bool:
@@ -4282,11 +4289,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         manager = getattr(self, "_voice_streaming_kws_manager", None)
         if manager is not None:
-            if manager.snapshot_stats().get("startup_failed"):
-                manager.close()
-                self._voice_streaming_kws_manager = None
-            else:
+            state = str(manager.snapshot_stats().get("state") or "")
+            if state in {"STARTING", "RUNNING"}:
                 return manager
+            # FAILED/CLOSING/CLOSED is terminal for this receiver lifetime.
+            # Do not create a second manager while receiver callbacks may still
+            # retain the original instance; a fresh join after explicit close
+            # will clear the field and create the next manager.
+            return None
         try:
             from .streaming_kws import DiscordStreamingKwsManager
 
@@ -4330,11 +4340,7 @@ class DiscordAdapter(BasePlatformAdapter):
         token = int(event.get("token") or 0)
         user_id = int(event.get("user_id") or 0)
         state = getattr(self, "_voice_playback_states", {}).get(guild_id)
-        active = bool(
-            state is not None
-            and state.token == token
-            and not state.interrupted.is_set()
-        )
+        active = bool(state is not None and state.token == token)
         guild = self._client.get_guild(guild_id) if self._client is not None else None
         authorized = bool(
             user_id
@@ -4360,27 +4366,11 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if effective_shadow or not active or not authorized:
             return
-        if not self._claim_voice_barge_in(guild_id, token):
+        grant = self._claim_voice_barge_in(guild_id, token, "streaming")
+        if grant is None:
             return
-        now = time.monotonic()
-        live_tokens = getattr(self, "_voice_streaming_kws_live_tokens", None)
-        if live_tokens is None:
-            live_tokens = {}
-            self._voice_streaming_kws_live_tokens = live_tokens
-        for key, detected_at in tuple(live_tokens.items()):
-            if now - detected_at > 30.0:
-                live_tokens.pop(key, None)
-        live_tokens[(guild_id, token)] = now
         interrupted = self._interrupt_voice_playback(guild_id, token)
-        if interrupted:
-            cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
-            if cfg.get("ack_enabled") and cfg.get("stop_ack_phrases"):
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = getattr(self, "_voice_streaming_kws_loop", None)
-                if loop is not None and not loop.is_closed():
-                    loop.create_task(self._play_voice_barge_in_ack(guild_id, "stop"))
+        self._schedule_voice_barge_in_ack(grant)
         logger.info(
             "Discord streaming KWS accepted playback=%s interrupted=%s",
             token,
@@ -4418,7 +4408,6 @@ class DiscordAdapter(BasePlatformAdapter):
         manager = getattr(self, "_voice_streaming_kws_manager", None)
         self._voice_streaming_kws_manager = None
         self._voice_streaming_kws_loop = None
-        getattr(self, "_voice_streaming_kws_live_tokens", {}).clear()
         if manager is not None:
             manager.close()
 
@@ -4431,7 +4420,11 @@ class DiscordAdapter(BasePlatformAdapter):
             value = int(raw)
             return max(minimum, value)
         except Exception as e:
-            logger.debug("Could not load discord.%s config: %s", key, e)
+            logger.debug(
+                "Could not load discord.%s config type=%s",
+                key,
+                type(e).__name__,
+            )
             return default
 
     def _load_voice_timeout(self) -> int:
@@ -4499,6 +4492,13 @@ class DiscordAdapter(BasePlatformAdapter):
             return floor
         return max(floor, duration + float(self.PLAYBACK_TIMEOUT_PADDING))
 
+    def _voice_interruption(self) -> VoiceInterruptionArbiter:
+        arbiter = getattr(self, "_voice_interruption_arbiter", None)
+        if not isinstance(arbiter, VoiceInterruptionArbiter):
+            arbiter = VoiceInterruptionArbiter()
+            self._voice_interruption_arbiter = arbiter
+        return arbiter
+
     def _begin_voice_playback(self, guild_id: int) -> _VoicePlaybackState:
         states = getattr(self, "_voice_playback_states", None)
         if not isinstance(states, dict):
@@ -4514,24 +4514,68 @@ class DiscordAdapter(BasePlatformAdapter):
         ) + 1
         state = _VoicePlaybackState(self._voice_playback_serial)
         states[guild_id] = state
+        self._voice_interruption().open_epoch(guild_id, state.token)
         return state
 
-    def _claim_voice_barge_in(self, guild_id: int, playback_token: int) -> bool:
-        claims = getattr(self, "_voice_barge_in_claims", None)
-        if not isinstance(claims, set):
-            claims = set()
-            self._voice_barge_in_claims = claims
-        claim = (guild_id, playback_token)
-        if claim in claims:
-            return False
-        claims.add(claim)
-        if len(claims) > 128:
-            newest = sorted(claims, key=lambda item: item[1], reverse=True)[:64]
-            claims.clear()
-            claims.update(newest)
-        return True
+    def _claim_voice_barge_in(
+        self,
+        guild_id: int,
+        playback_token: int,
+        source: str,
+    ) -> Optional[AckGrant]:
+        state = getattr(self, "_voice_playback_states", {}).get(guild_id)
+        if (
+            state is None
+            or state.token != playback_token
+            or state.interrupted.is_set()
+        ):
+            # Physical playback identity is an independent fail-closed guard.
+            # Revoke any orphaned arbiter epoch for this token rather than
+            # granting a detached ACK against missing transport state.
+            self._voice_interruption().playback_finished(guild_id, playback_token)
+            return None
+        return self._voice_interruption().claim_wake(
+            guild_id,
+            playback_token,
+            source,
+        )
 
-    async def _play_voice_barge_in_ack(self, guild_id: int, kind: str) -> bool:
+    def _schedule_voice_barge_in_ack(self, grant: AckGrant) -> None:
+        """Bind one detached ACK task to its exact epoch-owned grant."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_voice_streaming_kws_loop", None)
+        if loop is None or loop.is_closed():
+            self._voice_interruption().complete_ack(grant)
+            return
+        task = loop.create_task(self._run_voice_barge_in_ack(grant))
+        if not self._voice_interruption().bind_ack_task(grant, task):
+            task.cancel()
+            return
+        task.add_done_callback(_consume_background_task_result)
+
+    async def _run_voice_barge_in_ack(self, grant: AckGrant) -> bool:
+        """Run the sole ACK authorized by ``grant`` and then terminate it."""
+        arbiter = self._voice_interruption()
+        if not arbiter.validate_grant(grant):
+            return False
+        try:
+            return await self._play_voice_barge_in_ack(
+                grant.guild_id,
+                "stop",
+                grant=grant,
+            )
+        finally:
+            arbiter.complete_ack(grant)
+
+    async def _play_voice_barge_in_ack(
+        self,
+        guild_id: int,
+        kind: str,
+        *,
+        grant: Optional[AckGrant] = None,
+    ) -> bool:
         """Play the next configured barge-in ACK without blocking tail routing.
 
         Stop-only and follow-up acknowledgements keep independent deterministic
@@ -4562,12 +4606,19 @@ class DiscordAdapter(BasePlatformAdapter):
         indices[kind] = index + 1
 
         try:
-            return bool(await self.play_ack_in_voice(guild_id, phrase))
+            if grant is not None and not self._voice_interruption().validate_grant(grant):
+                return False
+            return bool(
+                await self.play_ack_in_voice(
+                    guild_id,
+                    phrase,
+                    interruption_grant=grant,
+                )
+            )
         except Exception:
             logger.debug(
                 "Discord voice barge-in %s acknowledgement failed",
                 kind,
-                exc_info=True,
             )
             return False
 
@@ -4585,15 +4636,21 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 if mixer.speech_active:
                     mixer.stop_speech()
-            except Exception:
-                logger.debug("Failed to stop Discord mixer speech", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to stop Discord mixer speech type=%s",
+                    type(exc).__name__,
+                )
         else:
             vc = getattr(self, "_voice_clients", {}).get(guild_id)
             try:
                 if vc is not None and vc.is_playing():
                     vc.stop()
-            except Exception:
-                logger.debug("Failed to stop Discord voice playback", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to stop Discord voice playback type=%s",
+                    type(exc).__name__,
+                )
         return True
 
     async def _wait_for_voice_playback(
@@ -4640,7 +4697,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if path and os.path.isfile(path):
             pcm = decode_to_pcm(path)
             if not pcm:
-                logger.warning("Ambient file %s failed to decode; using synth bed", path)
+                logger.warning(
+                    "Ambient voice file failed to decode; using synth bed"
+                )
         if not pcm:
             pcm = synth_ambient_pcm()
         self._ambient_pcm_cache = pcm
@@ -4668,7 +4727,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         def _after(error):
             if error:
-                logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
+                logger.error(
+                    "Voice mixer stream error guild=%d type=%s",
+                    guild_id,
+                    type(error).__name__,
+                )
 
         if vc.is_playing():
             vc.stop()
@@ -4697,7 +4760,13 @@ class DiscordAdapter(BasePlatformAdapter):
             from .voice_mixer import BYTES_PER_MS
         return b"\x00" * (BYTES_PER_MS * lead_ms)
 
-    async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
+    async def play_ack_in_voice(
+        self,
+        guild_id: int,
+        phrase: Optional[str] = None,
+        *,
+        interruption_grant: Optional[AckGrant] = None,
+    ) -> bool:
         """Synthesize an acknowledgement on the shared voice playback path.
 
         The no-phrase tool-progress form remains gated by ``voice_fx`` and the
@@ -4706,6 +4775,11 @@ class DiscordAdapter(BasePlatformAdapter):
         legacy playback while preserving serialization, cancellation, and
         receiver capture boundaries.
         """
+        if (
+            interruption_grant is not None
+            and not self._voice_interruption().validate_grant(interruption_grant)
+        ):
+            return False
         if phrase is None:
             if not self._voice_fx_cfg.get("ack_enabled"):
                 return False
@@ -4736,12 +4810,26 @@ class DiscordAdapter(BasePlatformAdapter):
             actual = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual):
                 return False
+            if (
+                interruption_grant is not None
+                and not self._voice_interruption().validate_grant(interruption_grant)
+            ):
+                return False
             # Use the same serialized playback/cancellation path as final TTS.
             # Direct mixer insertion would bypass playback tokens, strict
             # phrase gating, disconnect cleanup, and receiver echo prevention.
-            return await self.play_in_voice_channel(guild_id, actual)
+            if (
+                interruption_grant is not None
+                and not self._voice_interruption().validate_grant(interruption_grant)
+            ):
+                return False
+            return await self.play_in_voice_channel(
+                guild_id,
+                actual,
+                interruption_grant=interruption_grant,
+            )
         except Exception as e:
-            logger.debug("play_ack_in_voice failed: %s", e)
+            logger.debug("play_ack_in_voice failed type=%s", type(e).__name__)
             return False
         finally:
             for p in {audio_path, locals().get("actual")}:
@@ -4834,7 +4922,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._voice_listen_loop(guild_id)
                 )
             except Exception as e:
-                logger.warning("Voice receiver failed to start: %s", e)
+                logger.warning(
+                    "Voice receiver failed to start type=%s",
+                    type(e).__name__,
+                )
 
             # Phase 3: install the continuous mixer (ambient bed + ducked
             # speech).  Best-effort — if it fails we fall back to the legacy
@@ -4843,12 +4934,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 try:
                     await self._install_voice_mixer(guild_id, vc)
                 except Exception as e:
-                    logger.warning("Voice mixer failed to start: %s", e)
+                    logger.warning(
+                        "Voice mixer failed to start type=%s",
+                        type(e).__name__,
+                    )
 
             return True
 
+    def _terminate_voice_interruption_scope(
+        self,
+        guild_id: int,
+        reason: str,
+    ) -> tuple[Any, ...]:
+        """Revoke grants, then cancel detached ACK tasks outside arbiter locks."""
+        tasks = self._voice_interruption().terminate_scope(guild_id, reason)
+        for task in tasks:
+            task.cancel()
+        return tasks
+
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
+        self._terminate_voice_interruption_scope(guild_id, "leave")
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             playback_state = getattr(self, "_voice_playback_states", {}).get(guild_id)
             if playback_state is not None:
@@ -4899,7 +5005,13 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
-    async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
+    async def play_in_voice_channel(
+        self,
+        guild_id: int,
+        audio_path: str,
+        *,
+        interruption_grant: Optional[AckGrant] = None,
+    ) -> bool:
         """Play an audio file in the connected voice channel.
 
         When the continuous mixer is installed for this guild, the clip is
@@ -4907,6 +5019,17 @@ class DiscordAdapter(BasePlatformAdapter):
         reply can overlap the idle "thinking" loop seamlessly.  Otherwise we
         fall back to the legacy one-shot FFmpegPCMAudio path.
         """
+        def _grant_is_live() -> bool:
+            return bool(
+                interruption_grant is None
+                or (
+                    interruption_grant.guild_id == guild_id
+                    and self._voice_interruption().validate_grant(interruption_grant)
+                )
+            )
+
+        if not _grant_is_live():
+            return False
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return False
@@ -4920,8 +5043,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # A queued playback may have waited while /voice leave disconnected
         # and removed this client. Re-check after acquiring the per-guild lock
-        # so stale queued TTS cannot revive against an old VoiceClient.
-        if self._voice_clients.get(guild_id) is not vc or not vc.is_connected():
+        # so stale queued TTS cannot revive against an old VoiceClient. ACK
+        # grants are revalidated here because preparation precedes this lock.
+        if (
+            self._voice_clients.get(guild_id) is not vc
+            or not vc.is_connected()
+            or not _grant_is_live()
+        ):
             playback_lock.release()
             return False
 
@@ -4934,9 +5062,17 @@ class DiscordAdapter(BasePlatformAdapter):
             nonlocal playback_state, receiver_capturing, receiver_paused
             if playback_state is not None:
                 return playback_state
-            playback_state = self._begin_voice_playback(guild_id)
+            if interruption_grant is not None:
+                # The short ACK remains owned by the claimed original epoch;
+                # it must not open a second interruptible epoch.
+                playback_state = _VoicePlaybackState(interruption_grant.token)
+            else:
+                playback_state = self._begin_voice_playback(guild_id)
             if receiver is not None:
-                if self._voice_barge_in_capture_enabled():
+                if interruption_grant is not None:
+                    receiver.pause()
+                    receiver_paused = True
+                elif self._voice_barge_in_capture_enabled():
                     kws_manager = getattr(self, "_voice_streaming_kws_manager", None)
                     if kws_manager is not None:
                         kws_manager.begin_playback(guild_id, playback_state.token)
@@ -4967,8 +5103,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     from .voice_mixer import decode_to_pcm
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
                 if pcm:
+                    if not _grant_is_live():
+                        return False
                     state = _arm_playback()
                     speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
+                    if not _grant_is_live():
+                        return False
                     mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
                     # Block until the speech child drains so callers serialise
                     # replies (mirrors legacy semantics) but the ambient keeps
@@ -4981,13 +5121,17 @@ class DiscordAdapter(BasePlatformAdapter):
                             break
                         await asyncio.sleep(0.05)
                     return True
-                logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+                logger.warning(
+                    "Mixer decode failed; falling back to legacy playback"
+                )
 
             # ── Legacy one-shot path (no mixer) ─────────────────────────
             state = _arm_playback()
             # Wait for current playback to finish (with timeout)
             wait_start = time.monotonic()
             while vc.is_playing() and not state.interrupted.is_set():
+                if not _grant_is_live():
+                    return False
                 if time.monotonic() - wait_start > playback_timeout:
                     logger.warning("Timed out waiting for previous playback to finish")
                     vc.stop()
@@ -5002,7 +5146,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             def _after(error):
                 if error:
-                    logger.error("Voice playback error: %s", error)
+                    logger.error(
+                        "Voice playback error type=%s",
+                        type(error).__name__,
+                    )
                 loop.call_soon_threadsafe(done.set)
 
             # Prepend a short lead of silence so the voice socket's warm-up
@@ -5021,6 +5168,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 **ffmpeg_opts,
             )
             source = discord.PCMVolumeTransformer(source, volume=1.0)
+            if not _grant_is_live():
+                return False
             vc.play(source, after=_after)
             completed = await self._wait_for_voice_playback(
                 done,
@@ -5037,6 +5186,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     receiver.end_playback_capture(playback_state.token)
                 elif receiver_paused:
                     receiver.resume()
+            if playback_state is not None:
+                self._voice_interruption().playback_finished(
+                    guild_id,
+                    playback_state.token,
+                )
             states = getattr(self, "_voice_playback_states", None)
             if (
                 isinstance(states, dict)
@@ -5243,7 +5397,10 @@ class DiscordAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error("Voice listen loop error: %s", e, exc_info=True)
+            logger.error(
+                "Voice listen loop error type=%s",
+                type(e).__name__,
+            )
 
     async def _process_voice_input(
         self,
@@ -5256,21 +5413,19 @@ class DiscordAdapter(BasePlatformAdapter):
         """Convert PCM -> WAV -> STT and apply the playback phrase gate."""
         from tools.voice_mode import is_whisper_hallucination
 
-        streaming_live = False
         if playback_token is not None:
-            live_tokens = getattr(self, "_voice_streaming_kws_live_tokens", {})
-            streaming_live = live_tokens.pop((guild_id, playback_token), None) is not None
-            if streaming_live:
-                # Live KWS already interrupted, claimed, and scheduled the one
-                # stop ACK. Its tagged endpoint is not a model turn; only the
-                # next separately spoken, untagged utterance follows normal STT.
-                return
+            streaming_cfg = getattr(self, "_voice_streaming_kws_cfg", None)
+            streaming_batch_live = bool(
+                self._voice_streaming_kws_enabled()
+                and streaming_cfg is not None
+                and not streaming_cfg.shadow_only
+            )
             if not (
                 self._voice_barge_in_enabled()
                 or self._voice_barge_in_monitor_only()
-                or streaming_live
+                or streaming_batch_live
             ):
-                # Streaming shadow and non-matching live audio stay entirely
+                # Playback-tagged audio without an enabled gate stays entirely
                 # in memory: no temporary WAV and no batch/cloud STT request.
                 return
 
@@ -5327,7 +5482,13 @@ class DiscordAdapter(BasePlatformAdapter):
             if playback_token is not None:
                 cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
                 phrases = cfg.get("phrases") or ()
-                live_enabled = self._voice_barge_in_enabled() or streaming_live
+                streaming_cfg = getattr(self, "_voice_streaming_kws_cfg", None)
+                streaming_live_enabled = bool(
+                    self._voice_streaming_kws_enabled()
+                    and streaming_cfg is not None
+                    and not streaming_cfg.shadow_only
+                )
+                live_enabled = self._voice_barge_in_enabled() or streaming_live_enabled
                 monitor_only = self._voice_barge_in_monitor_only()
                 if not (live_enabled or monitor_only):
                     return
@@ -5347,8 +5508,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     matched,
                     len(trailing),
                 )
-                # Fail closed: monitor-only always returns before stale-state,
-                # interruption, acknowledgement, claim, or model routing.
+                # Every playback-tagged utterance is non-conversational.  Batch
+                # STT can claim a wake as a fallback, but trailing words from the
+                # same utterance never become a model turn.
                 if monitor_only:
                     logger.info(
                         "Discord barge-in monitor-only playback=%s matched=%s "
@@ -5358,70 +5520,35 @@ class DiscordAdapter(BasePlatformAdapter):
                         bool(trailing),
                     )
                     return
-
-                current_state = getattr(self, "_voice_playback_states", {}).get(
-                    guild_id
-                )
-                # A playback token is live only while its exact, uninterrupted
-                # state remains installed. Teardown marks interruption before
-                # flushing buffers, making that epoch terminal for every batch
-                # side effect (interrupt, ACK, claim, and model routing).
-                if (
-                    current_state is None
-                    or current_state.token != playback_token
-                    or current_state.interrupted.is_set()
-                ):
-                    logger.debug(
-                        "Discarded stale or terminal Discord barge-in for "
-                        "guild=%s playback=%s current=%s interrupted=%s",
-                        guild_id,
-                        playback_token,
-                        current_state.token if current_state is not None else None,
-                        bool(current_state and current_state.interrupted.is_set()),
-                    )
-                    return
                 if not matched:
                     logger.debug(
                         "Discarded Discord voice captured during playback: no barge-in phrase"
                     )
                     return
-                if not self._claim_voice_barge_in(guild_id, playback_token):
+                grant = self._claim_voice_barge_in(
+                    guild_id,
+                    playback_token,
+                    "batch",
+                )
+                if grant is None:
                     logger.debug(
-                        "Discarded duplicate Discord barge-in for guild=%s playback=%s",
+                        "Discarded stale or duplicate Discord barge-in for "
+                        "guild=%s playback=%s",
                         guild_id,
                         playback_token,
                     )
                     return
 
                 interrupted = self._interrupt_voice_playback(guild_id, playback_token)
-                streaming_cfg = getattr(self, "_voice_streaming_kws_cfg", None)
-                streaming_fallback_stop_only = bool(
-                    self._voice_streaming_kws_enabled()
-                    and streaming_cfg is not None
-                    and not streaming_cfg.shadow_only
-                )
-                usable_characters = len(re.findall(r"\w", trailing, flags=re.UNICODE))
-                min_characters = int(cfg.get("min_trailing_characters", 2) or 2)
-                has_follow_up = bool(
-                    not streaming_fallback_stop_only
-                    and trailing
-                    and usable_characters >= min_characters
-                    and not is_whisper_hallucination(trailing)
-                )
+                self._schedule_voice_barge_in_ack(grant)
                 logger.info(
                     "Discord barge-in accepted playback=%s "
-                    "interrupted=%s follow_up=%s",
+                    "interrupted=%s trailing_discarded=%s",
                     playback_token,
                     interrupted,
-                    has_follow_up,
+                    bool(trailing),
                 )
-                await self._play_voice_barge_in_ack(
-                    guild_id,
-                    "follow_up" if has_follow_up else "stop",
-                )
-                if not has_follow_up:
-                    return
-                transcript = trailing
+                return
             elif is_whisper_hallucination(transcript):
                 return
 

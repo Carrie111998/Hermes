@@ -111,7 +111,9 @@ def _make_adapter(
     }
     adapter._voice_playback_states = {}
     adapter._voice_playback_serial = 0
-    adapter._voice_barge_in_claims = set()
+    from plugins.platforms.discord.voice_interruption import VoiceInterruptionArbiter
+
+    adapter._voice_interruption_arbiter = VoiceInterruptionArbiter()
     adapter._voice_barge_in_ack_indices = {"stop": 0, "follow_up": 0}
     adapter._playback_timeout_for_audio = AsyncMock(return_value=30.0)
     adapter._cancel_voice_timeout = MagicMock()
@@ -135,6 +137,22 @@ async def _process_transcript(adapter, transcript, *, token=None):
             b"pcm",
             playback_token=token,
         )
+
+
+async def _settle_detached_ack() -> None:
+    """Give a newly scheduled ACK task two deterministic loop turns."""
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
+def _assert_ack_call(mock: AsyncMock, guild_id: int, phrase: str) -> None:
+    from plugins.platforms.discord.voice_interruption import AckGrant
+
+    mock.assert_awaited_once()
+    assert mock.await_args is not None
+    args, kwargs = mock.await_args
+    assert args == (guild_id, phrase)
+    assert isinstance(kwargs.get("interruption_grant"), AckGrant)
 
 
 @pytest.mark.asyncio
@@ -195,9 +213,10 @@ async def test_own_name_ack_then_fresh_utterance_uses_normal_voice_input_path():
     playback = adapter._begin_voice_playback(111)
 
     await _process_transcript(adapter, "하나야", token=playback.token)
+    await _settle_detached_ack()
 
     assert playback.interrupted.is_set()
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네.")
     adapter._voice_input_callback.assert_not_awaited()
 
     # Playback cleanup ends the tagged epoch. The next separately spoken input
@@ -412,7 +431,7 @@ async def test_legacy_stop_only_interrupts_playback_without_model_event():
         assert await asyncio.wait_for(play_task, timeout=1) is True
 
     vc.stop.assert_called_once()
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네, 멈출게요.")
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네, 멈출게요.")
     adapter._voice_input_callback.assert_not_awaited()
     assert receiver.pause_calls == 0
     assert receiver.playback_token is None
@@ -420,14 +439,14 @@ async def test_legacy_stop_only_interrupts_playback_without_model_event():
 
 
 @pytest.mark.asyncio
-async def test_mixer_stop_with_trailing_routes_one_clean_input():
+async def test_mixer_wake_tail_is_consumed_then_fresh_utterance_routes_once():
     adapter = _make_adapter(
         ack_enabled=True,
-        follow_up_ack_phrases=("네, 말씀하세요.",),
+        stop_ack_phrases=("네.",),
     )
     events = []
 
-    async def _ack(*_args):
+    async def _ack(*_args, **_kwargs):
         events.append("ack")
         return True
 
@@ -460,9 +479,14 @@ async def test_mixer_stop_with_trailing_routes_one_clean_input():
             token=token,
         )
         assert await asyncio.wait_for(play_task, timeout=1) is True
+        await asyncio.sleep(0)
 
     mixer.stop_speech.assert_called_once()
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네, 말씀하세요.")
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네.")
+    adapter._voice_input_callback.assert_not_awaited()
+
+    await _process_transcript(adapter, "다음 질문에 답해줘")
+
     adapter._voice_input_callback.assert_awaited_once_with(
         guild_id=111,
         user_id=42,
@@ -474,10 +498,10 @@ async def test_mixer_stop_with_trailing_routes_one_clean_input():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ack_result", [False, RuntimeError("TTS failed")])
-async def test_follow_up_ack_failure_fails_open_for_clean_tail(ack_result):
+async def test_ack_failure_still_consumes_the_entire_wake_utterance(ack_result):
     adapter = _make_adapter(
         ack_enabled=True,
-        follow_up_ack_phrases=("네, 말씀하세요.",),
+        stop_ack_phrases=("네, 말씀하세요.",),
     )
     mixer = _Mixer()
     mixer.active = True
@@ -495,13 +519,11 @@ async def test_follow_up_ack_failure_fails_open_for_clean_tail(ack_result):
         token=state.token,
     )
 
+    await _settle_detached_ack()
     assert state.interrupted.is_set()
-    ack_mock.assert_awaited_once_with(111, "네, 말씀하세요.")
-    adapter._voice_input_callback.assert_awaited_once_with(
-        guild_id=111,
-        user_id=42,
-        transcript="다음 질문에 답해줘",
-    )
+    _assert_ack_call(ack_mock, 111, "네, 말씀하세요.")
+    assert isinstance(adapter._voice_input_callback, AsyncMock)
+    adapter._voice_input_callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -551,10 +573,10 @@ async def test_short_trailing_fragment_stops_but_is_not_forwarded():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_barge_for_same_playback_routes_trailing_once():
+async def test_duplicate_barge_for_same_playback_consumes_tail_and_acks_once():
     adapter = _make_adapter(
         ack_enabled=True,
-        follow_up_ack_phrases=("네, 말씀하세요.",),
+        stop_ack_phrases=("네, 말씀하세요.",),
     )
     adapter.play_ack_in_voice = AsyncMock(return_value=True)
     mixer = _Mixer()
@@ -566,13 +588,11 @@ async def test_duplicate_barge_for_same_playback_routes_trailing_once():
     await _process_transcript(adapter, transcript, token=state.token)
     await _process_transcript(adapter, transcript, token=state.token)
 
+    await _settle_detached_ack()
     mixer.stop_speech.assert_called_once()
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네, 말씀하세요.")
-    adapter._voice_input_callback.assert_awaited_once_with(
-        guild_id=111,
-        user_id=42,
-        transcript="날씨 알려줘",
-    )
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네, 말씀하세요.")
+    assert isinstance(adapter._voice_input_callback, AsyncMock)
+    adapter._voice_input_callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -615,7 +635,9 @@ async def test_expired_playback_token_cannot_ack_or_route_after_state_removal():
 
     adapter.play_ack_in_voice.assert_not_awaited()
     adapter._voice_input_callback.assert_not_awaited()
-    assert adapter._voice_barge_in_claims == set()
+    assert adapter._voice_interruption().claim_wake(
+        111, expired.token, "probe"
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -648,8 +670,85 @@ async def test_leave_voice_channel_makes_interrupted_epoch_terminal_before_flush
     assert state.interrupted.is_set()
     adapter.play_ack_in_voice.assert_not_awaited()
     adapter._voice_input_callback.assert_not_awaited()
-    assert adapter._voice_barge_in_claims == set()
+    assert adapter._voice_interruption().claim_wake(
+        111, state.token, "probe"
+    ) is None
     assert adapter._voice_playback_states == {}
+
+
+@pytest.mark.asyncio
+async def test_leave_revokes_detached_ack_before_task_first_runs():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+    )
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+
+    adapter._handle_voice_streaming_kws_detection(
+        {"guild_id": 111, "token": state.token, "user_id": 42}
+    )
+    await adapter.leave_voice_channel(111)
+    await asyncio.sleep(0)
+
+    adapter.play_ack_in_voice.assert_not_awaited()
+    adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_teardown_during_blocked_ack_preparation_suppresses_external_playback():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+    )
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter.play_in_voice_channel = AsyncMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+
+    def _blocked_tts(*, text, output_path):
+        assert text == "네."
+        provider_started.set()
+        assert release_provider.wait(timeout=1)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(b"audio")
+        return json.dumps({"success": True, "file_path": output_path})
+
+    with patch("tools.tts_tool.text_to_speech_tool", side_effect=_blocked_tts):
+        adapter._handle_voice_streaming_kws_detection(
+            {"guild_id": 111, "token": state.token, "user_id": 42}
+        )
+        assert await asyncio.to_thread(provider_started.wait, 1)
+
+        # Revoke while preparation is in flight.  Deliberately delay task.cancel()
+        # so post-provider grant validation, not cancellation luck, is exercised.
+        tasks = adapter._voice_interruption_arbiter.terminate_scope(111, "leave")
+        assert len(tasks) == 1
+        release_provider.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    adapter.play_in_voice_channel.assert_not_awaited()
+    adapter._voice_input_callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -999,11 +1098,11 @@ async def test_streaming_live_detection_acks_once_across_real_playback_cleanup()
 
     assert adapter._voice_playback_states == {}
     await asyncio.sleep(0)
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네.")
 
     # The tagged wake endpoint is consumed without a second ACK or model turn.
     await _process_transcript(adapter, "세린아 잠깐", token=token)
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네.")
     adapter._voice_input_callback.assert_not_awaited()
 
     # A separately spoken utterance after playback cleanup is ordinary input.
@@ -1013,6 +1112,50 @@ async def test_streaming_live_detection_acks_once_across_real_playback_cleanup()
         user_id=42,
         transcript="내일 날씨 알려줘",
     )
+
+
+@pytest.mark.asyncio
+async def test_detector_first_then_batch_share_one_claim_ack_and_never_route_wake_tail():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(
+        enabled=True,
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+    )
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+
+    with patch.object(
+        adapter,
+        "_claim_voice_barge_in",
+        wraps=adapter._claim_voice_barge_in,
+    ) as claim_wake:
+        adapter._handle_voice_streaming_kws_detection(
+            {"guild_id": 111, "token": state.token, "user_id": 42}
+        )
+        await _process_transcript(
+            adapter,
+            "세린아 멈춰, 이 꼬리 명령은 라우팅되면 안 돼",
+            token=state.token,
+        )
+        await asyncio.sleep(0)
+
+    assert [item.args for item in claim_wake.call_args_list] == [
+        (111, state.token, "streaming"),
+        (111, state.token, "batch"),
+    ]
+    mixer.stop_speech.assert_called_once()
+    adapter.play_ack_in_voice.assert_awaited_once()
+    adapter._voice_input_callback.assert_not_awaited()
 
 
 def test_streaming_kws_live_detection_interrupts_and_claims_epoch_once():
@@ -1044,8 +1187,9 @@ def test_streaming_kws_live_detection_interrupts_and_claims_epoch_once():
 
     assert state.interrupted.is_set()
     mixer.stop_speech.assert_called_once()
-    assert adapter._voice_barge_in_claims == {(111, state.token)}
-    assert (111, state.token) in adapter._voice_streaming_kws_live_tokens
+    assert adapter._claim_voice_barge_in(
+        111, state.token, "duplicate-probe"
+    ) is None
     adapter._voice_input_callback.assert_not_awaited()
 
 
@@ -1075,7 +1219,9 @@ async def test_streaming_kws_live_token_consumes_entire_wake_utterance():
     )
 
     adapter._voice_input_callback.assert_not_awaited()
-    assert (111, state.token) not in adapter._voice_streaming_kws_live_tokens
+    assert adapter._claim_voice_barge_in(
+        111, state.token, "duplicate-probe"
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -1102,21 +1248,84 @@ async def test_delayed_streaming_kws_callback_cannot_route_batch_wake_tail():
     state = adapter._begin_voice_playback(111)
 
     # Batch STT reaches the wake endpoint before delayed streaming inference.
-    await _process_transcript(
+    with patch.object(
         adapter,
-        "세린아 멈춰, 날씨 알려줘",
-        token=state.token,
-    )
-    adapter._handle_voice_streaming_kws_detection(
-        {"guild_id": 111, "token": state.token, "user_id": 42}
-    )
-    await asyncio.sleep(0)
+        "_claim_voice_barge_in",
+        wraps=adapter._claim_voice_barge_in,
+    ) as claim_wake:
+        await _process_transcript(
+            adapter,
+            "세린아 멈춰, 날씨 알려줘",
+            token=state.token,
+        )
+        adapter._handle_voice_streaming_kws_detection(
+            {"guild_id": 111, "token": state.token, "user_id": 42}
+        )
+        await asyncio.sleep(0)
 
+    assert [item.args for item in claim_wake.call_args_list] == [
+        (111, state.token, "batch"),
+        (111, state.token, "streaming"),
+    ]
     assert state.interrupted.is_set()
-    assert adapter._voice_barge_in_claims == {(111, state.token)}
     mixer.stop_speech.assert_called_once()
-    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    _assert_ack_call(adapter.play_ack_in_voice, 111, "네.")
     adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.parametrize("terminal_state", ["FAILED", "CLOSING", "CLOSED"])
+def test_terminal_streaming_manager_is_not_recreated_while_receiver_may_hold_it(
+    terminal_state,
+):
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter()
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(enabled=True)
+    manager = MagicMock()
+    manager.snapshot_stats.return_value = {"state": terminal_state}
+    adapter._voice_streaming_kws_manager = manager
+
+    with patch(
+        "plugins.platforms.discord.streaming_kws.DiscordStreamingKwsManager"
+    ) as constructor:
+        assert adapter._ensure_voice_streaming_kws_manager() is None
+
+    constructor.assert_not_called()
+    manager.close.assert_not_called()
+    assert adapter._voice_streaming_kws_manager is manager
+
+
+@pytest.mark.parametrize("live_state", ["STARTING", "RUNNING"])
+def test_live_streaming_manager_is_reused(live_state):
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter()
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(enabled=True)
+    manager = MagicMock()
+    manager.snapshot_stats.return_value = {"state": live_state}
+    adapter._voice_streaming_kws_manager = manager
+
+    assert adapter._ensure_voice_streaming_kws_manager() is manager
+
+
+@pytest.mark.asyncio
+async def test_ack_provider_exception_body_and_traceback_stay_private(caplog):
+    canary = "ACK_PROVIDER_PRIVATE_CANARY_75325"
+    adapter = _make_adapter(
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(side_effect=RuntimeError(canary))
+    state = adapter._begin_voice_playback(111)
+    caplog.set_level("DEBUG")
+
+    await _process_transcript(adapter, "세린아 멈춰", token=state.token)
+    await _settle_detached_ack()
+
+    adapter.play_ack_in_voice.assert_awaited_once()
+    assert canary not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_streaming_kws_rejects_unauthorized_and_stale_detection():
