@@ -2,8 +2,8 @@
 
 These tests exercise the trust gate, JSON parsing, schema validation,
 image input encoding, and the auxiliary-client invocation contract.
-The auxiliary client itself is stubbed via ``make_plugin_llm_for_test``
-so we don't hit real providers.
+Injected callers cover the facade in isolation; patched auxiliary functions
+cover the production lazy-import handoff without hitting real providers.
 """
 
 from __future__ import annotations
@@ -363,6 +363,29 @@ class TestPluginLlmFacade:
             "effort": "high",
         }
 
+    def test_default_sync_transport_forwards_reasoning_config(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_call_llm(**kwargs):
+            captured.update(kwargs)
+            return _fake_response("ok")
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+        )
+
+        result = llm.complete(
+            [{"role": "user", "content": "hi"}],
+            provider="openrouter",
+            model="test-model",
+            reasoning_effort="none",
+        )
+
+        assert result.text == "ok"
+        assert captured["reasoning_config"] == {"enabled": False}
+
     def test_explicit_unknown_reasoning_effort_fails_before_provider_call(self):
         called = False
 
@@ -518,6 +541,37 @@ class TestAsyncSurface:
         assert structured.audit["reasoning_config"] == {
             "enabled": True,
             "effort": "low",
+        }
+
+    def test_default_async_transport_forwards_reasoning_config(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_async_call_llm(**kwargs):
+            captured.update(kwargs)
+            return _fake_response("async ok")
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client.async_call_llm",
+            fake_async_call_llm,
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_trusted_policy("my-plugin"),
+        )
+
+        async def _run() -> PluginLlmCompleteResult:
+            return await llm.acomplete(
+                [{"role": "user", "content": "hi"}],
+                provider="openrouter",
+                model="test-model",
+                reasoning_effort="high",
+            )
+
+        result = asyncio.run(_run())
+        assert result.text == "async ok"
+        assert captured["reasoning_config"] == {
+            "enabled": True,
+            "effort": "high",
         }
 
 

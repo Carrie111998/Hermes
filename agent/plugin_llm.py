@@ -658,13 +658,12 @@ class PluginLlm:
     ) -> PluginLlmCompleteResult:
         """Run a host-owned chat completion against the user's active model.
 
-        ``messages`` is the standard OpenAI shape. ``provider``,
-        ``model``, ``agent_id``, ``profile``, and ``reasoning_effort`` follow the same
-        explicit shape as the host's main config (``model.provider``
-        + ``model.model``). Each is independently gated by
-        ``plugins.entries.<id>.llm.allow_*_override`` (see module
-        docstring). Reasoning effort uses Hermes' provider-neutral levels and
-        does not alter provider or credential authority.
+        ``messages`` is the standard OpenAI shape. ``provider``, ``model``,
+        ``agent_id``, and ``profile`` follow the same explicit shape as the
+        host's main config and retain their independent
+        ``plugins.entries.<id>.llm.allow_*_override`` gates. Reasoning effort
+        uses Hermes' provider-neutral levels as a per-call bound and does not
+        alter provider or credential authority.
         """
         policy = self._policy_loader(self._plugin_id)
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
