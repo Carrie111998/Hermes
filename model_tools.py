@@ -29,7 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
-from tools.registry import discover_builtin_tools, registry
+from tools.registry import coding_tool_gate_refusal, discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -1164,6 +1164,16 @@ def handle_function_call(
             logger.debug("tool_request middleware error: %s", _mw_err)
 
     try:
+        # ``delegate_task`` is also an agent-loop tool.  Only apply the
+        # chat-originated Kanban gate when a session identifies the call as
+        # coming from a chat; calls without that context must retain the
+        # agent-loop interception below.
+        if function_name == "delegate_task" and session_id:
+            refusal = coding_tool_gate_refusal(
+                function_name, session_id=session_id,
+            )
+            if refusal is not None:
+                return refusal
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 

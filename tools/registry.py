@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -25,6 +26,66 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+# These tools can modify the checked-out workspace or launch implementation
+# work.  Keep the gate at the registry boundary so direct dispatches cannot
+# bypass the model-facing tool path.
+_KANBAN_GATED_TOOLS = frozenset({
+    "write_file", "patch", "terminal", "execute_code", "delegate_task",
+})
+_ACTIVE_KANBAN_STATUSES = frozenset({
+    "todo", "ready", "running", "review",
+})
+
+
+def coding_tool_gate_refusal(
+    tool_name: str,
+    *,
+    session_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return a structured refusal when chat coding lacks a Kanban task.
+
+    Dispatcher workers are already scoped by ``HERMES_KANBAN_TASK`` and are
+    trusted to work in that task's workspace.  Chat-originated calls instead
+    need an explicitly associated, nonterminal task row; checking the row by
+    session id avoids accepting an unrelated user's task.
+    """
+    if tool_name not in _KANBAN_GATED_TOOLS:
+        return None
+    if os.environ.get("HERMES_KANBAN_TASK", "").strip():
+        return None
+
+    normalized_session_id = str(session_id or "").strip()
+    if normalized_session_id:
+        try:
+            from hermes_cli import kanban_db
+
+            conn = kanban_db.connect()
+            try:
+                tasks = kanban_db.list_tasks(
+                    conn, session_id=normalized_session_id,
+                )
+            finally:
+                conn.close()
+            if any(task.status in _ACTIVE_KANBAN_STATUSES for task in tasks):
+                return None
+        except Exception:
+            logger.warning(
+                "Kanban coding gate could not verify session %r; refusing %s",
+                normalized_session_id,
+                tool_name,
+                exc_info=True,
+            )
+
+    return json.dumps({
+        "error": (
+            "Code-changing tools and implementation delegation require an "
+            "active Kanban task associated with this chat session."
+        ),
+        "error_type": "kanban_task_required",
+        "tool": tool_name,
+    }, ensure_ascii=False)
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -623,6 +684,11 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        refusal = coding_tool_gate_refusal(
+            name, session_id=kwargs.get("session_id"),
+        )
+        if refusal is not None:
+            return refusal
         try:
             if entry.is_async:
                 from model_tools import _run_async
