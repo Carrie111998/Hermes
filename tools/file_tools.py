@@ -1206,7 +1206,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # touch whitelisted roots. Enforced before any read I/O.
         from tools.profile_fs_guard import check_path_allowed
         _allow_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
-        _allow_err = check_path_allowed(path, base_dir=_allow_base)
+        _allow_err = check_path_allowed(path, base_dir=_allow_base, task_id=task_id)
         if _allow_err:
             return json.dumps({"error": _allow_err})
 
@@ -1667,7 +1667,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     # ── Profile filesystem allowlist (hard rule) ──────────────────────
     from tools.profile_fs_guard import check_path_allowed
     _allow_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
-    _allow_err = check_path_allowed(path, base_dir=_allow_base)
+    _allow_err = check_path_allowed(path, base_dir=_allow_base, task_id=task_id)
     if _allow_err:
         return tool_error(_allow_err)
     if not cross_profile:
@@ -1794,6 +1794,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+    # ── Profile filesystem allowlist (hard rule) ──────────────────────
+    # Applied to EVERY target: the explicit ``path=`` arg plus every V4A
+    # Update/Add/Delete/Move endpoint collected above. patch can create,
+    # overwrite, and delete files, so leaving it unguarded would be a
+    # write-side hole straight through the read/write/search boundary.
+    from tools.profile_fs_guard import check_path_allowed
+
+    for _p in _paths_to_check:
+        _allow_base = None if Path(_p).expanduser().is_absolute() else _resolve_base_dir(task_id)
+        _allow_err = check_path_allowed(_p, base_dir=_allow_base, task_id=task_id)
+        if _allow_err:
+            return tool_error(_allow_err)
+
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
@@ -1954,7 +1967,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # (grep/glob would otherwise expose denied file contents/names).
         from tools.profile_fs_guard import check_path_allowed
         _search_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
-        _allow_err = check_path_allowed(path, base_dir=_search_base)
+        _allow_err = check_path_allowed(path, base_dir=_search_base, task_id=task_id)
         if _allow_err:
             return tool_error(_allow_err)
 
