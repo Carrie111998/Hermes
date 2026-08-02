@@ -188,33 +188,63 @@ def _truncate_discord_component_text(text: str, limit: int) -> str:
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
 
 
-def _is_transient_discord_rest_error(error: Exception) -> bool:
-    """Return whether a Discord REST failure is safe to retry.
+def _discord_http_status(error: Exception) -> Optional[int]:
+    """Return an HTTP-like status carried by a discord.py exception."""
+    status = getattr(error, "status", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
 
-    Discord permission, validation, and other 4xx responses are durable for
-    the request as constructed. Retrying them can duplicate any side effects
-    that happened before the failure. Rate limits, server errors, and network
-    transport failures are the retryable cases.
-    """
-    http_exception = getattr(discord, "HTTPException", ()) if discord is not None else ()
-    if isinstance(http_exception, type) and isinstance(error, http_exception):
-        status = getattr(error, "status", None)
-        return status == 429 or (
-            isinstance(status, int) and 500 <= status < 600
-        )
 
+def _is_discord_rate_limit_error(error: Exception) -> bool:
+    """Return whether discord.py rejected a request as rate limited."""
     rate_limited = getattr(discord, "RateLimited", ()) if discord is not None else ()
-    if isinstance(rate_limited, type) and isinstance(error, rate_limited):
-        return True
+    return (
+        isinstance(rate_limited, type)
+        and isinstance(error, rate_limited)
+    ) or _discord_http_status(error) == 429
 
+
+def _is_discord_transport_error(error: Exception) -> bool:
+    """Return whether an error represents an ambiguous transport outcome."""
     if isinstance(error, (ConnectionError, TimeoutError)):
         return True
-
     try:
         import aiohttp
     except ImportError:  # pragma: no cover - installed with discord.py
         return False
     return isinstance(error, aiohttp.ClientError)
+
+
+def _is_ambiguous_discord_write_error(error: Exception) -> bool:
+    """Return whether a Discord write may have committed without a response."""
+    status = _discord_http_status(error)
+    return (
+        isinstance(status, int) and 500 <= status < 600
+    ) or _is_discord_transport_error(error)
+
+
+def _is_permanent_discord_write_error(error: Exception) -> bool:
+    """Return whether Discord definitively rejected a write as constructed."""
+    status = _discord_http_status(error)
+    return isinstance(error, (TypeError, ValueError)) or (
+        isinstance(status, int) and 400 <= status < 500 and status != 429
+    )
+
+
+def _is_retryable_discord_read_error(error: Exception) -> bool:
+    """Return whether a read-only Discord REST request is safe to retry.
+
+    Discord permission, validation, and other 4xx responses are durable for
+    the request as constructed. Read-only requests may safely retry rate
+    limits, server errors, and network transport failures.
+    """
+    status = _discord_http_status(error)
+    return (
+        _is_discord_rate_limit_error(error)
+        or (isinstance(status, int) and 500 <= status < 600)
+        or _is_discord_transport_error(error)
+    )
 
 
 def _discord_rest_retry_delay(error: Exception) -> float:
@@ -238,6 +268,86 @@ def _discord_rest_retry_delay(error: Exception) -> float:
         if math.isfinite(delay) and delay >= 0:
             return delay
     return _DISCORD_REST_RETRY_DELAY_SECONDS
+
+
+def _discord_retry_delay_from_headers(headers: Any) -> float:
+    """Return a standalone response's retry delay, or the short default."""
+    if headers:
+        for key in ("Retry-After", "X-RateLimit-Reset-After"):
+            try:
+                raw_delay = headers.get(key)
+                delay = float(raw_delay)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if math.isfinite(delay) and delay >= 0:
+                return delay
+    return _DISCORD_REST_RETRY_DELAY_SECONDS
+
+
+def _non_idempotent_discord_write_failure(
+    operation_name: str,
+    error: Exception,
+) -> str:
+    """Return a user-safe category for a write that cannot be reconciled."""
+    if _is_discord_rate_limit_error(error):
+        delay = _discord_rest_retry_delay(error)
+        return (
+            f"{operation_name} remained rate limited after one retry. "
+            f"Retry after {delay:g} seconds."
+        )
+    if _is_ambiguous_discord_write_error(error):
+        return (
+            f"{operation_name} may have succeeded, but Discord did not confirm it. "
+            "It was not retried to avoid creating a duplicate."
+        )
+    status = _discord_http_status(error)
+    if status in {401, 403}:
+        return (
+            f"{operation_name} was rejected. Check the bot's channel and thread "
+            "permissions."
+        )
+    if _is_permanent_discord_write_error(error):
+        return (
+            f"{operation_name} was rejected. Check the channel type, thread "
+            "settings, and bot permissions."
+        )
+    return (
+        f"{operation_name} could not be confirmed and was not retried to avoid "
+        "creating a duplicate."
+    )
+
+
+def _non_idempotent_discord_http_failure(
+    operation_name: str,
+    status: int,
+    headers: Any,
+) -> str:
+    """Return a user-safe category for a standalone non-idempotent POST."""
+    if status == 429:
+        retry_after = _discord_retry_delay_from_headers(headers)
+        return (
+            f"{operation_name} remained rate limited after one retry. "
+            f"Retry after {retry_after:g} seconds."
+        )
+    if status in {401, 403}:
+        return (
+            f"{operation_name} was rejected. Check the bot's channel and thread "
+            "permissions."
+        )
+    if 400 <= status < 500:
+        return (
+            f"{operation_name} was rejected. Check the channel type, thread "
+            "settings, and bot permissions."
+        )
+    if 500 <= status < 600:
+        return (
+            f"{operation_name} may have succeeded, but Discord did not confirm it. "
+            "It was not retried to avoid creating a duplicate."
+        )
+    return (
+        f"{operation_name} could not be confirmed and was not retried to avoid "
+        "creating a duplicate."
+    )
 
 
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
@@ -1518,19 +1628,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
         return True, role_authorized
 
-    async def _call_discord_rest_with_retry(
+    async def _call_discord_read_with_retry(
         self,
         operation: Callable[[], Any],
         *,
         operation_name: str,
     ) -> Any:
-        """Run one Discord REST operation, retrying transient failures once."""
+        """Run one read-only Discord REST operation with safe retries."""
         for attempt in range(_DISCORD_REST_MAX_ATTEMPTS):
             try:
                 return await operation()
             except Exception as error:
                 is_last_attempt = attempt + 1 >= _DISCORD_REST_MAX_ATTEMPTS
-                if is_last_attempt or not _is_transient_discord_rest_error(error):
+                if is_last_attempt or not _is_retryable_discord_read_error(error):
                     raise
                 delay = _discord_rest_retry_delay(error)
                 logger.info(
@@ -1543,6 +1653,42 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
 
         raise RuntimeError("unreachable Discord REST retry state")  # pragma: no cover
+
+    async def _call_discord_write_with_rate_limit_retry(
+        self,
+        operation: Callable[[], Any],
+        *,
+        operation_name: str,
+    ) -> Any:
+        """Run a write once, replaying only a definite 429 rejection."""
+        try:
+            return await operation()
+        except Exception as error:
+            if not _is_discord_rate_limit_error(error):
+                raise
+            delay = _discord_rest_retry_delay(error)
+            logger.info(
+                "[%s] %s was rate limited; replaying once in %.3fs",
+                self.name,
+                operation_name,
+                delay,
+            )
+            await asyncio.sleep(delay)
+        return await operation()
+
+    def _cache_authoritative_message_channel(self, channel: Any) -> None:
+        """Cache one successfully resolved channel for the current client."""
+        try:
+            channel_id = int(channel.id)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if channel_id not in self._authoritative_message_channels and (
+            len(self._authoritative_message_channels)
+            >= _DISCORD_AUTHORITATIVE_CHANNEL_CACHE_SIZE
+        ):
+            oldest_channel_id = next(iter(self._authoritative_message_channels))
+            self._authoritative_message_channels.pop(oldest_channel_id, None)
+        self._authoritative_message_channels[channel_id] = channel
 
     @staticmethod
     def _attach_authoritative_message_channel(message: Any, channel: Any) -> None:
@@ -1588,7 +1734,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return channel, False
 
         try:
-            resolved = await self._call_discord_rest_with_retry(
+            resolved = await self._call_discord_read_with_retry(
                 lambda: fetch_channel(channel_id),
                 operation_name=f"channel {channel_id} resolution",
             )
@@ -1603,13 +1749,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if resolved is None:
             return channel, False
 
-        if (
-            len(self._authoritative_message_channels)
-            >= _DISCORD_AUTHORITATIVE_CHANNEL_CACHE_SIZE
-        ):
-            oldest_channel_id = next(iter(self._authoritative_message_channels))
-            self._authoritative_message_channels.pop(oldest_channel_id, None)
-        self._authoritative_message_channels[channel_id] = resolved
+        self._cache_authoritative_message_channel(resolved)
         self._attach_authoritative_message_channel(message, resolved)
         return resolved, True
 
@@ -3278,15 +3418,34 @@ class DiscordAdapter(BasePlatformAdapter):
         starter_content = chunks[0] if chunks else thread_name
 
         try:
-            thread = await forum_channel.create_thread(
-                name=thread_name,
-                content=starter_content,
+            thread = await self._call_discord_write_with_rate_limit_retry(
+                lambda: forum_channel.create_thread(
+                    name=thread_name,
+                    content=starter_content,
+                ),
+                operation_name="Discord forum thread creation",
             )
-        except Exception as e:
-            logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
-            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+        except Exception as error:
+            logger.error(
+                "[%s] Forum thread create failed in %s (status=%s type=%s): %s",
+                self.name,
+                forum_channel.id,
+                _discord_http_status(error),
+                type(error).__name__,
+                error,
+                exc_info=True,
+            )
+            return SendResult(
+                success=False,
+                error=_non_idempotent_discord_write_failure(
+                    "Discord forum thread creation",
+                    error,
+                ),
+            )
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
+        if isinstance(thread_channel, discord.Thread):
+            self._cache_authoritative_message_channel(thread_channel)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
@@ -3353,17 +3512,32 @@ class DiscordAdapter(BasePlatformAdapter):
             kwargs["files"] = files
 
         try:
-            thread = await forum_channel.create_thread(**kwargs)
-        except Exception as e:
+            thread = await self._call_discord_write_with_rate_limit_retry(
+                lambda: forum_channel.create_thread(**kwargs),
+                operation_name="Discord forum file thread creation",
+            )
+        except Exception as error:
             logger.error(
-                "[%s] Failed to create forum thread with file in %s: %s",
+                "[%s] Forum file thread create failed in %s "
+                "(status=%s type=%s): %s",
                 self.name,
                 getattr(forum_channel, "id", "?"),
-                e,
+                _discord_http_status(error),
+                type(error).__name__,
+                error,
+                exc_info=True,
             )
-            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+            return SendResult(
+                success=False,
+                error=_non_idempotent_discord_write_failure(
+                    "Discord forum file thread creation",
+                    error,
+                ),
+            )
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
+        if isinstance(thread_channel, discord.Thread):
+            self._cache_authoritative_message_channel(thread_channel)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
@@ -6781,6 +6955,279 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    @staticmethod
+    def _thread_from_create_result(result: Any) -> Optional[Any]:
+        """Return the Thread carried by discord.py's create result shapes."""
+        if isinstance(result, discord.Thread):
+            return result
+        thread = getattr(result, "thread", None)
+        return thread if isinstance(thread, discord.Thread) else None
+
+    @staticmethod
+    def _is_forum_or_media_channel(channel: Any) -> bool:
+        """Return whether a channel uses Discord's atomic forum/media create."""
+        channel_classes = tuple(
+            cls
+            for cls in (
+                getattr(discord, "ForumChannel", None),
+                getattr(discord, "MediaChannel", None),
+            )
+            if isinstance(cls, type)
+        )
+        if channel_classes and isinstance(channel, channel_classes):
+            return True
+        channel_type = getattr(channel, "type", None)
+        type_value = getattr(channel_type, "value", channel_type)
+        return type_value in {15, 16}
+
+    def _message_thread_matches_source(self, message: Any, thread: Any) -> bool:
+        """Validate Discord's one-thread-per-message identity relationship."""
+        if not isinstance(thread, discord.Thread):
+            return False
+        source_id = getattr(message, "id", None)
+        parent_id = getattr(getattr(message, "channel", None), "id", None)
+        expected_guild = getattr(message, "guild", None) or getattr(
+            getattr(message, "channel", None), "guild", None
+        )
+        guild_id = getattr(expected_guild, "id", None)
+        actual_guild_id = getattr(getattr(thread, "guild", None), "id", None)
+        actual_parent_id = self._get_parent_channel_id(thread)
+        return (
+            source_id is not None
+            and parent_id is not None
+            and guild_id is not None
+            and str(getattr(thread, "id", "")) == str(source_id)
+            and actual_parent_id == str(parent_id)
+            and str(actual_guild_id) == str(guild_id)
+        )
+
+    async def _read_back_message_thread(
+        self,
+        message: Any,
+        *,
+        operation_name: str,
+    ) -> tuple[Optional[Any], bool]:
+        """Return ``(thread, definitely_absent)`` for a message-backed create."""
+        if self._client is None:
+            return None, False
+        fetch_channel = getattr(self._client, "fetch_channel", None)
+        if not callable(fetch_channel):
+            return None, False
+        try:
+            source_id = int(message.id)
+        except (AttributeError, TypeError, ValueError):
+            return None, False
+
+        try:
+            candidate = await self._call_discord_read_with_retry(
+                lambda: fetch_channel(source_id),
+                operation_name=f"{operation_name} read-back",
+            )
+        except Exception as error:
+            if _discord_http_status(error) == 404:
+                return None, True
+            logger.warning(
+                "[%s] %s read-back failed; write outcome remains unknown: %s",
+                self.name,
+                operation_name,
+                error,
+            )
+            return None, False
+
+        if not self._message_thread_matches_source(message, candidate):
+            logger.warning(
+                "[%s] %s read-back returned an unexpected channel "
+                "(type=%s id=%s parent=%s guild=%s); failing closed",
+                self.name,
+                operation_name,
+                type(candidate).__name__,
+                getattr(candidate, "id", None),
+                self._get_parent_channel_id(candidate),
+                getattr(getattr(candidate, "guild", None), "id", None),
+            )
+            return None, False
+
+        self._cache_authoritative_message_channel(candidate)
+        return candidate, False
+
+    async def _create_message_thread_with_reconciliation(
+        self,
+        message: Any,
+        *,
+        name: str,
+        auto_archive_duration: int,
+        reason: str,
+        operation_name: str,
+    ) -> tuple[Optional[Any], bool, Optional[str]]:
+        """Create one message-backed thread without blindly replaying writes.
+
+        Discord assigns the thread the source message ID and allows only one
+        thread per message. Network/timeouts/5xx are therefore reconciled with
+        ``GET /channels/{message.id}`` before a single replay. A 404 proves the
+        resource is absent; any unexpected read-back fails closed.
+        """
+
+        async def _issue_create() -> Any:
+            return await message.create_thread(
+                name=name,
+                auto_archive_duration=auto_archive_duration,
+                reason=reason,
+            )
+
+        async def _accept_or_read_back(result: Any) -> tuple[Optional[Any], bool]:
+            thread = self._thread_from_create_result(result)
+            if thread is not None and self._message_thread_matches_source(message, thread):
+                self._cache_authoritative_message_channel(thread)
+                return thread, False
+            return await self._read_back_message_thread(
+                message,
+                operation_name=operation_name,
+            )
+
+        had_ambiguous_write = False
+        try:
+            created = await _issue_create()
+        except Exception as first_error:
+            logger.warning(
+                "[%s] %s initial write failed (status=%s type=%s): %s",
+                self.name,
+                operation_name,
+                _discord_http_status(first_error),
+                type(first_error).__name__,
+                first_error,
+                exc_info=True,
+            )
+            if _is_discord_rate_limit_error(first_error):
+                delay = _discord_rest_retry_delay(first_error)
+                logger.info(
+                    "[%s] %s was rate limited; replaying once in %.3fs",
+                    self.name,
+                    operation_name,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            elif _is_ambiguous_discord_write_error(first_error):
+                had_ambiguous_write = True
+                reconciled, definitely_absent = await self._read_back_message_thread(
+                    message,
+                    operation_name=operation_name,
+                )
+                if reconciled is not None:
+                    return reconciled, False, None
+                if not definitely_absent:
+                    return (
+                        None,
+                        False,
+                        f"{operation_name} may have succeeded, but authoritative "
+                        "read-back could not confirm it. It was not retried to "
+                        "avoid creating a duplicate.",
+                    )
+                delay = _discord_rest_retry_delay(first_error)
+                logger.info(
+                    "[%s] %s was absent after an ambiguous failure; "
+                    "replaying once in %.3fs",
+                    self.name,
+                    operation_name,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            elif _is_permanent_discord_write_error(first_error):
+                return (
+                    None,
+                    True,
+                    _non_idempotent_discord_write_failure(
+                        operation_name,
+                        first_error,
+                    ),
+                )
+            else:
+                return (
+                    None,
+                    False,
+                    _non_idempotent_discord_write_failure(
+                        operation_name,
+                        first_error,
+                    ),
+                )
+        else:
+            accepted, _definitely_absent = await _accept_or_read_back(created)
+            if accepted is not None:
+                return accepted, False, None
+            return (
+                None,
+                False,
+                f"{operation_name} returned an unexpected result and authoritative "
+                "read-back could not confirm the thread.",
+            )
+
+        try:
+            replayed = await _issue_create()
+        except Exception as replay_error:
+            logger.warning(
+                "[%s] %s replay failed (status=%s type=%s): %s",
+                self.name,
+                operation_name,
+                _discord_http_status(replay_error),
+                type(replay_error).__name__,
+                replay_error,
+                exc_info=True,
+            )
+            if not had_ambiguous_write and (
+                _is_discord_rate_limit_error(replay_error)
+                or _is_permanent_discord_write_error(replay_error)
+            ):
+                return (
+                    None,
+                    True,
+                    _non_idempotent_discord_write_failure(
+                        operation_name,
+                        replay_error,
+                    ),
+                )
+            reconciled, definitely_absent = await self._read_back_message_thread(
+                message,
+                operation_name=operation_name,
+            )
+            if reconciled is not None:
+                return reconciled, False, None
+            return (
+                None,
+                definitely_absent,
+                (
+                    f"{operation_name} was not created after one safe retry. Check "
+                    "the channel type, thread settings, and bot permissions."
+                    if definitely_absent
+                    else f"{operation_name} may have succeeded, but authoritative "
+                    "read-back could not confirm it. It was not retried again to "
+                    "avoid creating a duplicate."
+                ),
+            )
+
+        accepted, _definitely_absent = await _accept_or_read_back(replayed)
+        if accepted is not None:
+            return accepted, False, None
+        return (
+            None,
+            False,
+            f"{operation_name} replay returned an unexpected result and "
+            "authoritative read-back could not confirm the thread.",
+        )
+
+    async def _delete_owned_thread_seed(self, seed_message: Any) -> None:
+        """Best-effort cleanup for a seed returned by this attempt's send."""
+        delete_seed = getattr(seed_message, "delete", None)
+        if not callable(delete_seed):
+            return
+        try:
+            await delete_seed()
+        except Exception:
+            logger.debug(
+                "[%s] Failed to remove owned Discord thread seed %s",
+                self.name,
+                getattr(seed_message, "id", "unknown"),
+                exc_info=True,
+            )
+
     async def _create_thread(
         self,
         interaction: discord.Interaction,
@@ -6791,10 +7238,9 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Create a thread in the current Discord channel.
 
-        Tries ``parent_channel.create_thread()`` first.  If Discord rejects
-        that (e.g. permission issues), falls back to sending a seed message
-        and creating the thread from it. The seed describes the request rather
-        than claiming success before Discord has accepted the thread.
+        Text channels use one owned seed plus Discord's deterministic
+        message-backed thread identity. Forum/media parents require their
+        atomic create endpoint; only a definite 429 rejection is replayed.
         """
         name = (name or "").strip()
         if not name:
@@ -6817,54 +7263,86 @@ class DiscordAdapter(BasePlatformAdapter):
         display_name = getattr(getattr(interaction, "user", None), "display_name", None) or "unknown user"
         reason = f"Requested by {display_name} via /thread"
         starter_message = (message or "").strip()
+        seed_content = starter_message or f"\U0001f9f5 Thread requested via Hermes: **{name}**"
 
-        try:
-            thread = await parent_channel.create_thread(
-                name=name,
-                auto_archive_duration=auto_archive_duration,
-                reason=reason,
-            )
-            if starter_message:
-                await thread.send(starter_message)
+        if self._is_forum_or_media_channel(parent_channel):
+            try:
+                result = await self._call_discord_write_with_rate_limit_retry(
+                    lambda: parent_channel.create_thread(
+                        name=name,
+                        content=seed_content,
+                        auto_archive_duration=auto_archive_duration,
+                        reason=reason,
+                    ),
+                    operation_name="Discord forum/media thread creation",
+                )
+            except Exception as error:
+                logger.warning(
+                    "[%s] /thread forum/media create failed (status=%s type=%s): %s",
+                    self.name,
+                    _discord_http_status(error),
+                    type(error).__name__,
+                    error,
+                    exc_info=True,
+                )
+                return {
+                    "error": _non_idempotent_discord_write_failure(
+                        "Discord forum/media thread creation",
+                        error,
+                    )
+                }
+            thread = self._thread_from_create_result(result)
+            if thread is None:
+                return {"error": "Discord forum/media create returned no thread."}
+            self._cache_authoritative_message_channel(thread)
             return {
                 "success": True,
                 "thread_id": str(thread.id),
                 "thread_name": getattr(thread, "name", None) or name,
             }
-        except Exception as direct_error:
-            seed_msg = None
-            try:
-                seed_content = starter_message or f"\U0001f9f5 Thread requested via Hermes: **{name}**"
-                seed_msg = await parent_channel.send(seed_content)
-                thread = await seed_msg.create_thread(
-                    name=name,
-                    auto_archive_duration=auto_archive_duration,
-                    reason=reason,
+
+        send_seed = getattr(parent_channel, "send", None)
+        if not callable(send_seed):
+            return {"error": "Discord channel cannot send a thread starter message."}
+        try:
+            seed_message = await self._call_discord_write_with_rate_limit_retry(
+                lambda: send_seed(seed_content),
+                operation_name="Discord thread starter message send",
+            )
+        except Exception as error:
+            logger.warning(
+                "[%s] /thread starter send failed (status=%s type=%s): %s",
+                self.name,
+                _discord_http_status(error),
+                type(error).__name__,
+                error,
+                exc_info=True,
+            )
+            return {
+                "error": _non_idempotent_discord_write_failure(
+                    "Discord thread starter message send",
+                    error,
                 )
-                return {
-                    "success": True,
-                    "thread_id": str(thread.id),
-                    "thread_name": getattr(thread, "name", None) or name,
-                }
-            except Exception as fallback_error:
-                if seed_msg is not None:
-                    delete_seed = getattr(seed_msg, "delete", None)
-                    if callable(delete_seed):
-                        try:
-                            await delete_seed()
-                        except Exception:
-                            logger.debug(
-                                "[%s] Failed to remove orphan Discord thread seed %s",
-                                self.name,
-                                getattr(seed_msg, "id", "unknown"),
-                                exc_info=True,
-                            )
-                return {
-                    "error": (
-                        "Discord rejected direct thread creation and the fallback also failed. "
-                        f"Direct error: {direct_error}. Fallback error: {fallback_error}"
-                    )
-                }
+            }
+
+        thread, definitely_absent, failure = (
+            await self._create_message_thread_with_reconciliation(
+                seed_message,
+                name=name,
+                auto_archive_duration=auto_archive_duration,
+                reason=reason,
+                operation_name="Discord /thread message-backed creation",
+            )
+        )
+        if thread is not None:
+            return {
+                "success": True,
+                "thread_id": str(thread.id),
+                "thread_name": getattr(thread, "name", None) or name,
+            }
+        if definitely_absent:
+            await self._delete_owned_thread_seed(seed_message)
+        return {"error": failure or "Discord thread creation failed."}
 
     # ------------------------------------------------------------------
     # Auto-thread helpers
@@ -6895,37 +7373,31 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Returns the created thread object, or ``None`` on failure. The original
         user message is the only thread starter: no bot-authored seed is sent,
-        so a failed request cannot leave a misleading or duplicate orphan.
-        Transient REST failures are retried once; validation and permission
-        failures are not retried.
+        so a failed request cannot leave a misleading or duplicate orphan. An
+        ambiguous write is reconciled by the source message's deterministic
+        thread ID before any single replay.
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
 
-        try:
-            thread = await self._call_discord_rest_with_retry(
-                lambda: message.create_thread(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                ),
+        thread, _definitely_absent, failure = (
+            await self._create_message_thread_with_reconciliation(
+                message,
+                name=thread_name,
+                auto_archive_duration=1440,
+                reason=reason,
                 operation_name=(
-                    "auto-thread creation from message "
+                    "Discord auto-thread creation from message "
                     f"{getattr(message, 'id', 'unknown')}"
                 ),
             )
-        except Exception as error:
-            classification = (
-                "transient retries exhausted"
-                if _is_transient_discord_rest_error(error)
-                else "permanent failure"
-            )
+        )
+        if thread is None:
             logger.warning(
-                "[%s] Auto-thread creation failed (%s): %s",
+                "[%s] Auto-thread creation failed: %s",
                 self.name,
-                classification,
-                error,
+                failure or "Discord did not confirm the thread",
             )
             return None
 
@@ -7003,11 +7475,10 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> Optional[str]:
         """Create a Discord thread under a text channel for a handoff.
 
-        Falls back to a seed-message + ``message.create_thread`` path if
-        ``parent.create_thread`` is rejected (some channel types or
-        permission setups). Returns the new thread id as a string, or
-        ``None`` on failure or when the parent isn't a text channel
-        (DMs, voice channels, threads themselves can't host threads).
+        Text channels use one owned seed and deterministic message-backed
+        creation. Forum/media parents use one atomic create whose result is
+        replayed only after a definite 429 rejection because no resource ID is
+        known before other failures.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return None
@@ -7035,44 +7506,94 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, parent_chat_id,
             )
             return None
+        if isinstance(parent, getattr(discord, "Thread", ())):
+            logger.info(
+                "[%s] Handoff thread: parent %s is already a thread; nested "
+                "threads are not supported",
+                self.name,
+                parent_chat_id,
+            )
+            return None
 
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
+        seed_content = f"\U0001f9f5 Hermes handoff: **{thread_name}**"
 
-        # First try: create a thread directly on the channel.
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
+        if self._is_forum_or_media_channel(parent):
+            try:
+                result = await self._call_discord_write_with_rate_limit_retry(
+                    lambda: parent.create_thread(
+                        name=thread_name,
+                        content=seed_content,
+                        auto_archive_duration=1440,
+                        reason=reason,
+                    ),
+                    operation_name="Discord handoff forum/media thread creation",
                 )
-                return str(thread.id)
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
-            )
-
-        # Fallback: post a seed message and create the thread from it.
-        try:
-            send = getattr(parent, "send", None)
-            if send is None:
+            except Exception as error:
+                logger.warning(
+                    "[%s] Handoff forum/media create failed for parent %s "
+                    "(status=%s type=%s): %s",
+                    self.name,
+                    parent_chat_id,
+                    _discord_http_status(error),
+                    type(error).__name__,
+                    error,
+                    exc_info=True,
+                )
                 return None
-            seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
-            thread = await seed_msg.create_thread(
+            thread = self._thread_from_create_result(result)
+            if thread is None:
+                logger.warning(
+                    "[%s] Handoff forum/media create returned no thread for parent %s",
+                    self.name,
+                    parent_chat_id,
+                )
+                return None
+            self._cache_authoritative_message_channel(thread)
+            return str(thread.id)
+
+        send = getattr(parent, "send", None)
+        if not callable(send):
+            return None
+        try:
+            seed_message = await self._call_discord_write_with_rate_limit_retry(
+                lambda: send(seed_content),
+                operation_name="Discord handoff starter message send",
+            )
+        except Exception as error:
+            logger.warning(
+                "[%s] Handoff seed send failed for parent %s "
+                "(status=%s type=%s): %s",
+                self.name,
+                parent_chat_id,
+                _discord_http_status(error),
+                type(error).__name__,
+                error,
+                exc_info=True,
+            )
+            return None
+
+        thread, definitely_absent, failure = (
+            await self._create_message_thread_with_reconciliation(
+                seed_message,
                 name=thread_name,
                 auto_archive_duration=1440,
                 reason=reason,
+                operation_name="Discord handoff message-backed creation",
             )
+        )
+        if thread is not None:
             return str(thread.id)
-        except Exception as fallback_error:
-            logger.warning(
-                "[%s] Handoff thread: both create paths failed for parent %s: %s",
-                self.name, parent_chat_id, fallback_error,
-            )
-            return None
+        if definitely_absent:
+            await self._delete_owned_thread_seed(seed_message)
+        logger.warning(
+            "[%s] Handoff thread creation failed for parent %s: %s",
+            self.name,
+            parent_chat_id,
+            failure or "Discord did not confirm the thread",
+        )
+        return None
 
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
@@ -9607,6 +10128,72 @@ async def _standalone_read_json_limited(resp: Any, limit_bytes: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+async def _standalone_non_idempotent_http_error(
+    operation_name: str,
+    resp: Any,
+) -> Dict[str, str]:
+    """Log a Discord response body and return only its safe failure category."""
+    body = await _standalone_read_text_limited(
+        resp,
+        _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
+    )
+    status = int(getattr(resp, "status", 0))
+    logger.error(
+        "%s failed (status=%s): %s",
+        operation_name,
+        status,
+        body,
+    )
+    return {
+        "error": _non_idempotent_discord_http_failure(
+            operation_name,
+            status,
+            getattr(resp, "headers", None),
+        )
+    }
+
+
+async def _standalone_forum_post_with_rate_limit_retry(
+    session: Any,
+    thread_url: str,
+    request_kwargs_factory: Callable[[], Dict[str, Any]],
+) -> tuple[Optional[dict], Optional[Dict[str, str]]]:
+    """Create a forum post, replaying only one definite HTTP 429 rejection."""
+    operation_name = "Discord forum thread creation"
+    for attempt in range(_DISCORD_REST_MAX_ATTEMPTS):
+        async with session.post(
+            thread_url,
+            **request_kwargs_factory(),
+        ) as resp:
+            if resp.status in {200, 201}:
+                data = await _standalone_read_json_limited(
+                    resp,
+                    _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                )
+                return data, None
+            if resp.status == 429 and attempt == 0:
+                body = await _standalone_read_text_limited(
+                    resp,
+                    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
+                )
+                delay = _discord_retry_delay_from_headers(
+                    getattr(resp, "headers", None)
+                )
+                logger.warning(
+                    "%s was rate limited; replaying once in %.3fs: %s",
+                    operation_name,
+                    delay,
+                    body,
+                )
+                await asyncio.sleep(delay)
+                continue
+            return None, await _standalone_non_idempotent_http_error(
+                operation_name,
+                resp,
+            )
+    raise RuntimeError("unreachable Discord forum retry state")  # pragma: no cover
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -9707,64 +10294,101 @@ async def _standalone_send(
                         continue
                     valid_media.append(media_path)
 
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), **_sess_kw) as session:
-                    if valid_media:
-                        # Multipart: payload_json + files[N] creates a forum
-                        # thread with the starter message plus attachments in
-                        # a single API call.
-                        attachments_meta = [
-                            {"id": str(idx), "filename": os.path.basename(path)}
-                            for idx, path in enumerate(valid_media)
-                        ]
-                        starter_message = {"content": (caption or message), "attachments": attachments_meta}
-                        payload_json = json.dumps({"name": thread_name, "message": starter_message})
-
-                        form = aiohttp.FormData()
-                        form.add_field("payload_json", payload_json, content_type="application/json")
-
-                        try:
-                            for idx, media_path in enumerate(valid_media):
-                                with open(media_path, "rb") as fh:
-                                    form.add_field(
-                                        f"files[{idx}]",
-                                        fh.read(),
-                                        filename=os.path.basename(media_path),
-                                    )
-                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
-                                if resp.status not in {200, 201}:
-                                    body = await _standalone_read_text_limited(
-                                        resp,
-                                        _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
-                                    )
-                                    return {"error": f"Discord forum thread creation error ({resp.status}): {body}"}
-                                data = await _standalone_read_json_limited(
-                                    resp,
-                                    _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                                )
-                        except Exception as e:
-                            return {"error": _standalone_sanitize_error(f"Discord forum thread upload failed: {e}")}
-                    else:
-                        # No media — simple JSON POST creates the thread with
-                        # just the text starter.
-                        async with session.post(
-                            thread_url,
-                            headers=json_headers,
-                            json={
-                                "name": thread_name,
-                                "message": {"content": message},
-                            },
-                            **_req_kw,
-                        ) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await _standalone_read_text_limited(
-                                    resp,
-                                    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
-                                )
-                                return {"error": f"Discord forum thread creation error ({resp.status}): {body}"}
-                            data = await _standalone_read_json_limited(
-                                resp,
-                                _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=60),
+                        **_sess_kw,
+                    ) as session:
+                        if valid_media:
+                            # Multipart: payload_json + files[N] creates a forum
+                            # thread with the starter message plus attachments in
+                            # a single API call.
+                            attachments_meta = [
+                                {"id": str(idx), "filename": os.path.basename(path)}
+                                for idx, path in enumerate(valid_media)
+                            ]
+                            starter_message = {
+                                "content": caption or message,
+                                "attachments": attachments_meta,
+                            }
+                            payload_json = json.dumps(
+                                {"name": thread_name, "message": starter_message}
                             )
+
+                            def _multipart_forum_request_kwargs() -> Dict[str, Any]:
+                                form = aiohttp.FormData()
+                                form.add_field(
+                                    "payload_json",
+                                    payload_json,
+                                    content_type="application/json",
+                                )
+                                for idx, media_path in enumerate(valid_media):
+                                    with open(media_path, "rb") as fh:
+                                        form.add_field(
+                                            f"files[{idx}]",
+                                            fh.read(),
+                                            filename=os.path.basename(media_path),
+                                        )
+                                return {
+                                    "headers": auth_headers,
+                                    "data": form,
+                                    **_req_kw,
+                                }
+
+                            data, forum_error = (
+                                await _standalone_forum_post_with_rate_limit_retry(
+                                    session,
+                                    thread_url,
+                                    _multipart_forum_request_kwargs,
+                                )
+                            )
+                        else:
+                            # No media — simple JSON POST creates the thread with
+                            # just the text starter.
+                            def _json_forum_request_kwargs() -> Dict[str, Any]:
+                                return {
+                                    "headers": json_headers,
+                                    "json": {
+                                        "name": thread_name,
+                                        "message": {"content": message},
+                                    },
+                                    **_req_kw,
+                                }
+
+                            data, forum_error = (
+                                await _standalone_forum_post_with_rate_limit_retry(
+                                    session,
+                                    thread_url,
+                                    _json_forum_request_kwargs,
+                                )
+                            )
+                        if forum_error is not None:
+                            return forum_error
+                        if data is None:
+                            logger.error(
+                                "Discord standalone forum create returned no payload"
+                            )
+                            return {
+                                "error": (
+                                    "Discord forum thread creation could not be "
+                                    "confirmed."
+                                )
+                            }
+                except Exception as error:
+                    logger.error(
+                        "Discord standalone forum create failed "
+                        "(status=%s type=%s): %s",
+                        _discord_http_status(error),
+                        type(error).__name__,
+                        error,
+                        exc_info=True,
+                    )
+                    return {
+                        "error": _non_idempotent_discord_write_failure(
+                            "Discord forum thread creation",
+                            error,
+                        )
+                    }
 
                 thread_id_created = data.get("id")
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)

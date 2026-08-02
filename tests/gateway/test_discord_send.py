@@ -44,7 +44,15 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
+import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+
+class _RateLimitError(Exception):
+    def __init__(self, retry_after: float, sentinel: str):
+        super().__init__(sentinel)
+        self.status = 429
+        self.retry_after = retry_after
 
 
 def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
@@ -140,6 +148,75 @@ class TestIsForumParent:
 
 
 @pytest.mark.asyncio
+async def test_forum_text_create_ambiguous_failure_is_not_retried_or_leaked():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(
+        side_effect=TimeoutError("RAW_FORUM_TEXT_SENTINEL")
+    )
+
+    result = await adapter._send_to_forum(forum_channel, "planning notes")
+
+    assert result.success is False
+    assert "may have succeeded" in (result.error or "")
+    assert "not retried" in (result.error or "")
+    assert "RAW_FORUM_TEXT_SENTINEL" not in (result.error or "")
+    forum_channel.create_thread.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_forum_text_create_retries_one_429(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sleep = AsyncMock()
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", sleep)
+    thread = SimpleNamespace(
+        id=777,
+        message=SimpleNamespace(id=800),
+        send=AsyncMock(),
+    )
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(
+        side_effect=[
+            _RateLimitError(2.5, "RAW_FIRST_429_SENTINEL"),
+            thread,
+        ]
+    )
+
+    result = await adapter._send_to_forum(forum_channel, "planning notes")
+
+    assert result.success is True
+    assert forum_channel.create_thread.await_count == 2
+    sleep.assert_awaited_once_with(2.5)
+
+
+@pytest.mark.asyncio
+async def test_forum_text_create_exhausted_429_is_safe_and_bounded(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sleep = AsyncMock()
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", sleep)
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(
+        side_effect=[
+            _RateLimitError(1.25, "RAW_FIRST_429_SENTINEL"),
+            _RateLimitError(3.5, "RAW_SECOND_429_SENTINEL"),
+        ]
+    )
+
+    result = await adapter._send_to_forum(forum_channel, "planning notes")
+
+    assert result.success is False
+    assert "remained rate limited after one retry" in (result.error or "")
+    assert "3.5 seconds" in (result.error or "")
+    assert "RAW_FIRST_429_SENTINEL" not in (result.error or "")
+    assert "RAW_SECOND_429_SENTINEL" not in (result.error or "")
+    assert forum_channel.create_thread.await_count == 2
+    sleep.assert_awaited_once_with(1.25)
+
+
+@pytest.mark.asyncio
 async def test_forum_post_file_creates_thread_with_attachment():
     """_forum_post_file routes file-bearing sends to create_thread with file kwarg."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
@@ -175,6 +252,28 @@ async def test_forum_post_file_creates_thread_with_attachment():
     assert call_kwargs["content"] == "here is a photo"
     # Thread name derived from content's first line
     assert call_kwargs["name"] == "here is a photo"
+
+
+@pytest.mark.asyncio
+async def test_forum_file_create_ambiguous_failure_is_not_retried_or_leaked():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(
+        side_effect=TimeoutError("RAW_FORUM_FILE_SENTINEL")
+    )
+
+    result = await adapter._forum_post_file(
+        forum_channel,
+        content="planning diagram",
+        file=SimpleNamespace(filename="diagram.png"),
+    )
+
+    assert result.success is False
+    assert "may have succeeded" in (result.error or "")
+    assert "not retried" in (result.error or "")
+    assert "RAW_FORUM_FILE_SENTINEL" not in (result.error or "")
+    forum_channel.create_thread.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -376,5 +475,3 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
-

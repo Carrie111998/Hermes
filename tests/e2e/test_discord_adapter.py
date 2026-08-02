@@ -84,10 +84,14 @@ class TestAutoThreadingPreservesCommand:
     async def test_command_detected_after_auto_thread(self, discord_adapter, bot_user, monkeypatch):
         """@mention /help in channel with auto-thread → thread created AND command dispatched."""
         monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
-        fake_thread = make_fake_thread(thread_id=90001, name="help")
         msg = make_discord_message(
             content=f"<@{BOT_USER_ID}> /help",
             mentions=[bot_user],
+        )
+        fake_thread = make_fake_thread(
+            thread_id=msg.id,
+            name="help",
+            parent=msg.channel,
         )
 
         # Simulate discord.py restoring the original raw content (with mention)

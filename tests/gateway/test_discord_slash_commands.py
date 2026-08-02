@@ -75,6 +75,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
+import discord  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
@@ -291,8 +292,27 @@ async def test_slash_command_registration_stays_under_discord_limit(adapter):
 
 @pytest.mark.asyncio
 async def test_handle_thread_create_slash_reports_success(adapter):
-    created_thread = SimpleNamespace(id=555, name="Planning", send=AsyncMock())
-    parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), send=AsyncMock())
+    guild = SimpleNamespace(id=1, name="TestGuild")
+    parent_channel = SimpleNamespace(
+        id=123,
+        guild=guild,
+        create_thread=AsyncMock(),
+        send=AsyncMock(),
+    )
+    created_thread = MagicMock(spec=[])
+    created_thread.id = 555
+    created_thread.name = "Planning"
+    created_thread.parent_id = parent_channel.id
+    created_thread.guild = guild
+    created_thread.__class__ = discord.Thread
+    seed_message = SimpleNamespace(
+        id=created_thread.id,
+        channel=parent_channel,
+        guild=guild,
+        create_thread=AsyncMock(return_value=created_thread),
+        delete=AsyncMock(),
+    )
+    parent_channel.send.return_value = seed_message
     interaction_channel = SimpleNamespace(parent=parent_channel)
     interaction = SimpleNamespace(
         channel=interaction_channel,
@@ -305,12 +325,13 @@ async def test_handle_thread_create_slash_reports_success(adapter):
 
     await adapter._handle_thread_create_slash(interaction, "Planning", "Kickoff", 1440)
 
-    parent_channel.create_thread.assert_awaited_once_with(
+    parent_channel.send.assert_awaited_once_with("Kickoff")
+    parent_channel.create_thread.assert_not_awaited()
+    seed_message.create_thread.assert_awaited_once_with(
         name="Planning",
         auto_archive_duration=1440,
         reason="Requested by Jezza via /thread",
     )
-    created_thread.send.assert_awaited_once_with("Kickoff")
     # Thread link shown to user
     interaction.followup.send.assert_awaited()
     args, kwargs = interaction.followup.send.await_args
@@ -319,13 +340,28 @@ async def test_handle_thread_create_slash_reports_success(adapter):
 
 
 @pytest.mark.asyncio
-async def test_handle_thread_create_slash_falls_back_to_seed_message(adapter):
-    created_thread = SimpleNamespace(id=555, name="Planning")
-    seed_message = SimpleNamespace(id=777, create_thread=AsyncMock(return_value=created_thread))
+async def test_handle_thread_create_slash_uses_honest_default_seed(adapter):
+    guild = SimpleNamespace(id=1, name="TestGuild")
     channel = SimpleNamespace(
-        create_thread=AsyncMock(side_effect=RuntimeError("direct failed")),
-        send=AsyncMock(return_value=seed_message),
+        id=123,
+        guild=guild,
+        create_thread=AsyncMock(),
+        send=AsyncMock(),
     )
+    created_thread = MagicMock(spec=[])
+    created_thread.id = 777
+    created_thread.name = "Planning"
+    created_thread.parent_id = channel.id
+    created_thread.guild = guild
+    created_thread.__class__ = discord.Thread
+    seed_message = SimpleNamespace(
+        id=created_thread.id,
+        channel=channel,
+        guild=guild,
+        create_thread=AsyncMock(return_value=created_thread),
+        delete=AsyncMock(),
+    )
+    channel.send.return_value = seed_message
     interaction = SimpleNamespace(
         channel=channel,
         channel_id=123,
@@ -335,9 +371,12 @@ async def test_handle_thread_create_slash_falls_back_to_seed_message(adapter):
         response=SimpleNamespace(defer=AsyncMock()),
     )
 
-    await adapter._handle_thread_create_slash(interaction, "Planning", "Kickoff", 1440)
+    await adapter._handle_thread_create_slash(interaction, "Planning", "", 1440)
 
-    channel.send.assert_awaited_once_with("Kickoff")
+    channel.send.assert_awaited_once_with(
+        "\U0001f9f5 Thread requested via Hermes: **Planning**"
+    )
+    channel.create_thread.assert_not_awaited()
     seed_message.create_thread.assert_awaited_once_with(
         name="Planning",
         auto_archive_duration=1440,
@@ -600,5 +639,4 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
 

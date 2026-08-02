@@ -388,14 +388,23 @@ def make_discord_message(
     if attachments is None:
         attachments = []
 
-    return SimpleNamespace(
+    message = SimpleNamespace(
         id=message_id, content=content, author=author, channel=channel,
         guild=getattr(channel, "guild", None),
         mentions=mentions, attachments=attachments,
         type=getattr(discord, "MessageType", SimpleNamespace()).default,
         reference=None, created_at=datetime.now(timezone.utc),
-        create_thread=AsyncMock(),
     )
+    if message.guild is None:
+        message.create_thread = AsyncMock()
+    else:
+        message.create_thread = AsyncMock(
+            return_value=make_fake_thread(
+                thread_id=message_id,
+                parent=channel,
+            )
+        )
+    return message
 
 
 def get_response_text(adapter) -> str | None:
