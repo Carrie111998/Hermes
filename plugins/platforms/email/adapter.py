@@ -49,7 +49,6 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource
-from agent.secret_scope import is_multiplex_active
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -495,37 +494,27 @@ class EmailAdapter(BasePlatformAdapter):
         #     email:
         #       skip_attachments: true
         self._skip_attachments = extra.get("skip_attachments", False)
-        if "response_delivery" in extra:
-            response_delivery = extra.get("response_delivery")
-        elif is_multiplex_active():
-            response_delivery = "email"
-        else:
-            response_delivery = os.getenv("EMAIL_RESPONSE_DELIVERY") or "email"
+        response_delivery = extra.get("response_delivery")
+        if response_delivery is None:
+            response_delivery = _get_esecret("EMAIL_RESPONSE_DELIVERY", "email")
         self._response_delivery = str(response_delivery or "email").strip().lower()
 
-        if "approval_discord_channel" in extra:
-            approval_discord_channel = extra.get("approval_discord_channel")
-        elif is_multiplex_active():
-            approval_discord_channel = ""
-        else:
+        approval_discord_channel = extra.get("approval_discord_channel")
+        if approval_discord_channel is None:
             approval_discord_channel = (
-                os.getenv("EMAIL_APPROVAL_DISCORD_CHANNEL")
-                or os.getenv("DISCORD_HOME_CHANNEL")
-                or ""
+                _get_esecret("EMAIL_APPROVAL_DISCORD_CHANNEL", "")
+                or _get_esecret("DISCORD_HOME_CHANNEL", "")
             )
         self._approval_discord_channel = str(approval_discord_channel or "").strip()
 
-        if "approval_discord_thread" in extra:
-            approval_discord_thread = extra.get("approval_discord_thread")
-        elif "approval_discord_thread_id" in extra:
-            approval_discord_thread = extra.get("approval_discord_thread_id")
-        elif is_multiplex_active():
-            approval_discord_thread = ""
-        else:
+        approval_discord_thread = extra.get(
+            "approval_discord_thread",
+            extra.get("approval_discord_thread_id"),
+        )
+        if approval_discord_thread is None:
             approval_discord_thread = (
-                os.getenv("EMAIL_APPROVAL_DISCORD_THREAD_ID")
-                or os.getenv("DISCORD_HOME_CHANNEL_THREAD_ID")
-                or ""
+                _get_esecret("EMAIL_APPROVAL_DISCORD_THREAD_ID", "")
+                or _get_esecret("DISCORD_HOME_CHANNEL_THREAD_ID", "")
             )
         self._approval_discord_thread = str(approval_discord_thread or "").strip()
 

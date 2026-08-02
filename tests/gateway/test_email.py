@@ -205,27 +205,6 @@ class TestEmailResponseDelivery(unittest.TestCase):
         self.assertEqual(adapter._response_delivery, "email")
         self.assertEqual(adapter._approval_discord_channel, "")
 
-    def test_multiplex_adapter_without_materialized_routing_fails_closed(self):
-        from agent.secret_scope import set_multiplex_active
-        from gateway.config import PlatformConfig
-        from plugins.platforms.email.adapter import EmailAdapter
-
-        process_values = {
-            "EMAIL_RESPONSE_DELIVERY": "discord",
-            "EMAIL_APPROVAL_DISCORD_CHANNEL": "ACTIVE_PROFILE_CHANNEL",
-            "DISCORD_HOME_CHANNEL": "ACTIVE_PROFILE_HOME",
-        }
-        with patch.dict(os.environ, process_values, clear=False):
-            set_multiplex_active(True)
-            try:
-                adapter = EmailAdapter(PlatformConfig(enabled=True))
-            finally:
-                set_multiplex_active(False)
-
-        self.assertEqual(adapter._response_delivery, "email")
-        self.assertEqual(adapter._approval_discord_channel, "")
-        self.assertEqual(adapter._approval_discord_thread, "")
-
     def test_yaml_platform_keys_are_bridged_into_email_extra(self):
         from pathlib import Path
         import tempfile
