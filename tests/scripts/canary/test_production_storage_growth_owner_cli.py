@@ -189,11 +189,17 @@ def test_install_owner_state_validates_sealed_runtime_before_privileged_mutation
 def test_build_plan_has_no_caller_runtime_hash_surface(monkeypatch) -> None:
     calls = []
     runtime = object()
-    artifacts = _artifact_attestation()
+    source = {"observation_sha256": "5" * 64}
+
+    class Route:
+        def collect_source_preflight(self):
+            calls.append("collect")
+            return source
+
     monkeypatch.setattr(
         cli,
-        "_runtime_artifacts",
-        lambda _release: (runtime, artifacts),
+        "_build_route",
+        lambda _release: (Route(), runtime),
     )
     monkeypatch.setattr(
         cli.owner,
@@ -202,11 +208,10 @@ def test_build_plan_has_no_caller_runtime_hash_surface(monkeypatch) -> None:
     )
     monkeypatch.setattr(cli, "_revalidate_runtime", lambda *_args: None)
     output = _Stream()
-    source = {"observation_sha256": "5" * 64}
     monkeypatch.setattr(
         cli.sys,
         "stdin",
-        _Stream(_frame("build-plan", {"source_preflight": source})),
+        _Stream(_frame("build-plan", {})),
     )
     monkeypatch.setattr(cli.sys, "stdout", output)
 
@@ -215,18 +220,46 @@ def test_build_plan_has_no_caller_runtime_hash_surface(monkeypatch) -> None:
         RELEASE,
         "build-plan",
     ]) == 0
-    assert calls == [{
+    assert calls == ["collect", {
         "release_sha": RELEASE,
         "source_preflight": source,
         "trusted_runtime": runtime,
-        "now_unix": calls[0]["now_unix"],
+        "now_unix": calls[1]["now_unix"],
     }]
     assert not {
         "executor_binary_sha256",
         "mutation_wrapper_sha256",
         "read_only_collector_sha256",
         "remote_transport_sha256",
-    }.intersection(calls[0])
+    }.intersection(calls[1])
+
+
+def test_build_plan_rejects_caller_supplied_source_before_route(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_build_route",
+        lambda _release: (_ for _ in ()).throw(AssertionError("route reached")),
+    )
+    output = _Stream()
+    monkeypatch.setattr(
+        cli.sys,
+        "stdin",
+        _Stream(_frame(
+            "build-plan",
+            {"source_preflight": {"observation_sha256": "5" * 64}},
+        )),
+    )
+    monkeypatch.setattr(cli.sys, "stdout", output)
+
+    assert cli.main([
+        "--release-sha",
+        RELEASE,
+        "build-plan",
+    ]) == 2
+    response = protocol.decode_canonical_json(
+        output.buffer.getvalue().removesuffix(b"\n")
+    )
+    assert response["error_code"] == "production_storage_owner_cli_frame_invalid"
 
 
 def test_privileged_owner_install_uses_one_fixed_isolated_installer_command() -> None:
@@ -347,7 +380,7 @@ def test_ambient_launcher_invokes_only_exact_sealed_owner_cli(
     response = owner.invoke_exact_production_storage_growth_owner_cli(
         release_sha=RELEASE,
         operation="build-plan",
-        document={"source_preflight": {"observation_sha256": "3" * 64}},
+        document={},
         runner=runner,
     )
 
@@ -362,9 +395,7 @@ def test_ambient_launcher_invokes_only_exact_sealed_owner_cli(
     )
     frame = protocol.decode_canonical_json(captured["input"])
     assert frame["operation"] == "build-plan"
-    assert frame["document"] == {
-        "source_preflight": {"observation_sha256": "3" * 64}
-    }
+    assert frame["document"] == {}
     assert frame["frame_sha256"] == protocol.sha256_json({
         "schema": frame["schema"],
         "operation": frame["operation"],
