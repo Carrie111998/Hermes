@@ -227,6 +227,14 @@ class TestClarifyLogPrivacy:
         adapter._team_bot_user_ids = {"T1": "U_BOT"}
         adapter._channel_team = {"C1": "T1"}
         adapter._clarify_resolved["9.9"] = False
+        adapter._clarify_callback_state["9.9"] = {
+            "clarify_id": "cid-priv",
+            "session_key": "sk-priv",
+            "channel_id": "C1",
+            "team_id": "",
+            "generation": None,
+            "responder_id": None,
+        }
         adapter._team_clients["T1"].chat_update = AsyncMock()
 
         async def _handler(_event):

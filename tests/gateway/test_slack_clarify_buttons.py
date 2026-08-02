@@ -82,6 +82,7 @@ def _clear_clarify_state():
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
+        cm._current_generations.clear()
         cm._notify_cbs.clear()
 
 
@@ -186,6 +187,33 @@ class TestSlackClarifyChoiceAction:
         assert entry is not None
         assert not entry.event.is_set()
 
+    @pytest.mark.asyncio
+    async def test_wrong_channel_does_not_consume_callback_state(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._clarify_resolved["2.3"] = False
+        adapter._clarify_callback_state["2.3"] = {
+            "clarify_id": "cid-channel",
+            "session_key": "sk-channel",
+            "channel_id": "C1",
+            "team_id": "T1",
+            "generation": 2,
+            "responder_id": None,
+        }
+        body = {
+            "message": {"ts": "2.3", "blocks": []},
+            "channel": {"id": "C2"},
+            "team": {"id": "T1"},
+            "user": {"name": "alice", "id": "U1"},
+        }
+        await adapter._handle_clarify_action(
+            AsyncMock(),
+            body,
+            {"action_id": "hermes_clarify_choice_0", "value": "cid-channel|0"},
+        )
+        assert adapter._clarify_resolved["2.3"] is False
+        assert "2.3" in adapter._clarify_callback_state
+
 
 # ===========================================================================
 # _handle_clarify_action — "Other" → text-capture → typed reply (c)
@@ -203,6 +231,14 @@ class TestSlackClarifyOtherFlow:
         _attach_auth_runner(adapter)
         cm.register("cidO", "sk-other", "Pick", ["x", "y"])
         adapter._clarify_resolved["4.4"] = False
+        adapter._clarify_callback_state["4.4"] = {
+            "clarify_id": "cidO",
+            "session_key": "sk-other",
+            "channel_id": "C1",
+            "team_id": "",
+            "generation": None,
+            "responder_id": None,
+        }
 
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()

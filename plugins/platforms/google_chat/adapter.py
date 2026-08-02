@@ -638,6 +638,11 @@ class GoogleChatAdapter(BasePlatformAdapter):
       GOOGLE_CHAT_MAX_BYTES    (FlowControl, default 16_777_216 = 16 MiB)
     """
 
+    # Card click actions are not yet handled by this adapter.  Do not claim
+    # the v1 interactive callback contract until the inbound action path can
+    # furnish and verify exact structural identity.
+    clarify_identity_version = 0
+
     MAX_MESSAGE_LENGTH = _MAX_TEXT_LENGTH
     # Pub/Sub supervisor configuration.
     _MAX_RECONNECT_ATTEMPTS = 10
@@ -2193,10 +2198,20 @@ class GoogleChatAdapter(BasePlatformAdapter):
         clarify_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        generation: Optional[int] = None,
+        responder_id: Optional[str] = None,
     ) -> SendResult:
         if not choices:
             return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
+                chat_id,
+                question,
+                choices,
+                clarify_id,
+                session_key,
+                metadata,
+                generation=generation,
+                responder_id=responder_id,
             )
 
         buttons: List[Dict[str, Any]] = []
@@ -2227,7 +2242,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
         )
         if not buttons:
             return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
+                chat_id,
+                question,
+                choices,
+                clarify_id,
+                session_key,
+                metadata,
+                generation=generation,
+                responder_id=responder_id,
             )
 
         card = card_spec_to_cards_v2(
@@ -2249,7 +2271,14 @@ class GoogleChatAdapter(BasePlatformAdapter):
             self._clarify_state[clarify_id] = session_key
             return result
         return await super().send_clarify(
-            chat_id, question, choices, clarify_id, session_key, metadata
+            chat_id,
+            question,
+            choices,
+            clarify_id,
+            session_key,
+            metadata,
+            generation=generation,
+            responder_id=responder_id,
         )
 
     async def edit_message(

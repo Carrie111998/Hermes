@@ -69,12 +69,21 @@ def _event(
     prompt_response: Optional[Dict[str, Any]] = None,
     text: str = "/once",
     chat_id: str = "c1",
+    user_id: str = "u1",
+    platform: str = "telegram",
+    scope_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.COMMAND,
         source=SessionSource(
-            platform="telegram", chat_id=chat_id, chat_type="dm", user_id="u1"
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=user_id,
+            scope_id=scope_id,
+            thread_id=thread_id,
         ),
         prompt_response=prompt_response,
     )
@@ -173,10 +182,11 @@ async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
     marked: list[str] = []
     monkeypatch.setattr(
         "tools.clarify_gateway.resolve_gateway_clarify",
-        lambda cid, resp: resolved.append((cid, resp)) or True,
+        lambda cid, resp, **_identity: resolved.append((cid, resp)) or True,
     )
     monkeypatch.setattr(
-        "tools.clarify_gateway.mark_awaiting_text", lambda cid: marked.append(cid)
+        "tools.clarify_gateway.mark_awaiting_text",
+        lambda cid, **_identity: marked.append(cid) or True,
     )
     # Positional id maps back to the REAL choice text.
     event = _event({"prompt_id": prompt_id, "option_id": "c1"})
@@ -189,6 +199,78 @@ async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
     event2 = _event({"prompt_id": prompt_id2, "option_id": "other"})
     assert await adapter._consume_prompt_response(event2) is True
     assert marked == ["cl-10"]
+
+
+@pytest.mark.asyncio
+async def test_clarify_prompt_identity_mismatch_does_not_consume_real_prompt(
+    monkeypatch,
+):
+    adapter, stub = _adapter()
+    await adapter.send_clarify(
+        "c1",
+        "Which?",
+        ["alpha"],
+        "cl-identity",
+        "s",
+        metadata={"scope_id": "scope-1", "thread_id": "thread-1"},
+        generation=4,
+        responder_id="u1",
+    )
+    prompt_id = stub.sent[-1]["prompt_id"]
+    resolved = []
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_gateway_clarify",
+        lambda *args, **kwargs: resolved.append((args, kwargs)) or True,
+    )
+
+    response = {"prompt_id": prompt_id, "option_id": "c0"}
+    assert await adapter._consume_prompt_response(
+        _event(
+            response,
+            chat_id="other-chat",
+            scope_id="scope-1",
+            thread_id="thread-1",
+        )
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(
+            response,
+            user_id="other-user",
+            scope_id="scope-1",
+            thread_id="thread-1",
+        )
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(response, scope_id="other-scope", thread_id="thread-1")
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(response, scope_id="scope-1", thread_id="other-thread")
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert await adapter._consume_prompt_response(
+        _event(
+            response,
+            platform="discord",
+            scope_id="scope-1",
+            thread_id="thread-1",
+        )
+    ) is True
+    assert prompt_id in adapter._pending_prompts
+    assert resolved == []
+
+    assert await adapter._consume_prompt_response(
+        _event(response, scope_id="scope-1", thread_id="thread-1")
+    ) is True
+    assert prompt_id not in adapter._pending_prompts
+    assert len(resolved) == 1
+    assert resolved[0][1] == {
+        "session_key": "s",
+        "generation": 4,
+        "responder_id": "u1",
+    }
 
 
 # ── Discord type-3 hp1 decode ────────────────────────────────────────────
@@ -250,4 +332,3 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-

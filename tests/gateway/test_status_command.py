@@ -23,12 +23,17 @@ from gateway.session import (
 def _reset_gateway_listener_authority(monkeypatch, tmp_path):
     """Each test models a fresh single-listener gateway process."""
     from tools import async_delegation
+    from tools import clarify_gateway
     from tools.process_registry import process_registry
 
     default_home = tmp_path / "default-hermes-home"
     default_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     async_delegation._reset_for_tests()
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+        clarify_gateway._current_generations.clear()
     with process_registry._checkpoint_path_lock:
         previous_checkpoint = process_registry._checkpoint_path
         process_registry._checkpoint_path = None
@@ -36,6 +41,10 @@ def _reset_gateway_listener_authority(monkeypatch, tmp_path):
         yield
     finally:
         async_delegation._reset_for_tests()
+        with clarify_gateway._lock:
+            clarify_gateway._entries.clear()
+            clarify_gateway._session_index.clear()
+            clarify_gateway._current_generations.clear()
         with process_registry._checkpoint_path_lock:
             process_registry._checkpoint_path = previous_checkpoint
 
