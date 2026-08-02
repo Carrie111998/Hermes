@@ -20,6 +20,7 @@ from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
     _build_call_kwargs,
+    _cache_endpoint_components,
     _read_codex_access_token,
     _get_provider_chain,
     _is_payment_error,
@@ -38,6 +39,38 @@ from agent.auxiliary_client import (
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
 )
+
+
+def test_cache_endpoint_components_hides_and_distinguishes_query_secrets():
+    endpoint, hidden = _cache_endpoint_components(
+        "HTTPS://user:password@Api.Example.com:443/v1/?z=2&token=secret&z=1#fragment"
+    )
+    reordered_endpoint, reordered_hidden = _cache_endpoint_components(
+        "https://user:password@api.example.com/v1?z=1&z=2&token=secret"
+    )
+    _, changed_hidden = _cache_endpoint_components(
+        "https://user:password@api.example.com/v1?z=1&z=2&token=other"
+    )
+
+    assert endpoint == "https://api.example.com/v1"
+    assert reordered_endpoint == endpoint
+    assert hidden == reordered_hidden
+    assert hidden != changed_hidden
+    assert "user" not in endpoint
+    assert "password" not in endpoint
+    assert "secret" not in repr(hidden)
+
+
+def test_cache_endpoint_components_keeps_duplicate_and_blank_query_values():
+    endpoint, hidden = _cache_endpoint_components(
+        "https://api.example.com/v1?route=&route=a&route=b"
+    )
+    _, collapsed_hidden = _cache_endpoint_components(
+        "https://api.example.com/v1?route=b"
+    )
+
+    assert endpoint == "https://api.example.com/v1"
+    assert hidden != collapsed_hidden
 
 
 def _jwt_with_claims(claims: dict) -> str:
@@ -99,11 +132,6 @@ def codex_auth_dir(tmp_path, monkeypatch):
         lambda: "codex-test-token-abc123",
     )
     return codex_dir
-
-
-class TestAuxiliaryMaxTokensParam:
-    pass
-
 
 
 class TestResolveTaskProviderModel:

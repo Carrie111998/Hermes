@@ -315,7 +315,8 @@ def test_busy_smart_media_envelopes_stay_with_their_own_fifo_turn(monkeypatch):
     )
     fired = []
 
-    def capture_dispatch(rid, _sid, captured_session, text):
+    def capture_dispatch(rid, _sid, captured_session, text, **kwargs):
+        assert kwargs["queued_prompt_generation"] == 0
         envelope = captured_session.pop("active_prompt_envelope")
         fired.append(
             (
@@ -901,7 +902,7 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
         ("drain-b", "sid", "B", ["/tmp/b.png"]),
         ("drain-c", "sid", "C", ["/tmp/c.png"]),
     ]
-    assert all(item[4] == {} for item in dispatched)
+    assert all(item[4] == {"queued_prompt_generation": 0} for item in dispatched)
 
 
 def _smart_decision(route):
@@ -1052,7 +1053,7 @@ def test_drain_compute_host_forwards_queued_envelope_images(monkeypatch):
         "sid": "sid",
         "text": "inspect",
         "images": ["/tmp/b.png"],
-        "generation": None,
+        "generation": 0,
     }
 
 
@@ -1088,6 +1089,28 @@ def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
     assert session["running"] is False
 
 
+def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch):
+    class _Agent:
+        clear_calls = 0
+
+        def clear_interrupt(self):
+            self.clear_calls += 1
+
+    agent = _Agent()
+    session = _session(agent=agent, queued_prompt={"text": "B", "transport": None})
+    original_run = server._run_prompt_submit
+
+    def stop_before_run(*args, **kwargs):
+        session["_queued_prompt_generation"] = 1
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_run_prompt_submit", stop_before_run)
+
+    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert agent.clear_calls == 0
+    assert session["running"] is False
+    assert session["queued_prompt"]["text"] == "B"
 
 
 def test_drain_requeues_failed_prompt_ahead_of_later_envelope(monkeypatch):
@@ -1220,6 +1243,96 @@ def test_accepted_queue_survives_process_state_recreation_with_media(tmp_path):
     tombstone = json.loads(state_path.read_text(encoding="utf-8"))
     assert tombstone["items"] == []
     assert tombstone["claim"] is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink contract")
+def test_prompt_queue_state_rejects_symlinked_private_ancestor(tmp_path):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir(mode=0o700)
+    outside_cache = tmp_path / "outside-cache"
+    outside_cache.mkdir(mode=0o700)
+    try:
+        (profile_home / "cache").symlink_to(outside_cache, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    session = _session(
+        session_key="symlinked-cache-ancestor",
+        profile_home=str(profile_home),
+    )
+
+    with pytest.raises(OSError, match="unsafe private artifact directory"):
+        server._prompt_queue_state_path(session)
+    assert list(outside_cache.iterdir()) == []
+
+
+def test_prompt_queue_restore_rejects_symlinked_ledger(tmp_path):
+    session_key = "symlinked-ledger"
+    original = _session(session_key=session_key)
+    assert server._enqueue_prompt(original, "private prompt", "old-ws")["accepted"]
+    state_path = server._prompt_queue_state_path(original)
+    assert state_path is not None
+    outside = tmp_path / "outside-ledger.json"
+    state_path.replace(outside)
+    try:
+        state_path.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    outside_bytes = outside.read_bytes()
+
+    restored = _session(session_key=session_key, transport="new-ws")
+    with server._prompt_queue_lock(restored):
+        items = server._queued_prompt_items_locked(restored)
+    receipt = server._enqueue_prompt(restored, "must not overwrite", "new-ws")
+
+    assert items == []
+    assert restored.get("_prompt_queue_restore_error") is True
+    assert receipt["accepted"] is False
+    assert receipt["reason"] == "recovery_error"
+    assert state_path.is_symlink()
+    assert outside.read_bytes() == outside_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+def test_prompt_queue_restore_rejects_hardlinked_ledger(tmp_path):
+    session_key = "hardlinked-ledger"
+    original = _session(session_key=session_key)
+    assert server._enqueue_prompt(original, "private prompt", "old-ws")["accepted"]
+    state_path = server._prompt_queue_state_path(original)
+    assert state_path is not None
+    outside = tmp_path / "outside-hardlink.json"
+    os.link(state_path, outside)
+    outside_bytes = outside.read_bytes()
+
+    restored = _session(session_key=session_key, transport="new-ws")
+    with server._prompt_queue_lock(restored):
+        items = server._queued_prompt_items_locked(restored)
+    receipt = server._enqueue_prompt(restored, "must not overwrite", "new-ws")
+
+    assert items == []
+    assert restored.get("_prompt_queue_restore_error") is True
+    assert receipt["accepted"] is False
+    assert receipt["reason"] == "recovery_error"
+    assert state_path.stat().st_nlink == 2
+    assert outside.read_bytes() == outside_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX private-mode contract")
+def test_prompt_queue_restore_repairs_nonprivate_ledger_mode_before_reading():
+    session_key = "public-mode-ledger"
+    original = _session(session_key=session_key)
+    assert server._enqueue_prompt(original, "private prompt", "old-ws")["accepted"]
+    state_path = server._prompt_queue_state_path(original)
+    assert state_path is not None
+    os.chmod(state_path, 0o644)
+
+    restored = _session(session_key=session_key, transport="new-ws")
+    with server._prompt_queue_lock(restored):
+        items = server._queued_prompt_items_locked(restored)
+
+    assert [item["text"] for item in items] == ["private prompt"]
+    assert state_path.stat().st_mode & 0o777 == 0o600
+    assert restored.get("_prompt_queue_restore_error") is not True
 
 
 def test_authoritative_reload_prevents_revision_aba_across_session_mirrors():
@@ -1470,7 +1583,7 @@ def test_drain_async_launcher_keeps_claim_until_worker_terminal(monkeypatch):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: launched.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: launched.append(text),
     )
     assert server._enqueue_prompt(session, "accepted async", "ws")["accepted"]
 
@@ -2021,7 +2134,7 @@ def test_tui_queued_prompts_are_fifo_and_never_replace_each_other(monkeypatch):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, session, text: fired.append(text),
+        lambda rid, sid, session, text, **_kwargs: fired.append(text),
     )
     session = _session(running=True)
 
@@ -2054,7 +2167,7 @@ def test_two_session_objects_cannot_dispatch_same_durable_item(monkeypatch):
     child = _session(session_key="shared-dispatch")
     dispatched: list[tuple[str, str]] = []
 
-    def launch(_rid, _sid, session, text):
+    def launch(_rid, _sid, session, text, **_kwargs):
         owner = "parent" if session is parent else "child"
         dispatched.append((owner, text))
 

@@ -137,14 +137,31 @@ class TestOpenLockPatience:
         finally:
             db.close()
 
-    def test_open_propagates_non_lock_errors_immediately(self, tmp_path):
-        """A non-lock open failure must not sit in the patience loop."""
-        # A directory is not openable as a database file — raises an
-        # OperationalError that is NOT the locked/busy class.
+    def test_unsafe_database_path_is_rejected_without_retry(self, tmp_path):
+        """A non-regular database path fails the private-artifact preflight."""
         bad_path = tmp_path / "state.db"
         bad_path.mkdir()
         t0 = time.monotonic()
-        with pytest.raises(sqlite3.Error):
+        with pytest.raises(
+            OSError,
+            match="unsafe private SQLite artifact: symlink or non-regular file",
+        ):
             SessionDB(db_path=bad_path)
         # Must fail well before a full patience window (loose bound).
+        assert time.monotonic() - t0 < 15.0
+
+    def test_non_lock_operational_errors_not_retried(self, tmp_path, monkeypatch):
+        calls = 0
+
+        def fail_connect(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr("hermes_state._connect_tracked_db", fail_connect)
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+            SessionDB(db_path=tmp_path / "state.db")
+
+        assert calls == 1
         assert time.monotonic() - t0 < 15.0

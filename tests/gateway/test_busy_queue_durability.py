@@ -548,6 +548,18 @@ def test_terminal_result_requires_explicit_receipt_success(tmp_path):
     )
 
 
+def test_terminal_discard_result_is_canonical_and_committable(tmp_path):
+    runner = _runner(tmp_path / "profile", _Adapter())
+
+    result = runner._busy_queue_terminal_discard_result()
+
+    assert result == {
+        "completed": True,
+        "receipt_terminal_success": True,
+    }
+    assert runner._busy_queue_result_is_terminal(result)
+
+
 def test_duplicate_finalizer_is_stale_and_cannot_authorize_progress(tmp_path):
     source = _source()
     adapter = _Adapter()
@@ -904,6 +916,42 @@ async def test_cancel_session_cancels_not_yet_dispatched_replay(tmp_path):
 
     assert replay_task.cancelled()
     assert session_key not in runner._busy_queue_replay_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claimed_replay_does_not_recreate_uncertain_fence(tmp_path):
+    profile_home = tmp_path / "profile"
+    adapter = _Adapter()
+    runner = _runner(profile_home, adapter)
+    source = _source()
+    session_key = runner._session_key_for_source(source)
+    started = asyncio.Event()
+    block = asyncio.Event()
+
+    async def handle_message(_event):
+        started.set()
+        await block.wait()
+
+    cast(Any, adapter).handle_message = handle_message
+    assert runner._queue_or_replace_pending_event(
+        session_key,
+        _event("cancel after claim", source, "cancel-race-1"),
+    )
+
+    replay_task = asyncio.create_task(
+        runner._run_busy_queue_replay(session_key, source)
+    )
+    runner._busy_queue_replay_tasks = {session_key: replay_task}
+    await asyncio.wait_for(started.wait(), timeout=2)
+    token = runner._busy_queue_active_claims[session_key]
+
+    assert runner._busy_queue_cancel_session(session_key, source, adapter) is True
+    with pytest.raises(asyncio.CancelledError):
+        await replay_task
+
+    assert token in runner._busy_queue_cancelled_claim_tokens
+    assert session_key not in runner._busy_queue_uncertain_sessions
+    assert not list(profile_home.rglob("*.json"))
 
 
 @pytest.mark.asyncio

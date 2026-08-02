@@ -3561,22 +3561,30 @@ class AIAgent:
             return len(text)
 
     @staticmethod
-    def _steer_marker_present_in_request(value: Any, marker: str) -> bool:
-        """Return whether a final provider payload still contains one exact marker."""
+    def _steer_marker_occurrences_in_request(value: Any, marker: str) -> int:
+        """Count exact marker occurrences in one final provider payload."""
 
+        if not marker:
+            return 0
         if isinstance(value, str):
-            return marker in value
+            return value.count(marker)
         if isinstance(value, dict):
-            return any(
-                AIAgent._steer_marker_present_in_request(item, marker)
+            return sum(
+                AIAgent._steer_marker_occurrences_in_request(item, marker)
                 for item in value.values()
             )
         if isinstance(value, (list, tuple)):
-            return any(
-                AIAgent._steer_marker_present_in_request(item, marker)
+            return sum(
+                AIAgent._steer_marker_occurrences_in_request(item, marker)
                 for item in value
             )
-        return False
+        return 0
+
+    @staticmethod
+    def _steer_marker_present_in_request(value: Any, marker: str) -> bool:
+        """Return whether a final provider payload still contains one exact marker."""
+
+        return AIAgent._steer_marker_occurrences_in_request(value, marker) > 0
 
     def _mark_injected_steer_receipts_requested(self, request: Any) -> int:
         """Record receipts visible in the exact payload passed to the provider."""
@@ -3607,19 +3615,31 @@ class AIAgent:
                 if isinstance(envelopes_by_generation, dict)
                 else []
             )
+            marker_occurrences: dict[str, int] = {}
+
+            def _claim_marker_occurrence(marker: str) -> bool:
+                if not marker:
+                    return False
+                if marker not in marker_occurrences:
+                    marker_occurrences[marker] = (
+                        self._steer_marker_occurrences_in_request(request, marker)
+                    )
+                if marker_occurrences[marker] <= 0:
+                    return False
+                marker_occurrences[marker] -= 1
+                return True
+
             if envelopes:
                 for marker, receipt_ids in envelopes:
-                    if marker and self._steer_marker_present_in_request(
-                        request, marker
-                    ):
+                    # Matching is occurrence-aware: byte-identical duplicate
+                    # markers consume one envelope each, in injection order.
+                    if _claim_marker_occurrence(marker):
                         generation_ids.update(receipt_ids)
             else:
                 # Legacy test stubs may populate the receipt map directly.
                 for receipt in receipts:
                     marker = format_steer_marker(receipt[0]).strip()
-                    if marker and self._steer_marker_present_in_request(
-                        request, marker
-                    ):
+                    if _claim_marker_occurrence(marker):
                         generation_ids.add(id(receipt))
             return len(generation_ids) - before
 
@@ -7569,10 +7589,29 @@ class AIAgent:
         from agent.auxiliary_client import scoped_runtime_main
 
         # Track receipt callback failures per turn; ContextVar ownership remains
-        # local to this caller thread through scoped_runtime_main below.
-        self._steer_receipt_callback_failed = False
+        # local to this caller thread through scoped_runtime_main below. Lightweight
+        # doubles/subclasses that do not expose a fully initialized checkpoint pair
+        # still participate in the conversation and relay lifecycle without steering.
+        open_steer_checkpoint: Optional[Callable[[], int]] = getattr(
+            self,
+            "_open_steer_checkpoint",
+            None,
+        )
+        close_steer_checkpoint: Optional[
+            Callable[[Optional[int]], Optional[str]]
+        ] = getattr(self, "_close_steer_checkpoint", None)
+        if (
+            callable(open_steer_checkpoint)
+            and callable(close_steer_checkpoint)
+            and getattr(self, "_pending_steer_lock", None) is not None
+        ):
+            supports_steer_checkpoint = True
+            self._steer_receipt_callback_failed = False
+            steer_generation: Optional[int] = open_steer_checkpoint()
+        else:
+            supports_steer_checkpoint = False
+            steer_generation = None
         result: Optional[Dict[str, Any]] = None
-        steer_generation = self._open_steer_checkpoint()
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -7659,7 +7698,12 @@ class AIAgent:
             # this turn, or it observes the closed lease and returns False
             # so gateway/CLI can queue it. A cached agent's next run gets a
             # different generation and rejects stale classifier decisions.
-            final_steer = self._close_steer_checkpoint(steer_generation)
+            if supports_steer_checkpoint and close_steer_checkpoint is not None:
+                final_steer: Optional[str] = close_steer_checkpoint(
+                    steer_generation
+                )
+            else:
+                final_steer = None
             committed = is_explicit_terminal_success(result)
             def _take_injected_receipts():
                 injected_by_generation = getattr(

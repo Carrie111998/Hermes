@@ -15,7 +15,6 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
-from unittest.mock import patch
 
 
 @pytest.fixture(autouse=True)

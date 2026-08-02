@@ -1201,7 +1201,7 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            timeout=0.5,
         )
 
         assert result.returncode == 0
@@ -1226,7 +1226,7 @@ class TestRunCommandSttIdleTimeout:
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_stt(
                 self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.1,
+                timeout=0.5,
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")

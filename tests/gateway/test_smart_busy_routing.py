@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -294,6 +295,63 @@ async def test_smart_rechecks_active_agent_after_classification_race():
     runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
     agent.steer.assert_not_called()
     agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_late_smart_classification_wakes_idle_session_without_new_inbound(
+    tmp_path,
+):
+    """A classifier that loses its predecessor turn must launch the durable head.
+
+    The predecessor's normal completion drain has already observed an empty
+    adapter queue before classification returns. No later inbound message is
+    available to heal the missed wakeup.
+    """
+    runner, agent = _runner_and_agent()
+    event = _event("continue after the current turn")
+    sk = build_session_key(event.source)
+    runner._running_agents[sk] = agent
+    classifier_started = asyncio.Event()
+    release_classifier = asyncio.Event()
+
+    async def classify(*_args, **_kwargs):
+        classifier_started.set()
+        await release_classifier.wait()
+        return await _decision(ROUTE_DEPENDENT, event.text)
+
+    adapter = MagicMock()
+    adapter._active_sessions = {}
+    adapter._pending_messages = {}
+    adapter.handle_message = AsyncMock()
+    runner._classify_smart_busy_message = classify
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._send_smart_busy_ack = AsyncMock()
+    runner._busy_queue_root_override = tmp_path / "profile"
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_uncertain_paths = set()
+    runner._busy_queue_active_claims = {}
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_cancelled_claim_tokens = set()
+    runner._busy_queue_finalized_claim_tokens = set()
+
+    route_task = asyncio.create_task(
+        runner._handle_smart_busy_message(event, sk, agent, adapter)
+    )
+    await classifier_started.wait()
+
+    # Simulate the original turn fully unwinding after its completion drain
+    # found no pending event. Classification is the only operation in flight.
+    assert runner._running_agents.pop(sk) is agent
+    release_classifier.set()
+    assert await route_task is True
+
+    adapter.handle_message.assert_awaited_once()
+    dispatched = adapter.handle_message.await_args.args[0]
+    assert dispatched.text == event.text
+    assert getattr(dispatched, "_hermes_busy_queue_claim_context", None)
+    assert sk not in adapter._pending_messages
 
 
 @pytest.mark.asyncio

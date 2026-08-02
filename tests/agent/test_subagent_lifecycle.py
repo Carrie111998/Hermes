@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -144,6 +145,12 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     from run_agent import AIAgent
 
     agent = AIAgent.__new__(AIAgent)
+    agent._pending_steer = None
+    agent._pending_steer_count = 0
+    agent._pending_steer_receipts = []
+    agent._pending_steer_lock = threading.Lock()
+    agent._steer_run_generation = 0
+    agent._steer_checkpoint_open = False
     observed = []
 
     def run_conversation(parent, *_args, **_kwargs):

@@ -254,10 +254,6 @@ async def test_steer_with_pending_sentinel_falls_back_to_queue(tmp_path):
 @pytest.mark.asyncio
 async def test_steer_agent_without_steer_method_falls_back(tmp_path):
     """An older agent without steer support falls back to the durable FIFO."""
-
-async def test_steer_agent_without_steer_method_falls_back():
-    """If the running agent somehow lacks the steer() method (older build,
-    test stub), the handler must not explode — fall back to /queue."""
     runner, adapter = _make_runner(_session_entry())
     _enable_durable_queue(runner, adapter, tmp_path / "profile")
     sk = build_session_key(_make_source())

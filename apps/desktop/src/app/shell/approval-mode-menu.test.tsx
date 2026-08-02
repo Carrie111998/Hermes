@@ -40,7 +40,11 @@ function Harness({
 }) {
   const item = useApprovalModeStatusbarItem(profile, requestGateway)
 
-  return <StatusbarControls items={[item]} />
+  return (
+    <MemoryRouter>
+      <StatusbarControls items={[item]} />
+    </MemoryRouter>
+  )
 }
 
 describe('approval mode statusbar item', () => {

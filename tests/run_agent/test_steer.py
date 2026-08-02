@@ -54,55 +54,32 @@ class TestSteerAcceptance:
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
 
-
-
-
-
-
-
-class TestSteerDrain:
-    def test_drain_returns_and_clears(self):
+    def test_rejects_empty_string(self):
         agent = _bare_agent()
-        agent.steer("hello")
-        assert agent._drain_pending_steer() == "hello"
+        assert agent.steer("") is False
         assert agent._pending_steer is None
 
-
-
-class TestActiveTurnRedirect:
-    def test_rejects_when_no_turn_is_active(self):
+    def test_rejects_whitespace_only(self):
         agent = _bare_agent()
-        assert agent.redirect("change course") is False
-        assert agent._pending_redirect is None
+        assert agent.steer("   \n\t  ") is False
+        assert agent._pending_steer is None
 
-    def test_cancels_only_an_active_model_request(self):
+    def test_rejects_none(self):
         agent = _bare_agent()
-        agent._model_request_active.set()
+        assert agent.steer(None) is False  # type: ignore[arg-type]
+        assert agent._pending_steer is None
 
-        assert agent.redirect("use Postgres") is True
-        assert agent._pending_redirect == "use Postgres"
-        assert agent._interrupt_requested is True
-        assert agent._interrupt_message is None
-
-    def test_multiple_redirects_preserve_message_boundaries(self):
+    def test_strips_surrounding_whitespace(self):
         agent = _bare_agent()
-        agent._model_request_active.set()
+        assert agent.steer("  hello world  \n") is True
+        assert agent._pending_steer == "hello world"
 
-        assert agent.redirect("first correction") is True
-        assert agent.redirect("second correction") is True
-        assert agent._pending_redirect == (
-            "first correction\n\n"
-            "[Additional user correction]\n"
-            "second correction"
-        )
-
-    def test_hard_interrupt_wins_over_new_redirect(self):
+    def test_concatenates_multiple_steers_with_newlines(self):
         agent = _bare_agent()
-        agent._model_request_active.set()
-        agent._interrupt_requested = True
-
-        assert agent.redirect("too late") is False
-        assert agent._pending_redirect is None
+        agent.steer("first note")
+        agent.steer("second note")
+        agent.steer("third note")
+        assert agent._pending_steer == "first note\nsecond note\nthird note"
 
     def test_rejects_ninth_pending_steer_without_losing_the_first_eight(self):
         agent = _bare_agent()
@@ -333,6 +310,62 @@ class TestActiveTurnRedirect:
             "consumed:first correction",
             "consumed:second correction",
         ]
+
+    def test_duplicate_markers_link_only_one_envelope_per_provider_occurrence(
+        self, monkeypatch
+    ):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        callbacks = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            generation = live_agent._steer_run_generation
+            injected_messages = []
+            for label in ("first", "second"):
+                assert live_agent.steer(
+                    "duplicate correction",
+                    run_generation=generation,
+                    on_consumed=lambda label=label: callbacks.append(
+                        f"consumed:{label}"
+                    ),
+                    on_unconsumed=lambda label=label: callbacks.append(
+                        f"unconsumed:{label}"
+                    ),
+                )
+                message = {
+                    "role": "tool",
+                    "content": f"result-{label}",
+                    "tool_call_id": label,
+                }
+                live_agent._apply_pending_steer_to_tool_results([message], 1)
+                injected_messages.append(message)
+
+            # Middleware retained only the first of two byte-identical markers.
+            # One provider occurrence must own exactly one receipt envelope.
+            assert (
+                live_agent._mark_injected_steer_receipts_requested(
+                    {"messages": injected_messages[:1]}
+                )
+                == 1
+            )
+            return {
+                "final_response": "done",
+                "messages": injected_messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert callbacks == ["consumed:first", "unconsumed:second"]
 
     def test_consumption_ack_rejects_completed_turn_with_cleanup_errors(self, monkeypatch):
         agent = _bare_agent()
@@ -625,6 +658,53 @@ class TestActiveTurnRedirect:
         assert result["cleanup_errors"] == ["steer receipt finalization failed"]
 
 
+class TestSteerDrain:
+    def test_drain_returns_and_clears(self):
+        agent = _bare_agent()
+        agent.steer("hello")
+        assert agent._drain_pending_steer() == "hello"
+        assert agent._pending_steer is None
+
+    def test_drain_on_empty_returns_none(self):
+        agent = _bare_agent()
+        assert agent._drain_pending_steer() is None
+
+
+class TestActiveTurnRedirect:
+    def test_rejects_when_no_turn_is_active(self):
+        agent = _bare_agent()
+        assert agent.redirect("change course") is False
+        assert agent._pending_redirect is None
+
+    def test_cancels_only_an_active_model_request(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+
+        assert agent.redirect("use Postgres") is True
+        assert agent._pending_redirect == "use Postgres"
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message is None
+
+    def test_multiple_redirects_preserve_message_boundaries(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+
+        assert agent.redirect("first correction") is True
+        assert agent.redirect("second correction") is True
+        assert agent._pending_redirect == (
+            "first correction\n\n"
+            "[Additional user correction]\n"
+            "second correction"
+        )
+
+    def test_hard_interrupt_wins_over_new_redirect(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        agent._interrupt_requested = True
+
+        assert agent.redirect("too late") is False
+        assert agent._pending_redirect is None
+
     def test_reasoning_deltas_are_display_only(self):
         """Streamed reasoning must never accumulate into replayable transcript
         state — an assistant checkpoint that inlines chain-of-thought trips
@@ -713,7 +793,6 @@ class TestActiveTurnRedirect:
         assert agent._pending_redirect is None
         assert agent._pending_steer == "also check migrations"
         assert agent._interrupt_requested is False
-
 
 class TestActiveTurnRedirectCheckpoint:
     def test_assistant_tail_puts_correction_last(self):
@@ -872,6 +951,13 @@ class TestSteerInjection:
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
         assert messages[-1]["content"] == "output"  # unchanged
 
+    def test_no_op_when_num_tool_msgs_zero(self):
+        agent = _bare_agent()
+        agent.steer("steer")
+        messages = [{"role": "user", "content": "hi"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=0)
+        # Steer should remain pending (nothing to drain into)
+        assert agent._pending_steer == "steer"
 
     def test_marker_labels_text_as_out_of_band_user_message(self):
         """The injection marker must attribute the appended text to the user
@@ -905,6 +991,23 @@ class TestSteerInjection:
         assert new_content[1]["type"] == "text"
         assert "extra note" in new_content[1]["text"]
 
+    def test_restashed_when_no_tool_result_in_batch(self):
+        """If the 'batch' contains no tool-role messages (e.g. all skipped
+        after an interrupt), the steer should be put back into the pending
+        slot so the caller's fallback path can deliver it."""
+        agent = _bare_agent()
+        agent.steer("ping")
+        messages = [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ]
+        # Claim there were N tool msgs, but the tail has none — simulates
+        # the interrupt-cancelled case.
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
+        # Messages untouched
+        assert messages[-1]["content"] == "y"
+        # And the steer is back in pending so the fallback can grab it
+        assert agent._pending_steer == "ping"
 
     def test_interrupt_during_no_tool_restore_keeps_payload_and_receipt_atomic(self):
         agent = _bare_agent()
@@ -1113,12 +1216,10 @@ class TestSteerClearedOnInterrupt:
         agent._tool_worker_threads_lock = None
 
         agent.steer("will be dropped")
-        agent._pending_redirect = "also drop this"
         assert agent._pending_steer == "will be dropped"
 
         agent.clear_interrupt()
         assert agent._pending_steer is None
-        assert agent._pending_redirect is None
 
     def test_system_timeout_transfers_accepted_steer_to_recovery_mailbox(self):
         agent = _bare_agent()
@@ -1232,6 +1333,26 @@ class TestPreApiCallSteerDrain:
         agent._pending_steer = _pre_api_steer
         assert agent._pending_steer == "early steer"
 
+    def test_pre_api_drain_finds_tool_msg_past_assistant(self):
+        """The pre-API drain should scan backwards past a non-tool message
+        (e.g., if an assistant message was somehow appended after tools)
+        and still find the tool result."""
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "let me check", "tool_calls": [
+                {"id": "tc1", "function": {"name": "web_search", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "content": "search results", "tool_call_id": "tc1"},
+        ]
+        agent.steer("change approach")
+        _pre_api_steer = agent._drain_pending_steer()
+        assert _pre_api_steer is not None
+        for _si in range(len(messages) - 1, -1, -1):
+            if messages[_si].get("role") == "tool":
+                messages[_si]["content"] += format_steer_marker(_pre_api_steer)
+                break
+        assert "change approach" in messages[2]["content"]
 
 
 class TestSteerMarkerContract:

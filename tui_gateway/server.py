@@ -6975,36 +6975,6 @@ def _coerce_seed_history(value: Any) -> list[dict]:
     return history
 
 
-def _content_display_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, (int, float)):
-        return str(content)
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            text = _content_display_text(part).strip()
-            if text:
-                parts.append(text)
-        return "\n".join(parts)
-    if isinstance(content, dict):
-        kind = content.get("type")
-        if kind in {"text", "input_text", "output_text"}:
-            return str(content.get("text") or content.get("content") or "")
-        if kind in {"image_url", "input_image", "image"}:
-            return "[image]"
-        if kind in {"input_audio", "audio"}:
-            return "[audio]"
-        if kind:
-            return f"[{kind}]"
-        if "text" in content:
-            return str(content.get("text") or "")
-        return "[structured content]"
-    return str(content)
-
-
 def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
@@ -7488,9 +7458,15 @@ def _prompt_queue_state_path(session: dict) -> Path | None:
     profile_home = (
         Path(str(profile_home_raw)).expanduser().resolve()
         if profile_home_raw
-        else _hermes_home
+        else Path(_hermes_home).expanduser().resolve()
     )
-    return profile_home / "cache" / "tui-prompt-queue" / f"{digest}.json"
+    # Resolve only the trusted profile root. Each private descendant must itself
+    # be a real, owner-only directory; never follow a pre-created ``cache`` or
+    # queue-directory symlink into an arbitrary location.
+    _secure_private_directory(profile_home)
+    cache_dir = _secure_private_directory(profile_home / "cache")
+    queue_dir = _secure_private_directory(cache_dir / "tui-prompt-queue")
+    return queue_dir / f"{digest}.json"
 
 
 def _serial_prompt_envelope(item: dict) -> dict:
@@ -7547,13 +7523,7 @@ def _load_persisted_prompt_items_locked(session: dict, *, force: bool = False) -
     if session.get("_prompt_queue_persistence_loaded") and not force:
         return
     path = _prompt_queue_state_path(session)
-    if path is None or not path.exists():
-        if session.get("_prompt_queue_persistence_initialized"):
-            # A missing file after this session observed a durable revision is
-            # an authoritative empty state committed by another owner.
-            _clear_published_prompt_queue_state(session)
-            session["_prompt_queue_revision"] = 0
-            session["_prompt_queue_writer_token"] = ""
+    if path is None:
         session["_prompt_queue_persistence_loaded"] = True
         return
     try:
@@ -7561,9 +7531,12 @@ def _load_persisted_prompt_items_locked(session: dict, *, force: bool = False) -
         # JSON control-character escaping can expand one accepted payload byte
         # to six storage bytes.  Bound reads without rejecting a valid 1 MiB
         # payload that was admitted before the restart.
-        if path.stat().st_size > (8 * max_bytes + 131_072):
-            raise ValueError("persisted prompt queue exceeds the recovery-file limit")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            _read_private_file(
+                path,
+                max_bytes=8 * max_bytes + 131_072,
+            ).decode("utf-8")
+        )
         if not isinstance(payload, dict):
             raise ValueError("persisted prompt queue is not an object")
         try:
@@ -7651,6 +7624,14 @@ def _load_persisted_prompt_items_locked(session: dict, *, force: bool = False) -
         session["_prompt_queue_writer_token"] = writer_token
         session["_prompt_queue_persistence_initialized"] = True
         session["_prompt_queue_persistence_loaded"] = True
+    except FileNotFoundError:
+        if session.get("_prompt_queue_persistence_initialized"):
+            # A missing file after this session observed a durable revision is
+            # an authoritative empty state committed by another owner.
+            _clear_published_prompt_queue_state(session)
+            session["_prompt_queue_revision"] = 0
+            session["_prompt_queue_writer_token"] = ""
+        session["_prompt_queue_persistence_loaded"] = True
     except Exception as exc:
         session["_prompt_queue_persistence_loaded"] = True
         session["_prompt_queue_restore_error"] = True
@@ -7663,9 +7644,12 @@ def _load_persisted_prompt_items_locked(session: dict, *, force: bool = False) -
 def _prompt_queue_disk_generation(path: Path) -> tuple[int, str]:
     """Read the replace-file CAS generation while its stable flock is held."""
 
-    if not path.exists():
+    try:
+        max_bytes = int(_load_tui_busy_queue_config()["max_bytes"])
+        raw = _read_private_file(path, max_bytes=8 * max_bytes + 131_072)
+    except FileNotFoundError:
         return 0, ""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(raw.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("persisted prompt queue is not an object")
     try:
@@ -7727,12 +7711,6 @@ def _persist_prompt_items_locked(
         )
     revision = durable_generation[0] + 1
     writer_token = _current_prompt_queue_process_token()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.name != "nt":
-        os.chmod(path.parent, 0o700)
-    temp = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-    )
     encoded = json.dumps(
         {
             "version": 4,
@@ -7747,29 +7725,11 @@ def _persist_prompt_items_locked(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        descriptor = os.open(temp, flags, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            if os.name != "nt":
-                raise
-        # Retain the atomically committed empty tombstone. The stable lock file
-        # already persists for this scope, and keeping the revision monotonic
-        # prevents an old in-process representation from mistaking a later
-        # empty→ready cycle for its own earlier revision (generation ABA).
-    finally:
-        temp.unlink(missing_ok=True)
+    _write_private_file_atomic(path, encoded)
+    # Retain the atomically committed empty tombstone. The stable lock file
+    # already persists for this scope, and keeping the revision monotonic
+    # prevents an old in-process representation from mistaking a later
+    # empty→ready cycle for its own earlier revision (generation ABA).
     return revision, writer_token
 
 
@@ -9060,6 +9020,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     with session["history_lock"]:
         if session.get("running"):
             return False
+        queue_generation = int(session.get("_queued_prompt_generation", 0))
         with _prompt_queue_lock(session):
             items, _expired = _cleanup_expired_prompts_locked(session)
             if session.get("_prompt_queue_restore_error"):
@@ -9081,6 +9042,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 sid,
                 session,
                 queued["text"],
+                queued_prompt_generation=queue_generation,
                 envelope=queued,
             )
             if resp.get("error"):
@@ -9096,7 +9058,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             # durable claim is committed by that worker's terminal ``finally``;
             # clearing it here would open a crash window before execution or
             # transcript persistence.
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                queued_prompt_generation=queue_generation,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -10909,7 +10877,9 @@ def _run_prompt_submit(
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
-            session.pop("active_prompt_envelope", None)
+            stale_envelope = session.pop("active_prompt_envelope", None)
+            if isinstance(stale_envelope, dict):
+                _requeue_prompt_front(session, stale_envelope)
             return
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))

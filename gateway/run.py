@@ -7885,6 +7885,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source="fallback",
                 )
 
+            # Classification can outlive the predecessor's terminal drain. If
+            # durable admission completed after that owner disappeared, claim
+            # and launch the FIFO head now; otherwise no future inbound message
+            # is guaranteed to wake the accepted work.
+            if (
+                accepted is True
+                and self._running_agents.get(session_key) is None
+            ):
+                await self._run_busy_queue_replay(
+                    session_key,
+                    event.source,
+                    startup_restore=False,
+                )
+
             log_route(decision, accepted=accepted, steered=steered)
             await self._send_smart_busy_ack(
                 event,
@@ -14084,7 +14098,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if quick_key in self.__dict__.setdefault(
                 "_busy_queue_uncertain_sessions", set()
             ):
-                return "⚠️ Steer uncertain: durable handoff could not be confirmed."
+                return (
+                    "⚠️ Steer uncertain: durable handoff could not be confirmed. "
+                    "Do not resend; check queue/session status first."
+                )
             return "⚠️ Steer not accepted: durable admission failed."
         if steered:
             preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
@@ -14125,6 +14142,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        # Durable replay/handoff events carry a transient claim sidecar. Capture
+        # it before pre-hooks can replace the dataclass instance, then pass it to
+        # the turn that owns terminal commit/rollback.
+        busy_queue_claim_context = getattr(
+            event,
+            "_hermes_busy_queue_claim_context",
+            None,
+        )
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -15473,7 +15498,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if (
+                isinstance(busy_queue_claim_context, tuple)
+                and len(busy_queue_claim_context) == 3
+            ):
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                    busy_queue_claim=busy_queue_claim_context,
+                )
+            else:
+                # Preserve the long-standing four-argument seam used by
+                # adapters, plugins, and lightweight test doubles.
+                _agent_result = await self._handle_message_with_agent(
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -25279,12 +25323,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 claim_key, claim_source, claim_token = (
                                     pending_busy_queue_claim
                                 )
-                                self._busy_queue_finalize_claim(
+                                discard_committed = self._busy_queue_finalize_claim(
                                     claim_key,
                                     claim_source,
                                     claim_token,
-                                    {"completed": True},
+                                    self._busy_queue_terminal_discard_result(),
                                 )
+                                if not discard_committed:
+                                    return result
                                 pending_busy_queue_claim = None
                             pending_event = None
                             pending = None
@@ -25456,7 +25502,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 claim_key,
                                 claim_source,
                                 claim_token,
-                                {"completed": True},
+                                self._busy_queue_terminal_discard_result(),
                             )
                         return result
                     # Resolve the follow-up's session key BEFORE preparing the
@@ -26472,8 +26518,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         session_key: str,
         source: SessionSource,
+        *,
+        startup_restore: bool = True,
     ) -> None:
-        """Claim one restored FIFO head and hand it to its rebound adapter."""
+        """Claim one durable FIFO head and hand it to its rebound adapter."""
         adapter = self._adapter_for_source(source)
         if adapter is None:
             return
@@ -26495,7 +26543,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             frozen_source,
             token,
         )
-        event._hermes_startup_restore_replay = True  # type: ignore[attr-defined]
+        if startup_restore:
+            event._hermes_startup_restore_replay = True  # type: ignore[attr-defined]
 
         # A predecessor can become active after the first liveness check but
         # before the durable claim. Restore the exact claim at the FIFO front;
@@ -26512,6 +26561,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent turn carrying the frozen context above.
             await adapter.handle_message(event)
         except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                cancelled_tokens = self.__dict__.setdefault(
+                    "_busy_queue_cancelled_claim_tokens",
+                    set(),
+                )
+                if token in cancelled_tokens:
+                    # Explicit /new or /stop already committed the durable
+                    # cancellation tombstone. The replay task must not recreate
+                    # an uncertainty fence for the intentionally removed claim.
+                    raise
             path = self._busy_queue_state_path(session_key, frozen_source)
             self._busy_queue_note_uncertain(
                 self._busy_queue_session_digest(session_key), session_key, path
@@ -27102,6 +27161,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not result.get("interrupted")
             and not result.get("cleanup_errors")
         )
+
+    @staticmethod
+    def _busy_queue_terminal_discard_result() -> Dict[str, bool]:
+        """Canonical terminal result for an intentionally discarded claim."""
+        return {
+            "completed": True,
+            "receipt_terminal_success": True,
+        }
 
     def _busy_queue_finalize_claim(
         self,

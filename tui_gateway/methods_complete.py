@@ -14,25 +14,60 @@ _profile_scoped = _registry.profile_scoped
 @method("paste.collapse")
 def _(rid, params: dict) -> dict:
     global _paste_counter
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
     text = params.get("text", "")
-    if not text:
+    if not isinstance(text, str) or not text:
         return _err(rid, 4004, "empty paste")
+    encoded = text.encode("utf-8")
+    if len(encoded) > _PASTE_MAX_BYTES:
+        return _err(rid, 4004, "paste exceeds private artifact limit")
 
-    _paste_counter += 1
-    line_count = text.count("\n") + 1
-    paste_dir = _hermes_home / "pastes"
-    paste_dir.mkdir(parents=True, exist_ok=True)
-
+    import hashlib
     from datetime import datetime
 
-    paste_file = (
-        paste_dir / f"paste_{_paste_counter}_{datetime.now().strftime('%H%M%S')}.txt"
-    )
-    paste_file.write_text(text, encoding="utf-8")
+    with _paste_lock:
+        _paste_counter += 1
+        paste_number = _paste_counter
 
-    placeholder = (
-        f"[Pasted text #{_paste_counter}: {line_count} lines \u2192 {paste_file}]"
-    )
+    try:
+        profile_home = Path(
+            str(session.get("profile_home") or _hermes_home)
+        ).expanduser()
+        _secure_private_directory(profile_home)
+        paste_root = _secure_private_directory(profile_home / "pastes")
+        session_scope = hashlib.sha256(
+            str(session.get("session_key") or params.get("session_id") or "").encode(
+                "utf-8"
+            )
+        ).hexdigest()[:24]
+        paste_dir = _secure_private_directory(paste_root / session_scope)
+        paste_file = paste_dir / (
+            f"paste_{datetime.now().strftime('%Y%m%dT%H%M%S%f')}_{paste_number}.txt"
+        )
+        _write_private_file_atomic(paste_file, encoded)
+
+        artifacts: list[Path] = []
+        for candidate in paste_dir.glob("paste_*.txt"):
+            try:
+                if _secure_private_file(candidate) is not None:
+                    artifacts.append(candidate)
+            except OSError:
+                continue
+        artifacts.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        for stale in artifacts[_PASTE_RETENTION_PER_SESSION:]:
+            try:
+                _secure_private_file(stale)
+                stale.unlink()
+            except OSError:
+                continue
+    except OSError:
+        return _err(rid, 5000, "paste.collapse failed securely")
+
+    line_count = text.count("\n") + 1
+    placeholder = f"[Pasted text #{paste_number}: {line_count} lines → {paste_file}]"
     return _ok(
         rid, {"placeholder": placeholder, "path": str(paste_file), "lines": line_count}
     )

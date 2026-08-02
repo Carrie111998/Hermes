@@ -583,6 +583,7 @@ class TestSegmentedDispatchIntegration:
         )
 
         assert _kinds(_plan_tool_batch_segments(calls)) == expected_segment_kinds
+        agent._open_steer_checkpoint()
 
         def fake_handle(name, args, task_id, **kwargs):
             if kwargs["tool_call_id"].endswith("large"):
@@ -601,6 +602,7 @@ class TestSegmentedDispatchIntegration:
         steer_messages = [m for m in messages if STEER_MARKER_OPEN in m["content"]]
         assert steer_messages == [messages[-1]]
         assert "preserve this steer after budget enforcement" in steer_messages[0]["content"]
+        assert agent._close_steer_checkpoint() is None
 
     def test_steer_survives_turn_budget_after_malformed_arguments(self, agent):
         """Malformed arguments still reach the shared post-budget finalizer.
@@ -619,6 +621,7 @@ class TestSegmentedDispatchIntegration:
         )
 
         assert _kinds(_plan_tool_batch_segments(calls)) == ["sequential"]
+        agent._open_steer_checkpoint()
         assert agent.steer("preserve malformed-call steer after budget enforcement")
 
         with patch("agent.tool_executor._budget_for_agent", return_value=budget):
@@ -628,6 +631,7 @@ class TestSegmentedDispatchIntegration:
         assert "Truncated:" in messages[0]["content"]
         assert messages[0]["content"].count(STEER_MARKER_OPEN) == 1
         assert "preserve malformed-call steer after budget enforcement" in messages[0]["content"]
+        assert agent._close_steer_checkpoint() is None
 
 
 class TestPathCanonicalization:

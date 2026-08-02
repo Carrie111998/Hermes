@@ -111,6 +111,35 @@ async def test_sentinel_placed_before_agent_setup():
     )
 
 
+@pytest.mark.asyncio
+async def test_durable_replay_claim_context_reaches_turn_owner():
+    runner = _make_runner()
+    event = _make_event(text="durable replay")
+    session_key = build_session_key(event.source)
+    claim_context = (session_key, event.source, "claim-token-1")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    observed = None
+
+    async def mock_inner(
+        self_inner,
+        ev,
+        src,
+        qk,
+        generation,
+        *,
+        busy_queue_claim=None,
+    ):
+        del self_inner, ev, src, qk, generation
+        nonlocal observed
+        observed = busy_queue_claim
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    assert observed == claim_context
+
+
 # ------------------------------------------------------------------
 # Test 2: Sentinel is cleaned up after _handle_message_with_agent
 # ------------------------------------------------------------------

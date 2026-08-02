@@ -75,7 +75,9 @@ async function renderSkills() {
     result = render(
       // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
       <QueryClientProvider client={queryClient}>
-        <SkillsView />
+        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+          <SkillsView />
+        </MemoryRouter>
       </QueryClientProvider>
     )
   })

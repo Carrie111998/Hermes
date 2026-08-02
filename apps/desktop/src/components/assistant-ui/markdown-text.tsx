@@ -71,13 +71,18 @@ function useCodePlugin(): CodePlugin | null {
 
     let cancelled = false
 
-    void import('@streamdown/code').then(({ code }) => {
-      codePluginCache = code
+    void import('@streamdown/code')
+      .then(({ code }) => {
+        codePluginCache = code
 
-      if (!cancelled) {
-        setPlugin(code)
-      }
-    })
+        if (!cancelled) {
+          setPlugin(code)
+        }
+      })
+      // Syntax highlighting is an optional enhancement. If the lazy chunk is
+      // unavailable (including during test-environment teardown), keep the
+      // plain-code fallback instead of leaking an unhandled rejection.
+      .catch(() => undefined)
 
     return () => {
       cancelled = true

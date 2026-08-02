@@ -75,7 +75,12 @@ class _RecordingHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self._record()
-        body = json.dumps({"data": []}).encode()
+        if self.path == "/lm-load":
+            body = json.dumps(
+                {"load_config": {"context_length": 4096}}
+            ).encode("utf-8")
+        else:
+            body = json.dumps({"data": []}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -463,7 +468,7 @@ def test_lmstudio_load_post_drops_bearer_on_redirect(monkeypatch):
     source = ThreadingHTTPServer(("127.0.0.1", 0), _LmStudioSourceHandler)
     Thread(target=source.serve_forever, daemon=True).start()
     _RecordingHandler.requests = []
-    _LmStudioSourceHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
+    _LmStudioSourceHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/lm-load"
     monkeypatch.setattr(
         models,
         "_lmstudio_fetch_raw_models",

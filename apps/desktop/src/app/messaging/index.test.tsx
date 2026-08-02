@@ -72,7 +72,11 @@ afterEach(() => {
 async function renderMessaging() {
   let result: ReturnType<typeof render>
   await act(async () => {
-    result = render(<MessagingView />)
+    result = render(
+      <MemoryRouter>
+        <MessagingView />
+      </MemoryRouter>
+    )
   })
 
   return result!

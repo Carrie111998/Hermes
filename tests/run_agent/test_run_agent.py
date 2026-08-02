@@ -136,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -1471,13 +1474,23 @@ class TestExecuteToolCalls:
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
+        caller_thread = threading.current_thread()
+        real_sleep = time.sleep
+        caller_sleeps = []
+
+        def track_caller_sleep(delay):
+            if threading.current_thread() is caller_thread:
+                caller_sleeps.append(delay)
+                return None
+            return real_sleep(delay)
+
         with (
             patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
-            patch("agent.tool_executor.time.sleep") as mock_sleep,
+            patch("agent.tool_executor.time.sleep", side_effect=track_caller_sleep),
         ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
         assert mock_hfc.call_count == 2
-        mock_sleep.assert_not_called()
+        assert caller_sleeps == []
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 

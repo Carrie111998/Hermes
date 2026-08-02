@@ -7877,16 +7877,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         event.app.current_buffer.reset(append_to_history=True)
         event.app.invalidate()
 
-    def _reset_input_buffer(self, buffer) -> None:
-        """Clear an input buffer after a programmatic submit (best-effort)."""
-        try:
-            buffer.reset(append_to_history=True)
-        except Exception:
-            try:
-                buffer.text = ""
-            except Exception:
-                pass
-
     @property
     def _smart_cli_active_turn(self) -> Optional[SmartCliTurnSnapshot]:
         """Compatibility alias for early SMART snapshots used by extensions."""
@@ -20275,7 +20265,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if durable_smart_jobs:
                 try:
                     print(
-                        f"{_YELLOW}Preserved {durable_smart_jobs} accepted SMART "
+                        f"{_ACCENT}Preserved {durable_smart_jobs} accepted SMART "
                         f"message{'s' if durable_smart_jobs != 1 else ''} for this session. "
                         f"Resume the session to continue them safely.{_RST}",
                         flush=True,
