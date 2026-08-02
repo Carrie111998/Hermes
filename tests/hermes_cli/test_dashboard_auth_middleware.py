@@ -176,6 +176,25 @@ def test_gated_pwa_asset_is_served_without_auth(monkeypatch, tmp_path, path):
     )
     assert response.content == expected
     assert "/login" not in response.headers.get("location", "")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/handoff",
+        "/manifest.webmanifest/extra",
+        "/pwa-icon-180.png/extra",
+        "/sw.js.map",
+    ],
+)
+def test_gated_pwa_allowlist_does_not_expose_nearby_paths(gated_app, path):
+    """Only the exact PWA shell files bypass the dashboard auth gate."""
+    response = gated_app.get(path, follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"].startswith("/auth/login?provider=stub")
+
+
 # ---------------------------------------------------------------------------
 # OAuth round trip
 # ---------------------------------------------------------------------------
@@ -424,4 +443,3 @@ def test_all_providers_unreachable_returns_503(_gated_state):
     r = client.get("/api/auth/me")
     assert r.status_code == 503
     assert "unreachable" in r.text.lower()
-
