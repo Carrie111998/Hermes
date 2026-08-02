@@ -645,6 +645,96 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
+# ── Gateway runtime-status write guard (#76728) ─────────────────────────────
+# ``gateway.status.write_runtime_status`` unconditionally stamps the CALLING
+# process's pid/argv into ``$HERMES_HOME/gateway_state.json`` (it asserts
+# ``kind: hermes-gateway`` about whatever happens to be calling). If a test ever
+# ran with HERMES_HOME still pointing at the operator's real root, it would
+# overwrite the live gateway's identity with the pytest process — and it never
+# self-heals (a healthy gateway only rewrites on state change).
+#
+# This is fail-closed **defense-in-depth**, exactly like the kanban write guard
+# above — NOT a fix for a currently-reachable write. The per-test ``_isolate_env``
+# fixture unconditionally re-points HERMES_HOME at a tmp dir
+# (``monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))``), so under normal
+# suite isolation the resolved status path is always under tmp and this guard
+# never fires. Its job is to catch a REGRESSION of that isolation (an
+# ``_isolate_env`` change, a test that opts out of it, or a direct
+# out-of-fixture invocation) before it can clobber the real
+# ``~/.hermes/gateway_state.json``. A deny-list keyed on the real root captured
+# at import time, so hermetic tests on sibling tempdirs are unaffected.
+
+
+def _capture_real_hermes_root() -> Path:
+    """Resolve the operator's REAL Hermes root from the pre-test environment.
+
+    Mirrors ``_capture_real_kanban_root`` but WITHOUT the kanban override:
+    gateway identity files live directly under HERMES_HOME
+    (``gateway/status.py::_get_process_hermes_home``), so the deny-list must
+    point at the real Hermes root, not a ``HERMES_KANBAN_HOME`` override dir.
+    Uses the pre-sandbox snapshot taken at the top of this file so it keeps
+    pointing at the operator's actual root after the session sandbox rewires
+    the env.
+    """
+    if _PRE_SANDBOX_HERMES_HOME:
+        # HERMES_HOME was genuinely set before the sandbox — honor it via the
+        # normal resolver (it may be a profile dir whose root matters).
+        from hermes_constants import get_default_hermes_root
+        return get_default_hermes_root().resolve()
+    # No pre-existing HERMES_HOME: the real root is the platform default, NOT
+    # the sandbox tempdir now sitting in the env.
+    return (Path.home() / ".hermes").resolve()
+
+
+_REAL_HERMES_ROOT = _capture_real_hermes_root()
+
+
+@pytest.fixture(autouse=True)
+def _gateway_state_write_guard(_hermetic_environment, monkeypatch):
+    """Fail-closed guard: refuse gateway runtime-status writes to the REAL root.
+
+    Uses a **deny-list**: only blocks writes whose resolved runtime-status path
+    (``gateway.status._get_runtime_status_path()``) lands under the real
+    ``~/.hermes`` captured at import time. Hermetic tests that legitimately move
+    HERMES_HOME to sibling tempdirs are unaffected.
+
+    Only patches when ``gateway.status`` is *already imported* — a
+    ``sys.modules`` probe, not an import — so the guard never drags the gateway
+    module into unrelated test processes.
+
+    Uses ``monkeypatch.setattr`` so pytest restores ``write_runtime_status``
+    automatically after each test (no stacked wrappers or state leakage).
+    """
+    _status = sys.modules.get("gateway.status")
+    if _status is None:
+        return
+
+    _orig_write = getattr(_status, "write_runtime_status", None)
+    if _orig_write is None:
+        return
+
+    def _guarded_write(*args, **kwargs):
+        try:
+            resolved = _status._get_runtime_status_path().expanduser().resolve()
+        except Exception:
+            # Can't resolve the target path — don't mask the original behavior.
+            return _orig_write(*args, **kwargs)
+        try:
+            resolved.relative_to(_REAL_HERMES_ROOT)
+        except ValueError:
+            # Resolved path is NOT under the real root — safe to write.
+            return _orig_write(*args, **kwargs)
+        raise RuntimeError(
+            f"gateway_state_write_guard: runtime-status path resolved to "
+            f"{resolved}, which is under the REAL Hermes root "
+            f"({_REAL_HERMES_ROOT}). Hermetic isolation has been bypassed — "
+            f"refusing to overwrite the operator's live "
+            f"~/.hermes/gateway_state.json with the test process. See #76728."
+        )
+
+    monkeypatch.setattr(_status, "write_runtime_status", _guarded_write)
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
@@ -1118,7 +1208,7 @@ def _live_system_guard(request, monkeypatch):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
-                f"os.killpg({pgid}, {sig}) — PGID is outside the test "
+                f"os.killpg({pgid}, {sig}) — PGID is outside the test "  # windows-footgun: ok  (literal in a diagnostic message, not a call)
                 "process group. See _live_system_guard for the why."
             )
 
