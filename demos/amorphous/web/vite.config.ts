@@ -11,12 +11,9 @@ export default defineConfig({
   },
   build: {
     chunkSizeWarningLimit: 900,
-    rollupOptions: {
-      output: {
-        entryFileNames: "assets/index.js",
-        chunkFileNames: "assets/[name].js",
-        assetFileNames: "assets/[name][extname]",
-      },
-    },
+    // Content-hashed filenames: the URL changes whenever the bundle changes,
+    // so a browser can NEVER serve a stale cached bundle (the #1 "looks the
+    // same after refresh" bug). The no-store HTML always points at the current
+    // hash; the boot guard self-heals any tab left on an old hash.
   },
 });
