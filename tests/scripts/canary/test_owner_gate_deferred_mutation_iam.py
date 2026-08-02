@@ -514,6 +514,15 @@ def test_successful_activation_evidence_context_holds_contract_and_exact_set(
         assert observed is frozen
         journal.require_contract_lease()
 
+    with deferred._successful_activation_evidence_context(
+        release_revision=authority.plan.spec.release_revision,
+        now_unix=pre_fixture.NOW,
+        journal=journal,
+        _include_transaction_id=True,
+    ) as bound:
+        assert bound == (frozen, authority.transaction_id)
+        journal.require_contract_lease()
+
 
 @pytest.mark.parametrize(
     "invalid_state",

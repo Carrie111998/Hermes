@@ -108,9 +108,9 @@ def _root_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
     if config is not None:
         return config
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        loaded = load_config() or {}
+        loaded = load_config_readonly() or {}
     except Exception:
         loaded = {}
     return loaded if isinstance(loaded, Mapping) else {}

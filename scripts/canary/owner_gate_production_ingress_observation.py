@@ -1679,8 +1679,7 @@ class OwnerGateProductionIngressTransport:
             )
         required = (
             "_owner_identity",
-            "_authorization_snapshot",
-            "_run_remote_input",
+            "_run_production_ingress_observer_input",
             "_fixed_remote_environment",
             "_known_hosts",
         )
@@ -1703,17 +1702,6 @@ class OwnerGateProductionIngressTransport:
         source, source_sha256 = _observer_source(revision)
         inner = self._transport
         account = inner._owner_identity.account_for_read_only_preflight()
-        inner._owner_identity.require_stable()
-        authorization = inner._authorization_snapshot(account)
-        if (
-            not isinstance(authorization, tuple)
-            or len(authorization) != 3
-            or any(
-                not isinstance(item, str) or _SHA256.fullmatch(item) is None
-                for item in authorization
-            )
-        ):
-            _error("owner_gate_production_ingress_transport_invalid")
         command = (
             *inner._fixed_remote_environment(chdir="/"),
             REMOTE_PYTHON,
@@ -1727,19 +1715,24 @@ class OwnerGateProductionIngressTransport:
             plan_digest,
         )
         try:
-            completed = inner._run_remote_input(
-                command,
-                account=account,
-                input_bytes=source,
-                timeout_seconds=120,
-                maximum_input_bytes=MAX_REMOTE_SOURCE_BYTES,
-                maximum_output_bytes=MAX_REMOTE_OUTPUT_BYTES,
+            completed, authorization = (
+                inner._run_production_ingress_observer_input(
+                    command,
+                    account=account,
+                    input_bytes=source,
+                )
             )
         except Exception as exc:
             _error("owner_gate_production_ingress_transport_failed", exc)
-        inner._owner_identity.require_stable()
-        if inner._authorization_snapshot(account) != authorization:
-            _error("owner_gate_production_ingress_transport_changed")
+        if (
+            not isinstance(authorization, tuple)
+            or len(authorization) != 3
+            or any(
+                not isinstance(item, str) or _SHA256.fullmatch(item) is None
+                for item in authorization
+            )
+        ):
+            _error("owner_gate_production_ingress_transport_invalid")
         raw = completed.stdout
         if (
             not isinstance(raw, bytes)
@@ -1782,6 +1775,7 @@ def collect_and_sign_production_ingress_observation(
     phase: str,
     release_revision: str,
     plan_sha256: str,
+    preparation_carrier_sha256: str,
     release_private_key: Any,
     now_unix: int | None = None,
 ) -> Mapping[str, Any]:
@@ -1794,6 +1788,11 @@ def collect_and_sign_production_ingress_observation(
     )
     if not isinstance(transport, OwnerGateProductionIngressTransport):
         _error("owner_gate_production_ingress_transport_invalid")
+    if (
+        not isinstance(preparation_carrier_sha256, str)
+        or _SHA256.fullmatch(preparation_carrier_sha256) is None
+    ):
+        _error("owner_gate_production_ingress_binding_invalid")
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import (
             Ed25519PrivateKey,
@@ -1833,6 +1832,7 @@ def collect_and_sign_production_ingress_observation(
         "phase": checked_phase,
         "release_revision": revision,
         "plan_sha256": plan_digest,
+        "preparation_carrier_sha256": preparation_carrier_sha256,
         "observation": checked_observation,
         "observer_report_sha256": checked_observation["report_sha256"],
         "transport_authority": dict(checked_transport),

@@ -860,7 +860,12 @@ def _validate_host(
     public_key: Ed25519PublicKey,
     expected_public_key_id: str,
     mutation_binding_present: bool,
+    historical_v2: bool = False,
 ) -> str:
+    if type(historical_v2) is not bool or (
+        historical_v2 and mutation_binding_present
+    ):
+        raise OwnerGatePreflightError("owner_gate_host_observation_invalid")
     _strict(raw, {
         "schema", "phase", "collected_at_unix", "completed_at_unix",
         "fresh_through_unix", "plan_sha256",
@@ -905,14 +910,13 @@ def _validate_host(
     ):
         raise OwnerGatePreflightError("owner_gate_host_observation_invalid")
 
-    release = _strict(raw["release"], {
+    release_fields = {
         "revision", "source_tree_oid", "root", "uid", "gid", "mode", "immutable",
         "package_sha256", "package_inventory_sha256",
         "pre_foundation_authority_sha256", "foundation_apply_receipt_sha256",
         "project_ancestry_evidence_sha256", "project_ancestry_chain_sha256",
         "resource_ancestor_chain",
         "install_receipt_sha256", "install_receipt_file_sha256",
-        "terminal_receipt_sha256",
         "cloud_signer_provisioning_receipt_sha256",
         "cloud_signer_readiness_sha256",
         "host_signer_provisioning_receipt_sha256",
@@ -922,7 +926,28 @@ def _validate_host(
         "observation_dispatcher_schemas",
         "python_version", "python_executable", "python_executable_sha256",
         "python_hash_revalidated_by_sha256sum",
-    }, "host_release")
+    }
+    if not historical_v2:
+        release_fields.add("terminal_receipt_sha256")
+    release = _strict(raw["release"], release_fields, "host_release")
+    release_digest_fields = (
+        "pre_foundation_authority_sha256",
+        "foundation_apply_receipt_sha256",
+        "project_ancestry_evidence_sha256",
+        "project_ancestry_chain_sha256",
+        "install_receipt_sha256",
+        "install_receipt_file_sha256",
+        "cloud_signer_provisioning_receipt_sha256",
+        "cloud_signer_readiness_sha256",
+        "host_signer_provisioning_receipt_sha256",
+        "host_signer_readiness_sha256",
+        "attached_sa_permission_probe_report_sha256",
+    )
+    if not historical_v2:
+        release_digest_fields = (
+            *release_digest_fields,
+            "terminal_receipt_sha256",
+        )
     if (
         release["revision"] != spec.release_revision
         or re.fullmatch(r"[0-9a-f]{40}", str(release["source_tree_oid"]))
@@ -937,20 +962,7 @@ def _validate_host(
         != spec.package_inventory_sha256
         or any(
             _SHA256.fullmatch(str(release[name])) is None
-            for name in (
-                "pre_foundation_authority_sha256",
-                "foundation_apply_receipt_sha256",
-                "project_ancestry_evidence_sha256",
-                "project_ancestry_chain_sha256",
-                "install_receipt_sha256",
-                "install_receipt_file_sha256",
-                "terminal_receipt_sha256",
-                "cloud_signer_provisioning_receipt_sha256",
-                "cloud_signer_readiness_sha256",
-                "host_signer_provisioning_receipt_sha256",
-                "host_signer_readiness_sha256",
-                "attached_sa_permission_probe_report_sha256",
-            )
+            for name in release_digest_fields
         )
         or not isinstance(release["resource_ancestor_chain"], list)
         or not release["resource_ancestor_chain"]
@@ -1149,7 +1161,14 @@ def _validate_cross_observation_binding(
     host_observation: Mapping[str, Any],
     *,
     mutation_binding_present: bool,
+    historical_v2: bool = False,
 ) -> None:
+    if type(historical_v2) is not bool or (
+        historical_v2 and mutation_binding_present
+    ):
+        raise OwnerGatePreflightError(
+            "owner_gate_observation_cross_binding_invalid"
+        )
     binding = cloud_observation["release_binding"]
     release = host_observation["release"]
     expected_phase = "post_iam" if mutation_binding_present else "inert"
@@ -1175,7 +1194,6 @@ def _validate_cross_observation_binding(
             "project_ancestry_chain_sha256",
         ),
         ("resource_ancestor_chain", "resource_ancestor_chain"),
-        ("terminal_receipt_sha256", "terminal_receipt_sha256"),
         (
             "attached_sa_permission_probe_report_sha256",
             "attached_sa_permission_probe_report_sha256",
@@ -1197,6 +1215,11 @@ def _validate_cross_observation_binding(
             "host_signer_readiness_sha256",
         ),
     )
+    if not historical_v2:
+        shared_release_fields = (
+            *shared_release_fields,
+            ("terminal_receipt_sha256", "terminal_receipt_sha256"),
+        )
     if (
         binding["phase"] != expected_phase
         or host_observation["phase"] != expected_phase
@@ -1225,9 +1248,22 @@ def _validate_production_ingress_observation(
     cloud_observation: Mapping[str, Any],
     host_observation: Mapping[str, Any],
     now_unix: int,
+    historical_ingress_v1: bool = False,
 ) -> Mapping[str, Any]:
+    if type(historical_ingress_v1) is not bool:
+        raise OwnerGatePreflightError(
+            "owner_gate_production_ingress_observation_invalid"
+    )
     try:
-        envelope = ingress.validate_signed_production_ingress_observation(
+        if historical_ingress_v1:
+            validator = (
+                ingress._validate_historical_signed_production_ingress_observation
+            )
+        else:
+            validator = (
+                ingress.validate_signed_production_ingress_observation
+            )
+        envelope = validator(
             production_ingress_observation,
             phase=phase,
             release_revision=plan.spec.release_revision,
@@ -1297,8 +1333,17 @@ def build_preflight_report(
     host_collector_public_key: Ed25519PublicKey,
     release_public_key: Ed25519PublicKey,
     now_unix: int,
+    _historical_ingress_v1: bool = False,
+    _historical_v2: bool = False,
 ) -> Mapping[str, Any]:
-    if not isinstance(now_unix, int) or isinstance(now_unix, bool) or now_unix <= 0:
+    if (
+        not isinstance(now_unix, int)
+        or isinstance(now_unix, bool)
+        or now_unix <= 0
+        or type(_historical_ingress_v1) is not bool
+        or type(_historical_v2) is not bool
+        or (_historical_v2 and not _historical_ingress_v1)
+    ):
         raise OwnerGatePreflightError("owner_gate_preflight_time_invalid")
     expected_cloud_key_id = plan.spec.cloud_collector_public_key_id
     expected_host_key_id = plan.spec.host_collector_public_key_id
@@ -1325,11 +1370,13 @@ def build_preflight_report(
         public_key=host_collector_public_key,
         expected_public_key_id=expected_host_key_id,
         mutation_binding_present=False,
+        historical_v2=_historical_v2,
     )
     _validate_cross_observation_binding(
         cloud_observation,
         host_observation,
         mutation_binding_present=False,
+        historical_v2=_historical_v2,
     )
     production_ingress_facts = _validate_production_ingress_observation(
         production_ingress_observation,
@@ -1339,6 +1386,7 @@ def build_preflight_report(
         cloud_observation=cloud_observation,
         host_observation=host_observation,
         now_unix=now_unix,
+        historical_ingress_v1=_historical_ingress_v1,
     )
     for observed in (cloud_observation, host_observation):
         collected = observed["collected_at_unix"]

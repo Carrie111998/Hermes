@@ -38,8 +38,33 @@ HOST_SUDOERS_TEMPLATE = (
     "ops/muncho/owner-gate/muncho-host-observation-attestor.sudoers.in"
 )
 HOST_RUNTIME_RECEIPT_SCHEMA = "muncho-host-offline-trusted-runtime.v1"
+HOST_RUNTIME_RECEIPT_FIELDS = frozenset({
+    "schema",
+    "release_revision",
+    "package_sha256",
+    "preflight_sha256",
+    "release",
+    "sudoers",
+    "runtime_inventory_sha256",
+    "runtime_interpreter",
+    "host_attestor_entrypoint",
+    "host_provisioner_entrypoint",
+    "offline_runtime",
+    "network_install_required",
+    "generic_usr_bin_python3_runtime",
+    "current_link_absent",
+    "activation_seal_absent",
+    "service_start_performed",
+    "service_enablement_mutated",
+    "iam_mutation_performed",
+    "cloud_mutation_performed",
+    "private_key_material_received",
+    "private_key_digest_recorded",
+    "receipt_sha256",
+})
 MAX_FILE_BYTES = 128 * 1024 * 1024
 _RELEASE_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SUDOERS_RELEASE_PATH = re.compile(
     rb"/opt/muncho-trusted-observation/releases/([0-9a-f]{40})/"
 )
@@ -56,6 +81,10 @@ class TrustedSignerStage0Error(RuntimeError):
 def _error(code: str, exc: BaseException | None = None) -> None:
     del exc
     raise TrustedSignerStage0Error(code) from None
+
+
+def _is_sha256(value: Any) -> bool:
+    return type(value) is str and _SHA256.fullmatch(value) is not None
 
 
 def _fsync_directory(path: Path) -> None:
@@ -800,6 +829,318 @@ def _seal_release(staging_or_release: Path, *, revision: str) -> Mapping[str, An
     }
 
 
+def _load_host_release_package(
+    release: Path,
+    *,
+    release_revision: str,
+) -> Mapping[str, Any]:
+    try:
+        raw = stage0._read_regular(
+            release / "package-manifest.json",
+            maximum=stage0.MAX_JSON_BYTES,
+            expected_uid=0,
+            expected_gid=0,
+            allowed_modes=frozenset({0o444}),
+        )
+        manifest = stage0._load_canonical_json(raw)
+    except stage0.OwnerGateStage0Error as exc:
+        _error("trusted_signer_stage0_host_package_invalid", exc)
+    unsigned = {
+        name: item
+        for name, item in manifest.items()
+        if name != "package_sha256"
+    }
+    inventory = {
+        name: manifest[name]
+        for name in stage0.INVENTORY_FIELDS
+        if name in manifest
+    }
+    if (
+        frozenset(manifest) != stage0.MANIFEST_FIELDS
+        or frozenset(inventory) != stage0.INVENTORY_FIELDS
+        or manifest.get("schema") != stage0.PACKAGE_SCHEMA
+        or manifest.get("release_revision") != release_revision
+        or manifest.get("package_sha256") != stage0.sha256_json(unsigned)
+        or manifest.get("package_inventory_sha256")
+        != stage0.sha256_json(inventory)
+        or manifest.get("activation_performed") is not False
+        or manifest.get("cloud_mutation_performed") is not False
+        or manifest.get("generic_shell_entrypoint") is not False
+        or manifest.get("local_gcloud_runtime_fallback") is not False
+    ):
+        _error("trusted_signer_stage0_host_package_invalid")
+    return dict(manifest)
+
+
+def _verify_sealed_host_release(release: Path) -> Mapping[str, Any]:
+    try:
+        root_state = release.lstat()
+    except OSError as exc:
+        _error("trusted_signer_stage0_release_invalid", exc)
+    if (
+        stat.S_ISLNK(root_state.st_mode)
+        or not stat.S_ISDIR(root_state.st_mode)
+        or root_state.st_uid != 0
+        or root_state.st_gid != 0
+        or stat.S_IMODE(root_state.st_mode) != 0o555
+        or (release / ".bootstrap-wheelhouse").exists()
+        or (release / ".bootstrap-wheelhouse-installed.json").exists()
+    ):
+        _error("trusted_signer_stage0_release_invalid")
+    projection: list[dict[str, Any]] = []
+    try:
+        paths = sorted(
+            release.rglob("*"),
+            key=lambda item: str(item.relative_to(release)),
+        )
+        for path in paths:
+            relative = str(path.relative_to(release))
+            item = path.lstat()
+            if item.st_uid != 0 or item.st_gid != 0:
+                _error("trusted_signer_stage0_release_owner_invalid")
+            if stat.S_ISLNK(item.st_mode):
+                target = os.readlink(path)
+                if os.path.isabs(target) or ".." in Path(target).parts:
+                    _error("trusted_signer_stage0_release_symlink_invalid")
+                projection.append({
+                    "path": relative,
+                    "type": "symlink",
+                    "target": target,
+                })
+            elif stat.S_ISDIR(item.st_mode):
+                if stat.S_IMODE(item.st_mode) != 0o555:
+                    _error("trusted_signer_stage0_release_invalid")
+                projection.append({
+                    "path": relative,
+                    "type": "directory",
+                    "mode": "0555",
+                })
+            elif stat.S_ISREG(item.st_mode):
+                mode = stat.S_IMODE(item.st_mode)
+                if mode not in {0o444, 0o555}:
+                    _error("trusted_signer_stage0_release_invalid")
+                raw = stage0._read_regular(
+                    path,
+                    maximum=MAX_FILE_BYTES,
+                    expected_uid=0,
+                    expected_gid=0,
+                    allowed_modes=frozenset({mode}),
+                    allow_empty=True,
+                )
+                projection.append({
+                    "path": relative,
+                    "type": "file",
+                    "mode": f"{mode:04o}",
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size": len(raw),
+                })
+            else:
+                _error("trusted_signer_stage0_release_node_invalid")
+    except TrustedSignerStage0Error:
+        raise
+    except OSError as exc:
+        _error("trusted_signer_stage0_release_invalid", exc)
+    try:
+        final_state = release.lstat()
+    except OSError as exc:
+        _error("trusted_signer_stage0_release_invalid", exc)
+    if (
+        final_state.st_uid != 0
+        or final_state.st_gid != 0
+        or stat.S_IMODE(final_state.st_mode) != 0o555
+    ):
+        _error("trusted_signer_stage0_release_invalid")
+    return {
+        "path": str(release),
+        "uid": 0,
+        "gid": 0,
+        "mode": "0555",
+        "projection_sha256": stage0.sha256_json(projection),
+        "projection_count": len(projection),
+    }
+
+
+def _verify_host_sudoers(
+    release: Path,
+    *,
+    sudoers_path: Path,
+) -> Mapping[str, Any]:
+    expected = _render_sudoers(release)
+    raw, _identity = _sudoers_snapshot(sudoers_path)
+    if raw != expected:
+        _error("trusted_signer_stage0_sudoers_conflict")
+    return {
+        "path": str(sudoers_path),
+        "uid": 0,
+        "gid": 0,
+        "mode": "0440",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def verify_host_offline_runtime(
+    release_revision: str,
+    *,
+    expected_receipt: Mapping[str, Any],
+    command_runner: Callable[..., bytes] = stage0._run,
+    release_base: Path = HOST_RELEASE_BASE,
+    sudoers_path: Path = HOST_SUDOERS_PATH,
+    current_link: Path = HOST_CURRENT_LINK,
+    activation_seal: Path = HOST_ACTIVATION_SEAL,
+) -> Mapping[str, Any]:
+    """Recompute one exact installed host-runtime receipt without mutation.
+
+    ``preflight_sha256`` is an installation-time capability fact.  The frozen
+    receipt supplies that historical value; every fact derivable from the
+    installed release is recomputed and the complete receipt must remain
+    byte-exact.
+    """
+
+    false_fields = (
+        "network_install_required",
+        "generic_usr_bin_python3_runtime",
+        "service_start_performed",
+        "service_enablement_mutated",
+        "iam_mutation_performed",
+        "cloud_mutation_performed",
+        "private_key_material_received",
+        "private_key_digest_recorded",
+    )
+    if (
+        os.geteuid() != 0  # windows-footgun: ok — Debian root boundary
+        or type(release_revision) is not str
+        or _RELEASE_REVISION.fullmatch(release_revision) is None
+        or not isinstance(expected_receipt, Mapping)
+        or frozenset(expected_receipt) != HOST_RUNTIME_RECEIPT_FIELDS
+        or expected_receipt.get("schema") != HOST_RUNTIME_RECEIPT_SCHEMA
+        or expected_receipt.get("release_revision") != release_revision
+        or not _is_sha256(expected_receipt.get("package_sha256"))
+        or not _is_sha256(expected_receipt.get("preflight_sha256"))
+        or not _is_sha256(
+            expected_receipt.get("runtime_inventory_sha256")
+        )
+        or expected_receipt.get("offline_runtime") is not True
+        or expected_receipt.get("current_link_absent") is not True
+        or expected_receipt.get("activation_seal_absent") is not True
+        or any(expected_receipt.get(name) is not False for name in false_fields)
+        or expected_receipt.get("receipt_sha256")
+        != stage0.sha256_json({
+            name: item
+            for name, item in expected_receipt.items()
+            if name != "receipt_sha256"
+        })
+        or release_base != HOST_RELEASE_BASE
+        or sudoers_path != HOST_SUDOERS_PATH
+        or current_link != HOST_CURRENT_LINK
+        or activation_seal != HOST_ACTIVATION_SEAL
+    ):
+        _error("trusted_signer_stage0_host_runtime_receipt_invalid")
+    if (
+        os.path.lexists(current_link)
+        or os.path.lexists(activation_seal)
+    ):
+        _error("trusted_signer_stage0_activation_forbidden")
+    release = release_base / release_revision
+    package = _load_host_release_package(
+        release,
+        release_revision=release_revision,
+    )
+    if package["package_sha256"] != expected_receipt["package_sha256"]:
+        _error("trusted_signer_stage0_host_runtime_receipt_invalid")
+    release_evidence = _verify_sealed_host_release(release)
+    sudoers_evidence = _verify_host_sudoers(
+        release,
+        sudoers_path=sudoers_path,
+    )
+    if (
+        stage0.canonical_json_bytes(release_evidence)
+        != stage0.canonical_json_bytes(expected_receipt["release"])
+        or stage0.canonical_json_bytes(sudoers_evidence)
+        != stage0.canonical_json_bytes(expected_receipt["sudoers"])
+    ):
+        _error("trusted_signer_stage0_host_runtime_receipt_mismatch")
+    try:
+        runtime_inventory_raw = command_runner(
+            (
+                str(release / "venv/bin/python"),
+                "-I",
+                "-B",
+                "-c",
+                stage0._runtime_inventory_probe_code(),
+            ),
+            env=stage0._pip_command_environment(),
+        )
+        runtime_inventory = stage0.validate_runtime_inventory(
+            runtime_inventory_raw,
+            venv=release / "venv",
+            manifest=package,
+        )
+    except (OSError, subprocess.SubprocessError, stage0.OwnerGateStage0Error) as exc:
+        _error("trusted_signer_stage0_runtime_inventory_invalid", exc)
+    if (
+        os.path.lexists(current_link)
+        or os.path.lexists(activation_seal)
+    ):
+        _error("trusted_signer_stage0_activation_forbidden")
+    post_package = _load_host_release_package(
+        release,
+        release_revision=release_revision,
+    )
+    post_release_evidence = _verify_sealed_host_release(release)
+    post_sudoers_evidence = _verify_host_sudoers(
+        release,
+        sudoers_path=sudoers_path,
+    )
+    if (
+        stage0.canonical_json_bytes(post_package)
+        != stage0.canonical_json_bytes(package)
+        or stage0.canonical_json_bytes(post_release_evidence)
+        != stage0.canonical_json_bytes(expected_receipt["release"])
+        or stage0.canonical_json_bytes(post_sudoers_evidence)
+        != stage0.canonical_json_bytes(expected_receipt["sudoers"])
+        or os.path.lexists(current_link)
+        or os.path.lexists(activation_seal)
+    ):
+        _error("trusted_signer_stage0_host_runtime_receipt_mismatch")
+    unsigned = {
+        "schema": HOST_RUNTIME_RECEIPT_SCHEMA,
+        "release_revision": release_revision,
+        "package_sha256": package["package_sha256"],
+        "preflight_sha256": expected_receipt["preflight_sha256"],
+        "release": post_release_evidence,
+        "sudoers": post_sudoers_evidence,
+        "runtime_inventory_sha256": stage0.sha256_json(runtime_inventory),
+        "runtime_interpreter": str(release / "venv/bin/python"),
+        "host_attestor_entrypoint": str(
+            release / "bin/muncho-host-observation-attestor"
+        ),
+        "host_provisioner_entrypoint": str(
+            release / "bin/muncho-host-trusted-signer-provision"
+        ),
+        "offline_runtime": True,
+        "network_install_required": False,
+        "generic_usr_bin_python3_runtime": False,
+        "current_link_absent": True,
+        "activation_seal_absent": True,
+        "service_start_performed": False,
+        "service_enablement_mutated": False,
+        "iam_mutation_performed": False,
+        "cloud_mutation_performed": False,
+        "private_key_material_received": False,
+        "private_key_digest_recorded": False,
+    }
+    recomputed = {
+        **unsigned,
+        "receipt_sha256": stage0.sha256_json(unsigned),
+    }
+    if (
+        stage0.canonical_json_bytes(recomputed)
+        != stage0.canonical_json_bytes(expected_receipt)
+    ):
+        _error("trusted_signer_stage0_host_runtime_receipt_mismatch")
+    return recomputed
+
+
 def _install_host_offline_runtime_locked(
     bundle: Path,
     *,
@@ -929,9 +1270,11 @@ __all__ = [
     "HOST_ACTIVATION_SEAL",
     "HOST_CURRENT_LINK",
     "HOST_RELEASE_BASE",
+    "HOST_RUNTIME_RECEIPT_FIELDS",
     "HOST_RUNTIME_RECEIPT_SCHEMA",
     "HOST_SUDOERS_PATH",
     "TrustedSignerStage0Error",
     "install_host_offline_runtime",
     "main",
+    "verify_host_offline_runtime",
 ]

@@ -5594,7 +5594,7 @@ def test_config_get_approval_mode_fails_safe_to_manual_for_invalid_explicit_valu
 
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     # _load_approval_mode delegates to the canonical resolver in
-    # tools.approval, which reads via hermes_cli.config.load_config —
+    # tools.approval, which reads via hermes_cli.config.load_config_readonly —
     # that path resolves HERMES_HOME from the environment, not
     # server._hermes_home.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

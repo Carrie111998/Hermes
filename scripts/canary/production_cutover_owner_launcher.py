@@ -341,6 +341,9 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         "prepare-release-unit-inputs",
         "preauthorize-release-unit-inputs",
     })
+    _PRODUCTION_INGRESS_INPUT_MAX_BYTES = 512 * 1024
+    _PRODUCTION_INGRESS_OUTPUT_MAX_BYTES = 2 * 1024 * 1024
+    _PRODUCTION_INGRESS_TIMEOUT_SECONDS = 120.0
     _ACTIONS = frozenset({
         "stage-host-artifacts",
         "collect-initial",
@@ -771,6 +774,93 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
             raise canary_transport.OwnerLauncherError(
                 "iap_ssh_dry_run_invalid"
             )
+
+    def _run_production_ingress_observer_input(
+        self,
+        remote_argv: Sequence[str],
+        *,
+        account: str,
+        input_bytes: bytes,
+    ) -> tuple[subprocess.CompletedProcess[bytes], tuple[str, str, str]]:
+        """Run the one read-only ingress observer under one bound authority.
+
+        The generic stopped-release transport retains its three authorization
+        snapshots because it also carries mutation commands.  This narrower
+        surface returns the exact snapshot it held before and after the fixed
+        read-only observer, avoiding duplicate outer snapshots without
+        caching or weakening the pre-/post-execution fences.
+        """
+
+        prefix = self._fixed_remote_environment(chdir="/")
+        logical = tuple(remote_argv)
+        suffix = logical[len(prefix) :]
+        if (
+            logical[: len(prefix)] != prefix
+            or len(suffix) != 9
+            or suffix[:4] != ("/usr/bin/python3", "-B", "-I", "-")
+            or suffix[4] not in {"inert", "post_iam"}
+            or suffix[5] != "--release-revision"
+            or package.REVISION.fullmatch(suffix[6] or "") is None
+            or suffix[7] != "--plan-sha256"
+            or canary_transport._SHA256.fullmatch(suffix[8] or "") is None
+            or not isinstance(input_bytes, bytes)
+            or not 0 < len(input_bytes)
+            <= self._PRODUCTION_INGRESS_INPUT_MAX_BYTES
+            or not isinstance(account, str)
+            or canary_transport.GcloudOwnerAccessToken._ACCOUNT.fullmatch(
+                account
+            )
+            is None
+        ):
+            raise canary_transport.OwnerLauncherError(
+                "production_ingress_observer_input_invalid"
+            )
+        self._owner_identity.require_stable()
+        authorization = self._authorization_snapshot(account)
+        argv = self._remote_argv(logical, account=account)
+        self._validate_dry_run(argv)
+        if self._authorization_snapshot(account) != authorization:
+            raise canary_transport.OwnerLauncherError(
+                "iap_ssh_authorization_changed"
+            )
+        command_prefix = self._gcloud_executable.trusted_command_prefix()
+        try:
+            completed = self._preflight_runner(
+                argv,
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=dict(
+                    canary_transport._owner_gcloud_environment(
+                        self._gcloud_configuration,
+                        command_prefix[0],
+                    )
+                ),
+                shell=False,
+                timeout=self._PRODUCTION_INGRESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self._postflight()
+            raise canary_transport.OwnerLauncherError(
+                "production_ingress_observer_unavailable"
+            ) from None
+        self._postflight()
+        self._owner_identity.require_stable()
+        if self._authorization_snapshot(account) != authorization:
+            raise canary_transport.OwnerLauncherError(
+                "iap_ssh_authorization_changed"
+            )
+        if (
+            completed.returncode != 0
+            or not isinstance(completed.stdout, bytes)
+            or len(completed.stdout)
+            > self._PRODUCTION_INGRESS_OUTPUT_MAX_BYTES
+        ):
+            raise canary_transport.OwnerLauncherError(
+                "production_ingress_observer_failed"
+            )
+        return completed, authorization
 
     @classmethod
     def _remote_command(cls, revision: str, action: str) -> tuple[str, ...]:

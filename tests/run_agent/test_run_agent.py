@@ -3649,7 +3649,7 @@ class TestConcurrentToolExecution:
         try:
             with (
                 patch(
-                    "hermes_cli.config.load_config",
+                    "hermes_cli.config.load_config_readonly",
                     return_value={
                         "approvals": {"plan_owner_user_ids": [owner_id]},
                     },
@@ -3737,7 +3737,7 @@ class TestConcurrentToolExecution:
         agent.user_id = "spoofed-caller"
         try:
             with patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={
                     "approvals": {"plan_owner_user_ids": ["owner-plan-dispatch"]},
                 },
@@ -3778,7 +3778,7 @@ class TestConcurrentToolExecution:
         agent._gateway_session_key = routing_key
         try:
             with patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={
                     "approvals": {"plan_owner_user_ids": ["owner-plan-dispatch"]},
                 },
@@ -3812,7 +3812,7 @@ class TestConcurrentToolExecution:
         agent._gateway_session_key = ""
         try:
             with patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={
                     "approvals": {"plan_owner_user_ids": ["owner-plan-dispatch"]},
                 },

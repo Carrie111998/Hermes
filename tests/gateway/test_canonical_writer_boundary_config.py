@@ -47,7 +47,7 @@ def test_production_socket_and_service_units_are_pinned():
 
 def test_tool_availability_is_static_policy_not_socket_health(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: _config(),
     )
 
@@ -100,7 +100,7 @@ def test_managed_policy_can_be_frozen_before_gateway_writable_config(monkeypatch
     writable = _config(enabled=False)
     hardening_calls: list[str] = []
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: writable,
     )
     monkeypatch.setattr(

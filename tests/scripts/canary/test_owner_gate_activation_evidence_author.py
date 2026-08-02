@@ -85,6 +85,31 @@ def _frozen(
     assert_collection_stable: Any | None = None,
     assert_staging_stable: Any | None = None,
 ) -> SimpleNamespace:
+    collection_guard = (
+        assert_collection_stable
+        or assert_stable
+        or (lambda **_kwargs: None)
+    )
+    staging_guard = (
+        assert_staging_stable
+        or assert_stable
+        or (lambda **_kwargs: None)
+    )
+
+    def preparation_carrier_sha256(**kwargs: Any) -> str:
+        collection_guard(**kwargs)
+        return SHA
+
+    def authenticated_preparation_carrier_sha256(**kwargs: Any) -> str:
+        staging_guard(**kwargs)
+        return SHA
+
+    def create_restore_capability(**kwargs: Any) -> object:
+        assert kwargs["iam_transaction_id"] == "d" * 64
+        assert kwargs["now_unix"] > 0
+        collection_guard(now_unix=kwargs["now_unix"])
+        return object()
+
     inert_evidence = {
         name: evidence[name] for name in inert._EVIDENCE_NAMES
     }
@@ -109,16 +134,15 @@ def _frozen(
         network_key=object(),
         cloud_key=object(),
         host_key=object(),
-        assert_activation_collection_window_stable=(
-            assert_collection_stable
-            or assert_stable
-            or (lambda **_kwargs: None)
+        preparation_carrier_sha256=preparation_carrier_sha256,
+        authenticated_preparation_carrier_sha256=(
+            authenticated_preparation_carrier_sha256
         ),
-        assert_activation_staging_window_stable=(
-            assert_staging_stable
-            or assert_stable
-            or (lambda **_kwargs: None)
+        create_owner_gate_host_observation_restore_capability=(
+            create_restore_capability
         ),
+        assert_activation_collection_window_stable=collection_guard,
+        assert_activation_staging_window_stable=staging_guard,
     )
 
 
@@ -130,7 +154,7 @@ def _install_snapshot(
     def snapshot(*, release_revision: str, now_unix: int):
         assert release_revision == frozen.binding.release_revision
         assert now_unix > 0
-        yield frozen
+        yield frozen, "d" * 64
 
     monkeypatch.setattr(author, "_iam_bound_inert_evidence_snapshot", snapshot)
     monkeypatch.setattr(
@@ -146,6 +170,48 @@ def _install_snapshot(
             ),
         ),
     )
+
+
+def test_post_iam_ready_rejects_valid_carrier_splice_before_report_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = _frozen(
+        release_revision=R1,
+        evidence=_evidence(),
+    )
+    rebuild_calls = 0
+    monkeypatch.setattr(
+        author.ingress,
+        "validate_signed_production_ingress_observation",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def rebuild(**_kwargs: Any) -> Mapping[str, Any]:
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+        return {}
+
+    monkeypatch.setattr(
+        author.preflight,
+        "build_post_iam_preflight_report",
+        rebuild,
+    )
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_activation_evidence_author_inert_changed",
+    ):
+        author._assert_post_iam_ready(
+            report={},
+            production_ingress_observation={
+                "preparation_carrier_sha256": "b" * 64,
+            },
+            cloud_observation={},
+            host_observation={},
+            frozen=frozen,
+            now_unix=1,
+        )
+
+    assert rebuild_calls == 0
 
 
 def _owner_capabilities(
@@ -189,7 +255,7 @@ def test_iam_authority_wraps_activation_evidence_journal_lease(
         events.append("iam-enter")
         iam_active = True
         try:
-            yield frozen
+            yield frozen, "d" * 64
         finally:
             iam_active = False
             events.append("iam-exit")
@@ -266,7 +332,7 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
     terminal = frozen.evidence[
         inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
     ]
-    host_preparation = object()
+    host_preparation = SimpleNamespace(_terminal=terminal)
 
     def resume(**_kwargs: Any) -> object:
         assert ordering[:3] == [
@@ -402,7 +468,12 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
         "fresh-ingress"
     )
     assert ordering.index("fresh-ingress") < ordering.index("post-pair")
-    assert guard_events == ["collection", "collection", "staging"]
+    assert guard_events == [
+        "collection",
+        "collection",
+        "collection",
+        "staging",
+    ]
     frame = stager._decode_canonical(dispatched[0])
     assert set(frame["evidence"]) == set(activation.EVIDENCE_NAMES)
     assert frame["evidence"][activation.NETWORK_EVIDENCE_NAME] == evidence[
@@ -488,7 +559,7 @@ def test_reauth_receipt_not_strictly_after_post_report_is_refused(
         "_dispatch_exact_frame",
         lambda **_kwargs: pytest.fail("IAP must not be reached"),
     )
-    current = iter((1000, 1001, 1002, 1003, 1004, 1005))
+    current = iter(range(1000, 1012))
     configuration, identity = _owner_capabilities()
     with pytest.raises(
         launcher.OwnerLauncherError,

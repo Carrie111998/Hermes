@@ -94,15 +94,26 @@ def _iam_bound_inert_evidence_snapshot(
     *,
     release_revision: str,
     now_unix: int,
-) -> Iterator[inert._FrozenInertEvidence]:
+) -> Iterator[tuple[inert._FrozenInertEvidence, str]]:
     """Map the successful deferred-IAM authority into this owner boundary."""
 
     try:
         with deferred_iam._successful_activation_evidence_context(
             release_revision=release_revision,
             now_unix=now_unix,
-        ) as frozen:
-            yield frozen
+            _include_transaction_id=True,
+        ) as bound:
+            if (
+                not isinstance(bound, tuple)
+                or len(bound) != 2
+                or type(bound[0]) is not inert._FrozenInertEvidence
+                or _SHA256.fullmatch(bound[1] or "") is None
+            ):
+                _error(
+                    "owner_gate_activation_evidence_author_"
+                    "iam_binding_invalid"
+                )
+            yield bound
     except deferred_iam.OwnerGateDeferredMutationIamError as exc:
         _error(
             "owner_gate_activation_evidence_author_iam_binding_invalid",
@@ -392,6 +403,18 @@ def _assert_post_iam_ready(
         )
     except ingress.ProductionIngressObservationError as exc:
         _error("owner_gate_activation_evidence_author_post_iam_stale", exc)
+    expected_carrier_sha256 = (
+        frozen.authenticated_preparation_carrier_sha256(
+            now_unix=now_unix
+        )
+    )
+    if (
+        production_ingress_observation.get(
+            "preparation_carrier_sha256"
+        )
+        != expected_carrier_sha256
+    ):
+        _error("owner_gate_activation_evidence_author_inert_changed")
     observed_at = report.get("observed_at_unix")
     if type(observed_at) is not int:
         _error("owner_gate_activation_evidence_author_post_iam_not_ready")
@@ -533,7 +556,7 @@ def _stage_post_iam_activation_evidence(
     with _iam_bound_inert_evidence_snapshot(
         release_revision=release_revision,
         now_unix=_clock(now_unix),
-    ) as frozen:
+    ) as (frozen, iam_transaction_id):
         transport = stage0_iap.OwnerGateStage0IapTransport(
             release_sha=release_revision,
             owner_identity=owner_identity,
@@ -641,21 +664,18 @@ def _stage_post_iam_activation_evidence(
                 gcloud_executable=gcloud_executable,
                 gcloud_configuration=gcloud_configuration,
             )
-            terminal_receipt = frozen.evidence.get(
-                inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
-            )
-            if not isinstance(terminal_receipt, Mapping):
-                _error(
-                    "owner_gate_activation_evidence_author_terminal_invalid"
-                )
-
             try:
+                restore_capability = (
+                    frozen.
+                    create_owner_gate_host_observation_restore_capability(
+                        transport=transport,
+                        iam_transaction_id=iam_transaction_id,
+                        now_unix=_clock(now_unix),
+                    )
+                )
                 host_preparation = (
                     transport.resume_owner_gate_host_observation_preparation(
-                        phase=POST_IAM_PHASE,
-                        terminal_receipt=terminal_receipt,
-                        kit_stream=frozen.inputs.kit_stream,
-                        bundle_stream=frozen.inputs.bundle_stream,
+                        restore_capability=restore_capability,
                     )
                 )
             except BaseException as exc:
@@ -663,8 +683,19 @@ def _stage_post_iam_activation_evidence(
                     "owner_gate_activation_evidence_author_resume_failed",
                     exc,
                 )
-            frozen.assert_activation_collection_window_stable(
-                now_unix=_clock(now_unix)
+            terminal_receipt = getattr(
+                host_preparation,
+                "_terminal",
+                None,
+            )
+            if not isinstance(terminal_receipt, Mapping):
+                _error(
+                    "owner_gate_activation_evidence_author_terminal_invalid"
+                )
+            preparation_carrier_sha256 = (
+                frozen.preparation_carrier_sha256(
+                    now_unix=_clock(now_unix)
+                )
             )
             try:
                 gcloud_configuration.assert_stable()
@@ -683,6 +714,9 @@ def _stage_post_iam_activation_evidence(
                         phase=POST_IAM_PHASE,
                         release_revision=release_revision,
                         plan_sha256=frozen.plan.sha256,
+                        preparation_carrier_sha256=(
+                            preparation_carrier_sha256
+                        ),
                         release_private_key=release_private_key,
                     )
                 )
