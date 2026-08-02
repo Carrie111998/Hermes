@@ -1078,6 +1078,47 @@ async def test_streaming_kws_live_token_consumes_entire_wake_utterance():
     assert (111, state.token) not in adapter._voice_streaming_kws_live_tokens
 
 
+@pytest.mark.asyncio
+async def test_delayed_streaming_kws_callback_cannot_route_batch_wake_tail():
+    from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
+
+    adapter = _make_adapter(
+        enabled=True,
+        monitor_only=False,
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+        follow_up_ack_phrases=("말씀하세요.",),
+    )
+    adapter._voice_streaming_kws_cfg = StreamingKwsConfig(
+        enabled=True,
+        shadow_only=False,
+    )
+    adapter._client.get_guild.return_value = MagicMock()
+    adapter._is_allowed_user = MagicMock(return_value=True)
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+
+    # Batch STT reaches the wake endpoint before delayed streaming inference.
+    await _process_transcript(
+        adapter,
+        "세린아 멈춰, 날씨 알려줘",
+        token=state.token,
+    )
+    adapter._handle_voice_streaming_kws_detection(
+        {"guild_id": 111, "token": state.token, "user_id": 42}
+    )
+    await asyncio.sleep(0)
+
+    assert state.interrupted.is_set()
+    assert adapter._voice_barge_in_claims == {(111, state.token)}
+    mixer.stop_speech.assert_called_once()
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    adapter._voice_input_callback.assert_not_awaited()
+
+
 def test_streaming_kws_rejects_unauthorized_and_stale_detection():
     from plugins.platforms.discord.streaming_kws import StreamingKwsConfig
 

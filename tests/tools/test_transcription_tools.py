@@ -334,6 +334,64 @@ class TestTranscribeLocalCommand:
 
 
 # ============================================================================
+# Provider failure privacy
+# ============================================================================
+
+class TestTranscriptionFailurePrivacy:
+    def test_local_provider_exception_is_bounded_in_logs_and_result(self, caplog):
+        from tools.transcription_tools import _transcribe_local
+
+        canary = "local provider private failure canary"
+        caplog.set_level("INFO", logger="tools.transcription_tools")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch(
+                 "tools.transcription_tools._load_local_whisper_model",
+                 side_effect=RuntimeError(canary),
+             ):
+            result = _transcribe_local("/tmp/private-audio.wav", "base")
+
+        assert result == {
+            "success": False,
+            "transcript": "",
+            "error": "Local transcription failed",
+        }
+        assert "provider=local stage=transcribe type=RuntimeError" in caplog.text
+        assert canary not in caplog.text
+        assert canary not in result["error"]
+
+    def test_generic_provider_exception_is_bounded_in_logs_and_result(
+        self,
+        caplog,
+        sample_wav,
+    ):
+        from tools.transcription_tools import _transcribe_openai
+
+        canary = "generic provider private failure canary"
+        caplog.set_level("INFO", logger="tools.transcription_tools")
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", side_effect=RuntimeError(canary)):
+            result = _transcribe_openai(
+                sample_wav,
+                "whisper-large-v3",
+                api_key="test-key",
+                base_url="https://stt.invalid/v1",
+                provider_label="deepinfra",
+            )
+
+        assert result == {
+            "success": False,
+            "transcript": "",
+            "error": "Transcription failed",
+        }
+        assert "provider=deepinfra stage=transcribe type=RuntimeError" in caplog.text
+        assert canary not in caplog.text
+        assert canary not in result["error"]
+
+
+# ============================================================================
 # _transcribe_local — additional tests
 # ============================================================================
 
@@ -406,7 +464,7 @@ class TestTranscribeLocalExtended:
 
 
     def test_cuda_out_of_memory_does_not_trigger_cpu_fallback(self, tmp_path):
-        """'CUDA out of memory' is a real error, not a missing lib — surface it."""
+        """CUDA OOM is not retried, but raw provider detail stays private."""
         audio = tmp_path / "test.ogg"
         audio.write_bytes(b"fake")
 
@@ -421,8 +479,11 @@ class TestTranscribeLocalExtended:
 
         # Single call — no CPU retry, because OOM isn't a missing-lib symptom.
         assert mock_whisper_cls.call_count == 1
-        assert result["success"] is False
-        assert "CUDA out of memory" in result["error"]
+        assert result == {
+            "success": False,
+            "transcript": "",
+            "error": "Local transcription failed",
+        }
 
 
 # ============================================================================

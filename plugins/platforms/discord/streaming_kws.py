@@ -307,14 +307,15 @@ class DiscordStreamingKwsManager:
         return stats
 
     def _put_control(self, item: _QueueItem) -> bool:
-        if self._closed.is_set():
-            return False
-        try:
-            self._queue.put_nowait(item)
-            return True
-        except queue.Full:
-            self._bump("queue_drops")
-            return False
+        with self._close_lock:
+            if self._closed.is_set():
+                return False
+            try:
+                self._queue.put_nowait(item)
+                return True
+            except queue.Full:
+                self._bump("queue_drops")
+                return False
 
     def begin_playback(self, guild_id: int, token: int) -> bool:
         return self._put_control(_QueueItem("begin", int(guild_id), int(token)))
@@ -328,9 +329,8 @@ class DiscordStreamingKwsManager:
         *,
         received_at: Optional[float] = None,
     ) -> bool:
-        if self._closed.is_set() or not pcm or not user_id:
+        if not pcm or not user_id:
             return False
-        self._bump("offered_frames")
         item = _QueueItem(
             "pcm",
             int(guild_id),
@@ -339,12 +339,16 @@ class DiscordStreamingKwsManager:
             bytes(pcm),
             time.monotonic() if received_at is None else float(received_at),
         )
-        try:
-            self._queue.put_nowait(item)
-            return True
-        except queue.Full:
-            self._bump("queue_drops")
-            return False
+        with self._close_lock:
+            if self._closed.is_set():
+                return False
+            self._bump("offered_frames")
+            try:
+                self._queue.put_nowait(item)
+                return True
+            except queue.Full:
+                self._bump("queue_drops")
+                return False
 
     def end_playback(self, guild_id: int, token: int) -> bool:
         guild_id = int(guild_id)

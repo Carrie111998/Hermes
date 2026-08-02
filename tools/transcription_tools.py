@@ -1254,12 +1254,14 @@ def _dispatch_to_plugin_provider(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "STT plugin provider '%s' raised: %s", key, exc, exc_info=True,
+            "STT provider failure provider=%s stage=transcribe type=%s",
+            key,
+            type(exc).__name__,
         )
         return {
             "success": False,
             "transcript": "",
-            "error": f"STT plugin '{key}' raised: {exc}",
+            "error": f"STT plugin '{key}' failed",
             "provider": key,
         }
 
@@ -1682,9 +1684,16 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
 
         return {"success": True, "transcript": transcript, "provider": "local"}
 
-    except Exception as e:
-        logger.error("Local transcription failed: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
+    except Exception as exc:
+        logger.error(
+            "STT provider failure provider=local stage=transcribe type=%s",
+            type(exc).__name__,
+        )
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "Local transcription failed",
+        }
 
 
 def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
@@ -1991,9 +2000,17 @@ def _transcribe_openai(
         return {"success": False, "transcript": "", "error": f"Request timeout: {e}"}
     except APIError as e:
         return {"success": False, "transcript": "", "error": f"API error: {e}"}
-    except Exception as e:
-        logger.error("%s transcription failed: %s", provider_label, e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
+    except Exception as exc:
+        logger.error(
+            "STT provider failure provider=%s stage=transcribe type=%s",
+            provider_label,
+            type(exc).__name__,
+        )
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "Transcription failed",
+        }
 
 # ---------------------------------------------------------------------------
 # Provider: mistral (Voxtral Transcribe API)

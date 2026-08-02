@@ -392,6 +392,81 @@ def test_close_discards_saturated_queue_after_blocked_inference():
     assert time.monotonic() - started < 0.1
 
 
+def test_close_is_linearizable_with_blocked_pcm_admission():
+    class ProbeLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.offer_acquired = threading.Event()
+            self.close_attempted = threading.Event()
+
+        def __enter__(self):
+            if threading.current_thread().name == "offer-probe":
+                self._lock.acquire()
+                self.offer_acquired.set()
+            else:
+                self.close_attempted.set()
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=32),
+        ("하나야 잠깐",),
+        lambda _event: None,
+        engine_factory=lambda *_args: _FakeEngine(None, None, fire_on=999),
+    )
+    assert manager._ready.wait(timeout=1)
+    probe_lock = ProbeLock()
+    manager._close_lock = probe_lock
+    original_put = manager._queue.put_nowait
+    offer_at_enqueue = threading.Event()
+    release_offer = threading.Event()
+    sentinel_enqueued = threading.Event()
+    offer_results = []
+
+    def blocking_put(item):
+        if item.kind == "pcm" and threading.current_thread().name == "offer-probe":
+            offer_at_enqueue.set()
+            assert release_offer.wait(timeout=2)
+        elif item.kind == "stop":
+            sentinel_enqueued.set()
+        return original_put(item)
+
+    manager._queue.put_nowait = blocking_put
+    offer = threading.Thread(
+        target=lambda: offer_results.append(
+            manager.offer_pcm(1, 70, 42, b"\x00" * 3840)
+        ),
+        name="offer-probe",
+    )
+    closer = threading.Thread(target=manager.close, name="close-probe")
+    offer.start()
+    assert offer_at_enqueue.wait(timeout=1)
+    closer.start()
+    assert probe_lock.close_attempted.wait(timeout=1)
+
+    # On the buggy implementation close can enqueue its sentinel while the
+    # unprotected offer is paused. With serialized admission, close waits for
+    # the offer's lock and the controller can release it immediately.
+    if not probe_lock.offer_acquired.is_set():
+        assert sentinel_enqueued.wait(timeout=1)
+    release_offer.set()
+    offer.join(timeout=1)
+    closer.join(timeout=1)
+    assert not offer.is_alive()
+    assert not closer.is_alive()
+    assert offer_results == [True]
+
+    for _ in range(3):
+        assert manager.offer_pcm(1, 70, 42, b"pcm") is False
+        assert manager.begin_playback(1, 71) is False
+        manager.close()
+    manager._thread.join(timeout=1)
+    assert manager.snapshot_stats()["queue_depth"] == 0
+
+
 def test_manager_idle_flush_can_detect_final_short_phrase():
     events = []
     fired = threading.Event()

@@ -5394,10 +5394,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
 
                 interrupted = self._interrupt_voice_playback(guild_id, playback_token)
+                streaming_cfg = getattr(self, "_voice_streaming_kws_cfg", None)
+                streaming_fallback_stop_only = bool(
+                    self._voice_streaming_kws_enabled()
+                    and streaming_cfg is not None
+                    and not streaming_cfg.shadow_only
+                )
                 usable_characters = len(re.findall(r"\w", trailing, flags=re.UNICODE))
                 min_characters = int(cfg.get("min_trailing_characters", 2) or 2)
                 has_follow_up = bool(
-                    trailing
+                    not streaming_fallback_stop_only
+                    and trailing
                     and usable_characters >= min_characters
                     and not is_whisper_hallucination(trailing)
                 )

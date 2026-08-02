@@ -18162,10 +18162,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info(
-                "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
+                "Suppressing duplicate voice transcript guild=%s user=%s "
+                "transcript_chars=%d",
                 guild_id,
                 user_id,
-                transcript[:100],
+                len(transcript),
             )
             return
 

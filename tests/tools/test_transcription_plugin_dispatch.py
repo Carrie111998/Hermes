@@ -153,6 +153,32 @@ class TestPluginDispatch:
         assert result is not None
         assert result["provider"] == "openrouter"
 
+    def test_plugin_exception_is_bounded_in_logs_and_result(self, caplog):
+        canary = "plugin provider private failure canary"
+        provider = _FakeProvider(
+            name="openrouter",
+            raise_exc=RuntimeError(canary),
+        )
+        transcription_registry.register_provider(provider)
+        caplog.set_level("INFO", logger="tools.transcription_tools")
+
+        result = transcription_tools._dispatch_to_plugin_provider(
+            "/tmp/audio.mp3", "openrouter",
+        )
+
+        assert result == {
+            "success": False,
+            "transcript": "",
+            "error": "STT plugin 'openrouter' failed",
+            "provider": "openrouter",
+        }
+        assert (
+            "provider=openrouter stage=transcribe type=RuntimeError"
+            in caplog.text
+        )
+        assert canary not in caplog.text
+        assert canary not in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via transcribe_audio
