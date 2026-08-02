@@ -2,14 +2,14 @@ import type { DesktopConnectionProbeResult } from '@/global'
 import { getDashboardHandoffTicket, getDashboardRemoteAccess } from '@/hermes'
 
 export type ContinueOnPhoneFailureReason =
-  | 'auth-required'
+  | 'browser-auth-not-supported'
   | 'handoff-failed'
   | 'insecure-url'
   | 'not-configured'
   | 'unreachable'
 
 export type ContinueOnPhoneResult =
-  | { ok: true; url: string }
+  | { expiresAt: number; ok: true; url: string }
   | { ok: false; reason: ContinueOnPhoneFailureReason }
 
 export interface ContinueOnPhoneDependencies {
@@ -18,13 +18,26 @@ export interface ContinueOnPhoneDependencies {
     sessionId: string,
     profile?: string
   ) => ReturnType<typeof getDashboardHandoffTicket>
+  now: () => number
   probe: (publicUrl: string) => Promise<Pick<DesktopConnectionProbeResult, 'authMode' | 'reachable'>>
 }
 
 const DEFAULT_DEPENDENCIES: ContinueOnPhoneDependencies = {
   getRemoteAccess: getDashboardRemoteAccess,
   mintHandoffTicket: getDashboardHandoffTicket,
+  now: () => Date.now(),
   probe: publicUrl => window.hermesDesktop.probeConnectionConfig(publicUrl)
+}
+
+function handoffExpiresAt(ttlSeconds: number, now: number): number | null {
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || !Number.isSafeInteger(now)) {
+    return null
+  }
+
+  const ttlMilliseconds = ttlSeconds * 1_000
+  const expiresAt = now + ttlMilliseconds
+
+  return Number.isSafeInteger(ttlMilliseconds) && Number.isSafeInteger(expiresAt) ? expiresAt : null
 }
 
 /** The connection probe reports gated dashboards as OAuth mode. */
@@ -67,6 +80,7 @@ export function buildDashboardSessionUrl(
     // POST body, then removes it from browser history before opening chat.
     url.pathname = `${basePath}/handoff`
     url.hash = new URLSearchParams({ ticket: cleanHandoff }).toString()
+
     return url.toString()
   }
 
@@ -108,14 +122,16 @@ export async function resolveContinueOnPhoneUrl(
   // every auth_required dashboard as OAuth mode, including handoff-capable
   // deployments.
   if (!isPhoneHandoffAuthMode(probe.authMode)) {
-    return { ok: false, reason: 'auth-required' }
+    return { ok: false, reason: 'browser-auth-not-supported' }
   }
 
   let ticket: string
+  let ttlSeconds: number
 
   try {
     const minted = await dependencies.mintHandoffTicket(sessionId, profile)
     ticket = (minted.ticket || '').trim()
+    ttlSeconds = minted.ttl_seconds
 
     if (!ticket) {
       return { ok: false, reason: 'handoff-failed' }
@@ -125,10 +141,11 @@ export async function resolveContinueOnPhoneUrl(
   }
 
   const url = buildDashboardSessionUrl(publicUrl, sessionId, profile, ticket)
+  const expiresAt = handoffExpiresAt(ttlSeconds, dependencies.now())
 
-  if (!url) {
-    return { ok: false, reason: 'insecure-url' }
+  if (!url || !expiresAt) {
+    return { ok: false, reason: 'handoff-failed' }
   }
 
-  return { ok: true, url }
+  return { expiresAt, ok: true, url }
 }

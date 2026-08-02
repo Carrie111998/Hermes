@@ -18,6 +18,7 @@ function dependencies(
       session_id: 'session-42',
       profile: 'work'
     }),
+    now: () => 1_000_000,
     probe: vi.fn().mockResolvedValue({ authMode: 'oauth', reachable: true }),
     ...overrides
   }
@@ -69,6 +70,7 @@ describe('resolveContinueOnPhoneUrl', () => {
     const result = await resolveContinueOnPhoneUrl('session-42', 'work', deps)
 
     expect(result).toEqual({
+      expiresAt: 1_120_000,
       ok: true,
       url: 'https://hermes.example.com/agent/handoff#ticket=handoff-ticket-abc'
     })
@@ -115,7 +117,7 @@ describe('resolveContinueOnPhoneUrl', () => {
     )
 
     expect(unreachable).toEqual({ ok: false, reason: 'unreachable' })
-    expect(unauthenticated).toEqual({ ok: false, reason: 'auth-required' })
+    expect(unauthenticated).toEqual({ ok: false, reason: 'browser-auth-not-supported' })
   })
 
   it('surfaces mint failures without leaking a bare resume URL', async () => {
@@ -124,6 +126,23 @@ describe('resolveContinueOnPhoneUrl', () => {
     })
 
     const result = await resolveContinueOnPhoneUrl('session-42', 'work', deps)
+
+    expect(result).toEqual({ ok: false, reason: 'handoff-failed' })
+  })
+
+  it('rejects an invalid ticket lifetime instead of presenting a code that may be stale', async () => {
+    const result = await resolveContinueOnPhoneUrl(
+      'session-42',
+      'work',
+      dependencies({
+        mintHandoffTicket: vi.fn().mockResolvedValue({
+          ticket: 'handoff-ticket-abc',
+          ttl_seconds: 0,
+          session_id: 'session-42',
+          profile: 'work'
+        })
+      })
+    )
 
     expect(result).toEqual({ ok: false, reason: 'handoff-failed' })
   })

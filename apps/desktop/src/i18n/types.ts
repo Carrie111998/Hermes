@@ -1629,6 +1629,21 @@ export interface Translations {
       continueOnPhoneDesc: string
       continueOnPhonePreparing: string
       continueOnPhoneQrAlt: string
+      continueOnPhoneExpiresIn: (seconds: number) => string
+      continueOnPhoneAvailabilityHint: string
+      continueOnPhoneExpiredTitle: string
+      continueOnPhoneExpiredDesc: string
+      continueOnPhoneNewCode: string
+      continueOnPhoneNotConfiguredTitle: string
+      continueOnPhoneNotConfiguredDesc: string
+      continueOnPhoneInsecureUrlTitle: string
+      continueOnPhoneInsecureUrlDesc: string
+      continueOnPhoneUnreachableTitle: string
+      continueOnPhoneUnreachableDesc: string
+      continueOnPhoneBrowserAuthTitle: string
+      continueOnPhoneBrowserAuthDesc: string
+      continueOnPhoneTicketFailedTitle: string
+      continueOnPhoneTicketFailedDesc: string
       continueOnPhoneUnavailableTitle: string
       continueOnPhoneUnavailableDesc: string
       continueOnPhoneCopyLink: string
