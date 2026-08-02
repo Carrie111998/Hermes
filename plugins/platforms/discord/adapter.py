@@ -4380,43 +4380,6 @@ class DiscordAdapter(BasePlatformAdapter):
         if manager is not None:
             manager.close()
 
-    def _next_voice_barge_in_ack_phrase(self, kind: str) -> Optional[str]:
-        """Return the next configured stop/follow-up ack in round-robin order."""
-        cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
-        if (
-            cfg.get("monitor_only")
-            or not cfg.get("ack_enabled")
-            or kind not in {"stop", "follow_up"}
-        ):
-            return None
-        phrases = cfg.get(f"{kind}_ack_phrases") or ()
-        if not phrases:
-            return None
-
-        indices = getattr(self, "_voice_barge_in_ack_indices", None)
-        if not isinstance(indices, dict):
-            indices = {"stop": 0, "follow_up": 0}
-            self._voice_barge_in_ack_indices = indices
-        index = int(indices.get(kind, 0) or 0)
-        indices[kind] = index + 1
-        return phrases[index % len(phrases)]
-
-    async def _play_voice_barge_in_ack(self, guild_id: int, kind: str) -> bool:
-        """Best-effort barge-in ack on the shared interruptible playback path."""
-        try:
-            phrase = self._next_voice_barge_in_ack_phrase(kind)
-            if not phrase:
-                return False
-            return await self.play_ack_in_voice(guild_id, phrase)
-        except Exception:
-            logger.debug(
-                "Discord voice barge-in %s ack failed (guild=%s)",
-                kind,
-                guild_id,
-                exc_info=True,
-            )
-            return False
-
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
         try:
@@ -5350,15 +5313,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 current_state = getattr(self, "_voice_playback_states", {}).get(
                     guild_id
                 )
-                if (
-                    current_state is not None
-                    and current_state.token != playback_token
-                ):
+                # A playback token is live only while its exact state remains
+                # installed. Receiver buffers may drain after playback cleanup;
+                # state removal is the strict epoch boundary for all live side
+                # effects (interrupt, ACK, claim, and model routing).
+                if current_state is None or current_state.token != playback_token:
                     logger.debug(
                         "Discarded stale Discord barge-in for guild=%s playback=%s current=%s",
                         guild_id,
                         playback_token,
-                        current_state.token,
+                        current_state.token if current_state is not None else None,
                     )
                     return
                 if not matched:

@@ -152,6 +152,46 @@ def test_phrase_matcher_rejects_embedded_phrase_and_noise():
     assert _match_voice_barge_in_phrase("어...", KOREAN_PHRASES) == (False, "")
 
 
+@pytest.mark.parametrize("own_name", ("하나야", "유나야", "미나야", "라나야", "세나야"))
+def test_phrase_matcher_accepts_only_configured_agent_own_name(own_name):
+    from plugins.platforms.discord.adapter import _match_voice_barge_in_phrase
+
+    configured = (own_name,)
+    assert _match_voice_barge_in_phrase(own_name, configured) == (True, "")
+    for other_name in {"하나야", "유나야", "미나야", "라나야", "세나야"} - {
+        own_name
+    }:
+        assert _match_voice_barge_in_phrase(other_name, configured) == (False, "")
+
+
+@pytest.mark.asyncio
+async def test_own_name_ack_then_fresh_utterance_uses_normal_voice_input_path():
+    adapter = _make_adapter(
+        phrases=("하나야",),
+        ack_enabled=True,
+        stop_ack_phrases=("네.",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    playback = adapter._begin_voice_playback(111)
+
+    await _process_transcript(adapter, "하나야", token=playback.token)
+
+    assert playback.interrupted.is_set()
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네.")
+    adapter._voice_input_callback.assert_not_awaited()
+
+    # Playback cleanup ends the tagged epoch. The next separately spoken input
+    # is untagged and follows the ordinary voice command path.
+    adapter._voice_playback_states.pop(111)
+    await _process_transcript(adapter, "내일 날씨 알려줘")
+
+    adapter._voice_input_callback.assert_awaited_once_with(
+        guild_id=111,
+        user_id=42,
+        transcript="내일 날씨 알려줘",
+    )
+
+
 def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
     from gateway.config import PlatformConfig
     from plugins.platforms.discord.adapter import DiscordAdapter
@@ -535,6 +575,27 @@ async def test_stale_playback_token_cannot_interrupt_or_route_into_newer_playbac
     assert current.interrupted.is_set() is False
     vc.stop.assert_not_called()
     adapter._voice_input_callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_playback_token_cannot_ack_or_route_after_state_removal():
+    adapter = _make_adapter(
+        ack_enabled=True,
+        follow_up_ack_phrases=("네, 말씀하세요.",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+    expired = adapter._begin_voice_playback(111)
+    adapter._voice_playback_states.pop(111)
+
+    await _process_transcript(
+        adapter,
+        "세린아 잠깐, 재생 종료 뒤 늦게 도착한 명령",
+        token=expired.token,
+    )
+
+    adapter.play_ack_in_voice.assert_not_awaited()
+    adapter._voice_input_callback.assert_not_awaited()
+    assert adapter._voice_barge_in_claims == set()
 
 
 @pytest.mark.asyncio
