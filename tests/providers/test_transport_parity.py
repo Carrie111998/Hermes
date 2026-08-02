@@ -161,9 +161,12 @@ class TestCustomOllamaParity:
         )
         assert kw["extra_body"]["options"]["num_ctx"] == 131072
 
-    def test_verified_ollama_sends_disabled_reasoning_controls(self, transport, monkeypatch):
+    def test_verified_ollama_sends_disabled_reasoning_controls(
+        self, transport, monkeypatch
+    ):
         monkeypatch.setattr(
-            "agent.model_metadata.detect_local_server_type", lambda *_args, **_kwargs: "ollama"
+            "agent.model_metadata.detect_local_server_type",
+            lambda *_args, **_kwargs: "ollama",
         )
         kw = transport.build_kwargs(
             model="qwen3:72b",
@@ -176,9 +179,12 @@ class TestCustomOllamaParity:
         assert kw["extra_body"]["think"] is False
         assert kw["reasoning_effort"] == "none"
 
-    def test_groq_custom_endpoint_omits_disabled_reasoning_controls(self, transport, monkeypatch):
+    def test_groq_custom_endpoint_omits_disabled_reasoning_controls(
+        self, transport, monkeypatch
+    ):
         monkeypatch.setattr(
-            "agent.model_metadata.detect_local_server_type", lambda *_args, **_kwargs: None
+            "agent.model_metadata.detect_local_server_type",
+            lambda *_args, **_kwargs: None,
         )
         kw = transport.build_kwargs(
             model="qwen3:72b",
@@ -190,3 +196,21 @@ class TestCustomOllamaParity:
         )
         assert "think" not in kw.get("extra_body", {})
         assert "reasoning_effort" not in kw
+
+    def test_groq_custom_endpoint_preserves_enabled_reasoning_effort(
+        self, transport, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "agent.model_metadata.detect_local_server_type",
+            lambda *_args, **_kwargs: None,
+        )
+        kw = transport.build_kwargs(
+            model="llama-3.3-70b-versatile",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            base_url="https://api.groq.com/openai/v1",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert "think" not in kw.get("extra_body", {})
+        assert kw["reasoning_effort"] == "high"

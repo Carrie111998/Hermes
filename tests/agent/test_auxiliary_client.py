@@ -2739,6 +2739,21 @@ class TestAuxiliaryProviderProfileReasoning:
         assert "thinking" not in kwargs.get("extra_body", {})
 
 
+    def test_custom_groq_endpoint_omits_ollama_reasoning_controls(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.model_metadata.detect_local_server_type", lambda *_args, **_kwargs: None
+        )
+        kwargs = _build_call_kwargs(
+            "custom",
+            "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "hi"}],
+            reasoning_config={"enabled": False, "effort": "none"},
+            base_url="https://api.groq.com/openai/v1",
+        )
+
+        assert "reasoning_effort" not in kwargs
+        assert "reasoning" not in kwargs.get("extra_body", {})
+        assert "think" not in kwargs.get("extra_body", {})
 
     def test_custom_verified_ollama_uses_auxiliary_api_key_for_disabled_reasoning(self, monkeypatch):
         probe_calls = []
