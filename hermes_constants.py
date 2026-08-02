@@ -289,6 +289,12 @@ def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     into ``%LOCALAPPDATA%\\hermes\\node``. POSIX installs use
     ``$HERMES_HOME/node/bin``. Include both shapes on every platform so mixed
     or migrated installs still work.
+
+    When a named profile is active (``HERMES_HOME=~/.hermes/profiles/<name>``),
+    the managed Node install lives at the machine-level default home
+    (``~/.hermes/node/bin``), not inside the profile.  Append the default
+    home's node dirs so ``find_node_executable`` resolves correctly under any
+    profile without duplicating the Node install per profile.
     """
     root = home or get_hermes_home()
     dirs = [root / "node"]
@@ -296,9 +302,29 @@ def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     # NOTE: keep this ordering in sync with hermesManagedNodePathEntries() in
     # apps/desktop/electron/main.cjs — the Electron main process is Node and
     # cannot import this module, so the platform-ordering rule is mirrored there.
+    result: list[Path]
     if sys.platform == "win32":
-        return dirs + [bin_dir]
-    return [bin_dir] + dirs
+        result = dirs + [bin_dir]
+    else:
+        result = [bin_dir] + dirs
+    # Append machine-level default home dirs when running under a named profile
+    # so that Node is found at the shared install location.  Only fall back
+    # when the active home is a sub-directory of the default home (profile
+    # mode); if HERMES_HOME points to a completely separate path (Docker,
+    # custom), the operator is expected to manage Node there.
+    default_home = _get_platform_default_hermes_home()
+    if default_home.resolve() != root.resolve():
+        try:
+            root.resolve().relative_to(default_home.resolve())
+        except ValueError:
+            return result  # not under default home — skip fallback
+        default_dirs = [default_home / "node"]
+        default_bin = default_home / "node" / "bin"
+        if sys.platform == "win32":
+            result.extend(default_dirs + [default_bin])
+        else:
+            result.extend([default_bin] + default_dirs)
+    return result
 
 
 def _candidate_node_command_names(command: str) -> list[str]:
