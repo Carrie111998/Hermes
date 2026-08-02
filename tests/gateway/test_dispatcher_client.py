@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 
 from gateway.dispatcher_client import (
+    DEFAULT_DISPATCHER_SOCKET,
     DispatcherClient,
     DispatcherConnectionError,
 )
@@ -306,10 +307,11 @@ async def test_context_manager_closes_on_exit(
     assert not client.is_connected
 
 
-def test_socket_path_is_required() -> None:
-    """DispatcherClient() without socket_path raises TypeError."""
-    with pytest.raises(TypeError):
-        DispatcherClient()  # type: ignore[call-arg]
+def test_socket_path_defaults_to_constant(monkeypatch) -> None:
+    """DispatcherClient() without socket_path uses DEFAULT_DISPATCHER_SOCKET."""
+    monkeypatch.delenv("HERMES_DISPATCHER_SOCKET", raising=False)
+    client = DispatcherClient()
+    assert client.socket_path == DEFAULT_DISPATCHER_SOCKET
 
 
 def test_socket_path_stored() -> None:
@@ -501,24 +503,198 @@ class TestDispatcherConfig:
 
 
 class TestDispatcherClientInit:
-    """DispatcherClient requires socket_path (no env var fallback)."""
+    """DispatcherClient socket_path priority: arg > env > default."""
 
-    def test_socket_path_required(self):
-        """Constructor requires socket_path — no default, no env var."""
+    def test_explicit_socket_path_wins(self):
+        """Explicit socket_path takes priority over env and default."""
         client = DispatcherClient(socket_path="/tmp/test.sock")
         assert client._path == "/tmp/test.sock"
 
-    def test_no_env_var_fallback(self):
-        """HERMES_DISPATCHER_SOCKET env var is no longer used."""
+    def test_env_var_fallback_when_no_arg(self):
+        """HERMES_DISPATCHER_SOCKET is used when socket_path is None."""
         import os
 
         old = os.environ.get("HERMES_DISPATCHER_SOCKET")
         try:
-            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/should/not/use"
-            client = DispatcherClient(socket_path="/explicit/path.sock")
-            assert client._path == "/explicit/path.sock"
+            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/var.sock"
+            client = DispatcherClient()
+            assert client._path == "/env/var.sock"
         finally:
             if old is None:
                 os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
             else:
                 os.environ["HERMES_DISPATCHER_SOCKET"] = old
+
+    def test_default_when_no_arg_no_env(self):
+        """DEFAULT_DISPATCHER_SOCKET used when no arg and no env."""
+        import os
+
+        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
+        try:
+            os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
+            client = DispatcherClient()
+            assert client._path == DEFAULT_DISPATCHER_SOCKET
+        finally:
+            if old is not None:
+                os.environ["HERMES_DISPATCHER_SOCKET"] = old
+
+    def test_empty_string_falls_back_to_env(self):
+        """Empty string socket_path falls back to env var."""
+        import os
+
+        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
+        try:
+            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/var.sock"
+            client = DispatcherClient(socket_path="")
+            assert client._path == "/env/var.sock"
+        finally:
+            if old is None:
+                os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
+            else:
+                os.environ["HERMES_DISPATCHER_SOCKET"] = old
+
+    def test_explicit_wins_over_env(self):
+        """Explicit socket_path wins even when env var is set."""
+        import os
+
+        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
+        try:
+            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/var.sock"
+            client = DispatcherClient(socket_path="/explicit.sock")
+            assert client._path == "/explicit.sock"
+        finally:
+            if old is None:
+                os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
+            else:
+                os.environ["HERMES_DISPATCHER_SOCKET"] = old
+
+
+class TestDispatcherConfigFromDict:
+    """GatewayConfig.from_dict handles nested dispatcher config."""
+
+    def test_flat_keys(self):
+        """Flat dispatcher_socket/commands keys are parsed."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({
+            "dispatcher_socket": "/tmp/s.sock",
+            "dispatcher_commands": ["echo", "forge"],
+        })
+        assert cfg.dispatcher_socket == "/tmp/s.sock"
+        assert cfg.dispatcher_commands == ["echo", "forge"]
+
+    def test_nested_dict(self):
+        """Nested dispatcher: dict is parsed."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({
+            "dispatcher": {"socket": "/tmp/nested.sock", "commands": ["ashare"]},
+        })
+        assert cfg.dispatcher_socket == "/tmp/nested.sock"
+        assert cfg.dispatcher_commands == ["ashare"]
+
+    def test_flat_keys_take_precedence(self):
+        """Flat keys win over nested dict when both present."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({
+            "dispatcher_socket": "/flat.sock",
+            "dispatcher_commands": ["echo"],
+            "dispatcher": {"socket": "/nested.sock", "commands": ["forge"]},
+        })
+        assert cfg.dispatcher_socket == "/flat.sock"
+        assert cfg.dispatcher_commands == ["echo"]
+
+    def test_empty_commands_list(self):
+        """Empty list disables forwarding (not same as None)."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({
+            "dispatcher_commands": [],
+        })
+        assert cfg.dispatcher_commands == []
+        assert cfg.dispatcher_commands is not None
+
+    def test_absent_commands_yields_none(self):
+        """Missing dispatcher_commands key yields None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({})
+        assert cfg.dispatcher_commands is None
+
+    def test_explicit_none_commands_yields_none(self):
+        """Explicit None dispatcher_commands is stored as None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_commands": None})
+        assert cfg.dispatcher_commands is None
+
+    def test_absent_socket_yields_none(self):
+        """Missing dispatcher_socket key yields None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({})
+        assert cfg.dispatcher_socket is None
+
+    def test_explicit_none_socket_yields_none(self):
+        """Explicit None dispatcher_socket is stored as None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_socket": None})
+        assert cfg.dispatcher_socket is None
+
+
+class TestDispatcherFromDict:
+    """GatewayConfig.from_dict validates dispatcher values.
+
+    Invalid values are rejected with a warning and stored as None.
+    """
+
+    def test_invalid_socket_type_stored_as_none(self):
+        """Non-string socket value is rejected and stored as None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_socket": 12345})
+        assert cfg.dispatcher_socket is None
+
+    def test_empty_socket_stored_as_none(self):
+        """Empty string socket value is rejected and stored as None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_socket": ""})
+        assert cfg.dispatcher_socket is None
+
+    def test_whitespace_socket_stored_as_none(self):
+        """Whitespace-only socket value is rejected and stored as None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_socket": "   "})
+        assert cfg.dispatcher_socket is None
+
+    def test_valid_socket_stripped(self):
+        """Valid socket value is stripped and stored."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_socket": " /tmp/test.sock "})
+        assert cfg.dispatcher_socket == "/tmp/test.sock"
+
+    def test_invalid_commands_type_stored_as_none(self):
+        """Non-list commands value is rejected and stored as None."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_commands": "not-a-list"})
+        assert cfg.dispatcher_commands is None
+
+    def test_commands_with_non_strings_stored_as_none(self):
+        """Commands list with non-string elements is rejected."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_commands": [123, True]})
+        assert cfg.dispatcher_commands is None
+
+    def test_valid_commands_stored(self):
+        """Valid commands list is stored as-is."""
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig.from_dict({"dispatcher_commands": ["echo", "forge"]})
+        assert cfg.dispatcher_commands == ["echo", "forge"]
