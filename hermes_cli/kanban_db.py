@@ -4642,9 +4642,9 @@ def submit_for_review(
         if original_assignee and reviewer == original_assignee:
             raise ValueError("reviewer must be different from the implementer")
 
-        # The webhook and native paths can create their cards in either order.
+        # The webhook and native paths can observe the same PR in either order.
         # Resolve the immutable PR identity while holding the same write lock,
-        # then fold the implementation card into the already-created webhook
+        # then fold any webhook observation into this native implementation
         # card instead of creating a second lifecycle.
         duplicate = conn.execute(
             "SELECT id, status, current_run_id FROM tasks WHERE idempotency_key = ? AND id != ? "
