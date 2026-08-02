@@ -2477,11 +2477,16 @@ def build_context_files_prompt(
 ) -> str:
     """Discover and load context files for the system prompt.
 
-    Priority (first found wins — only ONE project context type is loaded):
+    Project context priority (first found wins — only ONE project type is loaded):
       1. .hermes.md / HERMES.md  (walk to git root)
       2. AGENTS.md / agents.md   (merged chain: git root → cwd)
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
+
+    HERMES_HOME/.hermes.md (or AGENTS.md) is global operating policy: it is
+    ALWAYS included and is ADDED TO the project context above, not replaced by
+    it. It is emitted first so the project context can override it on conflict.
+    Deduplicated by resolved path when cwd is HERMES_HOME itself.
 
     SOUL.md from HERMES_HOME is independent and always included when present.
 
@@ -2532,16 +2537,26 @@ def build_context_files_prompt(
             or _load_claude_md(cwd_path, context_length)
             or _load_cursorrules(cwd_path, context_length)
         )
-    if project_context:
-        sections.append(project_context)
-    else:
-        # Global fallback (Patrick 2026-08-01): HERMES_HOME/.hermes.md (ou
-        # AGENTS.md) quando o cwd nao tem context file proprio. Regras globais
-        # do Hermes valem em qualquer diretorio, com precedencia local.
-        _global_ctx = get_hermes_home() / ".hermes.md"
-        if not _global_ctx.exists():
-            _global_ctx = get_hermes_home() / "AGENTS.md"
-        if _global_ctx.exists():
+    # Global operating policy (Patrick 2026-08-02): HERMES_HOME/.hermes.md (ou
+    # AGENTS.md) SEMPRE entra, somando com o context file do projeto — nao e
+    # fallback. Regras globais valem em qualquer diretorio; o projeto refina e
+    # vence em conflito, por isso o global vai ANTES do project_context.
+    #
+    # Dedupe por path resolvido: quando o cwd E o HERMES_HOME, o mesmo arquivo e
+    # encontrado pelas duas vias (_load_hermes_md sobe ate o git root) e seria
+    # injetado duas vezes (~22k chars duplicados).
+    _global_ctx = get_hermes_home() / ".hermes.md"
+    if not _global_ctx.exists():
+        _global_ctx = get_hermes_home() / "AGENTS.md"
+    if _global_ctx.exists():
+        _already_loaded = False
+        try:
+            _project_ctx_path = _find_hermes_md(cwd_path)
+            if _project_ctx_path is not None:
+                _already_loaded = _project_ctx_path.resolve() == _global_ctx.resolve()
+        except (OSError, ValueError):
+            _already_loaded = False
+        if not _already_loaded:
             try:
                 content = _global_ctx.read_text(encoding="utf-8").strip()
                 if content:
@@ -2553,6 +2568,9 @@ def build_context_files_prompt(
                     sections.append(content)
             except Exception as e:
                 logger.debug("Could not read global context file %s: %s", _global_ctx, e)
+
+    if project_context:
+        sections.append(project_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
