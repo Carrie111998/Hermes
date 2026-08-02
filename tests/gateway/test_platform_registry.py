@@ -145,6 +145,98 @@ class TestPlatformRegistry:
         assert loader_calls == 1
         assert results == [entry, entry]
 
+    @pytest.mark.parametrize("accessor_name", ["all_entries", "plugin_entries"])
+    def test_concurrent_deferred_loaders_can_reenter_iterating_accessor(
+        self, accessor_name
+    ):
+        reg = PlatformRegistry()
+        entries = {
+            name: self._make_entry(name)[0]
+            for name in ("reentrant-alpha", "reentrant-beta")
+        }
+        loaders_ready = threading.Barrier(2)
+        nested_results = {}
+        outer_results = {}
+        failures = []
+
+        def _loader(name):
+            try:
+                loaders_ready.wait(timeout=5)
+                nested_results[name] = getattr(reg, accessor_name)()
+                reg.register(entries[name])
+            except BaseException as exc:
+                failures.append(exc)
+                raise
+
+        for name in entries:
+            reg.register_deferred(name, lambda name=name: _loader(name))
+
+        def _resolve(name):
+            outer_results[name] = reg.get(name)
+
+        threads = [
+            threading.Thread(target=_resolve, args=(name,), daemon=True)
+            for name in entries
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert failures == []
+        assert outer_results == entries
+        assert set(nested_results) == set(entries)
+
+    def test_concurrent_deferred_loaders_can_cross_get_each_other(self):
+        reg = PlatformRegistry()
+        entries = {
+            name: self._make_entry(name)[0]
+            for name in ("cross-alpha", "cross-beta")
+        }
+        peers = {
+            "cross-alpha": "cross-beta",
+            "cross-beta": "cross-alpha",
+        }
+        loaders_ready = threading.Barrier(2)
+        nested_results = {}
+        outer_results = {}
+        failures = []
+
+        def _loader(name):
+            try:
+                loaders_ready.wait(timeout=5)
+                nested_results[name] = reg.get(peers[name])
+                reg.register(entries[name])
+            except BaseException as exc:
+                failures.append(exc)
+                raise
+
+        for name in entries:
+            reg.register_deferred(name, lambda name=name: _loader(name))
+
+        def _resolve(name):
+            outer_results[name] = reg.get(name)
+
+        threads = [
+            threading.Thread(target=_resolve, args=(name,), daemon=True)
+            for name in entries
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert failures == []
+        assert outer_results == entries
+        nested_values = list(nested_results.values())
+        assert nested_values.count(None) == 1
+        assert any(
+            observed is entries[peers[name]]
+            for name, observed in nested_results.items()
+        )
+
     @pytest.mark.parametrize("callback_name", ["check", "validate", "factory"])
     def test_adapter_callbacks_run_without_registry_lock_held(self, callback_name):
         reg = PlatformRegistry()

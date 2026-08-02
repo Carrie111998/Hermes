@@ -228,6 +228,10 @@ class PlatformRegistry:
         # `hermes setup`/`gateway status`, send_message).
         self._deferred: dict[str, Callable[[], None]] = {}
         self._resolving: dict[str, _DeferredResolution] = {}
+        # Current cross-thread deferred-loader waits.  Tracking this graph lets
+        # re-entrant loaders break only cyclic waits while ordinary readers
+        # still wait for the owning loader's final entry (or failure).
+        self._waiting: dict[int, _DeferredResolution] = {}
         self._generation = 0
         self._frozen = False
         self._transaction_owner: Optional[PlatformRegistry] = None
@@ -393,7 +397,7 @@ class PlatformRegistry:
                 if active is not None:
                     if active.owner_thread == threading.get_ident():
                         return
-                    wait_event = active.event
+                    wait_resolution = active
                 else:
                     loader = self._deferred.pop(name, None)
                     if loader is None:
@@ -401,10 +405,11 @@ class PlatformRegistry:
                     resolution = _DeferredResolution()
                     self._resolving[name] = resolution
                     self._generation += 1
-                    wait_event = None
-            if wait_event is None:
+                    wait_resolution = None
+            if wait_resolution is None:
                 break
-            wait_event.wait()
+            if not self._wait_for_resolution(wait_resolution):
+                return
 
         assert loader is not None
         assert resolution is not None
@@ -423,6 +428,41 @@ class PlatformRegistry:
                     self._resolving.pop(name, None)
                 resolution.event.set()
 
+    def _wait_for_resolution(self, resolution: _DeferredResolution) -> bool:
+        """Wait for *resolution*, unless that wait would close a loader cycle.
+
+        Returns ``False`` only when the caller must treat the still-provisional
+        resolution as unavailable so its own loader can finish and unblock the
+        cycle.  The registry lock is never held while waiting.
+        """
+        current_thread = threading.get_ident()
+        with self._lock:
+            if resolution.event.is_set():
+                return True
+
+            owner_thread = resolution.owner_thread
+            seen = set()
+            while owner_thread not in seen:
+                if owner_thread == current_thread:
+                    return False
+                seen.add(owner_thread)
+                owner_wait = self._waiting.get(owner_thread)
+                if owner_wait is None:
+                    self._waiting[current_thread] = resolution
+                    break
+                owner_thread = owner_wait.owner_thread
+            else:
+                # Defensive fallback for an already-cyclic dependency graph.
+                return False
+
+        try:
+            resolution.event.wait()
+        finally:
+            with self._lock:
+                if self._waiting.get(current_thread) is resolution:
+                    self._waiting.pop(current_thread, None)
+        return True
+
     def _resolve_all(self) -> None:
         """Run every pending deferred loader.
 
@@ -436,7 +476,7 @@ class PlatformRegistry:
             with self._lock:
                 pending = list(self._deferred)
                 active = [
-                    resolution.event
+                    resolution
                     for resolution in self._resolving.values()
                     if resolution.owner_thread != current_thread
                 ]
@@ -445,9 +485,15 @@ class PlatformRegistry:
                     self._resolve(name)
                 continue
             if active:
-                for event in active:
-                    event.wait()
-                continue
+                waited = False
+                for resolution in active:
+                    waited = self._wait_for_resolution(resolution) or waited
+                if waited:
+                    continue
+                # Every remaining foreign resolution depends (possibly
+                # transitively) on this loader.  Returning exposes only already
+                # committed entries and lets this loader release the cycle.
+                return
             return
 
     def register(self, entry: PlatformEntry) -> None:
