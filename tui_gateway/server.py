@@ -5008,13 +5008,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _session_usage_snapshot(session),
-        "profile_name": _response_profile_name(
+        "profile_name": (
             Path(session["profile_home"]).name
             if isinstance(session, dict) and session.get("profile_home")
-            else None
-        )
-        if isinstance(session, dict) and session.get("profile_home")
-        else _current_profile_name(),
+            else _current_profile_name()
+        ),
     }
     try:
         from hermes_cli import __version__, __release_date__

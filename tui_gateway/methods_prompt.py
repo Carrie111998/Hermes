@@ -185,13 +185,40 @@ def _(rid, params: dict) -> dict:
                     "truncation would erase the entire session transcript; "
                     "resubmit with confirm_empty_truncate=true if this is intended",
                 )
-            session["history"] = truncated
-            session["history_version"] = int(session.get("history_version", 0)) + 1
+            # Info for routine rewind/edit cuts; warning only when the client
+            # explicitly opts into wiping the whole transcript.
+            log_fn = logger.warning if not truncated else logger.info
+            log_fn(
+                "prompt.submit: truncating session %s history %d -> %d messages "
+                "(ordinal=%d)",
+                sid,
+                len(history),
+                len(truncated),
+                ordinal,
+            )
+            # Write-before-memory (mirrors gateway hygiene / manual /compress):
+            # persist the truncated transcript first. If replace_messages fails,
+            # refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+                    logger.error(
+                        "prompt.submit: replace_messages failed for session %s "
+                        "(ordinal=%d); refusing turn so memory and DB stay "
+                        "aligned: %s",
+                        sid,
+                        ordinal,
+                        exc,
+                        exc_info=True,
+                    )
+                    return _err(
+                        rid,
+                        5008,
+                        f"failed to persist history truncation: {exc}",
+                    )
+            session["history"] = truncated
+            session["history_version"] = int(session.get("history_version", 0)) + 1
         envelope = _capture_prompt_envelope_locked(
             session,
             rid,
