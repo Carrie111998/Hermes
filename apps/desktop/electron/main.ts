@@ -148,6 +148,7 @@ import {
   redactSecrets,
   SshConnection
 } from './ssh-connection'
+import { installStdioPipeErrorGuards } from './stdio-pipe-guards'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
@@ -203,7 +204,6 @@ import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath } from './wsl-path-bridge'
-import { installStdioPipeErrorGuards } from './stdio-pipe-guards'
 
 // ESM evaluates static imports (including electron) before any module body
 // statement, so this cannot run literally before `import 'electron'`. Install
