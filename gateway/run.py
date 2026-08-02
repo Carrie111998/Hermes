@@ -6370,6 +6370,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=_profile,
         )
 
+    @staticmethod
+    def _telegram_topic_profile_name(source: SessionSource) -> str:
+        """Profile namespace for Telegram topic-mode rows (issue #76423).
+
+        Prefer the profile already stamped on the routed event
+        (``source.profile``). Do **not** fall back to the process-global
+        active profile here — under multiplex that can mis-attribute
+        topic state across bots sharing one ``state.db``.
+        """
+        name = str(getattr(source, "profile", None) or "").strip()
+        return name if name else "default"
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -6383,6 +6395,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw = session_db.is_telegram_topic_mode_enabled(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=self._telegram_topic_profile_name(source),
             )
         except Exception:
             logger.debug("Failed to read Telegram topic mode state", exc_info=True)
@@ -6484,6 +6497,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(source.user_id or ""),
             session_key=session_entry.session_key,
             session_id=session_entry.session_id,
+            profile_name=self._telegram_topic_profile_name(source),
         )
 
     def _sync_telegram_topic_binding(
@@ -6551,6 +6565,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
                 chat_id=str(source.chat_id),
+                profile_name=self._telegram_topic_profile_name(source),
             )
         except Exception:
             logger.debug("topic-recover: read failed", exc_info=True)
@@ -10650,6 +10665,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
+            # Topic-mode rows are namespaced by profile in shared state.db
+            # (issue #76423). Primary adapters own the process-active profile.
+            adapter._hermes_profile_name = self._active_profile_name()
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -11751,6 +11769,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
+                    adapter._hermes_profile_name = self._active_profile_name()
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -12695,6 +12714,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
         adapter._busy_text_mode = self._busy_text_mode
+        # Secondary adapters always carry the profile they serve so prune
+        # paths namespace topic bindings correctly under multiplex (#76423).
+        adapter._hermes_profile_name = profile_name
 
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform
@@ -15576,6 +15598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._telegram_topic_profile_name(source),
                 )) if self._session_db else None
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
@@ -19107,6 +19130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 binding = await session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._telegram_topic_profile_name(source),
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
                     return
@@ -19264,13 +19288,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             currently_enabled = await self._session_db.is_telegram_topic_mode_enabled(
                 chat_id=chat_id,
                 user_id=str(source.user_id or ""),
+                profile_name=self._telegram_topic_profile_name(source),
             )
         except Exception:
             currently_enabled = False
         if not currently_enabled:
             return "Multi-session topic mode is not currently enabled for this chat."
         try:
-            await self._session_db.disable_telegram_topic_mode(chat_id=chat_id)
+            await self._session_db.disable_telegram_topic_mode(
+                chat_id=chat_id,
+                profile_name=self._telegram_topic_profile_name(source),
+            )
         except Exception as exc:
             logger.exception("Failed to disable Telegram topic mode")
             return f"Failed to disable topic mode: {exc}"
@@ -19301,6 +19329,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sessions = await self._session_db.list_unlinked_telegram_sessions_for_user(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=self._telegram_topic_profile_name(source),
                 limit=10,
             )
         except Exception:
@@ -19350,9 +19379,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "That session does not belong to this Telegram user."
 
         linked = await self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
+        topic_profile = self._telegram_topic_profile_name(source)
         current_binding = await self._session_db.get_telegram_topic_binding(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
+            profile_name=topic_profile,
         )
         if linked:
             if not current_binding or current_binding.get("session_id") != session_id:
@@ -19367,6 +19398,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 session_id=session_id,
                 managed_mode="restored",
+                profile_name=topic_profile,
             )
         except ValueError as exc:
             if "already linked" in str(exc):
