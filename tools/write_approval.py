@@ -43,21 +43,61 @@ web dashboard.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import re
+import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
+
+def _atomic_pending_json_write(path: Path, data: Mapping[str, Any], *, create: bool = False) -> None:
+    """Write pending JSON without ever following the destination symlink."""
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise ValueError("pending directory is not a regular local directory")
+    if path.is_symlink() or (create and os.path.lexists(path)):
+        raise FileExistsError("pending record path already exists or is a symlink")
+    if path.exists() and not path.is_file():
+        raise ValueError("pending record path is not a regular file")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise FileExistsError("pending record path became a symlink")
+        # Replace the directory entry itself; never redirect through a symlink.
+        os.replace(tmp_path, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
 # Subsystem identifiers
 MEMORY = "memory"
 SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Config key (per subsystem). A single boolean: the approval gate is OFF by
 # default (writes flow freely, the pre-gate behaviour), and ON means stage /
@@ -108,11 +148,119 @@ def _normalize_enabled(value: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 def _pending_dir(subsystem: str) -> Path:
-    return get_hermes_home() / "pending" / subsystem
+    if subsystem not in _SUBSYSTEMS:
+        raise ValueError(f"invalid pending subsystem: {subsystem!r}")
+    root = get_hermes_home() / "pending"
+    directory = root / subsystem
+    if (root.exists() and root.is_symlink()) or (
+        directory.exists() and directory.is_symlink()
+    ):
+        raise RuntimeError("pending write directory must not be a symlink")
+    return directory
 
 
-def stage_write(subsystem: str, payload: Dict[str, Any],
-                *, summary: str, origin: str) -> Dict[str, Any]:
+def _validate_pending_id(pending_id: str) -> str:
+    value = str(pending_id or "")
+    if not _ID_RE.fullmatch(value):
+        raise ValueError("pending id contains invalid characters")
+    return value
+
+
+def _risk_for(subsystem: str, action: str) -> str:
+    if action in {"delete", "remove", "remove_file"}:
+        return "high"
+    if subsystem == SKILLS and action in {"edit", "patch", "write_file"}:
+        return "medium"
+    if subsystem == MEMORY and action in {"replace", "batch"}:
+        return "medium"
+    return "low"
+
+
+def _capture_skill_precondition(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Fingerprint the exact existing skill target without changing it."""
+    try:
+        from tools.skill_manager_tool import _find_skill
+
+        found = _find_skill(str(payload.get("name") or ""))
+        action = str(payload.get("action") or "")
+        if found is None:
+            return {"target_exists": False}
+        skill_dir = Path(found["path"])
+        skill_root = skill_dir.resolve()
+        if action in {"write_file", "remove_file"}:
+            target = skill_dir / str(payload.get("file_path") or "")
+        else:
+            target = skill_dir / "SKILL.md"
+        try:
+            target.resolve(strict=False).relative_to(skill_root)
+        except (OSError, ValueError):
+            return {"capture_failed": True}
+        if not target.exists() or target.is_symlink() or not target.is_file():
+            return {"target_exists": False}
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        return {"target_exists": True, "target_sha256": digest}
+    except Exception:
+        return {"capture_failed": True}
+
+
+def verify_reviewed_payload(
+    subsystem: str,
+    record: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    memory_store=None,
+) -> tuple[bool, str]:
+    """Reject changed replay payloads or targets after human review."""
+    from agent import learning_ledger
+
+    record_id = str(record.get("id") or "")
+    candidate_id = str(record.get("candidate_id") or "")
+    ledger_id = str(candidate.get("candidate_id") or "")
+    if not record_id or record_id != candidate_id or record_id != ledger_id:
+        return False, "pending record is not linked to its reviewed candidate"
+    if str(record.get("subsystem") or "") != subsystem or str(candidate.get("subsystem") or "") != subsystem:
+        return False, "pending subsystem does not match its reviewed candidate"
+    payload = dict(record.get("payload") or {})
+    fingerprint = learning_ledger.canonical_payload_fingerprint(subsystem, payload)
+    if fingerprint != str(candidate.get("payload_fingerprint") or ""):
+        return False, "reviewed payload changed after staging"
+    precondition = dict(record.get("precondition") or candidate.get("precondition") or {})
+    if not precondition:
+        return True, ""
+    if precondition.get("capture_failed"):
+        return False, "target precondition could not be captured"
+    if subsystem == MEMORY:
+        if memory_store is None:
+            return False, "memory store unavailable"
+        entries = memory_store._entries_for(str(payload.get("target") or "memory"))
+        target_fingerprint = precondition.get("target_fingerprint")
+        if target_fingerprint:
+            actual = hashlib.sha256(
+                json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if actual != target_fingerprint:
+                return False, "memory target changed after staging"
+            return True, ""
+        for old_text in precondition.get("old_texts", []):
+            if not any(str(old_text) in entry for entry in entries):
+                return False, "memory target changed after staging"
+        return True, ""
+    current = _capture_skill_precondition(payload)
+    if current != precondition:
+        return False, "skill target changed after staging"
+    return True, ""
+
+
+def stage_write(
+    subsystem: str,
+    payload: Dict[str, Any],
+    *,
+    summary: str,
+    origin: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+    candidate_id: Optional[str] = None,
+    dedup_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
 
     Args:
@@ -125,30 +273,166 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
             entry text itself.
         origin: ``foreground`` or ``background_review`` — recorded for audit.
 
-    Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
-    logs and still returns a record (the write is simply lost, which is the
-    safe failure for an approval gate — nothing is silently committed).
+    Returns a dict with ``id`` and metadata. Staging fails closed unless both
+    the exact replay payload and its ledger lifecycle row are durable.
     """
-    pid = uuid.uuid4().hex[:8]
+    from agent import learning_ledger
+
+    if subsystem not in _SUBSYSTEMS:
+        raise ValueError(f"invalid pending subsystem: {subsystem!r}")
+    pid = _validate_pending_id(candidate_id or uuid.uuid4().hex)
+    meta: Dict[str, Any] = {}
+    if (origin or "") == "background_review":
+        try:
+            from agent.learning_context import current_learning_metadata
+
+            meta = current_learning_metadata()
+        except Exception:
+            meta = {}
+    meta.update(dict(metadata or {}))
+    if subsystem == SKILLS and not meta.get("precondition"):
+        meta["precondition"] = _capture_skill_precondition(payload)
+    payload_fingerprint = learning_ledger.canonical_payload_fingerprint(subsystem, payload)
+    resolved_dedup_key = dedup_key or learning_ledger.candidate_dedup_key(subsystem, payload)
+    if (origin or "") == "background_review":
+        existing = learning_ledger.find_candidate_by_dedup(
+            resolved_dedup_key,
+            statuses={"pending", "applying", "active", "validated", "rejected", "rolled_back"},
+        )
+        if existing is not None:
+            return {
+                "id": existing["candidate_id"],
+                "candidate_id": existing["candidate_id"],
+                "subsystem": subsystem,
+                "action": payload.get("action", ""),
+                "summary": (summary or "").strip(),
+                "origin": origin,
+                "ledger_recorded": True,
+                "suppressed": True,
+                "deduplicated": True,
+                "existing_status": existing["status"],
+            }
+    evidence = dict(meta.get("evidence") or {})
+    if str(evidence.get("risk") or "unknown") == "unknown":
+        evidence["risk"] = _risk_for(subsystem, str(payload.get("action") or ""))
     record = {
         "id": pid,
+        "candidate_id": pid,
+        "schema_version": 2,
         "subsystem": subsystem,
         "action": payload.get("action", ""),
         "summary": (summary or "").strip(),
         "origin": origin or "foreground",
         "created_at": time.time(),
         "payload": payload,
+        "payload_fingerprint": payload_fingerprint,
+        "dedup_key": resolved_dedup_key,
+        "precondition": dict(meta.get("precondition") or {}),
+        "ledger_recorded": False,
+        "success": True,
+        "staged": True,
     }
     try:
         d = _pending_dir(subsystem)
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = d / f"{pid}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        _atomic_pending_json_write(path, record, create=True)
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        record["success"] = False
+        record["staged"] = False
+        return record
+
+    try:
+        source = {"origin": record["origin"], **dict(meta.get("source") or {})}
+        learning_ledger.create_candidate(
+            {
+                "candidate_id": pid,
+                "subsystem": subsystem,
+                "action": record["action"],
+                "status": "pending",
+                "payload_fingerprint": payload_fingerprint,
+                "dedup_key": resolved_dedup_key,
+                "pending_relpath": f"pending/{subsystem}/{pid}.json",
+                "proposal": {
+                    # Pending JSON is the exact, reviewable replay envelope.
+                    # The long-lived ledger keeps only a non-content-bearing gist.
+                    "summary": f"{subsystem} {record['action']} candidate",
+                    "target": payload.get("target"),
+                    "name": payload.get("name"),
+                    "file_path": payload.get("file_path"),
+                },
+                "source": source,
+                "evidence": evidence,
+                "precondition": record["precondition"],
+            }
+        )
+        record["ledger_recorded"] = True
+        _atomic_pending_json_write(path, record)
+    except Exception as e:
+        # A competing process may have latched the same autonomous proposal
+        # after our optimistic pre-check.  The SQLite latch is authoritative;
+        # remove this orphan replay payload and report the existing candidate.
+        if (origin or "") == "background_review":
+            try:
+                existing = learning_ledger.find_candidate_by_dedup(resolved_dedup_key)
+                if existing is not None and existing["candidate_id"] != pid:
+                    path.unlink(missing_ok=True)
+                    return {
+                        "id": existing["candidate_id"],
+                        "candidate_id": existing["candidate_id"],
+                        "subsystem": subsystem,
+                        "action": payload.get("action", ""),
+                        "summary": (summary or "").strip(),
+                        "origin": origin,
+                        "ledger_recorded": True,
+                        "success": True,
+                        "staged": False,
+                        "suppressed": True,
+                        "deduplicated": True,
+                        "existing_status": existing["status"],
+                    }
+            except Exception:
+                pass
+        logger.error("Failed to record learning candidate %s: %s", pid, e, exc_info=True)
+        path.unlink(missing_ok=True)
+        record["success"] = False
+        record["staged"] = False
     return record
+
+
+def _read_pending_record(
+    path: Path,
+    *,
+    subsystem: str,
+    expected_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read one pending record only when its envelope matches its path."""
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            return None
+        record_id = _validate_pending_id(str(record.get("id") or ""))
+        if record_id != expected_id:
+            return None
+        raw_candidate_id = record.get("candidate_id")
+        if raw_candidate_id in {None, ""}:
+            # Pre-ledger records had no candidate_id. Bind them to their
+            # immutable filename/id so migration never trusts a mutable link.
+            candidate_id = record_id
+            record["candidate_id"] = record_id
+        else:
+            candidate_id = _validate_pending_id(str(raw_candidate_id))
+            if candidate_id != record_id:
+                return None
+        record_subsystem = str(record.get("subsystem") or subsystem)
+        if record_subsystem != subsystem:
+            return None
+        return record
+    except Exception:
+        return None
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
@@ -158,9 +442,15 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
         return []
     records: List[Dict[str, Any]] = []
     for p in d.glob("*.json"):
+        expected_id = p.name.removesuffix(".json")
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
-        except Exception:
+            expected_id = _validate_pending_id(expected_id)
+        except ValueError:
+            continue
+        record = _read_pending_record(p, subsystem=subsystem, expected_id=expected_id)
+        if record is not None:
+            records.append(record)
+        else:
             logger.warning("Skipping unreadable pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
     return records
@@ -168,17 +458,16 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
+    pending_id = _validate_pending_id(pending_id)
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     if not path.exists():
         return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return _read_pending_record(path, subsystem=subsystem, expected_id=pending_id)
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
+    pending_id = _validate_pending_id(pending_id)
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     try:
         if path.exists():
@@ -187,6 +476,125 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
     except Exception as e:  # pragma: no cover
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
+
+
+def claim_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically claim one pending payload for apply/reject."""
+    pending_id = _validate_pending_id(pending_id)
+    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        return None
+    claim_id = uuid.uuid4().hex
+    claim_path = path.with_name(f"{pending_id}.json.applying.{claim_id}")
+    try:
+        os.replace(path, claim_path)
+        record = _read_pending_record(
+            claim_path,
+            subsystem=subsystem,
+            expected_id=pending_id,
+        )
+        if record is None:
+            claim_path.unlink(missing_ok=True)
+            return None
+        record["_claim_path"] = str(claim_path)
+        record["_claim_id"] = claim_id
+        return record
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.error("Failed to claim pending %s/%s: %s", subsystem, pending_id, e)
+        return None
+
+
+def release_claim(subsystem: str, claim: Mapping[str, Any], *, restore: bool) -> bool:
+    """Restore or delete a claimed payload after a decision."""
+    pending_id = _validate_pending_id(str(claim.get("id") or ""))
+    claim_path = Path(str(claim.get("_claim_path") or ""))
+    expected_parent = _pending_dir(subsystem).resolve()
+    if (
+        not claim_path.exists()
+        or claim_path.is_symlink()
+        or not claim_path.is_file()
+        or claim_path.parent.resolve() != expected_parent
+        or not claim_path.name.startswith(f"{pending_id}.json.applying.")
+    ):
+        return False
+    try:
+        if restore:
+            canonical = _pending_dir(subsystem) / f"{pending_id}.json"
+            # Never overwrite a fresh canonical proposal created while this
+            # claim was in flight.  A failed restore remains an explicit claim
+            # for reconciliation instead of losing either payload.
+            os.link(claim_path, canonical, follow_symlinks=False)
+            if canonical.is_symlink() or not canonical.is_file():
+                canonical.unlink(missing_ok=True)
+                return False
+            claim_path.unlink()
+        else:
+            claim_path.unlink()
+        return True
+    except Exception as e:
+        logger.error("Failed to release pending claim %s/%s: %s", subsystem, pending_id, e)
+        return False
+
+
+def list_claims(subsystem: str) -> List[Dict[str, Any]]:
+    """List interrupted claims without replaying or resolving them."""
+    d = _pending_dir(subsystem)
+    if not d.exists():
+        return []
+    claims: List[Dict[str, Any]] = []
+    for path in d.glob("*.json.applying.*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            pending_id = _validate_pending_id(str(record.get("id") or ""))
+            if not path.name.startswith(f"{pending_id}.json.applying."):
+                continue
+            record["_claim_path"] = str(path)
+            record["_claim_id"] = path.name.rsplit(".", 1)[-1]
+            record["_claim_age_seconds"] = max(0.0, time.time() - path.stat().st_mtime)
+            claims.append(record)
+        except Exception:
+            logger.warning("Skipping unreadable pending claim: %s", path)
+    claims.sort(key=lambda item: (-float(item.get("_claim_age_seconds", 0)), str(item.get("id", ""))))
+    return claims
+
+
+def ensure_candidate_for_record(record: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return or create a ledger candidate for a legacy pending record."""
+    from agent import learning_ledger
+
+    candidate_id = str(record.get("candidate_id") or record.get("id") or "")
+    if not candidate_id:
+        return None
+    existing = learning_ledger.get_candidate(candidate_id)
+    if existing is not None:
+        return existing
+    subsystem = str(record.get("subsystem") or "")
+    payload = dict(record.get("payload") or {})
+    try:
+        return learning_ledger.create_candidate(
+            {
+                "candidate_id": candidate_id,
+                "subsystem": subsystem,
+                "action": str(record.get("action") or payload.get("action") or "legacy"),
+                "status": "pending",
+                "payload_fingerprint": learning_ledger.canonical_payload_fingerprint(subsystem, payload),
+                "dedup_key": learning_ledger.candidate_dedup_key(subsystem, payload),
+                "pending_relpath": f"pending/{subsystem}/{candidate_id}.json",
+                "proposal": {
+                    "summary": f"{subsystem} {str(record.get('action') or payload.get('action') or 'legacy')} candidate"
+                },
+                "source": {"origin": str(record.get("origin") or "legacy")},
+                "evidence": {"status": "legacy_missing"},
+                "precondition": {},
+            }
+        )
+    except Exception as e:
+        logger.error("Failed to create ledger entry for legacy pending %s: %s", candidate_id, e)
+        return None
 
 
 def pending_count(subsystem: str) -> int:
@@ -271,10 +679,35 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
     delays a write for approval, never silently refuses it. ``blocked`` is
     still produced when the user *actively denies* an inline prompt.
     """
+    background = is_background()
+
+    # A real background-review run binds a trusted metadata envelope.  Missing
+    # context here means a legacy/internal caller, whose existing gate-off
+    # behavior remains unchanged for compatibility.
+    if background:
+        try:
+            from agent.learning_context import current_learning_metadata
+
+            evidence = dict(current_learning_metadata().get("evidence") or {})
+        except Exception:
+            evidence = {}
+        if evidence:
+            trust = str(evidence.get("source_trust") or "unknown")
+            status = str(evidence.get("status") or "missing")
+            risk = str(evidence.get("risk") or "unknown")
+            if (
+                trust in {"untrusted_external", "user_supplied_unverified", "unknown"}
+                or status in {"missing", "malformed", "unverified"}
+                or risk == "high"
+            ):
+                where = "/skills pending" if subsystem == SKILLS else "/memory pending"
+                return GateDecision(
+                    stage=True,
+                    message=f"Untrusted or high-risk learning candidate staged for review with {where}.",
+                )
+
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
-
-    background = is_background()
 
     # Skills always stage — a SKILL.md is too large to review inline, and a
     # background skill write happens in a daemon thread with no user present.
@@ -444,9 +877,10 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
 
     # Resolve current on-disk content for diffable actions.
     try:
-        from tools.skill_manager_tool import _find_skill
+        from tools.skill_manager_tool import _find_skill, _validate_file_path
     except Exception:
         _find_skill = None  # type: ignore
+        _validate_file_path = None  # type: ignore
 
     current = ""
     target_label = "SKILL.md"
@@ -458,14 +892,19 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
                 p = base / "SKILL.md"
             elif action in {"patch", "write_file"}:
                 rel = payload.get("file_path") or "SKILL.md"
+                path_error = _validate_file_path(str(rel)) if _validate_file_path is not None else "validator unavailable"
+                if path_error:
+                    return f"invalid staged skill path: {path_error}"
                 p = base / rel
                 target_label = rel
             else:
                 p = base / "SKILL.md"
             try:
-                if p.exists():
+                base_resolved = Path(base).resolve()
+                p.resolve(strict=False).relative_to(base_resolved)
+                if p.exists() and not p.is_symlink() and p.is_file():
                     current = p.read_text(encoding="utf-8")
-            except Exception:
+            except (OSError, ValueError):
                 current = ""
 
     if action == "edit":
