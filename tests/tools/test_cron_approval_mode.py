@@ -164,6 +164,50 @@ class TestCronDenyMode:
             # Should contain the description of what was flagged
             assert "dangerous" in result["message"].lower() or "delete" in result["message"].lower()
 
+    def test_cached_pattern_cannot_bypass_task_local_cron_deny(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "is_approved", lambda *_: True)
+        monkeypatch.setattr(
+            approval_module, "_command_matches_permanent_allowlist", lambda *_: False
+        )
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_module, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+        with _active_cron_context():
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+        assert not result["approved"]
+        assert "cron_mode" in result["message"]
+
+    def test_permanent_command_allowlist_cannot_bypass_cron_deny(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module, "_command_matches_permanent_allowlist", lambda *_: True
+        )
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_module, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+        with _active_cron_context():
+            direct = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            combined = check_all_command_guards("rm -rf /tmp/stuff", "local")
+        assert not direct["approved"]
+        assert not combined["approved"]
+
+    def test_plugin_session_cache_cannot_bypass_cron_deny(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "is_approved", lambda *_: True)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_module, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+        with _active_cron_context():
+            result = approval_module.request_tool_approval(
+                "terminal", "smtp send", rule_key="smtp"
+            )
+        assert not result["approved"]
+        assert "cron" in result["message"].lower()
+
 
 class TestCronApproveMode:
     """When HERMES_CRON_SESSION is set and cron_mode=approve, dangerous commands pass through."""
@@ -251,6 +295,34 @@ class TestCronDenyModeAllGuards:
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
         assert not result["approved"]
         assert result.get("status") == "pending_approval"
+
+    def test_stale_cron_env_with_ask_cannot_autoapprove_public_gate(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_module, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(
+            approval_module, "_command_matches_permanent_allowlist", lambda *_: False
+        )
+        submitted: list[dict] = []
+        monkeypatch.setattr(
+            approval_module,
+            "submit_pending",
+            lambda _session, payload: submitted.append(payload),
+        )
+
+        result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+
+        assert not result["approved"]
+        assert result.get("status") == "approval_required"
+        assert len(submitted) == 1
 
     def test_safe_command_allowed_in_combined_guard(self, monkeypatch):
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")

@@ -2030,9 +2030,10 @@ def _run_approval_gate(
     escalations). Extracting it keeps the fail-closed / cron / gateway /
     persist policy in ONE place so the two entry points can never drift.
 
-    Ordering mirrors the historical ``check_dangerous_command`` tail:
-    yolo bypass → session-cache short-circuit → interactive/gateway/cron
-    branch → prompt → ``deny/session/always`` persistence. The caller is
+    Ordering mirrors the historical ``check_dangerous_command`` tail while
+    enforcing the unattended boundary: yolo bypass → task-local cron policy →
+    session-cache short-circuit → interactive/gateway/ask branch → prompt →
+    ``deny/session/always`` persistence. The caller is
     responsible for the checks that are specific to its input shape
     (hardline detection, command-string permanent allowlist, dangerous-
     pattern detection) BEFORE calling this gate.
@@ -2068,6 +2069,19 @@ def _run_approval_gate(
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
+    # Cron policy is task-local and outranks remembered approvals. A cached
+    # interactive approval must never silently grant authority to a later
+    # unattended cron run. Explicit cron approve mode is the only cron bypass.
+    if _is_cron_approval_context():
+        if _get_cron_approval_mode() == "deny":
+            return {
+                "approved": False,
+                "message": cron_deny_message,
+                "pattern_key": pattern_key,
+                "description": description,
+            }
+        return {"approved": True, "message": None}
+
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
@@ -2081,19 +2095,10 @@ def _run_approval_gate(
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
-    if not is_cli and not is_gateway:
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
-                return {
-                    "approved": False,
-                    "message": cron_deny_message,
-                    "pattern_key": pattern_key,
-                    "description": description,
-                }
-            # cron_mode: approve — fall through to auto-approve below.
-        elif fail_closed_when_no_human:
+    if not is_cli and not is_gateway and not is_ask:
+        if fail_closed_when_no_human:
             # Non-cron, non-interactive, no gateway: no human can answer.
             # The plugin-escalation path opts in to fail-closed here so a
             # plugin-flagged action never runs ungated. (The dangerous-
@@ -2120,7 +2125,7 @@ def _run_approval_gate(
         )
         return {"approved": True, "message": None}
 
-    if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+    if is_gateway or is_ask:
         # Interactive gateway round-trip when a notify callback is
         # registered for this session (Discord/Telegram/Slack embed +
         # buttons, same mechanism as check_dangerous_command). Blocks the
@@ -2287,6 +2292,10 @@ def check_dangerous_command(command: str, env_type: str,
     # CLI --yolo remains process-scoped via the env var for local use.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
+
+    # Task-local cron policy outranks command and pattern approval caches.
+    if _is_cron_approval_context():
+        return _check_cron_command_guards(command)
 
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
@@ -2553,7 +2562,7 @@ def _check_cron_command_guards(command: str) -> dict:
     """Apply cron_mode without consulting interactive gateway/ask surfaces.
 
     Cron workers may inherit approval-related environment from a gateway
-    parent.  HERMES_CRON_SESSION is the stronger identity signal: no human is
+    parent. Task-local cron provenance is the stronger identity signal: no human is
     attached to the run, so deny mode must block warnings rather than route
     them into an interactive approval flow.  Explicit cron approve mode keeps
     the existing unattended auto-approve contract.
@@ -2671,13 +2680,14 @@ def check_all_command_guards(command: str, env_type: str,
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
-        return {"approved": True, "message": None}
-
-    # Cron identity outranks inherited gateway/ask context. A scheduler worker
-    # has no human approval surface even if its parent exported HERMES_EXEC_ASK.
+    # Cron identity outranks command and pattern approval caches as well as
+    # inherited gateway/ask context. A scheduler worker has no human approval
+    # surface even if its parent exported HERMES_EXEC_ASK.
     if _is_cron_approval_context():
         return _check_cron_command_guards(command)
+
+    if _command_matches_permanent_allowlist(command):
+        return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
