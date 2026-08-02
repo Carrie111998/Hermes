@@ -1004,9 +1004,8 @@ platform_toolsets:
 #   voice_barge_in:                   # Strict VC interruption while bot TTS plays (default: off)
 #     enabled: false                  # Opt in; otherwise inbound capture pauses during bot speech
 #     monitor_only: false             # Fail-closed; when true it overrides enabled and never interrupts, ACKs, or routes input
-#     phrases:                        # Use distinctive multi-word phrases, not broad single words
-#       - "세린아 멈춰"
-#       - "세린아 잠깐"
+#     phrases:                        # Configure only this deployment's own wake name
+#       - "하나야"                    # e.g. 하나야/유나야/미나야/라나야/세나야; choose one
 #     streaming_kws:                 # Optional local low-latency Korean detector
 #       enabled: false               # Off by default; local model downloads once on first use
 #       shadow_only: true            # Log detections without interrupting until canary acceptance
@@ -1021,19 +1020,18 @@ platform_toolsets:
 #       contrast_wake_names: []        # If bias is enabled, add confusable names with equal weight
 #       num_threads: 4
 #       queue_frames: 256              # Bounded in-memory PCM queue; no audio is persisted
-#     min_trailing_characters: 2      # Shorter tail is treated as noise/filler and not sent to model
+#     min_trailing_characters: 2      # Applies only when a command is spoken in the same utterance
 #     ack_enabled: false              # Independently opt in to spoken barge-in acknowledgements
-#     stop_ack_phrases:               # Round-robin after stop-only/noisy matches; no model event
-#       - "네, 멈출게요."
-#       - "알겠어요."
+#     stop_ack_phrases:               # Short round-robin ACK after own-name-only match; no model event
+#       - "네."
+#       - "말씀하세요."
 #     follow_up_ack_phrases:          # Independent round-robin before a clean tail is routed once
 #       - "네, 말씀하세요."
 #       - "좋아요, 이어서 들을게요."
-#   # Example: "세린아 멈춰, 다음 질문에 답해줘" stops current TTS, plays the
-#   # next follow-up ACK when enabled, then routes only "다음 질문에 답해줘".
-#   # A stop-only match can play a stop ACK but creates no model event. ACK
-#   # synthesis/playback failure never blocks a valid tail. Audio without one
-#   # of the configured prefix phrases is discarded while TTS is playing.
+#   # Recommended two-step flow: say only "하나야" to stop TTS and hear a short
+#   # stop ACK, then speak a fresh command after the ACK. The fresh utterance
+#   # follows the normal voice-input path. Overlap audio without the configured
+#   # deployment name is discarded while TTS is playing.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)
