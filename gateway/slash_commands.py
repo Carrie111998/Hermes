@@ -2629,6 +2629,11 @@ class GatewaySlashCommandsMixin:
             state = mgr.pause(reason="user-paused")
             if state is None:
                 return t("gateway.goal.no_goal_set")
+            schedule_semantic_refresh = getattr(
+                self, "_schedule_adapter_semantic_base_refresh", None
+            )
+            if callable(schedule_semantic_refresh):
+                schedule_semantic_refresh(event.source, session_entry.session_id)
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -2642,11 +2647,21 @@ class GatewaySlashCommandsMixin:
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            schedule_semantic_refresh = getattr(
+                self, "_schedule_adapter_semantic_base_refresh", None
+            )
+            if callable(schedule_semantic_refresh):
+                schedule_semantic_refresh(event.source, session_entry.session_id)
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
             mgr.clear()
+            schedule_semantic_refresh = getattr(
+                self, "_schedule_adapter_semantic_base_refresh", None
+            )
+            if callable(schedule_semantic_refresh):
+                schedule_semantic_refresh(event.source, session_entry.session_id)
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -2714,6 +2729,14 @@ class GatewaySlashCommandsMixin:
             state = mgr.set(args, contract=contract)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
+
+        # The persisted epic is authoritative for semantic room naming. Queue
+        # its refresh before kickoff so an auto-title from that turn cannot win.
+        schedule_semantic_refresh = getattr(
+            self, "_schedule_adapter_semantic_base_refresh", None
+        )
+        if callable(schedule_semantic_refresh):
+            schedule_semantic_refresh(event.source, session_entry.session_id)
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.
@@ -4322,17 +4345,20 @@ class GatewaySlashCommandsMixin:
                                 "Failed to rename Telegram topic from /title",
                                 exc_info=True,
                             )
-                    schedule_adapter_title = getattr(
-                        self, "_schedule_adapter_session_title_propagation", None
-                    )
-                    if callable(schedule_adapter_title):
-                        try:
-                            schedule_adapter_title(source, session_id, sanitized)
-                        except Exception:
-                            logger.debug(
-                                "Failed to propagate /title through platform adapter",
-                                exc_info=True,
+                    try:
+                        if self._adapter_supports_semantic_base_refresh(source):
+                            self._schedule_adapter_semantic_base_refresh(
+                                source, session_id
                             )
+                        elif self._adapter_supports_session_title_propagation(source):
+                            self._schedule_adapter_session_title_propagation(
+                                source, session_id, sanitized
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Failed to propagate /title through platform adapter",
+                            exc_info=True,
+                        )
                     return t("gateway.title.set_to", title=sanitized)
                 else:
                     return t("gateway.title.not_found")

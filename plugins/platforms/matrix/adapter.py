@@ -1154,10 +1154,14 @@ class MatrixAdapter(BasePlatformAdapter):
         else:
             self._dynamic_room_name_enabled = bool(dynamic_room_name)
         self._dynamic_room_name_bases: Dict[str, str] = {}
+        self._dynamic_room_name_recovered_bases: Dict[str, str] = {}
+        self._dynamic_room_name_initialized: Set[str] = set()
         self._dynamic_room_name_status: Dict[str, str] = {}
         self._dynamic_room_name_active: Dict[str, int] = {}
         self._dynamic_room_name_active_turns: Set[tuple[str, str]] = set()
         self._dynamic_room_name_last_sent: Dict[str, str] = {}
+        self._dynamic_room_name_superseded_sent: Dict[str, Set[str]] = {}
+        self._dynamic_room_name_terminal_external_checks: Set[str] = set()
         self._dynamic_room_name_locks: Dict[str, asyncio.Lock] = {}
         self._dynamic_room_name_tasks: Set[asyncio.Task] = set()
         self._dynamic_room_name_room_tasks: Dict[str, asyncio.Task] = {}
@@ -1824,6 +1828,8 @@ class MatrixAdapter(BasePlatformAdapter):
             await asyncio.gather(*room_name_tasks, return_exceptions=True)
         self._dynamic_room_name_tasks.clear()
         self._dynamic_room_name_room_tasks.clear()
+        self._dynamic_room_name_terminal_external_checks.clear()
+        self._dynamic_room_name_superseded_sent.clear()
 
         # Close the SQLite crypto store database.
         if hasattr(self, "_crypto_db") and self._crypto_db:
@@ -3631,7 +3637,7 @@ class MatrixAdapter(BasePlatformAdapter):
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
         cleaned = re.sub(r"^(?:[🟡✅🔴❌⏹]\s*)+", "", cleaned).strip()
         if not cleaned:
-            return "Hermes"
+            return ""
         if len(cleaned) > 60:
             cleaned = cleaned[:57].rstrip() + "..."
         return cleaned
@@ -3645,18 +3651,14 @@ class MatrixAdapter(BasePlatformAdapter):
             and str(event.source.chat_type).lower() == "dm"
         )
 
-    def _dynamic_room_name_base(self, room_id: str) -> str:
-        base = self._dynamic_room_name_bases.get(room_id)
-        if base:
-            return base
-        self._dynamic_room_name_bases[room_id] = "Hermes"
-        return "Hermes"
+    def _dynamic_room_name_base(self, room_id: str) -> str | None:
+        return self._dynamic_room_name_bases.get(room_id) or None
 
     async def _initialize_dynamic_room_name_base(self, room_id: str) -> None:
         """Recover the stable base from room state on the first render."""
-        if room_id in self._dynamic_room_name_bases:
+        if room_id in self._dynamic_room_name_initialized:
             return
-        base = "Hermes"
+        base = ""
         try:
             current_name = await asyncio.wait_for(
                 self._get_room_name(room_id),
@@ -3670,10 +3672,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id,
                 exc_info=True,
             )
-        # A semantic-title callback may have installed a newer base while the
-        # state request was in flight. Never replace that newer in-memory value.
-        if room_id not in self._dynamic_room_name_bases:
-            self._dynamic_room_name_bases[room_id] = base
+        self._dynamic_room_name_initialized.add(room_id)
+        if base:
+            self._dynamic_room_name_recovered_bases[room_id] = base
+            self._dynamic_room_name_bases.setdefault(room_id, base)
 
     async def _send_dynamic_room_name(self, room_id: str, name: str) -> bool:
         """Best-effort, deduplicated ``m.room.name`` state update."""
@@ -3702,16 +3704,49 @@ class MatrixAdapter(BasePlatformAdapter):
         lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
         async with lock:
             await self._initialize_dynamic_room_name_base(room_id)
-            base = self._dynamic_room_name_base(room_id)
-            status = self._dynamic_room_name_status.get(room_id, "idle")
-            prefix = {
-                "working": "🟡",
-                "success": "✅",
-                "failure": "🔴",
-                "cancelled": "🔴",
-            }.get(status)
-            name = f"{prefix} {base}" if prefix else base
-            return await self._send_dynamic_room_name(room_id, name)
+            return await self._render_dynamic_room_name_locked(room_id)
+
+    async def _render_dynamic_room_name_locked(self, room_id: str) -> bool:
+        """Render while the caller holds this room's dynamic-name lock."""
+        status = self._dynamic_room_name_status.get(room_id, "idle")
+        # Immediately before a terminal render, notice a human/client rename
+        # that happened while Hermes was working.  Only a value different from
+        # our last successful write is external.  This read runs under the same
+        # room lock as authoritative semantic-base updates, so a delayed read
+        # can never overwrite a newer tool rename: the newer update either ran
+        # first (and is observed as last_sent) or runs after and wins.
+        if room_id in self._dynamic_room_name_terminal_external_checks:
+            self._dynamic_room_name_terminal_external_checks.discard(room_id)
+            superseded_sent = self._dynamic_room_name_superseded_sent.pop(
+                room_id, set()
+            )
+            try:
+                current_name = await asyncio.wait_for(
+                    self._get_room_name(room_id),
+                    timeout=self._dynamic_room_name_timeout_seconds,
+                )
+            except Exception:
+                current_name = None
+            if (
+                current_name
+                and current_name != self._dynamic_room_name_last_sent.get(room_id)
+                and current_name not in superseded_sent
+            ):
+                external_base = self._sanitize_dynamic_room_name(current_name)
+                if external_base:
+                    self._dynamic_room_name_bases[room_id] = external_base
+                    self._dynamic_room_name_recovered_bases[room_id] = external_base
+        base = self._dynamic_room_name_base(room_id)
+        if not base:
+            return False
+        prefix = {
+            "working": "🟡",
+            "success": "✅",
+            "failure": "🔴",
+            "cancelled": "🔴",
+        }.get(status)
+        name = f"{prefix} {base}" if prefix else base
+        return await self._send_dynamic_room_name(room_id, name)
 
     def _schedule_dynamic_room_name_render(self, room_id: str) -> None:
         """Queue a best-effort room-state write without blocking message intake."""
@@ -3760,12 +3795,6 @@ class MatrixAdapter(BasePlatformAdapter):
         if turn_key in self._dynamic_room_name_active_turns:
             return False
         self._dynamic_room_name_active_turns.add(turn_key)
-        if room_id not in self._dynamic_room_name_bases:
-            chat_name = getattr(event.source, "chat_name", None)
-            if isinstance(chat_name, str) and chat_name.strip():
-                self._dynamic_room_name_bases[room_id] = (
-                    self._sanitize_dynamic_room_name(chat_name)
-                )
         self._dynamic_room_name_active[room_id] = (
             self._dynamic_room_name_active.get(room_id, 0) + 1
         )
@@ -3795,6 +3824,8 @@ class MatrixAdapter(BasePlatformAdapter):
             self._dynamic_room_name_status[room_id] = "cancelled"
         else:
             self._dynamic_room_name_status[room_id] = "failure"
+        if not remaining:
+            self._dynamic_room_name_terminal_external_checks.add(room_id)
         self._schedule_dynamic_room_name_render(room_id)
         return True
 
@@ -3802,10 +3833,66 @@ class MatrixAdapter(BasePlatformAdapter):
         """Apply an auto-generated session title while preserving task status."""
         if not self._dynamic_room_name_enabled or not room_id:
             return False
-        self._dynamic_room_name_bases[str(room_id)] = self._sanitize_dynamic_room_name(
-            title
+        room_id = str(room_id)
+        base = self._sanitize_dynamic_room_name(title)
+        lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            await self._initialize_dynamic_room_name_base(room_id)
+            if base:
+                self._dynamic_room_name_bases[room_id] = base
+            return await self._render_dynamic_room_name_locked(room_id)
+
+    async def on_session_semantic_base_changed(
+        self,
+        source: SessionSource,
+        base: str | None,
+    ) -> bool:
+        """Apply the gateway-resolved goal/title base to an opted-in DM."""
+        if not (
+            self._dynamic_room_name_enabled
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
+        ):
+            return False
+        room_id = str(source.chat_id)
+        sanitized = self._sanitize_dynamic_room_name(base) if base else ""
+        lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            # Capture the pre-authoritative room base before the first goal/title
+            # replaces it. The read is bounded by the normal Matrix timeout.
+            await self._initialize_dynamic_room_name_base(room_id)
+            if sanitized:
+                previous_sent = self._dynamic_room_name_last_sent.get(room_id)
+                if (
+                    previous_sent
+                    and sanitized != self._dynamic_room_name_base(room_id)
+                ):
+                    # Matrix state reads can briefly return any preceding write
+                    # from a chain of authoritative tool-driven semantic
+                    # updates. Remember the whole superseded chain until the
+                    # single terminal reconciliation consumes it, so no stale
+                    # echo can be mistaken for a human rename.
+                    self._dynamic_room_name_superseded_sent.setdefault(
+                        room_id, set()
+                    ).add(previous_sent)
+                self._dynamic_room_name_bases[room_id] = sanitized
+            else:
+                recovered = self._dynamic_room_name_recovered_bases.get(room_id)
+                if recovered:
+                    self._dynamic_room_name_bases[room_id] = recovered
+                else:
+                    self._dynamic_room_name_bases.pop(room_id, None)
+                    return False
+            return await self._render_dynamic_room_name_locked(room_id)
+
+    def supports_session_semantic_base_refresh(self, source: SessionSource) -> bool:
+        """Declare whether this Matrix session opted into live room renames."""
+        return bool(
+            self._dynamic_room_name_enabled
+            and self._client
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
         )
-        return await self._render_dynamic_room_name(str(room_id))
 
     async def on_session_title_changed(
         self,

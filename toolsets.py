@@ -535,7 +535,7 @@ TOOLSETS = {
 
     "hermes-matrix": {
         "description": "Matrix bot toolset - decentralized encrypted messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["set_chat_title"],
         "includes": []
     },
 

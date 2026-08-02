@@ -114,6 +114,12 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+# Gateway-local capability for tools that operate on the current chat.  The
+# callable is deliberately task-local: a module-global callback would retain a
+# runner (and its profile/config) across shutdowns and test cases.
+_CURRENT_CHAT_RENAME_CALLBACK: ContextVar = ContextVar(
+    "HERMES_CURRENT_CHAT_RENAME_CALLBACK", default=_UNSET
+)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -212,6 +218,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    current_chat_rename_callback=None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -248,6 +255,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _CURRENT_CHAT_RENAME_CALLBACK.set(current_chat_rename_callback),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -290,6 +298,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_CHAT_RENAME_CALLBACK.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -338,12 +347,19 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_CHAT_RENAME_CALLBACK.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
         clear_session_cwd()
     except Exception:
         pass
+
+
+def get_current_chat_rename_callback():
+    """Return the gateway-local current-chat rename capability, if bound."""
+    callback = _CURRENT_CHAT_RENAME_CALLBACK.get()
+    return None if callback is _UNSET else callback
 
 
 def get_session_env(name: str, default: str = "") -> str:

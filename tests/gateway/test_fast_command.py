@@ -130,6 +130,26 @@ class _TitleAwareAdapter(BasePlatformAdapter):
     async def on_session_title_changed(self, source, title):
         return None
 
+    async def on_session_semantic_base_changed(self, source, base):
+        return None
+
+
+class _LegacyTitleAwareAdapter(BasePlatformAdapter):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return None
+
+    async def on_session_title_changed(self, source, title):
+        return None
+
 
 def test_turn_route_injects_priority_processing_without_changing_runtime():
     runner = _make_runner()
@@ -336,12 +356,91 @@ async def test_run_agent_passes_optional_adapter_title_callback(monkeypatch, tmp
 
     mock_title.assert_called_once()
     callback = mock_title.call_args.kwargs["title_callback"]
-    with patch.object(runner, "_schedule_adapter_session_title_propagation") as mock_schedule:
+    with patch.object(runner, "_schedule_adapter_semantic_base_refresh") as mock_schedule:
         callback("Semantic Session Title")
     mock_schedule.assert_called_once_with(
         _make_matrix_source(),
         "session-1",
-        "Semantic Session Title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_retains_legacy_title_callback_without_semantic_hook(
+    monkeypatch, tmp_path
+):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
+    runner.adapters = {
+        Platform.TELEGRAM: _LegacyTitleAwareAdapter(
+            PlatformConfig(), Platform.TELEGRAM
+        )
+    }
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(
+        tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"}
+    )
+
+    with patch("agent.title_generator.maybe_auto_title") as mock_title:
+        await runner._run_agent(
+            message="raw user prompt",
+            context_prompt="",
+            history=[],
+            source=_make_source(),
+            session_id="session-1",
+            session_key="agent:main:telegram:dm:12345",
+        )
+
+    callback = mock_title.call_args.kwargs["title_callback"]
+    with patch.object(runner, "_schedule_adapter_semantic_base_refresh") as semantic, patch.object(
+        runner, "_schedule_adapter_session_title_propagation"
+    ) as legacy:
+        callback("Semantic Session Title")
+    semantic.assert_not_called()
+    legacy.assert_called_once_with(
+        _make_source(), "session-1", "Semantic Session Title"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_turn_goal_completion_refreshes_semantic_base_immediately():
+    runner = _make_runner()
+    runner.config = SimpleNamespace(goals=SimpleNamespace(max_turns=5))
+    runner._schedule_adapter_semantic_base_refresh = MagicMock()
+    manager = MagicMock()
+    manager.is_active.side_effect = [True, False]
+    manager.evaluate_after_turn.return_value = {
+        "should_continue": False,
+        "message": "",
+    }
+
+    with patch("hermes_cli.goals.GoalManager", return_value=manager):
+        await runner._post_turn_goal_continuation(
+            session_entry=SimpleNamespace(session_id="session-1"),
+            source=_make_source(),
+            final_response="finished",
+        )
+
+    manager.evaluate_after_turn.assert_called_once()
+    runner._schedule_adapter_semantic_base_refresh.assert_called_once_with(
+        _make_source(), "session-1"
     )
 
 
@@ -536,3 +635,142 @@ async def test_adapter_title_propagation_ignores_stale_session():
     )
 
     adapter.on_session_title_changed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("goal_status", ["paused", "done"])
+async def test_semantic_base_refresh_uses_title_when_goal_not_active(goal_status):
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="session-1"))
+    )
+    runner._session_db = SimpleNamespace(
+        get_session_title=AsyncMock(return_value="Persisted session title")
+    )
+    applied = []
+    adapter = SimpleNamespace(
+        on_session_semantic_base_changed=AsyncMock(
+            side_effect=lambda _source, base: applied.append(base)
+        )
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+    fake_manager = MagicMock()
+    fake_manager.is_active.return_value = False
+    fake_manager.state = SimpleNamespace(goal="Old epic", status=goal_status)
+    generation = runner._reserve_adapter_title_generation("session-1")
+    try:
+        with patch("hermes_cli.goals.GoalManager", return_value=fake_manager):
+            await runner._refresh_adapter_semantic_base(
+                _make_source(), "session-1", generation
+            )
+    finally:
+        runner._release_adapter_title_generation("session-1")
+    assert applied == ["Persisted session title"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_base_refresh_active_goal_precedes_persisted_title():
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="session-1"))
+    )
+    runner._session_db = SimpleNamespace(
+        get_session_title=AsyncMock(return_value="Delayed auto title")
+    )
+    adapter = SimpleNamespace(on_session_semantic_base_changed=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+    fake_manager = MagicMock()
+    fake_manager.is_active.return_value = True
+    fake_manager.state = SimpleNamespace(goal="Authoritative epic")
+    generation = runner._reserve_adapter_title_generation("session-1")
+    try:
+        with patch("hermes_cli.goals.GoalManager", return_value=fake_manager):
+            await runner._refresh_adapter_semantic_base(
+                _make_source(), "session-1", generation
+            )
+    finally:
+        runner._release_adapter_title_generation("session-1")
+    adapter.on_session_semantic_base_changed.assert_awaited_once_with(
+        _make_source(), "Authoritative epic"
+    )
+    runner._session_db.get_session_title.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_semantic_base_refresh_no_persisted_source_delegates_recovery():
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="session-1"))
+    )
+    runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value=None))
+    adapter = SimpleNamespace(on_session_semantic_base_changed=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+    fake_manager = MagicMock()
+    fake_manager.is_active.return_value = False
+    generation = runner._reserve_adapter_title_generation("session-1")
+    try:
+        with patch("hermes_cli.goals.GoalManager", return_value=fake_manager):
+            await runner._refresh_adapter_semantic_base(
+                _make_source(), "session-1", generation
+            )
+    finally:
+        runner._release_adapter_title_generation("session-1")
+    adapter.on_session_semantic_base_changed.assert_awaited_once_with(
+        _make_source(), None
+    )
+
+
+@pytest.mark.asyncio
+async def test_delayed_auto_title_refresh_cannot_overwrite_newer_active_epic():
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="session-1")
+        ),
+    )
+    title_read_started = asyncio.Event()
+    release_title_read = asyncio.Event()
+
+    async def delayed_title(_session_id):
+        title_read_started.set()
+        await release_title_read.wait()
+        return "Stale auto title"
+
+    runner._session_db = SimpleNamespace(get_session_title=delayed_title)
+    adapter = SimpleNamespace(on_session_semantic_base_changed=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+    goal_active = False
+
+    def manager_factory(*_args, **_kwargs):
+        manager = MagicMock()
+        manager.is_active.return_value = goal_active
+        manager.state = SimpleNamespace(goal="New active epic")
+        return manager
+
+    old_generation = runner._reserve_adapter_title_generation("session-1")
+    with patch("hermes_cli.goals.GoalManager", side_effect=manager_factory):
+        old_task = asyncio.create_task(
+            runner._refresh_adapter_semantic_base(
+                _make_source(), "session-1", old_generation
+            )
+        )
+        await title_read_started.wait()
+        goal_active = True
+        new_generation = runner._reserve_adapter_title_generation("session-1")
+        new_task = asyncio.create_task(
+            runner._refresh_adapter_semantic_base(
+                _make_source(), "session-1", new_generation
+            )
+        )
+        release_title_read.set()
+        await asyncio.gather(old_task, new_task)
+    runner._release_adapter_title_generation("session-1")
+    runner._release_adapter_title_generation("session-1")
+
+    adapter.on_session_semantic_base_changed.assert_awaited_once_with(
+        _make_source(), "New active epic"
+    )

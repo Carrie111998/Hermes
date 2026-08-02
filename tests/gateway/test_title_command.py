@@ -34,6 +34,7 @@ def _make_runner(session_db=None):
     runner._voice_mode = {}
     runner._schedule_telegram_topic_title_rename = MagicMock()
     runner._schedule_adapter_session_title_propagation = MagicMock()
+    runner._schedule_adapter_semantic_base_refresh = MagicMock()
     # Gateway holds the async facade; the slash handlers await it.
     if session_db is not None:
         session_db = SimpleNamespace(
@@ -127,7 +128,10 @@ class TestHandleTitleCommand:
         db.create_session("test_session_123", "matrix")
 
         runner = _make_runner(session_db=db)
-        runner._schedule_adapter_session_title_propagation = MagicMock()
+        runner.adapters[Platform.MATRIX] = SimpleNamespace(
+            on_session_semantic_base_changed=AsyncMock()
+        )
+        runner._schedule_adapter_semantic_base_refresh = MagicMock()
 
         event = _make_event(
             text="/title Matrix Task Name",
@@ -138,9 +142,64 @@ class TestHandleTitleCommand:
         result = await runner._handle_title_command(event)
 
         assert "Matrix Task Name" in result
-        runner._schedule_adapter_session_title_propagation.assert_called_once_with(
-            event.source, "test_session_123", "Matrix Task Name"
+        runner._schedule_adapter_semantic_base_refresh.assert_called_once_with(
+            event.source, "test_session_123"
         )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_propagates_to_legacy_only_adapter(self, tmp_path):
+        """Legacy adapters receive the sanitized title through their title hook."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "discord")
+
+        runner = _make_runner(session_db=db)
+        runner.adapters[Platform.DISCORD] = SimpleNamespace(
+            on_session_title_changed=AsyncMock()
+        )
+        event = _make_event(
+            text="/title Legacy\x00 Room",
+            platform=Platform.DISCORD,
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Legacy Room" in result
+        runner._schedule_adapter_session_title_propagation.assert_called_once_with(
+            event.source, "test_session_123", "Legacy Room"
+        )
+        runner._schedule_adapter_semantic_base_refresh.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_prefers_semantic_hook_over_legacy_hook(self, tmp_path):
+        """Semantic refresh wins so an active goal remains the visible base."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "matrix")
+
+        runner = _make_runner(session_db=db)
+        runner.adapters[Platform.MATRIX] = SimpleNamespace(
+            on_session_semantic_base_changed=AsyncMock(),
+            on_session_title_changed=AsyncMock(),
+        )
+        event = _make_event(
+            text="/title Matrix Session Title",
+            platform=Platform.MATRIX,
+            user_id="@user:matrix.org",
+            chat_id="!room:matrix.org",
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Matrix Session Title" in result
+        runner._schedule_adapter_semantic_base_refresh.assert_called_once_with(
+            event.source, "test_session_123"
+        )
+        runner._schedule_adapter_session_title_propagation.assert_not_called()
         db.close()
 
     @pytest.mark.asyncio
