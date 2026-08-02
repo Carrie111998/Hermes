@@ -593,7 +593,17 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
-def _posix_form_for_sensitive_check(path: str) -> str:
+def _casefold_sensitive_posix_paths(task_id: str = "default") -> bool:
+    """Return True when denylist matching should ignore path case.
+
+    Native Windows + Git Bash local sinks are case-insensitive, so mixed-case
+    spellings like ``/Etc/hosts`` must match the lowercase POSIX denylist.
+    Container and remote POSIX backends remain case-sensitive.
+    """
+    return sys.platform == "win32" and _terminal_env_type_for_task(task_id) == "local"
+
+
+def _posix_form_for_sensitive_check(path: str, *, casefold: bool = False) -> str:
     """Return *path* with separators normalized for POSIX denylist matching.
 
     On Windows hosts, ``ntpath.normpath`` / ``Path`` turn ``/etc/hosts`` into
@@ -601,8 +611,12 @@ def _posix_form_for_sensitive_check(path: str) -> str:
     ``/var/run/docker.sock``), so comparisons must use a shared separator or
     the write guard fails open while the shell layer later restores the POSIX
     path via ``_bash_safe_path``.
+
+    When *casefold* is True (native Windows local only), also fold case so
+    Git Bash-equivalent spellings cannot bypass the denylist.
     """
-    return path.replace("\\", "/")
+    form = path.replace("\\", "/")
+    return form.casefold() if casefold else form
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -614,8 +628,10 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     normalized = os.path.normpath(_expand_tilde(filepath))
     # Compare denylist entries against slash-normalized forms so Windows
     # backslash rewriting cannot bypass the POSIX prefixes / exact paths.
-    resolved_posix = _posix_form_for_sensitive_check(resolved)
-    normalized_posix = _posix_form_for_sensitive_check(normalized)
+    # Native Windows local also casefolds to match Git Bash sink semantics.
+    casefold = _casefold_sensitive_posix_paths(task_id)
+    resolved_posix = _posix_form_for_sensitive_check(resolved, casefold=casefold)
+    normalized_posix = _posix_form_for_sensitive_check(normalized, casefold=casefold)
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
