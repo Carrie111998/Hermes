@@ -81,7 +81,13 @@ export function SkillsHub({ gw, maxWidth, onClose, t }: SkillsHubProps) {
     setErr('')
 
     gw.request<{ installed?: boolean; name?: string }>('skills.manage', { action: 'install', query: name })
-      .then(() => onClose())
+      .then(r => {
+        if (r?.installed) {
+          onClose()
+        } else {
+          setErr(`Install failed for "${name}".`)
+        }
+      })
       .catch((e: unknown) => setErr(rpcErrorMessage(e)))
       .finally(() => setInstalling(false))
   }

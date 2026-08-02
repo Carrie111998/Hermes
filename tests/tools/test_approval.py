@@ -172,6 +172,35 @@ class TestWindowsShellDestructiveCommands:
         assert dangerous is True
         assert key != "Windows PowerShell destructive delete"
 
+    def test_powershell_inline_command_payload_f_is_not_the_file_flag(self):
+        # An inline payload can legitimately carry its own -f (Write-Host's
+        # -ForegroundColor alias). Shell tokenization keeps that payload as a
+        # single invocation argument, so the inner -f is never read as the
+        # outer -File flag. The command is still gated, by -Command.
+        assert approval_module._interpreter_exec_flag(
+            "powershell", ["-Command", "Write-Host -f Green ok"]
+        ) == "-command"
+        assert approval_module._interpreter_exec_flag(
+            "powershell", ["-NoProfile", "-Command", "Write-Host -File x"]
+        ) == "-command"
+
+        dangerous, key, desc = detect_dangerous_command(
+            'powershell -Command "Write-Host -f Green ok"'
+        )
+        assert dangerous is True
+
+    def test_powershell_file_flag_after_leading_options_still_matches(self):
+        # The same scan must still reach -File when ordinary PowerShell
+        # options precede it.
+        assert approval_module._interpreter_exec_flag(
+            "powershell", ["-ExecutionPolicy", "Bypass", "-File", "helper.ps1"]
+        ) == "-file"
+
+        dangerous, key, desc = detect_dangerous_command(
+            "powershell -ExecutionPolicy Bypass -File helper.ps1"
+        )
+        assert dangerous is True
+
     def test_plain_text_does_not_trigger_windows_delete(self):
         dangerous, key, desc = detect_dangerous_command(
             "echo remember to del old notes"

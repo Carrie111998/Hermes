@@ -533,6 +533,7 @@ SCANNABLE_EXTENSIONS = {
     '.md', '.txt', '.py', '.sh', '.bash', '.js', '.ts', '.rb',
     '.yaml', '.yml', '.json', '.toml', '.cfg', '.ini', '.conf',
     '.html', '.css', '.xml', '.tex', '.r', '.jl', '.pl', '.php',
+    '.ps1', '.psm1', '.psd1', '.bat', '.cmd',
 }
 
 # Known binary extensions that should NOT be in a skill
@@ -567,6 +568,94 @@ INVISIBLE_CHARS = {
 # Scanning functions
 # ---------------------------------------------------------------------------
 
+# Windows PowerShell's Out-File and Set-Content default to UTF-16LE with a
+# BOM, and editors on Windows routinely save .ps1/.bat with a UTF-8 BOM, so a
+# perfectly ordinary script can arrive in any of these encodings. Decoding as
+# UTF-8 only would treat a UTF-16 script as an unreadable binary and skip it
+# entirely — the scanner would advertise coverage it does not have.
+# Longest BOM first: the UTF-32LE mark starts with the UTF-16LE one.
+_BOM_ENCODINGS = (
+    (b'\x00\x00\xfe\xff', 'utf-32-be'),
+    (b'\xff\xfe\x00\x00', 'utf-32-le'),
+    (b'\xef\xbb\xbf', 'utf-8'),
+    (b'\xfe\xff', 'utf-16-be'),
+    (b'\xff\xfe', 'utf-16-le'),
+)
+
+
+# A single byte that is not valid UTF-8 must not excuse the scanner from
+# looking at a file: /bin/sh runs a script with an invalid byte in a comment
+# just as happily, and legacy-encoded scripts (latin-1, cp1251) are ordinary
+# text. Undecodable bytes are replaced rather than rejected, which preserves
+# every ASCII threat pattern; only content that classifies as binary is
+# skipped, and that decision is made on the bytes, not on a decode failure.
+_TEXT_CONTROL_BYTES = frozenset(b'\t\n\r\f\v\x08\x1b')
+_BINARY_SNIFF_BYTES = 8192
+_BINARY_CONTROL_RATIO = 0.30
+
+
+def _looks_like_bomless_utf16(raw: bytes) -> str:
+    """Return 'utf-16-le'/'utf-16-be' when the NUL pattern says so, else ''.
+
+    ASCII encoded as UTF-16 puts a NUL beside every character, so the nulls
+    land consistently on one side. Checked before the binary test, since NUL
+    bytes are otherwise the strongest binary signal there is.
+    """
+    sample = raw[:_BINARY_SNIFF_BYTES]
+    if len(sample) < 4 or b'\x00' not in sample:
+        return ''
+    pairs = len(sample) // 2
+    even_nul = sum(1 for i in range(pairs) if sample[2 * i] == 0)
+    odd_nul = sum(1 for i in range(pairs) if sample[2 * i + 1] == 0)
+    if odd_nul >= pairs * 0.9 and even_nul <= pairs * 0.1:
+        return 'utf-16-le'
+    if even_nul >= pairs * 0.9 and odd_nul <= pairs * 0.1:
+        return 'utf-16-be'
+    return ''
+
+
+def _looks_binary(raw: bytes) -> bool:
+    """Classify on the bytes themselves, the way file(1) and git do.
+
+    A NUL byte, or a large share of control bytes that no text format uses,
+    means this is not a script however it would decode.
+    """
+    sample = raw[:_BINARY_SNIFF_BYTES]
+    if not sample:
+        return False
+    if b'\x00' in sample:
+        return True
+    control = sum(
+        1 for b in sample if b < 0x20 and b not in _TEXT_CONTROL_BYTES
+    )
+    return control > len(sample) * _BINARY_CONTROL_RATIO
+
+
+def _decode_text(raw: bytes):
+    """Decode a candidate script file as permissively as a shell would.
+
+    Returns the decoded text, or None only when the bytes classify as binary.
+    A leading BOM is honoured and dropped rather than decoded to U+FEFF,
+    which would otherwise trip the invisible-unicode check on every
+    BOM-marked file.
+    """
+    for bom, encoding in _BOM_ENCODINGS:
+        if raw.startswith(bom):
+            try:
+                return raw[len(bom):].decode(encoding)
+            except UnicodeDecodeError:
+                return raw[len(bom):].decode(encoding, errors='replace')
+
+    utf16 = _looks_like_bomless_utf16(raw)
+    if utf16:
+        return raw.decode(utf16, errors='replace')
+
+    if _looks_binary(raw):
+        return None
+
+    return raw.decode('utf-8', errors='replace')
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """
     Scan a single file for threat patterns and invisible unicode characters.
@@ -581,12 +670,24 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     if not rel_path:
         rel_path = file_path.name
 
-    if file_path.suffix.lower() not in SCANNABLE_EXTENSIONS and file_path.name != "SKILL.md":
+    # Extensionless files (unix-style executables with no suffix, e.g.
+    # "run"/"setup") are still scanned as text — most THREAT_PATTERNS are
+    # language-agnostic (egress tools, persistence paths), so this catches
+    # the same abuse shapes regardless of what interpreter would run them.
+    # The UnicodeDecodeError guard below still protects against attempting
+    # to scan an actual binary that happens to lack an extension.
+    if (
+        file_path.suffix.lower() not in SCANNABLE_EXTENSIONS
+        and file_path.name != "SKILL.md"
+        and file_path.suffix != ""
+    ):
         return []
 
     try:
-        content = file_path.read_text(encoding='utf-8')
-    except (UnicodeDecodeError, OSError):
+        content = _decode_text(file_path.read_bytes())
+    except OSError:
+        return []
+    if content is None:
         return []
 
     findings = []
