@@ -74,6 +74,7 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.prompt_builder import compose_effective_system_tail
 from agent.prompt_caching import (
     build_prompt_cache_plan,
     strip_anthropic_cache_control,
@@ -1044,15 +1045,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        effective = sp
-        _ephemeral_parts = []
-        _ts = getattr(agent, "_current_turn_timestamp", "") or ""
-        if _ts:
-            _ephemeral_parts.append(_ts)
-        if agent.ephemeral_system_prompt:
-            _ephemeral_parts.append(agent.ephemeral_system_prompt)
-        if _ephemeral_parts:
-            effective = (effective + "\n\n" + "\n\n".join(_ephemeral_parts)).strip()
+        effective = compose_effective_system_tail(agent, sp)
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1799,20 +1792,7 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        effective_system = active_system_prompt or ""
-        # Per-turn timestamp + persistent ephemeral prompt, both appended
-        # AFTER the cached prefix so the byte-stable system prompt is
-        # untouched. The timestamp is a transient per-turn attribute set in
-        # run_conversation (never persisted, never stacked on the persistent
-        # ephemeral prompt).
-        _ephemeral_parts = []
-        _ts = getattr(agent, "_current_turn_timestamp", "") or ""
-        if _ts:
-            _ephemeral_parts.append(_ts)
-        if agent.ephemeral_system_prompt:
-            _ephemeral_parts.append(agent.ephemeral_system_prompt)
-        if _ephemeral_parts:
-            effective_system = (effective_system + "\n\n" + "\n\n".join(_ephemeral_parts)).strip()
+        effective_system = compose_effective_system_tail(agent, active_system_prompt or "")
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
