@@ -14,6 +14,7 @@ import concurrent.futures
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -1278,6 +1279,26 @@ AGENT_ITERATION_REASON_MISSING = "agent_iteration_missing"
 AGENT_ITERATION_REASON_PARSE_FAILED = "agent_iteration_parse_failed"
 AGENT_ITERATION_REASON_SCHEMA_MISMATCH = "agent_iteration_schema_mismatch"
 AGENT_ITERATION_SUMMARY_MAX_CHARS = 200
+TRACKER_ITERATION_JOB_NAME = "jobflow-tracker-cycle"
+TRACKER_PHASE_SECONDS_KEYS = frozenset({
+    "inbox",
+    "pipeline_update",
+    "analytics",
+    "postgres_bridge",
+    "api_reconcile",
+})
+
+
+def _valid_phase_seconds(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != TRACKER_PHASE_SECONDS_KEYS:
+        return False
+    return all(
+        not isinstance(seconds, bool)
+        and isinstance(seconds, (int, float))
+        and math.isfinite(seconds)
+        and seconds >= 0
+        for seconds in value.values()
+    )
 
 
 def _strip_iteration_markers(text: str) -> str:
@@ -1357,7 +1378,10 @@ def _extract_agent_iteration(final_response: str):
         for key, val in counters.items():
             if not isinstance(key, str):
                 return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
-            if isinstance(val, bool) or not isinstance(val, (int, float)):
+            if key == "phase_seconds":
+                if not _valid_phase_seconds(val):
+                    return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+            elif isinstance(val, bool) or not isinstance(val, (int, float)):
                 return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
 
     anomalies = parsed.get("anomalies")
@@ -1446,6 +1470,17 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
                 job_id=job_id or None,
             )
             return
+
+        if (
+            error_reason is None
+            and parsed is not None
+            and job_name == TRACKER_ITERATION_JOB_NAME
+            and not _valid_phase_seconds(
+                parsed.get("counters", {}).get("phase_seconds")
+            )
+        ):
+            error_reason = AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+            parsed = None
 
         if error_reason is None and parsed is not None:
             payload = dict(parsed)

@@ -4820,6 +4820,98 @@ class TestExtractAgentIteration:
         parsed, err, _ = _extract_agent_iteration(text)
         assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
 
+    def test_phase_seconds_accepts_exact_non_negative_finite_numeric_shape(self):
+        from cron.scheduler import _extract_agent_iteration
+
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent":"tracker","summary":"ok",'
+            '"counters":{"messages":2,"phase_seconds":{'
+            '"inbox":1.25,"pipeline_update":0,"analytics":2,'
+            '"postgres_bridge":3.5,"api_reconcile":4}}}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+
+        assert err is None
+        assert parsed["counters"]["phase_seconds"] == {
+            "inbox": 1.25,
+            "pipeline_update": 0,
+            "analytics": 2,
+            "postgres_bridge": 3.5,
+            "api_reconcile": 4,
+        }
+
+    @pytest.mark.parametrize(
+        "phase_seconds",
+        [
+            {"inbox": 1},
+            {
+                "inbox": True,
+                "pipeline_update": 0,
+                "analytics": 0,
+                "postgres_bridge": 0,
+                "api_reconcile": 0,
+            },
+            {
+                "inbox": -1,
+                "pipeline_update": 0,
+                "analytics": 0,
+                "postgres_bridge": 0,
+                "api_reconcile": 0,
+            },
+            {
+                "inbox": float("inf"),
+                "pipeline_update": 0,
+                "analytics": 0,
+                "postgres_bridge": 0,
+                "api_reconcile": 0,
+            },
+            {
+                "inbox": 0,
+                "pipeline_update": 0,
+                "analytics": 0,
+                "postgres_bridge": 0,
+                "api_reconcile": 0,
+                "extra": 1,
+            },
+        ],
+    )
+    def test_phase_seconds_rejects_invalid_shapes(self, phase_seconds):
+        from cron.scheduler import (
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+            _extract_agent_iteration,
+        )
+
+        payload = {
+            "agent": "tracker",
+            "summary": "ok",
+            "counters": {"phase_seconds": phase_seconds},
+        }
+        text = (
+            "<AGENT_ITERATION_JSON>"
+            + json.dumps(payload)
+            + "</AGENT_ITERATION_JSON>"
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+
+        assert parsed is None
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_unknown_nested_counter_remains_invalid(self):
+        from cron.scheduler import (
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+            _extract_agent_iteration,
+        )
+
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent":"scout","summary":"ok",'
+            '"counters":{"other_nested":{"value":1}}}</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+
+        assert parsed is None
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
     def test_anomalies_must_be_list(self):
         from cron.scheduler import (
             _extract_agent_iteration,
@@ -4944,6 +5036,46 @@ class TestEmitAgentIterationEvent:
         assert payload["counters"]["new"] == 23
         assert payload["job_name"] == "jobflow-scout"
         assert payload["job_id"] == "scout-456"
+
+    def test_tracker_cycle_requires_phase_seconds(self):
+        from cron.scheduler import (
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+            _emit_agent_iteration_event,
+        )
+        from events.schema import EventType
+
+        emitter = self._emitter_with_bus()
+        job = {"id": "tracker-1", "name": "jobflow-tracker-cycle"}
+        response = (
+            '<AGENT_ITERATION_JSON>{"agent":"tracker","summary":"ok",'
+            '"counters":{"messages_processed":2}}</AGENT_ITERATION_JSON>'
+        )
+
+        _emit_agent_iteration_event(emitter, job, response)
+
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ERROR
+        assert kwargs["payload"]["reason"] == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+        assert kwargs["payload"]["job_name"] == "jobflow-tracker-cycle"
+
+    def test_tracker_cycle_emits_complete_phase_seconds(self):
+        from cron.scheduler import _emit_agent_iteration_event
+        from events.schema import EventType
+
+        emitter = self._emitter_with_bus()
+        job = {"id": "tracker-2", "name": "jobflow-tracker-cycle"}
+        response = (
+            '<AGENT_ITERATION_JSON>{"agent":"tracker","summary":"ok",'
+            '"counters":{"phase_seconds":{"inbox":1.0,'
+            '"pipeline_update":2.0,"analytics":0,"postgres_bridge":3.0,'
+            '"api_reconcile":4.0}}}</AGENT_ITERATION_JSON>'
+        )
+
+        _emit_agent_iteration_event(emitter, job, response)
+
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ITERATION
+        assert kwargs["payload"]["counters"]["phase_seconds"]["analytics"] == 0
 
     def test_malformed_marker_emits_agent_error(self):
         from cron.scheduler import (
