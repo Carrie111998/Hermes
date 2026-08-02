@@ -58,12 +58,43 @@ def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
 
 
 
-def test_agent_memory_delegation_identity_is_stable_per_task_run():
-    first = kb._agent_memory_delegation_id("default", "t_memory", 7)
+def test_no_governed_agent_memory_helpers_remain():
+    offenders = sorted(
+        name
+        for name in vars(kb)
+        if name.startswith("_agent_memory_")
+        or name == "_remember_kanban_run_best_effort"
+    )
+    assert offenders == []
 
-    assert first == kb._agent_memory_delegation_id("default", "t_memory", 7)
-    assert first != kb._agent_memory_delegation_id("default", "t_memory", 8)
-    assert first != kb._agent_memory_delegation_id("default", "t_other", 7)
+
+def test_legacy_agent_memory_metadata_remains_readable_through_get_run(
+    kanban_home,
+):
+    board = "legacy-memory-metadata"
+    kb.create_board(board, name="Legacy metadata")
+    legacy = {
+        "agent_memory": {"write": {"status": "stored"}},
+        "unrelated": {"worker_session_id": "session-old"},
+    }
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn, title="Legacy run", initial_status="running", board=board
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(legacy), run_id),
+        )
+        conn.commit()
+
+        run = kb.get_run(conn, run_id)
+
+    assert run is not None
+    assert run.metadata == legacy
 
 
 def test_init_creates_expected_tables(kanban_home):
