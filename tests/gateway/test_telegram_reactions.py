@@ -10,12 +10,12 @@ from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 
-def _make_adapter(**extra_env):
+def _make_adapter(extra=None, **extra_env):
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
-    adapter.config = PlatformConfig(enabled=True, token="fake-token")
+    adapter.config = PlatformConfig(enabled=True, token="fake-token", extra=extra or {})
     adapter._bot = AsyncMock()
     adapter._bot.set_message_reaction = AsyncMock()
     return adapter
@@ -92,7 +92,61 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
     adapter._bot.set_message_reaction.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_on_processing_start_uses_configured_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter(extra={"reactions_on_receive": "🔧"})
+
+    await adapter.on_processing_start(_make_event())
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="🔧",
+    )
+
+
+@pytest.mark.parametrize("suppressed", ["", "clear"])
+@pytest.mark.asyncio
+async def test_on_processing_start_can_be_suppressed(monkeypatch, suppressed):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter(extra={"reactions_on_receive": suppressed})
+
+    await adapter.on_processing_start(_make_event())
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
+
+
 # ── on_processing_complete ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_uses_configured_success_reaction(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter(extra={"reactions_on_success": "✅"})
+
+    await adapter.on_processing_complete(_make_event(), ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="✅",
+    )
+
+
+@pytest.mark.parametrize("suppressed", ["", "clear", "none"])
+@pytest.mark.asyncio
+async def test_on_processing_complete_clears_suppressed_failure_reaction(monkeypatch, suppressed):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter(extra={"reactions_on_failure": suppressed})
+
+    await adapter.on_processing_complete(_make_event(), ProcessingOutcome.FAILURE)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
 
 
 @pytest.mark.asyncio

@@ -1199,8 +1199,8 @@ This covers the custom fallback transport layer that Hermes uses for Telegram co
 The bot can add emoji reactions to messages as visual processing feedback:
 
 - 👀 when the bot starts processing your message
-- ✅ when the response is delivered successfully
-- ❌ if an error occurs during processing
+- 👍 when processing succeeds
+- 👎 if processing fails
 
 Reactions are **disabled by default**. Enable them in `config.yaml`:
 
@@ -1209,7 +1209,23 @@ telegram:
   reactions: true
 ```
 
-Or via environment variable:
+You can customize or suppress each lifecycle reaction under the Telegram
+platform's `extra` settings:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      reactions_on_receive: "👀"
+      reactions_on_success: "👍"
+      reactions_on_failure: "👎"
+```
+
+Use `""`, `clear`, or `none` to suppress an individual reaction. When a
+completion reaction is suppressed, Hermes clears the in-progress reaction so
+it does not remain stuck on the message.
+
+Or enable reactions via environment variable:
 
 ```bash
 TELEGRAM_REACTIONS=true

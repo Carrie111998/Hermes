@@ -9783,6 +9783,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
+    def _processing_reaction(self, name: str, default: str) -> str:
+        """Return a configured processing reaction emoji, or its default."""
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        value = extra.get(name, default)
+        if value is None or str(value).strip().lower() in {"", "clear", "none"}:
+            return ""
+        return str(value)
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
@@ -9830,7 +9838,9 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            reaction = self._processing_reaction("reactions_on_receive", "\U0001f440")
+            if reaction:
+                await self._set_reaction(chat_id, message_id, reaction)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
@@ -9854,11 +9864,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
         else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
+            reaction = self._processing_reaction(
+                "reactions_on_success" if outcome == ProcessingOutcome.SUCCESS else "reactions_on_failure",
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
+            if reaction:
+                await self._set_reaction(chat_id, message_id, reaction)
+            else:
+                await self._clear_reactions(chat_id, message_id)
 
 
 # ──────────────────────────────────────────────────────────────────────────
