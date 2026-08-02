@@ -239,6 +239,7 @@ async def test_run_backfill_dispatches_unaddressed_messages(adapter, monkeypatch
         message,
         role_authorized=False,
         recovered=True,
+        channel_context_authoritative=False,
     )
 
 
@@ -291,6 +292,7 @@ async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, mon
         allowed,
         role_authorized=False,
         recovered=True,
+        channel_context_authoritative=False,
     )
 
 
@@ -456,5 +458,4 @@ async def test_iter_candidates_keeps_latest_messages_when_window_exceeds_limit(a
         got.append(msg.id)
 
     assert got == [2, 3, 4]
-
 

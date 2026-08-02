@@ -70,6 +70,9 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
 })
 _DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DISCORD_IMAGE_MAX_REDIRECTS = 10
+_DISCORD_REST_MAX_ATTEMPTS = 2
+_DISCORD_REST_RETRY_DELAY_SECONDS = 0.75
+_DISCORD_AUTHORITATIVE_CHANNEL_CACHE_SIZE = 1024
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
 # non-conversational message-ID set populated from explicitly marked sends
 # (metadata["non_conversational"]). These regexes exist solely to recognize
@@ -183,6 +186,58 @@ async def _read_url_image_with_redirect_guard(
 def _truncate_discord_component_text(text: str, limit: int) -> str:
     """Return text within Discord's UTF-16 component field budget."""
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
+
+
+def _is_transient_discord_rest_error(error: Exception) -> bool:
+    """Return whether a Discord REST failure is safe to retry.
+
+    Discord permission, validation, and other 4xx responses are durable for
+    the request as constructed. Retrying them can duplicate any side effects
+    that happened before the failure. Rate limits, server errors, and network
+    transport failures are the retryable cases.
+    """
+    http_exception = getattr(discord, "HTTPException", ()) if discord is not None else ()
+    if isinstance(http_exception, type) and isinstance(error, http_exception):
+        status = getattr(error, "status", None)
+        return status == 429 or (
+            isinstance(status, int) and 500 <= status < 600
+        )
+
+    rate_limited = getattr(discord, "RateLimited", ()) if discord is not None else ()
+    if isinstance(rate_limited, type) and isinstance(error, rate_limited):
+        return True
+
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return True
+
+    try:
+        import aiohttp
+    except ImportError:  # pragma: no cover - installed with discord.py
+        return False
+    return isinstance(error, aiohttp.ClientError)
+
+
+def _discord_rest_retry_delay(error: Exception) -> float:
+    """Return Discord's requested retry delay, or the short default backoff."""
+    candidates = [getattr(error, "retry_after", None)]
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        candidates.extend((
+            headers.get("Retry-After"),
+            headers.get("X-RateLimit-Reset-After"),
+        ))
+
+    for raw_delay in candidates:
+        if raw_delay is None:
+            continue
+        try:
+            delay = float(raw_delay)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(delay) and delay >= 0:
+            return delay
+    return _DISCORD_REST_RETRY_DELAY_SECONDS
 
 
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
@@ -1061,6 +1116,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        # ``fetch_channel`` is the authoritative type source when a partial or
+        # synthetic Gateway cache projects a thread as a text channel. Cache
+        # successful REST resolutions for this client connection so ordinary
+        # channel traffic does not add one GET per message.
+        self._authoritative_message_channels: Dict[int, Any] = {}
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1287,6 +1347,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_mentions=_build_allowed_mentions(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._authoritative_message_channels.clear()
             adapter_self = self  # capture for closure
 
             # Register event handlers
@@ -1457,6 +1518,101 @@ class DiscordAdapter(BasePlatformAdapter):
 
         return True, role_authorized
 
+    async def _call_discord_rest_with_retry(
+        self,
+        operation: Callable[[], Any],
+        *,
+        operation_name: str,
+    ) -> Any:
+        """Run one Discord REST operation, retrying transient failures once."""
+        for attempt in range(_DISCORD_REST_MAX_ATTEMPTS):
+            try:
+                return await operation()
+            except Exception as error:
+                is_last_attempt = attempt + 1 >= _DISCORD_REST_MAX_ATTEMPTS
+                if is_last_attempt or not _is_transient_discord_rest_error(error):
+                    raise
+                delay = _discord_rest_retry_delay(error)
+                logger.info(
+                    "[%s] Transient Discord REST failure during %s; retrying in %.3fs: %s",
+                    self.name,
+                    operation_name,
+                    delay,
+                    error,
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError("unreachable Discord REST retry state")  # pragma: no cover
+
+    @staticmethod
+    def _attach_authoritative_message_channel(message: Any, channel: Any) -> None:
+        """Attach a REST-resolved channel and guild to a discord.py message."""
+        message.channel = channel
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            message.guild = guild
+
+    async def _resolve_authoritative_message_channel(
+        self,
+        message: Any,
+    ) -> tuple[Any, bool]:
+        """Resolve reliable guild/channel context for an admitted message.
+
+        discord.py builds ``Message.channel`` from its Gateway guild cache and
+        does not use ``MESSAGE_CREATE.channel_type`` to repair a partial cache.
+        A projected or incomplete ``GUILD_CREATE`` can therefore materialize a
+        real thread as ``TextChannel`` and can leave ``Message.guild`` unset.
+        Resolve the delivered channel ID through REST before deciding whether
+        auto-threading is legal. This runs only after admission authorization.
+        """
+        channel = getattr(message, "channel", None)
+        if channel is None:
+            return None, False
+        if isinstance(channel, (discord.DMChannel, discord.Thread)):
+            return channel, True
+        if self._client is None:
+            return channel, False
+
+        try:
+            channel_id = int(channel.id)
+        except (AttributeError, TypeError, ValueError):
+            return channel, False
+
+        cached = self._authoritative_message_channels.get(channel_id)
+        if cached is not None:
+            self._attach_authoritative_message_channel(message, cached)
+            return cached, True
+
+        fetch_channel = getattr(self._client, "fetch_channel", None)
+        if not callable(fetch_channel):
+            return channel, False
+
+        try:
+            resolved = await self._call_discord_rest_with_retry(
+                lambda: fetch_channel(channel_id),
+                operation_name=f"channel {channel_id} resolution",
+            )
+        except Exception as error:
+            logger.warning(
+                "[%s] Could not resolve authoritative Discord channel %s: %s",
+                self.name,
+                channel_id,
+                error,
+            )
+            return channel, False
+        if resolved is None:
+            return channel, False
+
+        if (
+            len(self._authoritative_message_channels)
+            >= _DISCORD_AUTHORITATIVE_CHANNEL_CACHE_SIZE
+        ):
+            oldest_channel_id = next(iter(self._authoritative_message_channels))
+            self._authoritative_message_channels.pop(oldest_channel_id, None)
+        self._authoritative_message_channels[channel_id] = resolved
+        self._attach_authoritative_message_channel(message, resolved)
+        return resolved, True
+
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
         if not self._ready_event.is_set():
@@ -1469,8 +1625,13 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if not admitted:
             return False
+        _channel, channel_context_authoritative = (
+            await self._resolve_authoritative_message_channel(message)
+        )
         return await self._handle_message(
-            message, role_authorized=role_authorized,
+            message,
+            role_authorized=role_authorized,
+            channel_context_authoritative=channel_context_authoritative,
         )
 
     async def _cancel_bot_task(self) -> None:
@@ -2255,6 +2416,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
+        admitted, role_authorized = self._discord_message_admission(
+            message, claim=False,
+        )
+        if not admitted:
+            return False
+        _channel, channel_context_authoritative = (
+            await self._resolve_authoritative_message_channel(message)
+        )
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
@@ -2272,15 +2441,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._self_is_explicitly_mentioned(message)
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
-        )
-        if not admitted:
-            return False
         return await self._handle_message(
             message,
             role_authorized=role_authorized,
             recovered=True,
+            channel_context_authoritative=channel_context_authoritative,
         )
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
@@ -6628,7 +6793,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Tries ``parent_channel.create_thread()`` first.  If Discord rejects
         that (e.g. permission issues), falls back to sending a seed message
-        and creating the thread from it.
+        and creating the thread from it. The seed describes the request rather
+        than claiming success before Discord has accepted the thread.
         """
         name = (name or "").strip()
         if not name:
@@ -6666,8 +6832,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 "thread_name": getattr(thread, "name", None) or name,
             }
         except Exception as direct_error:
+            seed_msg = None
             try:
-                seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
+                seed_content = starter_message or f"\U0001f9f5 Thread requested via Hermes: **{name}**"
                 seed_msg = await parent_channel.send(seed_content)
                 thread = await seed_msg.create_thread(
                     name=name,
@@ -6680,6 +6847,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     "thread_name": getattr(thread, "name", None) or name,
                 }
             except Exception as fallback_error:
+                if seed_msg is not None:
+                    delete_seed = getattr(seed_msg, "delete", None)
+                    if callable(delete_seed):
+                        try:
+                            await delete_seed()
+                        except Exception:
+                            logger.debug(
+                                "[%s] Failed to remove orphan Discord thread seed %s",
+                                self.name,
+                                getattr(seed_msg, "id", "unknown"),
+                                exc_info=True,
+                            )
                 return {
                     "error": (
                         "Discord rejected direct thread creation and the fallback also failed. "
@@ -6714,59 +6893,47 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
-        Returns the created thread object, or ``None`` on failure. Both the
-        primary ``message.create_thread`` and the seed-message fallback are
-        retried once after a short backoff so transient connect errors
-        (e.g. ``Cannot connect to host discord.com:443``) don't immediately
-        burn through to the caller's failure path (#20243).
+        Returns the created thread object, or ``None`` on failure. The original
+        user message is the only thread starter: no bot-authored seed is sent,
+        so a failed request cannot leave a misleading or duplicate orphan.
+        Transient REST failures are retried once; validation and permission
+        failures are not retried.
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
 
-        last_direct_error: Exception | None = None
-        last_fallback_error: Exception | None = None
+        try:
+            thread = await self._call_discord_rest_with_retry(
+                lambda: message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                ),
+                operation_name=(
+                    "auto-thread creation from message "
+                    f"{getattr(message, 'id', 'unknown')}"
+                ),
+            )
+        except Exception as error:
+            classification = (
+                "transient retries exhausted"
+                if _is_transient_discord_rest_error(error)
+                else "permanent failure"
+            )
+            logger.warning(
+                "[%s] Auto-thread creation failed (%s): %s",
+                self.name,
+                classification,
+                error,
+            )
+            return None
 
-        for attempt in range(2):
-            try:
-                thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
-                try:
-                    setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
-                except Exception:
-                    pass
-                return thread
-            except Exception as direct_error:
-                last_direct_error = direct_error
-                try:
-                    seed_msg = await message.channel.send(
-                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
-                    )
-                    thread = await seed_msg.create_thread(
-                        name=thread_name,
-                        auto_archive_duration=1440,
-                        reason=reason,
-                    )
-                    try:
-                        setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
-                    except Exception:
-                        pass
-                    return thread
-                except Exception as fallback_error:
-                    last_fallback_error = fallback_error
-                    if attempt == 0:
-                        # Brief backoff before the second attempt — most failures
-                        # in this path are transient connect errors that recover
-                        # within a second or two.
-                        await asyncio.sleep(0.75)
-                        continue
-
-        logger.warning(
-            "[%s] Auto-thread creation failed after retry. Direct error: %s. Fallback error: %s",
-            self.name,
-            last_direct_error,
-            last_fallback_error,
-        )
-        return None
+        try:
+            setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
+        except Exception:
+            pass
+        return thread
 
     async def rename_thread(
         self,
@@ -7557,6 +7724,7 @@ class DiscordAdapter(BasePlatformAdapter):
         role_authorized: bool = False,
         *,
         recovered: bool = False,
+        channel_context_authoritative: bool = True,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -7660,7 +7828,11 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
-                thread = await self._auto_create_thread(message)
+                thread = (
+                    await self._auto_create_thread(message)
+                    if channel_context_authoritative
+                    else None
+                )
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
