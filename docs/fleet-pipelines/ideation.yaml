@@ -1,0 +1,150 @@
+name: ideation
+description: 'The fleet ideation pipeline. Starts AFTER analyst grills Randy and produces
+  a grill artifact. Enriches the artifact with Context7 docs, passes through spec-author
+  for spec (with Gherkin acceptance tests), qa for acceptance criteria validation,
+  security for security. The workflow engine delivers the final output back to the
+  calling analyst session, which presents it to Randy for approval and issue creation.
+  When analyst files the issue on the project''s GitHub repo, analyst MUST apply the
+  "L3-spec" label — the implementation cron filters project boards for that label
+  to distinguish L3 (sealed-envelope QA + tests gate merge) from L2 (human line review)
+  lanes.
+
+  '
+trigger_events:
+- workflow_dispatch
+roles:
+  analyst: nikola
+  qa: raven
+  security: ada
+  spec-author: edison
+nodes:
+  enrich-artifact:
+    agent: '{analyst}'
+    task: 'Read the grill artifact attached to this card. Identify the technologies,
+      APIs, and services mentioned (e.g. Supabase, Paddle, Stripe, Fly.io). Use Context7
+      to pull relevant documentation for each technology. Update the grill artifact
+      with: 1. Documentation references (Context7 doc paths) 2. API endpoints and
+      patterns relevant to the decisions made 3. Implementation constraints from the
+      docs 4. Any conflicts between the grill decisions and the docs
+
+      If the grill artifact references an existing codebase, use GitNexus to understand
+      the current code structure and note integration points.
+
+      Output: updated grill artifact with enriched context.
+
+      '
+    timeout_minutes: 30
+    channel: orchestration
+    fallback_on_timeout: degraded
+    outputs:
+    - enriched_artifact
+  spec-author-spec:
+    agent: '{spec-author}'
+    task: "Read the enriched grill artifact attached to this card. Generate a formal\
+      \ SPEC.md from it. Define: - Architecture decisions - Data flow - Component\
+      \ interfaces - Edge cases - Acceptance criteria (testable) - Constraints and\
+      \ breaking changes\nFor each acceptance criterion, write a Gherkin .feature\
+      \ file in the project's features/ directory. Each feature file defines the acceptance\
+      \ test that proves the criterion is met. Use Given/When/Then format. Set a target\
+      \ Farley Index per feature (≥7.0 standard, ≥8.0 critical paths, ≥5.0 exploratory).\n\
+      The spec must be implementable without re-litigating intent. Use GitNexus to\
+      \ understand the existing codebase and ensure the spec aligns with current architecture.\n\
+      Use Context7 to verify API patterns and ensure the spec uses correct endpoints\
+      \ and conventions.\n## Spec Landing Location (2026-06-30)\nThe agent session\
+      \ starts in the project repo root (set by the kanban dispatcher via the board's\
+      \ `default_workdir`). All paths are REPO-RELATIVE, not workspace-relative. Do\
+      \ NOT use `projects/<slug>/...` — that is the parent directory the dispatcher\
+      \ uses, not spec-author's CWD.\nLand the spec artifacts inside the repo. Use\
+      \ the convention that already exists in the repo:\n\n  Preferred: `docs/specs/<domain>/SPEC.md`\n\
+      \             `docs/specs/<domain>/acceptance.md`\n             `docs/features/<domain>/*.feature`\n\
+      \n  Fallback if repo has no `docs/`: `<repo-root>/specs/<domain>/SPEC.md`\n\
+      \             `<repo-root>/specs/<domain>/acceptance.md`\n             `<repo-root>/features/<domain>/*.feature`\n\
+      \nInspect the repo first (`ls docs/`). If a `docs/specs/` or `specs/` convention\
+      \ already exists in the repo, follow it. Otherwise create `docs/specs/<domain>/`\
+      \ and use the preferred form. Existing conventions seen across the fleet: agent-service\
+      \ uses `docs/`, payment-gateway uses `spec/` at repo root, gateway uses `docs/`.\n\
+      Identify `<domain>` from the grill artifact (e.g. authentication, billing, onboarding).\
+      \ Use `to-spec` and `sdd-authoring` skills for the spec structure (artifact\
+      \ pyramid: L1 executive summary, L2 dimension specs, L3 dossiers).\n## Structural\
+      \ Quality Gates (path 2 — self-check before reporting done)\nRun these pass/fail\
+      \ checks before reporting the spec as complete. If ANY gate fails, fix the spec\
+      \ and re-check. Do NOT report done until all gates pass. No numerical score\
+      \ — pass/fail only.\n1. **SPEC.md contains required sections**, in this order:\n\
+      \   Problem Statement, Solution, Architecture, Component Interfaces,\n   Data\
+      \ Flow, Edge Cases, Acceptance Criteria, Constraints and\n   Breaking Changes,\
+      \ Out of Scope. Each section must be non-empty.\n\n2. **acceptance.md exists\
+      \ and is a structured list** — not prose.\n   Each acceptance criterion on its\
+      \ own line with format:\n   `- [ ] <criterion ID>: <description> [target: <farley_index>]`\n\
+      \   Minimum 3 criteria per spec.\n\n3. **Gherkin scenarios cover the three required\
+      \ coverage types:**\n   - At least one **happy-path** scenario\n   - At least\
+      \ one **error or edge-case** scenario\n   - At least one **boundary condition**\
+      \ scenario\n   Each .feature file must have at least 2 scenarios.\n\n4. **No\
+      \ TODO/TBD/FIXME markers** in SPEC.md or acceptance.md.\n   Unresolved questions\
+      \ belong in a \"Open Questions\" section at\n   the bottom of SPEC.md, not inline.\n\
+      \n5. **No implicit TODOs.** Every acceptance criterion must be\n   testable\
+      \ — if you cannot write a Gherkin scenario for it, the\n   criterion has an\
+      \ implicit TODO. Rewrite or remove it.\n\n6. **All file paths in SPEC.md are\
+      \ repo-relative** (no\n   `projects/<slug>/...` prefixes).\n\nWhen all gates\
+      \ pass, complete the spec. When any gate fails, fix and re-check. Report the\
+      \ pass/fail status in the card body so qa's peer review can verify.\nOutput:\
+      \ REPO-RELATIVE paths to SPEC.md and acceptance.md in `outputs.spec_path` and\
+      \ `outputs.acceptance_path` so downstream tasks read from the same paths."
+    depends_on:
+    - enrich-artifact
+    timeout_minutes: 60
+    channel: orchestration
+    fallback_on_timeout: degraded
+    outputs:
+    - spec_path
+    - acceptance_path
+    reviews:
+    - qa-review
+    - security-security
+  qa-review:
+    agent: '{qa}'
+    task: 'The spec-author node completed and produced spec artifacts. To find them:
+
+      Read the card body of task {nodes.spec-author-spec.card_id}. The spec-author
+      includes REPO-RELATIVE paths to SPEC.md and acceptance.md in its completion
+      summary (look for "outputs.spec_path" and "outputs.acceptance_path" in the
+      card body or metadata). Also read the grill artifact attached to THIS card.
+
+      The Gherkin .feature files are in the project''s tests/features/ or
+      docs/features/ directory — find them with: find . -name "*.feature" -path
+      "*/<domain>/*" where <domain> matches the grill artifact''s domain.
+
+      Review from the USER''s perspective: 1. Does the spec cover all user
+      workflows mentioned in the grill? 2. Are acceptance criteria testable and
+      complete? 3. Are there gaps in the spec that would block implementation?
+
+      Output: your review findings. If blocking, include specific issues found
+      and what needs to be fixed.'
+    depends_on:
+    - spec-author-spec
+    timeout_minutes: 30
+    channel: orchestration
+    fallback_on_timeout: degraded
+    outputs:
+    - review_status
+  security-security:
+    agent: '{security}'
+    task: 'The spec-author node completed and produced spec artifacts. To find them:
+
+      Read the card body of task {nodes.spec-author-spec.card_id}. The spec-author
+      includes REPO-RELATIVE paths to SPEC.md and acceptance.md in its completion
+      summary (look for "outputs.spec_path" and "outputs.acceptance_path" in the
+      card body or metadata).
+
+      Security review of the finalized spec. Check for: 1. Authentication/authorization
+      gaps 2. Data exposure risks 3. Input validation missing 4. API security concerns
+      5. Infrastructure security issues
+
+      Output: your security findings. If blocking, include specific vulnerabilities
+      and what needs to be fixed.'
+    depends_on:
+    - qa-review
+    timeout_minutes: 30
+    channel: orchestration
+    fallback_on_timeout: degraded
+    outputs:
+    - security_status
