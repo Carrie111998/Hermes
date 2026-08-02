@@ -440,6 +440,42 @@ class TestDeliverResultErrorReturns:
         assert result is not None
         assert "not configured" in result
 
+    def test_multi_instance_platform_list_unwraps_to_enabled(self):
+        """Regression: platforms configured as List[PlatformConfig] (e.g. multiple
+        Feishu bots) must not crash with "'list' object has no attribute 'enabled'".
+
+        The type union ``Union[PlatformConfig, List[PlatformConfig]]`` allows lists,
+        but ``_deliver_result`` assumed a single object and called ``.enabled`` /
+        ``.extra`` directly on the list.
+        """
+        from gateway.config import Platform
+
+        disabled_cfg = MagicMock()
+        disabled_cfg.enabled = False
+        enabled_cfg = MagicMock()
+        enabled_cfg.enabled = True
+        enabled_cfg.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.FEISHU: [disabled_cfg, enabled_cfg]}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg):
+            job = {
+                "id": "multi-instance",
+                "deliver": "origin",
+                "origin": {"platform": "feishu", "chat_id": "oc_test"},
+            }
+            # Must not raise "'list' object has no attribute 'enabled'".
+            # Delivery may still fail (no live adapter/credentials), but the
+            # failure must NOT be an AttributeError on the list-of-configs path.
+            result = _deliver_result(job, "Output.")
+        # If it got past the pconfig.enabled check, result should be either
+        # None (success — unlikely without a real adapter) or a delivery error
+        # string that is NOT "not configured/enabled".
+        if result is not None:
+            assert "not configured" not in result, (
+                "List unwrap failed — the enabled config was not found"
+            )
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
