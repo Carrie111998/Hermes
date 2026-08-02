@@ -435,7 +435,7 @@ function ConnectionsView({ data }: { data: any }) {
 function WorkflowView({ c, data }: { c: Component; data: any }) {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<string>(
-    data.runs?.length ? `Last run ${when(data.runs[0].ts)}:\n${(data.runs[0].result || "").slice(0, 1500)}` : ""
+    data.runs?.length ? (data.runs[0].result || "").slice(0, 4000) : ""
   );
   const specs = useMemo(
     () => deriveInputs(data.workflow?.prompt_template, c.props.inputs),
@@ -481,9 +481,22 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
           <span className="text-[12px] text-red">needs: {missing.join(", ")}</span>
         )}
       </div>
-      {result && (
-        <div className="mt-2.5 bg-[#0d1526] border border-line rounded-lg px-3.5 py-3 overflow-auto flex-1 min-h-0">
-          <Prose>{result}</Prose>
+      {(result || running) && (
+        <div className="mt-3 flex-1 min-h-0 flex flex-col rounded-xl border border-line bg-[#0b1424] overflow-hidden">
+          <div className="flex items-center gap-2 px-3.5 h-8 border-b border-line/70 shrink-0 bg-white/[0.015]">
+            <span className={`w-1.5 h-1.5 rounded-full ${running ? "bg-blue animate-pulse" : "bg-green shadow-[0_0_6px] shadow-green"}`} />
+            <span className="text-[10.5px] w590 uppercase tracking-[0.08em] text-ink-4">
+              {running ? "Hermes working" : "Result"}
+            </span>
+            {!running && data.runs?.length ? (
+              <span className="text-[10.5px] text-ink-4 ml-auto tabular-nums">{when(data.runs[0].ts)}</span>
+            ) : null}
+          </div>
+          <div className="flex-1 min-h-0 overflow-auto px-3.5 py-3">
+            {running && !result
+              ? <div className="flex items-center gap-2 text-[12.5px] text-ink-3"><LoaderCircle size={13} className="spin" /> running the full agent — may take a minute…</div>
+              : <Prose>{result}</Prose>}
+          </div>
         </div>
       )}
     </div>
