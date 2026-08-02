@@ -309,12 +309,24 @@ def sweep_recoverable(
 def _prune(now: Optional[float] = None) -> None:
     now = now if now is not None else time.time()
     cutoff = now - _RETENTION_SECONDS
+    # Failed obligations are pruned more aggressively: they are retried by
+    # sweep_recoverable on every boot, which can re-trigger flood control on
+    # a platform that is already rate-limited. A failed obligation older
+    # than 1 hour is stale by definition — the original response is gone and
+    # redelivery would just fail again. Prune them so they stop poisoning
+    # the startup restore path.
+    _failed_cutoff = now - 3600  # 1 hour
     try:
         with _transaction() as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
                    WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
                 (cutoff,),
+            )
+            conn.execute(
+                """DELETE FROM delivery_obligations
+                   WHERE state = 'failed' AND updated_at < ?""",
+                (_failed_cutoff,),
             )
             total = conn.execute(
                 "SELECT COUNT(*) FROM delivery_obligations"

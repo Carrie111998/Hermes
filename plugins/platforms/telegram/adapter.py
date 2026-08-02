@@ -4672,6 +4672,28 @@ class TelegramAdapter(BasePlatformAdapter):
                             if _send_attempt < 2:
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 safe_send_error = _redact_telegram_error_text(send_err)
+                                # Cap the inline flood control sleep. Telegram
+                                # sometimes demands waits of 30+ minutes; honouring
+                                # that inside the send coroutine blocks the caller
+                                # (often the startup restore drain) for the whole
+                                # duration, which prevents the gateway from
+                                # processing any inbound messages. If the wait
+                                # exceeds the cap, raise immediately so the caller
+                                # can mark the send as failed and move on (the
+                                # delivery ledger + redelivery path handle retries
+                                # on the next boot). See #flood-control-block-cap.
+                                _FLOOD_SLEEP_CAP = 30.0
+                                if wait > _FLOOD_SLEEP_CAP:
+                                    logger.warning(
+                                        "[%s] Telegram flood control on send (attempt %d/3), "
+                                        "wait %.1fs exceeds cap %.0fs — raising instead of sleeping: %s",
+                                        self.name,
+                                        _send_attempt + 1,
+                                        wait,
+                                        _FLOOD_SLEEP_CAP,
+                                        safe_send_error,
+                                    )
+                                    raise
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
                                     self.name,
