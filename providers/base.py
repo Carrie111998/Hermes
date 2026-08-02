@@ -56,6 +56,15 @@ class ProviderProfile:
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 
+    # External ACP process transport. These fields let third-party plugins
+    # reuse the generic ACP shim without adding provider-name branches to the
+    # Hermes core. Environment variables are optional per-user overrides.
+    external_command: str = ""
+    external_args: tuple[str, ...] = ()
+    external_command_env: str = ""
+    external_args_env: str = ""
+    external_auth_args: tuple[str, ...] = ()
+
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
     # tool-result messages natively.  Set on providers that expose

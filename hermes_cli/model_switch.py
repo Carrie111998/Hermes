@@ -2075,6 +2075,45 @@ def list_authenticated_providers(
             live = [current_model]
         curated["lmstudio"] = live
 
+    # External ACP provider plugins own their local authentication and model
+    # catalogs. Surface every authenticated plugin here without adding its
+    # slug to a Hermes-maintained overlay table.
+    try:
+        from providers import list_providers as _list_provider_profiles
+        from hermes_cli.auth import get_auth_status as _get_auth_status
+
+        for _profile in _list_provider_profiles():
+            if _profile.auth_type != "external_process":
+                continue
+            _slug = _profile.name
+            if _slug.lower() in seen_slugs or _slug.lower() in _excluded:
+                continue
+            _status = _get_auth_status(_slug)
+            if not _status.get("logged_in"):
+                continue
+            try:
+                _ids = _profile.fetch_models(timeout=8.0) or []
+            except Exception:
+                _ids = []
+            if not _ids:
+                _ids = list(_profile.fallback_models or curated.get(_slug, []))
+            _ids = list(dict.fromkeys(str(item) for item in _ids if item))
+            _total = len(_ids)
+            _top = _ids[:max_models] if max_models is not None else _ids
+            results.append({
+                "slug": _slug,
+                "name": _profile.display_name or _slug,
+                "is_current": _slug == current_provider,
+                "is_user_defined": True,
+                "models": _top,
+                "total_models": _total,
+                "source": "plugin",
+            })
+            seen_slugs.add(_slug.lower())
+            _record_builtin_endpoint(_slug)
+    except Exception:
+        logger.debug("external ACP provider discovery failed", exc_info=True)
+
     # --- 1. Check Hermes-mapped providers ---
     from hermes_cli.models import _AGGREGATOR_PROVIDERS as _AGG_PROVIDERS
     from hermes_cli.providers import ALIASES as _PROVIDER_ALIAS_TABLE
