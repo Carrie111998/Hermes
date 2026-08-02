@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 
@@ -253,6 +255,47 @@ def test_command_timeout_is_reported_and_rolled_back(tmp_path):
     assert "timed out" in report["commands"]["apply"][0]["attempts"][0]["stderr"]
 
 
+def test_timeout_kills_delayed_child_before_rollback_can_be_undone(tmp_path):
+    runner = load_runner()
+    workdir = tmp_path / "repo"
+    target = workdir / "timeout-child.txt"
+    slow_script = workdir / "spawn_child.py"
+    verify_script = workdir / "verify.py"
+    report_path = workdir / "timeout-child-report.json"
+    target.parent.mkdir(parents=True)
+    target.write_text("old\n", encoding="utf-8")
+    child_code = "import time; from pathlib import Path; time.sleep(0.4); Path('timeout-child.txt').write_text('late\\n', encoding='utf-8')"
+    write(slow_script, f"""
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+        Path('timeout-child.txt').write_text('new\\n', encoding='utf-8')
+        subprocess.Popen([sys.executable, '-c', {child_code!r}])
+        time.sleep(2)
+    """)
+    write(verify_script, """
+        raise SystemExit('verify should not run')
+    """)
+
+    rc = runner.main([
+        "--workdir", str(workdir),
+        "--name", "timeout-child",
+        "--snapshot", "timeout-child.txt",
+        "--apply-json", json.dumps([sys.executable, "spawn_child.py"]),
+        "--verify-json", json.dumps([sys.executable, "verify.py"]),
+        "--report", str(report_path),
+        "--retry-delays", "0",
+        "--timeout", "0.1",
+    ])
+    time.sleep(0.7)
+
+    assert rc == 1
+    assert target.read_text(encoding="utf-8") == "old\n"
+    report = read_report(report_path)
+    assert "process tree terminated" in report["commands"]["apply"][0]["attempts"][0]["stderr"]
+
+
 def test_preflight_validation_helpers_reject_bad_inputs(tmp_path):
     runner = load_runner()
     workdir = tmp_path / "repo"
@@ -363,6 +406,129 @@ def test_backoff_with_nonzero_delay_is_recorded(tmp_path):
 
     assert [attempt.exit_code for attempt in report.attempts] == [1, 1]
     assert report.attempts[0].delay_before_next_seconds == 0.01
+
+
+def test_process_tree_terminator_noops_when_process_already_finished():
+    runner = load_runner()
+
+    class DoneProcess:
+        def poll(self):
+            return 0
+
+    runner._terminate_process_tree(DoneProcess())
+
+
+def test_process_tree_terminator_escalates_to_sigkill(monkeypatch):
+    runner = load_runner()
+    calls = []
+
+    class HangingProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            raise TimeoutError("still alive")
+
+        def kill(self):  # pragma: no cover - should not be used on POSIX path
+            raise AssertionError("unexpected direct kill")
+
+    def fake_killpg(pid, sig):
+        calls.append((pid, sig))
+
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg, raising=False)
+
+    runner._terminate_process_tree(HangingProcess())
+
+    assert calls == [(4321, runner.signal.SIGTERM), (4321, runner.signal.SIGKILL)]
+
+
+def test_process_tree_terminator_handles_process_lookup_race(monkeypatch):
+    runner = load_runner()
+    calls = []
+
+    class VanishedProcess:
+        pid = 111
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            raise AssertionError("wait should not run when initial killpg raises")
+
+        def kill(self):  # pragma: no cover - process already gone
+            raise AssertionError("unexpected direct kill")
+
+    def fake_killpg(pid, sig):
+        calls.append((pid, sig))
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg, raising=False)
+
+    runner._terminate_process_tree(VanishedProcess())
+
+    assert calls == [(111, runner.signal.SIGTERM), (111, runner.signal.SIGKILL)]
+
+
+def test_process_tree_terminator_falls_back_to_direct_kill(monkeypatch):
+    runner = load_runner()
+    killed = []
+
+    class StubbornProcess:
+        pid = 222
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            raise TimeoutError("still alive")
+
+        def kill(self):
+            killed.append(True)
+
+    def fake_killpg(pid, sig):
+        raise RuntimeError("permission denied")
+
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg, raising=False)
+
+    runner._terminate_process_tree(StubbornProcess())
+
+    assert killed == [True]
+
+
+def test_timeout_report_includes_partial_stdout_and_stderr(monkeypatch, tmp_path):
+    runner = load_runner()
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+
+    class FakeProcess:
+        pid = 333
+        returncode = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["fake"], timeout, output="partial-out", stderr="partial-err")
+            return "tail-out", "tail-err"
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: None, raising=False)
+
+    report = runner.run_command([sys.executable, "fake.py"], workdir, timeout=0.1, retry_delays=[0])
+
+    attempt = report.attempts[0]
+    assert attempt.exit_code == 124
+    assert attempt.stdout == "partial-outtail-out"
+    assert "partial-errtail-err" in attempt.stderr
 
 
 def test_preflight_rejects_snapshot_paths_outside_workdir(tmp_path):

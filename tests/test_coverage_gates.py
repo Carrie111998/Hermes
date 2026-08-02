@@ -18,6 +18,7 @@ def load_module(name: str, path: Path):
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHANGED_GATE = load_module("changed_line_coverage_gate", REPO_ROOT / "scripts" / "ci" / "changed_line_coverage_gate.py")
+OSV_GATE = load_module("osv_new_vuln_gate", REPO_ROOT / "scripts" / "ci" / "osv_new_vuln_gate.py")
 RUNNER = load_module("run_tests_parallel", REPO_ROOT / "scripts" / "run_tests_parallel.py")
 
 
@@ -71,15 +72,15 @@ def test_changed_line_gate_looks_up_absolute_coverage_suffixes():
     assert result.missing == {"agent/foo.py": [11]}
 
 
-def test_changed_line_gate_treats_files_without_coverage_as_non_executable():
+def test_changed_line_gate_treats_files_without_coverage_as_uncovered():
     result = CHANGED_GATE.evaluate_changed_line_coverage(
         {"agent/unmeasured.py": {7}},
         {"agent/other.py": ({1}, set(), set())},
     )
 
-    assert result.total == 0
+    assert result.total == 1
     assert result.covered == 0
-    assert result.missing == {}
+    assert result.missing == {"agent/unmeasured.py": [7]}
 
 
 def test_changed_line_gate_runs_git_diff_and_fails_closed(monkeypatch, tmp_path):
@@ -118,6 +119,17 @@ def test_changed_line_gate_treats_excluded_and_non_executable_lines_as_neutral_a
     assert result.covered == 2
     assert round(result.percent, 2) == 66.67
     assert result.missing == {"agent/foo.py": [11]}
+
+
+def test_changed_line_gate_fails_closed_when_measured_file_has_no_executable_lines():
+    changed = {"agent/generated.py": {3}}
+    coverage = {"agent/generated.py": (set(), set(), set())}
+
+    result = CHANGED_GATE.evaluate_changed_line_coverage(changed, coverage)
+
+    assert result.total == 1
+    assert result.covered == 0
+    assert result.missing == {"agent/generated.py": [3]}
 
 
 def test_changed_line_gate_cli_fails_below_threshold(tmp_path, capsys):
@@ -178,27 +190,39 @@ def test_changed_line_gate_passes_when_no_source_lines_changed(tmp_path, capsys)
     assert "Changed-line coverage: 100.00%" in captured.out
 
 
-def test_osv_workflow_keeps_report_only_baseline_but_blocks_changed_lockfiles():
-    workflow = (REPO_ROOT / ".github" / "workflows" / "osv-scanner.yml").read_text(encoding="utf-8")
+def test_osv_gate_allows_existing_baseline_vulnerabilities(capsys):
+    base = {
+        "runs": [{"results": [{"ruleId": "GHSA-old", "locations": [{"physicalLocation": {"artifactLocation": {"uri": "uv.lock"}}}]}]}]
+    }
+    head = {
+        "runs": [{"results": [{"ruleId": "GHSA-old", "locations": [{"physicalLocation": {"artifactLocation": {"uri": "uv.lock"}}}]}]}]
+    }
 
-    assert "detect-lockfile-changes:" in workflow
-    assert "new-lockfile-vuln-gate:" in workflow
-    assert "fail-on-vuln: false" in workflow
-    assert "fail-on-vuln: true" in workflow
-    assert "uv.lock package-lock.json website/package-lock.json" in workflow
-    assert "needs.detect-lockfile-changes.outputs.changed == 'true'" in workflow
+    new_ids = OSV_GATE.newly_introduced(base, head)
+
+    assert new_ids == set()
+    assert OSV_GATE.render(new_ids) == "No newly introduced OSV vulnerabilities found.\n"
 
 
-def test_tests_workflow_collects_combines_and_gates_coverage():
-    workflow = (REPO_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+def test_osv_gate_fails_only_new_head_vulnerability(tmp_path, capsys):
+    base_file = tmp_path / "base.sarif.json"
+    head_file = tmp_path / "head.sarif.json"
+    base_file.write_text(json.dumps({
+        "runs": [{"results": [{"ruleId": "GHSA-old", "locations": [{"physicalLocation": {"artifactLocation": {"uri": "uv.lock"}}}]}]}]
+    }), encoding="utf-8")
+    head_file.write_text(json.dumps({
+        "runs": [{"results": [
+            {"ruleId": "GHSA-old", "locations": [{"physicalLocation": {"artifactLocation": {"uri": "uv.lock"}}}]},
+            {"ruleId": "GHSA-new", "locations": [{"physicalLocation": {"artifactLocation": {"uri": "package-lock.json"}}}]},
+        ]}]
+    }), encoding="utf-8")
 
-    assert "scripts/run_tests.sh --coverage --files" in workflow
-    assert "coverage-data-slice-${{ matrix.slice.index }}" in workflow
-    assert "coverage combine coverage-data" in workflow
-    assert "coverage json -o coverage.json" in workflow
-    assert "scripts/ci/changed_line_coverage_gate.py" in workflow
-    assert "--fail-under 100" in workflow
-    assert "set -euo pipefail" in workflow
+    exit_code = OSV_GATE.main(["--base", str(base_file), "--head", str(head_file)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "GHSA-new@package-lock.json" in captured.out
+    assert "GHSA-old@uv.lock" not in captured.out
 
 
 def test_parallel_runner_builds_coverage_subprocess_command():

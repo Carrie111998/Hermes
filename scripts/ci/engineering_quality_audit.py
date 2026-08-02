@@ -325,25 +325,27 @@ def audit_repo(repo: Path) -> AuditReport:
     osv = read_text(repo / ".github" / "workflows" / "osv-scanner.yml")
     if osv:
         has_report_only_scan = re.search(r"fail-on-vuln:\s*false", osv) is not None
-        has_blocking_new_lockfile_gate = (
+        has_base_head_comparison = (
             "new-lockfile-vuln-gate" in osv
             and "detect-lockfile-changes" in osv
-            and re.search(r"fail-on-vuln:\s*true", osv) is not None
+            and "osv_new_vuln_gate.py" in osv
+            and "osv-base.sarif" in osv
+            and "osv-head.sarif" in osv
         )
-        if has_report_only_scan and not has_blocking_new_lockfile_gate:
+        if has_report_only_scan and not has_base_head_comparison:
             findings.append(Finding(
                 "RIESGO",
                 "Dependency security",
-                "OSV scanner existe pero no bloquea vulnerabilidades.",
+                "OSV scanner existe pero no bloquea vulnerabilidades nuevas contra una línea base.",
                 ".github/workflows/osv-scanner.yml fail-on-vuln: false",
-                "Mantener report-only para deuda heredada, pero añadir gate para vulnerabilidades nuevas.",
+                "Mantener report-only para deuda heredada, pero comparar base/head y bloquear solo vulnerabilidades nuevas.",
             ))
-        elif has_report_only_scan and has_blocking_new_lockfile_gate:
+        elif has_report_only_scan and has_base_head_comparison:
             findings.append(Finding(
                 "CONFIRMADO",
                 "Dependency security",
-                "OSV mantiene escaneo report-only para deuda heredada y bloquea vulnerabilidades cuando cambian lockfiles.",
-                ".github/workflows/osv-scanner.yml report-only + new-lockfile-vuln-gate",
+                "OSV mantiene escaneo report-only para deuda heredada y bloquea solo vulnerabilidades nuevas cuando cambian lockfiles.",
+                ".github/workflows/osv-scanner.yml report-only + base/head OSV gate",
             ))
         else:
             findings.append(Finding("CONFIRMADO", "Dependency security", "OSV scanner existe y no está explícitamente en report-only.", ".github/workflows/osv-scanner.yml"))

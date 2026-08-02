@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -212,33 +214,56 @@ def rollback(workdir: Path, snapshot: SnapshotReport) -> None:
                 raise SafeChangeError(f"cannot restore unsupported snapshot kind {item.kind!r}")
 
 
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:  # pragma: no cover - Windows fallback
+            proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:  # pragma: no cover - Windows fallback
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            proc.kill()
+
+
 def run_command(argv: Sequence[str], workdir: Path, timeout: float, retry_delays: Sequence[float]) -> CommandReport:
     command_report = CommandReport(argv=list(argv))
     for index, delay in enumerate(retry_delays):
         start = time.monotonic()
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
         try:
-            proc = subprocess.run(
-                list(argv),
-                cwd=workdir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                shell=False,
-            )
+            stdout, stderr = proc.communicate(timeout=timeout)
             exit_code = proc.returncode
-            stdout = proc.stdout
-            stderr = proc.stderr
         except subprocess.TimeoutExpired as exc:
+            _terminate_process_tree(proc)
+            stdout, stderr = proc.communicate()
+            if exc.stdout and isinstance(exc.stdout, str):
+                stdout = f"{exc.stdout}{stdout or ''}"
+            if exc.stderr and isinstance(exc.stderr, str):
+                stderr = f"{exc.stderr}{stderr or ''}"
             exit_code = 124
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-            stderr = f"{stderr}\ncommand timed out after {timeout}s".strip()
+            stderr = f"{stderr or ''}\ncommand timed out after {timeout}s; process tree terminated".strip()
         duration = round(time.monotonic() - start, 4)
         should_retry = exit_code != 0 and index < len(retry_delays) - 1
-        command_report.attempts.append(AttemptReport(exit_code, stdout, stderr, duration, delay if should_retry else None))
+        command_report.attempts.append(AttemptReport(exit_code, stdout or "", stderr or "", duration, delay if should_retry else None))
         if exit_code == 0:
             return command_report
         if should_retry and delay:

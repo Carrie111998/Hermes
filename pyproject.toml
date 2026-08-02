@@ -413,7 +413,7 @@ addopts = "-m 'not integration'"
 [tool.coverage.run]
 branch = true
 parallel = true
-source = ["agent", "tools", "hermes_cli", "gateway", "cron", "providers", "plugins", "scripts"]
+source = ["."]
 omit = [
     "tests/*",
     "*/tests/*",

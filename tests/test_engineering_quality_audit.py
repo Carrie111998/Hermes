@@ -77,10 +77,17 @@ def test_audit_detects_mature_engineering_controls(tmp_path):
     """)
     write(repo / ".github" / "workflows" / "osv-scanner.yml", f"""
         jobs:
+          detect-lockfile-changes:
+            steps:
+              - uses: actions/checkout@{sha}
           scan:
             uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@{sha}
             with:
-              fail-on-vuln: true
+              fail-on-vuln: false
+          new-lockfile-vuln-gate:
+            needs: detect-lockfile-changes
+            steps:
+              - run: python3 scripts/ci/osv_new_vuln_gate.py --base /tmp/osv-base.sarif --head /tmp/osv-head.sarif
     """)
     write(repo / ".github" / "workflows" / "appsec.yml", """
         jobs:
@@ -273,8 +280,8 @@ def test_audit_recognizes_osv_two_lane_policy(tmp_path):
               fail-on-vuln: false
           new-lockfile-vuln-gate:
             needs: detect-lockfile-changes
-            with:
-              fail-on-vuln: true
+            steps:
+              - run: python3 scripts/ci/osv_new_vuln_gate.py --base /tmp/osv-base.sarif --head /tmp/osv-head.sarif
     """)
     write(repo / "tests" / "test_sample.py", """
         def test_case():
@@ -286,9 +293,37 @@ def test_audit_recognizes_osv_two_lane_policy(tmp_path):
     assert any(
         finding.area == "Dependency security"
         and finding.status == "CONFIRMADO"
-        and "bloquea vulnerabilidades cuando cambian lockfiles" in finding.detail
+        and "bloquea solo vulnerabilidades nuevas" in finding.detail
         for finding in report.findings
     )
+
+
+def test_audit_recognizes_non_report_only_osv_scanner(tmp_path):
+    repo = tmp_path / "repo"
+    write(repo / "pyproject.toml", """
+        [tool.pytest.ini_options]
+        testpaths = ["tests"]
+    """)
+    write(repo / ".github" / "workflows" / "osv-scanner.yml", """
+        jobs:
+          scan:
+            steps:
+              - run: osv-scanner --lockfile=uv.lock
+    """)
+    write(repo / "tests" / "test_sample.py", """
+        def test_case():
+            assert True
+    """)
+
+    report = engineering_quality_audit.audit_repo(repo)
+
+    assert any(
+        finding.area == "Dependency security"
+        and finding.status == "CONFIRMADO"
+        and "no está explícitamente en report-only" in finding.detail
+        for finding in report.findings
+    )
+
 
 def test_markdown_and_json_interfaces_are_deterministic(tmp_path, capsys):
     repo = tmp_path / "repo"

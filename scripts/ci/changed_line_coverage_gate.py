@@ -115,7 +115,7 @@ def load_coverage_lines(path: Path) -> dict[str, tuple[set[int], set[int], set[i
     return out
 
 
-def _lookup_coverage(path: str, coverage: dict[str, tuple[set[int], set[int], set[int]]]) -> tuple[set[int], set[int], set[int]]:
+def _lookup_coverage(path: str, coverage: dict[str, tuple[set[int], set[int], set[int]]]) -> tuple[set[int], set[int], set[int]] | None:
     normalized = path.replace("\\", "/")
     if normalized in coverage:
         return coverage[normalized]
@@ -123,7 +123,7 @@ def _lookup_coverage(path: str, coverage: dict[str, tuple[set[int], set[int], se
     for filename, lines in coverage.items():
         if filename.endswith(suffix):
             return lines
-    return set(), set(), set()
+    return None
 
 
 def evaluate_changed_line_coverage(changed: dict[str, set[int]], coverage: dict[str, tuple[set[int], set[int], set[int]]]) -> ChangedLineResult:
@@ -131,10 +131,20 @@ def evaluate_changed_line_coverage(changed: dict[str, set[int]], coverage: dict[
     covered = 0
     missing: dict[str, list[int]] = {}
     for path, lines in sorted(changed.items()):
-        executed, missing_lines, excluded = _lookup_coverage(path, coverage)
+        coverage_lines = _lookup_coverage(path, coverage)
+        if coverage_lines is None:
+            total += len(lines)
+            missing.setdefault(path, []).extend(sorted(lines))
+            continue
+        executed, missing_lines, excluded = coverage_lines
         executable = executed | missing_lines
         for line in sorted(lines):
-            if line in excluded or line not in executable:
+            if line in excluded:
+                continue
+            if line not in executable:
+                if not executable:
+                    total += 1
+                    missing.setdefault(path, []).append(line)
                 continue
             total += 1
             if line in executed:
