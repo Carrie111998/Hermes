@@ -225,7 +225,9 @@ function Avatar({ name }: { name: string }) {
 }
 
 /* ---------- recharts area chart ---------- */
+let _chartSeq = 0;
 function ChartView({ data }: { data: any }) {
+  const [uid] = useState(() => `ch${++_chartSeq}`);
   const pts = (data.points || []).map(([t, v]: [number, number]) => ({
     t, v,
     label: new Date(t * 1000).toLocaleDateString([], { month: "short", day: "numeric" }) +
@@ -247,22 +249,16 @@ function ChartView({ data }: { data: any }) {
         </span>
         <span className="text-[11px] text-ink-3 truncate">{data.label}</span>
       </div>
-      <div className="flex-1 min-h-[180px] -mx-1">
+      <div className="relative flex-1 min-h-[180px] -mx-1">
+        <div className="absolute inset-0">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={pts} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
             <defs>
-              <linearGradient id="blueFill" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient id={`${uid}-fill`} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.32} />
                 <stop offset="55%" stopColor="#3b82f6" stopOpacity={0.08} />
                 <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
               </linearGradient>
-              <filter id="lineGlow" x="-20%" y="-20%" width="140%" height="140%">
-                <feGaussianBlur stdDeviation="3.5" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur" />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
             </defs>
             <CartesianGrid stroke="#1c2740" strokeDasharray="3 3" vertical={false} />
             <XAxis dataKey="label" hide />
@@ -277,12 +273,17 @@ function ChartView({ data }: { data: any }) {
               formatter={(v: any) => [fmt(v), ""]}
               separator=""
             />
+            {/* glow = wide soft under-stroke, no SVG/CSS filters (those fail to
+                rasterize on large surfaces in software rendering) */}
+            <Area type="monotone" dataKey="v" stroke="#3b82f6" strokeWidth={7}
+                  strokeOpacity={0.22} fill="none" dot={false} activeDot={false}
+                  isAnimationActive={false} />
             <Area type="monotone" dataKey="v" stroke="#60a5fa" strokeWidth={2}
-                  fill="url(#blueFill)" dot={false}
-                  style={{ filter: "url(#lineGlow)" }}
+                  fill={`url(#${uid}-fill)`} dot={false}
                   activeDot={{ r: 4, fill: "#93c5fd", stroke: "#3b82f6", strokeWidth: 2 }} />
           </AreaChart>
         </ResponsiveContainer>
+        </div>
       </div>
     </div>
   );

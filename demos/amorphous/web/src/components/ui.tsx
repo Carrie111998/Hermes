@@ -83,7 +83,7 @@ export function DialogContent({ className, children, ...props }:
         className="fixed inset-0 z-[120] bg-[#05080f]/75 backdrop-blur-[3px] data-[state=open]:animate-in data-[state=open]:fade-in-0" />
       <DialogPrimitive.Content
         className={cn(
-          "fixed left-1/2 top-1/2 z-[121] -translate-x-1/2 -translate-y-1/2",
+          "fixed inset-0 z-[121] m-auto",
           "w-[min(1060px,92vw)] h-[min(720px,86vh)] flex flex-col",
           "bg-panel border border-line-2 rounded-2xl overflow-hidden",
           "shadow-[0_32px_90px_rgba(2,6,23,.8),0_0_0_1px_rgba(255,255,255,.03)]",
