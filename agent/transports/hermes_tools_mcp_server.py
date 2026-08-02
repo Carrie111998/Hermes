@@ -156,8 +156,6 @@ PRODUCT_OWNER_TOOLS: tuple[str, ...] = (
     "kanban_create",
     "kanban_comment",
     "kanban_heartbeat",
-    "kanban_agent_memory_recall",
-    "kanban_agent_memory_write",
     "kanban_complete",
     "kanban_block",
 )
@@ -166,16 +164,12 @@ PRODUCT_OWNER_INTAKE_TOOLS: tuple[str, ...] = (
     "work_inbox_show",
     "work_inbox_decide",
     "work_inbox_heartbeat",
-    "work_inbox_agent_memory_recall",
-    "work_inbox_agent_memory_write",
 )
 
 REVIEWER_TOOLS: tuple[str, ...] = (
     "kanban_show",
     "kanban_comment",
     "kanban_heartbeat",
-    "kanban_agent_memory_recall",
-    "kanban_agent_memory_write",
     "kanban_complete",
     "kanban_block",
     "review_target",

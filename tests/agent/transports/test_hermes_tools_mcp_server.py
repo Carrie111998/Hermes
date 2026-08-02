@@ -150,8 +150,6 @@ class TestCapabilitySets:
             "kanban_create",
             "kanban_comment",
             "kanban_heartbeat",
-            "kanban_agent_memory_recall",
-            "kanban_agent_memory_write",
             "kanban_complete",
             "kanban_block",
         )
@@ -167,8 +165,6 @@ class TestCapabilitySets:
             "work_inbox_show",
             "work_inbox_decide",
             "work_inbox_heartbeat",
-            "work_inbox_agent_memory_recall",
-            "work_inbox_agent_memory_write",
         )
         assert not any(name.startswith("kanban_") for name in selected)
 
@@ -199,13 +195,18 @@ class TestCapabilitySets:
             "kanban_show",
             "kanban_comment",
             "kanban_heartbeat",
-            "kanban_agent_memory_recall",
-            "kanban_agent_memory_write",
             "kanban_complete",
             "kanban_block",
             "review_target",
         )
         assert {"kanban_create", "kanban_link", "kanban_list"}.isdisjoint(selected)
+
+    def test_capability_sets_expose_no_governed_agent_memory_tools(self):
+        from agent.transports.hermes_tools_mcp_server import CAPABILITY_SETS
+
+        for capability, tools in CAPABILITY_SETS.items():
+            offenders = [name for name in tools if "agent_memory" in name]
+            assert offenders == [], f"{capability}: {offenders}"
 
     def test_unknown_explicit_capability_set_exposes_nothing(self):
         from agent.transports import hermes_tools_mcp_server as m
