@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.runtime_status import emit_runtime_status
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+    emit_runtime_status(agent)
 
     cost_result = estimate_usage_cost(
         agent.model,
@@ -269,6 +272,8 @@ def _record_codex_app_server_compaction(
             )
     except Exception:
         logger.debug("event_callback error on codex session:compress", exc_info=True)
+
+    emit_runtime_status(agent)
 
     return True
 

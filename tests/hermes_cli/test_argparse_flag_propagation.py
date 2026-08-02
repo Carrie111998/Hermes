@@ -102,6 +102,157 @@ class TestChatVerboseArg:
         assert "verbose" not in captured
 
 
+class TestRuntimeStatusFilePropagation:
+    """The hidden supervisor path must survive parser and cmd_chat handoff."""
+
+    @pytest.mark.parametrize("argv", [
+        ["--runtime-status-file", "/tmp/runtime-status.json", "chat"],
+        ["chat", "--runtime-status-file", "/tmp/runtime-status.json"],
+    ])
+    def test_flag_is_accepted_on_both_sides_of_chat(self, argv):
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, _chat_parser = build_top_level_parser()
+        args = parser.parse_args(argv)
+
+        assert args.runtime_status_file == "/tmp/runtime-status.json"
+
+    def test_cmd_chat_forwards_runtime_status_file(self, monkeypatch):
+        import types
+
+        import hermes_cli.main as main_mod
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, chat_parser = build_top_level_parser()
+        chat_parser.set_defaults(func=main_mod.cmd_chat)
+        args = parser.parse_args([
+            "chat", "--runtime-status-file", "/tmp/runtime-status.json",
+        ])
+        captured = {}
+        fake_cli = types.ModuleType("cli")
+
+        def fake_main(**kwargs):
+            captured.update(kwargs)
+
+        setattr(fake_cli, "main", fake_main)
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "cli", fake_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+
+        main_mod.cmd_chat(args)
+
+        assert captured["runtime_status_file"] == "/tmp/runtime-status.json"
+
+    def test_cmd_chat_forwards_runtime_status_file_to_tui(self, monkeypatch):
+        import types
+
+        import hermes_cli.main as main_mod
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, chat_parser = build_top_level_parser()
+        chat_parser.set_defaults(func=main_mod.cmd_chat)
+        args = parser.parse_args([
+            "chat",
+            "--tui",
+            "--runtime-status-file",
+            "/tmp/runtime-status.json",
+        ])
+        captured = {}
+
+        def fake_launch_tui(*args, **kwargs):
+            captured.update(kwargs)
+            raise SystemExit(0)
+
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+        monkeypatch.setattr(main_mod, "_launch_tui", fake_launch_tui)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main_mod.cmd_chat(args)
+
+        assert exc_info.value.code == 0
+        assert captured["runtime_status_file"] == "/tmp/runtime-status.json"
+
+    def test_launch_tui_bridges_only_the_explicit_runtime_status_target(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_cli.main as main_mod
+
+        explicit_target = str(tmp_path / "explicit-status.json")
+        captured = {}
+
+        def fake_call(argv, *, cwd, env):
+            captured["argv"] = argv
+            captured["cwd"] = cwd
+            captured["env"] = env
+            return 0
+
+        monkeypatch.setenv(
+            "HERMES_TUI_RUNTIME_STATUS_FILE",
+            str(tmp_path / "stale-status.json"),
+        )
+        monkeypatch.setattr(main_mod.subprocess, "call", fake_call)
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda *_args, **_kwargs: (["node", "entry.js"], tmp_path),
+        )
+        monkeypatch.setattr(main_mod, "_apply_tui_python_env", lambda _env: None)
+        monkeypatch.setattr(main_mod, "_resolve_tui_heap_mb", lambda: 1024)
+        monkeypatch.setattr(main_mod, "_print_tui_exit_summary", lambda *_args: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main_mod._launch_tui(runtime_status_file=explicit_target)
+
+        assert exc_info.value.code == 0
+        assert captured["env"]["HERMES_TUI_RUNTIME_STATUS_FILE"] == explicit_target
+
+    def test_launch_tui_drops_stale_runtime_status_target_without_flag(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_cli.main as main_mod
+
+        captured = {}
+
+        def fake_call(argv, *, cwd, env):
+            captured["env"] = env
+            return 0
+
+        monkeypatch.setenv(
+            "HERMES_TUI_RUNTIME_STATUS_FILE",
+            str(tmp_path / "stale-status.json"),
+        )
+        monkeypatch.setattr(main_mod.subprocess, "call", fake_call)
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda *_args, **_kwargs: (["node", "entry.js"], tmp_path),
+        )
+        monkeypatch.setattr(main_mod, "_apply_tui_python_env", lambda _env: None)
+        monkeypatch.setattr(main_mod, "_resolve_tui_heap_mb", lambda: 1024)
+        monkeypatch.setattr(main_mod, "_print_tui_exit_summary", lambda *_args: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main_mod._launch_tui()
+
+        assert exc_info.value.code == 0
+        assert "HERMES_TUI_RUNTIME_STATUS_FILE" not in captured["env"]
+
+
 class TestYoloEnvVar:
     """Verify --yolo sets HERMES_YOLO_MODE regardless of flag position.
 

@@ -231,6 +231,13 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--runtime-status-file",
+        default=None,
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+    _inherited_flag(
+        parser,
         "--ignore-user-config",
         action="store_true",
         default=False,
@@ -420,6 +427,13 @@ def build_top_level_parser():
         action="store_true",
         default=argparse.SUPPRESS,
         help="Include the session ID in the agent's system prompt",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--runtime-status-file",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help=argparse.SUPPRESS,
     )
     _inherited_flag(
         chat_parser,

@@ -6131,6 +6131,17 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def _apply_tui_runtime_status(agent):
+    """Attach the invocation-scoped TUI status target to a backend agent."""
+    target = os.environ.get("HERMES_TUI_RUNTIME_STATUS_FILE")
+    agent.runtime_status_file = target if isinstance(target, str) and target.strip() else None
+    if agent.runtime_status_file:
+        from agent.runtime_status import emit_runtime_status
+
+        emit_runtime_status(agent)
+    return agent
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -6149,7 +6160,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _apply_tui_runtime_status(synthetic)
 
     from run_agent import AIAgent
 
@@ -6269,7 +6280,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6316,6 +6327,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _apply_tui_runtime_status(agent)
 
 
 def _init_session(

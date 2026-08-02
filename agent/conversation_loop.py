@@ -46,6 +46,7 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.runtime_status import emit_runtime_status
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -3225,6 +3226,8 @@ def run_conversation(
                     # charged to that old compaction, and so preflight deferral
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
+
+                emit_runtime_status(agent)
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.

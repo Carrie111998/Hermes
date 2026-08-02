@@ -2285,6 +2285,7 @@ def _launch_tui(
     worktree: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    runtime_status_file: Optional[str] = None,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
 ):
@@ -2363,6 +2364,13 @@ def _launch_tui(
         env["HERMES_TUI_CHECKPOINTS"] = "1"
     if pass_session_id:
         env["HERMES_TUI_PASS_SESSION_ID"] = "1"
+    # Internal invocation bridge: only an explicitly parsed supervisor target
+    # may reach the Python TUI backend. Clear ambient/stale values inherited
+    # from the parent shell so an ordinary TUI launch cannot overwrite an old
+    # supervisor's status file.
+    env.pop("HERMES_TUI_RUNTIME_STATUS_FILE", None)
+    if runtime_status_file:
+        env["HERMES_TUI_RUNTIME_STATUS_FILE"] = runtime_status_file
     if max_turns is not None:
         env["HERMES_TUI_MAX_TURNS"] = str(max_turns)
     if verbose:
@@ -2697,6 +2705,7 @@ def cmd_chat(args):
             worktree=getattr(args, "worktree", False),
             checkpoints=getattr(args, "checkpoints", False),
             pass_session_id=getattr(args, "pass_session_id", False),
+            runtime_status_file=getattr(args, "runtime_status_file", None),
             max_turns=getattr(args, "max_turns", None),
             accept_hooks=getattr(args, "accept_hooks", False),
         )
@@ -2719,6 +2728,7 @@ def cmd_chat(args):
         "worktree": getattr(args, "worktree", False),
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
+        "runtime_status_file": getattr(args, "runtime_status_file", None),
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),

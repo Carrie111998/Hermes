@@ -47,6 +47,7 @@ from agent.context_engine import (
     sanitize_memory_context,
 )
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.runtime_status import emit_runtime_status
 
 logger = logging.getLogger(__name__)
 
@@ -2317,6 +2318,8 @@ def compress_context(
                 })
             except Exception as e:
                 logger.debug("event_callback error on session:compress: %s", e)
+
+        emit_runtime_status(agent)
 
         # Surface the compaction mode to the caller (run_conversation / gateway)
         # via a rotation-independent flag. The gateway uses this — NOT an

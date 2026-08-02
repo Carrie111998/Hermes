@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 
 from rich.markup import escape as _escape
+from agent.runtime_status import emit_runtime_status
 
 
 class CLIAgentSetupMixin:
@@ -516,6 +517,8 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            self.agent.runtime_status_file = getattr(self, "runtime_status_file", None)
+            emit_runtime_status(self.agent)
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

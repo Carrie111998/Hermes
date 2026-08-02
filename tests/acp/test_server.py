@@ -263,7 +263,10 @@ class TestSessionOps:
     def test_build_usage_update_for_zed_context_indicator(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")
         state.history = [{"role": "user", "content": "hello"}]
-        state.agent.context_compressor = MagicMock(context_length=100_000)
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000,
+            compression_count=3,
+        )
         state.agent._cached_system_prompt = "system"
         state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
 
@@ -277,6 +280,9 @@ class TestSessionOps:
         assert update.session_update == "usage_update"
         assert update.size == 100_000
         assert update.used == 25_000
+        assert update.field_meta == {
+            "hermes": {"compressionCount": 3},
+        }
 
 
 
