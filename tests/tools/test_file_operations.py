@@ -409,7 +409,9 @@ class TestReadStatProbeAborted:
 
     def _stat_exit(self, mock_env, code):
         def side_effect(command, **kwargs):
-            if command.startswith("wc -c"):
+            # The size probe wraps ``wc -c`` in an ``[ -f ]`` guard
+            # (_size_probe_cmd); match the wc fragment wherever it appears.
+            if "wc -c" in command:
                 return {"output": "", "returncode": code}
             return {"output": "", "returncode": 0}
         mock_env.execute.side_effect = side_effect
@@ -435,6 +437,11 @@ class TestReadStatProbeAborted:
         ops = self._stat_exit(mock_env, 130)
         result = ops.read_file_raw("/tmp/test/present.md")
         assert result.error == "Read interrupted while checking file: /tmp/test/present.md"
+
+    def test_read_file_raw_timeout_reports_timed_out(self, mock_env):
+        ops = self._stat_exit(mock_env, 124)
+        result = ops.read_file_raw("/tmp/test/present.md")
+        assert result.error == "Read timed out while checking file: /tmp/test/present.md"
 
     def test_read_file_raw_other_error_still_file_not_found(self, mock_env):
         ops = self._stat_exit(mock_env, 1)
