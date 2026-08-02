@@ -904,6 +904,155 @@ def test_projection_reconciliation_recovers_fragmented_release_state(
     assert previous_payloads["sudoers"] != current_payloads["sudoers"]
 
 
+def test_projection_reconciliation_selects_canonical_equivalent_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+    previous_revision = "a" * 40
+    canonical_revision = "9" * 40
+    previous_layout = provisioning._projection_layout(
+        previous_revision,
+        role="cloud",
+    )
+    canonical_release = layout.release_base / canonical_revision
+    canonical_release.mkdir()
+    canonical_layout = replace(
+        previous_layout,
+        release=canonical_release,
+        authority_manifest=canonical_release / "package-manifest.json",
+        pinned_public_key=canonical_release / "cloud.pub",
+        receipt=(
+            previous_layout.receipt.parent
+            / f"cloud-signer-{canonical_revision}.json"
+        ),
+        sudoers_template=canonical_release / "sudoers.in",
+    )
+    canonical_authority: Mapping[str, object] = {
+        **authority,
+        "package_sha256": "0" * 64,
+        "public_raw": previous_payloads["installed_public_key"],
+        "public_key_id": hashlib.sha256(
+            previous_payloads["installed_public_key"]
+        ).hexdigest(),
+    }
+    canonical_payloads = {
+        **previous_payloads,
+        "sudoers": (
+            f"root ALL=(root) NOPASSWD: "
+            f"{layout.release_base}/{canonical_revision}/bin/provision\n"
+        ).encode("ascii"),
+    }
+    projection_paths = provisioning._projection_paths(layout)
+
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_layout",
+        lambda revision, *, role: (
+            canonical_layout
+            if revision == canonical_revision and role == "cloud"
+            else (
+                previous_layout
+                if revision == previous_revision and role == "cloud"
+                else (
+                    layout
+                    if revision == layout.release.name and role == "cloud"
+                    else (_ for _ in ()).throw(
+                        AssertionError("unexpected release")
+                    )
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_paths",
+        lambda selected: (
+            projection_paths
+            if selected in {canonical_layout, previous_layout, layout}
+            else (_ for _ in ()).throw(AssertionError("unexpected layout"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_release_and_authority",
+        lambda selected: (
+            canonical_authority
+            if selected is canonical_layout
+            else (
+                authority
+                if selected is layout
+                else (
+                    {
+                        **canonical_authority,
+                        "package_sha256": "1" * 64,
+                    }
+                    if selected is previous_layout
+                    else (_ for _ in ()).throw(
+                        AssertionError("unexpected layout")
+                    )
+                )
+            )
+        ),
+    )
+
+    def projection_payloads(
+        selected: provisioning.SignerLayout,
+        *,
+        authority: Mapping[str, object],
+    ) -> Mapping[str, bytes]:
+        del authority
+        if selected is canonical_layout:
+            return canonical_payloads
+        if selected is previous_layout:
+            return previous_payloads
+        if selected is layout:
+            return current_payloads
+        raise AssertionError("unexpected projection")
+
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_payloads",
+        projection_payloads,
+    )
+    assert layout.sudoers is not None
+    layout.sudoers.chmod(0o640)
+    layout.sudoers.write_bytes(current_payloads["sudoers"])
+    layout.sudoers.chmod(0o440)
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    intent = json.loads(
+        provisioning._projection_reconciliation_intent_path(
+            layout
+        ).read_text()
+    )
+    assert (
+        intent["source_projections"]["installed_public_key"][
+            "release_revision"
+        ]
+        == canonical_revision
+    )
+    assert (
+        intent["source_projections"]["config"]["release_revision"]
+        == canonical_revision
+    )
+    assert (
+        intent["source_projections"]["sudoers"]["release_revision"]
+        == layout.release.name
+    )
+    for name, (path, _uid, _gid, _mode) in projection_paths.items():
+        assert path.read_bytes() == current_payloads[name]
+
+
 def _private_key_rollover_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
