@@ -34,6 +34,31 @@ export type ScanOutcome =
   | { kind: 'blocked'; result: VenvBlockerScanResult }
   | { kind: 'probe-failure'; error: string }
 
+/**
+ * The CLI updater owns the messaging gateway lifecycle: it stops enabled
+ * gateway profiles before replacing the venv and restarts them afterwards.
+ * Desktop's earlier preflight must not reject that managed process before the
+ * CLI updater gets a chance to stop it.
+ */
+export function isUpdaterManagedGatewayBlocker(proc: VenvBlockerProcess): boolean {
+  const cmdline = proc.cmdline.replace(/["']/g, ' ')
+
+  return (
+    /(?:^|\s)-m\s+hermes_cli\.main\s+(?:-p\s+\S+\s+)?gateway\s+run(?:\s|$)/i.test(cmdline) ||
+    /(?:^|\s)(?:\S*[\\/])?hermes(?:\.exe)?\s+(?:-p\s+\S+\s+)?gateway\s+run(?:\s|$)/i.test(cmdline)
+  )
+}
+
+export function filterUpdaterManagedBlockers(outcome: ScanOutcome): ScanOutcome {
+  if (outcome.kind !== 'blocked') return outcome
+
+  const processes = outcome.result.processes.filter((proc) => !isUpdaterManagedGatewayBlocker(proc))
+
+  return processes.length > 0
+    ? { kind: 'blocked', result: { blocked: true, processes } }
+    : { kind: 'clear', result: { blocked: false, processes: [] } }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -148,7 +173,7 @@ export async function scanVenvBlockers(
     return { kind: 'probe-failure', error: diag.join('; ') }
   }
 
-  return parseVenvBlockerScanOutput(stdout)
+  return filterUpdaterManagedBlockers(parseVenvBlockerScanOutput(stdout))
 }
 
 // ---------------------------------------------------------------------------

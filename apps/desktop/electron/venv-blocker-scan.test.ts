@@ -15,8 +15,10 @@ import path from 'node:path'
 import { describe, it } from 'vitest'
 
 import {
+  filterUpdaterManagedBlockers,
   formatBlockerMessage,
   formatProbeFailedMessage,
+  isUpdaterManagedGatewayBlocker,
   parseVenvBlockerScanOutput,
   resolveVenvPython,
   scanVenvBlockers
@@ -147,6 +149,55 @@ describe('parseVenvBlockerScanOutput', () => {
   })
 })
 
+describe('updater-managed gateway filtering', () => {
+  const gateway = {
+    pid: 37748,
+    name: 'python.exe',
+    cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main gateway run'
+  }
+
+  it('recognizes Python module and Hermes shim gateway commands', () => {
+    assert.equal(isUpdaterManagedGatewayBlocker(gateway), true)
+    assert.equal(
+      isUpdaterManagedGatewayBlocker({
+        pid: 2,
+        name: 'hermes.exe',
+        cmdline: 'C:\\Hermes\\venv\\Scripts\\hermes.exe -p default gateway run'
+      }),
+      true
+    )
+  })
+
+  it('does not exempt other Hermes processes', () => {
+    assert.equal(
+      isUpdaterManagedGatewayBlocker({
+        pid: 3,
+        name: 'python.exe',
+        cmdline: 'python.exe -m hermes_cli.main serve --host 0.0.0.0'
+      }),
+      false
+    )
+  })
+
+  it('clears a gateway-only scan because the CLI updater owns its lifecycle', () => {
+    assert.deepEqual(
+      filterUpdaterManagedBlockers({ kind: 'blocked', result: { blocked: true, processes: [gateway] } }),
+      { kind: 'clear', result: { blocked: false, processes: [] } }
+    )
+  })
+
+  it('preserves unrelated blockers while removing the managed gateway', () => {
+    const serve = { pid: 4, name: 'python.exe', cmdline: 'python.exe -m hermes_cli.main serve' }
+    assert.deepEqual(
+      filterUpdaterManagedBlockers({
+        kind: 'blocked',
+        result: { blocked: true, processes: [gateway, serve] }
+      }),
+      { kind: 'blocked', result: { blocked: true, processes: [serve] } }
+    )
+  })
+})
+
 // ---------------------------------------------------------------------------
 // scanVenvBlockers — subprocess with injection
 // ---------------------------------------------------------------------------
@@ -180,6 +231,22 @@ describe('scanVenvBlockers', () => {
 
   it('blocked scan returns blocked', async () => {
     assert.equal((await scanVenvBlockers('/r', execReturn(blockedJson), stubVenv)).kind, 'blocked')
+  })
+
+  it('gateway-only scan returns clear so the CLI updater can stop it', async () => {
+    const gatewayJson = JSON.stringify({
+      ok: true,
+      blocked: true,
+      processes: [
+        {
+          pid: 37748,
+          name: 'python.exe',
+          cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main gateway run'
+        }
+      ]
+    })
+
+    assert.equal((await scanVenvBlockers('/r', execReturn(gatewayJson), stubVenv)).kind, 'clear')
   })
 
   it('non-zero exit is probe-failure', async () => {
