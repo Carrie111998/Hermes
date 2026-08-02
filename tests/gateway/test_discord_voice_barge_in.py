@@ -394,14 +394,138 @@ def test_pre_arm_inflight_pcm_cannot_join_new_playback_generation():
     prior_pcm = b"\x00" * 96_000
     playback_pcm = b"\x01" * 3_840
 
+    prior_generation = receiver._capture_generation
     receiver.begin_playback_capture(7)
+    playback_generation = receiver._capture_generation
     with receiver._lock:
-        receiver._commit_decoded_pcm_locked(100, prior_pcm, None, received_at=1.0)
-        receiver._commit_decoded_pcm_locked(100, playback_pcm, 7, received_at=2.0)
+        receiver._commit_decoded_pcm_locked(
+            100, prior_pcm, None, prior_generation, received_at=1.0
+        )
+        receiver._commit_decoded_pcm_locked(
+            100, playback_pcm, 7, playback_generation, received_at=2.0
+        )
 
     assert bytes(receiver._buffers[100]) == playback_pcm
     assert receiver._buffer_playback_tokens[100] == 7
     assert receiver.check_silence(with_context=True) == [(42, prior_pcm, None)]
+
+
+def test_capture_generation_splits_pre_playback_playback_and_post_playback_pcm():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc)
+    receiver._ssrc_to_user[100] = 42
+    prior = b"\x01" * 96_000
+    playback = b"\x02" * 96_000
+    post = b"\x03" * 96_000
+
+    pre_generation = receiver._capture_generation
+    receiver.begin_playback_capture(7)
+    playback_generation = receiver._capture_generation
+    receiver.end_playback_capture(7)
+    post_generation = receiver._capture_generation
+
+    with receiver._lock:
+        receiver._commit_decoded_pcm_locked(
+            100, playback, 7, playback_generation, received_at=1.0
+        )
+        receiver._commit_decoded_pcm_locked(
+            100, prior, None, pre_generation, received_at=2.0
+        )
+        receiver._commit_decoded_pcm_locked(
+            100, post, None, post_generation, received_at=3.0
+        )
+
+    assert receiver.flush_pending(with_context=True) == [
+        (42, playback, 7),
+        (42, prior, None),
+        (42, post, None),
+    ]
+
+
+def test_boundary_items_follow_public_two_tuple_contract_without_context():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc)
+    receiver._ssrc_to_user[100] = 42
+    pcm = b"\x01" * 96_000
+    with receiver._lock:
+        receiver._queue_completed_segment_locked(100, pcm, 7, 1)
+
+    assert receiver.check_silence(with_context=False) == [(42, pcm)]
+
+
+def test_repeated_playback_end_emits_one_drain_callback():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    drained = MagicMock()
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc, playback_drained_callback=drained)
+
+    receiver.begin_playback_capture(7)
+    receiver.end_playback_capture(7)
+    receiver.end_playback_capture(7)
+
+    drained.assert_called_once_with(7)
+
+
+def test_completed_generation_queue_is_bounded_by_items_and_bytes():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc)
+    receiver._ssrc_to_user[100] = 42
+    pcm = b"\x01" * 96_000
+
+    with receiver._lock:
+        for generation in range(receiver.MAX_BOUNDARY_SEGMENTS + 5):
+            receiver._queue_completed_segment_locked(
+                100, pcm, None, generation
+            )
+
+    stats = receiver.snapshot_transport_stats()
+    assert len(receiver._boundary_completed) == receiver.MAX_BOUNDARY_SEGMENTS
+    assert receiver._boundary_completed_bytes <= receiver.MAX_BOUNDARY_BYTES
+    assert stats["boundary_dropped_segments"] == 5
+    assert stats["boundary_dropped_bytes"] == 5 * len(pcm)
+
+
+def test_playback_boundary_defers_unknown_ssrc_resolution_until_lock_released():
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+    receiver = VoiceReceiver(vc)
+    pcm = b"\x01" * 96_000
+    receiver._buffers[100].extend(pcm)
+    receiver._last_packet_time[100] = 1.0
+    receiver._infer_user_for_ssrc = MagicMock(return_value=42)
+
+    receiver.begin_playback_capture(7)
+    receiver._infer_user_for_ssrc.assert_not_called()
+    assert receiver.check_silence(with_context=True) == [(42, pcm, None)]
+    receiver._infer_user_for_ssrc.assert_called_once_with(100)
 
 
 @pytest.mark.asyncio

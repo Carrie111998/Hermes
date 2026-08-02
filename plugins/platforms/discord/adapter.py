@@ -491,6 +491,8 @@ class VoiceReceiver:
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    MAX_BOUNDARY_SEGMENTS = 32
+    MAX_BOUNDARY_BYTES = 8 * 1024 * 1024
 
     def __init__(
         self,
@@ -532,8 +534,11 @@ class VoiceReceiver:
         # with the playback token so STT completed after playback still goes
         # through the strict phrase gate instead of the normal model path.
         self._playback_capture_token: Optional[int] = None
+        self._capture_generation = 0
         self._buffer_playback_tokens: Dict[int, Optional[int]] = {}
-        self._boundary_completed: List[Tuple[int, bytes, Optional[int]]] = []
+        self._buffer_generations: Dict[int, int] = {}
+        self._boundary_completed: List[Tuple[int, bytes, Optional[int], int]] = []
+        self._boundary_completed_bytes = 0
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
@@ -546,6 +551,7 @@ class VoiceReceiver:
         self._playback_seen_ssrcs: Dict[int, set[int]] = {}
         self._playback_inflight: Dict[int, int] = defaultdict(int)
         self._playback_ending_tokens: set[int] = set()
+        self._playback_finished_tokens: set[int] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -576,12 +582,16 @@ class VoiceReceiver:
             self._decoders.clear()
             self._ssrc_to_user.clear()
             self._playback_capture_token = None
+            self._capture_generation += 1
             self._buffer_playback_tokens.clear()
+            self._buffer_generations.clear()
             self._boundary_completed.clear()
+            self._boundary_completed_bytes = 0
             self._playback_transport_stats.clear()
             self._playback_seen_ssrcs.clear()
             self._playback_inflight.clear()
             self._playback_ending_tokens.clear()
+            self._playback_finished_tokens.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -601,6 +611,8 @@ class VoiceReceiver:
         self,
         token: int,
     ) -> Optional[Tuple[Optional[Dict[str, int]], int]]:
+        if token in self._playback_finished_tokens:
+            return None
         if token not in self._playback_ending_tokens:
             return None
         if self._playback_inflight.get(token, 0) > 0:
@@ -609,6 +621,7 @@ class VoiceReceiver:
         self._playback_inflight.pop(token, None)
         stats = self._playback_transport_stats.pop(token, None)
         seen_count = len(self._playback_seen_ssrcs.pop(token, set()))
+        self._playback_finished_tokens.add(token)
         return (dict(stats) if stats is not None else None, seen_count)
 
     @staticmethod
@@ -660,77 +673,121 @@ class VoiceReceiver:
     def begin_playback_capture(self, token: int) -> None:
         """Enable and tag inbound capture for one TTS playback."""
         with self._lock:
-            # Close any valid utterance that began before TTS as an untagged
-            # conversational segment. New PCM starts a fresh playback epoch,
-            # so the two generations can never be concatenated or relabeled.
+            if self._playback_capture_token == token:
+                return
             for ssrc in list(self._buffers):
                 self._complete_buffer_locked(ssrc)
+            self._capture_generation += 1
             self._playback_capture_token = token
             self._playback_transport_stats[token] = defaultdict(int)
             self._playback_seen_ssrcs[token] = set()
             self._playback_inflight[token] = 0
             self._playback_ending_tokens.discard(token)
-            # Capture mode must override any echo-prevention pause left on the
-            # real receiver. Set the token first so the SocketReader thread
-            # cannot admit an untagged playback packet during the transition.
+            self._playback_finished_tokens.discard(token)
             self._paused = False
         logger.info("Discord voice playback capture armed (token=%s)", token)
 
+    def _queue_completed_segment_locked(
+        self,
+        ssrc: int,
+        pcm: bytes,
+        playback_token: Optional[int],
+        generation: int,
+    ) -> None:
+        if not pcm:
+            return
+        size = len(pcm)
+        self._boundary_completed.append((ssrc, pcm, playback_token, generation))
+        self._boundary_completed_bytes += size
+        while (
+            len(self._boundary_completed) > self.MAX_BOUNDARY_SEGMENTS
+            or self._boundary_completed_bytes > self.MAX_BOUNDARY_BYTES
+        ):
+            _old_ssrc, old_pcm, _old_token, _old_generation = (
+                self._boundary_completed.pop(0)
+            )
+            self._boundary_completed_bytes -= len(old_pcm)
+            self._transport_stats["boundary_dropped_segments"] += 1
+            self._transport_stats["boundary_dropped_bytes"] += len(old_pcm)
+
     def _complete_buffer_locked(self, ssrc: int) -> None:
-        """Move one complete-enough PCM generation to the endpoint queue."""
+        """Move one complete-enough PCM generation to the bounded queue."""
         buf = self._buffers.get(ssrc)
         if buf:
             duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
             if duration >= self.MIN_SPEECH_DURATION:
-                user_id = self._ssrc_to_user.get(ssrc, 0)
-                if not user_id:
-                    user_id = self._infer_user_for_ssrc(ssrc)
-                if user_id:
-                    self._boundary_completed.append(
-                        (
-                            user_id,
-                            bytes(buf),
-                            self._buffer_playback_tokens.get(ssrc),
-                        )
-                    )
+                self._queue_completed_segment_locked(
+                    ssrc,
+                    bytes(buf),
+                    self._buffer_playback_tokens.get(ssrc),
+                    self._buffer_generations.get(ssrc, self._capture_generation),
+                )
         self._buffers.pop(ssrc, None)
         self._last_packet_time.pop(ssrc, None)
         self._buffer_playback_tokens.pop(ssrc, None)
+        self._buffer_generations.pop(ssrc, None)
 
     def _commit_decoded_pcm_locked(
         self,
         ssrc: int,
         pcm: bytes,
         playback_token: Optional[int],
+        generation: int,
         *,
         received_at: float,
     ) -> None:
-        """Append PCM without crossing an entry-pinned playback generation."""
+        """Append PCM without crossing an entry-pinned capture generation."""
         existing = self._buffers.get(ssrc)
+        existing_generation = self._buffer_generations.get(ssrc)
         existing_token = self._buffer_playback_tokens.get(ssrc)
-        if existing and existing_token != playback_token:
+        if existing and (
+            existing_generation != generation or existing_token != playback_token
+        ):
             self._complete_buffer_locked(ssrc)
 
         self._buffers[ssrc].extend(pcm)
         self._last_packet_time[ssrc] = received_at
         self._buffer_playback_tokens[ssrc] = playback_token
+        self._buffer_generations[ssrc] = generation
         if playback_token is not None:
             max_playback_bytes = self.SAMPLE_RATE * self.CHANNELS * 2 * 15
             overflow = len(self._buffers[ssrc]) - max_playback_bytes
             if overflow > 0:
                 del self._buffers[ssrc][:overflow]
 
+    def _drain_boundary_locked(self) -> List[Tuple[int, bytes, Optional[int], int]]:
+        segments = self._boundary_completed
+        self._boundary_completed = []
+        self._boundary_completed_bytes = 0
+        return segments
+
     def end_playback_capture(self, token: int) -> None:
         """Stop new tagging; finalize after token-pinned callbacks drain."""
+        newly_ending = False
         with self._lock:
+            if token in self._playback_finished_tokens:
+                return
+            known = (
+                self._playback_capture_token == token
+                or token in self._playback_transport_stats
+                or token in self._playback_inflight
+                or token in self._playback_ending_tokens
+            )
+            if not known:
+                return
             if self._playback_capture_token == token:
+                for ssrc in list(self._buffers):
+                    self._complete_buffer_locked(ssrc)
                 self._playback_capture_token = None
-            self._playback_ending_tokens.add(token)
+                self._capture_generation += 1
+            if token not in self._playback_ending_tokens:
+                self._playback_ending_tokens.add(token)
+                newly_ending = True
             inflight = self._playback_inflight.get(token, 0)
             summary = self._take_playback_summary_locked(token)
         if summary is not None:
             self._finish_playback_summary(token, summary)
-        else:
+        elif newly_ending:
             logger.info(
                 "Discord voice playback capture draining token=%s inflight=%d",
                 token,
@@ -789,6 +846,7 @@ class VoiceReceiver:
         packet_stats: Dict[str, int] = defaultdict(int)
         packet_stats["udp_callbacks"] = 1
         packet_token: Optional[int] = None
+        packet_generation = 0
         decoded_pcm: Optional[bytes] = None
         decoded_ssrc: Optional[int] = None
         seen_ssrc: Optional[int] = None
@@ -800,6 +858,7 @@ class VoiceReceiver:
             running = self._running
             paused = self._paused
             packet_token = self._playback_capture_token
+            packet_generation = self._capture_generation
             if packet_token is not None:
                 self._playback_inflight[packet_token] += 1
 
@@ -1000,6 +1059,7 @@ class VoiceReceiver:
                             decoded_ssrc,
                             decoded_pcm,
                             packet_token,
+                            packet_generation,
                             received_at=time.monotonic(),
                         )
                     if packet_token is not None:
@@ -1069,53 +1129,83 @@ class VoiceReceiver:
             pass
         return 0
 
+    def _resolve_completed_segments(
+        self,
+        segments: List[Tuple[int, bytes, Optional[int], int]],
+        ssrc_user_map: Dict[int, int],
+        *,
+        with_context: bool,
+    ) -> Tuple[list, set[int]]:
+        completed = []
+        resolved_ssrcs: set[int] = set()
+        for ssrc, pcm, playback_token, _generation in segments:
+            user_id = ssrc_user_map.get(ssrc, 0)
+            if not user_id:
+                user_id = self._infer_user_for_ssrc(ssrc)
+            if not user_id:
+                continue
+            resolved_ssrcs.add(ssrc)
+            item = (user_id, pcm, playback_token)
+            completed.append(item if with_context else item[:2])
+        return completed, resolved_ssrcs
+
     def check_silence(self, *, with_context: bool = False) -> list:
         """Return completed utterances, optionally with playback tokens."""
         now = time.monotonic()
-        completed = []
         endpoint_logs = []
 
         with self._lock:
-            completed.extend(self._boundary_completed)
-            self._boundary_completed.clear()
+            segments = self._drain_boundary_locked()
             ssrc_user_map = dict(self._ssrc_to_user)
-            ssrc_list = list(self._buffers.keys())
-
-            for ssrc in ssrc_list:
+            for ssrc in list(self._buffers):
                 last_time = self._last_packet_time.get(ssrc, now)
                 silence_duration = now - last_time
                 buf = self._buffers[ssrc]
-                # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        # SSRC not mapped (SPEAKING event missing after bot rejoin).
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
-                        playback_token = self._buffer_playback_tokens.get(ssrc)
-                        item = (user_id, bytes(buf), playback_token)
-                        completed.append(item if with_context else item[:2])
-                        if playback_token is not None:
-                            endpoint_logs.append(
-                                (
-                                    playback_token,
-                                    len(buf),
-                                    round(buf_duration * 1000),
-                                    round(silence_duration * 1000),
-                                )
+                if (
+                    silence_duration >= self.SILENCE_THRESHOLD
+                    and buf_duration >= self.MIN_SPEECH_DURATION
+                ):
+                    playback_token = self._buffer_playback_tokens.get(ssrc)
+                    segments.append(
+                        (
+                            ssrc,
+                            bytes(buf),
+                            playback_token,
+                            self._buffer_generations.get(
+                                ssrc, self._capture_generation
+                            ),
+                        )
+                    )
+                    if playback_token is not None:
+                        endpoint_logs.append(
+                            (
+                                ssrc,
+                                playback_token,
+                                len(buf),
+                                round(buf_duration * 1000),
+                                round(silence_duration * 1000),
                             )
-                    self._buffers[ssrc] = bytearray()
-                    self._last_packet_time.pop(ssrc, None)
-                    self._buffer_playback_tokens.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
-                    # Stale buffer with no valid user — discard
+                        )
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
                     self._buffer_playback_tokens.pop(ssrc, None)
+                    self._buffer_generations.pop(ssrc, None)
+                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                    self._buffers.pop(ssrc, None)
+                    self._last_packet_time.pop(ssrc, None)
+                    self._buffer_playback_tokens.pop(ssrc, None)
+                    self._buffer_generations.pop(ssrc, None)
 
-        for playback_token, pcm_bytes, duration_ms, silence_ms in endpoint_logs:
+        completed, resolved_ssrcs = self._resolve_completed_segments(
+            segments,
+            ssrc_user_map,
+            with_context=with_context,
+        )
+        for ssrc, playback_token, pcm_bytes, duration_ms, silence_ms in endpoint_logs:
+            if ssrc not in resolved_ssrcs:
+                continue
             logger.info(
                 "Discord voice endpoint playback=%s pcm_bytes=%d "
                 "duration_ms=%d silence_ms=%d mapped=true",
@@ -1128,37 +1218,47 @@ class VoiceReceiver:
 
     def flush_pending(self, *, with_context: bool = False) -> list:
         """Return pending utterances, optionally with playback tokens."""
-        completed = []
         flush_logs = []
 
         with self._lock:
-            completed.extend(self._boundary_completed)
-            self._boundary_completed.clear()
+            segments = self._drain_boundary_locked()
             ssrc_user_map = dict(self._ssrc_to_user)
             for ssrc, buf in list(self._buffers.items()):
-                # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
                 if buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
-                        playback_token = self._buffer_playback_tokens.get(ssrc)
-                        item = (user_id, bytes(buf), playback_token)
-                        completed.append(item if with_context else item[:2])
-                        if playback_token is not None:
-                            flush_logs.append(
-                                (
-                                    playback_token,
-                                    len(buf),
-                                    round(buf_duration * 1000),
-                                )
+                    playback_token = self._buffer_playback_tokens.get(ssrc)
+                    segments.append(
+                        (
+                            ssrc,
+                            bytes(buf),
+                            playback_token,
+                            self._buffer_generations.get(
+                                ssrc, self._capture_generation
+                            ),
+                        )
+                    )
+                    if playback_token is not None:
+                        flush_logs.append(
+                            (
+                                ssrc,
+                                playback_token,
+                                len(buf),
+                                round(buf_duration * 1000),
                             )
+                        )
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
                 self._buffer_playback_tokens.pop(ssrc, None)
+                self._buffer_generations.pop(ssrc, None)
 
-        for playback_token, pcm_bytes, duration_ms in flush_logs:
+        completed, resolved_ssrcs = self._resolve_completed_segments(
+            segments,
+            ssrc_user_map,
+            with_context=with_context,
+        )
+        for ssrc, playback_token, pcm_bytes, duration_ms in flush_logs:
+            if ssrc not in resolved_ssrcs:
+                continue
             logger.info(
                 "Discord voice flush playback=%s pcm_bytes=%d "
                 "duration_ms=%d mapped=true",
