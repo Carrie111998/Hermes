@@ -2370,6 +2370,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
+    "_session_temperature_overrides",
     "_session_service_tier_overrides",
     "_pending_model_notes",
     "_last_resolved_model",
@@ -4436,6 +4437,15 @@ class TurnRunner:
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
+        # Inject the session/global temperature into the route's
+        # request_overrides so the transport applies it on every request.
+        _tmp_temp = self._runner._resolve_session_temperature(source=ctx.source)
+        if _tmp_temp is not None:
+            turn_route["request_overrides"] = {
+                **(turn_route.get("request_overrides") or {}),
+                "temperature": _tmp_temp,
+            }
+
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
         # schemas for prompt cache hits.
@@ -5657,6 +5667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "_pending_one_turn_model_restores"
     )
     _session_reasoning_overrides = legacy_dict_property("_session_reasoning_overrides")
+    _session_temperature_overrides = legacy_dict_property("_session_temperature_overrides")
     _session_service_tier_overrides = legacy_dict_property(
         "_session_service_tier_overrides"
     )
@@ -8048,6 +8059,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+
+    def _resolve_session_temperature(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+    ) -> Optional[float]:
+        """Resolve the effective sampling temperature for a session.
+
+        Priority: session-scoped ``/temperature`` override > global config
+        ``model.temperature`` > None (server default). The provider contract
+        and the ``agent.request_overrides`` session value are both enforced in
+        the transport, which outranks this global default.
+        """
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+
+        if resolved_session_key:
+            _overrides = self._session_temperature_overrides
+            if resolved_session_key in _overrides:
+                return _overrides[resolved_session_key]
+        # Fall back to global config model.temperature
+        cfg = _load_gateway_runtime_config()
+        _mcfg = cfg.get("model") or {}
+        if isinstance(_mcfg, dict):
+            _t = _mcfg.get("temperature")
+            if isinstance(_t, (int, float)) and not isinstance(_t, bool):
+                return float(_t)
+        return None
+
+    def _set_session_temperature_override(
+        self,
+        session_key: str,
+        value: Optional[float],
+    ) -> None:
+        """Set or clear the session-scoped temperature override."""
+        if not session_key:
+            return
+        _overrides = self._session_temperature_overrides
+        if value is None:
+            _overrides.pop(session_key, None)
+        else:
+            _overrides[session_key] = value
 
     def _resolve_session_service_tier(
         self,
@@ -14863,6 +14921,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
 
+        if canonical == "temperature":
+            return await self._handle_temperature_command(event)
+
         if canonical == "memory":
             return await self._handle_memory_command(event)
 
@@ -19137,6 +19198,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+
+            # Inject the session/global temperature into the route's
+            # request_overrides so the transport applies it on every request.
+            _tmp_temp = self._resolve_session_temperature(source=source)
+            if _tmp_temp is not None:
+                turn_route["request_overrides"] = {
+                    **(turn_route.get("request_overrides") or {}),
+                    "temperature": _tmp_temp,
+                }
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).

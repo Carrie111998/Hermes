@@ -222,6 +222,16 @@ gateway:
     set_global_save_failed:    "🧠 ✓ Reasoning effort set to `{effort}` (session only — config save failed)\n_(takes effect on next message)_"
     set_session:               "🧠 ✓ Reasoning effort set to `{effort}` (session only — add `--global` to persist)\n_(takes effect on next message)_"
 
+  temperature:
+    status:                    "🌡️ **Temperature:** `{value}`\n\n_Usage:_ `/temperature <0.0-2.0> [--global]` or `/temperature reset`"
+    reset_global_unsupported:  "⚠️ `/temperature reset --global` is not supported. Use `/temperature <value> --global` to change the global default."
+    reset_done:                "🌡️ ✓ Session temperature override cleared; falling back to global config/server default."
+    unknown_arg:               "⚠️ Unknown argument: `{arg}`\n\n**Valid:** a number between `0.0` and `2.0`, or `reset`\n**Persist:** add `--global` to save beyond this session"
+    out_of_range:              "⚠️ Temperature out of range: `{value}` (allowed `0.0` – `2.0`)"
+    set_global:                "🌡️ ✓ Temperature set to `{value}` (saved to config)\n_(takes effect on next message)_"
+    set_global_save_failed:    "🌡️ ✓ Temperature set to `{value}` (session only — config save failed)\n_(takes effect on next message)_"
+    set_session:               "🌡️ ✓ Temperature set to `{value}` (session only — add `--global` to persist)\n_(takes effect on next message)_"
+
   reload_mcp:
     cancelled:             "🟡 /reload-mcp cancelled. MCP tools unchanged."
     always_followup:       "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml."

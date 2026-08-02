@@ -318,6 +318,8 @@ class ChatCompletionsTransport(ProviderTransport):
             qwen_prepare_inplace_fn: callable | None — in-place variant for deepcopied lists
             qwen_session_metadata: dict | None
             # Temperature
+            temperature: Any — global default from config model.temperature
+                (used when no provider contract and no session override)
             fixed_temperature: Any — from _fixed_temperature_for_model()
             omit_temperature: bool
             # Reasoning
@@ -502,10 +504,32 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
-        # Request overrides last (service_tier etc.)
+        # Temperature resolution — precedence (highest first):
+        #   provider contract (omit_temperature / fixed_temperature)
+        #   > session override (request_overrides["temperature"], applied next)
+        #   > global config (model.temperature, params["temperature"])
+        #   > server default (no key sent)
+        if params.get("omit_temperature"):
+            pass  # provider contract — send nothing
+        elif params.get("fixed_temperature") is not None:
+            api_kwargs["temperature"] = params["fixed_temperature"]
+        else:
+            tmp = params.get("temperature")
+            if tmp is not None:
+                api_kwargs["temperature"] = tmp
+
+        # Request overrides last (service_tier etc.). A session temperature
+        # override wins over the global config above, but never overrides a
+        # provider contract (omit_temperature / fixed_temperature).
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            _has_temp_contract = params.get("omit_temperature") or params.get(
+                "fixed_temperature"
+            ) is not None
+            for k, v in overrides.items():
+                if k == "temperature" and _has_temp_contract:
+                    continue
+                api_kwargs[k] = v
 
         return api_kwargs
 
@@ -619,9 +643,17 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides (user config)
         overrides = params.get("request_overrides")
         if overrides:
+            # Provider temperature contract (OMIT_TEMPERATURE / fixed value)
+            # wins over a session override — never let user config override it.
+            _has_temp_contract = (
+                profile.fixed_temperature is OMIT_TEMPERATURE
+                or profile.fixed_temperature is not None
+            )
             for k, v in overrides.items():
                 if k == "extra_body" and isinstance(v, dict):
                     extra_body.update(v)
+                elif k == "temperature" and _has_temp_contract:
+                    continue
                 else:
                     api_kwargs[k] = v
 

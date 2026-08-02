@@ -463,6 +463,11 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            # Re-apply the session temperature override across agent re-inits
+            # (the CLI sets self.agent = None on /model and /reasoning).
+            _st = getattr(self, "_session_temperature", None)
+            if _st is not None:
+                request_overrides = {**(request_overrides or {}), "temperature": _st}
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
