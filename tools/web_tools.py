@@ -769,6 +769,18 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             primary_response = None
             primary_exception = None
             for index, candidate in enumerate(providers_to_try):
+                # Re-check interruption before each candidate dispatch so a
+                # stop signal during/after the primary doesn't trigger a
+                # fallback network request. A provider may return an
+                # ``Interrupted`` failure from its own internal check; without
+                # this guard the loop would proceed to the next fallback.
+                if index > 0 and is_interrupted():
+                    response_data = primary_response or {
+                        "success": False,
+                        "error": "Interrupted",
+                    }
+                    break
+
                 logger.info(
                     "Web search via %s: '%s' (limit: %d)",
                     candidate.name,

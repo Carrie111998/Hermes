@@ -476,6 +476,92 @@ class TestWebSearchErrorHandling:
         primary_provider.search.assert_called_once_with("test query", 3)
         fallback_provider.search.assert_called_once_with("test query", 3)
 
+    def test_search_runtime_fallback_skipped_when_interrupted(self):
+        """If the primary returns an Interrupted failure, the loop must not
+        dispatch a fallback provider (no extra network request)."""
+        import tools.web_tools
+
+        primary_provider = MagicMock()
+        primary_provider.name = "tavily"
+        primary_provider.supports_search.return_value = True
+        primary_provider.search.return_value = {
+            "success": False,
+            "error": "Interrupted",
+        }
+
+        fallback_provider = MagicMock()
+        fallback_provider.name = "ddgs"
+        fallback_provider.supports_search.return_value = True
+        fallback_provider.is_available.return_value = True
+
+        providers = {"tavily": primary_provider, "ddgs": fallback_provider}
+        # is_interrupted returns False for the initial check, True after the
+        # primary fails (simulating a stop signal arriving mid-search).
+        interrupt_values = iter([False, True])
+        with patch("tools.web_tools._get_search_backend", return_value="tavily"), \
+             patch("tools.web_tools._get_capability_fallback_backends", return_value=["ddgs"]), \
+             patch("agent.web_search_registry.get_provider", side_effect=providers.get), \
+             patch("tools.interrupt.is_interrupted", side_effect=lambda: next(interrupt_values)), \
+             patch.object(tools.web_tools._debug, "log_call"), \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+        assert result["success"] is False
+        assert result["error"] == "Interrupted"
+        fallback_provider.search.assert_not_called()
+
+    def test_search_runtime_fallback_preserves_primary_failure_when_all_fail(self):
+        """When the primary and all fallbacks fail, the original primary
+        failure response is returned (not the last fallback's failure)."""
+        import tools.web_tools
+
+        primary_provider = MagicMock()
+        primary_provider.name = "tavily"
+        primary_provider.supports_search.return_value = True
+        primary_provider.search.return_value = {
+            "success": False,
+            "error": "quota exhausted",
+        }
+
+        fallback_provider = MagicMock()
+        fallback_provider.name = "ddgs"
+        fallback_provider.supports_search.return_value = True
+        fallback_provider.is_available.return_value = True
+        fallback_provider.search.return_value = {
+            "success": False,
+            "error": "rate limited",
+        }
+
+        providers = {"tavily": primary_provider, "ddgs": fallback_provider}
+        with patch("tools.web_tools._get_search_backend", return_value="tavily"), \
+             patch("tools.web_tools._get_capability_fallback_backends", return_value=["ddgs"]), \
+             patch("agent.web_search_registry.get_provider", side_effect=providers.get), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.object(tools.web_tools._debug, "log_call"), \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
+
+        assert result["success"] is False
+        assert result["error"] == "quota exhausted"
+        primary_provider.search.assert_called_once_with("test query", 3)
+        fallback_provider.search.assert_called_once_with("test query", 3)
+
+    def test_search_runtime_fallback_uses_shared_fallback_backends_config(self):
+        """The shared ``web.fallback_backends`` config key is used when no
+        capability-specific ``web.search_fallback_backends`` is set."""
+        from tools.web_tools import _get_capability_fallback_backends
+
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={
+                "fallback_backends": ["ddgs", "brave-free"],
+            },
+        ):
+            assert _get_capability_fallback_backends("search") == [
+                "ddgs",
+                "brave-free",
+            ]
+
 
 class TestCheckWebApiKey:
     """Test suite for check_web_api_key() unified availability check."""
