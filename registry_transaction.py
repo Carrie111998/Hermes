@@ -257,15 +257,13 @@ class MappingRegistry:
         prepared: _PreparedMapping,
     ) -> None:
         self.validate_prepared_locked(snapshot, prepared)
-        self._items.clear()
-        self._items.update(prepared._items)
+        self._items = dict(prepared._items)
         self._generation = max(self._generation, prepared._generation) + 1
 
     def restore_snapshot_locked(self, snapshot: _MappingSnapshot) -> None:
         """Restore an opaque snapshot exactly while the registry lock is held."""
         self._validate_snapshot(snapshot)
-        self._items.clear()
-        self._items.update(dict(snapshot._items))
+        self._items = dict(snapshot._items)
         self._generation = snapshot._generation
 
 
