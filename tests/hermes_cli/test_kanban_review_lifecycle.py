@@ -224,7 +224,7 @@ def test_webhook_replay_preserves_native_review_claim(board):
         assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
 
 
-def test_webhook_first_native_submission_reconciles_one_card(board):
+def test_webhook_first_native_submission_preserves_native_card(board):
     with board as conn:
         webhook_id = kb.ingest_pull_request(
             conn, repository="acme/repo", number=1, head_sha="a" * 40,
@@ -237,9 +237,72 @@ def test_webhook_first_native_submission_reconciles_one_card(board):
             conn, implementation_id, reviewer="reviewer", summary="handoff",
             metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
         )
-        assert kb.get_task(conn, webhook_id).status == "review"
-        assert kb.get_task(conn, implementation_id).status == "archived"
+        assert kb.get_task(conn, webhook_id).status == "archived"
+        assert kb.get_task(conn, implementation_id).status == "review"
         assert conn.execute("SELECT COUNT(*) AS n FROM tasks WHERE status != 'archived'").fetchone()["n"] == 1
+
+
+def test_webhook_first_claimed_review_run_is_finalized(board):
+    with board as conn:
+        webhook_id = kb.ingest_pull_request(
+            conn, repository="acme/repo", number=3, head_sha="c" * 40,
+            title="Webhook review", reviewer="reviewer",
+        )
+        assert webhook_id is not None
+        webhook_review = kb.claim_review_task(conn, webhook_id, claimer="worker:reviewer")
+        assert webhook_review is not None
+        webhook_run_id = webhook_review.current_run_id
+
+        implementation_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, implementation_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="handoff",
+            metadata={**REVIEW_METADATA, "pr_url": "https://github.com/acme/repo/pull/3",
+                      "repo": "acme/repo", "number": 3, "head_sha": "c" * 40},
+            expected_run_id=implementation.current_run_id,
+        )
+
+        merged_run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (webhook_run_id,),
+        ).fetchone()
+        assert merged_run["status"] == "review"
+        assert merged_run["outcome"] == "submitted_for_review"
+        assert merged_run["ended_at"] is not None
+        assert kb.get_task(conn, webhook_id).status == "archived"
+        assert kb.get_task(conn, implementation_id).status == "review"
+
+
+def test_webhook_first_reconciliation_merges_duplicate_subscriptions(board):
+    with board as conn:
+        webhook_id = kb.ingest_pull_request(
+            conn, repository="acme/repo", number=2, head_sha="b" * 40,
+            title="Webhook review", reviewer="reviewer",
+        )
+        implementation_id = kb.create_task(conn, title="implement", assignee="dev")
+        for task_id, cursor in ((webhook_id, 3), (implementation_id, 7)):
+            conn.execute(
+                "INSERT INTO kanban_notify_subs "
+                "(task_id, platform, chat_id, thread_id, created_at, last_event_id) "
+                "VALUES (?, 'telegram', 'same-chat', 'same-thread', 1, ?)",
+                (task_id, cursor),
+            )
+        conn.commit()
+        implementation = kb.claim_task(conn, implementation_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="handoff",
+            metadata={**REVIEW_METADATA, "pr_url": "https://github.com/acme/repo/pull/2",
+                      "repo": "acme/repo", "number": 2, "head_sha": "b" * 40},
+            expected_run_id=implementation.current_run_id,
+        )
+        row = conn.execute(
+            "SELECT task_id, last_event_id FROM kanban_notify_subs "
+            "WHERE platform='telegram' AND chat_id='same-chat' AND thread_id='same-thread'"
+        ).fetchone()
+        assert row["task_id"] == implementation_id
+        assert row["last_event_id"] == 7
 
 
 def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board):
