@@ -543,7 +543,7 @@ same auth gate as the rest of `/api/`.
 | `GET /api/ops/checkpoints` · `POST .../prune` | Inspect / prune the `/rollback` store |
 | `POST /api/ops/hooks` · `DELETE /api/ops/hooks` | Create / remove a shell hook (consent-gated) |
 | `GET /api/system/stats` | Host stats — OS, CPU, memory, disk, uptime |
-| `GET /api/dashboard/remote-access` | The configured dashboard public URL (for [Continue on phone](#continue-a-session-on-your-phone)); empty when unset |
+| `GET /api/dashboard/remote-access` | The configured dashboard public URL (for [Link phone](#link-a-phone)); empty when unset |
 | `POST /api/auth/handoff-ticket` | Mint a single-use phone handoff ticket `{session_id, profile?}` (full desk only) |
 | `POST /api/auth/handoff-consume` | Same-origin fragment bootstrap exchange for a resume-scoped phone cookie |
 | `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git/pip installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 6h cache |
@@ -1107,9 +1107,9 @@ Instead of the in-app setting, you can point the desktop at a backend with an en
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value; otherwise the signing key is regenerated per boot.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) instead of a reachable address, or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
 
-## Continue a session on your phone
+## Link a phone
 
-Hermes Desktop can hand the conversation you're looking at to your phone: **session menu → Continue on phone** shows a QR code that opens the same session in this dashboard's Chat tab.
+Hermes Desktop can link the conversation you're looking at to your phone: **session menu → Link phone** shows a QR code that opens the same session in this dashboard's Chat tab.
 
 The QR encodes a **single-use handoff URL**:
 

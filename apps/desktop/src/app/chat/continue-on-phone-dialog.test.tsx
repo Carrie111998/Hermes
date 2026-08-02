@@ -55,9 +55,9 @@ describe('ContinueOnPhoneDialog', () => {
       ctrlKey: false,
       pointerType: 'mouse'
     })
-    fireEvent.click(await screen.findByText('Continue on phone'))
+    fireEvent.click(await screen.findByText('Link phone'))
 
-    expect(await screen.findByRole('dialog', { name: 'Continue on phone' })).toBeTruthy()
+    expect(await screen.findByRole('dialog', { name: 'Link phone' })).toBeTruthy()
   })
 
   it('shows a scannable continuation link and can open the same URL', async () => {

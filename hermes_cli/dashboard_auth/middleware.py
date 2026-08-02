@@ -401,7 +401,7 @@ async def gated_auth_middleware(
             record = authenticate(linked_secret)
             if record is not None:
                 from hermes_cli.dashboard_auth.base import Session
-                session = Session(user_id=record["user_id"], email=record["email"], display_name=record["display_name"], org_id=record["org_id"], provider=record["provider"], expires_at=0, access_token="", refresh_token="", scopes=("resume",), bound_session_id=record["session_id"], bound_profile=record["profile"], device_id=record["id"])
+                session = Session(user_id=record["id"], email="", display_name=record["label"], org_id="", provider="linked-device", expires_at=0, access_token="", refresh_token="", scopes=("resume",), bound_session_id=record["session_id"], bound_profile=record["profile"], device_id=record["id"])
                 request.state.session = session
                 denied = _scope_denial_response(request, session)
                 if denied is not None:
@@ -458,12 +458,7 @@ async def gated_auth_middleware(
     # good refresh token — defeating the whole transparent-refresh feature.
     session = None
     if at:
-        # Handoff-minted cookie ATs are verified first via a process-local
-        # HMAC path. They carry scopes=("resume",) only — never superuser /
-        # API_SERVER_KEY / wildcard — and never a refresh token.
-        from hermes_cli.dashboard_auth.ws_tickets import verify_handoff_session_token
-
-        session = verify_handoff_session_token(at)
+        session = None
         if session is None:
             # Try every registered provider's verify_session in turn. A provider
             # that doesn't recognise the token returns None and we move on; the
@@ -674,8 +669,7 @@ def consume_handoff_response(
     if previous:
         from hermes_cli.dashboard_auth.linked_devices import authenticate
         previous_record = authenticate(previous)
-    identity = {key: str(info.get(key) or "") for key in ("user_id", "email", "display_name", "org_id", "provider")}
-    device_id, secret = create_or_rotate(existing_id=str(previous_record["id"]) if previous_record else "", label=device_label(request.headers.get("user-agent", "")), session_id=str(info.get("session_id") or ""), profile=str(info.get("profile") or ""), identity=identity)
+    _device_id, secret = create_or_rotate(existing_id=str(previous_record["id"]) if previous_record else "", label=device_label(request.headers.get("user-agent", "")), session_id=str(info.get("session_id") or ""), profile=str(info.get("profile") or ""))
     # F-02: redirect from ticket-bound targets only (ignore client query).
     location = handoff_redirect_location(
         info,

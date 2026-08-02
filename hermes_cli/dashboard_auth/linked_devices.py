@@ -30,9 +30,8 @@ def _db() -> sqlite3.Connection:
     db = sqlite3.connect(_path())
     db.execute("""CREATE TABLE IF NOT EXISTS linked_devices (
         id TEXT PRIMARY KEY, credential_hash BLOB NOT NULL, label TEXT NOT NULL,
-        session_id TEXT NOT NULL, profile TEXT NOT NULL, user_id TEXT NOT NULL,
-        email TEXT NOT NULL, display_name TEXT NOT NULL, org_id TEXT NOT NULL,
-        provider TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+        session_id TEXT NOT NULL, profile TEXT NOT NULL,
+        created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
         revoked_at INTEGER
     )""")
     return db
@@ -51,16 +50,16 @@ def device_label(user_agent: str) -> str:
     return "Browser"
 
 
-def create_or_rotate(*, existing_id: str = "", label: str, session_id: str, profile: str, identity: dict[str, str]) -> tuple[str, str]:
+def create_or_rotate(*, existing_id: str = "", label: str, session_id: str, profile: str) -> tuple[str, str]:
     now = int(time.time()); device_id = existing_id or f"dev_{uuid.uuid4().hex}"
-    secret = secrets.token_urlsafe(48)  # 288 bits before URL encoding
-    values = (device_id, _hash(secret), label, session_id, profile, identity["user_id"], identity["email"], identity["display_name"], identity["org_id"], identity["provider"], now, now)
+    secret = secrets.token_urlsafe(48)  # 384 bits of random input entropy
+    values = (device_id, _hash(secret), label, session_id, profile, now, now)
     with _db() as db:
         if existing_id:
-            db.execute("""UPDATE linked_devices SET credential_hash=?, label=?, session_id=?, profile=?, user_id=?, email=?, display_name=?, org_id=?, provider=?, last_seen_at=?, revoked_at=NULL WHERE id=?""", (values[1], *values[2:10], now, device_id))
+            db.execute("""UPDATE linked_devices SET credential_hash=?, label=?, session_id=?, profile=?, last_seen_at=?, revoked_at=NULL WHERE id=?""", (values[1], values[2], values[3], values[4], now, device_id))
             if db.total_changes == 0: existing_id = ""
         if not existing_id:
-            db.execute("INSERT INTO linked_devices VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)", values)
+            db.execute("INSERT INTO linked_devices VALUES (?, ?, ?, ?, ?, ?, ?, NULL)", values)
     return device_id, secret
 
 
@@ -68,13 +67,13 @@ def authenticate(secret: str) -> dict[str, Any] | None:
     if not secret: return None
     now = int(time.time())
     with _db() as db:
-        row = db.execute("SELECT id, credential_hash, label, session_id, profile, user_id, email, display_name, org_id, provider, created_at, last_seen_at, revoked_at FROM linked_devices WHERE revoked_at IS NULL").fetchall()
+        row = db.execute("SELECT id, credential_hash, label, session_id, profile, created_at, last_seen_at, revoked_at FROM linked_devices WHERE revoked_at IS NULL").fetchall()
         candidate = _hash(secret)
         for item in row:
             if secrets.compare_digest(item[1], candidate):
-                if now - item[11] > DEVICE_COOKIE_TTL_SECONDS: return None
+                if now - item[6] > DEVICE_COOKIE_TTL_SECONDS: return None
                 db.execute("UPDATE linked_devices SET last_seen_at=? WHERE id=?", (now, item[0]))
-                keys = ("id", "credential_hash", "label", "session_id", "profile", "user_id", "email", "display_name", "org_id", "provider", "created_at", "last_seen_at", "revoked_at")
+                keys = ("id", "credential_hash", "label", "session_id", "profile", "created_at", "last_seen_at", "revoked_at")
                 return dict(zip(keys, item))
     return None
 

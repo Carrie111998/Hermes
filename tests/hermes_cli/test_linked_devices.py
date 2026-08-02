@@ -6,13 +6,9 @@ import sqlite3
 from hermes_cli.dashboard_auth import linked_devices
 
 
-def _identity():
-    return {"user_id": "u", "email": "", "display_name": "", "org_id": "", "provider": "stub"}
-
-
 def test_linked_device_persists_hash_without_plaintext_and_authenticates(monkeypatch, tmp_path):
     monkeypatch.setattr(linked_devices, "get_hermes_home", lambda: tmp_path)
-    device_id, credential = linked_devices.create_or_rotate(label="iPhone", session_id="s", profile="default", identity=_identity())
+    device_id, credential = linked_devices.create_or_rotate(label="iPhone", session_id="s", profile="default")
     assert linked_devices.authenticate(credential)["id"] == device_id
     with sqlite3.connect(tmp_path / "linked_devices.sqlite3") as db:
         assert credential not in repr(db.execute("SELECT * FROM linked_devices").fetchall())
@@ -20,8 +16,8 @@ def test_linked_device_persists_hash_without_plaintext_and_authenticates(monkeyp
 
 def test_linked_device_rotation_and_revocation(monkeypatch, tmp_path):
     monkeypatch.setattr(linked_devices, "get_hermes_home", lambda: tmp_path)
-    device_id, old = linked_devices.create_or_rotate(label="Browser", session_id="s", profile="", identity=_identity())
-    same_id, new = linked_devices.create_or_rotate(existing_id=device_id, label="Browser", session_id="s", profile="", identity=_identity())
+    device_id, old = linked_devices.create_or_rotate(label="Browser", session_id="s", profile="")
+    same_id, new = linked_devices.create_or_rotate(existing_id=device_id, label="Browser", session_id="s", profile="")
     assert same_id == device_id and linked_devices.authenticate(old) is None
     assert len(linked_devices.list_devices()) == 1
     assert linked_devices.revoke(device_id) and linked_devices.authenticate(new) is None
@@ -31,7 +27,7 @@ def test_linked_device_sliding_expiry(monkeypatch, tmp_path):
     monkeypatch.setattr(linked_devices, "get_hermes_home", lambda: tmp_path)
     now = {"value": 1000}
     monkeypatch.setattr(linked_devices.time, "time", lambda: now["value"])
-    _, credential = linked_devices.create_or_rotate(label="iPad", session_id="s", profile="", identity=_identity())
+    _, credential = linked_devices.create_or_rotate(label="iPad", session_id="s", profile="")
     now["value"] += linked_devices.DEVICE_COOKIE_TTL_SECONDS - 1
     assert linked_devices.authenticate(credential) is not None
     now["value"] += linked_devices.DEVICE_COOKIE_TTL_SECONDS + 1

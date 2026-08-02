@@ -17,14 +17,15 @@ from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import ws_tickets
 from hermes_cli.dashboard_auth.base import Session, TokenPrincipal
-from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE as SESSION_AT_COOKIE, SESSION_RT_COOKIE
+from hermes_cli.dashboard_auth.cookies import LINKED_DEVICE_COOKIE, SESSION_RT_COOKIE
 from hermes_cli.dashboard_auth import linked_devices
-from hermes_cli.dashboard_auth.ws_tickets import (
-    HANDOFF_SESSION_TTL_SECONDS,
-    _reset_for_tests,
-)
+from hermes_cli.dashboard_auth.ws_tickets import _reset_for_tests
 from hermes_state import SessionDB
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+# Existing security-path assertions below refer to the resume credential. The
+# protocol now names it explicitly as a linked-device cookie.
+SESSION_AT_COOKIE = LINKED_DEVICE_COOKIE
 
 
 @pytest.fixture
@@ -462,7 +463,7 @@ def test_handoff_minted_session_is_not_superuser(gated_app):
     session = linked_devices.authenticate(at)
     assert session is not None
     assert session["session_id"] == "chat-scope"
-    assert session["provider"] == "stub"
+    assert session["id"]
 
 
 def test_linked_device_inactivity_ttl_is_90_days():
@@ -1102,42 +1103,6 @@ def test_exact_handoff_scopes_reject_admin_and_extras():
     assert exact_handoff_scopes_or_none(("unknown",)) is None
     assert sanitize_handoff_scopes(("resume", "admin")) == ()
     assert sanitize_handoff_scopes(("admin",)) == ()
-
-
-def test_verify_handoff_token_rejects_admin_scope(gated_app):
-    """M3: forged admin/mixed scope payloads must not yield a Session."""
-    payload_admin = {
-        "sub": "u1",
-        "email": "",
-        "name": "",
-        "org_id": "",
-        "provider": "stub",
-        "session_id": "s1",
-        "profile": "default",
-        "scopes": ["admin"],
-        "kind": "handoff",
-        "exp": 2_000_000_000,
-    }
-    payload_mixed = dict(payload_admin)
-    payload_mixed["scopes"] = ["resume", "admin"]
-    payload_ok = dict(payload_admin)
-    payload_ok["scopes"] = ["resume"]
-    payload_empty = dict(payload_admin)
-    payload_empty["scopes"] = []
-
-    tok_admin = ws_tickets._sign_handoff_session(payload_admin)
-    tok_mixed = ws_tickets._sign_handoff_session(payload_mixed)
-    tok_ok = ws_tickets._sign_handoff_session(payload_ok)
-    tok_empty = ws_tickets._sign_handoff_session(payload_empty)
-
-    assert ws_tickets.verify_handoff_session_token(tok_admin) is None
-    assert ws_tickets.verify_handoff_session_token(tok_mixed) is None
-    sess = ws_tickets.verify_handoff_session_token(tok_ok)
-    assert sess is not None
-    assert sess.scopes == ("resume",)
-    sess_empty = ws_tickets.verify_handoff_session_token(tok_empty)
-    assert sess_empty is not None
-    assert sess_empty.scopes == ("resume",)
 
 
 def test_consume_handoff_ticket_rejects_non_exact_scopes(gated_app):
