@@ -285,13 +285,17 @@ def _strip_reasoning_tags(text: str) -> str:
             flags=re.IGNORECASE,
         )
     # Tool-call XML blocks (openclaw/openclaw#67318).
+    # NOTE: intentionally does NOT use re.IGNORECASE — models emit
+    # these tags in lower case only, and case-insensitive matching
+    # corrupts data content (e.g. JS/HTML that contains `<TOOL_CALL>`
+    # literal strings). See #72797.
     for tc_tag in ("tool_call", "tool_calls", "tool_result",
                    "function_call", "function_calls"):
         cleaned = re.sub(
             rf"<{tc_tag}\b[^>]*>.*?</{tc_tag}>\s*",
             "",
             cleaned,
-            flags=re.DOTALL | re.IGNORECASE,
+            flags=re.DOTALL,
         )
     # <function name="..."> — boundary + attribute gated to avoid prose FPs.
     cleaned = re.sub(
@@ -303,11 +307,12 @@ def _strip_reasoning_tags(text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
     # Stray tool-call close tags.
+    # NOTE: intentionally does NOT use re.IGNORECASE — same rationale
+    # as the generic tool-call tag patterns above (#72797).
     cleaned = re.sub(
         r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*',
         '',
         cleaned,
-        flags=re.IGNORECASE,
     )
     return cleaned.strip()
 
