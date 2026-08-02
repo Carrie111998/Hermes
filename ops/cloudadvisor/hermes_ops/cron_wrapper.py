@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from hermes_cli.agent_memory_protocol import acknowledge_attention
-
 from .decision_packet import load_escalation_decision_packet
 from .sync_status import SyncDecisionOutbox
 
@@ -55,21 +53,6 @@ _SYNC_FIELDS = {
     "decision_packet_path",
     "decision_packet_sha256",
     "decision_idempotency_key",
-}
-_AGENT_MEMORY_FIELDS = {
-    "enabled",
-    "vault_available",
-    "pending",
-    "oldest_pending_hours",
-    "attention_required",
-    "reason",
-    "fingerprint",
-    "notify_ole",
-}
-_AGENT_MEMORY_REASONS = {
-    "none",
-    "corrupt_or_unsafe",
-    "pending_for_24_hours",
 }
 
 
@@ -284,113 +267,8 @@ def _deliver_message(
             raise OSError("delivery command failed")
 
 
-def _load_agent_memory_status(raw: str) -> dict[str, object]:
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("invalid Agent Memory status JSON") from exc
-    if not isinstance(payload, dict) or set(payload) != _AGENT_MEMORY_FIELDS:
-        raise ValueError(
-            "Agent Memory status fields do not match the wrapper schema"
-        )
-    for field in (
-        "enabled",
-        "vault_available",
-        "attention_required",
-        "notify_ole",
-    ):
-        if type(payload[field]) is not bool:
-            raise ValueError(f"Agent Memory status {field} must be boolean")
-    pending = payload["pending"]
-    if type(pending) is not int or pending < 0:
-        raise ValueError("Agent Memory status pending is invalid")
-    oldest = payload["oldest_pending_hours"]
-    if (
-        isinstance(oldest, bool)
-        or not isinstance(oldest, (int, float))
-        or not math.isfinite(oldest)
-        or oldest < 0
-    ):
-        raise ValueError("Agent Memory status oldest_pending_hours is invalid")
-    reason = payload["reason"]
-    if not isinstance(reason, str) or reason not in _AGENT_MEMORY_REASONS:
-        raise ValueError("Agent Memory status reason is invalid")
-    fingerprint = payload["fingerprint"]
-    if (
-        not isinstance(fingerprint, str)
-        or len(fingerprint) != 64
-        or any(character not in "0123456789abcdef" for character in fingerprint)
-    ):
-        raise ValueError("Agent Memory status fingerprint is invalid")
-    attention = payload["attention_required"]
-    notify = payload["notify_ole"]
-    if notify and not attention:
-        raise ValueError("Agent Memory notification contradicts attention state")
-    if (reason == "none") != (not attention):
-        raise ValueError("Agent Memory reason contradicts attention state")
-    if attention and pending == 0:
-        raise ValueError("Agent Memory attention requires pending entries")
-    return payload
 
 
-def run_agent_memory_attention(
-    config: CronWrapperConfig,
-    *,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    deliver: Callable[[str], None] | None = None,
-    delivery_run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    acknowledge: Callable[[str], None] = acknowledge_attention,
-) -> int:
-    try:
-        completed = run(
-            [
-                str(config.python),
-                "-m",
-                "hermes_cli.main",
-                "agent-memory",
-                "status",
-            ],
-            cwd=config.install_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-        )
-        if completed.returncode != 0:
-            raise ValueError("Agent Memory status command failed")
-        status = _load_agent_memory_status(completed.stdout or "")
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        # This is a best-effort attention sidecar. Routine status/config/parse,
-        # timeout, and lock failures must not fail successful health or sync.
-        return 0
-    if not status["notify_ole"]:
-        return 0
-    reasons = {
-        "pending_for_24_hours": "external vault unavailable for 24 hours",
-        "corrupt_or_unsafe": "unsafe or corrupt outbox entry",
-    }
-    reason = reasons[str(status["reason"])]
-    message = "\n".join(
-        [
-            "🚨 Hermes Agent Memory needs attention",
-            "Recommendation: inspect the Agent Memory outbox",
-            f"Reason: {reason}",
-            f"Pending entries: {status['pending']}",
-            "Hermes kept development running and preserved writes locally.",
-        ]
-    ) + "\n"
-    try:
-        _deliver_message(
-            config,
-            message,
-            deliver=deliver,
-            delivery_run=delivery_run,
-        )
-        acknowledge(str(status["fingerprint"]))
-        return 0
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        print(f"Agent Memory attention delivery failed: {exc}", file=sys.stderr)
-    return 2
 
 
 def _result_requires_no_delivery(
@@ -590,11 +468,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         print("sync-auto wrapper failed: invalid configuration", file=sys.stderr)
         return 2
-    primary_code = (
-        run_health(config) if args.mode == "health" else run_sync_auto(config)
-    )
-    memory_code = run_agent_memory_attention(config)
-    return primary_code if primary_code != 0 else memory_code
+    return run_health(config) if args.mode == "health" else run_sync_auto(config)
 
 
 if __name__ == "__main__":
