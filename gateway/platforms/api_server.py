@@ -10716,12 +10716,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 # adapter sharing this loop. Same hardening the platform HTTP
                 # event verifier already got.
                 claims = await asyncio.to_thread(verifier, **verify_kwargs)
+            # ``asyncio.iscoroutinefunction`` does not recognize callable
+            # objects whose ``__call__`` is async.  The worker-thread branch
+            # therefore returns their coroutine object; await any awaitable
+            # result before deciding whether authentication succeeded.
+            if inspect.isawaitable(claims):
+                claims = await claims
         except Exception:
             # Fail closed: a crashing verifier must never admit a fire — this
             # is the only inbound that can trigger remote job execution.
             logger.exception("cron fire: verifier crashed; rejecting token")
             claims = None
-        if claims is None:
+        if not isinstance(claims, Mapping):
             logger.warning(
                 "cron fire: rejected invalid token: %s",
                 self._request_audit_log_suffix(request),

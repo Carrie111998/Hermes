@@ -13,6 +13,8 @@ hosted agents don't expose). It must:
     background, returning 202.
 """
 
+import gc
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -110,4 +112,45 @@ def test_unknown_job_200_gone(monkeypatch):
         _restore(pa, ph)
         client.close()
 
+
+@pytest.mark.parametrize("claims", [None, object()], ids=["none", "non-mapping"])
+def test_async_callable_object_invalid_claims_fail_closed_without_warning(
+    monkeypatch, recwarn, claims
+):
+    """The dashboard's public webhook must await callable verifiers and reject
+    invalid results without starting a job or leaking an un-awaited coroutine.
+    """
+    fired = []
+
+    class AsyncCallableVerifier:
+        async def __call__(self, **kw):
+            return claims
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        AsyncCallableVerifier,
+    )
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda jid: "default")
+    monkeypatch.setattr(
+        web_server,
+        "_fire_cron_job_for_profile",
+        lambda profile, job_id: fired.append((profile, job_id)),
+    )
+
+    client, pa, ph = _client(auth_required=False)
+    try:
+        resp = client.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer invalid"},
+            json={"job_id": "must-not-fire"},
+        )
+        assert resp.status_code == 401
+        gc.collect()
+        assert fired == []
+        assert not [
+            warning for warning in recwarn if issubclass(warning.category, RuntimeWarning)
+        ]
+    finally:
+        _restore(pa, ph)
+        client.close()
 

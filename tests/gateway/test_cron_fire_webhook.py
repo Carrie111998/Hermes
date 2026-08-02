@@ -8,6 +8,7 @@ test_chronos_verify.py.
 """
 
 import asyncio
+import gc
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -238,3 +239,69 @@ async def test_async_verifier_is_awaited(adapter, monkeypatch):
             break
         await asyncio.sleep(0.01)
     assert spy.fired == ["async-ok"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claims", [None, object()], ids=["none", "non-mapping"])
+async def test_async_callable_object_invalid_claims_fail_closed_without_warning(
+    adapter, monkeypatch, recwarn, claims
+):
+    """An object with async ``__call__`` must be awaited and its result must
+    satisfy the verifier contract before any job is fired.
+    """
+    spy = _SpyProvider()
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
+
+    class AsyncCallableVerifier:
+        async def __call__(self, **kw):
+            return claims
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        AsyncCallableVerifier,
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer invalid"},
+            json={"job_id": "must-not-fire"},
+        )
+        assert resp.status == 401
+
+    await asyncio.sleep(0)
+    gc.collect()
+    assert spy.fired == []
+    assert not [warning for warning in recwarn if issubclass(warning.category, RuntimeWarning)]
+
+
+@pytest.mark.asyncio
+async def test_async_callable_object_valid_claims_are_awaited(adapter, monkeypatch):
+    """A valid Mapping returned by an async callable object remains supported."""
+    spy = _SpyProvider()
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
+
+    class AsyncCallableVerifier:
+        async def __call__(self, **kw):
+            return {"purpose": "cron_fire", "aud": "agent:x"}
+
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        AsyncCallableVerifier,
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "async-callable-ok"},
+        )
+        assert resp.status == 202
+
+    for _ in range(50):
+        if spy.fired:
+            break
+        await asyncio.sleep(0.01)
+    assert spy.fired == ["async-callable-ok"]

@@ -9,7 +9,9 @@ rely on exactly that).
 
 import asyncio  # noqa: F401 — used by handlers
 import functools  # noqa: F401
+import inspect
 import logging
+from collections.abc import Mapping
 from typing import Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
@@ -146,13 +148,27 @@ async def cron_fire_webhook(request: Request):
     token = auth[7:].strip() if auth.startswith("Bearer ") else ""
 
     cfg = load_config()
-    claims = get_fire_verifier()(
+    verifier = get_fire_verifier()
+    verify_kwargs = dict(
         token=token,
         expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
         jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
         issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
     )
-    if claims is None:
+    try:
+        if asyncio.iscoroutinefunction(verifier):
+            claims = await verifier(**verify_kwargs)
+        else:
+            claims = await asyncio.to_thread(verifier, **verify_kwargs)
+        # Async callable objects are not reported as coroutine functions.  In
+        # that case the worker-thread invocation returns a coroutine object,
+        # which must be awaited before its claims can cross the auth boundary.
+        if inspect.isawaitable(claims):
+            claims = await claims
+    except Exception:
+        _log.exception("cron fire: verifier crashed; rejecting token")
+        claims = None
+    if not isinstance(claims, Mapping):
         return JSONResponse({"error": "invalid fire token"}, status_code=401)
 
     try:
