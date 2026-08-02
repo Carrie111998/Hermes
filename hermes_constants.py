@@ -904,9 +904,16 @@ def agent_browser_runnable(path: str | None) -> bool:
     # never even spawn a subprocess for the broken-link case.
     if not os.path.exists(probe) or not os.access(probe, os.X_OK):
         return False
-    # Reject empty PE stubs without paying for a spawn (Windows ARM64).
+    # Reject empty PE stubs without paying for a spawn — Windows ARM64 only.
+    # Short POSIX shell wrappers are often <<1KB and must still reach --version.
     try:
-        if Path(probe).is_file() and Path(probe).stat().st_size < 1024:
+        probe_path = Path(probe)
+        if (
+            is_windows_arm64()
+            and probe_path.is_file()
+            and probe_path.suffix.lower() == ".exe"
+            and probe_path.stat().st_size < 1024
+        ):
             return False
     except OSError:
         return False

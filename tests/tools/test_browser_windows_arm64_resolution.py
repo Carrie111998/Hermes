@@ -98,10 +98,13 @@ class TestResolveAndHeal:
         stub.write_bytes(b"")
         assert hc._agent_browser_native_binary_usable(stub) is False
 
-    def test_prefer_replaces_shim_with_native(self, tmp_path):
+    def test_prefer_replaces_shim_with_native(self, tmp_path, monkeypatch):
         shim, native = _shim_with_package(tmp_path)
-        with patch.object(hc, "is_windows_arm64", return_value=True):
-            assert hc.prefer_agent_browser_native_binary(str(shim)) == str(native)
+        # Filename selection keys off sys.platform; is_windows_arm64 alone is
+        # not enough on Linux CI (would pick linux-* names and miss the .exe).
+        monkeypatch.setattr(hc, "is_windows_arm64", lambda: True)
+        monkeypatch.setattr(hc.sys, "platform", "win32")
+        assert hc.prefer_agent_browser_native_binary(str(shim)) == str(native)
 
     def test_prefer_passes_through_npx_sentinel(self):
         assert (
