@@ -3658,7 +3658,10 @@ class MatrixAdapter(BasePlatformAdapter):
             return
         base = "Hermes"
         try:
-            current_name = await self._get_room_name(room_id)
+            current_name = await asyncio.wait_for(
+                self._get_room_name(room_id),
+                timeout=self._dynamic_room_name_timeout_seconds,
+            )
             if current_name:
                 base = self._sanitize_dynamic_room_name(current_name)
         except Exception:

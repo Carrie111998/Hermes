@@ -1855,6 +1855,43 @@ class TestMatrixDynamicRoomNames:
         assert names == ["🟡 Hermes"]
 
     @pytest.mark.asyncio
+    async def test_initial_room_name_read_timeout_does_not_block_lifecycle(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        read_started = asyncio.Event()
+        read_cancelled = asyncio.Event()
+
+        async def never_returning_room_name(*args, **kwargs):
+            read_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                read_cancelled.set()
+
+        self.adapter._dynamic_room_name_timeout_seconds = 0.01
+        self.adapter._client.get_state_event = AsyncMock(
+            side_effect=never_returning_room_name
+        )
+        event = self._event()
+
+        await asyncio.wait_for(self.adapter.on_processing_start(event), timeout=0.05)
+        await asyncio.wait_for(read_started.wait(), timeout=0.05)
+        await asyncio.wait_for(self._drain_room_name_tasks(), timeout=0.1)
+
+        assert read_cancelled.is_set()
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == "Hermes"
+
+        await self.adapter.on_session_title_changed(event.source, "Semantic title")
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await asyncio.wait_for(self._drain_room_name_tasks(), timeout=0.1)
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Hermes", "🟡 Semantic title", "✅ Semantic title"]
+
+    @pytest.mark.asyncio
     async def test_newer_semantic_title_wins_over_delayed_initial_state_read(self):
         initial_read_started = asyncio.Event()
         release_initial_read = asyncio.Event()
