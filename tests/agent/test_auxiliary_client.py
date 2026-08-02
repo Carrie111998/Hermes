@@ -778,6 +778,68 @@ class TestBuildCodexClient:
         assert second_model == "gpt-5.4"
         assert mock_openai.call_count == 2
 
+    def test_cached_client_does_not_pin_oauth_peek_token(self):
+        """OAuth must reach the provider's select+refresh path, not peek().
+
+        Regression: _get_cached_client() borrowed a read-only peeked Codex
+        access token and forwarded it as explicit_api_key.  An expired first
+        pool entry was therefore retried verbatim after 401 even though later
+        entries and the singleton token were healthy.
+        """
+        import agent.auxiliary_client as aux
+
+        oauth_entry = MagicMock(
+            auth_type="oauth",
+            runtime_api_key="stale-oauth-token",
+        )
+        fake_client = MagicMock()
+
+        with (
+            patch("agent.auxiliary_client._peek_pool_entry", return_value=oauth_entry),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fake_client, "gpt-5.6-luna"),
+            ) as mock_resolve,
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                client, model = aux._get_cached_client(
+                    "openai-codex", "gpt-5.6-luna"
+                )
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert client is fake_client
+        assert model == "gpt-5.6-luna"
+        assert mock_resolve.call_args.kwargs["explicit_api_key"] is None
+
+    def test_cached_client_still_pins_api_key_pool_entry(self):
+        """The first-entry-bias fix remains active for API-key providers."""
+        import agent.auxiliary_client as aux
+
+        api_key_entry = MagicMock(
+            auth_type="api_key",
+            runtime_api_key="rotated-api-key",
+        )
+        fake_client = MagicMock()
+
+        with (
+            patch("agent.auxiliary_client._peek_pool_entry", return_value=api_key_entry),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fake_client, "test-model"),
+            ) as mock_resolve,
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                client, model = aux._get_cached_client("openrouter", "test-model")
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert client is fake_client
+        assert model == "test-model"
+        assert mock_resolve.call_args.kwargs["explicit_api_key"] == "rotated-api-key"
+
 
 class TestResolveProviderClientUniversalModelFallback:
     """resolve_provider_client() picks a sensible model when callers pass none (#31845).

@@ -6960,15 +6960,22 @@ def _get_cached_client(
                 effective = _compat_model(cached_client, model, cached_default)
                 return cached_client, effective
     # Build outside the lock.
-    # For pool-backed api_key providers, derive the active API key from the
+    # For pool-backed API-key providers, derive the active API key from the
     # pool entry rather than from env vars.  resolve_api_key_provider_credentials
     # always prefers env vars (first-entry bias), which bypasses pool rotation:
     # after key #1 is marked exhausted the retry would still get key #1 from
     # the env var and fail again, causing the retry2_err handler to mark key #2.
+    #
+    # Do not do this for OAuth entries.  ``peek()`` is deliberately read-only:
+    # it neither refreshes an expired access token nor rotates away from one.
+    # Passing that token as ``explicit_api_key`` bypasses the OAuth provider's
+    # normal select+refresh path and pins both the first request and its retry
+    # to the same stale credential (observed as repeated Codex aux 401s while
+    # the main Codex route remains healthy).
     effective_api_key = api_key
     if not effective_api_key:
         _pe = _peek_pool_entry(_normalize_aux_provider(provider))
-        if _pe is not None:
+        if _pe is not None and getattr(_pe, "auth_type", None) == "api_key":
             _pk = _pool_runtime_api_key(_pe)
             if _pk:
                 effective_api_key = _pk
