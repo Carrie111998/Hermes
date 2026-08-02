@@ -2528,6 +2528,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+            except SystemError as exc:
+                # CPython raises SystemError ("<...> returned NULL without
+                # setting an exception") when a sqlite3 C-extension function
+                # fails (typically SQLITE_NOMEM under memory pressure on a
+                # large state.db) but does not set a Python-level exception.
+                # This is transient: the allocation succeeds on retry once
+                # the memory pressure clears (in-progress VACUUM finishes, a
+                # sibling WAL checkpoint releases its buffers, the OS page
+                # cache recycles). Treat it like a locked/busy error and
+                # retry within the patience budget rather than destroying the
+                # caller's turn — the database itself is healthy.
+                logger.warning(
+                    "Transient SystemError during state.db write "
+                    "(session=%s): %s — retrying",
+                    getattr(self, "_current_session_id", "unknown"),
+                    exc,
+                )
+                if self._sleep_before_write_retry(deadline, patience_s):
+                    continue
+                raise
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
