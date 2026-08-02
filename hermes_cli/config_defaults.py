@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
         # None = SQLite defaults (autocheckpoint 1000 pages, no size limit).
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
+        # Optional PostgreSQL hot-tier shadow. SQLite remains authoritative;
+        # this is an observation-only gate and is disabled for every existing
+        # and new installation until explicitly enabled in config.yaml.
+        "postgres_hot": {"shadow_enabled": False},
     },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.

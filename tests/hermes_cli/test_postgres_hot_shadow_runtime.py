@@ -10,6 +10,9 @@ import pytest
 from hermes_cli import postgres_hot_read_adapter as adapter
 
 
+ENABLED_CONFIG = {"database": {"postgres_hot": {"shadow_enabled": True}}}
+
+
 class InlineThread:
     def __init__(self, *, target, name: str, daemon: bool) -> None:
         self.target = target
@@ -29,11 +32,18 @@ def test_default_off_does_not_touch_sqlite_or_start_thread(monkeypatch) -> None:
     assert runtime.observe_sqlite_session(
         db,
         "session-1",
+        config={},
         environ={},
         _thread_factory=lambda **kwargs: started.append(kwargs),
     ) is False
     db.get_messages.assert_not_called()
     assert started == []
+
+
+def test_canonical_config_default_is_off() -> None:
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["database"]["postgres_hot"]["shadow_enabled"] is False
 
 
 def test_enabled_without_dsn_fails_open_without_touching_sqlite(caplog) -> None:
@@ -45,7 +55,8 @@ def test_enabled_without_dsn_fails_open_without_touching_sqlite(caplog) -> None:
     assert runtime.observe_sqlite_session(
         db,
         "session-1",
-        environ={runtime.SHADOW_ENABLED_ENV: "1"},
+        config=ENABLED_CONFIG,
+        environ={},
     ) is False
     db.get_messages.assert_not_called()
     assert "DSN is unavailable" in caplog.text
@@ -58,10 +69,8 @@ def test_non_literal_gate_value_stays_disabled() -> None:
     assert runtime.observe_sqlite_session(
         db,
         "session-1",
-        environ={
-            runtime.SHADOW_ENABLED_ENV: "true",
-            runtime.SHADOW_DSN_ENV: "postgresql://private",
-        },
+        config={"database": {"postgres_hot": {"shadow_enabled": "true"}}},
+        environ={runtime.SHADOW_DSN_ENV: "postgresql://private"},
     ) is False
     db.get_messages.assert_not_called()
 
@@ -88,10 +97,8 @@ def test_enabled_snapshots_bounded_sqlite_page_before_daemon_thread(monkeypatch)
     assert runtime.observe_sqlite_session(
         db,
         "session-1",
-        environ={
-            runtime.SHADOW_ENABLED_ENV: "1",
-            runtime.SHADOW_DSN_ENV: "postgresql://private",
-        },
+        config=ENABLED_CONFIG,
+        environ={runtime.SHADOW_DSN_ENV: "postgresql://private"},
         now_epoch_s=100_000.0,
         _thread_factory=factory,
     ) is True
@@ -125,10 +132,8 @@ def test_single_flight_skips_when_observer_is_busy(monkeypatch) -> None:
         assert runtime.observe_sqlite_session(
             db,
             "session-1",
-            environ={
-                runtime.SHADOW_ENABLED_ENV: "1",
-                runtime.SHADOW_DSN_ENV: "postgresql://private",
-            },
+            config=ENABLED_CONFIG,
+            environ={runtime.SHADOW_DSN_ENV: "postgresql://private"},
         ) is False
     finally:
         runtime._SHADOW_SLOT.release()
@@ -151,10 +156,8 @@ def test_worker_failure_is_redacted_and_releases_slot(monkeypatch, caplog) -> No
     assert runtime.observe_sqlite_session(
         db,
         "session-1",
-        environ={
-            runtime.SHADOW_ENABLED_ENV: "1",
-            runtime.SHADOW_DSN_ENV: secret,
-        },
+        config=ENABLED_CONFIG,
+        environ={runtime.SHADOW_DSN_ENV: secret},
         _thread_factory=lambda **kwargs: InlineThread(**kwargs),
     ) is True
     assert "worker failed open" in caplog.text
@@ -178,10 +181,8 @@ def test_thread_start_failure_releases_slot_and_redacts(monkeypatch, caplog) -> 
     assert runtime.observe_sqlite_session(
         db,
         "session-1",
-        environ={
-            runtime.SHADOW_ENABLED_ENV: "1",
-            runtime.SHADOW_DSN_ENV: secret,
-        },
+        config=ENABLED_CONFIG,
+        environ={runtime.SHADOW_DSN_ENV: secret},
         _thread_factory=lambda **_kwargs: BrokenThread(),
     ) is False
     assert "setup failed open" in caplog.text
@@ -204,10 +205,8 @@ def test_keyboard_interrupt_propagates_and_releases_slot() -> None:
         runtime.observe_sqlite_session(
             db,
             "session-1",
-            environ={
-                runtime.SHADOW_ENABLED_ENV: "1",
-                runtime.SHADOW_DSN_ENV: "postgresql://private",
-            },
+            config=ENABLED_CONFIG,
+            environ={runtime.SHADOW_DSN_ENV: "postgresql://private"},
             _thread_factory=lambda **_kwargs: InterruptThread(),
         )
     assert runtime._SHADOW_SLOT.acquire(blocking=False)

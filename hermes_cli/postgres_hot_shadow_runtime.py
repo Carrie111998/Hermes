@@ -25,7 +25,6 @@ from hermes_cli.postgres_hot_read_adapter import (
     make_24h_request,
 )
 
-SHADOW_ENABLED_ENV = "HERMES_POSTGRES_HOT_SHADOW_ENABLED"
 SHADOW_DSN_ENV = "HERMES_POSTGRES_HOT_DSN"
 CONNECT_TIMEOUT_SECONDS = 2.0
 CLOSE_TIMEOUT_SECONDS = 2.0
@@ -34,9 +33,15 @@ _SHADOW_SLOT = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
-def _enabled(environ: Mapping[str, str]) -> bool:
-    """Only the literal value ``1`` enables network activity."""
-    return environ.get(SHADOW_ENABLED_ENV, "") == "1"
+def _enabled(config: Mapping[str, object]) -> bool:
+    """Only a literal boolean in config.yaml enables network activity."""
+    database = config.get("database")
+    if not isinstance(database, Mapping):
+        return False
+    postgres_hot = database.get("postgres_hot")
+    if not isinstance(postgres_hot, Mapping):
+        return False
+    return postgres_hot.get("shadow_enabled") is True
 
 
 def _safe_count(metadata: Mapping[str, object], key: str) -> int:
@@ -111,6 +116,7 @@ def observe_sqlite_session(
     session_db: Any,
     session_id: str,
     *,
+    config: Mapping[str, object] | None = None,
     environ: Mapping[str, str] | None = None,
     now_epoch_s: float | None = None,
     _thread_factory: Callable[..., Any] = threading.Thread,
@@ -121,7 +127,17 @@ def observe_sqlite_session(
     serving authority and callers must ignore it for transcript selection.
     """
     effective_environ = os.environ if environ is None else environ
-    if not _enabled(effective_environ):
+    try:
+        if config is None:
+            from hermes_cli.config import load_config_readonly
+
+            effective_config = load_config_readonly()
+        else:
+            effective_config = config
+    except Exception:
+        logger.warning("PostgreSQL hot shadow config is unavailable; observation skipped")
+        return False
+    if not _enabled(effective_config):
         return False
 
     dsn = effective_environ.get(SHADOW_DSN_ENV, "")
