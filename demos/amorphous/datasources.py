@@ -103,7 +103,7 @@ def src_github_issues(props: dict) -> dict:
 def src_system_stats(props: dict) -> dict:
     load1, load5, load15 = os.getloadavg()
     mem = {}
-    for line in Path("/proc/meminfo").read_text().splitlines():
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
         k, v = line.split(":", 1)
         mem[k] = int(v.strip().split()[0])
     total_gb = mem["MemTotal"] / 1048576
