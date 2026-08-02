@@ -96,6 +96,37 @@ class TestResolveProviderClientMainAlias:
 class TestResolveProviderClientNamedCustom:
     """resolve_provider_client should resolve named custom providers directly."""
 
+    def test_key_env_uses_active_profile_secret_scope(self, monkeypatch):
+        """Named custom providers must not read another profile's process env."""
+        from agent import secret_scope
+        from agent.auxiliary_client import resolve_provider_client
+
+        monkeypatch.setenv("NAMED_TEST_PROFILE_KEY", "wrong-profile-key")
+        previous_multiplex = secret_scope.is_multiplex_active()
+        token = secret_scope.set_secret_scope(
+            {"NAMED_TEST_PROFILE_KEY": "right-profile-key"}
+        )
+        secret_scope.set_multiplex_active(True)
+        try:
+            with (
+                patch(
+                    "hermes_cli.runtime_provider._get_named_custom_provider",
+                    return_value={
+                        "name": "beans",
+                        "base_url": "https://beans.test/v1",
+                        "key_env": "NAMED_TEST_PROFILE_KEY",
+                    },
+                ),
+                patch("agent.auxiliary_client.OpenAI") as mock_openai,
+            ):
+                mock_openai.return_value = MagicMock()
+                resolve_provider_client("beans", "test-model")
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(previous_multiplex)
+
+        assert mock_openai.call_args.kwargs["api_key"] == "right-profile-key"
+
     def test_named_custom_provider(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "test-model"},

@@ -107,6 +107,33 @@ class TestAuxiliaryMaxTokensParam:
 
 
 class TestResolveTaskProviderModel:
+    def test_key_env_uses_active_profile_secret_scope(self, monkeypatch):
+        """Task-specific key_env must not read another profile's process env."""
+        from agent import secret_scope
+
+        monkeypatch.setenv("AUX_TEST_PROFILE_KEY", "wrong-profile-key")
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {
+                "provider": "custom",
+                "model": "test-model",
+                "base_url": "https://example.test/v1",
+                "key_env": "AUX_TEST_PROFILE_KEY",
+            },
+        )
+        previous_multiplex = secret_scope.is_multiplex_active()
+        token = secret_scope.set_secret_scope(
+            {"AUX_TEST_PROFILE_KEY": "right-profile-key"}
+        )
+        secret_scope.set_multiplex_active(True)
+        try:
+            _, _, _, api_key, _ = _resolve_task_provider_model(task="vision")
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(previous_multiplex)
+
+        assert api_key == "right-profile-key"
+
     @pytest.mark.parametrize(
         "provider",
         [
