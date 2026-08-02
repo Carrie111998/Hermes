@@ -807,6 +807,47 @@ class TestInstallerNoShell:
         assert ok is False
         assert not [c for c in calls if c[0] == "popen"]
 
+    def test_posix_manual_hint_materializes_three_github_siblings(self):
+        """Failure/timeout recovery must not re-teach the broken lone curl|bash.
+
+        teknium/hermes-sweeper on #76861: the old hint was
+        `curl install.sh | bash`, which has no on-disk siblings and falls
+        back to cua.ai under NXDOMAIN.
+        """
+        import subprocess
+        from unittest.mock import MagicMock
+        from hermes_cli import tools_config
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 1
+        fake_proc.returncode = 1  # installer ran but did not leave binary
+        fake_proc.communicate.return_value = ("", None)
+        info_msgs = []
+
+        with patch("platform.system", return_value="Linux"), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
+             patch("subprocess.Popen", return_value=fake_proc), \
+             patch.object(tools_config.shutil, "which", return_value=None), \
+             patch.object(tools_config, "_clear_stale_cua_install_lock"), \
+             patch.object(tools_config, "_print_warning"), \
+             patch.object(tools_config, "_print_info", side_effect=lambda m: info_msgs.append(m)), \
+             patch.object(tools_config, "_print_success"):
+            ok = tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
+
+        assert ok is False
+        joined = "\n".join(info_msgs)
+        # Must teach the three-script sibling workflow.
+        assert "install.sh" in joined
+        assert "_install-rust.sh" in joined
+        assert "_install-common.sh" in joined
+        assert "raw.githubusercontent.com/trycua/cua" in joined
+        assert "mktemp" in joined
+        # Must not be the lone curl|bash one-liner (no siblings → cua.ai).
+        assert "cua.ai" not in joined
+        # Reject the old form: command-sub curl of install.sh alone.
+        assert '$(curl' not in joined
+        assert "curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)" not in joined
+
     def test_temp_script_dir_removed_after_run(self, tmp_path):
         import os
         captured = {}

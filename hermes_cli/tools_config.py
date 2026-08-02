@@ -1420,8 +1420,11 @@ def _run_cua_driver_installer(
         # _install-common.sh from its own directory when they are present and
         # only falls back to fetching them from the cua.ai vanity CDN
         # otherwise, so the whole set is downloaded as siblings and no DNS
-        # beyond GitHub is required. The manual hint stays the upstream
-        # one-liner since that's what the docs/README teach.
+        # beyond GitHub is required.
+        #
+        # The manual recovery hint must materialize the same three siblings —
+        # a lone `curl install.sh | bash` reintroduces the cua.ai hop when
+        # public DNS for that host is NXDOMAIN (see #76860 / review on #76861).
         import tempfile as _tempfile
 
         scripts_base = (
@@ -1429,7 +1432,17 @@ def _run_cua_driver_installer(
             "libs/cua-driver/scripts/"
         )
         script_names = ("install.sh", "_install-rust.sh", "_install-common.sh")
-        manual_hint = f'/bin/bash -c "$(curl -fsSL {scripts_base}install.sh)"'
+        # One pasteable line: mktemp + three GitHub raw curls + bash install.sh.
+        # Keep as a single logical command so failure/timeout print sites stay
+        # one _print_info each.
+        manual_hint = (
+            'tmpdir=$(mktemp -d) && '
+            f'base={scripts_base.rstrip("/")} && '
+            'curl -fsSL -o "$tmpdir/install.sh" "$base/install.sh" && '
+            'curl -fsSL -o "$tmpdir/_install-rust.sh" "$base/_install-rust.sh" && '
+            'curl -fsSL -o "$tmpdir/_install-common.sh" "$base/_install-common.sh" && '
+            '/bin/bash "$tmpdir/install.sh"'
+        )
         script_dir = _tempfile.mkdtemp(prefix="cua-driver-install-")
 
         def _download_failed(detail: str) -> None:
