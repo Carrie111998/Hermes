@@ -3013,6 +3013,87 @@ class CLICommandsMixin:
         else:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (this session — use --global to persist){_RST}")
 
+    def _handle_temperature_command(self, cmd: str):
+        """Handle /temperature — set sampling temperature for the main model.
+
+        Usage:
+            /temperature               Show current temperature
+            /temperature <value>       Set session temperature (0.0-2.0)
+            /temperature <value> --global  Persist to config.yaml (model.temperature)
+            /temperature reset         Clear this session's temperature override
+        """
+        from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, save_config_value
+
+        parts = cmd.strip().split(maxsplit=1)
+
+        if len(parts) < 2:
+            # Show current state
+            session_val = getattr(self, "_session_temperature", None)
+            if session_val is not None:
+                current = f"{session_val} (session)"
+            else:
+                global_val = None
+                _model_cfg = CLI_CONFIG.get("model")
+                if isinstance(_model_cfg, dict):
+                    _gv = _model_cfg.get("temperature")
+                    if isinstance(_gv, (int, float)) and not isinstance(_gv, bool):
+                        global_val = float(_gv)
+                if global_val is not None:
+                    current = f"{global_val} (global)"
+                else:
+                    current = "unset (server default)"
+            _cprint(f"  {_ACCENT}Temperature: {current}{_RST}")
+            _cprint(f"  {_DIM}Usage: /temperature <0.0-2.0> [--global] | reset{_RST}")
+            return
+
+        arg_tokens = parts[1].strip().split()
+        # Session scope is the default; --global persists to config.yaml.
+        # --session is accepted as an explicit no-op for parity with /model.
+        explicit_global = "--global" in arg_tokens
+        arg = " ".join(
+            token for token in arg_tokens if token not in ("--global", "--session")
+        ).strip()
+
+        # Reset session override
+        if arg == "reset":
+            if explicit_global:
+                _cprint(f"  {_DIM}(._.) 'reset' is session-scoped; run /temperature with no value to view.{_RST}")
+                return
+            self._session_temperature = None
+            if self.agent:
+                overrides = dict(getattr(self.agent, "request_overrides", None) or {})
+                overrides.pop("temperature", None)
+                self.agent.request_overrides = overrides
+            _cprint(f"  {_ACCENT}✓ Temperature override cleared (using global/server default){_RST}")
+            return
+
+        # Validate numeric value in [0.0, 2.0]
+        try:
+            value = float(arg)
+        except (TypeError, ValueError):
+            _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
+            _cprint(f"  {_DIM}Valid: a number between 0.0 and 2.0, or 'reset'{_RST}")
+            return
+        if value < 0.0 or value > 2.0:
+            _cprint(f"  {_DIM}(._.) Temperature out of range: {value} (allowed 0.0-2.0){_RST}")
+            return
+
+        # Set session override (no agent restart needed — the transport reads
+        # agent.request_overrides on every request).
+        self._session_temperature = value
+        if self.agent:
+            self.agent.request_overrides = {
+                **(getattr(self.agent, "request_overrides", None) or {}),
+                "temperature": value,
+            }
+
+        if explicit_global and save_config_value("model.temperature", value):
+            _cprint(f"  {_ACCENT}✓ Temperature set to {value} (saved to config){_RST}")
+        elif explicit_global:
+            _cprint(f"  {_ACCENT}✓ Temperature set to {value} (session only; config save failed){_RST}")
+        else:
+            _cprint(f"  {_ACCENT}✓ Temperature set to {value} (this session — use --global to persist){_RST}")
+
     def _handle_busy_command(self, cmd: str):
         """Handle /busy — control what Enter does while Hermes is working.
 

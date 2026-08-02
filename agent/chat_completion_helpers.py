@@ -1238,6 +1238,23 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
 
+    # Global default temperature (config ``model.temperature``). Optional;
+    # None when unset. The session override (agent.request_overrides
+    # ["temperature"]) and any provider contract (OMIT_TEMPERATURE /
+    # fixed_temperature) both take precedence over this — the transport
+    # enforces the ordering. This is the single chokepoint for main-model
+    # requests, so it covers CLI, gateway, cron, and delegation.
+    global_temperature = None
+    try:
+        from hermes_cli.config import load_config
+        _mcfg = load_config().get("model") or {}
+        if isinstance(_mcfg, dict):
+            _t = _mcfg.get("temperature")
+            if isinstance(_t, (int, float)) and not isinstance(_t, bool):
+                global_temperature = float(_t)
+    except Exception:
+        pass
+
     # Provider detection flags
     _is_qwen = agent._is_qwen_portal()
     _is_or = agent._is_openrouter_url()
@@ -1330,6 +1347,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
+            temperature=global_temperature,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
             provider_preferences=_prefs or None,
@@ -1371,6 +1389,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         is_tokenhub=_is_tokenhub,
         is_lmstudio=_is_lmstudio,
         is_custom_provider=agent.provider == "custom",
+        temperature=global_temperature,
         ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None,
         openrouter_min_coding_score=agent.openrouter_min_coding_score,

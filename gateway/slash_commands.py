@@ -3426,6 +3426,67 @@ class GatewaySlashCommandsMixin:
             session_key, platform_key, args, persist_global=persist_global
         )
 
+    async def _handle_temperature_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /temperature — set sampling temperature for the main model.
+
+        Usage:
+            /temperature               Show current temperature
+            /temperature <value>       Set session temperature (0.0-2.0)
+            /temperature <value> --global  Persist to config.yaml (model.temperature)
+            /temperature reset         Clear this session's temperature override
+        """
+        raw_args = event.get_command_args().strip()
+        # Normalize the source (Telegram DM topic recovery) before deriving
+        # the override key so storage matches the key the next message turn
+        # reads — same fix as /model and /reasoning.
+        _temp_source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(_temp_source)
+
+        if not raw_args:
+            # Show current state
+            current = self._resolve_session_temperature(session_key=session_key)
+            value = str(current) if current is not None else "unset (server default)"
+            return t("gateway.temperature.status", value=value)
+
+        arg_tokens = raw_args.split()
+        # Session scope is the default; --global persists to config.yaml.
+        # --session is accepted as an explicit no-op for parity with /model.
+        explicit_global = "--global" in arg_tokens
+        arg = " ".join(
+            token for token in arg_tokens if token not in ("--global", "--session")
+        ).strip()
+
+        # Reset session override
+        if arg == "reset":
+            if explicit_global:
+                return t("gateway.temperature.reset_global_unsupported")
+            self._set_session_temperature_override(session_key, None)
+            self._evict_cached_agent(session_key)
+            return t("gateway.temperature.reset_done")
+
+        # Validate numeric in [0.0, 2.0]
+        try:
+            value = float(arg)
+        except (TypeError, ValueError):
+            return t("gateway.temperature.unknown_arg", arg=arg)
+        if value < 0.0 or value > 2.0:
+            return t("gateway.temperature.out_of_range", value=value)
+
+        if explicit_global:
+            if self._save_gateway_config_key("model.temperature", value):
+                self._set_session_temperature_override(session_key, None)
+                self._evict_cached_agent(session_key)
+                return t("gateway.temperature.set_global", value=value)
+            self._set_session_temperature_override(session_key, value)
+            self._evict_cached_agent(session_key)
+            return t("gateway.temperature.set_global_save_failed", value=value)
+
+        self._set_session_temperature_override(session_key, value)
+        self._evict_cached_agent(session_key)
+        return t("gateway.temperature.set_session", value=value)
+
     async def _handle_memory_command(self, event: MessageEvent) -> str:
         """Handle /memory — review pending memory writes + toggle the approval gate.
 
