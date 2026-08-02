@@ -268,9 +268,16 @@ class TestPostStopInterruptSwallow:
         class _RecordingAgent:
             def __init__(self):
                 self.interrupt_reasons = []
+                self._gateway_turn_process_task_id = ""
+                self._gateway_turn_process_baseline: object = None
 
             def interrupt(self, reason=None):
                 self.interrupt_reasons.append(reason)
+                # Emulate the worker finalizer winning immediately after the
+                # interrupt signal. The control path must already own a frozen
+                # snapshot of these markers for detached process reaping.
+                self._gateway_turn_process_task_id = ""
+                self._gateway_turn_process_baseline = None
 
         agent = _RecordingAgent()
         agent._gateway_turn_process_task_id = "session-123"

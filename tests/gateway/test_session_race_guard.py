@@ -128,16 +128,112 @@ async def test_durable_replay_claim_context_reaches_turn_owner():
         generation,
         *,
         busy_queue_claim=None,
+        busy_queue_claim_guard=None,
     ):
         del self_inner, ev, src, qk, generation
         nonlocal observed
         observed = busy_queue_claim
+        assert busy_queue_claim_guard is not None
+        busy_queue_claim_guard["handed_off"] = True
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
         await runner._handle_message(event)
 
     assert observed == claim_context
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_session_store_failure_does_not_publish_claim_handoff(
+    monkeypatch,
+):
+    runner = _make_runner()
+    event = _make_event(text="pre-turn failure")
+    session_key = build_session_key(event.source)
+    claim_context = (session_key, event.source, "claim-pre-turn")
+    guard = {"handed_off": False}
+    monkeypatch.setattr(
+        runner, "_recover_telegram_topic_thread_id", lambda source: None
+    )
+    monkeypatch.setattr(
+        runner.session_store,
+        "get_or_create_session",
+        MagicMock(side_effect=RuntimeError("pre-turn session-store failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="pre-turn session-store failure"):
+        await runner._handle_message_with_agent(
+            event,
+            event.source,
+            session_key,
+            1,
+            busy_queue_claim=claim_context,
+            busy_queue_claim_guard=guard,
+        )
+
+    assert guard == {"handed_off": False}
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_session_store_failure_rolls_back_durable_claim(
+    monkeypatch,
+):
+    runner = _make_runner()
+    event = _make_event(text="pre-turn rollback")
+    claim_context = (
+        build_session_key(event.source),
+        event.source,
+        "claim-pre-turn-rollback",
+    )
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    monkeypatch.setattr(
+        runner, "_recover_telegram_topic_thread_id", lambda source: None
+    )
+    monkeypatch.setattr(
+        runner.session_store,
+        "get_or_create_session",
+        MagicMock(side_effect=RuntimeError("pre-turn session-store failure")),
+    )
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+
+    with pytest.raises(RuntimeError, match="pre-turn session-store failure"):
+        await runner._handle_message(event)
+
+    rollback.assert_called_once_with(
+        *claim_context,
+        runner.adapters[Platform.TELEGRAM],
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_handoff_publishes_at_terminal_turn_boundary(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="terminal boundary")
+    session_key = build_session_key(event.source)
+    claim_context = (session_key, event.source, "claim-boundary")
+    guard = {"handed_off": False}
+    result = {"completed": True, "failed": False, "partial": False}
+    inner = AsyncMock(return_value=result)
+    monkeypatch.setattr(runner, "_run_agent_inner", inner)
+
+    observed = await runner._run_agent(
+        event.text,
+        "context",
+        [],
+        event.source,
+        "session-id",
+        session_key=session_key,
+        busy_queue_claim=claim_context,
+        busy_queue_claim_guard=guard,
+    )
+
+    assert observed == result
+    assert guard == {"handed_off": True}
+    inner.assert_awaited_once()
+    await_args = inner.await_args
+    assert await_args is not None
+    assert await_args.kwargs["busy_queue_claim"] == claim_context
 
 
 @pytest.mark.asyncio

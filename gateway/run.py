@@ -15715,14 +15715,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 isinstance(busy_queue_claim_context, tuple)
                 and len(busy_queue_claim_context) == 3
             ):
-                if busy_queue_claim_guard is not None:
-                    busy_queue_claim_guard["handed_off"] = True
                 _agent_result = await self._handle_message_with_agent(
                     event,
                     source,
                     _quick_key,
                     _run_generation,
                     busy_queue_claim=busy_queue_claim_context,
+                    busy_queue_claim_guard=busy_queue_claim_guard,
                 )
             else:
                 # Preserve the long-standing four-argument seam used by
@@ -16324,6 +16323,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _quick_key: str,
         run_generation: int,
         busy_queue_claim: Optional[tuple[str, SessionSource, str]] = None,
+        busy_queue_claim_guard: Optional[Dict[str, bool]] = None,
     ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -17507,6 +17507,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
                 busy_queue_claim=busy_queue_claim,
+                busy_queue_claim_guard=busy_queue_claim_guard,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -22934,13 +22935,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _process_task_id = ""
         _process_baseline = None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
-            request_hard_interrupt(running_agent, interrupt_reason)
+            # Snapshot immutable turn ownership before signalling. A hard
+            # interrupt can let the worker finalizer clear these mutable
+            # markers before the control path gets another instruction.
             _process_task_id = getattr(
                 running_agent, "_gateway_turn_process_task_id", ""
             )
             _process_baseline = getattr(
                 running_agent, "_gateway_turn_process_baseline", None
             )
+            request_hard_interrupt(running_agent, interrupt_reason)
         # Bump the generation *before* scheduling the reap thread and capture
         # the post-bump value: task_id is session-scoped (task_id ==
         # session_id), so if a replacement turn claims this session and
@@ -24128,6 +24132,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
         busy_queue_claim: Optional[tuple[str, SessionSource, str]] = None,
+        busy_queue_claim_guard: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -24148,6 +24153,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             smart_missions[session_key] = str(message or "")[:8_000]
 
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            if busy_queue_claim_guard is not None and busy_queue_claim is not None:
+                busy_queue_claim_guard["handed_off"] = True
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
@@ -24161,6 +24168,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
+            if busy_queue_claim_guard is not None and busy_queue_claim is not None:
+                busy_queue_claim_guard["handed_off"] = True
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,

@@ -430,5 +430,5 @@ class TestUpdateInHelp:
         # checking the help output includes it.
         from gateway.run import GatewayRunner
         import inspect
-        source = inspect.getsource(GatewayRunner._handle_message)
+        source = inspect.getsource(GatewayRunner._handle_message_impl)
         assert '"update"' in source
